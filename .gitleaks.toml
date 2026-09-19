@@ -1,0 +1,7 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Explicit nonfunctional encryption test fixture, not a provider credential"
+regexTarget = "secret"
+regexes = ['^sk-ant-api03-abcdef1234567890-SECRET-KEY-TOKEN$']

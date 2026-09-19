@@ -175,7 +175,10 @@ impl MemoryGuard {
 
         #[cfg(target_os = "windows")]
         let (success, fail) = {
-            let success = pids_to_trim.iter().filter(|&&pid| Self::empty_working_set_win32(pid)).count();
+            let success = pids_to_trim
+                .iter()
+                .filter(|&&pid| Self::empty_working_set_win32(pid))
+                .count();
             (success, pids_to_trim.len() - success)
         };
         // There is no supported remote EmptyWorkingSet equivalent on macOS/Linux.

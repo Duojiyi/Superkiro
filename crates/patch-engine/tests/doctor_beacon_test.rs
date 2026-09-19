@@ -26,7 +26,11 @@ async fn test_doctor_diagnostics_and_one_click_repair() {
     let doctor = Doctor::new(settings_mgr.clone(), token_storage.clone());
 
     // Every installation and credential path is synthetic; the gateway is a local mock.
-    let app_dir = temp_dir.join("resources/app");
+    let app_dir = if cfg!(target_os = "macos") {
+        temp_dir.join("Contents/Resources/app")
+    } else {
+        temp_dir.join("resources/app")
+    };
     let agent_dir = app_dir.join("extensions/kiro.kiro-agent");
     fs::create_dir_all(agent_dir.join("dist")).unwrap();
     fs::write(

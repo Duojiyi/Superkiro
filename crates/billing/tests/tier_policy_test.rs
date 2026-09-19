@@ -85,7 +85,15 @@ fn entitlement_survives_engine_snapshot_reload() {
     let engine = BillingEngine::new();
     let card = Card::new("persisted", "group-pro-plus", 5_000_000_000);
     engine.upsert_card(card);
-    engine.adjust_balance("persisted", -4_999_999_999, "admin", "test balance change", 1).unwrap();
+    engine
+        .adjust_balance(
+            "persisted",
+            -4_999_999_999,
+            "admin",
+            "test balance change",
+            1,
+        )
+        .unwrap();
     let directory = std::env::temp_dir().join(format!(
         "billing-tier-{}-{}",
         std::process::id(),

@@ -411,7 +411,9 @@ class DesktopWindow:
         if not self._allowed(token) or not self._window:
             return None
         import webview
-        result = self._window.create_file_dialog(webview.FOLDER_DIALOG)
+        result = self._window.create_file_dialog(
+            webview.OPEN_DIALOG, file_types=("Applications (*.app)",)
+        ) if sys.platform == "darwin" else self._window.create_file_dialog(webview.FOLDER_DIALOG)
         if not result:
             return None
         code, output = run_patch_cli(["status"])
