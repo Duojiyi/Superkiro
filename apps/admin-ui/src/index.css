@@ -75,3 +75,17 @@ pre {max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere;}
 .full-width {grid-column: 1 / -1;}
 .preview-content {white-space: pre-wrap; margin: 16px 0; overflow-wrap: anywhere;}
 .page-content > section {margin-top: 24px;}
+@media(min-width: 701px) {.page-content {padding-top: 40px;} .page-heading h2 {margin-bottom: 34px;} .brand-caption {margin-bottom: 36px;} }
+.page-content > .space-y-4 > .flex:first-child {background: white; padding: 18px; border-radius: 12px;}
+.page-content > .space-y-4 > table {min-height: 220px;}
+.sidebar nav button[aria-current] {background: #fbeae5;}
+
+.sample-range {background: white; padding: 16px 20px; border-radius: 8px; font-size: 13px;}
+@media(max-width: 700px) {
+  .page-content th, .page-content td {min-width: 105px;}
+  .provider-heading {flex-wrap: wrap; gap: 16px;}
+  .provider-heading > div {min-width: 0; max-width: 100%;}
+  .provider-heading span {overflow-wrap: anywhere;}
+  .provider-heading button {white-space: nowrap;}
+  .request-chart {gap: 4px;}
+}

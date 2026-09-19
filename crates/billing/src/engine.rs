@@ -3195,6 +3195,37 @@ impl BillingEngine {
         })
     }
 
+    /// UTC today plus the preceding 29 days, through now. Never substitute traces
+    /// for missing ledger details: archived summaries lack tokens/model dimensions.
+    pub fn settled_usage(
+        &self,
+        card_id: &str,
+        now_secs: u64,
+    ) -> Option<crate::settled_usage::SettledUsage> {
+        let _state_guard = self.state_lock.read().unwrap();
+        if !self.cards.read().unwrap().contains_key(card_id) {
+            return None;
+        }
+        let (start, end) = crate::settled_usage::window(now_secs);
+        if self
+            .archived_ledger_summary
+            .read()
+            .unwrap()
+            .cards
+            .get(card_id)
+            .is_some_and(|c| c.usage_by_second.range(start..end).next().is_some())
+        {
+            return None;
+        }
+        // ponytail: scan the retained ledger; add a per-card index if measured traffic warrants it.
+        let ledger = self.ledger.read().unwrap();
+        Some(crate::settled_usage::aggregate(
+            ledger.iter(),
+            card_id,
+            now_secs,
+        ))
+    }
+
     /// List append-only ledger entries for a card, optionally filtered by ledger kind.
     pub fn list_ledger_entries_for_card(
         &self,

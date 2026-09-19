@@ -247,10 +247,10 @@ export class AdminApiClient {
     });
   }
 
-  async batchCards(count: number, groupId = 'group-pro-plus'): Promise<{ success: boolean; cards: GeneratedCard[] }> {
+  async batchCards(count: number, groupId = 'group-pro-plus', templateId = 'tier-2000'): Promise<{ success: boolean; cards: GeneratedCard[] }> {
     return this.request('/api/v1/admin/cards/batch', {
       method: 'POST',
-      body: JSON.stringify({ count, groupId }),
+      body: JSON.stringify({ count, groupId, templateId, maxDevices: 1 }),
     });
   }
 

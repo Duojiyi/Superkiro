@@ -4,7 +4,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { adminApi, AdminStats, AdminCardItem, AdminAnnouncement, AdminFinancials, GeneratedCard } from './api';
 
 const pages = {overview: ['运营概览', '服务是否稳定，额度是否准确，从这里开始。'], cards: ['卡密资产', '按分组管理权益，所有额度调整保留操作原因。单卡仅限一台设备。'], groups: ['分组与权益', '让套餐权益可读、可比较。单卡单设备，四档积分套餐。'], providers: ['供应商与 Key', '模型能力按 Key 精确授权；发现结果进入草稿，不自动上线。'], models: ['模型与定价', '映射路由、配置积分价格，校验后发布。'], traces: ['调用追踪', '定位失败原因，不记录用户提示词或上游响应正文。'], reconciliation: ['财务对账', '结算积分、估算成本、实际充值分别呈现。'], announcements: ['公告管理', '核对公告正文后发布。当前接口面向全部用户。'], security: ['安全与审计', '高风险操作二次确认，密钥不回显，审计可追溯。']} as const;
-const tiers = [{id: 'group-pro', name: 'PRO', points: 1000}, {id: 'group-pro-plus', name: 'PRO+', points: 2000}, {id: 'group-pro-max', name: 'PRO Max', points: 5000}, {id: 'group-power', name: 'Power', points: 10000}];
+const tiers = [{id: 'tier-1000', name: 'PRO', points: 1000}, {id: 'tier-2000', name: 'PRO+', points: 2000}, {id: 'tier-5000', name: 'PRO Max', points: 5000}, {id: 'tier-10000', name: 'Power', points: 10000}];
 
 type Tab = 'overview' | 'cards' | 'groups' | 'providers' | 'models' | 'traces' | 'reconciliation' | 'announcements' | 'security';
 
@@ -30,6 +30,12 @@ export default function App() {
   const [announcements, setAnnouncements] = useState<AdminAnnouncement[]>([]);
   const [financials, setFinancials] = useState<AdminFinancials | null>(null);
   const [traces, setTraces] = useState<Array<Record<string, unknown>>>([]);
+  const successfulTraces = traces.filter(trace => trace.status === 'success').length;
+  const completedTraces = traces.filter(trace => ['success', 'error', 'client_aborted'].includes(String(trace.status))).length;
+  const traceBins = Array.from({length: 12}, (_, hour) => traces.filter(trace => {
+    const date = new Date(Number(trace.ts) * 1000);
+    return Number.isFinite(date.getTime()) && Math.floor(date.getHours() / 2) === hour;
+  }).length);
   const [providers, setProviders] = useState<Array<Record<string, unknown>>>([]);
   const [selectedProviderKey, setSelectedProviderKey] = useState<Record<string, unknown> | undefined>();
   const [providerKeys, setProviderKeys] = useState<Array<Record<string, unknown>>>([]);
@@ -38,6 +44,16 @@ export default function App() {
   const [loadError, setLoadError] = useState('');
   const [groupFilter, setGroupFilter] = useState('ALL');
   const [traceQuery, setTraceQuery] = useState('');
+  const [selectedTrace, setSelectedTrace] = useState<Record<string, unknown> | null>(null);
+  const [audit, setAudit] = useState<Array<Record<string, unknown>>>([]);
+  const [auditError, setAuditError] = useState('');
+  const [providersLoaded, setProvidersLoaded] = useState(false);
+  useEffect(() => {
+    if (activeTab !== 'security' || !isAuthenticated) {setAudit([]); return;}
+    let current = true;
+    adminApi.getCommercialConfig().then(result => {if (current) {setAudit(result.config.audit); setAuditError('');}}).catch(() => {if (current) setAuditError('配置审计读取失败，请稍后重试。');});
+    return () => {current = false;};
+  }, [activeTab, isAuthenticated, syncedAt]);
 
   // Selected card for adjustment
   const [selectedCard, setSelectedCard] = useState<AdminCardItem | null>(null);
@@ -47,6 +63,8 @@ export default function App() {
   // Batch generation form
   const [batchCount, setBatchCount] = useState<number>(50);
   const [batchGroup, setBatchGroup] = useState<string>('group-pro-plus');
+  const [batchTemplate, setBatchTemplate] = useState('tier-2000');
+  const [cardGroups, setCardGroups] = useState<Array<Record<string, unknown>>>([]);
 
   // New announcement form
   const [noticeTitle, setNoticeTitle] = useState('');
@@ -68,21 +86,26 @@ export default function App() {
         setIsAuthenticated(true);
       } else {
         setIsAuthenticated(false);
-        setStats(null); setCards([]); setAnnouncements([]); setFinancials(null); setTraces([]); setProviders([]); setProviderKeys([]); setSyncedAt(null);
+        setCardGroups([]); setStats(null); setCards([]); setAnnouncements([]); setFinancials(null); setTraces([]); setProviders([]); setProviderKeys([]); setProvidersLoaded(false); setSelectedProviderKey(undefined); setSelectedTrace(null); setSyncedAt(null);
         return;
       }
 
-      const [statsRes, cardsRes, noticesRes, financialsRes, tracesRes, providersRes] = await Promise.all([
+      const [statsRes, cardsRes, noticesRes, financialsRes, tracesRes, providersRes, configRes] = await Promise.all([
         adminApi.getStats().catch(() => null),
         adminApi.getCards().catch(() => ({ success: false, count: 0, cards: [] })),
         adminApi.getAnnouncements().catch(() => ({ success: false, announcements: [] })),
         adminApi.getFinancials().catch(() => null),
         adminApi.getTraces(100).catch(() => ({ success: false, traces: [] })),
         adminApi.getProviders().catch(() => ({ success: false, providers: [], keys: [] })),
+        adminApi.getCommercialConfig().catch(() => ({success: false, config: null})),
       ]);
 
-      if (![statsRes, cardsRes, noticesRes, financialsRes, tracesRes, providersRes].every(r => r?.success)) setLoadError('部分数据读取失败，保留最近一次结果。请刷新重试。');
+      if (![statsRes, cardsRes, noticesRes, financialsRes, tracesRes, providersRes, configRes].every(r => r?.success)) setLoadError('部分数据读取失败，保留最近一次结果。请刷新重试。');
       else setSyncedAt(new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}));
+      if (configRes.success && configRes.config) {
+        const groups = configRes.config.groups; setCardGroups(groups);
+        setBatchGroup(current => groups.some(group => group.id === current) ? current : String(groups[0]?.id ?? ''));
+      } else setCardGroups([]);
       if (statsRes && statsRes.success) {
         setStats(statsRes);
       }
@@ -95,6 +118,7 @@ export default function App() {
       if (financialsRes && financialsRes.success) setFinancials(financialsRes);
       if (tracesRes && tracesRes.success) setTraces(tracesRes.traces);
       if (providersRes && providersRes.success) {
+        setProvidersLoaded(true);
         setProviders(providersRes.providers || []);
         setProviderKeys(providersRes.keys || []);
       }
@@ -108,6 +132,22 @@ export default function App() {
   useEffect(() => {
     refreshData();
   }, [refreshData]);
+
+  useEffect(() => {
+    if (!(showBatchModal || showAdjustModal || showKekModal || showNoticeModal || showKeyModal || generatedCards.length)) return;
+    const previous = document.activeElement as HTMLElement | null;
+    const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+    const focusable = () => Array.from(dialog?.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex="0"]') || []);
+    focusable()[0]?.focus();
+    const keydown = (event: KeyboardEvent) => {
+      if (event.key !== 'Tab') return;
+      const nodes = focusable(); const first = nodes[0]; const last = nodes[nodes.length - 1];
+      if (event.shiftKey && document.activeElement === first) {event.preventDefault(); last?.focus();}
+      else if (!event.shiftKey && document.activeElement === last) {event.preventDefault(); first?.focus();}
+    };
+    document.addEventListener('keydown', keydown);
+    return () => {document.removeEventListener('keydown', keydown); previous?.focus();};
+  }, [showBatchModal, showAdjustModal, showKekModal, showNoticeModal, showKeyModal, generatedCards.length]);
 
   const handleSaveKey = async () => {
     adminApi.setAdminKey(adminKeyInput.trim());
@@ -172,11 +212,11 @@ export default function App() {
   };
 
   const handleBatchGenerate = async () => {
-    if (loading || !tiers.some(t => t.id === batchGroup) || !Number.isInteger(batchCount) || batchCount < 1 || batchCount > 500) return;
-    if (!window.confirm(`确认生成 ${batchCount} 张 ${tiers.find(t => t.id === batchGroup)?.name} 卡密？每张仅限一台设备，积分与权益以服务端校验为准。`)) return;
+    if (loading || !tiers.some(t => t.id === batchTemplate) || !cardGroups.some(group => group.id === batchGroup) || !Number.isInteger(batchCount) || batchCount < 1 || batchCount > 500) return;
+    if (!window.confirm(`确认生成 ${batchCount} 张 ${tiers.find(t => t.id === batchTemplate)?.name} 卡密？每张仅限一台设备，积分与权益以服务端校验为准。`)) return;
     try {
       setLoading(true);
-      const res = await adminApi.batchCards(batchCount, batchGroup);
+      const res = await adminApi.batchCards(batchCount, batchGroup, batchTemplate);
       if (res.success) {
         showToast(`成功批量生成 ${res.cards.length} 张卡密！已持久化入库`);
         setGeneratedCards(res.cards);
@@ -292,17 +332,17 @@ export default function App() {
       <main className="workspace">
         <header className="topbar"><span>工作台 / {pages[activeTab][0]}</span><div><span>{syncedAt ? `最近同步 ${syncedAt}` : '尚未同步'}</span><button onClick={() => setShowKeyModal(true)}>{isAuthenticated ? '管理会话' : '管理员登录'}</button><button disabled={loading} onClick={() => refreshData()}>{loading ? '刷新中…' : '刷新'}</button></div></header>
         <div className="page-content">
-          <div className="page-heading"><div><h2>{pages[activeTab][0]}</h2><p>{pages[activeTab][1]}</p></div>{activeTab === 'cards' && <button className="primary" onClick={() => setShowBatchModal(true)}>＋ 批量生成</button>}{activeTab === 'providers' && <button className="primary" onClick={() => document.getElementById('key-editor')?.scrollIntoView({behavior: 'smooth'})}>＋ 添加供应商</button>}</div>
+          <div className="page-heading"><div><h2>{pages[activeTab][0]}</h2><p>{pages[activeTab][1]}</p></div>{activeTab === 'overview' && <button disabled title="现有接口仅返回最近追踪，不支持完整日期聚合" className="sample-range">最近样本 · 日期筛选未支持</button>}{activeTab === 'cards' && <button className="primary" onClick={() => setShowBatchModal(true)}>＋ 批量生成</button>}{activeTab === 'providers' && <button className="primary" onClick={() => document.getElementById('key-editor')?.scrollIntoView({behavior: 'smooth'})}>＋ 添加供应商</button>}</div>
           {loadError && <p role="alert" className="notice-panel">{loadError}</p>}
           {activeTab === 'overview' && <div className="space-y-6">
             <div className="metric-grid">
-              <section className="panel metric"><p>结算请求</p><strong>{financials?.dashboard.total_requests.toLocaleString() ?? '—'}</strong><small>账本累计口径</small></section>
-              <section className="panel metric"><p>卡密资产</p><strong>{stats?.totalCards.toLocaleString() ?? '—'}</strong><small>{stats ? `已激活 ${stats.activeCards} · 未激活 ${stats.unactivatedCards}` : '等待服务端数据'}</small></section>
+              <section className="panel metric"><p>成功请求</p><strong>{traces.length ? successfulTraces.toLocaleString() : '—'}</strong><small>最近 {traces.length} 条追踪样本 · 非全天</small></section>
+              <section className="panel metric"><p>请求成功率</p><strong>{completedTraces ? `${(successfulTraces / completedTraces * 100).toFixed(1)}%` : '—'}</strong><small>最近样本：成功 / 已结束 {completedTraces} 条，排除进行中</small></section>
               <section className="panel metric"><p>已结算积分</p><strong>{financials ? (financials.dashboard.total_credits_charged / 1_000_000).toLocaleString() : '—'}</strong><small>仅含已完成结算</small></section>
               <section className="panel metric"><p>估算上游成本</p><strong>未配置</strong><small>未接入可核验采购口径</small></section>
             </div>
-            <div className="overview-grid"><section className="panel"><h3>请求量</h3><p className="muted">最近读取的 {traces.length} 条调用追踪 · 非全天统计</p><div className="request-chart">{traces.length ? Array.from({length: 12}, (_, hour) => { const count = traces.filter(t => { const date = new Date(Number(t.ts) * 1000); return !isNaN(date.getTime()) && Math.floor(date.getHours() / 2) === hour; }).length; return <div className="chart-column" key={hour}><span>{count}</span><div style={{height: `${Math.max(2, count / Math.max(1, traces.length) * 220)}px`}}/><small>{String(hour * 2).padStart(2, '0')}</small></div>; }) : <p className="empty-state">暂无调用追踪数据</p>}</div></section>
-            <section className="panel attention"><h3>需要关注</h3><h4>{providerKeys.filter(k => Number(k.cooldown_until ?? 0) > Date.now() / 1000).length} 个 Key 正在冷却</h4><button onClick={() => setActiveTab('providers')}>查看供应商状态 →</button><h4>{stats ? stats.frozenCards + stats.bannedCards : '—'} 张异常卡密</h4><button onClick={() => setActiveTab('cards')}>查看卡密资产 →</button><p className="muted">成本未配置，不展示推测毛利。</p></section></div>
+            <div className="overview-grid"><section className="panel"><h3>请求量</h3><p className="muted">最近读取的 {traces.length} 条调用追踪 · 非全天统计 · 本地时区按两小时合并（可跨日）</p><div className="request-chart" role="img" aria-label={`最近 ${traces.length} 条追踪按本地时段分布`}>{traces.length ? traceBins.map((count, hour) => { return <div className="chart-column" title={`${hour * 2}:00–${hour * 2 + 2}:00 · ${count} 条`} key={hour}><span>{count}</span><div style={{height: `${count / Math.max(1, ...traceBins) * 180}px`}}/><small>{String(hour * 2).padStart(2, '0')}</small></div>; }) : <p className="empty-state">暂无调用追踪数据</p>}</div></section>
+            <section className="panel attention"><h3>需要关注</h3><h4>{providersLoaded ? providerKeys.filter(k => Number(k.cooldown_until ?? 0) > Date.now() / 1000).length : '—'} 个 Key 正在冷却</h4><button onClick={() => setActiveTab('providers')}>查看供应商状态 →</button><h4>{stats ? stats.frozenCards + stats.bannedCards : '—'} 张异常卡密</h4><button onClick={() => setActiveTab('cards')}>查看卡密资产 →</button><p className="muted">成本未配置，不展示推测毛利。</p></section></div>
             <section className="panel"><h3>服务健康</h3><table><thead><tr><th>服务</th><th>状态</th><th>Key 数量</th><th>操作</th></tr></thead><tbody>{providers.map(p => <tr key={String(p.id)}><td>{String(p.name || p.id)}</td><td>{p.enabled === false ? '已停用' : '已启用 · 健康状态见 Key'}</td><td>{providerKeys.filter(k => k.provider_id === p.id).length}</td><td><button onClick={() => setActiveTab('providers')}>查看 Key →</button></td></tr>)}{!providers.length && <tr><td colSpan={4} className="empty-state">暂无服务端供应商数据</td></tr>}</tbody></table></section>
           </div>}
 
@@ -338,12 +378,7 @@ export default function App() {
                   >
                      导出 CSV
                   </button>
-                  <button
-                    onClick={() => setShowBatchModal(true)}
-                    className="px-3 py-1.5 bg-[#B94B39] text-white hover:bg-[#B94B39] text-white rounded text-xs font-medium"
-                  >
-                    ➕ 批量制卡 (Generator)
-                  </button>
+
                 </div>
               </div>
 
@@ -456,7 +491,7 @@ export default function App() {
               {providers.length > 0 ? (
                 providers.map((p: any) => (
                   <div key={p.id} className="p-4 rounded-xl bg-white border border-[#E5E8E5] space-y-4">
-                    <div className="flex justify-between items-center border-b border-[#E5E8E5] pb-3">
+                    <div className="provider-heading flex justify-between items-center border-b border-[#E5E8E5] pb-3">
                       <div>
                         <span className="font-bold text-[#23272B]">{p.name || p.id}</span>
                         <span className="ml-2 text-xs text-[#7B8388] font-mono">{p.base_url || '地址未配置'}</span>
@@ -514,45 +549,10 @@ export default function App() {
           {/* TAB 5: MODELS */}
           {activeTab === 'models' && <CommercialEditor key="models" kind="models" />}
 
-          {/* TAB 6: TRACES */}
-          {activeTab === 'traces' && (
-            <div className="space-y-4">
-              <div className="flex justify-between items-center">
-                <input aria-label="筛选请求" placeholder="搜索请求 ID / 卡密 / 模型 / 状态" value={traceQuery} onChange={e => setTraceQuery(e.target.value)} />
-                <span className="text-xs text-[#7B8388]">来自服务端持久化 trace，不含对话正文</span>
-              </div>
-              {traces.length === 0 ? (
-                <div className="p-6 rounded-xl bg-white border border-[#E5E8E5] text-[#7B8388] text-xs">当前没有服务端 trace 数据。</div>
-              ) : <table className="w-full text-left text-xs bg-white rounded-xl border border-[#E5E8E5] overflow-hidden">
-                <thead className="bg-[#EFF1EF] text-[#7B8388]">
-                  <tr>
-                    <th className="p-3">时间</th>
-                    <th className="p-3">卡密</th>
-                    <th className="p-3">模型</th>
-                    <th className="p-3">状态</th>
-                    <th className="p-3">首字 (TTFT)</th>
-                    <th className="p-3">速率</th>
-                    <th className="p-3">Tokens (入/出)</th>
-                    <th className="p-3">扣除积分</th>
-                    <th className="p-3">重试链路</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-800 text-[#23272B]">
-                  {traces.filter(trace => !traceQuery || [trace.id, trace.card_id, trace.exposed_model, trace.status].some(v => String(v ?? '').toLowerCase().includes(traceQuery.toLowerCase()))).map((trace, index) => <tr key={String(trace.id ?? index)}>
-                    <td className="p-3 text-[#7B8388]">{String(trace.ts ?? '')}</td>
-                    <td className="p-3 font-mono text-[#B94B39]">{String(trace.card_id ?? '')}</td>
-                    <td className="p-3">{String(trace.exposed_model ?? '')}</td>
-                    <td className="p-3">{String(trace.status ?? '')}</td>
-                    <td className="p-3">{String(trace.ttft_ms ?? '-')} ms</td>
-                    <td className="p-3">{String(trace.tokens_per_second ?? '-')}</td>
-                    <td className="p-3 font-mono">{String(trace.input_tokens ?? 0)} / {String(trace.output_tokens ?? 0)}</td>
-                    <td className="p-3 font-mono text-[#39816D]">{(Number(trace.credits_charged ?? 0) / 1_000_000).toFixed(6)}</td>
-                    <td className="p-3">{Array.isArray(trace.attempt_chain) && trace.attempt_chain.length > 0 ? <details><summary>{trace.attempt_chain.length} 次（首段尝试）</summary><pre className="max-w-xs overflow-auto whitespace-pre-wrap">{JSON.stringify(trace.attempt_chain, null, 2)}</pre></details> : '-'}</td>
-                  </tr>)}
-                </tbody>
-              </table>}
-            </div>
-          )}
+          {activeTab === 'traces' && <div className="space-y-6"><section className="panel"><table><thead><tr><th>请求 ID</th><th>模型</th><th>首字耗时</th><th>结算</th><th>结果</th><th>操作</th></tr></thead><tbody>{traces.filter(trace => !traceQuery || [trace.id, trace.card_id, trace.exposed_model, trace.status].some(v => String(v ?? '').toLowerCase().includes(traceQuery.toLowerCase()))).map((trace, index) => <tr key={String(trace.id ?? index)} className={selectedTrace === trace ? 'selected-row' : ''}><td>{String(trace.id ?? '—')}</td><td>{String(trace.exposed_model ?? '—')}</td><td>{trace.ttft_ms == null ? '—' : `${trace.ttft_ms} ms`}</td><td>{trace.credits_charged == null ? '—' : `${(Number(trace.credits_charged)/1_000_000).toFixed(6)} 积分`}</td><td>{String(trace.status ?? '—')}</td><td><button onClick={() => setSelectedTrace(trace)}>详情 →</button></td></tr>)}{!traces.length && <tr><td colSpan={6} className="empty-state">暂无已读取的调用追踪</td></tr>}</tbody></table></section>
+            <div className="two-columns"><section className="panel"><h3>筛选请求</h3><label className="block">请求 / 模型 / 状态<input className="block w-full mt-3" aria-label="筛选请求" placeholder="输入请求 ID、卡密、模型或状态" value={traceQuery} onChange={e => setTraceQuery(e.target.value)} /></label><p className="muted">在最近读取的最多 100 条追踪中筛选。</p></section><section className="panel"><h3>请求详情</h3>{selectedTrace ? <><p>{String(selectedTrace.id)}</p><p className="muted">{new Date(Number(selectedTrace.ts)*1000).toLocaleString()} · 卡密 {String(selectedTrace.card_id)}</p><p>Tokens：{String(selectedTrace.input_tokens ?? '—')} / {String(selectedTrace.output_tokens ?? '—')} · 速率 {String(selectedTrace.tokens_per_second ?? '—')} Tokens/s</p><pre>{JSON.stringify(selectedTrace.attempt_chain ?? [], null, 2)}</pre><button className="primary" onClick={async () => {try {await navigator.clipboard.writeText(String(selectedTrace.id)); showToast('已复制请求 ID');} catch {showToast('复制失败，请手动复制请求 ID');}}}>复制请求 ID</button></> : <p className="muted">选择请求查看重试链路、Tokens 与结算详情。</p>}</section></div>
+            <section className="notice-panel"><h3>失败处理</h3><p>临时错误仅在首段输出前按策略重试。发生部分输出后不重放流，避免重复内容与扣费。</p></section>
+          </div>}
 
           {/* TAB 7: RECONCILIATION */}
           {activeTab === 'reconciliation' && (
@@ -599,6 +599,7 @@ export default function App() {
           {/* TAB 9: SECURITY */}
           {activeTab === 'security' && (
             <div className="space-y-4">
+              <section className="panel"><h3>配置发布审计</h3><p className="muted">仅列出现有配置接口返回的发布记录，不代表全部管理操作审计。</p><table><thead><tr><th>时间</th><th>操作人 / 原因</th><th>原版本</th><th>发布版本</th></tr></thead><tbody>{audit.map((row, index) => <tr key={index}><td>{row.created_at_secs ? new Date(Number(row.created_at_secs) * 1000).toLocaleString() : '—'}</td><td>{String(row.operator ?? '—')} · {String(row.reason ?? '—')}</td><td>{String(row.previous_revision ?? '—')}</td><td>{String(row.revision ?? '—')}</td></tr>)}{!audit.length && <tr><td colSpan={4} className="empty-state">{auditError || '暂无已读取的配置审计记录'}</td></tr>}</tbody></table></section>
               <div className="flex justify-between items-center">
                 <h3 className="font-semibold text-[#23272B]">部署安全状态</h3>
                 <button onClick={() => showToast('KEK 轮换必须通过外部密钥管理/部署流程执行')} className="px-3 py-1.5 bg-[#EFF1EF] hover:bg-[#EFF1EF] text-[#23272B] rounded text-xs font-medium">KEK 轮换说明</button>
@@ -630,7 +631,7 @@ export default function App() {
 
       {/* Admin Key Modal */}
       {showKeyModal && (
-        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
+        <div role="dialog" aria-modal="true" aria-label="管理操作确认" className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
           <div className="bg-white border border-[#E5E8E5] p-6 rounded-xl w-96 space-y-4">
             <h3 className="font-bold text-[#23272B] text-base">管理员密钥配置 (Admin Key)</h3>
             <p className="text-xs text-[#7B8388]">
@@ -639,7 +640,7 @@ export default function App() {
             <div>
               <input
                 type="password"
-                placeholder="输入管理员密钥 (x-admin-key)..."
+                aria-label="管理员密钥" autoComplete="off" placeholder="输入管理员密钥 (x-admin-key)..."
                 value={adminKeyInput}
                 onChange={(e) => setAdminKeyInput(e.target.value)}
                 className="w-full bg-[#EFF1EF] border border-[#E5E8E5] p-2 rounded text-[#23272B] font-mono text-xs focus:outline-none focus:border-[#E9C8C1]"
@@ -674,25 +675,26 @@ export default function App() {
 
       {/* Batch Generator Modal */}
       {showBatchModal && (
-        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
+        <div role="dialog" aria-modal="true" aria-label="管理操作确认" className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
           <div className="bg-white border border-[#E5E8E5] p-6 rounded-xl w-96 space-y-4">
             <h3 className="font-bold text-[#23272B] text-base">批量生成卡密</h3>
             <div className="space-y-3 text-xs">
               <div>
                 <label className="text-[#7B8388] block mb-1">积分套餐 · 单卡单设备</label>
                 <select
-                  value={batchGroup}
-                  onChange={(e) => setBatchGroup(e.target.value)}
+                  aria-label="积分套餐" value={batchTemplate}
+                  onChange={(e) => setBatchTemplate(e.target.value)}
                   className="w-full bg-[#EFF1EF] border border-[#E5E8E5] p-2 rounded text-[#23272B]"
                 >
                   {tiers.map(tier => <option key={tier.id} value={tier.id}>{tier.name} · {tier.points.toLocaleString()} 积分 · 单设备</option>)}
                 </select>
               </div>
+              <div><label className="text-[#7B8388] block mb-1">权益分组（服务端配置）</label><select aria-label="权益分组" className="w-full" value={batchGroup} onChange={e => setBatchGroup(e.target.value)} disabled={!cardGroups.length}>{!cardGroups.length && <option value="">请先登录并读取分组配置</option>}{cardGroups.map(group => <option key={String(group.id)} value={String(group.id)}>{String(group.name ?? group.id)}</option>)}</select></div>
               <div>
                 <label className="text-[#7B8388] block mb-1">生成数量 (1 ~ 500)</label>
                 <input
                   type="number"
-                  min="1"
+                  aria-label="生成数量" min="1"
                   max="500"
                   value={batchCount}
                   onChange={(e) => setBatchCount(Math.max(1, Math.min(500, parseInt(e.target.value) || 1)))}
@@ -702,7 +704,7 @@ export default function App() {
             </div>
             <div className="flex justify-end gap-2 pt-2">
               <button onClick={() => setShowBatchModal(false)} className="px-3 py-1.5 bg-[#EFF1EF] text-[#23272B] rounded text-xs">取消</button>
-              <button onClick={handleBatchGenerate} disabled={loading} className="px-3 py-1.5 bg-[#B94B39] text-white hover:bg-[#B94B39] text-white rounded text-xs font-medium disabled:opacity-50">
+              <button onClick={handleBatchGenerate} disabled={loading || !cardGroups.some(group => group.id === batchGroup)} className="px-3 py-1.5 bg-[#B94B39] text-white hover:bg-[#B94B39] text-white rounded text-xs font-medium disabled:opacity-50">
                 {loading ? '正在生成并入库...' : '生成并入库'}
               </button>
             </div>
@@ -712,7 +714,7 @@ export default function App() {
 
       {/* Adjust Balance Modal */}
       {showAdjustModal && (
-        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
+        <div role="dialog" aria-modal="true" aria-label="管理操作确认" className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
           <div className="bg-white border border-[#E5E8E5] p-6 rounded-xl w-96 space-y-4">
             <h3 className="font-bold text-[#23272B] text-base">人工调账 (写入账本条目)</h3>
             {selectedCard && (
@@ -752,7 +754,7 @@ export default function App() {
 
       {/* KEK Rotation Modal */}
       {showKekModal && (
-        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
+        <div role="dialog" aria-modal="true" aria-label="管理操作确认" className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
           <div className="bg-white border border-[#E5E8E5] p-6 rounded-xl w-96 space-y-4">
             <h3 className="font-bold text-[#23272B] text-base">主密钥 (KEK) 轮换向导</h3>
             <p className="text-xs text-[#7B8388]">系统将以旧 KEK 批量解密全部 Provider Key 并以新 KEK 重新 AES-256-GCM 封装写入。</p>
@@ -772,7 +774,7 @@ export default function App() {
 
       {/* Notice Modal */}
       {showNoticeModal && (
-        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
+        <div role="dialog" aria-modal="true" aria-label="管理操作确认" className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
           <div className="bg-white border border-[#E5E8E5] p-6 rounded-xl w-96 space-y-4">
             <h3 className="font-bold text-[#23272B] text-base">发布服务公告</h3>
             <div className="space-y-3 text-xs">

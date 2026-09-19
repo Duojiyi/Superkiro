@@ -30,7 +30,7 @@ async fn main() {
                 Err(error) => Err(error),
             };
             match result {
-                Ok(usage) => println!("{}", json!({"success": true, "usage": usage})),
+                Ok(usage) => println!("{}", desktop_usage_output(usage)),
                 Err(error) => {
                     println!("{}", json!({"success": false, "error": error}));
                     std::process::exit(1);
@@ -225,4 +225,34 @@ async fn desktop_operation(operation: &str, args: &[String]) -> Result<(), Strin
     session
         .activate_and_launch(&install, &gateway, card, close_confirmed)
         .await
+}
+
+// Preserve the gateway payload while exposing the desktop's top-level statistics contract.
+fn desktop_usage_output(usage: serde_json::Value) -> serde_json::Value {
+    json!({"success": true, "settledUsage": usage.get("settledUsage"), "usage": usage})
+}
+
+#[cfg(test)]
+mod usage_output_tests {
+    use super::*;
+
+    #[test]
+    fn forwards_real_statistics_and_live_entitlement() {
+        let usage = json!({"virtualPlanName":"PRO", "validUntil":1234,
+            "settledUsage":{"totalTokens":12,"todayPoints":0.5,"todayTokens":12,
+                "daily":[{"date":"2026-09-19","points":0.5,"tokens":12}],
+                "models":[{"name":"model","points":0.5,"tokens":12}]}});
+        let output = desktop_usage_output(usage.clone());
+        assert_eq!(output["success"], true);
+        assert_eq!(output["settledUsage"], usage["settledUsage"]);
+        assert_eq!(output["usage"], usage);
+        assert!(output["settledUsage"].get("usd").is_none());
+        assert!(output["settledUsage"].get("referencePrice").is_none());
+    }
+
+    #[test]
+    fn old_gateway_does_not_fabricate_zero_statistics() {
+        let output = desktop_usage_output(json!({"usageBreakdownList":[]}));
+        assert!(output["settledUsage"].is_null());
+    }
 }

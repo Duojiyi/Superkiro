@@ -59,6 +59,14 @@ pub struct UserInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetUsageLimitsResponse {
+    #[serde(default)]
+    pub virtual_plan_name: String,
+    #[serde(default)]
+    pub valid_until: Option<u64>,
+    #[serde(default)]
+    pub settled_usage: Option<billing::settled_usage::SettledUsage>,
+    #[serde(default)]
+    pub settled_usage_unavailable_reason: Option<String>,
     pub subscription_info: SubscriptionInfo,
     pub usage_breakdown_list: Vec<UsageBreakdown>,
     pub overage_configuration: OverageConfiguration,
@@ -117,7 +125,21 @@ impl FacadeHandler for GetUsageLimitsHandler {
                 .map(|c| c.credit_total as f64 / 1_000_000.0)
                 .unwrap_or(group.virtual_usage_limit.max(0.0));
 
+            let settled_usage = self
+                .store
+                .billing()
+                .and_then(|b| b.settled_usage(card_id, now_secs));
             let resp = GetUsageLimitsResponse {
+                virtual_plan_name: card
+                    .as_ref()
+                    .and_then(|c| c.plan_name())
+                    .unwrap_or("Legacy service plan")
+                    .to_string(),
+                valid_until: card.as_ref().and_then(|c| c.valid_until),
+                settled_usage_unavailable_reason: settled_usage
+                    .is_none()
+                    .then(|| "Settled ledger detail unavailable for this UTC window".to_string()),
+                settled_usage,
                 subscription_info: SubscriptionInfo {
                     subscription_title: card
                         .as_ref()

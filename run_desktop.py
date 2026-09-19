@@ -188,6 +188,7 @@ class SecureBridgeHandler(BaseHTTPRequestHandler):
                     try:
                         data["platform"] = sys.platform
                         data["suggested_gateway_url"] = validate_gateway(os.environ.get("KIRO_GATEWAY_URL") or DEFAULT_GATEWAY_URL)
+                        data["portal_url"] = data["suggested_gateway_url"] + "/portal"
                     except ValueError:
                         pass
                 self.send_json(200 if code == 0 else 500, data)
@@ -388,6 +389,7 @@ class DesktopWindow:
 
     def __init__(self):
         self._window = None
+        self._maximized = False
 
     def _allowed(self, token):
         return isinstance(token, str) and token.isascii() and secrets.compare_digest(token, SESSION_TOKEN)
@@ -442,9 +444,25 @@ class DesktopWindow:
         except Exception:
             return False
 
+    def open_external(self, url, token):
+        if not self._allowed(token):
+            return False
+        portal = validate_gateway(os.environ.get("KIRO_GATEWAY_URL") or DEFAULT_GATEWAY_URL) + "/portal"
+        if url not in (portal, "https://kiro.dev/downloads/"):
+            return False
+        import webbrowser
+        return webbrowser.open(url, new=2)
+
     def maximize(self, token):
         if self._allowed(token) and self._window:
-            self._window.toggle_fullscreen()
+            if sys.platform == "darwin":
+                self._window.toggle_fullscreen()
+            elif self._maximized:
+                self._window.restore()
+                self._maximized = False
+            else:
+                self._window.maximize()
+                self._maximized = True
 
     def pick_install_path(self, token):
         if not self._allowed(token) or not self._window:

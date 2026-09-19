@@ -14,6 +14,7 @@ pub mod observability;
 pub mod provider;
 pub mod rate_card;
 pub mod reservation;
+pub mod settled_usage;
 pub mod template;
 pub mod tenant;
 pub mod topup;

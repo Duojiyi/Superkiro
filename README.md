@@ -66,3 +66,16 @@ cargo test --workspace --locked --no-fail-fast
 
 Use isolated fixtures for frontend visual checks. Passing mock-based tests or package
 builds does not certify real IDE interaction, production billing or notarization.
+
+### Frontend acceptance
+
+Desktop visual contracts: `python -B -m unittest -v test_superkiro_desktop_ui`
+(requires Playwright and Chromium). Admin checks live in `apps/admin-ui/tests`:
+`contracts.cjs`, `visual.cjs` (unauthenticated) and `visual-authenticated.cjs`
+(populated fixture data). The CI frontend job builds and runs these checks.
+Screenshots are local acceptance evidence, not production data.
+
+Desktop daily usage is settled ledger data in UTC; token/model totals cover the
+last 30 UTC dates and the chart displays the last seven. Missing archived detail
+is reported as unavailable, never synthesized. Dollar estimates need an explicit
+reference price and are not inferred from private upstream costs.

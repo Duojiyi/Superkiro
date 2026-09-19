@@ -1,0 +1,41 @@
+{
+  "conversationState": {
+    "conversationId": "conv_abc123_xyz",
+    "currentMessage": {
+      "userInputMessage": {
+        "content": "Please inspect this architecture screenshot and read the configuration file.",
+        "modelId": "claude-3-7-sonnet",
+        "origin": "AI_EDITOR",
+        "images": [
+          {
+            "format": "png",
+            "source": {
+              "bytes": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+            }
+          }
+        ],
+        "userInputMessageContext": {
+          "tools": [
+            {
+              "name": "fs_read",
+              "description": "Read file contents from filesystem",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path"
+                ]
+              }
+            }
+          ],
+          "toolResults": []
+        }
+      }
+    },
+    "history": []
+  }
+}
