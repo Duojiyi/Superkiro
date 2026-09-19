@@ -1,1 +1,2 @@
 pywebview==6.2.1
+keyring==25.6.0

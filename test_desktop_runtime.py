@@ -20,6 +20,24 @@ class DesktopRuntimeTests(unittest.TestCase):
         self.assertTrue(controls.screen("connect", bridge.SESSION_TOKEN))
         controls._window.resize.assert_called_with(480, 620)
 
+    def test_credentials_are_authenticated_and_use_native_store(self):
+        controls = bridge.DesktopWindow()
+        store = Mock()
+        store.get_password.return_value = "fixture-card"
+        with patch.object(controls, "_credential_store", return_value=store):
+            self.assertIsNone(controls.get_remembered_card("wrong"))
+            self.assertFalse(controls.set_remembered_card("fixture-card", "wrong"))
+            self.assertFalse(controls.clear_remembered_card("wrong"))
+            store.assert_not_called()
+            self.assertEqual(controls.get_remembered_card(bridge.SESSION_TOKEN), "fixture-card")
+            self.assertTrue(controls.set_remembered_card("fixture-card", bridge.SESSION_TOKEN))
+            store.set_password.assert_called_once_with("Superkiro", "card", "fixture-card")
+            self.assertTrue(controls.clear_remembered_card(bridge.SESSION_TOKEN))
+            store.delete_password.assert_called_once_with("Superkiro", "card")
+        with patch.object(controls, "_credential_store", side_effect=RuntimeError("locked")):
+            self.assertFalse(controls.set_remembered_card("fixture-card", bridge.SESSION_TOKEN))
+            self.assertIsNone(controls.get_remembered_card(bridge.SESSION_TOKEN))
+
     def test_selected_installation_is_passed_to_child_only(self):
         with tempfile.TemporaryDirectory() as directory:
             file = os.path.join(directory, "preferences.json")

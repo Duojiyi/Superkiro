@@ -403,6 +403,45 @@ class DesktopWindow:
         if self._allowed(token) and self._window:
             self._window.minimize()
 
+    @staticmethod
+    def _credential_store():
+        # Select OS-native stores explicitly; never permit plaintext/fallback backends.
+        if sys.platform == "win32":
+            from keyring.backends.Windows import WinVaultKeyring
+            return WinVaultKeyring()
+        if sys.platform == "darwin":
+            from keyring.backends.macOS import Keyring
+            return Keyring()
+        raise RuntimeError("Native credential storage unavailable")
+
+    def get_remembered_card(self, token):
+        if not self._allowed(token):
+            return None
+        try:
+            return self._credential_store().get_password("Superkiro", "card")
+        except Exception:
+            return None
+
+    def set_remembered_card(self, card, token):
+        if not self._allowed(token) or not isinstance(card, str) or not card.strip() or len(card) > 256:
+            return False
+        try:
+            self._credential_store().set_password("Superkiro", "card", card.strip())
+            return True
+        except Exception:
+            return False
+
+    def clear_remembered_card(self, token):
+        if not self._allowed(token):
+            return False
+        try:
+            store = self._credential_store()
+            if store.get_password("Superkiro", "card") is not None:
+                store.delete_password("Superkiro", "card")
+            return True
+        except Exception:
+            return False
+
     def maximize(self, token):
         if self._allowed(token) and self._window:
             self._window.toggle_fullscreen()

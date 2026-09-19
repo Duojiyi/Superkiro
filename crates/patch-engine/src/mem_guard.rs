@@ -12,6 +12,7 @@
 //! - `IDE Cache Purger`: Cleans non-active cache and logs older than a configurable threshold.
 
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "windows")]
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -122,6 +123,7 @@ impl MemoryGuard {
 
     /// Sample the current process tree and gather memory metrics.
     pub fn sample_memory() -> MemorySnapshot {
+        #[cfg(target_os = "windows")]
         let mut snapshot = MemorySnapshot::default();
 
         #[cfg(target_os = "windows")]
@@ -155,10 +157,7 @@ impl MemoryGuard {
         }
 
         #[cfg(not(target_os = "windows"))]
-        {
-            // Cross-platform basic sampler via ps
-            snapshot = Self::sample_unix_processes();
-        }
+        let snapshot = Self::sample_unix_processes();
 
         snapshot
     }

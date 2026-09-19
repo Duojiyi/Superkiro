@@ -12,6 +12,8 @@ args = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--window
         "--add-data", f"apps/desktop-ui{os.pathsep}apps/desktop-ui",
         "--add-data", f"deploy/server-ca.pem{os.pathsep}deploy",
         "--add-binary", f"target/release/{binary}{os.pathsep}bin"]
+if sys.platform == "win32":
+    args += ["--hidden-import", "keyring.backends.Windows"]
 if sys.platform == "darwin":
-    args += ["--osx-bundle-identifier", "app.superkiro.desktop"]
+    args += ["--osx-bundle-identifier", "app.superkiro.desktop", "--hidden-import", "keyring.backends.macOS"]
 subprocess.run(args + ["run_desktop.py"], check=True)
