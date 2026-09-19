@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kiro-wire",
+    "crates/gateway",
+    "crates/billing",
+    "crates/patch-engine",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Kiro BYOK Authors"]
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.38", features = ["full"] }
+thiserror = "1.0"
+bytes = "1.6"
+axum = "0.7"
+http-body-util = "0.1"
+tower = { version = "0.4", features = ["util"] }
+jsonwebtoken = "9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures-util = "0.3"
+wiremock = "0.6"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif"] }
+base64 = "0.22"
+tower-http = { version = "0.5", features = ["timeout"] }

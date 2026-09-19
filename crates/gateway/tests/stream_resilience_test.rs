@@ -1,0 +1,893 @@
+//! Comprehensive resilience tests for streaming exceptions, idempotency, and billing settlement (Spec §4.6, §4.7, §6.1, §6.3, T06).
+
+use billing::card::Card;
+use billing::crypto::MasterKek;
+use billing::engine::BillingEngine;
+use billing::reservation::ReservationEstimateParams;
+use bytes::Bytes;
+use futures_util::{Stream, StreamExt};
+use gateway::idempotency::IdempotencyManager;
+use gateway::provider::{
+    ProviderDelta, ProviderError, ProviderStreamEvent, ReceiverStream, TokenUsage,
+};
+use gateway::stream::{create_stream_guard, BillingSettler, StreamGuardConfig};
+use kiro_wire::decoder::EventStreamDecoder;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
+
+fn create_test_billing() -> (BillingEngine, String) {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let temp_dir = std::env::temp_dir().join(format!(
+        "kiro_test_t06_{}_{}_{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let state_file = temp_dir.join("billing_state.json");
+
+    let kek = MasterKek::from_bytes([9u8; 32]);
+    let billing = BillingEngine::new();
+    billing.set_persistence_path(&state_file);
+    billing.set_master_kek(kek);
+
+    let mut card = Card::new("card-t06-test", "group-default", 10_000_000);
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    card.activate(now_secs, 86400 * 30).unwrap();
+    billing.upsert_card(card);
+
+    (billing, "card-t06-test".to_string())
+}
+
+async fn collect_and_decode_frames(
+    mut stream: impl Stream<Item = Result<Bytes, std::io::Error>> + Unpin,
+) -> Vec<(String, Vec<u8>)> {
+    let mut decoder = EventStreamDecoder::new();
+    let mut decoded = Vec::new();
+
+    while let Some(chunk_res) = stream.next().await {
+        let chunk = chunk_res.expect("Stream chunk error");
+        decoder.feed(&chunk).expect("Feed chunk error");
+        while let Some(f) = decoder.decode().expect("Decode frame error") {
+            let event_type = f
+                .headers
+                .get(":event-type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let exception_type = f
+                .headers
+                .get(":exception-type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let name = if !event_type.is_empty() {
+                event_type
+            } else {
+                exception_type
+            };
+            decoded.push((name, f.payload));
+        }
+    }
+    decoded
+}
+
+// --------------------------------------------------------------------------
+// 1. TTFB Timeout before first token releases reservation with 0 charge
+// --------------------------------------------------------------------------
+#[tokio::test]
+async fn test_t06_ttfb_timeout_releases_reservation() {
+    let (billing, card_id) = create_test_billing();
+    let initial_balance = billing.get_card(&card_id).unwrap().available_credits();
+
+    let inv_id = "inv-ttfb-timeout";
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let params = ReservationEstimateParams {
+        estimated_input_tokens: 1000,
+        max_output_tokens: 2000,
+        input_rate_per_m: 15_000_000,
+        output_rate_per_m: 60_000_000,
+        credit_multiplier: 1.0,
+        margin_multiplier: 1.0,
+        model: Some("claude-3-5-sonnet".to_string()),
+    };
+    let _res = billing
+        .reserve(&card_id, inv_id, &params, now_secs, 300)
+        .unwrap();
+
+    let (tx, rx) = mpsc::channel(16);
+    // Upstream stream that never sends anything (triggers TTFB watchdog timeout)
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = tx.send(Err(ProviderError::Timeout)).await;
+    });
+
+    let config = StreamGuardConfig {
+        keepalive_interval: Duration::from_secs(60),
+        model_id: "claude-3-5-sonnet".to_string(),
+        context_window: None,
+    };
+
+    let settler = BillingSettler::new(
+        billing.clone(),
+        inv_id.to_string(),
+        "claude-3-5-sonnet".to_string(),
+        "provider-1".to_string(),
+        "claude-3-5-sonnet".to_string(),
+    )
+    .with_estimated_input(1000);
+
+    let idemp_mgr = IdempotencyManager::default();
+    let idemp_guard = idemp_mgr.try_acquire(inv_id).unwrap();
+
+    let stream = create_stream_guard(
+        ReceiverStream::new(rx),
+        config,
+        None,
+        Some(idemp_guard),
+        Some(settler),
+    );
+    let frames = collect_and_decode_frames(stream).await;
+
+    // Must emit exception frame to client
+    assert!(frames
+        .iter()
+        .any(|(name, _)| name == "InternalServerException"));
+
+    // Assert: reservation is released, card balance is untouched, credit_reserved is 0
+    let card = billing.get_card(&card_id).unwrap();
+    assert_eq!(card.credit_reserved, 0);
+    assert_eq!(card.available_credits(), initial_balance);
+    assert_eq!(
+        billing.list_ledger_entries_for_card(&card_id, None).len(),
+        0
+    );
+
+    // Assert: idempotency was not committed as completed, client can retry immediately
+    assert!(idemp_mgr.get_completed(inv_id).is_none());
+    assert!(idemp_mgr.try_acquire(inv_id).is_ok());
+}
+
+// --------------------------------------------------------------------------
+// 2. Partial text emitted then EOF without Usage performs partial settlement
+// --------------------------------------------------------------------------
+#[tokio::test]
+async fn test_t06_partial_text_then_eof_without_usage_settles_and_fails_idempotency() {
+    let (billing, card_id) = create_test_billing();
+    let initial_balance = billing.get_card(&card_id).unwrap().available_credits();
+
+    let inv_id = "inv-partial-eof";
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let params = ReservationEstimateParams {
+        estimated_input_tokens: 1000,
+        max_output_tokens: 2000,
+        input_rate_per_m: 15_000_000,
+        output_rate_per_m: 60_000_000,
+        credit_multiplier: 1.0,
+        margin_multiplier: 1.0,
+        model: Some("claude-3-5-sonnet".to_string()),
+    };
+    let _res = billing
+        .reserve(&card_id, inv_id, &params, now_secs, 300)
+        .unwrap();
+
+    let (tx, rx) = mpsc::channel(16);
+    tokio::spawn(async move {
+        // Emit 80 characters of text
+        let _ = tx
+            .send(Ok(ProviderStreamEvent::Delta(ProviderDelta::Text(
+                "This is a partial streaming chunk containing eighty chars of output text."
+                    .to_string(),
+            ))))
+            .await;
+        // Upstream abruptly closes connection (EOF) without Usage or Done
+    });
+
+    let config = StreamGuardConfig {
+        keepalive_interval: Duration::from_secs(60),
+        model_id: "claude-3-5-sonnet".to_string(),
+        context_window: None,
+    };
+
+    let settler = BillingSettler::new(
+        billing.clone(),
+        inv_id.to_string(),
+        "claude-3-5-sonnet".to_string(),
+        "provider-1".to_string(),
+        "claude-3-5-sonnet".to_string(),
+    )
+    .with_estimated_input(1000);
+
+    let idemp_mgr = IdempotencyManager::default();
+    let idemp_guard = idemp_mgr.try_acquire(inv_id).unwrap();
+
+    let stream = create_stream_guard(
+        ReceiverStream::new(rx),
+        config,
+        None,
+        Some(idemp_guard),
+        Some(settler),
+    );
+    let frames = collect_and_decode_frames(stream).await;
+
+    // Stream must notify client of abrupt end
+    assert!(frames
+        .iter()
+        .any(|(name, _)| name == "InternalServerException"));
+
+    // T06: Must NOT let customer consume compute for free!
+    // Estimated tokens: 1000 input, ~19 output tokens
+    let card = billing.get_card(&card_id).unwrap();
+    assert_eq!(card.credit_reserved, 0);
+    assert!(
+        card.available_credits() < initial_balance,
+        "Partial output consumption must be billed"
+    );
+    let ledger = billing.list_ledger_entries_for_card(&card_id, None);
+    assert_eq!(ledger.len(), 1);
+    assert!(ledger[0].output_tokens > 0);
+    assert_eq!(ledger[0].input_tokens, 1000);
+
+    // Idempotency: must be marked failed, not completed
+    assert!(idemp_mgr.get_completed(inv_id).is_none());
+    assert!(matches!(
+        idemp_mgr.try_acquire(inv_id),
+        Err(gateway::idempotency::IdempotencyError::AlreadyFailed(_))
+    ));
+}
+
+// --------------------------------------------------------------------------
+// 3. Error after Usage received settles actual usage
+// --------------------------------------------------------------------------
+#[tokio::test]
+async fn test_t06_error_after_usage_settles_actual_usage() {
+    let (billing, card_id) = create_test_billing();
+    let initial_balance = billing.get_card(&card_id).unwrap().available_credits();
+
+    let inv_id = "inv-error-after-usage";
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let params = ReservationEstimateParams {
+        estimated_input_tokens: 1000,
+        max_output_tokens: 2000,
+        input_rate_per_m: 15_000_000,
+        output_rate_per_m: 60_000_000,
+        credit_multiplier: 1.0,
+        margin_multiplier: 1.0,
+        model: Some("claude-3-5-sonnet".to_string()),
+    };
+    let _res = billing
+        .reserve(&card_id, inv_id, &params, now_secs, 300)
+        .unwrap();
+
+    let (tx, rx) = mpsc::channel(16);
+    tokio::spawn(async move {
+        let _ = tx
+            .send(Ok(ProviderStreamEvent::Delta(ProviderDelta::Text(
+                "Hello!".to_string(),
+            ))))
+            .await;
+        // Provider reported exact token usage
+        let _ = tx
+            .send(Ok(ProviderStreamEvent::Usage(TokenUsage {
+                uncached_prompt_tokens: 50,
+                prompt_tokens: 80,
+                completion_tokens: 15,
+                total_tokens: 95,
+                output_tokens_final: true,
+                cache_read_input_tokens: Some(30),
+                cache_creation_input_tokens: None,
+            })))
+            .await;
+        // Then connection dropped
+        let _ = tx.send(Err(ProviderError::StreamDisconnected)).await;
+    });
+
+    let config = StreamGuardConfig {
+        keepalive_interval: Duration::from_secs(60),
+        model_id: "claude-3-5-sonnet".to_string(),
+        context_window: None,
+    };
+
+    let settler = BillingSettler::new(
+        billing.clone(),
+        inv_id.to_string(),
+        "claude-3-5-sonnet".to_string(),
+        "provider-1".to_string(),
+        "claude-3-5-sonnet".to_string(),
+    );
+
+    let idemp_mgr = IdempotencyManager::default();
+    let idemp_guard = idemp_mgr.try_acquire(inv_id).unwrap();
+
+    let stream = create_stream_guard(
+        ReceiverStream::new(rx),
+        config,
+        None,
+        Some(idemp_guard),
+        Some(settler),
+    );
+    let frames = collect_and_decode_frames(stream).await;
+
+    // Both user-friendly text chunk and exception frame emitted
+    assert!(frames
+        .iter()
+        .any(|(name, _)| name == "assistantResponseEvent"));
+    assert!(frames
+        .iter()
+        .any(|(name, _)| name == "InternalServerException"));
+
+    // Settled actual usage (uncached: 50, output: 15, cache_read: 30)
+    let card = billing.get_card(&card_id).unwrap();
+    assert_eq!(card.credit_reserved, 0);
+    assert!(card.available_credits() < initial_balance);
+    let ledger = billing.list_ledger_entries_for_card(&card_id, None);
+    assert_eq!(ledger.len(), 1);
+    assert_eq!(ledger[0].output_tokens, 15);
+    assert_eq!(ledger[0].cache_read_tokens, 30);
+    assert_eq!(ledger[0].input_tokens, 80); // 50 uncached + 30 cache_read
+
+    // Marked failed in idempotency
+    assert!(matches!(
+        idemp_mgr.try_acquire(inv_id),
+        Err(gateway::idempotency::IdempotencyError::AlreadyFailed(_))
+    ));
+}
+
+// --------------------------------------------------------------------------
+// 4. Clean Done stream settles and commits idempotency
+// --------------------------------------------------------------------------
+#[tokio::test]
+async fn test_t06_clean_stream_done_settles_and_commits_idempotency() {
+    let (billing, card_id) = create_test_billing();
+    let initial_balance = billing.get_card(&card_id).unwrap().available_credits();
+
+    let inv_id = "inv-clean-done";
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let params = ReservationEstimateParams {
+        estimated_input_tokens: 1000,
+        max_output_tokens: 2000,
+        input_rate_per_m: 15_000_000,
+        output_rate_per_m: 60_000_000,
+        credit_multiplier: 1.0,
+        margin_multiplier: 1.0,
+        model: Some("claude-3-5-sonnet".to_string()),
+    };
+    let _res = billing
+        .reserve(&card_id, inv_id, &params, now_secs, 300)
+        .unwrap();
+
+    let (tx, rx) = mpsc::channel(16);
+    tokio::spawn(async move {
+        let _ = tx
+            .send(Ok(ProviderStreamEvent::Delta(ProviderDelta::Text(
+                "Complete response.".to_string(),
+            ))))
+            .await;
+        let _ = tx
+            .send(Ok(ProviderStreamEvent::Usage(TokenUsage {
+                uncached_prompt_tokens: 100,
+                prompt_tokens: 100,
+                completion_tokens: 20,
+                total_tokens: 120,
+                output_tokens_final: true,
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
+            })))
+            .await;
+        let _ = tx.send(Ok(ProviderStreamEvent::Done)).await;
+    });
+
+    let config = StreamGuardConfig {
+        keepalive_interval: Duration::from_secs(60),
+        model_id: "claude-3-5-sonnet".to_string(),
+        context_window: None,
+    };
+
+    let settler = BillingSettler::new(
+        billing.clone(),
+        inv_id.to_string(),
+        "claude-3-5-sonnet".to_string(),
+        "provider-1".to_string(),
+        "claude-3-5-sonnet".to_string(),
+    );
+
+    let idemp_mgr = IdempotencyManager::default();
+    let idemp_guard = idemp_mgr.try_acquire(inv_id).unwrap();
+
+    let stream = create_stream_guard(
+        ReceiverStream::new(rx),
+        config,
+        None,
+        Some(idemp_guard),
+        Some(settler),
+    );
+    let frames = collect_and_decode_frames(stream).await;
+
+    // Normal termination: metadata event emitted, no exceptions
+    assert!(frames.iter().any(|(name, _)| name == "metadataEvent"));
+    assert!(!frames
+        .iter()
+        .any(|(name, _)| name == "InternalServerException"));
+
+    // Settled
+    let card = billing.get_card(&card_id).unwrap();
+    assert_eq!(card.credit_reserved, 0);
+    assert!(card.available_credits() < initial_balance);
+    assert_eq!(
+        billing.list_ledger_entries_for_card(&card_id, None).len(),
+        1
+    );
+
+    // Idempotency committed!
+    let completed = idemp_mgr.get_completed(inv_id).expect("Must be committed");
+    assert_eq!(completed.model_id, "claude-3-5-sonnet");
+    assert_eq!(completed.total_output_tokens, 20);
+
+    // Retry with same invocation ID returns AlreadyCompleted
+    assert!(matches!(
+        idemp_mgr.try_acquire(inv_id),
+        Err(gateway::idempotency::IdempotencyError::AlreadyCompleted(_))
+    ));
+}
+
+// --------------------------------------------------------------------------
+// 5. Duplicate Done events cause no duplicate settlement
+// --------------------------------------------------------------------------
+#[tokio::test]
+async fn test_t06_duplicate_done_events_are_idempotent() {
+    let (billing, card_id) = create_test_billing();
+
+    let inv_id = "inv-dup-done";
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let params = ReservationEstimateParams {
+        estimated_input_tokens: 500,
+        max_output_tokens: 500,
+        input_rate_per_m: 15_000_000,
+        output_rate_per_m: 60_000_000,
+        credit_multiplier: 1.0,
+        margin_multiplier: 1.0,
+        model: Some("claude-3-5-sonnet".to_string()),
+    };
+    let _res = billing
+        .reserve(&card_id, inv_id, &params, now_secs, 300)
+        .unwrap();
+
+    let (tx, rx) = mpsc::channel(16);
+    tokio::spawn(async move {
+        let _ = tx
+            .send(Ok(ProviderStreamEvent::Delta(ProviderDelta::Text(
+                "Hello".to_string(),
+            ))))
+            .await;
+        let _ = tx
+            .send(Ok(ProviderStreamEvent::Usage(TokenUsage {
+                uncached_prompt_tokens: 50,
+                prompt_tokens: 50,
+                completion_tokens: 10,
+                total_tokens: 60,
+                output_tokens_final: true,
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
+            })))
+            .await;
+        let _ = tx.send(Ok(ProviderStreamEvent::Done)).await;
+        // Duplicate trailing Done
+        let _ = tx.send(Ok(ProviderStreamEvent::Done)).await;
+    });
+
+    let config = StreamGuardConfig {
+        keepalive_interval: Duration::from_secs(60),
+        model_id: "claude-3-5-sonnet".to_string(),
+        context_window: None,
+    };
+
+    let settler = BillingSettler::new(
+        billing.clone(),
+        inv_id.to_string(),
+        "claude-3-5-sonnet".to_string(),
+        "provider-1".to_string(),
+        "claude-3-5-sonnet".to_string(),
+    );
+
+    let stream = create_stream_guard(ReceiverStream::new(rx), config, None, None, Some(settler));
+    let _frames = collect_and_decode_frames(stream).await;
+
+    // Exactly 1 ledger entry, no double charge
+    let ledger = billing.list_ledger_entries_for_card(&card_id, None);
+    assert_eq!(ledger.len(), 1);
+    assert_eq!(billing.get_card(&card_id).unwrap().credit_reserved, 0);
+}
+
+// --------------------------------------------------------------------------
+// 6. Client disconnect midway cancels upstream and settles partial compute
+// --------------------------------------------------------------------------
+#[tokio::test]
+async fn test_t06_client_disconnect_settles_and_aborts() {
+    let (billing, card_id) = create_test_billing();
+    let initial_balance = billing.get_card(&card_id).unwrap().available_credits();
+
+    let inv_id = "inv-client-disconnect";
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let params = ReservationEstimateParams {
+        estimated_input_tokens: 1000,
+        max_output_tokens: 2000,
+        input_rate_per_m: 15_000_000,
+        output_rate_per_m: 60_000_000,
+        credit_multiplier: 1.0,
+        margin_multiplier: 1.0,
+        model: Some("claude-3-5-sonnet".to_string()),
+    };
+    let _res = billing
+        .reserve(&card_id, inv_id, &params, now_secs, 300)
+        .unwrap();
+
+    let (tx, rx) = mpsc::channel(16);
+    tokio::spawn(async move {
+        loop {
+            if tx
+                .send(Ok(ProviderStreamEvent::Delta(ProviderDelta::Text(
+                    "continuous chunk ".to_string(),
+                ))))
+                .await
+                .is_err()
+            {
+                break; // Client dropped stream
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+
+    let config = StreamGuardConfig {
+        keepalive_interval: Duration::from_secs(60),
+        model_id: "claude-3-5-sonnet".to_string(),
+        context_window: None,
+    };
+
+    let settler = BillingSettler::new(
+        billing.clone(),
+        inv_id.to_string(),
+        "claude-3-5-sonnet".to_string(),
+        "provider-1".to_string(),
+        "claude-3-5-sonnet".to_string(),
+    )
+    .with_estimated_input(1000);
+
+    let idemp_mgr = IdempotencyManager::default();
+    let idemp_guard = idemp_mgr.try_acquire(inv_id).unwrap();
+
+    let stream = create_stream_guard(
+        ReceiverStream::new(rx),
+        config,
+        None,
+        Some(idemp_guard),
+        Some(settler),
+    );
+
+    // Read 2 chunks then drop receiver
+    let mut boxed = Box::pin(stream);
+    let _c1 = boxed.next().await;
+    let _c2 = boxed.next().await;
+    drop(boxed);
+
+    // Wait for worker task to detect disconnect
+    tokio::time::sleep(Duration::from_millis(60)).await;
+
+    // Partial settlement executed
+    let card = billing.get_card(&card_id).unwrap();
+    assert_eq!(card.credit_reserved, 0);
+    assert!(card.available_credits() < initial_balance);
+    assert_eq!(
+        billing.list_ledger_entries_for_card(&card_id, None).len(),
+        1
+    );
+
+    // Guard marked failed (cannot be replayed or charged again)
+    assert!(matches!(
+        idemp_mgr.try_acquire(inv_id),
+        Err(gateway::idempotency::IdempotencyError::AlreadyFailed(_))
+    ));
+}
+
+// --------------------------------------------------------------------------
+// 7. Cold restart recovery discards held reservations without freezing credit
+// --------------------------------------------------------------------------
+#[tokio::test]
+async fn test_t06_cold_restart_recovers_unsettled_reservations() {
+    let (billing, card_id) = create_test_billing();
+    let initial_balance = billing.get_card(&card_id).unwrap().available_credits();
+
+    // Create a reservation that never got settled (server crashed midway)
+    let inv_id = "inv-unsettled-crash";
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let params = ReservationEstimateParams {
+        estimated_input_tokens: 1000,
+        max_output_tokens: 2000,
+        input_rate_per_m: 15_000_000,
+        output_rate_per_m: 60_000_000,
+        credit_multiplier: 1.0,
+        margin_multiplier: 1.0,
+        model: Some("claude-3-5-sonnet".to_string()),
+    };
+    let _res = billing
+        .reserve(&card_id, inv_id, &params, now_secs, 300)
+        .unwrap();
+
+    // During in-flight, credit_reserved > 0 and available < initial
+    assert!(billing.get_card(&card_id).unwrap().credit_reserved > 0);
+    assert!(billing.get_card(&card_id).unwrap().available_credits() < initial_balance);
+
+    // Simulate node reboot: export snapshot and reload it into a fresh BillingEngine
+    let snap = billing.export_snapshot();
+    let recovered_billing = BillingEngine::new();
+    recovered_billing.import_snapshot(snap);
+
+    // Assert: Held reservation is discarded, credit_reserved is reset to 0, available balance restored!
+    let recovered_card = recovered_billing.get_card(&card_id).unwrap();
+    assert_eq!(recovered_card.credit_reserved, 0);
+    assert_eq!(recovered_card.available_credits(), initial_balance);
+}
+
+// --------------------------------------------------------------------------
+// 8. Malformed / illegal SSE error mid-stream settles partial text & fails idempotency
+// --------------------------------------------------------------------------
+#[tokio::test]
+async fn test_t06_malformed_sse_error_settles_and_fails_idempotency() {
+    let (billing, card_id) = create_test_billing();
+    let initial_balance = billing.get_card(&card_id).unwrap().available_credits();
+
+    let inv_id = "inv-malformed-sse";
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let params = ReservationEstimateParams {
+        estimated_input_tokens: 500,
+        max_output_tokens: 1000,
+        input_rate_per_m: 15_000_000,
+        output_rate_per_m: 60_000_000,
+        credit_multiplier: 1.0,
+        margin_multiplier: 1.0,
+        model: Some("claude-3-5-sonnet".to_string()),
+    };
+    let _res = billing
+        .reserve(&card_id, inv_id, &params, now_secs, 300)
+        .unwrap();
+
+    let (tx, rx) = mpsc::channel(16);
+    tokio::spawn(async move {
+        let _ = tx
+            .send(Ok(ProviderStreamEvent::Delta(ProviderDelta::Text(
+                "Good prefix before corrupted chunk: ".to_string(),
+            ))))
+            .await;
+        // Upstream sends malformed protocol parse error
+        let _ = tx
+            .send(Err(ProviderError::Parse(
+                "invalid json in SSE chunk".to_string(),
+            )))
+            .await;
+    });
+
+    let config = StreamGuardConfig {
+        keepalive_interval: Duration::from_secs(60),
+        model_id: "claude-3-5-sonnet".to_string(),
+        context_window: None,
+    };
+
+    let settler = BillingSettler::new(
+        billing.clone(),
+        inv_id.to_string(),
+        "claude-3-5-sonnet".to_string(),
+        "provider-1".to_string(),
+        "claude-3-5-sonnet".to_string(),
+    )
+    .with_estimated_input(500);
+
+    let idemp_mgr = IdempotencyManager::default();
+    let idemp_guard = idemp_mgr.try_acquire(inv_id).unwrap();
+
+    let stream = create_stream_guard(
+        ReceiverStream::new(rx),
+        config,
+        None,
+        Some(idemp_guard),
+        Some(settler),
+    );
+    let frames = collect_and_decode_frames(stream).await;
+
+    // Both text and exception frame emitted
+    assert!(frames
+        .iter()
+        .any(|(name, _)| name == "assistantResponseEvent"));
+    assert!(frames
+        .iter()
+        .any(|(name, _)| name == "InternalServerException"));
+
+    // Settled partial usage (500 estimated input, proportional output tokens)
+    let card = billing.get_card(&card_id).unwrap();
+    assert_eq!(card.credit_reserved, 0);
+    assert!(card.available_credits() < initial_balance);
+    assert_eq!(
+        billing.list_ledger_entries_for_card(&card_id, None).len(),
+        1
+    );
+
+    // Idempotency marked failed
+    assert!(matches!(
+        idemp_mgr.try_acquire(inv_id),
+        Err(gateway::idempotency::IdempotencyError::AlreadyFailed(_))
+    ));
+}
+
+// --------------------------------------------------------------------------
+// 9. Concurrent invocation conflict (409) and settlement I/O persistence fault
+// --------------------------------------------------------------------------
+#[tokio::test]
+async fn test_t06_concurrent_retry_conflict_and_settlement_io_fault() {
+    let (billing, card_id) = create_test_billing();
+    let inv_id = "inv-concurrent-conflict";
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let params = ReservationEstimateParams {
+        estimated_input_tokens: 500,
+        max_output_tokens: 1000,
+        input_rate_per_m: 15_000_000,
+        output_rate_per_m: 60_000_000,
+        credit_multiplier: 1.0,
+        margin_multiplier: 1.0,
+        model: Some("claude-3-5-sonnet".to_string()),
+    };
+
+    // First reservation succeeds
+    let _res1 = billing
+        .reserve(&card_id, inv_id, &params, now_secs, 300)
+        .unwrap();
+
+    // Concurrent second reservation with the SAME invocation ID must be rejected as duplicate
+    let res2 = billing.reserve(&card_id, inv_id, &params, now_secs, 300);
+    assert!(matches!(
+        res2,
+        Err(billing::BillingError::DuplicateInvocation(_))
+    ));
+
+    // Idempotency manager also rejects concurrent acquire
+    let idemp_mgr = IdempotencyManager::default();
+    let guard1 = idemp_mgr.try_acquire(inv_id).unwrap();
+    let acquire2 = idemp_mgr.try_acquire(inv_id);
+    assert!(matches!(
+        acquire2,
+        Err(gateway::idempotency::IdempotencyError::InProgress(_))
+    ));
+
+    // Test persistence fault during settlement
+    billing.inject_persistence_fault(true);
+    let mut settler = BillingSettler::new(
+        billing.clone(),
+        inv_id.to_string(),
+        "claude-3-5-sonnet".to_string(),
+        "provider-1".to_string(),
+        "claude-3-5-sonnet".to_string(),
+    );
+
+    let usage = billing::UsageTokens {
+        uncached_input_tokens: 100,
+        output_tokens: 50,
+        cache_read_tokens: 0,
+        cache_creation_tokens: 0,
+    };
+
+    // Settle with injected fault returns persistence error
+    let err = settler.settle(&usage).unwrap_err();
+    assert!(err.to_string().contains("persistence"));
+
+    // Reset fault and guard
+    billing.inject_persistence_fault(false);
+    guard1.fail();
+}
+
+// A normal protocol terminator is not proof that the upstream generated a response.
+#[tokio::test]
+async fn empty_completed_stream_releases_credits_and_allows_retry() {
+    for input_usage in [false, true] {
+        let (billing, card_id) = create_test_billing();
+        let initial_balance = billing.get_card(&card_id).unwrap().available_credits();
+        let inv_id = "empty-completed";
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let params = ReservationEstimateParams {
+            estimated_input_tokens: 1000,
+            max_output_tokens: 2000,
+            input_rate_per_m: 15_000_000,
+            output_rate_per_m: 60_000_000,
+            credit_multiplier: 1.0,
+            margin_multiplier: 1.0,
+            model: Some("claude-3-5-sonnet".to_string()),
+        };
+        billing
+            .reserve(&card_id, inv_id, &params, now, 300)
+            .unwrap();
+        let mut events = vec![Ok(ProviderStreamEvent::Delta(ProviderDelta::Text(
+            String::new(),
+        )))];
+        events.push(Ok(ProviderStreamEvent::Delta(
+            ProviderDelta::ToolCallChunk {
+                index: 0,
+                id: None,
+                name: None,
+                arguments: String::new(),
+            },
+        )));
+        if input_usage {
+            events.push(Ok(ProviderStreamEvent::Usage(TokenUsage {
+                prompt_tokens: 1000,
+                uncached_prompt_tokens: 1000,
+                total_tokens: 1000,
+                ..Default::default()
+            })));
+        }
+        events.push(Ok(ProviderStreamEvent::StopReason("stop".into())));
+        events.push(Ok(ProviderStreamEvent::Done));
+        let manager = IdempotencyManager::default();
+        let settler = BillingSettler::new(
+            billing.clone(),
+            inv_id.into(),
+            "claude-3-5-sonnet".into(),
+            "provider-1".into(),
+            "claude-3-5-sonnet".into(),
+        )
+        .with_estimated_input(1000);
+        let frames = collect_and_decode_frames(create_stream_guard(
+            futures_util::stream::iter(events),
+            StreamGuardConfig::default(),
+            None,
+            Some(manager.try_acquire(inv_id).unwrap()),
+            Some(settler),
+        ))
+        .await;
+        assert!(frames
+            .iter()
+            .any(|(name, _)| name == "InternalServerException"));
+        assert!(!frames.iter().any(|(name, payload)| name == "metadataEvent"
+            && serde_json::from_slice::<serde_json::Value>(payload).unwrap()["stopReason"]
+                .is_string()));
+        let card = billing.get_card(&card_id).unwrap();
+        assert_eq!(card.credit_reserved, 0);
+        assert_eq!(card.available_credits(), initial_balance);
+        assert!(billing
+            .list_ledger_entries_for_card(&card_id, None)
+            .is_empty());
+        assert!(manager.get_completed(inv_id).is_none());
+        assert!(manager.try_acquire(inv_id).is_ok());
+    }
+}
