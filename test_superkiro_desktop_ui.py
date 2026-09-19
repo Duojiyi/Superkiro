@@ -129,8 +129,20 @@ class SuperkiroDesktopUI(unittest.TestCase):
         self.page.evaluate('status()')
         expect(self.page.locator('#overview-title')).to_have_text('Kiro 已就绪')
         self.shot('02-connected')
-        self.assertAlmostEqual(self.page.locator('#takeover').bounding_box()['y'], 387, delta=2)
-        self.assertAlmostEqual(self.page.locator('#status .balance').bounding_box()['y'], 459, delta=2)
+        # System fonts differ between Windows and Linux. Test the layout contract,
+        # not an absolute coordinate accumulated from platform-specific line boxes.
+        for font in [None, 'sans-serif', 'serif']:
+            with self.subTest(font=font):
+                self.page.evaluate("font => document.documentElement.style.fontFamily = font || ''", font)
+                wave = self.page.locator('#status .overview-wave').bounding_box()
+                actions = self.page.locator('#status .actions').bounding_box()
+                expect(self.page.locator('#activation-note')).to_be_hidden()
+                balance = self.page.locator('#status .balance').bounding_box()
+                self.assertAlmostEqual(wave['height'], 121, delta=0.1)
+                self.assertAlmostEqual(actions['y'], wave['y'] + wave['height'], delta=0.1)
+                self.assertGreaterEqual(actions['height'], 50)
+                self.assertAlmostEqual(balance['y'] - actions['y'] - actions['height'], 21, delta=0.1)
+        self.page.evaluate("document.documentElement.style.fontFamily = ''")
         heights = self.page.locator('.overview-wave i').evaluate_all('(bars)=>bars.map(b=>b.getBoundingClientRect().height)')
         self.assertGreater(heights[29], heights[11])
         self.assertGreater(heights[11], heights[47])

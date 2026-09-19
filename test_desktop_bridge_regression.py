@@ -34,7 +34,7 @@ class BridgeTests(unittest.TestCase):
     def test_verify_is_read_only_and_authenticated(self):
         payload = {"card_key": "test-secret", "gateway_url": "https://gateway.invalid"}
         with patch.object(bridge, "verify_card", return_value={"status": "active"}) as verify, patch.object(bridge, "run_patch_cli") as cli:
-            self.assertEqual(self.request("/api/verify-card", "POST", payload, authenticated=False)[0], 403)
+            self.assertEqual(self.request("/api/verify-card", "POST", headers={"Content-Length": "1024"}, authenticated=False)[0], 403)
             verify.assert_not_called()
             code, body, _ = self.request("/api/verify-card", "POST", payload)
             self.assertEqual(code, 200)
@@ -69,7 +69,15 @@ class BridgeTests(unittest.TestCase):
         with patch.dict(bridge.os.environ, {}, clear=True), patch.object(bridge, "run_patch_cli", return_value=(0, '{"success":true}')) as cli:
             code, body, _ = self.request("/api/status")
             self.assertEqual(code, 200)
-            self.assertEqual(json.loads(body)["suggested_gateway_url"], bridge.DEFAULT_GATEWAY_URL)
+            self.assertEqual(bridge.DEFAULT_GATEWAY_URL, "https://kiro.rent")
+            self.assertEqual(json.loads(body)["suggested_gateway_url"], "https://kiro.rent")
+            self.assertEqual(json.loads(body)["portal_url"], "https://kiro.rent/")
+            with patch.object(bridge, "verify_card", return_value={"status": "active"}) as verify:
+                for value in ({"card_key": "test-card"}, {"card_key": "test-card", "gateway_url": ""}):
+                    code, body, _ = self.request("/api/verify-card", "POST", value)
+                    self.assertEqual(code, 200)
+                    self.assertEqual(json.loads(body)["gateway_url"], "https://kiro.rent")
+                    verify.assert_called_with("https://kiro.rent", "test-card")
             for value in ({"card_key": "test-card"}, {"card_key": "test-card", "gateway_url": ""}):
                 code, _, _ = self.request("/api/activate", "POST", value)
                 self.assertEqual(code, 200)
@@ -84,6 +92,8 @@ class BridgeTests(unittest.TestCase):
         if authenticated:
             defaults["X-Kiro-Session-Token"] = bridge.SESSION_TOKEN
         defaults.update(headers or {})
+        # Header-only rejection cases must respond before reading the declared body.
+        # Sending a body after early rejection races socket closure on Windows.
         body = json.dumps(payload) if payload is not None else None
         conn.request(method, path, body=body, headers=defaults)
         response = conn.getresponse()
@@ -104,11 +114,26 @@ class BridgeTests(unittest.TestCase):
             cli.assert_not_called()
 
     def test_deployment_gateway_is_suggested_not_claimed_applied(self):
-        with patch.dict(bridge.os.environ, {"KIRO_GATEWAY_URL": "https://160.202.47.98"}), patch.object(bridge, "run_patch_cli", return_value=(0, '{"gateway_url":null}')):
+        with patch.dict(bridge.os.environ, {"KIRO_GATEWAY_URL": "https://dev-gateway.invalid"}), patch.object(bridge, "run_patch_cli", return_value=(0, '{"gateway_url":null}')):
             status, body, _ = self.request("/api/status")
             self.assertEqual(status, 200)
-            self.assertEqual(json.loads(body)["suggested_gateway_url"], "https://160.202.47.98")
+            self.assertEqual(json.loads(body)["suggested_gateway_url"], "https://dev-gateway.invalid")
             self.assertIsNone(json.loads(body)["gateway_url"])
+
+    def test_development_gateway_is_consistent_across_callers(self):
+        gateway = "https://dev-gateway.invalid"
+        with patch.dict(bridge.os.environ, {"KIRO_GATEWAY_URL": gateway}, clear=True), \
+             patch.object(bridge, "run_patch_cli", return_value=(0, '{"success":true}')) as cli, \
+             patch.object(bridge, "verify_card", return_value={"status": "active"}) as verify:
+            code, body, _ = self.request("/api/status")
+            self.assertEqual(code, 200)
+            self.assertEqual(json.loads(body)["portal_url"], gateway + "/")
+            self.assertEqual(self.request("/api/verify-card", "POST", {"card_key": "fixture"})[0], 200)
+            verify.assert_called_once_with(gateway, "fixture")
+            self.assertEqual(self.request("/api/activate", "POST", {"card_key": "fixture"})[0], 200)
+            self.assertEqual(cli.call_args.args[0], ["desktop-activate", "--gateway-url", gateway])
+            self.assertEqual(self.request("/api/doctor")[0], 200)
+            self.assertEqual(cli.call_args.args[0], ["doctor", "--gateway-url", gateway])
 
     def test_static_paths_and_headers(self):
         status, body, headers = self.request("/")
@@ -140,7 +165,7 @@ class BridgeTests(unittest.TestCase):
             for payload in [[], "text", {"card_key": 7}, {"card_key": "x" * 257}]:
                 self.assertEqual(self.request("/api/unbind", "POST", payload)[0], 400)
             self.assertEqual(self.request("/api/unbind", "POST", {"card_key": ""})[0], 400)
-            self.assertEqual(self.request("/api/restore", "POST", {"x": "x" * 17000})[0], 400)
+            self.assertEqual(self.request("/api/restore", "POST", headers={"Content-Length": "17000"})[0], 400)
             cli.assert_not_called()
 
     def test_restore_and_unbind_routes(self):
@@ -152,7 +177,7 @@ class BridgeTests(unittest.TestCase):
 
     def test_launch_requires_local_session_and_propagates_failure(self):
         with patch.object(bridge, "run_patch_cli", return_value=(0, '{"success":true}')) as cli:
-            self.assertEqual(self.request("/api/launch", "POST", {}, authenticated=False)[0], 403)
+            self.assertEqual(self.request("/api/launch", "POST", headers={"Content-Length": "1024"}, authenticated=False)[0], 403)
             cli.assert_not_called()
             self.assertEqual(self.request("/api/launch", "POST", {})[0], 200)
             cli.assert_called_once_with(["desktop-launch"])

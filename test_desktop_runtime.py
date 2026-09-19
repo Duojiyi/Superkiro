@@ -1,4 +1,6 @@
 import json
+import runpy
+from pathlib import Path
 import os
 import tempfile
 import unittest
@@ -7,6 +9,57 @@ import run_desktop as bridge
 
 
 class DesktopRuntimeTests(unittest.TestCase):
+    def test_import_never_auto_trusts_bundled_ca(self):
+        # Even an old CA left next to the executable must not change trust.
+        with patch.dict(os.environ, {}, clear=True), patch.object(bridge.os.path, "isfile", return_value=True):
+            runpy.run_path(bridge.__file__, run_name="desktop_import_test")
+            self.assertNotIn("KIRO_GATEWAY_CA_CERT", os.environ)
+            self.assertNotIn("NODE_EXTRA_CA_CERTS", bridge.desktop_environment())
+
+    def test_tls_uses_public_roots_and_explicit_development_override(self):
+        for ca in (None, "developer-ca.pem"):
+            env = {} if ca is None else {"KIRO_GATEWAY_CA_CERT": ca}
+            with self.subTest(ca=ca), patch.dict(os.environ, env, clear=True), \
+                 patch.object(bridge.ssl, "create_default_context") as context, \
+                 patch.object(bridge.urllib.request, "build_opener", side_effect=RuntimeError("stop before network")):
+                with self.assertRaisesRegex(RuntimeError, "stop before network"):
+                    bridge.verify_card("https://kiro.rent", "fixture")
+                context.assert_called_once_with()
+                if ca is None:
+                    context.return_value.load_verify_locations.assert_not_called()
+                    self.assertNotIn("KIRO_GATEWAY_CA_CERT", bridge.desktop_environment())
+                else:
+                    context.return_value.load_verify_locations.assert_called_once_with(cafile=ca)
+                    self.assertEqual(bridge.desktop_environment()["KIRO_GATEWAY_CA_CERT"], ca)
+
+    def test_homepage_and_override_match_browser_allowlist(self):
+        controls = bridge.DesktopWindow()
+        for env, homepage in (({}, "https://kiro.rent/"),
+                              ({"KIRO_GATEWAY_URL": "https://dev.invalid/"}, "https://dev.invalid/")):
+            with self.subTest(homepage=homepage), patch.dict(os.environ, env, clear=True), patch("webbrowser.open", return_value=True) as browser:
+                self.assertTrue(controls.open_external(homepage, bridge.SESSION_TOKEN))
+                browser.assert_called_once_with(homepage, new=2)
+                self.assertFalse(controls.open_external("https://160.202.47.98/portal", bridge.SESSION_TOKEN))
+
+    def test_packaging_contains_runtime_assets_without_private_ca(self):
+        build = Path(bridge.__file__).parent / "scripts" / "build_desktop.py"
+        with patch("subprocess.run") as run, patch("os.chdir"):
+            runpy.run_path(str(build), run_name="build_test")
+        command = run.call_args.args[0]
+        data = [command[i + 1] for i, arg in enumerate(command) if arg == "--add-data"]
+        self.assertEqual(len(data), 3)
+        self.assertEqual({Path(item.split(os.pathsep)[0]).name for item in data},
+                         {"index.html", "desktop.css", "desktop.js"})
+        self.assertNotIn("server-ca.pem", " ".join(command))
+        self.assertIn("--add-binary", command)
+
+    def test_packaging_rejects_missing_runtime_resource(self):
+        build = Path(bridge.__file__).parent / "scripts" / "build_desktop.py"
+        with patch("subprocess.run") as run, patch("os.chdir"), patch.object(Path, "is_file", return_value=False):
+            with self.assertRaisesRegex(FileNotFoundError, "Missing desktop resource"):
+                runpy.run_path(str(build), run_name="build_test")
+            self.assertFalse(any("PyInstaller" in call.args[0] for call in run.call_args_list))
+
     def test_window_controls_require_current_session(self):
         controls = bridge.DesktopWindow()
         controls._window = Mock()

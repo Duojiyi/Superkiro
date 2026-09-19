@@ -17,10 +17,8 @@ import threading
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 BASE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_GATEWAY_URL = "https://160.202.47.98"
-DEPLOY_CA = os.path.join(BASE_DIR, "deploy", "server-ca.pem")
-if os.path.isfile(DEPLOY_CA):
-    os.environ.setdefault("KIRO_GATEWAY_CA_CERT", DEPLOY_CA)
+DEFAULT_GATEWAY_URL = "https://kiro.rent"
+# Public TLS by default; KIRO_GATEWAY_CA_CERT is an explicit development override.
 
 UI_DIR = os.path.join(BASE_DIR, 'apps', 'desktop-ui')
 SESSION_TOKEN = secrets.token_hex(16)
@@ -188,7 +186,7 @@ class SecureBridgeHandler(BaseHTTPRequestHandler):
                     try:
                         data["platform"] = sys.platform
                         data["suggested_gateway_url"] = validate_gateway(os.environ.get("KIRO_GATEWAY_URL") or DEFAULT_GATEWAY_URL)
-                        data["portal_url"] = data["suggested_gateway_url"] + "/portal"
+                        data["portal_url"] = data["suggested_gateway_url"] + "/"
                     except ValueError:
                         pass
                 self.send_json(200 if code == 0 else 500, data)
@@ -447,7 +445,7 @@ class DesktopWindow:
     def open_external(self, url, token):
         if not self._allowed(token):
             return False
-        portal = validate_gateway(os.environ.get("KIRO_GATEWAY_URL") or DEFAULT_GATEWAY_URL) + "/portal"
+        portal = validate_gateway(os.environ.get("KIRO_GATEWAY_URL") or DEFAULT_GATEWAY_URL) + "/"
         if url not in (portal, "https://kiro.dev/downloads/"):
             return False
         import webbrowser

@@ -32,8 +32,8 @@ jobs:
         with:
           python-version: '3.13'
 
-      - name: Desktop Bridge Regressions
-        run: python -m unittest -v test_desktop_bridge_regression test_desktop_runtime
+      - name: Desktop Bridge and Release Default Regressions
+        run: python -B -m unittest -v test_desktop_bridge_regression test_desktop_runtime
 
       - name: Deployment Script Syntax
         if: runner.os == 'Linux'
@@ -82,7 +82,8 @@ jobs:
           python-version: '3.13'
       - run: python -m pip install playwright==1.61.0
       - run: python -m playwright install chromium
-      - run: python -B -m unittest -v test_superkiro_desktop_ui
+      - name: Desktop UI Layout and Interaction Regressions
+        run: python -B -m unittest -v test_superkiro_desktop_ui
         working-directory: .
 
   security:
