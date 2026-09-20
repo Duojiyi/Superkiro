@@ -74,7 +74,7 @@ const server=http.createServer(async(req,res)=>{
   await page.getByRole('button',{name:'下一页',exact:true}).click();
   assert.equal(await page.locator('tbody tr').count(),4);
   await page.getByRole('textbox',{name:'搜索调用记录',exact:true}).fill('不存在的请求');
-  await page.getByText('没有符合条件的请求，请调整筛选条件。',{exact:true}).waitFor();
+  await page.getByText('没有符合条件的请求，请调整或清除筛选。',{exact:true}).waitFor();
   assert(await page.getByRole('button',{name:'上一页',exact:true}).isDisabled());
   await page.getByRole('textbox',{name:'搜索调用记录',exact:true}).fill('成功');
   assert.equal(await page.locator('tbody tr').count(),18);
