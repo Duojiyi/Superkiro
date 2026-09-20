@@ -2872,6 +2872,28 @@ impl BillingEngine {
         reason: &str,
         now_secs: u64,
     ) -> Result<Card, BillingError> {
+        self.void_card_inner(card_id, operator_id, reason, now_secs, true)
+    }
+
+    /// Permanently revoke a card while retaining its balance and audit history.
+    pub fn void_card(
+        &self,
+        card_id: &str,
+        operator_id: &str,
+        reason: &str,
+        now_secs: u64,
+    ) -> Result<Card, BillingError> {
+        self.void_card_inner(card_id, operator_id, reason, now_secs, false)
+    }
+
+    fn void_card_inner(
+        &self,
+        card_id: &str,
+        operator_id: &str,
+        reason: &str,
+        now_secs: u64,
+        unactivated_only: bool,
+    ) -> Result<Card, BillingError> {
         let op = operator_id.trim();
         if op.is_empty() {
             return Err(BillingError::InvalidAdjustment(
@@ -2902,17 +2924,28 @@ impl BillingEngine {
         if card.status == CardStatus::Voided {
             return Ok(card.clone());
         }
-        if card.status != CardStatus::Unactivated
-            || card.activated_at.is_some()
-            || card.valid_until.is_some()
-            || card.credit_used != 0
-            || card.credit_reserved != 0
-            || !card.bound_devices.is_empty()
+        if unactivated_only
+            && (card.status != CardStatus::Unactivated
+                || card.activated_at.is_some()
+                || card.valid_until.is_some()
+                || card.credit_used != 0
+                || card.credit_reserved != 0
+                || !card.bound_devices.is_empty())
         {
             return Err(BillingError::CannotVoidActivatedCard {
                 card_id: card_id.to_string(),
                 current_status: card.status,
             });
+        }
+
+        if card.credit_reserved != 0
+            || candidate.reservations.values().any(|r| {
+                r.card_id == card_id && r.state == crate::reservation::ReservationState::Held
+            })
+        {
+            return Err(BillingError::InvalidState(
+                "Card has in-flight requests; freeze it and retry after settlement".into(),
+            ));
         }
 
         card.status = CardStatus::Voided;

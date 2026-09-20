@@ -327,7 +327,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
       } catch {setActionError('调账恢复记录无法读取，请先核对账本；本次未发送删除请求。'); return;}
     }
     const label = {freeze: '冻结', unfreeze: '解冻', ban: '封禁', void: '删除（永久作废）', archive: '归档', unarchive: '取消归档', export: '导出明文卡密'}[action];
-    if (!window.confirm(`确认仅对已选 ${targets.length} 张卡密执行${label}？${action === 'export' ? '下载文件包含秘密，请妥善保管。' : action === 'void' ? '仅未激活卡密可删除；删除后不可恢复或使用，余额将不可使用，财务与审计记录保留。其他状态会跳过，请核对选择。' : action === 'archive' || action === 'unarchive' ? '仅改变管理列表展示，不解封、不续期、不修改余额或历史账本。只有已封禁、已到期或已作废的卡密可归档。' : '状态操作可能中断使用，请核对选择。'}`)) return;
+    if (!window.confirm(`确认仅对已选 ${targets.length} 张卡密执行${label}？${action === 'export' ? '下载文件包含秘密，请妥善保管。' : action === 'void' ? '包含已激活卡密；删除后不可恢复或使用，剩余额度失效但账面余额、财务与审计记录保留，不自动退款。有在途请求的卡将拒绝删除，请先冻结并等待结算后重试。' : action === 'archive' || action === 'unarchive' ? '仅改变管理列表展示，不解封、不续期、不修改余额或历史账本。只有已封禁、已到期或已作废的卡密可归档。' : '状态操作可能中断使用，请核对选择。'}`)) return;
     writing.current = true; setCardBulkBusy(true); setCardBulkResults([]); setActionError('');
     const results: Array<{id: string; result: string}> = [];
     const codes: string[] = [];
@@ -346,7 +346,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
             if ((action === 'archive' && (card.archivedAt != null || !(['banned', 'expired', 'voided'].includes(card.status) || (card.validUntil != null && card.validUntil <= Date.now() / 1000)))) || (action === 'unarchive' && card.archivedAt == null)) {
               failedIds.push(card.id); results.push({id: card.id, result: '未执行：不符合归档条件或已是目标状态'}); continue;
             }
-            if ((action === 'freeze' && card.status !== 'active') || (action === 'unfreeze' && card.status !== 'frozen') || (action === 'ban' && ['banned', 'voided'].includes(card.status)) || (action === 'void' && card.status !== 'unactivated')) {
+            if ((action === 'freeze' && card.status !== 'active') || (action === 'unfreeze' && card.status !== 'frozen') || (action === 'ban' && ['banned', 'voided'].includes(card.status)) || (action === 'void' && card.status === 'voided')) {
               failedIds.push(card.id); results.push({id: card.id, result: '未执行：当前状态不适用该操作'}); continue;
             }
             const response = await adminApi.updateCardStatus(card.id, action, `管理员批量操作：${label}`);
@@ -643,10 +643,10 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
               }}>核对未确认调账</button></section>}
               <section className="panel" aria-label="批量卡密管理">
                 <p>已选 {selectedCardIds.length} 张卡密 · 批量操作仅针对当前页所选卡密。</p>
-                <p className="muted">删除仅适用于未激活卡密，执行永久作废并保留财务记录。已使用卡密请先封禁；封禁或到期记录可归档清理，取消归档不会恢复授权。列表与总量统计保留已作废、归档卡的账面余额，不代表可消费积分。导出文件包含完整卡密，请妥善保管。筛选、翻页或刷新后需重新选择。</p><div className="actions">
+                <p className="muted">删除支持已激活卡密，永久撤销使用权限并保留财务记录，不自动退款。有在途请求时请先冻结，等待结算后重试。仅需清理列表可归档已封禁或到期记录，取消归档不会恢复授权。列表与总量统计保留已作废、归档卡的账面余额，不代表可消费积分。导出文件包含完整卡密，请妥善保管。筛选、翻页或刷新后需重新选择。</p><div className="actions">
                   <button disabled={cardBulkBusy || loading || !pageCards.length} onClick={() => setSelectedCardIds(pageCards.map(card => card.id))}>当前页全选</button>
                   <button disabled={cardBulkBusy || !selectedCardIds.length} onClick={() => setSelectedCardIds([])}>清空选择</button>
-                  {(['freeze', 'unfreeze', 'ban', 'void', 'archive', 'unarchive', 'export'] as const).map(action => <button className={(action === 'ban' || action === 'void') ? 'danger' : action === 'export' ? 'primary' : 'secondary'} key={action} disabled={cardBulkBusy || loading || mutationBusy || revealing || !selectedCardIds.length} onClick={() => void handleCardBulk(action)}>{{freeze: '批量冻结', unfreeze: '批量解冻', ban: '批量封禁', void: '批量删除（未激活）', archive: '批量归档', unarchive: '取消归档', export: '导出已选卡密'}[action]}</button>)}
+                  {(['freeze', 'unfreeze', 'ban', 'void', 'archive', 'unarchive', 'export'] as const).map(action => <button className={(action === 'ban' || action === 'void') ? 'danger' : action === 'export' ? 'primary' : 'secondary'} key={action} disabled={cardBulkBusy || loading || mutationBusy || revealing || !selectedCardIds.length} onClick={() => void handleCardBulk(action)}>{{freeze: '批量冻结', unfreeze: '批量解冻', ban: '批量封禁', void: '批量删除（永久作废）', archive: '批量归档', unarchive: '取消归档', export: '导出已选卡密'}[action]}</button>)}
                 </div>
                 {cardBulkBusy && <p role="status">正在逐项处理，请勿重复提交…</p>}
                 {!!cardBulkResults.length && <div aria-label="批量操作结果" role="status"><p>本次逐项结果（不含卡密明文）：</p>{cardBulkResults.map(item => <p key={item.id}>{item.id}：{item.result}</p>)}</div>}

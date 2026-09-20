@@ -112,6 +112,14 @@ window.__TAURI_INTERNALS__.invoke=async(command,args)=>{
                         return {clientHeight:r.clientHeight,scrollHeight:r.scrollHeight,clientWidth:r.clientWidth,scrollWidth:r.scrollWidth,scrollTop:r.scrollTop,clipped,bottomBlank:innerHeight-last};
                     }''')
                     name=f'{width}x{height}-{state}-{view}'
+                    if view == 'settings' and height > 600:
+                        buttons = page.locator('.settings-actions button')
+                        assert buttons.count() == 6
+                        for button in buttons.all():
+                            bounds = button.bounding_box()
+                            assert bounds and 30 <= bounds['height'] <= 36, (name, bounds)
+                        assert page.locator('.settings-actions > p').count() == 0
+
                     if geometry['scrollHeight']>geometry['clientHeight'] or geometry['scrollWidth']>geometry['clientWidth'] or geometry['clipped'] or geometry['scrollTop']:
                         failures.append(name + ': overflow or clipped content')
                     if view=='login' and height==540 and geometry['bottomBlank']>80: failures.append(name+': excessive bottom blank')

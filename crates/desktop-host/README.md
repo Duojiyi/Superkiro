@@ -78,8 +78,20 @@ operation/snapshot remains. Closing does not silently restore or terminate Kiro.
 elsewhere), threshold_mb (2500), cooldown_seconds (300), last_sample_mb, last_error,
 and last_trim. Sampling runs every 60 seconds; only above-threshold Windows
 samples with processes can trigger working-set trimming, no more than once in
-five minutes. Errors yield null metrics/results, never invented successful savings.
+five minutes. Manual attempts also restart the automatic cooldown; explicit manual
+attempts are not rate-limited. The first sample occurs immediately after startup.
+An attempt with zero successful trims and any failures returns an error.
 No process termination or cache deletion is performed by automatic maintenance.
+The loop runs only while Superkiro is running (including in the tray).
+
+Limitations: the current scope is name-based Kiro roots and their descendants,
+not a verified selected installation or user session. PID reuse between sampling
+and opening a process is not protected by process-creation identity checks.
+Working-set reduction is not heap release and may cause page faults on reuse;
+the before/after delta is observational, not proven savings caused by trimming.
+There is no system-pressure or idle detection, so the fixed threshold is not a
+claim of optimal performance. These require further hardening and native workload
+benchmarks before stronger safety/performance claims.
 
 Recovery gating uses snapshot OR the desktop session rollback file, independent
 of authenticated/token readability. An unreadable session path fails closed.

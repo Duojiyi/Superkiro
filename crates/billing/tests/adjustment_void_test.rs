@@ -988,3 +988,49 @@ fn test_archive_eligibility_and_reservations() {
         }
     }
 }
+
+#[test]
+fn activated_card_void_preserves_accounts_and_revokes_access() {
+    let engine = BillingEngine::new();
+    let mut card = Card::new("used-delete", "group-default", 100_000_000);
+    card.status = CardStatus::Active;
+    card.activated_at = Some(NOW_SECS - 100);
+    card.credit_used = 14_600_000;
+    let version = card.token_version;
+    engine.upsert_card(card);
+    let result = engine
+        .void_card("used-delete", "admin", "user requested removal", NOW_SECS)
+        .unwrap();
+    assert_eq!(result.status, CardStatus::Voided);
+    assert_eq!(result.credit_total, 100_000_000);
+    assert_eq!(result.credit_used, 14_600_000);
+    assert_eq!(result.token_version, version + 1);
+    assert!(result.check_can_reserve(1, NOW_SECS).is_err());
+    assert!(engine.unfreeze_card("used-delete").is_err());
+    let entries = engine.ledger_entries();
+    assert_eq!(
+        entries.last().unwrap().operator_id.as_deref(),
+        Some("admin")
+    );
+    engine
+        .void_card("used-delete", "admin", "retry", NOW_SECS)
+        .unwrap();
+    assert_eq!(engine.ledger_entries().len(), entries.len());
+}
+
+#[test]
+fn activated_card_void_rejects_pending_settlement() {
+    let engine = BillingEngine::new();
+    let mut card = Card::new("pending-delete", "group-default", 100_000_000);
+    card.status = CardStatus::Active;
+    card.credit_reserved = 1;
+    engine.upsert_card(card);
+    assert!(engine
+        .void_card("pending-delete", "admin", "remove", NOW_SECS)
+        .is_err());
+    assert_eq!(
+        engine.get_card("pending-delete").unwrap().status,
+        CardStatus::Active
+    );
+    assert!(engine.ledger_entries().is_empty());
+}

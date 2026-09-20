@@ -611,9 +611,9 @@ async fn test_admin_void_auth_rejections_and_idempotent_audit() {
     }
     for (id, key, expected) in [
         ("card-admin-01", "invalid", StatusCode::UNAUTHORIZED),
-        ("card-admin-02", TEST_ADMIN_KEY, StatusCode::BAD_REQUEST),
-        ("frozen", TEST_ADMIN_KEY, StatusCode::BAD_REQUEST),
-        ("banned", TEST_ADMIN_KEY, StatusCode::BAD_REQUEST),
+        ("card-admin-02", TEST_ADMIN_KEY, StatusCode::OK),
+        ("frozen", TEST_ADMIN_KEY, StatusCode::OK),
+        ("banned", TEST_ADMIN_KEY, StatusCode::OK),
         ("card-admin-01", TEST_ADMIN_KEY, StatusCode::OK),
         ("card-admin-01", TEST_ADMIN_KEY, StatusCode::OK),
     ] {
@@ -657,7 +657,7 @@ async fn test_admin_void_auth_rejections_and_idempotent_audit() {
     assert_eq!(card.status, CardStatus::Voided);
     assert_eq!(card.credit_total, 10_000_000);
     let ledger = billing.ledger_entries();
-    assert_eq!(ledger.len(), 1);
+    assert_eq!(ledger.len(), 4);
     assert_eq!(ledger[0].operator_id.as_deref(), Some("admin"));
     assert_eq!(ledger[0].reason.as_deref(), Some("misprint"));
     assert_eq!(ledger[0].credits_charged, 0);

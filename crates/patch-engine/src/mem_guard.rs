@@ -212,7 +212,10 @@ impl MemoryGuard {
         let error = initial_snapshot
             .error
             .clone()
-            .or(after_snapshot.error.clone());
+            .or(after_snapshot.error.clone())
+            .or_else(|| {
+                (success == 0 && fail > 0).then(|| "No working sets could be trimmed".to_string())
+            });
         let released = if error.is_none() {
             initial_snapshot
                 .total_memory_mb
@@ -516,6 +519,20 @@ mod ownership_tests {
             ..Default::default()
         };
         let result = MemoryGuard::trim_result(before, after, 1, 0);
+        assert!(result.error.is_some());
+        assert_eq!(result.released_memory_mb, 0);
+    }
+    #[test]
+    fn failed_trim_never_claims_success_or_released_memory() {
+        let before = MemorySnapshot {
+            total_memory_mb: 1000,
+            ..Default::default()
+        };
+        let after = MemorySnapshot {
+            total_memory_mb: 200,
+            ..Default::default()
+        };
+        let result = MemoryGuard::trim_result(before, after, 0, 1);
         assert!(result.error.is_some());
         assert_eq!(result.released_memory_mb, 0);
     }

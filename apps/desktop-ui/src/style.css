@@ -196,8 +196,8 @@ select:focus-visible,.path-box:focus-visible{outline:2px solid #dfc291;outline-o
 .page-settings .memory-card>.memory-status{grid-column:1;font-size:11px;margin:2px 0}
 .page-settings .memory-card>button{grid-column:2;grid-row:3/5;align-self:center;min-height:32px;padding:5px 12px;font-size:12px}
 .page-settings .settings-actions{grid-template-columns:repeat(3,1fr);gap:6px;margin-top:8px}
-.page-settings .settings-actions .danger-action{grid-column:2/4}
-.page-settings .settings-actions button{min-height:32px;padding:5px 8px;font-size:12px}
+.page-settings .settings-actions .danger-action{grid-column:auto}
+.page-settings .settings-actions button{height:32px;align-self:start;min-height:32px;padding:5px 8px;font-size:12px}
 .page-settings .account-card{padding:8px 14px}
 .page-settings .account-card h2{margin:4px 0}
 .page-settings .account-card .row{min-height:26px}

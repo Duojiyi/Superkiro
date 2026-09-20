@@ -92,17 +92,17 @@ const server=http.createServer(async(req,res)=>{
     await check(4).check();page.once('dialog',d=>d.accept());await button('批量封禁').click();await page.waitForFunction(()=>!document.querySelector('input[type=checkbox]').disabled);
     assert.equal(statusCalls.at(-1).cardId,'bulk-4');assert.equal(statusCalls.length,before+1);
     await page.getByLabel('搜索卡密',{exact:true}).fill('');
-    // Delete means irreversible void, and must skip issued/used/voided cards.
+    // Delete means irreversible void, and allows activated cards but skips already voided cards.
     cards[0].status='unactivated';cards[1].status='active';cards[2].status='voided';
     await page.getByLabel('状态筛选',{exact:true}).selectOption('ALL');
     await button('刷新').click();await page.waitForFunction(()=>!document.querySelector('input[type=checkbox]').disabled);
-    assert(await button('批量删除（未激活）').isDisabled());
+    assert(await button('批量删除（永久作废）').isDisabled());
     await check(0).check();await check(1).check();await check(2).check();
     const beforeVoid=statusCalls.length;
-    page.once('dialog',d=>d.dismiss());await button('批量删除（未激活）').click();assert.equal(statusCalls.length,beforeVoid);
+    page.once('dialog',d=>d.dismiss());await button('批量删除（永久作废）').click();assert.equal(statusCalls.length,beforeVoid);
     page.once('dialog',d=>{assert(d.message().includes('3 张'));assert(d.message().includes('不可恢复'));assert(d.message().includes('财务与审计记录保留'));return d.accept();});
-    await button('批量删除（未激活）').click();await page.waitForFunction(()=>!document.querySelector('input[type=checkbox]').disabled);
-    assert.equal(statusCalls.length,beforeVoid+1);assert.equal(statusCalls.at(-1).action,'void');assert.equal(statusCalls.at(-1).cardId,'bulk-0');
+    await button('批量删除（永久作废）').click();await page.waitForFunction(()=>!document.querySelector('input[type=checkbox]').disabled);
+    assert.equal(statusCalls.length,beforeVoid+2);assert.equal(statusCalls.at(-1).action,'void');assert.equal(statusCalls.at(-1).cardId,'bulk-1');
     assert((await results.innerText()).includes('删除（永久作废）成功'));
     assert.equal(await page.getByRole('checkbox',{checked:true}).count(),2);
     await button('清空选择').click();
@@ -134,7 +134,7 @@ const server=http.createServer(async(req,res)=>{
     await button('重新登录确认调账账户').click();await page.getByLabel('密码',{exact:true}).fill('fixture-password');await button('登录').click();
     await page.getByRole('navigation').getByRole('button',{name:'卡密资产',exact:true}).click();await check(5).check();
     const beforePendingVoid=statusCalls.length;
-    await button('批量删除（未激活）').click();await page.getByRole('alert').filter({hasText:'本次未发送删除请求'}).waitFor();assert.equal(statusCalls.length,beforePendingVoid);
+    await button('批量删除（永久作废）').click();await page.getByRole('alert').filter({hasText:'本次未发送删除请求'}).waitFor();assert.equal(statusCalls.length,beforePendingVoid);
     cards[5].status='voided';await button('刷新').click();await page.waitForFunction(()=>!document.querySelector('input[type=checkbox]').disabled);
     assert.equal(await check(5).count(),0);
     let replayed=null;await page.route('**/api/v1/admin/cards/adjust',route=>{replayed=route.request().postDataJSON();return route.fulfill({json:{success:true}});});

@@ -106,10 +106,6 @@ impl FacadeHandler for GetUsageLimitsHandler {
                 .saturating_div(86_400)
                 .saturating_add(30)
                 .saturating_mul(86_400);
-            let credit_label = std::env::var("CREDIT_LABEL")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| "算力积分".to_string());
             let claims = req.extensions().get::<AuthClaims>();
             let group = self.store.get_group(claims.map(|c| c.group_id.as_str()));
             let card_id = claims.map(|c| c.card_id.as_str()).unwrap_or("dev-user");
@@ -161,8 +157,9 @@ impl FacadeHandler for GetUsageLimitsHandler {
                     subscription_management_target: "MANAGE".to_string(),
                 },
                 usage_breakdown_list: vec![UsageBreakdown {
-                    display_name: credit_label.clone(),
-                    display_name_plural: credit_label,
+                    // Keep the native Kiro credit terminology independent of portal branding.
+                    display_name: "Credit".to_string(),
+                    display_name_plural: "Credits".to_string(),
                     current_usage,
                     current_usage_with_precision: current_usage,
                     usage_limit,
@@ -185,7 +182,12 @@ impl FacadeHandler for GetUsageLimitsHandler {
                 days_until_reset: 30,
                 next_date_reset: next_reset,
             };
-            json_response(StatusCode::OK, &resp)
+            let mut response = json_response(StatusCode::OK, &resp);
+            response.headers_mut().insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            );
+            response
         })
     }
 }

@@ -10,6 +10,7 @@ pub struct Host {
     operation_state: std::sync::Mutex<Value>,
     preferences: PathBuf,
     maintenance: std::sync::Mutex<Value>,
+    last_trim_attempt: std::sync::Mutex<Option<std::time::Instant>>,
     _instance: patch_engine::SingleInstanceLock,
 }
 impl Host {
@@ -21,6 +22,7 @@ impl Host {
             maintenance: std::sync::Mutex::new(
                 json!({"enabled":true,"mode":if cfg!(windows) {"automatic"} else {"monitor-only"},"threshold_mb":2500,"cooldown_seconds":300,"last_sample_mb":null,"last_error":null,"last_trim":null}),
             ),
+            last_trim_attempt: std::sync::Mutex::new(None),
             preferences: config.join("preferences.json"),
             _instance: patch_engine::SingleInstanceLock::acquire(Some(&config.join("host.lock")))?,
         })
@@ -207,7 +209,6 @@ pub fn start_maintenance(host: std::sync::Arc<Host>) {
     tauri::async_runtime::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut last_attempt: Option<std::time::Instant> = None;
         loop {
             interval.tick().await;
             let Ok(_operation) = host.operation.try_lock() else {
@@ -237,12 +238,20 @@ pub fn start_maintenance(host: std::sync::Arc<Host>) {
                     cfg!(windows),
                     sample.total_memory_mb,
                     sample.processes.len(),
-                    last_attempt.map(|t| t.elapsed().as_secs()),
+                    host.last_trim_attempt
+                        .lock()
+                        .map(|t| t.map(|t| t.elapsed().as_secs()))
+                        .unwrap_or(Some(0)),
                 )
             {
                 continue;
             }
-            last_attempt = Some(std::time::Instant::now());
+            {
+                let Ok(mut last_attempt) = host.last_trim_attempt.lock() else {
+                    continue;
+                };
+                *last_attempt = Some(std::time::Instant::now());
+            }
             let pids: Vec<_> = sample.processes.iter().map(|p| p.pid).collect();
             let result = tauri::async_runtime::spawn_blocking(move || {
                 MemoryGuard::trim_working_set(Some(&pids))
@@ -684,6 +693,10 @@ pub async fn dispatch(host: &Host, path: &str, method: &str, body: Value) -> Res
                 return Err("No Kiro processes to trim".into());
             }
             let pids: Vec<_> = sample.processes.iter().map(|p| p.pid).collect();
+            *host
+                .last_trim_attempt
+                .lock()
+                .map_err(|_| "Maintenance state unavailable")? = Some(std::time::Instant::now());
             let result = MemoryGuard::trim_working_set(Some(&pids));
             if let Some(error) = result.error.as_ref() {
                 return Err(error.clone());

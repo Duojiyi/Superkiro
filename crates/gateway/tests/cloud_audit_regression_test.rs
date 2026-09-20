@@ -384,11 +384,15 @@ async fn usage_reports_spendable_balance_after_reservations() {
     use gateway::facade::{usage::GetUsageLimitsHandler, virtualization::VirtualizationStore};
     let b = engine();
     let mut card = b.get_card("card").unwrap();
-    card.credit_used = 2_000_000;
+    card.credit_total = 2_000_000_000;
+    card.credit_used = 11_595_800;
     card.credit_reserved = 3_000_000;
     b.upsert_card(card);
     let handler = GetUsageLimitsHandler::new(VirtualizationStore::with_billing(b, "group"));
-    for (card_id, expected) in [("card", json!(5.0)), ("missing", serde_json::Value::Null)] {
+    for (card_id, expected) in [
+        ("card", json!(1985.4042)),
+        ("missing", serde_json::Value::Null),
+    ] {
         let mut req = Request::builder()
             .uri("/getUsageLimits")
             .body(Body::empty())
@@ -402,11 +406,19 @@ async fn usage_reports_spendable_balance_after_reservations() {
         });
         let response = handler.handle(req).await;
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "no-store");
         let bytes = axum::body::to_bytes(response.into_body(), 65536)
             .await
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["availableCredits"], expected);
+        let credit = &body["usageBreakdownList"][0];
+        assert_eq!(credit["displayName"], "Credit");
+        assert_eq!(credit["displayNamePlural"], "Credits");
+        if card_id == "card" {
+            assert_eq!(credit["currentUsageWithPrecision"], json!(11.5958));
+            assert_eq!(credit["usageLimitWithPrecision"], json!(2000.0));
+        }
     }
 }
 

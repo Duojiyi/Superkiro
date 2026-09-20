@@ -302,6 +302,7 @@ describe('review preflight and reserved balance',()=>{
   await waitFor(()=>expect(document.querySelector('.shell')?.getAttribute('aria-busy')).toBe('false'));
   expect(document.querySelector('.balance-value')?.textContent).toBe('100');
   expect(screen.getByText(/余额更新于/)).toBeTruthy();
+  expect(screen.getByTitle(/预留不计入已用积分/)).toBeTruthy();
   expect(invoke.mock.calls.some(([,p])=>p.path==='/api/usage')).toBe(false);
  });
  it('retains verified balance after failed activation and page navigation',async()=>{
@@ -696,13 +697,15 @@ describe('verification-only account operations',()=>{
   expect(safeError('[auth:remote-secret] remote-secret')).not.toContain('remote-secret');
  });
 
-it('offers manual upgrade guidance and opens the official download section',async()=>{
+it('keeps account actions compact and opens the official download section',async()=>{
  setup(true);const original=invoke.getMockImplementation()!;
  invoke.mockImplementation(async(c,p)=>{const result=await original(c,p);return p.path==='/api/status'?{...result,app_version:'0.1.0-preview.123456789abc'}:result;});
  HTMLDialogElement.prototype.showModal=function(){this.open=true;};
  render(<App/>);await login();fireEvent.click(screen.getByRole('button',{name:'设置'}));
  fireEvent.change(screen.getByLabelText('设置分组'),{target:{value:'account'}});
- expect(screen.getByText(/升级前请保存工作/).textContent).toContain('还原失败时请保留备份');
+ expect(screen.queryByText(/升级前请保存工作/)).toBeNull();
+ expect(document.querySelectorAll('.settings-actions > button')).toHaveLength(6);
+ expect(document.querySelector('.settings-actions > p')).toBeNull();
  fireEvent.click(screen.getByRole('button',{name:'版本信息'}));
  expect(screen.getByRole('dialog').textContent).toContain('0.1.0-preview.123456789abc');
  fireEvent.submit(document.querySelector('dialog form')!);

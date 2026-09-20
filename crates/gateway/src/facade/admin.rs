@@ -1221,10 +1221,9 @@ impl FacadeHandler for AdminCardStatusHandler {
                 "freeze" => self.billing.freeze_card(card_id, &reason),
                 "unfreeze" => self.billing.unfreeze_card(card_id),
                 "ban" => self.billing.ban_card(card_id, &reason),
-                "void" => {
-                    self.billing
-                        .void_unactivated_card(card_id, operator_id, &reason, now_secs())
-                }
+                "void" => self
+                    .billing
+                    .void_card(card_id, operator_id, &reason, now_secs()),
                 "archive" | "unarchive" => self.billing.set_card_archived(
                     card_id,
                     req_data.action == "archive",
