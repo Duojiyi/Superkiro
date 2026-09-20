@@ -55,7 +55,9 @@ const server=http.createServer(async(req,res)=>{
     await button('上一页').click();await check(0).check();
     await page.getByLabel('搜索卡密',{exact:true}).fill('bulk-1');assert.equal(await page.getByRole('checkbox',{checked:true}).count(),0);
     await page.getByLabel('搜索卡密',{exact:true}).fill('');await check(0).check();await check(1).check();
+    assert.equal(await page.getByRole('checkbox',{checked:true}).count(),2,'both selected cards remain checked after filtering');
     page.once('dialog',d=>d.dismiss());await button('批量冻结').click();assert.equal(statusCalls.length,0);
+    assert.equal(await page.getByRole('checkbox',{checked:true}).count(),2,'cancel preserves both selected cards');
     page.once('dialog',d=>{assert(d.message().includes('2 张'));return d.accept();});await button('批量冻结').click();
     await waitForRoute(()=>held);assert(await button('批量冻结').isDisabled());assert(await check(0).isDisabled());
     assert(await page.getByLabel('搜索卡密',{exact:true}).isDisabled());

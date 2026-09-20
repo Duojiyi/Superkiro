@@ -668,7 +668,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
                   {filteredCards.length > 0 ? (
                     pageCards.map((card) => (
                       <tr key={card.id}>
-                        <td><input type="checkbox" aria-label={`选择卡密 ${card.id}`} disabled={cardBulkBusy || loading} checked={selectedCardIds.includes(card.id)} onChange={e => setSelectedCardIds(ids => e.target.checked ? [...ids, card.id] : ids.filter(id => id !== card.id))} /></td>
+                        <td><input type="checkbox" aria-label={`选择卡密 ${card.id}`} disabled={cardBulkBusy || loading} checked={selectedCardIds.includes(card.id)} onChange={e => {const checked = e.currentTarget.checked; setSelectedCardIds(ids => checked ? [...ids, card.id] : ids.filter(id => id !== card.id));}} /></td>
                         <td className="p-3 font-mono text-[#475467]">{card.id}{card.note && <small className="card-note">{card.note}</small>}</td>
                         <td className="p-3" title={card.groupId}>{String(cardGroups.find(group => group.id === card.groupId)?.name ?? card.groupId)}</td>
                         <td className="p-3">
