@@ -106,6 +106,9 @@ for (const input of ['', '-1', 'NaN', 'Infinity', '1e3', '1.0000001', '900719925
  assert.throws(()=>saveAdjustment({...storage,getItem:()=>null},old));
  saveAdjustment(storage,old); // Exact legacy retries remain recoverable; UI offers explicit zero-micro clear.
  const message='Invalid balance adjustment: Adjustment delta cannot be zero';
+ const insufficient='Card error: Insufficient credit: available 1000000 micro-credits, needed 2000000';
+ assert(isUnsubmittedAdjustmentRejection(409,insufficient,{...old,delta:-2}));
+ for(const [status,text,delta] of [[503,insufficient,-2],[409,'Idempotency conflict',-2],[409,insufficient,2],[409,insufficient,-3]])assert.equal(isUnsubmittedAdjustmentRejection(status,text,{...old,delta}),false);
  assert(isUnsubmittedAdjustmentRejection(400,message,old));assert(isUnsubmittedAdjustmentRejection(400,message,{...old,delta:-0.0000001}));
  for(const [status,text,intent] of [[400,'another error',old],[409,message,old],[503,message,old],[400,message,{...old,delta:10}],[400,message,{...old,delta:0.0000005}]])assert.equal(isUnsubmittedAdjustmentRejection(status,text,intent),false);
  clearAdjustment(storage,old);assert.equal(values.size,0);

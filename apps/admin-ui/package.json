@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "test": "node tests/contracts.cjs && node tests/auth-session.cjs && node tests/session-deadline.cjs",
     "test:card-bulk": "node tests/card-bulk.cjs",
+    "test:iteration": "node tests/iteration.cjs",
     "test:browser": "node tests/auth-gate.cjs",
     "test:usability": "node tests/public-login.cjs && node tests/usability.cjs"
   },

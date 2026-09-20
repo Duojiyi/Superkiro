@@ -43,7 +43,7 @@ const server=http.createServer(async(req,res)=>{
    await shot(`${id}-desktop.png`);
   }
   await nav('卡密资产');
-  assert.equal(await page.getByRole('button',{name:'不可恢复',exact:true}).isDisabled(),true);
+  assert.equal(await page.getByRole('button',{name:'无可用明文',exact:true}).isDisabled(),true);
   await page.getByRole('textbox',{name:'搜索卡密',exact:true}).fill('fixture-card-0');
   assert.equal(await page.locator('tbody tr').count(),1);
   await page.getByRole('button',{name:'查看卡密',exact:true}).click();
@@ -70,12 +70,20 @@ const server=http.createServer(async(req,res)=>{
   }
   assert.equal(fixture.writes.filter(w=>w.endpoint==='cards/batch').length,4);
   await nav('调用追踪');
-  await page.getByRole('textbox',{name:'筛选请求',exact:true}).fill('fixture-trace-0');
+  assert.equal(await page.locator('tbody tr').count(),20);
+  await page.getByRole('button',{name:'下一页',exact:true}).click();
+  assert.equal(await page.locator('tbody tr').count(),4);
+  await page.getByRole('textbox',{name:'搜索调用记录',exact:true}).fill('不存在的请求');
+  await page.getByText('没有符合条件的请求，请调整筛选条件。',{exact:true}).waitFor();
+  assert(await page.getByRole('button',{name:'上一页',exact:true}).isDisabled());
+  await page.getByRole('textbox',{name:'搜索调用记录',exact:true}).fill('成功');
+  assert.equal(await page.locator('tbody tr').count(),18);
+  await page.getByRole('textbox',{name:'搜索调用记录',exact:true}).fill('fixture-trace-0');
   assert.equal(await page.locator('tbody tr').count(),1);
   await page.getByRole('button',{name:'详情 →',exact:true}).click();
   assert.ok((await page.locator('pre').textContent()).includes('fixture-key'));
   await shot('trace-detail-desktop.png');
-  await page.getByRole('textbox',{name:'筛选请求',exact:true}).fill('');
+  await page.getByRole('textbox',{name:'搜索调用记录',exact:true}).fill('');
   await nav('财务对账');const exportFile=page.waitForEvent('download');await page.getByRole('button',{name:'导出对账 CSV',exact:true}).click();await exportFile;
   await page.setViewportSize({width:390,height:844});
   for(const[id,name]of pages){await nav(name);assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,`${id} mobile overflow`);await shot(`${id}-mobile.png`);if(id==='providers'){const scrolled=await page.locator('table').first().evaluate(e=>{e.scrollLeft=e.scrollWidth;return e.scrollLeft>0;});assert.equal(scrolled,true,'mobile provider table actions scroll into view');await shot('providers-mobile-scrolled.png');}}

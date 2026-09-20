@@ -2,13 +2,15 @@ import {useEffect,useRef,useState} from 'react';
 import {adminApi,type AdminFinancials,type CommercialConfig} from './api';
 import {estimatedMoney,financialEstimates,parseFinancialSettings} from './financial';
 
-export default function FinancialPanel({data,onPublished}:{data:AdminFinancials|null;onPublished:()=>Promise<void>}){
+export default function FinancialPanel({data,onPublished,onDirtyChange,onBusyChange}:{data:AdminFinancials|null;onPublished:()=>Promise<void>;onDirtyChange:(dirty:boolean)=>void;onBusyChange:(busy:boolean)=>void}){
   const [config,setConfig]=useState<CommercialConfig|null>(null),[face,setFace]=useState(''),[rate,setRate]=useState(''),[reason,setReason]=useState(''),[message,setMessage]=useState(''),[busy,setBusy]=useState(false);
   const pending=useRef(false),alive=useRef(true);
+  useEffect(()=>{onBusyChange(busy);return()=>onBusyChange(false);},[busy,onBusyChange]);
+  useEffect(()=>{onDirtyChange(!!reason.trim() || (!!config?.settings && (face!==String(config.settings.credit_face_value_cny)||rate!==String(config.settings.usd_cny_rate))));},[config,face,rate,reason,onDirtyChange]);
   const apply=(next:CommercialConfig)=>{setConfig(next);setFace(next.settings?String(next.settings.credit_face_value_cny):'');setRate(next.settings?String(next.settings.usd_cny_rate):'');};
   async function load(){
     if(pending.current)return;pending.current=true;setBusy(true);setMessage('正在读取财务配置…');
-    try{const result=await adminApi.getCommercialConfig();if(!result.success)throw new Error('配置读取未确认');if(alive.current){apply(result.config);setMessage(result.config.settings?'':'服务端未提供财务配置，暂不可发布。');}}
+    try{const result=await adminApi.getCommercialConfig();if(!result.success)throw new Error('配置读取未确认');if(alive.current){apply(result.config);setReason('');setMessage(result.config.settings?'':'服务端未提供财务配置，暂不可发布。');}}
     catch(error){if(alive.current){setConfig(null);setMessage(error instanceof Error?error.message:'配置读取失败');}}finally{pending.current=false;if(alive.current)setBusy(false);}
   }
   useEffect(()=>{alive.current=true;void load();return()=>{alive.current=false;};},[]);

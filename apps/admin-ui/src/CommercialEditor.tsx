@@ -2,12 +2,13 @@ import { pointsToMicro } from './pricing';
 import { useEffect, useState } from 'react';
 import { adminApi, CommercialConfig } from './api';
 
-export default function CommercialEditor({ kind,onDirtyChange }: {kind: 'groups' | 'models';onDirtyChange:(dirty:boolean)=>void}) {
+export default function CommercialEditor({ kind,onDirtyChange,onBusyChange }: {kind: 'groups' | 'models';onDirtyChange:(dirty:boolean)=>void;onBusyChange:(busy:boolean)=>void}) {
   const [config, setConfig] = useState<CommercialConfig | null>(null);
   const [draft, setDraft] = useState(''),[loadedDraft,setLoadedDraft]=useState('');
   const [reason, setReason] = useState('');
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
+  useEffect(()=>{onBusyChange(busy);return()=>onBusyChange(false);},[busy,onBusyChange]);
   const [selected, setSelected] = useState(0);
   const [priceDraft, setPriceDraft] = useState<Record<string, unknown> | null>(null);
   const [priceInputs, setPriceInputs] = useState<Record<string, string>>({});
@@ -23,7 +24,7 @@ export default function CommercialEditor({ kind,onDirtyChange }: {kind: 'groups'
       const costs=Object.fromEntries(Object.keys(costFields).map(field=>{const raw=String(priceDraft[field]??'');const value=Number(raw);if(!raw.trim()||!Number.isFinite(value)||value<0)throw new Error('四类采购价格必须为非负有限数，明确免费时才填 0');return [field,value];}));
       const values = Object.fromEntries(Object.keys(priceFields).map(field => [field, pointsToMicro(priceInputs[field] ?? '')]));
       const versions = [...(Array.isArray(parsedDraft.versions) ? parsedDraft.versions : []).filter(v => v.id !== priceDraft.id), Object.fromEntries(Object.entries({...priceDraft, ...values, ...costs}).filter(([key]) => key !== 'source_id'))];
-      setDraft(JSON.stringify({...parsedDraft, versions}, null, 2)); setMessage('价格版本已加入本页草稿，尚未发布。请填写原因并确认发布。');
+      setDraft(JSON.stringify({...parsedDraft, versions}, null, 2)); setPriceDraft(null); setPriceInputs({}); setMessage('价格版本已加入本页草稿，尚未发布。请填写原因并确认发布。');
     } catch (error) { setMessage(String(error)); }
   };
   let parsedDraft: Record<string, Array<Record<string, unknown>>> = {};
@@ -40,23 +41,26 @@ export default function CommercialEditor({ kind,onDirtyChange }: {kind: 'groups'
     setBusy(true);
     try {
       const result = await adminApi.getCommercialConfig();
+      if (!result.success) throw new Error('服务器未确认配置读取成功，请重新读取。');
       setConfig(result.config); setSelected(0); setPriceDraft(null);
       setLoadedDraft(JSON.stringify(kind === 'groups' ? {groups: result.config.groups} : {models: result.config.models, rate_cards: result.config.rate_cards, versions: []}, null, 2));
       setReason('');
       setDraft(JSON.stringify(kind === 'groups' ? {groups: result.config.groups} : {models: result.config.models, rate_cards: result.config.rate_cards, versions: []}, null, 2));
-      setMessage('已读取当前配置。新增价格版本请放入 versions；既有版本只能查看，不可覆盖。');
+      setMessage('当前配置已加载。历史价格只读；调整价格请创建新版本。');
     } catch (e) { setMessage(String(e)); } finally { setBusy(false); }
   };
   useEffect(() => { void load(); }, [kind]);
   const publish = async () => {
     if (!config || busy) return;
     try {
+      if(priceDraft)throw new Error('价格编辑尚未加入发布草稿，请先点击“加入价格草稿”，或取消价格编辑后再发布。');
       const parsed: unknown = JSON.parse(draft);
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('配置必须是 JSON 对象');
       if (!reason.trim()) throw new Error('请填写变更原因');
       if (!window.confirm('确认发布配置？新请求将使用新映射，价格按生效时间启用。有未结算请求时发布会被拒绝。')) return;
       setBusy(true);
       const result = await adminApi.publishCommercialConfig({...parsed, expected_revision: config.revision, reason});
+      if (!result.success) throw new Error('服务器未确认发布成功，请重新读取配置核对后再操作。');
       setConfig(result.config); setReason(''); setPriceDraft(null);
       setLoadedDraft(JSON.stringify(kind === 'groups' ? {groups: result.config.groups} : {models: result.config.models, rate_cards: result.config.rate_cards, versions: []}, null, 2));
       setReason('');
@@ -69,11 +73,11 @@ export default function CommercialEditor({ kind,onDirtyChange }: {kind: 'groups'
     <section className="panel"><h3>{kind === 'groups' ? '套餐分组' : '模型目录与路由'}</h3><p className="muted">{kind === 'groups' ? '发卡套餐：PRO 1,000 · PRO+ 2,000 · PRO Max 5,000 · Power 10,000。单卡单设备；实际发卡权益由服务端校验。' : '模型发现不等于 Key 授权。请核对可用路由和价格后发布。'}</p>
       <table><thead><tr>{(kind === 'groups' ? ['分组', '套餐', '价格表', '操作'] : ['展示名称', '上游模型 ID', '供应商 / Key 池', '操作']).map(label => <th key={label}>{label}</th>)}</tr></thead><tbody>{rows.map((row, index) => <tr key={String(row.id ?? index)} className={selected === index ? 'selected-row' : ''}><td>{String(row[kind === 'groups' ? 'name' : 'exposed_model_id'] ?? row.id)}</td><td>{String(row[kind === 'groups' ? 'virtual_plan_name' : 'target_model'] ?? '—')}</td><td>{String(row[kind === 'groups' ? 'rate_card_id' : 'target_provider_id'] ?? '—')}</td><td><button onClick={() => setSelected(index)}>编辑配置 →</button></td></tr>)}{!rows.length && <tr><td colSpan={4} className="empty-state">暂无已读取的配置</td></tr>}</tbody></table>
     </section>
-    <div className="two-columns"><section className="panel"><h3>正在编辑 · {String(selectedRow?.name ?? selectedRow?.exposed_model_id ?? '请选择条目')}</h3><fieldset disabled={busy || !selectedRow} className="field-grid">{selectedRow && fields.filter(field => field in selectedRow).map(field => <label key={field}>{labels[field]}{typeof selectedRow[field] === 'boolean' ? <input type="checkbox" checked={Boolean(selectedRow[field])} onChange={e => updateField(field, e.target.checked)} /> : <input type={typeof selectedRow[field] === 'number' ? 'number' : 'text'} step="any" value={String(selectedRow[field] ?? '')} onChange={e => updateField(field, typeof selectedRow[field] === 'number' ? Number(e.target.value) : e.target.value)} />}</label>)}</fieldset></section><section className="panel"><h3>发布前检查</h3><p className="muted">版本：{config?.revision ?? '尚未读取'}</p><p>发布需要变更原因和二次确认。服务端校验版本冲突、路由与在途请求。</p><p className="muted">配置更新不代表存量卡密权益已变更。既有价格版本不可覆盖，新版本按生效时间启用。</p></section></div>
-    {kind === 'models' && <div className="two-columns"><section className="panel"><h3>积分价格</h3><p className="muted">单位：积分 / 百万 Tokens。仅固定积分模式可在此编辑；成本加成与按次计费保留高级配置。</p><select aria-label="选择价格版本模板" value={String(priceDraft?.source_id ?? '')} onChange={e => {const version = config?.versions.find(v => v.id === e.target.value); if (!version) {setPriceDraft(null); return;} setPriceDraft({...version, id: '', effective_from_secs: 0, source_id: version.id}); setPriceInputs(Object.fromEntries(Object.keys(priceFields).map(field => [field, String(Number(version[field] ?? 0) / 1_000_000)])));}}><option value="">从现有版本创建新草稿</option>{config?.versions.filter(v => v.pricing_mode === 'fixed').map(v => <option key={String(v.id)} value={String(v.id)}>{String(v.model)} · {String(v.id)}</option>)}</select>{priceDraft && <div className="field-grid page-supplement"><label>新版本 ID<input value={String(priceDraft.id)} onChange={e => setPriceDraft({...priceDraft, id: e.target.value})}/></label><label>生效时间（本地时区）<input type="datetime-local" onChange={e => setPriceDraft({...priceDraft, effective_from_secs: Math.floor(new Date(e.target.value).getTime()/1000)})}/></label>{Object.entries(priceFields).map(([field, label]) => <label key={field}>{label}<input inputMode="decimal" value={priceInputs[field] ?? ''} onChange={e => setPriceInputs({...priceInputs, [field]: e.target.value})}/></label>)}<label>采购计价币种<select value={String(priceDraft.currency??'')} onChange={e=>setPriceDraft({...priceDraft,currency:e.target.value})}><option value="">请选择</option><option value="USD">USD</option><option value="CNY">CNY</option></select></label>{Object.entries(costFields).map(([field,label])=><label key={field}>{label}（计价货币 / 百万 Tokens）<input type="number" min="0" step="any" value={String(priceDraft[field]??'')} onChange={e=>setPriceDraft({...priceDraft,[field]:e.target.value})}/></label>)}<p className="muted">采购价格用于成本估算，与积分收费分开。缺少价格不能按免费处理；仅明确免费时填 0。</p><button className="primary" onClick={stagePrice}>加入价格草稿</button></div>}</section><section className="notice-panel"><h3>价格版本与生效规则</h3><p>积分以精确微积分提交，1 积分 = 1,000,000 微积分。</p><p>历史版本保持只读。新增版本沿用所选版本的模型与价格表；采购币种和四类价格请核对后发布。</p><p className="muted">页面草稿不做浏览器持久化。尚未提供价格模板时，请通过高级配置添加首个版本。</p></section></div>}
+    <div className="two-columns"><section className="panel"><h3>正在编辑 · {String(selectedRow?.name ?? selectedRow?.exposed_model_id ?? '请选择条目')}</h3><fieldset disabled={busy || !selectedRow} className="field-grid">{selectedRow && fields.filter(field => field in selectedRow).map(field => <label key={field}>{labels[field]}{typeof selectedRow[field] === 'boolean' ? <input type="checkbox" checked={Boolean(selectedRow[field])} onChange={e => updateField(field, e.target.checked)} /> : <input type={typeof selectedRow[field] === 'number' ? 'number' : 'text'} step="any" value={String(selectedRow[field] ?? '')} onChange={e => updateField(field, typeof selectedRow[field] === 'number' ? Number(e.target.value) : e.target.value)} />}</label>)}</fieldset></section><section className="panel"><h3>发布前检查</h3><p className="muted">版本：{config?.revision ?? '尚未读取'}</p><p>填写变更原因后发布。发布前会检查版本冲突、路由配置和未结算请求。</p><p className="muted">历史价格不可覆盖，新价格按指定时间生效。修改分组配置不会自动调整已发卡密余额。</p></section></div>
+    {kind === 'models' && <div className="two-columns"><section className="panel"><h3>积分价格</h3><p className="muted">单位：积分 / 百万 Tokens。仅固定积分模式可在此编辑；成本加成与按次计费保留高级配置。</p><select disabled={busy} aria-label="选择价格版本模板" value={String(priceDraft?.source_id ?? '')} onChange={e => {const version = config?.versions.find(v => v.id === e.target.value); if (!version) {setPriceDraft(null); return;} setPriceDraft({...version, id: '', effective_from_secs: 0, source_id: version.id}); setPriceInputs(Object.fromEntries(Object.keys(priceFields).map(field => [field, String(Number(version[field] ?? 0) / 1_000_000)])));}}><option value="">从现有版本创建新草稿</option>{config?.versions.filter(v => v.pricing_mode === 'fixed').map(v => <option key={String(v.id)} value={String(v.id)}>{String(v.model)} · {String(v.id)}</option>)}</select>{priceDraft && <div className="field-grid page-supplement"><label>新版本 ID<input value={String(priceDraft.id)} onChange={e => setPriceDraft({...priceDraft, id: e.target.value})}/></label><label>生效时间（本地时区）<input type="datetime-local" onChange={e => setPriceDraft({...priceDraft, effective_from_secs: Math.floor(new Date(e.target.value).getTime()/1000)})}/></label>{Object.entries(priceFields).map(([field, label]) => <label key={field}>{label}<input inputMode="decimal" value={priceInputs[field] ?? ''} onChange={e => setPriceInputs({...priceInputs, [field]: e.target.value})}/></label>)}<label>采购计价币种<select value={String(priceDraft.currency??'')} onChange={e=>setPriceDraft({...priceDraft,currency:e.target.value})}><option value="">请选择</option><option value="USD">USD</option><option value="CNY">CNY</option></select></label>{Object.entries(costFields).map(([field,label])=><label key={field}>{label}（计价货币 / 百万 Tokens）<input type="number" min="0" step="any" value={String(priceDraft[field]??'')} onChange={e=>setPriceDraft({...priceDraft,[field]:e.target.value})}/></label>)}<p className="muted">采购价格用于成本估算，与积分收费分开。缺少价格不能按免费处理；仅明确免费时填 0。</p><button className="primary" onClick={stagePrice}>加入价格草稿</button><button onClick={() => {if(window.confirm('确认丢弃尚未加入发布草稿的价格编辑？')){setPriceDraft(null);setPriceInputs({});}}}>取消价格编辑</button></div>}</section><section className="notice-panel"><h3>价格版本与生效规则</h3><p>积分以精确微积分提交，1 积分 = 1,000,000 微积分。</p><p>历史版本保持只读。新增版本沿用所选版本的模型与价格表；采购币种和四类价格请核对后发布。</p><p className="muted">页面草稿不做浏览器持久化。尚未提供价格模板时，请通过高级配置添加首个版本。</p></section></div>}
     <section className="p-6 rounded-xl bg-white border border-[#E5E8E5] space-y-4">
     <h3 className="font-semibold text-[#23272B]">{kind === 'groups' ? '分组配置' : '模型映射与版本化定价'}</h3>
-    <p className="text-[#7B8388] text-sm">配置编辑器只提交列出的条目，不会因省略条目而删除配置。隐藏模型请设置 visible=false。积分价格字段以微积分为单位，1 积分 = 1,000,000 微积分。</p>
+    <p className="text-[#7B8388] text-sm">修改后填写原因并发布；离开页面会丢弃未发布草稿。新增条目及完整参数可在高级配置中编辑。</p>
     <p role="status" className="text-[#A87029] text-sm">{message}</p>
     <button disabled={busy} onClick={() => { if (!config || window.confirm('重新读取将丢弃未发布的编辑，继续吗？')) void load(); }} className="px-4 py-2 bg-[#EFF1EF] rounded">重新读取配置</button>
     <details><summary>高级配置 JSON · 新增条目与价格版本</summary><label className="block">配置 JSON<textarea aria-label="配置 JSON" value={draft} disabled={busy} onChange={e => setDraft(e.target.value)} spellCheck={false} className="block w-full h-96 bg-white font-mono text-sm p-3 border border-[#E5E8E5] rounded" /></label></details>

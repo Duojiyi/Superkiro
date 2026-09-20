@@ -111,3 +111,45 @@ pre {max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere;}
   .metric-grid {grid-template-columns:minmax(0,1fr);}
   .topbar > div {flex-wrap:wrap;}
 }
+
+/* Shared control hierarchy: actions remain distinguishable from labels. */
+:root {color: #252b35;}
+.admin-app button, .auth-page button {min-height:36px; border:1px solid #c8ced6; border-radius:7px; padding:7px 12px; font-weight:600; line-height:1.4;}
+.admin-app button:not([class]), .admin-app button.secondary {background:#fff; color:#344054;}
+.admin-app button.primary, .auth-page button.primary {background:#a83f2e; border-color:#a83f2e; color:#fff; min-height:42px;}
+.admin-app button.danger {background:#fff1f0; border-color:#e3a29b; color:#a12b25;}
+.admin-app button:disabled, .auth-page button:disabled {opacity:1; background:#edf0f3; border-color:#d8dde4; color:#707985;}
+.admin-app button:hover:not(:disabled), .auth-page button:hover:not(:disabled) {box-shadow:0 1px 4px #18223018;}
+.sidebar nav button {border-color:transparent; background:transparent; color:#525e6c; font-weight:500;}
+.sidebar nav button[aria-current] {border-color:#efc8bc;}
+.sidebar-footer button {margin-top:8px; font-size:12px;}
+.topbar button {background:#fff; font-size:13px;}
+.sidebar {border-right:1px solid #e4e7ec;}
+.page-heading h2 {margin-bottom:10px;}
+.page-heading p, .muted, .panel small, .sidebar-footer, .topbar {color:#596575;}
+.panel {border:1px solid #e4e7ec;}
+.actions {gap:10px; margin-top:16px;}
+.page-content td button {margin:0 6px 6px 0; white-space:nowrap;}
+th {background:#f0f3f6; color:#475467;}
+th, td {padding:13px 14px !important;}
+tbody tr + tr td {border-top:1px solid #e8ecf1 !important;}
+.page-content input:not([type=checkbox]), .page-content select, .page-content textarea {background:#fff; border:1px solid #bbc4d0; min-height:40px;}
+.page-content input[type=checkbox] {width:17px; height:17px; accent-color:#a83f2e; cursor:pointer;}
+.field-grid {align-items:start;}
+.field-grid label {color:#475467;}
+.page-content input::placeholder, .page-content textarea::placeholder {color:#667085;}
+.notice-panel {background:#fff8ef; border:1px solid #efdbc1; color:#654521;}
+.trace-toolbar input {display:block; width:min(100%,520px); margin:8px 0;}
+.status-badge {display:inline-flex; border:1px solid #cbd3df; border-radius:5px; padding:3px 8px; white-space:nowrap; font-weight:600; background:#f2f4f7; color:#475467;}
+.status-success {background:#ecfdf3; border-color:#abdfc1; color:#16633c;}
+.status-error {background:#fff1f0; border-color:#efb3ac; color:#a12b25;}
+.status-client_aborted {background:#fff8eb; border-color:#ebcc92; color:#805510;}
+.auth-card {max-width:400px; box-shadow:0 12px 40px #18223008;}
+.auth-card .primary {width:100%;}
+@media(min-width:1800px) {.sidebar {width:260px;} .sidebar nav button {font-size:16px; padding:13px;} .page-content {padding:32px 40px;} .page-heading h2 {font-size:32px;} .page-heading p {font-size:15px;} }
+@media(prefers-reduced-motion:reduce) {* {scroll-behavior:auto !important; transition:none !important;}}
+
+.table-hint {display:none; font-size:12px; color:#596575; margin-bottom:12px;}
+@media(max-width:700px) {.table-hint {display:block;}}
+
+.card-note {display:block; max-width:300px; white-space:normal; overflow-wrap:anywhere; margin-top:6px; font-size:11px;}

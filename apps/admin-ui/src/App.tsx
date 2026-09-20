@@ -7,7 +7,7 @@ import {loadAdjustment,saveAdjustment,clearAdjustment,isZeroMicroAdjustment,isUn
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { adminApi, AdminApiError, AdminStats, AdminCardItem, AdminAnnouncement, AdminFinancials, GeneratedCard } from './api';
 
-const pages = {overview: ['运营概览', '服务是否稳定，额度是否准确，从这里开始。'], cards: ['卡密资产', '按分组管理权益，所有额度调整保留操作原因。单卡仅限一台设备。'], groups: ['分组与权益', '让套餐权益可读、可比较。单卡单设备，四档积分套餐。'], providers: ['供应商与 Key', '模型能力按 Key 精确授权；发现结果进入草稿，不自动上线。'], models: ['模型与定价', '映射路由、配置积分价格，校验后发布。'], traces: ['调用追踪', '定位失败原因，不记录用户提示词或上游响应正文。'], reconciliation: ['财务对账', '结算积分、估算成本、实际充值分别呈现。'], announcements: ['公告管理', '核对公告正文后发布。当前接口面向全部用户。'], security: ['安全与审计', '高风险操作二次确认，密钥不回显，审计可追溯。']} as const;
+const pages = {overview: ['运营概览', '查看请求成功率、积分结算与供应商成本概况。'], cards: ['卡密资产', '管理卡密发放、余额、有效期和设备绑定。'], groups: ['分组与权益', '配置套餐分组、用量上限及关联价格表。'], providers: ['供应商与 Key', '管理供应商连接、API 密钥及可用模型。'], models: ['模型与定价', '配置模型路由、访问权限和计费价格。'], traces: ['调用追踪', '定位失败原因，不记录用户提示词或上游响应正文。'], reconciliation: ['财务对账', '结算积分、估算成本、实际充值分别呈现。'], announcements: ['公告管理', '创建和发布面向全部用户的服务公告。'], security: ['安全与审计', '管理登录会话，查看认证配置和配置发布记录。']} as const;
 const tiers = [{"id": "tier-1000", "name": "PRO", "points": 1000, "price_cny": 30}, {"id": "tier-2000", "name": "PRO+", "points": 2000, "price_cny": 55}, {"id": "tier-5000", "name": "PRO Max", "points": 5000, "price_cny": 130}, {"id": "tier-10000", "name": "Power", "points": 10000, "price_cny": 250}];
 
 type Tab = 'overview' | 'cards' | 'groups' | 'providers' | 'models' | 'traces' | 'reconciliation' | 'announcements' | 'security';
@@ -105,8 +105,14 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
   useEffect(() => {mounted.current = true; return () => {mounted.current = false;};}, []);
   const [activeTab, setActiveTab] = useState<Tab>('overview');
   const commercialDirty=useRef(false);
+  const providerDirty=useRef(false);
+  const editorBusy=useRef(false);
+  const markProviderDirty=useCallback((dirty:boolean)=>{providerDirty.current=dirty;},[]);
+  const markEditorBusy=useCallback((busy:boolean)=>{editorBusy.current=busy;},[]);
+  const mayLeaveProvider=()=>{if(editorBusy.current){showToast('操作正在处理中，请等待结果后再切换页面。');return false;}return !providerDirty.current || window.confirm('离开将丢弃未保存的供应商密钥草稿，继续吗？');};
+  useEffect(()=>{const guard=(event:BeforeUnloadEvent)=>{if(commercialDirty.current||providerDirty.current||editorBusy.current){event.preventDefault();event.returnValue='';}};window.addEventListener('beforeunload',guard);return()=>window.removeEventListener('beforeunload',guard);},[]);
   const markCommercialDirty=useCallback((dirty:boolean)=>{commercialDirty.current=dirty;},[]);
-  const navigate=(tab:Tab)=>{if(cardBulkBusy)return;if(tab===activeTab)return;if(commercialDirty.current&&!window.confirm('离开将丢弃未发布的商业配置草稿，继续吗？'))return;commercialDirty.current=false;setActiveTab(tab);};
+  const navigate=(tab:Tab)=>{if(cardBulkBusy)return;if(tab===activeTab)return;if(!mayLeaveProvider())return;if(commercialDirty.current&&!window.confirm('离开将丢弃未发布的配置草稿，继续吗？'))return;commercialDirty.current=false;providerDirty.current=false;setActiveTab(tab);};
 
   // Interactive state
   const [cardStatusFilter, setCardStatusFilter] = useState('ALL');
@@ -117,6 +123,22 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
   const [cardBulkResults, setCardBulkResults] = useState<Array<{id: string; result: string}>>([]);
   const [showBatchModal, setShowBatchModal] = useState(false);
   const [generatedCards, setGeneratedCards] = useState<GeneratedCard[]>([]);
+  const issuanceStorageKey = 'admin-pending-issuance:v1';
+  const [issuanceRecovery, setIssuanceRecovery] = useState<'refresh' | 'review' | null>(() => {
+    try {return sessionStorage.getItem(issuanceStorageKey) ? 'refresh' : null;} catch {return 'refresh';}
+  });
+  const [issuanceReference, setIssuanceReference] = useState(() => {try{const reference=JSON.parse(sessionStorage.getItem(issuanceStorageKey) || '{}')?.reference;return typeof reference==='string' && reference.length<=256 ? reference : '';}catch{return '';}});
+  const [issuanceChecking, setIssuanceChecking] = useState(false);
+  const refreshIssuanceForReview = async () => {
+    if (issuanceChecking || writing.current) return;
+    setIssuanceChecking(true); setIssuanceRecovery('refresh');
+    try {
+      const result = await adminApi.getCards();
+      if (!result.success) throw new Error('服务端未确认卡密列表');
+      setCards(result.cards); setIssuanceRecovery('review'); setActionError('');
+    } catch {setActionError('卡密核对刷新失败，仍禁止制卡。请重试刷新。');}
+    finally {setIssuanceChecking(false);}
+  };
   const [showAdjustModal, setShowAdjustModal] = useState(false);
   const [showKekModal, setShowKekModal] = useState(false);
   const [showNoticeModal, setShowNoticeModal] = useState(false);
@@ -141,12 +163,24 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
   }).length);
   const [providers, setProviders] = useState<Array<Record<string, unknown>>>([]);
   const [selectedProviderKey, setSelectedProviderKey] = useState<Record<string, unknown> | undefined>();
+  const selectProviderKey = (key?: Record<string, unknown>) => {
+    if (key?.id !== selectedProviderKey?.id || key?.provider_id !== selectedProviderKey?.provider_id) {
+      if (!mayLeaveProvider()) return;
+      providerDirty.current = false; setSelectedProviderKey(key);
+    }
+    document.getElementById('key-editor')?.scrollIntoView({behavior: 'smooth'});
+  };
   const [providerKeys, setProviderKeys] = useState<Array<Record<string, unknown>>>([]);
   const [loading, setLoading] = useState(false);
   const [syncedAt, setSyncedAt] = useState<string | null>(null);
   const [loadError, setLoadError] = useState('');
   const [groupFilter, setGroupFilter] = useState('ALL');
   const [traceQuery, setTraceQuery] = useState('');
+  const [tracePage, setTracePage] = useState(0);
+  const traceStatusLabel = (value: unknown) => ({success: '成功', error: '失败', client_aborted: '客户端中断', pending: '处理中', running: '处理中'}[String(value)] ?? String(value ?? '未知'));
+  const filteredTraces = traces.filter(trace => !traceQuery.trim() || [trace.id, trace.card_id, trace.exposed_model, trace.status, traceStatusLabel(trace.status)].some(value => String(value ?? '').toLowerCase().includes(traceQuery.trim().toLowerCase())));
+  const tracePageCount = Math.max(1, Math.ceil(filteredTraces.length / 20));
+  const currentTracePage = Math.min(tracePage, tracePageCount - 1);
   const [selectedTrace, setSelectedTrace] = useState<Record<string, unknown> | null>(null);
   const [audit, setAudit] = useState<Array<Record<string, unknown>>>([]);
   const [auditError, setAuditError] = useState('');
@@ -180,7 +214,10 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
   const [noticeTitle, setNoticeTitle] = useState('');
   const [noticeLevel, setNoticeLevel] = useState<'info' | 'warning' | 'critical'>('info');
   const [noticeContent, setNoticeContent] = useState('');
-  const [noticeRecovery, setNoticeRecovery] = useState<'refresh' | 'review' | null>(null);
+  const noticeStorageKey = 'admin-pending-announcement:v1';
+  const [noticeRecovery, setNoticeRecovery] = useState<'refresh' | 'review' | null>(() => {
+    try {return sessionStorage.getItem(noticeStorageKey) ? 'refresh' : null;} catch {return 'refresh';}
+  });
   const [noticeChecking, setNoticeChecking] = useState(false);
   const checkingNotices = useRef(false);
 
@@ -265,14 +302,15 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
     if(writing.current || cardBulkBusy)return;
     if (!window.confirm(`确认对卡密 ${cardId} 执行${action === 'freeze' ? '冻结' : action === 'ban' ? '封禁' : '解冻'}？`)) return;
     try {
-      writing.current=true;const res = await adminApi.updateCardStatus(cardId, action, `管理员手动操作: ${action}`);
+      writing.current=true;setMutationBusy(true);const res = await adminApi.updateCardStatus(cardId, action, `管理员手动操作：${{freeze: '冻结', unfreeze: '解冻', ban: '封禁'}[action]}`);
+      if (!res.success) throw new Error('服务器未确认状态变更，请刷新核对。');
       if (res.success) {
         showToast(`卡密 ${cardId} 已${action === 'freeze' ? '冻结' : action === 'unfreeze' ? '解冻' : '封禁'}`);
         refreshData();
       }
     } catch (err: any) {
       setActionError(`操作失败：${err.message}`);
-    }finally{writing.current=false;}
+    }finally{writing.current=false;setMutationBusy(false);}
   };
 
   const handleCardBulk = async (action: 'freeze' | 'unfreeze' | 'ban' | 'export') => {
@@ -364,25 +402,31 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
       }
     } catch (err: any) {
       if(sent&&adjustment.current&&err instanceof AdminApiError&&isUnsubmittedAdjustmentRejection(err.status,err.message,adjustment.current)){
-        try{clearAdjustment(sessionStorage,adjustment.current);adjustment.current=null;setActionError('服务端明确拒绝零微积分调账，未入账；已清除该无效意图，请更正金额。');return;}catch{setActionError('该零微积分调账未入账，但本地记录未能清除，请检查浏览器存储。');return;}
+        try{clearAdjustment(sessionStorage,adjustment.current);adjustment.current=null;setActionError('服务端明确拒绝调账，未入账；已清除该无效意图，请检查可用余额并更正金额。');return;}catch{setActionError('该调账未入账，但本地记录未能清除，请检查浏览器存储。');return;}
       }
       setActionError(`${sent?'调账结果未确认':'尚未发送调账'}：${err.message}。请核对原意图；重试仍需手动确认。`);
     } finally {adjusting.current=false;setMutationBusy(false);}
   };
 
   const handleBatchGenerate = async () => {
-    if (writing.current || loading || !tiers.some(t => t.id === batchTemplate) || !cardGroups.some(group => group.id === batchGroup) || !Number.isInteger(batchCount) || batchCount < 1 || batchCount > 500) return;
+    if (issuanceRecovery || writing.current || loading || !tiers.some(t => t.id === batchTemplate) || !cardGroups.some(group => group.id === batchGroup) || !Number.isInteger(batchCount) || batchCount < 1 || batchCount > 500) return;
     if (!window.confirm(`确认生成 ${batchCount} 张 ${tiers.find(t => t.id === batchTemplate)?.name} 卡密？每张仅限一台设备，积分与权益以服务端校验为准。`)) return;
     try {
       writing.current=true;setLoading(true);
-      const res = await adminApi.batchCards(batchCount, batchGroup, batchTemplate);
+      const reference = `批次 ${new Date().toISOString()} ${crypto.randomUUID()}`;
+      setIssuanceReference(reference);
+      sessionStorage.setItem(issuanceStorageKey, JSON.stringify({reference, count: batchCount, group: batchGroup, template: batchTemplate, startedAt: new Date().toISOString()}));
+      const res = await adminApi.batchCards(batchCount, batchGroup, batchTemplate, reference);
+      if (!res.success) throw new Error('服务器未确认生成结果');
       if (res.success) {
         showToast(`成功批量生成 ${res.cards.length} 张卡密！已持久化入库`);
         setGeneratedCards(res.cards);
+        sessionStorage.removeItem(issuanceStorageKey);
         setShowBatchModal(false);
         await refreshData();
       }
     } catch (err: any) {
+      setIssuanceRecovery('refresh'); setShowBatchModal(false);
       setActionError(`批量制卡结果未确认：${err.message}。请先核对卡密列表，不要立即重复生成。`);
     } finally {
       writing.current=false;setLoading(false);
@@ -467,9 +511,10 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
     if (!window.confirm('确认向全部用户发布该公告？有效期为 7 天。')) return;
     try {
       setMutationBusy(true); setActionError('');
-      writing.current=true;const res = await adminApi.createAnnouncement(noticeTitle.trim(), noticeContent.trim(), noticeLevel, 86400 * 7);
+      writing.current=true;sessionStorage.setItem(noticeStorageKey, new Date().toISOString());const res = await adminApi.createAnnouncement(noticeTitle.trim(), noticeContent.trim(), noticeLevel, 86400 * 7);
       if (!res.success) throw new Error('服务端未确认公告发布');
       if (res.success) {
+        sessionStorage.removeItem(noticeStorageKey);
         showToast('公告已成功发布并同步到网关');
         setShowNoticeModal(false);
         setNoticeTitle('');
@@ -523,7 +568,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
       <main className="workspace">
         <header className="topbar"><span>工作台 / {pages[activeTab][0]}</span><div><span>{syncedAt ? `最近同步 ${syncedAt}` : '尚未同步'}</span><button onClick={() => navigate('security')}>管理会话</button><button disabled={loading || cardBulkBusy} onClick={() => refreshData()}>{loading ? '刷新中…' : '刷新'}</button></div></header>
         <div className="page-content" key={isAuthenticated ? 'authenticated' : 'anonymous'}>
-          <div className="page-heading"><div><h2>{pages[activeTab][0]}</h2><p>{pages[activeTab][1]}</p></div>{activeTab === 'overview' && <button disabled title="现有接口仅返回最近追踪，不支持完整日期聚合" className="sample-range">最近样本 · 日期筛选未支持</button>}{activeTab === 'cards' && <button className="primary" disabled={!isAuthenticated} onClick={() => setShowBatchModal(true)}>＋ 批量生成</button>}{activeTab === 'providers' && <button disabled={!isAuthenticated} className="primary" onClick={() => document.getElementById('key-editor')?.scrollIntoView({behavior: 'smooth'})}>＋ 添加供应商</button>}</div>
+          <div className="page-heading"><div><h2>{pages[activeTab][0]}</h2><p>{pages[activeTab][1]}</p></div>{activeTab === 'overview' && <button disabled title="现有接口仅返回最近追踪，不支持完整日期聚合" className="sample-range">最近样本 · 日期筛选未支持</button>}{activeTab === 'cards' && <button className="primary" disabled={!isAuthenticated} onClick={() => setShowBatchModal(true)}>＋ 批量生成</button>}{activeTab === 'providers' && <button disabled={!isAuthenticated} className="primary" onClick={() => selectProviderKey()}>＋ 添加供应商</button>}</div>
           {!operator&&<p role="status" className="notice-panel">刷新后需重新登录确认账户，才能新建或恢复调账。<button onClick={onReauthenticate}>重新登录确认调账账户</button></p>}
           {actionError && <div role="alert" className="notice-panel">{actionError} <button onClick={() => setActionError('')}>关闭提示</button></div>}{loadError && <p role="alert" className="notice-panel">{loadError}</p>}
           {activeTab === 'overview' && <div className="space-y-6">
@@ -557,10 +602,10 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
                     className="px-3 py-1.5 bg-white border border-[#E5E8E5] rounded text-xs text-[#23272B]"
                   >
                     <option value="ALL">全部状态</option>
-                    <option value="ACTIVE">已激活 (Active)</option>
-                    <option value="UNACTIVATED">未激活 (Unactivated)</option>
-                    <option value="FROZEN">已冻结 (Frozen)</option>
-                    <option value="BANNED">已封禁 (Banned)</option><option value="EXPIRED">已到期</option><option value="VOIDED">已作废</option>
+                    <option value="ACTIVE">已激活</option>
+                    <option value="UNACTIVATED">未激活</option>
+                    <option value="FROZEN">已冻结</option>
+                    <option value="BANNED">已封禁</option><option value="EXPIRED">已到期</option><option value="VOIDED">已作废</option>
                   </select>
                 </div>
                 <div className="flex gap-2">
@@ -568,23 +613,24 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
                     disabled={!generatedCards.length} title="仅导出本次生成结果，不批量读取历史明文" onClick={downloadGeneratedCards}
                     className="px-3 py-1.5 bg-[#EFF1EF] hover:bg-[#EFF1EF] text-[#23272B] rounded text-xs border border-[#E5E8E5]"
                   >
-                     导出 CSV
+                     导出本次生成结果
                   </button>
 
                 </div>
               </div>
 
               <section className="panel" aria-label="批量卡密管理">
-                <p>已选 {selectedCardIds.length} 张 · 仅操作当前页明确选中的卡密；成功项取消选择，失败或未执行项仅在当前页保留；筛选、翻页、手动刷新后清空选择。</p>
-                <div className="actions">
+                <p>已选 {selectedCardIds.length} 张卡密 · 批量操作仅针对当前页所选卡密。</p>
+                <p className="muted">导出的文件包含完整卡密，请妥善保管。筛选、翻页或刷新后需重新选择。</p><div className="actions">
                   <button disabled={cardBulkBusy || loading || !pageCards.length} onClick={() => setSelectedCardIds(pageCards.map(card => card.id))}>当前页全选</button>
                   <button disabled={cardBulkBusy || !selectedCardIds.length} onClick={() => setSelectedCardIds([])}>清空选择</button>
-                  {(['freeze', 'unfreeze', 'ban', 'export'] as const).map(action => <button key={action} disabled={cardBulkBusy || loading || mutationBusy || revealing || !selectedCardIds.length} onClick={() => void handleCardBulk(action)}>{{freeze: '批量冻结', unfreeze: '批量解冻', ban: '批量封禁', export: '导出已选卡密'}[action]}</button>)}
+                  {(['freeze', 'unfreeze', 'ban', 'export'] as const).map(action => <button className={action === 'ban' ? 'danger' : action === 'export' ? 'primary' : 'secondary'} key={action} disabled={cardBulkBusy || loading || mutationBusy || revealing || !selectedCardIds.length} onClick={() => void handleCardBulk(action)}>{{freeze: '批量冻结', unfreeze: '批量解冻', ban: '批量封禁', export: '导出已选卡密'}[action]}</button>)}
                 </div>
                 {cardBulkBusy && <p role="status">正在逐项处理，请勿重复提交…</p>}
                 {!!cardBulkResults.length && <div aria-label="批量操作结果" role="status"><p>本次逐项结果（不含卡密明文）：</p>{cardBulkResults.map(item => <p key={item.id}>{item.id}：{item.result}</p>)}</div>}
                 <div className="actions"><button disabled={cardBulkBusy || loading || currentCardPage === 0} onClick={() => {setSelectedCardIds([]); setCardPage(currentCardPage - 1);}}>上一页</button><span>第 {currentCardPage + 1} / {pageCount} 页 · 每页 50 条 · 共 {filteredCards.length} 条</span><button disabled={cardBulkBusy || loading || currentCardPage + 1 >= pageCount} onClick={() => {setSelectedCardIds([]); setCardPage(currentCardPage + 1);}}>下一页</button></div>
               </section>
+              <p className="table-hint">左右滑动表格查看全部信息和操作。</p>
               <table className="w-full text-left border-collapse bg-white rounded-xl border border-[#E5E8E5] overflow-hidden">
                 <thead className="bg-[#EFF1EF] text-xs text-[#7B8388]">
                   <tr>
@@ -601,14 +647,14 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
                     pageCards.map((card) => (
                       <tr key={card.id}>
                         <td><input type="checkbox" aria-label={`选择卡密 ${card.id}`} disabled={cardBulkBusy || loading} checked={selectedCardIds.includes(card.id)} onChange={e => setSelectedCardIds(ids => e.target.checked ? [...ids, card.id] : ids.filter(id => id !== card.id))} /></td>
-                        <td className="p-3 font-mono text-[#B94B39]">{card.id}</td>
-                        <td className="p-3">{card.groupId}</td>
+                        <td className="p-3 font-mono text-[#475467]">{card.id}{card.note && <small className="card-note">{card.note}</small>}</td>
+                        <td className="p-3" title={card.groupId}>{String(cardGroups.find(group => group.id === card.groupId)?.name ?? card.groupId)}</td>
                         <td className="p-3">
                           {card.pointsTotal.toFixed(2)} / {card.pointsAvailable.toFixed(2)} 积分
                         </td>
                         <td className="p-3">
                           <div>{card.validUntil ? new Date(card.validUntil * 1000).toLocaleDateString() : '未开始 / 未配置'}</div>{card.boundDevices.length} / {card.maxDevices}{' '}
-                          {card.boundDevices.length > 0 ? `(${card.boundDevices.join(', ')})` : '(未激活)'}
+                          {card.boundDevices.length > 0 ? `(${card.boundDevices.join(', ')})` : '(未绑定)'}
                         </td>
                         <td className="p-3">
                           {card.status === 'active' && (
@@ -633,7 +679,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
                             setRevealing(true);
                             try { const result = await adminApi.revealCard(card.id); if (!result.success || !result.rawCode) throw new Error('卡密不可恢复'); setRevealedCard({cardId: card.id, rawCode: result.rawCode}); }
                             catch (err: any) {setActionError(`查看失败：${err.message}`);} finally {setRevealing(false);}
-                          }}>{card.codeRecoverable ? '查看卡密' : '不可恢复'}</button>{!card.codeRecoverable && <small className="block muted">旧卡未保存可恢复明文，无法查看或复制；请使用原交付记录。</small>}
+                          }}>{card.codeRecoverable ? '查看卡密' : '无可用明文'}</button>{!card.codeRecoverable && <small className="block muted">此卡未保留明文，请查阅原发放记录。</small>}
                           <button
                             onClick={() => {
                               if(cardBulkBusy)return;
@@ -650,7 +696,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
                           </button>
                           {card.status === 'active' && (
                             <button
-                              disabled={cardBulkBusy} onClick={() => handleCardStatus(card.id, 'freeze')}
+                              disabled={cardBulkBusy || mutationBusy} onClick={() => handleCardStatus(card.id, 'freeze')}
                               className="text-[#A87029] hover:underline"
                             >
                               冻结
@@ -658,7 +704,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
                           )}
                           {card.status === 'frozen' && (
                             <button
-                              disabled={cardBulkBusy} onClick={() => handleCardStatus(card.id, 'unfreeze')}
+                              disabled={cardBulkBusy || mutationBusy} onClick={() => handleCardStatus(card.id, 'unfreeze')}
                               className="text-[#39816D] hover:underline"
                             >
                               解冻
@@ -666,8 +712,8 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
                           )}
                           {card.status !== 'banned' && (
                             <button
-                              disabled={cardBulkBusy} onClick={() => handleCardStatus(card.id, 'ban')}
-                              className="text-[#B94B39] hover:underline"
+                              disabled={cardBulkBusy || mutationBusy} onClick={() => handleCardStatus(card.id, 'ban')}
+                              className="danger"
                             >
                               封禁
                             </button>
@@ -687,18 +733,22 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
             </div>
           )}
 
+          {activeTab === 'cards' && issuanceRecovery && <section className="notice-panel" aria-label="制卡结果核对">
+            <h3>上次制卡结果待核对</h3>{issuanceReference && <p className="card-note">{issuanceReference}</p>}<p>请求可能已经入库，已暂停再次制卡。请刷新卡密列表，按下方批次编号搜索，并核对数量；已生成的卡密可在列表中查看或导出。</p>
+            <div className="actions"><button disabled={!issuanceReference} onClick={() => {setSearchQuery(issuanceReference);setGroupFilter('ALL');setCardStatusFilter('ALL');}}>按本批次筛选</button><button disabled={issuanceChecking || loading} onClick={() => void refreshIssuanceForReview()}>{issuanceChecking ? '正在刷新卡密…' : '刷新卡密以核对'}</button><button disabled={issuanceChecking || issuanceRecovery !== 'review'} onClick={() => {if(!window.confirm('确认已核对最新卡密列表？已有本次生成结果时，请勿重复制卡。解除限制不会自动生成。'))return;try{sessionStorage.removeItem(issuanceStorageKey);setIssuanceRecovery(null);setActionError('');}catch{setActionError('无法清除待核对记录，仍禁止制卡。请检查浏览器存储。');}}}>已核对列表，解除制卡限制</button></div>
+          </section>}
           {activeTab === 'cards' && <div className="two-columns page-supplement"><section className="panel"><h3>批量生成卡密</h3><p>PRO 1,000 · PRO+ 2,000 · PRO Max 5,000 · Power 10,000</p><p className="muted">每张卡密仅限一台设备。支持恢复的卡密可在列表中按需查看，请安全交付。</p><div className="actions"><button className="primary" disabled={!isAuthenticated} onClick={() => setShowBatchModal(true)}>预览生成清单</button></div></section><section className="notice-panel"><h3>额度调整需要留下原因</h3><p>从卡密记录选择调账，填写增减积分与操作原因，确认后写入账本。结果未确认时保持原参数重试，不要另起调账。</p><p className="muted">当前显示 {filteredCards.length} 条匹配记录，已分页读取卡密列表。</p></section></div>}
           {/* TAB 3: GROUPS */}
-          {activeTab === 'groups' && isAuthenticated && <CommercialEditor key="groups" kind="groups" onDirtyChange={markCommercialDirty} />}
+          {activeTab === 'groups' && isAuthenticated && <CommercialEditor key="groups" kind="groups" onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy} />}
 
           {/* TAB 4: PROVIDERS */}
           {activeTab === 'providers' && isAuthenticated && (
             <div className="space-y-4">
               <div className="flex justify-between items-center">
-                <h3 className="font-semibold text-[#23272B]">上游 Provider 与多 Key 治理</h3>
+                <h3 className="font-semibold text-[#23272B]">供应商连接与 API 密钥</h3>
                 <div className="flex gap-2">
                   <button disabled title="独立定时连通性测速尚未配置" className="px-3 py-1.5 bg-[#EFF1EF] text-[#7B8388] rounded text-xs border border-[#E5E8E5] cursor-not-allowed"> 连通性测速 (未配置)</button>
-                  <button disabled title="在下方渠道与 Key 编辑器添加供应商" className="px-3 py-1.5 bg-[#EFF1EF] text-[#7B8388] rounded text-xs font-medium cursor-not-allowed border border-[#E5E8E5]">在下方添加渠道与 Key</button>
+                  <button onClick={() => selectProviderKey()} title="打开供应商与密钥编辑器" className="px-3 py-1.5 bg-[#EFF1EF] text-[#7B8388] rounded text-xs font-medium border border-[#E5E8E5]">管理 API 密钥</button>
                 </div>
               </div>
               {providers.length > 0 ? (
@@ -724,11 +774,12 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
                     </div>
                     {providerKeys.filter((k: any) => k.provider_id === p.id).length > 0 ? (
                       <div className="overflow-x-auto">
+                        <p className="table-hint">左右滑动表格查看状态和编辑操作。</p>
                         <table className="w-full text-left text-xs">
                           <thead className="text-[#7B8388]">
                             <tr>
-                              <th className="py-2">Key ID</th>
-                              <th className="py-2">脱敏密匙</th>
+                              <th className="py-2">密钥 ID</th>
+                              <th className="py-2">模型授权</th>
                               <th className="py-2">权重</th>
                               <th className="py-2">状态</th><th className="py-2">操作</th>
                             </tr>
@@ -736,10 +787,10 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
                           <tbody className="divide-y divide-slate-800 text-[#23272B]">
                             {providerKeys.filter((k: any) => k.provider_id === p.id).map((k: any) => (
                               <tr key={k.id}>
-                                <td className="py-2 font-mono text-[#B94B39]">{k.id}</td>
+                                <td className="py-2 font-mono text-[#475467]">{k.id}</td>
                                 <td className="py-2 font-mono"><span>密钥不返回浏览器</span><div className="text-[#7B8388]">{Array.isArray(k.allowed_models) ? k.allowed_models.join(', ') || '不允许任何模型' : '旧版未限制（建议迁移）'}</div></td>
                                 <td className="py-2">{k.weight ?? 1}</td>
-                                <td className="py-2"><span className="px-1.5 py-0.5 bg-[#EDF5F0] text-[#39816D] rounded">{k.enabled === false ? "Disabled" : k.health_state || "unknown"}</span></td><td><button onClick={() => {setSelectedProviderKey(k); document.getElementById('key-editor')?.scrollIntoView({behavior: 'smooth'});}}>编辑 →</button></td>
+                                <td className="py-2"><span className={`status-badge ${k.enabled !== false && k.health_state === 'healthy' ? 'status-success' : ''}`}>{k.enabled === false ? '已停用' : ({healthy: '正常', cooldown: '冷却中', degraded: '异常', unknown: '未检测'}[String(k.health_state)] ?? String(k.health_state || '未检测'))}</span></td><td><button onClick={() => selectProviderKey(k)}>编辑 →</button></td>
                               </tr>
                             ))}
                           </tbody>
@@ -758,13 +809,13 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
             </div>
           )}
 
-          {activeTab === 'providers' && isAuthenticated && <ProviderKeyEditor selectedKey={selectedProviderKey} onSaved={() => void refreshData()} />}
+          {activeTab === 'providers' && isAuthenticated && <ProviderKeyEditor key={`${selectedProviderKey?.provider_id ?? 'new'}:${selectedProviderKey?.id ?? 'new'}`} selectedKey={providerKeys.find(key => key.id === selectedProviderKey?.id && key.provider_id === selectedProviderKey?.provider_id)} onDirtyChange={markProviderDirty} onBusyChange={markEditorBusy} onSaved={saved => {if(saved){setProviderKeys(keys => keys.some(key => key.id === saved.id && key.provider_id === saved.provider_id) ? keys.map(key => key.id === saved.id && key.provider_id === saved.provider_id ? {...key, ...saved} : key) : [...keys, saved]);setSelectedProviderKey(saved);}void refreshData();}} />}
 
           {/* TAB 5: MODELS */}
-          {activeTab === 'models' && isAuthenticated && <CommercialEditor key="models" kind="models" onDirtyChange={markCommercialDirty} />}
+          {activeTab === 'models' && isAuthenticated && <CommercialEditor key="models" kind="models" onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy} />}
 
-          {activeTab === 'traces' && <div className="space-y-6"><section className="panel"><table><thead><tr><th>请求 ID</th><th>模型</th><th>首字耗时</th><th>结算</th><th>结果</th><th>操作</th></tr></thead><tbody>{traces.filter(trace => !traceQuery || [trace.id, trace.card_id, trace.exposed_model, trace.status].some(v => String(v ?? '').toLowerCase().includes(traceQuery.toLowerCase()))).map((trace, index) => <tr key={String(trace.id ?? index)} className={selectedTrace === trace ? 'selected-row' : ''}><td>{String(trace.id ?? '—')}</td><td>{String(trace.exposed_model ?? '—')}</td><td>{trace.ttft_ms == null ? '—' : `${trace.ttft_ms} ms`}</td><td>{trace.credits_charged == null ? '—' : `${(Number(trace.credits_charged)/1_000_000).toFixed(6)} 积分`}</td><td>{String(trace.status ?? '—')}</td><td><button onClick={() => setSelectedTrace(trace)}>详情 →</button></td></tr>)}{!traces.length && <tr><td colSpan={6} className="empty-state">暂无已读取的调用追踪</td></tr>}</tbody></table></section>
-            <div className="two-columns"><section className="panel"><h3>筛选请求</h3><label className="block">请求 / 模型 / 状态<input className="block w-full mt-3" aria-label="筛选请求" placeholder="输入请求 ID、卡密、模型或状态" value={traceQuery} onChange={e => setTraceQuery(e.target.value)} /></label><p className="muted">在最近读取的最多 100 条追踪中筛选。</p></section><section className="panel"><h3>请求详情</h3>{selectedTrace ? <><p>{String(selectedTrace.id)}</p><p className="muted">{new Date(Number(selectedTrace.ts)*1000).toLocaleString()} · 卡密 {String(selectedTrace.card_id)}</p><p>Tokens：{String(selectedTrace.input_tokens ?? '—')} / {String(selectedTrace.output_tokens ?? '—')} · 速率 {String(selectedTrace.tokens_per_second ?? '—')} Tokens/s</p><pre>{JSON.stringify(selectedTrace.attempt_chain ?? [], null, 2)}</pre><button className="primary" onClick={async () => {try {await navigator.clipboard.writeText(String(selectedTrace.id)); showToast('已复制请求 ID');} catch {showToast('复制失败，请手动复制请求 ID');}}}>复制请求 ID</button></> : <p className="muted">选择请求查看重试链路、Tokens 与结算详情。</p>}</section></div>
+          {activeTab === 'traces' && <div className="space-y-6"><section className="panel trace-toolbar"><label>搜索调用记录<input aria-label="搜索调用记录" placeholder="请求 ID、卡密、模型或状态" value={traceQuery} onChange={e => {setTraceQuery(e.target.value); setTracePage(0);}} /></label><p className="muted">最近 {traces.length} 条记录，匹配 {filteredTraces.length} 条。仅筛选已加载记录。</p><div className="actions"><button disabled={currentTracePage === 0} onClick={() => setTracePage(currentTracePage - 1)}>上一页</button><span>第 {currentTracePage + 1} / {tracePageCount} 页 · 每页 20 条</span><button disabled={currentTracePage + 1 >= tracePageCount} onClick={() => setTracePage(currentTracePage + 1)}>下一页</button></div></section><section className="panel"><table><thead><tr><th>请求 ID</th><th>模型</th><th>首字耗时</th><th>结算</th><th>结果</th><th>操作</th></tr></thead><tbody>{filteredTraces.slice(currentTracePage * 20, (currentTracePage + 1) * 20).map((trace, index) => <tr key={String(trace.id ?? index)} className={selectedTrace === trace ? 'selected-row' : ''}><td>{String(trace.id ?? '—')}</td><td>{String(trace.exposed_model ?? '—')}</td><td>{trace.ttft_ms == null ? '—' : `${trace.ttft_ms} ms`}</td><td>{trace.credits_charged == null ? '—' : `${(Number(trace.credits_charged)/1_000_000).toFixed(6)} 积分`}</td><td><span className={`status-badge status-${String(trace.status)}`}>{traceStatusLabel(trace.status)}</span></td><td><button onClick={() => {setSelectedTrace(trace); requestAnimationFrame(() => document.getElementById('trace-detail')?.focus());}}>详情 →</button></td></tr>)}{!filteredTraces.length && <tr><td colSpan={6} className="empty-state">{traceQuery.trim() ? '没有符合条件的请求，请调整筛选条件。' : '暂无调用记录'}</td></tr>}</tbody></table></section>
+            <div className="two-columns"><section id="trace-detail" tabIndex={-1} className="panel"><h3>请求详情</h3>{selectedTrace ? <><p>{String(selectedTrace.id)}</p><p className="muted">{new Date(Number(selectedTrace.ts)*1000).toLocaleString()} · 卡密 {String(selectedTrace.card_id)}</p><p>Tokens：{String(selectedTrace.input_tokens ?? '—')} / {String(selectedTrace.output_tokens ?? '—')} · 速率 {String(selectedTrace.tokens_per_second ?? '—')} Tokens/s</p><pre>{JSON.stringify(selectedTrace.attempt_chain ?? [], null, 2)}</pre><button className="primary" onClick={async () => {try {await navigator.clipboard.writeText(String(selectedTrace.id)); showToast('已复制请求 ID');} catch {showToast('复制失败，请手动复制请求 ID');}}}>复制请求 ID</button></> : <p className="muted">选择请求查看重试链路、Tokens 与结算详情。</p>}</section></div>
             <section className="notice-panel"><h3>失败处理</h3><p>临时错误仅在首段输出前按策略重试。发生部分输出后不重放流，避免重复内容与扣费。</p></section>
           </div>}
 
@@ -779,7 +830,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
                 </div>
               </div>
               <section className="panel"><table><thead><tr><th>统计口径</th><th>结算请求</th><th>已扣积分</th><th>收入关联</th><th>状态</th></tr></thead><tbody><tr><td>当前保留账本</td><td>{financials?.dashboard.total_requests ?? '—'}</td><td>{financials ? (financials.dashboard.total_credits_charged / 1_000_000).toLocaleString() : '—'}</td><td>待关联实际充值账本</td><td>{financials ? '已读取 · 尚未人工核对' : '未读取'}</td></tr></tbody></table></section>
-              <FinancialPanel data={financials} onPublished={refreshData}/>
+              <FinancialPanel data={financials} onPublished={refreshData} onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy}/>
               <div className="grid grid-cols-2 gap-4">
                   <div className="p-4 rounded-xl bg-white border border-[#E5E8E5] space-y-3">
                     <h4 className="font-bold text-[#23272B] text-sm">模型账本成本记录（非实际利润）</h4>
@@ -806,40 +857,40 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
 
           {activeTab === 'announcements' && <div className="space-y-6">
             {noticeRecovery && <section className="notice-panel" aria-label="公告发布结果核对">
-              <p role="status">上次公告可能已发布，草稿已保留，暂时禁止再次发布。请刷新并核对下方公告的标题、正文和发布时间；已有相同公告时不要重复发布。</p>
+              <p role="status">上次公告可能已发布，暂时禁止再次发布。请刷新并核对下方公告的标题、正文和发布时间；已有相同公告时不要重复发布。</p>
               <div className="actions"><button disabled={noticeChecking} onClick={() => void refreshNoticesForReview()}>{noticeChecking ? '正在刷新公告…' : '刷新公告以核对'}</button>
-                <button disabled={noticeChecking || noticeRecovery !== 'review'} onClick={() => {if (window.confirm('确认已核对刷新后的公告列表？若已有相同公告，请勿再次发布。解除限制不会自动提交。')) {setNoticeRecovery(null); setActionError('');}}}>已核对列表，解除发布限制</button></div>
+                <button disabled={noticeChecking || noticeRecovery !== 'review'} onClick={() => {if (window.confirm('确认已核对刷新后的公告列表？若已有相同公告，请勿再次发布。解除限制不会自动提交。')) {try{sessionStorage.removeItem(noticeStorageKey);setNoticeRecovery(null);setActionError('');}catch{setActionError('无法清除待核对记录，仍禁止发布。');}}}}>已核对列表，解除发布限制</button></div>
             </section>}
             <section className="panel"><table><thead><tr><th>标题</th><th>范围</th><th>发布时间</th><th>状态</th><th>操作</th></tr></thead><tbody>{announcements.map(notice => <tr key={notice.id}><td>{notice.title}</td><td>全部用户</td><td>{new Date(notice.created_at * 1000).toLocaleString()}</td><td>{!notice.enabled ? '已停用' : notice.expires_at && notice.expires_at < Date.now()/1000 ? '已到期' : '已发布'}</td><td><details><summary>预览</summary><p>{notice.content}</p></details></td></tr>)}{!announcements.length && <tr><td colSpan={5} className="empty-state">暂无已读取的公告</td></tr>}</tbody></table></section>
             <div className="two-columns"><section className="panel"><h3>编辑公告</h3><div className="field-grid"><label>标题<input aria-label="公告标题" value={noticeTitle} onChange={e => setNoticeTitle(e.target.value)} /></label><label>等级<select aria-label="公告等级" value={noticeLevel} onChange={e => setNoticeLevel(e.target.value as typeof noticeLevel)}><option value="info">普通提示</option><option value="warning">预警通知</option><option value="critical">紧急通知</option></select></label><label className="full-width">正文<textarea rows={4} aria-label="正文内容" value={noticeContent} onChange={e => setNoticeContent(e.target.value)} /></label></div></section><section className="panel"><h3>用户侧预览</h3><h4>{noticeTitle || '尚未填写标题'}</h4><p className="preview-content">{noticeContent || '填写正文后在此预览。'}</p><p className="muted">全部用户 · 发布后有效期 7 天</p><div className="actions"><button className="primary" disabled={!isAuthenticated || !!noticeRecovery || !noticeTitle.trim() || !noticeContent.trim()} onClick={() => setShowNoticeModal(true)}>预览并确认发布</button></div></section></div>
-            <section className="notice-panel"><h3>发布确认</h3><p>核对受众和正文后发布。不将尚未生效的配置变更描述为已上线。</p></section>
+            <section className="notice-panel"><h3>发布确认</h3><p>公告发布后对全部用户可见，有效期为 7 天。请确认正文、通知等级和服务状态准确。</p></section>
           </div>}
 
           {/* TAB 9: SECURITY */}
           {activeTab === 'security' && (
             <div className="space-y-4">
-              <section className="panel"><h3>配置发布审计</h3><p className="muted">仅列出现有配置接口返回的发布记录，不代表全部管理操作审计。</p><table><thead><tr><th>时间</th><th>操作人 / 原因</th><th>原版本</th><th>发布版本</th></tr></thead><tbody>{audit.map((row, index) => <tr key={index}><td>{row.created_at_secs ? new Date(Number(row.created_at_secs) * 1000).toLocaleString() : '—'}</td><td>{String(row.operator ?? '—')} · {String(row.reason ?? '—')}</td><td>{String(row.previous_revision ?? '—')}</td><td>{String(row.revision ?? '—')}</td></tr>)}{!audit.length && <tr><td colSpan={4} className="empty-state">{auditError || '暂无已读取的配置审计记录'}</td></tr>}</tbody></table></section>
+              <section className="panel"><h3>配置发布审计</h3><p className="muted">记录分组、模型与定价的配置发布。卡密调账记录请在财务对账中查看。</p><table><thead><tr><th>时间</th><th>操作人 / 原因</th><th>原版本</th><th>发布版本</th></tr></thead><tbody>{audit.map((row, index) => <tr key={index}><td>{row.created_at_secs ? new Date(Number(row.created_at_secs) * 1000).toLocaleString() : '—'}</td><td>{String(row.operator ?? '—')} · {String(row.reason ?? '—')}</td><td>{String(row.previous_revision ?? '—')}</td><td>{String(row.revision ?? '—')}</td></tr>)}{!audit.length && <tr><td colSpan={4} className="empty-state">{auditError || '暂无已读取的配置审计记录'}</td></tr>}</tbody></table></section>
               <div className="flex justify-between items-center">
                 <h3 className="font-semibold text-[#23272B]">部署安全状态</h3>
                 <button onClick={() => showToast('KEK 轮换必须通过外部密钥管理/部署流程执行')} className="px-3 py-1.5 bg-[#EFF1EF] hover:bg-[#EFF1EF] text-[#23272B] rounded text-xs font-medium">KEK 轮换说明</button>
               </div>
-              <div className="two-columns"><section className="panel"><h3>管理员会话</h3><p>使用管理员账号和密码登录，会话有效期 15 分钟。</p><p>当前会话：{isAuthenticated ? '有效' : '未认证'}</p><div className="actions"><button className="primary" onClick={() => void handleLogout(false)}>退出登录</button><button disabled={!isAuthenticated} onClick={() => handleLogout(true)}>全部会话下线</button></div></section><section className="panel"><h3>双因素验证</h3><p>TOTP 尚未接入，需外部身份系统。</p><p className="muted">部署级 RLS 和审计存储需单独验收，不以界面状态代替服务端检查。</p></section></div>
+              <div className="two-columns"><section className="panel"><h3>管理员会话</h3><p>使用管理员账号和密码登录，会话有效期 15 分钟。</p><p>当前会话：{isAuthenticated ? '有效' : '未认证'}</p><div className="actions"><button className="primary" onClick={() => void handleLogout(false)}>退出登录</button><button className="danger" disabled={!isAuthenticated} onClick={() => {if (window.confirm('确认退出所有管理员会话？所有已登录管理员都需要重新登录。')) void handleLogout(true);}}>全部会话下线</button></div></section><section className="panel"><h3>双因素验证</h3><p>{adminApi.twoFactorEnabled === true ? '已启用：登录时需输入动态验证码。' : adminApi.twoFactorEnabled === false ? '未启用：当前仅使用账号和密码登录。' : '暂时无法确认双因素验证状态，请重新验证会话。'}</p><p className="muted">双因素验证由服务器配置管理，本页面不支持修改。</p></section></div>
               <div className="grid grid-cols-2 gap-4">
                 <div className="p-4 rounded-xl bg-white border border-[#E5E8E5] space-y-3">
                   <h4 className="font-bold text-[#23272B] text-sm">主密钥 (KEK) 保护状态</h4>
                   <div className="text-xs space-y-1 text-[#23272B]">
                     <div>加密算法: <span className="text-[#39816D] font-mono">AES-256-GCM (ring::aead)</span></div>
                     <div>注入源: <span className="text-[#23272B] font-mono">外部环境变量 (KIRO_MASTER_KEK)</span></div>
-                    <div>Provider Key 数: <span className="font-mono text-[#23272B]">由服务端实时返回</span></div>
-                    <div>登录防爆破机制: <span className="text-[#23272B] font-mono">服务端配置</span></div>
+                    <div>已配置 API 密钥: <span className="font-mono text-[#23272B]">{providersLoaded ? providerKeys.length : '未读取'}</span></div>
+                    <div>登录失败保护: <span className="text-[#23272B] font-mono">服务端配置</span></div>
                   </div>
                 </div>
                 <div className="p-4 rounded-xl bg-white border border-[#E5E8E5] space-y-3">
-                  <h4 className="font-bold text-[#23272B] text-sm">管理员 2FA 与多租户 RLS</h4>
+                  <h4 className="font-bold text-[#23272B] text-sm">登录保护与数据隔离</h4>
                   <div className="text-xs space-y-1 text-[#23272B]">
-                    <div>数据隔离: <span className="text-[#23272B] font-mono">当前单进程账本；部署级 RLS 未接入</span></div>
-                    <div>管理认证: <span className="text-[#39816D] font-mono">短时 HttpOnly Cookie + CSRF</span></div>
-                    <div>TOTP 2FA: <span className="text-[#A87029]">{adminApi.twoFactorEnabled===true?'已启用 · 登录强制动态验证码':adminApi.twoFactorEnabled===false?'未启用 · 当前使用用户名和密码登录':'配置状态未确认'}</span></div>
+                    <div>数据隔离: <span className="text-[#23272B] font-mono">当前为单实例账本，不提供多租户隔离</span></div>
+                    <div>会话保护: <span className="text-[#39816D] font-mono">短时 HttpOnly Cookie + CSRF</span></div>
+                    <div>动态验证码: <span className="text-[#A87029]">{adminApi.twoFactorEnabled===true?'已启用 · 登录强制动态验证码':adminApi.twoFactorEnabled===false?'未启用 · 当前使用用户名和密码登录':'配置状态未确认'}</span></div>
                   </div>
                 </div>
               </div>
@@ -907,7 +958,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
             </div>
             <div className="flex justify-end gap-2 pt-2">
               <button disabled={loading} onClick={() => setShowBatchModal(false)} className="px-3 py-1.5 bg-[#EFF1EF] text-[#23272B] rounded text-xs">取消</button>
-              <button onClick={handleBatchGenerate} disabled={loading || !cardGroups.some(group => group.id === batchGroup)} className="px-3 py-1.5 bg-[#B94B39] text-white hover:bg-[#B94B39] text-white rounded text-xs font-medium disabled:opacity-50">
+              <button onClick={handleBatchGenerate} disabled={!!issuanceRecovery || loading || !cardGroups.some(group => group.id === batchGroup)} className="px-3 py-1.5 bg-[#B94B39] text-white hover:bg-[#B94B39] text-white rounded text-xs font-medium disabled:opacity-50">
                 {loading ? '正在生成并入库...' : '生成并入库'}
               </button>
             </div>

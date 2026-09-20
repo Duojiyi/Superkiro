@@ -27,5 +27,9 @@ export function isZeroMicroAdjustment(intent:Adjustment):boolean {
   return Number.isFinite(intent.delta)&&intent.delta!==0&&Math.abs(intent.delta*1_000_000)<0.5;
 }
 export function isUnsubmittedAdjustmentRejection(status:number,message:string,intent:Adjustment):boolean {
-  return status===400&&message==='Invalid balance adjustment: Adjustment delta cannot be zero'&&isZeroMicroAdjustment(intent);
+  if(status===400&&message==='Invalid balance adjustment: Adjustment delta cannot be zero'&&isZeroMicroAdjustment(intent))return true;
+  // Only this exact insufficient-balance response is known to precede any commit.
+  // A generic 409 also includes idempotency conflicts and must retain the intent.
+  const insufficient=/^Card error: Insufficient credit: available (\d+) micro-credits, needed (\d+)$/.exec(message);
+  return status===409 && intent.delta<0 && !!insufficient && Number(insufficient[1])<Number(insufficient[2]) && Number(insufficient[2])===Math.round(-intent.delta*1_000_000);
 }

@@ -90,6 +90,9 @@ jobs:
       - run: node tests/visual.cjs
       - run: node tests/visual-authenticated.cjs
       - run: node tests/auth-gate.cjs
+      - run: npm run test:usability
+      - run: npm run test:card-bulk
+      - run: npm run test:iteration
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'

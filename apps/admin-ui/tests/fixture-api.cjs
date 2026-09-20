@@ -37,7 +37,7 @@ module.exports = function fixtureApi() {
       assert.equal(body.maxDevices,1); assert.equal('creditTotal' in body,false); assert.ok(groups.some(g=>g.id===body.groupId));
       const points=Number(body.templateId.replace('tier-','')); assert.ok([1000,2000,5000,10000].includes(points));
       const generated=Array.from({length:body.count},(_,i)=>({cardId:`fixture-issued-${cards.length+i}`,rawCode:`FIXTURE-NOT-VALID-${points}-${i}`,groupId:body.groupId,creditTotal:points*1000000,status:'unactivated'}));
-      generated.forEach(c=>cards.push({id:c.cardId,status:c.status,creditTotal:c.creditTotal,creditUsed:0,availableCredits:c.creditTotal,pointsTotal:points,pointsAvailable:points,boundDevices:[],maxDevices:1,groupId:c.groupId}));
+      generated.forEach(c=>cards.push({id:c.cardId,status:c.status,creditTotal:c.creditTotal,creditUsed:0,availableCredits:c.creditTotal,pointsTotal:points,pointsAvailable:points,boundDevices:[],maxDevices:1,groupId:c.groupId,note:body.note}));
       return reply({success:true,cards:generated});
     }
     if(endpoint==='cards/status') {const card=cards.find(c=>c.id===body.cardId); assert.ok(card); card.status=body.action==='freeze'?'frozen':body.action==='unfreeze'?'active':'banned'; return reply({success:true,cardId:card.id,newStatus:card.status});}
