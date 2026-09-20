@@ -19,6 +19,9 @@ type SnapshotSaveHook = (Arc<std::sync::Barrier>, Arc<std::sync::Barrier>);
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum BillingError {
+    #[error("Group does not allow new card issuance")]
+    GroupIssuanceDisabled,
+
     #[error("Card {0} not found")]
     CardNotFound(String),
 
@@ -844,9 +847,7 @@ impl BillingEngine {
                 .get(&card.group_id)
                 .is_some_and(|g| !g.issuance_enabled)
             {
-                return Err(BillingError::InvalidState(
-                    "Group does not allow new card issuance".into(),
-                ));
+                return Err(BillingError::GroupIssuanceDisabled);
             }
             if candidate.cards.contains_key(&card.id) {
                 return Err(BillingError::InvalidState(
@@ -1345,15 +1346,13 @@ impl BillingEngine {
         let mut candidate = self.export_snapshot_locked(sequence, previous_checksum);
 
         for card in &cards_vec {
-            if insert_only
+            if !candidate.cards.contains_key(&card.id)
                 && candidate
                     .groups
                     .get(&card.group_id)
                     .is_some_and(|g| !g.issuance_enabled)
             {
-                return Err(BillingError::InvalidState(
-                    "Group does not allow new card issuance".into(),
-                ));
+                return Err(BillingError::GroupIssuanceDisabled);
             }
             if insert_only && candidate.cards.contains_key(&card.id) {
                 return Err(BillingError::InvalidState(

@@ -27,6 +27,10 @@ fn disabled_group_blocks_new_issuance_without_touching_existing_cards() {
     assert!(engine
         .insert_new_cards_checked([Card::new("new", "group", 10)])
         .is_err());
+    assert_eq!(
+        engine.upsert_cards_checked([Card::new("upsert-new", "group", 10)]),
+        Err(billing::BillingError::GroupIssuanceDisabled)
+    );
     assert_eq!(engine.list_all_cards().len(), 1);
     assert_eq!(
         serde_json::to_value(engine.get_card(&existing.card.id)).unwrap(),
@@ -36,6 +40,9 @@ fn disabled_group_blocks_new_issuance_without_touching_existing_cards() {
         engine.reveal_card_code(&existing.card.id).unwrap(),
         Some(existing.raw_code)
     );
+    engine
+        .upsert_cards_checked([existing.card.clone()])
+        .unwrap();
     let restored = BillingEngine::new();
     restored.import_snapshot(engine.export_snapshot());
     assert!(!restored.get_group("group").unwrap().issuance_enabled);

@@ -886,6 +886,13 @@ impl FacadeHandler for AdminBatchCardsHandler {
                     .issue_cards(&template, body.count, body.note.as_deref(), now)
                 {
                     Ok(cards) => cards,
+                    Err(billing::BillingError::GroupIssuanceDisabled) => {
+                        return error_response(
+                            StatusCode::CONFLICT,
+                            "IssuanceDisabledException",
+                            "Group no longer allows new card issuance; refresh the configuration",
+                        )
+                    }
                     Err(error) => {
                         return error_response(
                             StatusCode::INTERNAL_SERVER_ERROR,
