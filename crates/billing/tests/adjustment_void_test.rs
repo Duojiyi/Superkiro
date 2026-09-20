@@ -741,3 +741,250 @@ fn test_reserve_and_settle_persistence_failure_leaves_memory_untouched() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn test_void_persists_audit_and_retry_is_noop() {
+    let path = std::env::temp_dir().join(format!("kiro_void_retry_{}.json", std::process::id()));
+    let engine = BillingEngine::new();
+    engine.upsert_card(Card::new("void-retry", "group-default", 100_000));
+    let grant = engine
+        .adjust_balance_idempotent(
+            "void-retry",
+            10_000,
+            "admin",
+            "grant",
+            NOW_SECS,
+            Some("pre-void-grant"),
+        )
+        .unwrap();
+    engine.save_to_file(&path).unwrap();
+    let before = engine.ledger_entries();
+    let original = engine.get_card("void-retry").unwrap();
+
+    engine.inject_persistence_fault(true);
+    assert!(engine
+        .void_unactivated_card("void-retry", "admin", "misprint", NOW_SECS)
+        .is_err());
+    assert_eq!(engine.get_card("void-retry").unwrap(), original);
+    assert_eq!(
+        serde_json::to_value(engine.ledger_entries()).unwrap(),
+        serde_json::to_value(&before).unwrap()
+    );
+    engine.inject_persistence_fault(false);
+    let voided = engine
+        .void_unactivated_card("void-retry", "admin", "misprint", NOW_SECS)
+        .unwrap();
+    assert_eq!(voided.credit_total, original.credit_total);
+    assert_eq!(voided.credit_used, original.credit_used);
+    assert_eq!(voided.status, CardStatus::Voided);
+    assert_eq!(
+        engine
+            .void_unactivated_card("void-retry", "other-admin", "retry", NOW_SECS + 1)
+            .unwrap(),
+        voided
+    );
+
+    let restored = BillingEngine::new();
+    restored.load_from_file(&path).unwrap();
+    assert_eq!(restored.get_card("void-retry").unwrap(), voided);
+    assert_eq!(
+        restored
+            .void_unactivated_card("void-retry", "admin", "retry after restart", NOW_SECS + 2)
+            .unwrap(),
+        voided
+    );
+    restored.upsert_topup_code(TopupCode::new(
+        "void-topup",
+        billing::card::hash_card_code("unused-topup"),
+        100,
+        100,
+        NOW_SECS,
+    ));
+    assert!(restored
+        .redeem_topup("void-retry", "unused-topup", NOW_SECS, "admin")
+        .is_err());
+    assert!(!restored.get_topup_code("void-topup").unwrap().is_used);
+    assert!(restored.freeze_card("void-retry", "test").is_err());
+    assert!(restored.unfreeze_card("void-retry").is_err());
+    assert!(restored.ban_card("void-retry", "test").is_err());
+    assert!(restored.activate_card("void-retry", NOW_SECS, 100).is_err());
+    for delta in [1, -1] {
+        assert!(restored
+            .adjust_balance("void-retry", delta, "admin", "test", NOW_SECS)
+            .is_err());
+    }
+    assert_eq!(restored.get_card("void-retry").unwrap(), voided);
+    let replay = restored
+        .adjust_balance_idempotent(
+            "void-retry",
+            10_000,
+            "admin",
+            "grant",
+            NOW_SECS + 3,
+            Some("pre-void-grant"),
+        )
+        .unwrap();
+    assert_eq!(replay.id, grant.id);
+    let rejected = restored
+        .adjust_balance_idempotent(
+            "void-retry",
+            10_000,
+            "admin",
+            "grant",
+            NOW_SECS + 3,
+            Some("uncommitted-grant"),
+        )
+        .unwrap_err();
+    assert_eq!(
+        rejected.to_string(),
+        "Invalid billing state: cannot adjust a voided card"
+    );
+    let entries = restored.ledger_entries();
+    assert_eq!(entries.len(), before.len() + 1);
+    assert_eq!(
+        serde_json::to_value(&entries[..before.len()]).unwrap(),
+        serde_json::to_value(&before).unwrap()
+    );
+    let audit = entries.last().unwrap();
+    assert_eq!(audit.credits_charged, 0);
+    assert_eq!(audit.operator_id.as_deref(), Some("admin"));
+    assert_eq!(audit.reason.as_deref(), Some("misprint"));
+    assert_eq!(audit.exposed_model, "void_card");
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("json.anchor"));
+}
+
+#[test]
+fn test_void_rejects_unactivated_status_with_activation_or_usage_evidence() {
+    let engine = BillingEngine::new();
+    for evidence in 0..5 {
+        let mut card = Card::new(format!("used-{evidence}"), "group-default", 100_000);
+        match evidence {
+            0 => card.activated_at = Some(NOW_SECS),
+            1 => card.valid_until = Some(NOW_SECS + 100),
+            2 => card.credit_used = 1,
+            3 => card.credit_reserved = 1,
+            _ => card.bound_devices.push("device".into()),
+        }
+        engine.upsert_card(card.clone());
+        assert!(matches!(
+            engine.void_unactivated_card(&card.id, "admin", "test", NOW_SECS),
+            Err(BillingError::CannotVoidActivatedCard { .. })
+        ));
+        assert_eq!(engine.get_card(&card.id).unwrap(), card);
+    }
+    assert!(engine.ledger_entries().is_empty());
+}
+
+#[test]
+fn test_archive_is_audited_persistent_metadata_only() {
+    let engine = BillingEngine::new();
+    let mut card = Card::new("archive-test", "group-default", 100_000);
+    card.status = CardStatus::Banned;
+    let mut legacy = serde_json::to_value(&card).unwrap();
+    legacy.as_object_mut().unwrap().remove("archived_at");
+    assert_eq!(serde_json::from_value::<Card>(legacy).unwrap(), card);
+    engine.upsert_card(card.clone());
+    let path = std::env::temp_dir().join(format!("kiro_archive_{}.json", std::process::id()));
+    engine.save_to_file(&path).unwrap();
+    engine.inject_persistence_fault(true);
+    assert!(engine
+        .set_card_archived(&card.id, true, "admin", "cleanup", NOW_SECS)
+        .is_err());
+    assert_eq!(engine.get_card(&card.id).unwrap(), card);
+    assert!(engine.ledger_entries().is_empty());
+    engine.inject_persistence_fault(false);
+    let mut archived = card.clone();
+    archived.archived_at = Some(NOW_SECS);
+    assert_eq!(
+        engine
+            .set_card_archived(&card.id, true, "admin", "cleanup", NOW_SECS)
+            .unwrap(),
+        archived
+    );
+    let restored = BillingEngine::new();
+    restored.load_from_file(&path).unwrap();
+    assert_eq!(restored.get_card(&card.id).unwrap(), archived);
+    assert_eq!(
+        restored
+            .set_card_archived(&card.id, true, "admin", "retry", NOW_SECS + 1)
+            .unwrap(),
+        archived
+    );
+    assert_eq!(restored.ledger_entries().len(), 1);
+    for _ in 0..2 {
+        assert_eq!(
+            restored
+                .set_card_archived(&card.id, false, "admin", "show again", NOW_SECS + 2)
+                .unwrap(),
+            card
+        );
+    }
+    assert!(restored.activate_card(&card.id, NOW_SECS + 3, 100).is_err());
+    let entries = restored.ledger_entries();
+    assert_eq!(entries.len(), 2);
+    for (entry, action, reason, time) in [
+        (&entries[0], "archive_card", "cleanup", NOW_SECS),
+        (&entries[1], "unarchive_card", "show again", NOW_SECS + 2),
+    ] {
+        assert_eq!(entry.exposed_model, action);
+        assert_eq!(entry.operator_id.as_deref(), Some("admin"));
+        assert_eq!(entry.reason.as_deref(), Some(reason));
+        assert_eq!(entry.ts_secs, time);
+        assert_eq!(entry.credits_charged, 0);
+    }
+    let reloaded = BillingEngine::new();
+    reloaded.load_from_file(&path).unwrap();
+    assert_eq!(reloaded.get_card(&card.id).unwrap(), card);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("json.anchor"));
+}
+
+#[test]
+fn test_archive_eligibility_and_reservations() {
+    let engine = BillingEngine::new();
+    for (index, status, until, allowed) in [
+        (0, CardStatus::Unactivated, None, false),
+        (1, CardStatus::Active, None, false),
+        (2, CardStatus::Frozen, None, false),
+        (3, CardStatus::Banned, None, true),
+        (4, CardStatus::Expired, None, true),
+        (5, CardStatus::Voided, None, true),
+        (6, CardStatus::Active, Some(NOW_SECS), true),
+        (7, CardStatus::Active, Some(NOW_SECS + 1), false),
+    ] {
+        for reserved in [0, 1] {
+            let mut card = Card::new(
+                format!("archive-{index}-{reserved}"),
+                "group-default",
+                100_000,
+            );
+            card.status = status;
+            card.valid_until = until;
+            card.credit_reserved = reserved;
+            engine.upsert_card(card.clone());
+            let before = engine.ledger_entries().len();
+            let result = engine.set_card_archived(&card.id, true, "admin", "cleanup", NOW_SECS);
+            if allowed && reserved == 0 {
+                let mut expected = card.clone();
+                expected.archived_at = Some(NOW_SECS);
+                assert_eq!(result.unwrap(), expected);
+                assert_eq!(
+                    engine
+                        .set_card_archived(&card.id, false, "admin", "restore visibility", NOW_SECS)
+                        .unwrap(),
+                    card
+                );
+                assert!(engine
+                    .get_card(&card.id)
+                    .unwrap()
+                    .check_active(NOW_SECS)
+                    .is_err());
+            } else {
+                assert!(result.is_err());
+                assert_eq!(engine.get_card(&card.id).unwrap(), card);
+                assert_eq!(engine.ledger_entries().len(), before);
+            }
+        }
+    }
+}

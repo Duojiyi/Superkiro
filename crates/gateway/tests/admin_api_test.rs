@@ -597,3 +597,197 @@ async fn tier_issuance_validates_catalog_group_and_single_device() {
         assert_eq!(card.max_devices, 1);
     }
 }
+
+#[tokio::test]
+async fn test_admin_void_auth_rejections_and_idempotent_audit() {
+    let (billing, app) = setup_admin_app();
+    for (id, status) in [
+        ("frozen", CardStatus::Frozen),
+        ("banned", CardStatus::Banned),
+    ] {
+        let mut card = Card::new(id, "group-admin", 100_000);
+        card.status = status;
+        billing.upsert_card(card);
+    }
+    for (id, key, expected) in [
+        ("card-admin-01", "invalid", StatusCode::UNAUTHORIZED),
+        ("card-admin-02", TEST_ADMIN_KEY, StatusCode::BAD_REQUEST),
+        ("frozen", TEST_ADMIN_KEY, StatusCode::BAD_REQUEST),
+        ("banned", TEST_ADMIN_KEY, StatusCode::BAD_REQUEST),
+        ("card-admin-01", TEST_ADMIN_KEY, StatusCode::OK),
+        ("card-admin-01", TEST_ADMIN_KEY, StatusCode::OK),
+    ] {
+        let before = billing.get_card(id).unwrap();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/admin/cards/status")
+            .header("x-admin-key", key)
+            .header("x-operator-id", "forged")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({"cardId": id, "action": "void", "reason": "misprint", "operatorId": "forged"}).to_string()))
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+        assert_eq!(response.status(), expected);
+        if expected == StatusCode::OK {
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["newStatus"], "voided");
+            assert_eq!(body["cardId"], id);
+        } else {
+            assert_eq!(billing.get_card(id).unwrap(), before);
+            assert!(billing.ledger_entries().is_empty());
+        }
+    }
+    for action in ["freeze", "unfreeze", "ban"] {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/admin/cards/status")
+            .header("x-admin-key", TEST_ADMIN_KEY)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"cardId": "card-admin-01", "action": action}).to_string(),
+            ))
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    let card = billing.get_card("card-admin-01").unwrap();
+    assert_eq!(card.status, CardStatus::Voided);
+    assert_eq!(card.credit_total, 10_000_000);
+    let ledger = billing.ledger_entries();
+    assert_eq!(ledger.len(), 1);
+    assert_eq!(ledger[0].operator_id.as_deref(), Some("admin"));
+    assert_eq!(ledger[0].reason.as_deref(), Some("misprint"));
+    assert_eq!(ledger[0].credits_charged, 0);
+}
+
+#[tokio::test]
+async fn test_admin_archive_list_and_unarchive_preserve_status() {
+    let (billing, app) = setup_admin_app();
+    billing.ban_card("card-admin-02", "test").unwrap();
+    for (action, archived) in [
+        ("archive", true),
+        ("archive", true),
+        ("unarchive", false),
+        ("unarchive", false),
+    ] {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/admin/cards/status")
+            .header("x-admin-key", TEST_ADMIN_KEY)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({"cardId": "card-admin-02", "action": action, "reason": "cleanup", "operatorId": "forged"}).to_string()))
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["newStatus"], "banned");
+        assert_eq!(body["archivedAt"].is_u64(), archived);
+        let req = Request::builder()
+            .uri("/api/v1/admin/cards")
+            .header("x-admin-key", TEST_ADMIN_KEY)
+            .body(Body::empty())
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let card = body["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == "card-admin-02")
+            .unwrap();
+        assert_eq!(card["archivedAt"].is_u64(), archived);
+        assert_eq!(card["status"], "banned");
+        assert_eq!(card["creditTotal"], 5_000_000);
+    }
+    let entries = billing.ledger_entries();
+    assert_eq!(entries.len(), 2);
+    assert!(entries
+        .iter()
+        .all(|e| e.operator_id.as_deref() == Some("admin") && e.credits_charged == 0));
+}
+
+#[tokio::test]
+async fn test_adjust_authenticated_operator_and_legacy_idempotency() {
+    let (billing, app) = setup_admin_app();
+    // Entries written before the handler used the authentication helper remain replayable.
+    billing
+        .adjust_balance_idempotent(
+            "card-admin-01",
+            1_000_000,
+            "admin",
+            "grant",
+            1,
+            Some("legacy-grant"),
+        )
+        .unwrap();
+    billing
+        .adjust_balance_idempotent(
+            "card-admin-01",
+            1_000_000,
+            "other-operator",
+            "grant",
+            1,
+            Some("other-grant"),
+        )
+        .unwrap();
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/admin/session")
+        .header("x-admin-key", TEST_ADMIN_KEY)
+        .body(Body::empty())
+        .unwrap();
+    let response = tower::ServiceExt::oneshot(app.clone(), request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let session: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let bearer = format!("Bearer {}", session["accessToken"].as_str().unwrap());
+
+    for (key, credential, expected) in [
+        ("new-grant", "invalid", StatusCode::UNAUTHORIZED),
+        ("legacy-grant", bearer.as_str(), StatusCode::OK),
+        ("new-grant", bearer.as_str(), StatusCode::OK),
+        ("new-grant", TEST_ADMIN_KEY, StatusCode::OK),
+        ("other-grant", bearer.as_str(), StatusCode::CONFLICT),
+    ] {
+        let auth_header = if credential.starts_with("Bearer ") {
+            "authorization"
+        } else {
+            "x-admin-key"
+        };
+        let request = Request::builder().method(Method::POST).uri("/api/v1/admin/cards/adjust")
+            .header(auth_header, credential)
+            .header("idempotency-key", key)
+            .header("x-operator-id", "other-operator")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({"cardId":"card-admin-01", "deltaPoints":1.0, "reason":"grant", "operatorId":"other-operator"}).to_string())).unwrap();
+        let response = tower::ServiceExt::oneshot(app.clone(), request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+    let entries = billing.ledger_entries();
+    assert_eq!(entries.len(), 3);
+    let entry = entries
+        .iter()
+        .find(|e| e.invocation_id.as_deref() == Some("new-grant"))
+        .unwrap();
+    assert_eq!(entry.operator_id.as_deref(), Some("admin"));
+    assert_eq!(entry.credits_charged, 1_000_000);
+    assert_eq!(
+        billing.get_card("card-admin-01").unwrap().credit_total,
+        13_000_000
+    );
+}

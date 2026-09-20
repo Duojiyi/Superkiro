@@ -42,6 +42,9 @@ for (const input of ['', '-1', 'NaN', 'Infinity', '1e3', '1.0000001', '900719925
   for (const [run, endpoint, expected] of [
     [() => api.adjustBalance('card-1', -10, 'refund'), '/cards/adjust', {cardId:'card-1',deltaPoints:-10,reason:'refund'}],
     [() => api.updateCardStatus('card-1', 'ban', 'abuse'), '/cards/status', {cardId:'card-1',action:'ban',reason:'abuse'}],
+    [() => api.updateCardStatus('card-2', 'void', 'unused inventory'), '/cards/status', {cardId:'card-2',action:'void',reason:'unused inventory'}],
+    [() => api.updateCardStatus('card-2', 'archive', 'cleanup'), '/cards/status', {cardId:'card-2',action:'archive',reason:'cleanup'}],
+    [() => api.updateCardStatus('card-2', 'unarchive', 'review'), '/cards/status', {cardId:'card-2',action:'unarchive',reason:'review'}],
     [() => api.createAnnouncement('notice', 'body', 'warning', 3600), '/announcements', {title:'notice',content:'body',level:'warning',ttlSecs:3600}],
     [() => api.updateProviderStatus('provider-1', false), '/providers/status', {providerId:'provider-1',enabled:false}],
     [() => api.pruneTraces(123), '/traces/prune', {cutoffSecs:123}],
@@ -103,6 +106,9 @@ for (const input of ['', '-1', 'NaN', 'Infinity', '1e3', '1.0000001', '900719925
  const old={operator:'admin',cardId:'card-1',delta:0.0000001,reason:'legacy',key:'old-zero-micro'};
  const values=new Map([['superkiro.pending-adjustment.v1:admin',JSON.stringify(old)]]),storage={getItem:k=>values.get(k)??null,setItem:(k,v)=>values.set(k,v),removeItem:k=>values.delete(k)};
  assert(isZeroMicroAdjustment(loadAdjustment(storage,'admin')));
+ assert(isUnsubmittedAdjustmentRejection(400,'Invalid billing state: cannot adjust a voided card',old));
+ assert.equal(isUnsubmittedAdjustmentRejection(409,'Invalid billing state: cannot adjust a voided card',old),false);
+ assert.equal(isUnsubmittedAdjustmentRejection(400,'Invalid billing state: unknown',old),false);
  assert.throws(()=>saveAdjustment({...storage,getItem:()=>null},old));
  saveAdjustment(storage,old); // Exact legacy retries remain recoverable; UI offers explicit zero-micro clear.
  const message='Invalid balance adjustment: Adjustment delta cannot be zero';

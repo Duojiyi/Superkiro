@@ -545,8 +545,13 @@ fn usage_output(usage: Value) -> Value {
     json!({"success":true,"settledUsage":settled,"usage":safe_usage})
 }
 
+fn unbind_gateway(session_gateway: Option<&str>, body: &Value) -> Result<String, String> {
+    gateway(session_gateway.or(body["gateway_url"].as_str()))
+}
+
 fn confirmed_restore_stop(
     body: &Value,
+    pending: bool,
     stop: impl FnOnce() -> Result<(), patch_engine::process::ProcessError>,
 ) -> Result<(), String> {
     if body.get("close_kiro_confirmed").and_then(Value::as_bool) != Some(true) {
@@ -554,13 +559,16 @@ fn confirmed_restore_stop(
             "Explicit close_kiro_confirmed: true is required to close Kiro and restore".into(),
         );
     }
-    stop().map_err(|e| format!("Cannot stop Kiro for restore: {e}"))
+    if pending {
+        stop().map_err(|e| format!("Cannot stop Kiro for restore: {e}"))?;
+    }
+    Ok(())
 }
 
 pub async fn dispatch(host: &Host, path: &str, method: &str, body: Value) -> Result<Value, String> {
     if matches!(
         path.split('?').next(),
-        Some("/api/doctor" | "/api/verify-card" | "/api/activate")
+        Some("/api/doctor" | "/api/verify-card" | "/api/activate" | "/api/unbind")
     ) {
         gateway_certificates()?;
     }
@@ -582,7 +590,7 @@ pub async fn dispatch(host: &Host, path: &str, method: &str, body: Value) -> Res
                 "kiro_version":install.as_ref().map(|i| &i.version),"has_snapshot":SnapshotManager::default().has_active_snapshot(),
                 "recovery_pending":recovery_pending(),"authenticated":token_readable && session.as_ref().is_some_and(|s| s.authenticated()),"gateway_url":session.as_ref().and_then(|s| s.gateway()),"suggested_gateway_url":gateway,
                 "portal_url":format!("{gateway}/"),"platform":if cfg!(windows) {"win32"} else if cfg!(target_os="macos") {"darwin"} else {"linux"},
-                "model_service_available":null,"tray_available":true,"memory_maintenance":host.maintenance.lock().map_err(|_| "Maintenance state unavailable")?.clone(),"app_version":env!("CARGO_PKG_VERSION")}),
+                "model_service_available":null,"tray_available":true,"memory_maintenance":host.maintenance.lock().map_err(|_| "Maintenance state unavailable")?.clone(),"app_version":env!("SUPERKIRO_BUILD_VERSION")}),
             )
         }
         ("GET", "/api/usage") => Ok(usage_output(DesktopSession::system()?.usage().await?)),
@@ -635,16 +643,26 @@ pub async fn dispatch(host: &Host, path: &str, method: &str, body: Value) -> Res
             Ok(json!({"success":true}))
         }
         ("POST", "/api/restore") => {
-            confirmed_restore_stop(&body, patch_engine::process::stop_kiro_for_restore)?;
+            confirmed_restore_stop(
+                &body,
+                recovery_pending(),
+                patch_engine::process::stop_kiro_for_restore,
+            )?;
             DesktopSession::system()?.restore_and_logout(&SnapshotManager::default())?;
             Ok(json!({"success":true}))
         }
         ("POST", "/api/unbind") => {
             let card = body["card_key"].as_str().unwrap_or("");
             validate_card(card)?;
-            confirmed_restore_stop(&body, patch_engine::process::stop_kiro_for_restore)?;
-            DesktopSession::system()?
-                .unbind(&SnapshotManager::default(), card.trim())
+            let session = DesktopSession::system()?;
+            let target = unbind_gateway(session.gateway().as_deref(), &body)?;
+            confirmed_restore_stop(
+                &body,
+                recovery_pending(),
+                patch_engine::process::stop_kiro_for_restore,
+            )?;
+            session
+                .unbind_with_gateway(&SnapshotManager::default(), card.trim(), &target)
                 .await?;
             Ok(json!({"success":true}))
         }
@@ -679,6 +697,13 @@ pub async fn dispatch(host: &Host, path: &str, method: &str, body: Value) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn restore_without_local_changes_never_stops_official_kiro() {
+        confirmed_restore_stop(&json!({"close_kiro_confirmed":true}), false, || {
+            panic!("verification-only sessions must not close Kiro")
+        })
+        .unwrap();
+    }
     #[test]
     fn rejects_unsafe_gateways() {
         for value in [
@@ -1209,12 +1234,13 @@ mod restore_confirmation_tests {
             json!({"close_kiro_confirmed":1}),
             json!({"close_kiro_confirmed":null}),
         ] {
-            assert!(
-                confirmed_restore_stop(&body, || panic!("must not stop without consent")).is_err()
-            );
+            assert!(confirmed_restore_stop(&body, true, || panic!(
+                "must not stop without consent"
+            ))
+            .is_err());
         }
         let called = std::cell::Cell::new(false);
-        confirmed_restore_stop(&json!({"close_kiro_confirmed":true}), || {
+        confirmed_restore_stop(&json!({"close_kiro_confirmed":true}), true, || {
             called.set(true);
             Ok(())
         })
@@ -1224,7 +1250,7 @@ mod restore_confirmation_tests {
 
     #[test]
     fn failed_stop_prevents_restore() {
-        let result = confirmed_restore_stop(&json!({"close_kiro_confirmed":true}), || {
+        let result = confirmed_restore_stop(&json!({"close_kiro_confirmed":true}), true, || {
             Err(patch_engine::process::ProcessError::UnknownState)
         })
         .map(|_| -> Result<(), String> { panic!("must not restore after failed stop") });
@@ -1253,5 +1279,35 @@ mod restore_confirmation_tests {
         }
         drop(host);
         std::fs::remove_dir(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod client_contract_tests {
+    use super::*;
+    #[test]
+    fn unbind_gateway_honors_explicit_target_and_saved_session() {
+        assert_eq!(
+            unbind_gateway(None, &json!({"gateway_url":"https://a.example"})).unwrap(),
+            "https://a.example"
+        );
+        for supplied in [
+            "https://b.example",
+            "http://unsafe.example",
+            "https://user:secret@a.example",
+        ] {
+            assert_eq!(
+                unbind_gateway(Some("https://a.example"), &json!({"gateway_url":supplied}))
+                    .unwrap(),
+                "https://a.example"
+            );
+        }
+        for supplied in [
+            "http://unsafe.example",
+            "https://user:secret@a.example",
+            "https://a.example?secret=1",
+        ] {
+            assert!(unbind_gateway(None, &json!({"gateway_url":supplied})).is_err());
+        }
     }
 }

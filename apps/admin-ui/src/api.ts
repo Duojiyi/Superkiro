@@ -62,6 +62,7 @@ export interface AdminCardItem {
   boundDevices: string[];
   maxDevices: number;
   activatedAt?: number;
+  archivedAt?: number | null;
   validUntil?: number;
   groupId: string;
   note?: string;
@@ -229,7 +230,7 @@ export class AdminApiClient {
 
   async updateCardStatus(
     cardId: string,
-    action: 'freeze' | 'unfreeze' | 'ban',
+    action: 'freeze' | 'unfreeze' | 'ban' | 'void' | 'archive' | 'unarchive',
     reason?: string
   ): Promise<AdminCardStatusResponse> {
     return this.request('/api/v1/admin/cards/status', {

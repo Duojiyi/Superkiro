@@ -87,6 +87,8 @@ const server=http.createServer(async(req,res)=>{
     // Unstaged price edits never silently disappear behind a successful publish.
     await nav('模型与定价');await page.getByLabel('选择价格版本模板').selectOption('fixture-price-0');
     await page.getByLabel('新版本 ID',{exact:true}).fill('fixture-new-price');await page.getByLabel('生效时间（本地时区）').fill('2030-01-01T10:00');
+    // The legacy fixture omits the version multiplier; enter it explicitly like an administrator.
+    await page.getByLabel('价格版本扣费倍率（1 = 不加倍）',{exact:true}).fill('1');
     await page.getByLabel('采购计价币种').selectOption('USD');
     for(const name of ['采购输入价格','采购输出价格','采购缓存读取价格','采购缓存写入价格'])await page.getByLabel(name+'（计价货币 / 百万 Tokens）',{exact:true}).fill('1');
     await page.getByLabel('变更原因',{exact:true}).fill('test new price');
@@ -95,7 +97,7 @@ const server=http.createServer(async(req,res)=>{
     await nav('确认并发布');await page.getByRole('status').filter({hasText:'价格编辑尚未加入发布草稿'}).waitFor();
     assert.equal(publishBodies.length,0);assert.equal(await page.getByLabel('新版本 ID',{exact:true}).inputValue(),'fixture-new-price');
     await nav('加入价格草稿');page.once('dialog',d=>d.accept());await nav('确认并发布');
-    await page.getByRole('status').filter({hasText:'发布成功'}).waitFor();assert.equal(publishBodies.length,1);assert.equal(publishBodies[0].versions[0].id,'fixture-new-price');
+    await page.getByRole('status').filter({hasText:'发布成功'}).waitFor();assert.equal(publishBodies.length,1);assert.equal(publishBodies[0].versions[0].id,'fixture-new-price');assert.equal(publishBodies[0].versions[0].margin_multiplier,1);
     console.log('PASS: definite insufficient-balance rejection clears only uncommitted intent; another card remains editable; unstaged prices block publish without losing inputs; staged version is submitted');
     assert.deepEqual(errors,[]);
     console.log('PASS: committed issuance lost response locks across reload; failed review cannot unlock; successful review never submits; saved Key remount uses latest permissions; same-Key edit preserves dirty guard; trace details receive focus');

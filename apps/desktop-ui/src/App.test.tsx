@@ -672,3 +672,69 @@ describe('memory sampling invalidation',()=>{
   expect(screen.queryByRole('button',{name:'打开 Kiro ↗'})).toBeNull();
  });
 });
+
+
+describe('verification-only account operations',()=>{
+ it.each(['切换卡密','解除设备绑定'])('%s does not claim to close an untouched IDE',async(action)=>{
+  setup(true);HTMLDialogElement.prototype.showModal=function(){this.open=true;};
+  render(<App/>);await login();
+  fireEvent.click(screen.getByRole('button',{name:/设置/}));
+  fireEvent.change(screen.getByLabelText('设置分组'),{target:{value:'account'}});
+  fireEvent.click(screen.getByRole('button',{name:action}));
+  expect(screen.getByRole('dialog').textContent).toContain('不会关闭 Kiro 或修改官方配置');
+  if(action==='解除设备绑定')fireEvent.change(screen.getByLabelText('当前卡密'),{target:{value:'secret-card'}});
+  fireEvent.submit(document.querySelector('dialog form')!);
+  await screen.findByLabelText('输入你的卡密');
+  expect(invoke.mock.calls.some(([,p])=>p.path===(action==='切换卡密'?'/api/restore':'/api/unbind'))).toBe(true);
+  if(action==='解除设备绑定')expect(invoke.mock.calls.find(([,p])=>p.path==='/api/unbind')?.[1].body.gateway_url).toBe('https://example.com');
+ });
+});
+
+ it('renders only safe auth categories and bounded retry hints',()=>{
+  expect(safeError('[connection:authenticate] Authentication rejected: 403 - [auth:device-binding] remote-secret [retry-after:60]')).toBe('[connection:authenticate] 设备绑定不匹配，请先解除原设备绑定。 请在 60 秒后重试。');
+  expect(safeError('[auth:locked-out] remote-secret [retry-after:86401]')).toBe('认证暂时锁定，请稍后重试。');
+  expect(safeError('[auth:remote-secret] remote-secret')).not.toContain('remote-secret');
+ });
+
+it('offers manual upgrade guidance and opens the official download section',async()=>{
+ setup(true);const original=invoke.getMockImplementation()!;
+ invoke.mockImplementation(async(c,p)=>{const result=await original(c,p);return p.path==='/api/status'?{...result,app_version:'0.1.0-preview.123456789abc'}:result;});
+ HTMLDialogElement.prototype.showModal=function(){this.open=true;};
+ render(<App/>);await login();fireEvent.click(screen.getByRole('button',{name:'设置'}));
+ fireEvent.change(screen.getByLabelText('设置分组'),{target:{value:'account'}});
+ expect(screen.getByText(/升级前请保存工作/).textContent).toContain('还原失败时请保留备份');
+ fireEvent.click(screen.getByRole('button',{name:'版本信息'}));
+ expect(screen.getByRole('dialog').textContent).toContain('0.1.0-preview.123456789abc');
+ fireEvent.submit(document.querySelector('dialog form')!);
+ fireEvent.click(screen.getByRole('button',{name:'下载新版 ↗'}));
+ await waitFor(()=>expect(invoke).toHaveBeenCalledWith('native',{method:'open_external',args:['https://kiro.rent/#downloads']}));
+});
+it('retains a restarted session gateway for unbind after restoration',async()=>{
+ setup(true);const original=invoke.getMockImplementation()!;let restored=false;
+ invoke.mockImplementation(async(c,p)=>{
+  if(p.path==='/api/restore')restored=true;
+  const result=await original(c,p);
+  return p.path==='/api/status'?{...result,authenticated:!restored,has_snapshot:!restored,...(!restored?{gateway_url:'https://custom.example'}:{})}:result;
+ });
+ HTMLDialogElement.prototype.showModal=function(){this.open=true;};render(<App/>);
+ await screen.findByRole('button',{name:'还原 Kiro 配置'});
+ await waitFor(()=>expect(invoke.mock.calls.some(([,p])=>p.path==='/api/usage')).toBe(true));
+ fireEvent.click(screen.getByRole('button',{name:'还原 Kiro 配置'}));fireEvent.submit(document.querySelector('dialog form')!);
+ await screen.findByText('Kiro 配置已还原，当前卡密与积分信息已保留。');
+ fireEvent.click(screen.getByRole('button',{name:'设置'}));fireEvent.change(screen.getByLabelText('设置分组'),{target:{value:'account'}});
+ fireEvent.click(screen.getByRole('button',{name:'解除设备绑定'}));fireEvent.change(screen.getByLabelText('当前卡密'),{target:{value:'secret-card'}});fireEvent.submit(document.querySelector('dialog form')!);
+ await waitFor(()=>expect(invoke.mock.calls.find(([,p])=>p.path==='/api/unbind')?.[1].body.gateway_url).toBe('https://custom.example'));
+});
+
+it('keeps recovery evidence and gives actionable support guidance after restore failure',async()=>{
+ setup(true);const original=invoke.getMockImplementation()!;
+ invoke.mockImplementation((c,p)=>p.path==='/api/restore'?Promise.reject(new Error('ExtensionChanged')):original(c,p));
+ HTMLDialogElement.prototype.showModal=function(){this.open=true;};render(<App/>);await login();
+ fireEvent.click(screen.getByRole('button',{name:'设置'}));fireEvent.change(screen.getByLabelText('设置分组'),{target:{value:'account'}});
+ fireEvent.click(screen.getByRole('button',{name:'切换卡密'}));fireEvent.submit(document.querySelector('dialog form')!);
+ await screen.findByRole('heading',{name:'恢复未完成'});
+ expect(screen.getByText(/保留本机快照/).textContent).toContain('不要公开上传');
+ expect(screen.getByText(/通过官网支持渠道/).textContent).toContain('尚未完成真实 IDE');
+ fireEvent.click(screen.getByRole('button',{name:'查看连接诊断'}));
+ expect(screen.getByRole('button',{name:'重新检测 ↻'})).toBeTruthy();
+});

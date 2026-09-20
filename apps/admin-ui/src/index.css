@@ -153,3 +153,48 @@ tbody tr + tr td {border-top:1px solid #e8ecf1 !important;}
 @media(max-width:700px) {.table-hint {display:block;}}
 
 .card-note {display:block; max-width:300px; white-space:normal; overflow-wrap:anywhere; margin-top:6px; font-size:11px;}
+
+/* Model price editor: independent full-width layout, never nested in shared two-column forms. */
+.pricing-editor .pricing-heading {display:flex; justify-content:space-between; align-items:center; gap:16px;}
+.pricing-editor .pricing-heading h3, .pricing-editor .pricing-heading h4 {margin:0 0 6px; font-weight:650;}
+.pricing-editor .pricing-heading h4 {font-size:16px;}
+.pricing-editor p {margin:0; font-size:13px;}
+.pricing-editor .pricing-badge {flex-shrink:0; background:#edf5f0; color:#39816d; padding:5px 10px; border-radius:6px; font-size:12px;}
+.pricing-editor .pricing-template {display:flex; align-items:center; flex-wrap:wrap; gap:16px 24px; margin:18px 0 24px;}
+.pricing-editor .pricing-template > label {min-width:260px;}
+.pricing-editor details {font-size:13px; color:#667085; max-width:540px;}
+.pricing-editor summary {cursor:pointer;}
+.pricing-editor details p {margin-top:8px;}
+.pricing-editor .pricing-form {display:grid; grid-template-columns:minmax(0,1fr); gap:24px; min-width:0; padding:0; border:0;}
+.pricing-editor .pricing-grid {display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:16px; align-items:start;}
+.pricing-editor label {display:grid; gap:7px; min-width:0; font-size:13px; color:#475467;}
+.pricing-editor input, .pricing-editor select {width:100%; min-width:0; box-sizing:border-box;}
+.pricing-editor .pricing-rates small {font-size:11px; line-height:1.6; overflow-wrap:anywhere;}
+.pricing-editor .pricing-preview {grid-column:1 / -1; padding:20px; border:1px solid #dce9e1; border-radius:12px; background:#f6faf7;}
+.pricing-editor .pricing-tokens {margin-top:16px;}
+.pricing-editor .pricing-formula {margin:14px 0 10px; color:#667085; font-size:12px;}
+.pricing-editor .pricing-result {display:flex; align-items:baseline; flex-wrap:wrap; gap:4px 8px; padding:12px 16px; border-radius:8px; background:#e5f0e9; color:#25624e;}
+.pricing-editor .pricing-result strong {font-size:22px; line-height:1.4; font-variant-numeric:tabular-nums; overflow-wrap:anywhere;}
+.pricing-editor .pricing-result-error {background:#fff2e7; color:#8b5228;}
+.pricing-editor .pricing-footnote {margin-top:10px; font-size:12px; color:#667085;}
+.pricing-editor .pricing-procurement {grid-column:1 / -1; padding-top:20px; border-top:1px solid #e5e8eb;}
+.pricing-editor .pricing-procurement .pricing-heading {margin-bottom:16px;}
+.pricing-editor .pricing-procurement .pricing-heading > label {min-width:130px;}
+.pricing-editor .pricing-actions {display:flex; align-items:center; flex-wrap:wrap; gap:12px;}
+.pricing-editor .pricing-actions span {font-size:12px;}
+@media(max-width:1100px) and (min-width:701px) {
+  .pricing-editor .pricing-meta, .pricing-editor .pricing-rates, .pricing-editor .pricing-procurement .pricing-grid {grid-template-columns:repeat(2,minmax(0,1fr));}
+}
+@media(max-width:700px) {
+  .pricing-editor .pricing-grid {grid-template-columns:minmax(0,1fr);}
+  .pricing-editor .pricing-heading {align-items:flex-start; flex-wrap:wrap;}
+  .pricing-editor .pricing-template {display:grid; grid-template-columns:minmax(0,1fr);}
+  .pricing-editor .pricing-template > label {min-width:0;}
+  .pricing-editor .pricing-preview {padding:16px;}
+  .pricing-editor .pricing-result strong {font-size:19px;}
+  .pricing-editor .pricing-procurement .pricing-heading > label {width:100%;}
+}
+
+@media(min-width:701px) {
+  .pricing-editor .pricing-procurement .pricing-grid label {grid-template-rows:minmax(40px,auto) auto;}
+}

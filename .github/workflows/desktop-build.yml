@@ -11,6 +11,7 @@ on:
     branches: [main]
 env:
   CARGO_BUILD_JOBS: 2
+  SUPERKIRO_BUILD_REVISION: ${{ github.sha }}
 permissions:
   contents: read
 jobs:

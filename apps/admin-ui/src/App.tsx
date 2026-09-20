@@ -115,7 +115,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
   const navigate=(tab:Tab)=>{if(cardBulkBusy)return;if(tab===activeTab)return;if(!mayLeaveProvider())return;if(commercialDirty.current&&!window.confirm('离开将丢弃未发布的配置草稿，继续吗？'))return;commercialDirty.current=false;providerDirty.current=false;setActiveTab(tab);};
 
   // Interactive state
-  const [cardStatusFilter, setCardStatusFilter] = useState('ALL');
+  const [cardStatusFilter, setCardStatusFilter] = useState('CURRENT');
   const [searchQuery, setSearchQuery] = useState('');
   const [cardPage, setCardPage] = useState(0);
   const [selectedCardIds, setSelectedCardIds] = useState<string[]>([]);
@@ -313,12 +313,21 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
     }finally{writing.current=false;setMutationBusy(false);}
   };
 
-  const handleCardBulk = async (action: 'freeze' | 'unfreeze' | 'ban' | 'export') => {
+  const handleCardBulk = async (action: 'freeze' | 'unfreeze' | 'ban' | 'void' | 'archive' | 'unarchive' | 'export') => {
     if (writing.current || cardBulkBusy || loading || mutationBusy || revealing) return;
     const targets = pageCards.filter(card => selectedCardIds.includes(card.id));
     if (!targets.length) return;
-    const label = {freeze: '冻结', unfreeze: '解冻', ban: '封禁', export: '导出明文卡密'}[action];
-    if (!window.confirm(`确认仅对已选 ${targets.length} 张卡密执行${label}？${action === 'export' ? '下载文件包含秘密，请妥善保管。' : '状态操作可能中断使用，请核对选择。'}`)) return;
+    if (action === 'void') {
+      if (!operator) {setActionError('请先重新登录确认调账账户，再删除卡密；本次未发送删除请求。'); return;}
+      try {
+        const pending = operator ? loadAdjustment(sessionStorage, operator) : null;
+        if (pending && targets.some(card => card.id === pending.cardId)) {
+          setActionError(`卡 ${pending.cardId} 有未确认调账，请先核对原调账，再删除；本次未发送删除请求。`); return;
+        }
+      } catch {setActionError('调账恢复记录无法读取，请先核对账本；本次未发送删除请求。'); return;}
+    }
+    const label = {freeze: '冻结', unfreeze: '解冻', ban: '封禁', void: '删除（永久作废）', archive: '归档', unarchive: '取消归档', export: '导出明文卡密'}[action];
+    if (!window.confirm(`确认仅对已选 ${targets.length} 张卡密执行${label}？${action === 'export' ? '下载文件包含秘密，请妥善保管。' : action === 'void' ? '仅未激活卡密可删除；删除后不可恢复或使用，余额将不可使用，财务与审计记录保留。其他状态会跳过，请核对选择。' : action === 'archive' || action === 'unarchive' ? '仅改变管理列表展示，不解封、不续期、不修改余额或历史账本。只有已封禁、已到期或已作废的卡密可归档。' : '状态操作可能中断使用，请核对选择。'}`)) return;
     writing.current = true; setCardBulkBusy(true); setCardBulkResults([]); setActionError('');
     const results: Array<{id: string; result: string}> = [];
     const codes: string[] = [];
@@ -334,10 +343,13 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
             if (!response.success || !response.rawCode) throw new Error('reveal failed');
             codes.push(response.rawCode);
           } else {
-            if ((action === 'freeze' && card.status !== 'active') || (action === 'unfreeze' && card.status !== 'frozen') || (action === 'ban' && card.status === 'banned')) {
+            if ((action === 'archive' && (card.archivedAt != null || !(['banned', 'expired', 'voided'].includes(card.status) || (card.validUntil != null && card.validUntil <= Date.now() / 1000)))) || (action === 'unarchive' && card.archivedAt == null)) {
+              failedIds.push(card.id); results.push({id: card.id, result: '未执行：不符合归档条件或已是目标状态'}); continue;
+            }
+            if ((action === 'freeze' && card.status !== 'active') || (action === 'unfreeze' && card.status !== 'frozen') || (action === 'ban' && ['banned', 'voided'].includes(card.status)) || (action === 'void' && card.status !== 'unactivated')) {
               failedIds.push(card.id); results.push({id: card.id, result: '未执行：当前状态不适用该操作'}); continue;
             }
-            const response = await adminApi.updateCardStatus(card.id, action, `管理员批量操作: ${action}`);
+            const response = await adminApi.updateCardStatus(card.id, action, `管理员批量操作：${label}`);
             if (!response.success) throw new Error('status failed');
           }
           results.push({id: card.id, result: action === 'export' ? '读取成功' : `${label}成功`});
@@ -402,7 +414,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
       }
     } catch (err: any) {
       if(sent&&adjustment.current&&err instanceof AdminApiError&&isUnsubmittedAdjustmentRejection(err.status,err.message,adjustment.current)){
-        try{clearAdjustment(sessionStorage,adjustment.current);adjustment.current=null;setActionError('服务端明确拒绝调账，未入账；已清除该无效意图，请检查可用余额并更正金额。');return;}catch{setActionError('该调账未入账，但本地记录未能清除，请检查浏览器存储。');return;}
+        try{clearAdjustment(sessionStorage,adjustment.current);adjustment.current=null;setActionError('服务端明确拒绝调账，未入账；已清除该无效意图，请检查卡密状态、账面余额与调账金额。');return;}catch{setActionError('该调账未入账，但本地记录未能清除，请检查浏览器存储。');return;}
       }
       setActionError(`${sent?'调账结果未确认':'尚未发送调账'}：${err.message}。请核对原意图；重试仍需手动确认。`);
     } finally {adjusting.current=false;setMutationBusy(false);}
@@ -531,7 +543,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
   useEffect(() => {setSelectedCardIds([]);}, [cardPage]);
   const filteredCards = cards.filter((c) => {
     if (groupFilter !== 'ALL' && c.groupId !== groupFilter) return false;
-    if (cardStatusFilter !== 'ALL' && c.status.toUpperCase() !== cardStatusFilter.toUpperCase()) {
+    if ((cardStatusFilter === 'CURRENT' && (c.status === 'voided' || c.archivedAt != null)) || (cardStatusFilter === 'ARCHIVED' && c.archivedAt == null) || (!['ALL', 'CURRENT', 'ARCHIVED'].includes(cardStatusFilter) && c.status.toUpperCase() !== cardStatusFilter.toUpperCase())) {
       return false;
     }
     if (searchQuery) {
@@ -601,11 +613,11 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
                     onChange={(e) => setCardStatusFilter(e.target.value)}
                     className="px-3 py-1.5 bg-white border border-[#E5E8E5] rounded text-xs text-[#23272B]"
                   >
-                    <option value="ALL">全部状态</option>
+                    <option value="CURRENT">工作列表（未删除、未归档）</option><option value="ARCHIVED">已归档记录</option><option value="ALL">全部状态（含已删除、已归档）</option>
                     <option value="ACTIVE">已激活</option>
                     <option value="UNACTIVATED">未激活</option>
                     <option value="FROZEN">已冻结</option>
-                    <option value="BANNED">已封禁</option><option value="EXPIRED">已到期</option><option value="VOIDED">已作废</option>
+                    <option value="BANNED">已封禁</option><option value="EXPIRED">已到期</option><option value="VOIDED">已删除（作废记录）</option>
                   </select>
                 </div>
                 <div className="flex gap-2">
@@ -619,12 +631,22 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
                 </div>
               </div>
 
+              {adjustment.current && <section className="notice-panel" aria-label="未确认调账恢复"><p>卡 {adjustment.current.cardId} 有未确认调账。即使原卡已被删除或归档，也可使用原幂等键核对，不会创建第二笔调账。</p><button disabled={cardBulkBusy || mutationBusy || loading} onClick={() => {
+                try {
+                  if (!operator) return;
+                  const saved = loadAdjustment(sessionStorage, operator);
+                  if (!saved) {adjustment.current = null; setActionError('未找到待核对意图，请刷新列表。'); return;}
+                  const card = cards.find(item => item.id === saved.cardId);
+                  if (!card) {setActionError('未读取到原卡记录，请刷新或人工核对账本；原意图仍保留。'); return;}
+                  adjustment.current = saved; setSelectedCard(card); setAdjustAmount(String(saved.delta)); setAdjustReason(saved.reason); setShowAdjustModal(true);
+                } catch {setActionError('调账恢复记录无法读取，请人工核对账本；未发送请求。');}
+              }}>核对未确认调账</button></section>}
               <section className="panel" aria-label="批量卡密管理">
                 <p>已选 {selectedCardIds.length} 张卡密 · 批量操作仅针对当前页所选卡密。</p>
-                <p className="muted">导出的文件包含完整卡密，请妥善保管。筛选、翻页或刷新后需重新选择。</p><div className="actions">
+                <p className="muted">删除仅适用于未激活卡密，执行永久作废并保留财务记录。已使用卡密请先封禁；封禁或到期记录可归档清理，取消归档不会恢复授权。列表与总量统计保留已作废、归档卡的账面余额，不代表可消费积分。导出文件包含完整卡密，请妥善保管。筛选、翻页或刷新后需重新选择。</p><div className="actions">
                   <button disabled={cardBulkBusy || loading || !pageCards.length} onClick={() => setSelectedCardIds(pageCards.map(card => card.id))}>当前页全选</button>
                   <button disabled={cardBulkBusy || !selectedCardIds.length} onClick={() => setSelectedCardIds([])}>清空选择</button>
-                  {(['freeze', 'unfreeze', 'ban', 'export'] as const).map(action => <button className={action === 'ban' ? 'danger' : action === 'export' ? 'primary' : 'secondary'} key={action} disabled={cardBulkBusy || loading || mutationBusy || revealing || !selectedCardIds.length} onClick={() => void handleCardBulk(action)}>{{freeze: '批量冻结', unfreeze: '批量解冻', ban: '批量封禁', export: '导出已选卡密'}[action]}</button>)}
+                  {(['freeze', 'unfreeze', 'ban', 'void', 'archive', 'unarchive', 'export'] as const).map(action => <button className={(action === 'ban' || action === 'void') ? 'danger' : action === 'export' ? 'primary' : 'secondary'} key={action} disabled={cardBulkBusy || loading || mutationBusy || revealing || !selectedCardIds.length} onClick={() => void handleCardBulk(action)}>{{freeze: '批量冻结', unfreeze: '批量解冻', ban: '批量封禁', void: '批量删除（未激活）', archive: '批量归档', unarchive: '取消归档', export: '导出已选卡密'}[action]}</button>)}
                 </div>
                 {cardBulkBusy && <p role="status">正在逐项处理，请勿重复提交…</p>}
                 {!!cardBulkResults.length && <div aria-label="批量操作结果" role="status"><p>本次逐项结果（不含卡密明文）：</p>{cardBulkResults.map(item => <p key={item.id}>{item.id}：{item.result}</p>)}</div>}
@@ -636,7 +658,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
                   <tr>
                     <th className="p-3">选择</th><th className="p-3">卡密 ID</th>
                     <th className="p-3">所属分组</th>
-                    <th className="p-3">总积分 / 余额</th>
+                    <th className="p-3">总积分 / 账面余额</th>
                     <th className="p-3">到期时间 / 设备绑定</th>
                     <th className="p-3">状态</th>
                     <th className="p-3">操作</th>
@@ -670,8 +692,9 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
                             <span className="px-2 py-0.5 bg-[#FBEAE5] text-[#B94B39] border border-rose-800 rounded">已封禁</span>
                           )}
                           {card.status === 'expired' && <span>已到期</span>}
+                          {card.archivedAt != null && <span className="muted"> · 已归档</span>}
                           {card.status === 'voided' && (
-                            <span className="px-2 py-0.5 bg-zinc-800 text-zinc-400 border border-zinc-700 rounded">已作废</span>
+                            <span className="px-2 py-0.5 bg-zinc-800 text-zinc-400 border border-zinc-700 rounded">已删除（作废）</span>
                           )}
                         </td>
                         <td className="p-3 space-x-2">
@@ -681,8 +704,10 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
                             catch (err: any) {setActionError(`查看失败：${err.message}`);} finally {setRevealing(false);}
                           }}>{card.codeRecoverable ? '查看卡密' : '无可用明文'}</button>{!card.codeRecoverable && <small className="block muted">此卡未保留明文，请查阅原发放记录。</small>}
                           <button
+                            disabled={card.status === 'voided' || cardBulkBusy || mutationBusy}
+                            title={card.status === 'voided' ? '已删除卡密不可调账，请通过账本查看作废记录' : '调整积分并保留账本记录'}
                             onClick={() => {
-                              if(cardBulkBusy)return;
+                              if(cardBulkBusy || card.status === 'voided')return;
                               if(!operator){setActionError('请先重新登录确认调账账户。');return;}
                               try{
                                 const saved=loadAdjustment(sessionStorage,operator);
@@ -710,7 +735,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
                               解冻
                             </button>
                           )}
-                          {card.status !== 'banned' && (
+                          {!['banned', 'voided'].includes(card.status) && (
                             <button
                               disabled={cardBulkBusy || mutationBusy} onClick={() => handleCardStatus(card.id, 'ban')}
                               className="danger"

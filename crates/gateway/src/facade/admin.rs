@@ -4,7 +4,7 @@
 //! - `GET /api/v1/admin/me`: verify admin auth credentials
 //! - `GET /api/v1/admin/stats`: system overview and financial metrics
 //! - `GET /api/v1/admin/cards`: query cards with filtering
-//! - `POST /api/v1/admin/cards/status`: freeze, unfreeze, or ban cards (persisted)
+//! - `POST /api/v1/admin/cards/status`: freeze, unfreeze, ban, void, archive, or unarchive cards (persisted)
 //! - `POST /api/v1/admin/cards/adjust`: manual balance adjustment (persisted)
 //! - `POST /api/v1/admin/cards/batch`: batch generate cards from template
 //! - `GET /api/v1/admin/announcements`: list announcements
@@ -169,6 +169,11 @@ impl AdminAuthState {
     /// `new_production()` and therefore never accepts it on data endpoints.
     pub fn verify(&self, headers: &axum::http::HeaderMap) -> bool {
         self.verify_session(headers) || (self.legacy_key_allowed && self.verify_bootstrap(headers))
+    }
+
+    /// Both browser sessions and legacy credentials authenticate the sole admin account.
+    pub fn authenticated_operator(&self, headers: &axum::http::HeaderMap) -> Option<&'static str> {
+        self.verify(headers).then_some("admin")
     }
 
     pub fn issue_session(&self, ttl_secs: u64) -> Result<AdminSessionResponse, String> {
@@ -1074,6 +1079,7 @@ pub struct AdminCardItem {
     pub points_available: f64,
     pub bound_devices: Vec<String>,
     pub max_devices: u32,
+    pub archived_at: Option<u64>,
     pub activated_at: Option<u64>,
     pub valid_until: Option<u64>,
     pub group_id: String,
@@ -1128,6 +1134,7 @@ impl FacadeHandler for AdminCardsHandler {
                     points_available: (c.available_credits() as f64) / micro,
                     bound_devices: c.bound_devices,
                     max_devices: c.max_devices,
+                    archived_at: c.archived_at,
                     activated_at: c.activated_at,
                     valid_until: c.valid_until,
                     group_id: c.group_id,
@@ -1157,7 +1164,7 @@ impl FacadeHandler for AdminCardsHandler {
 #[serde(rename_all = "camelCase")]
 pub struct AdminCardStatusRequest {
     pub card_id: String,
-    pub action: String, // "freeze" | "unfreeze" | "ban"
+    pub action: String, // "freeze" | "unfreeze" | "ban" | "void" | "archive" | "unarchive"
     pub reason: Option<String>,
 }
 
@@ -1177,9 +1184,9 @@ impl FacadeHandler for AdminCardStatusHandler {
 
     fn handle<'a>(&'a self, req: Request<Body>) -> BoxFuture<'a, Response> {
         Box::pin(async move {
-            if !self.auth.verify(req.headers()) {
+            let Some(operator_id) = self.auth.authenticated_operator(req.headers()) else {
                 return unauthorized_response();
-            }
+            };
 
             let bytes = match axum::body::to_bytes(req.into_body(), 64 * 1024).await {
                 Ok(b) => b,
@@ -1211,16 +1218,27 @@ impl FacadeHandler for AdminCardStatusHandler {
             }
 
             let res = match req_data.action.as_str() {
-                "freeze" => self.billing.freeze_card(card_id, &reason).map(|_| "frozen"),
-                "unfreeze" => self.billing.unfreeze_card(card_id).map(|_| "active"),
-                "ban" => self.billing.ban_card(card_id, &reason).map(|_| "banned"),
+                "freeze" => self.billing.freeze_card(card_id, &reason),
+                "unfreeze" => self.billing.unfreeze_card(card_id),
+                "ban" => self.billing.ban_card(card_id, &reason),
+                "void" => {
+                    self.billing
+                        .void_unactivated_card(card_id, operator_id, &reason, now_secs())
+                }
+                "archive" | "unarchive" => self.billing.set_card_archived(
+                    card_id,
+                    req_data.action == "archive",
+                    operator_id,
+                    &reason,
+                    now_secs(),
+                ),
                 _ => {
                     return (
                         StatusCode::BAD_REQUEST,
                         [(header::CONTENT_TYPE, "application/json")],
                         axum::Json(serde_json::json!({
                             "success": false,
-                            "error": "Invalid action: must be 'freeze', 'unfreeze', or 'ban'",
+                            "error": "Invalid action: must be 'freeze', 'unfreeze', 'ban', 'void', 'archive', or 'unarchive'",
                         })),
                     )
                         .into_response();
@@ -1228,12 +1246,13 @@ impl FacadeHandler for AdminCardStatusHandler {
             };
 
             match res {
-                Ok(new_status) => json_response(
+                Ok(card) => json_response(
                     StatusCode::OK,
                     &serde_json::json!({
                         "success": true,
                         "cardId": card_id,
-                        "newStatus": new_status,
+                        "newStatus": card.status,
+                        "archivedAt": card.archived_at,
                     }),
                 ),
                 Err(e) => (
@@ -1277,9 +1296,9 @@ impl FacadeHandler for AdminCardAdjustHandler {
 
     fn handle<'a>(&'a self, req: Request<Body>) -> BoxFuture<'a, Response> {
         Box::pin(async move {
-            if !self.auth.verify(req.headers()) {
+            let Some(operator_id) = self.auth.authenticated_operator(req.headers()) else {
                 return unauthorized_response();
-            }
+            };
 
             if !self.billing.persistence_ready() {
                 return (
@@ -1380,7 +1399,7 @@ impl FacadeHandler for AdminCardAdjustHandler {
             match self.billing.adjust_balance_idempotent(
                 &req_data.card_id,
                 delta_credits,
-                "admin",
+                operator_id,
                 &reason,
                 now,
                 Some(idempotency_key),

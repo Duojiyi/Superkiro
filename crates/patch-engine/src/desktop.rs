@@ -77,20 +77,26 @@ impl DesktopSession {
     /// Fetch account usage without exposing credentials to the webview.
     pub async fn usage(&self) -> Result<serde_json::Value, String> {
         let _lock = self.lock()?;
-        let session = self.load()?;
+        let mut session = self.load()?;
         if !session.authenticated {
             return Err("Not authenticated".into());
         }
         let gateway =
             crate::patch::validate_gateway_url(&session.gateway).map_err(|e| e.to_string())?;
         let token = if self.storage.is_expired(60) {
-            AuthClient::with_ca(self.storage.clone(), session.ca_path.as_deref())
+            match AuthClient::with_ca(self.storage.clone(), session.ca_path.as_deref())
                 .refresh(&gateway)
                 .await
-                .map_err(|_| {
-                    "Authorization expired; refresh failed. Reconnect or retry when online."
-                        .to_string()
-                })?
+            {
+                Ok(token) => token,
+                Err(error) => {
+                    if error.is_authorization_rejected() {
+                        session.authenticated = false;
+                        self.save(&session)?;
+                    }
+                    return Err(error.to_string());
+                }
+            }
         } else {
             self.storage
                 .load()
@@ -107,7 +113,12 @@ impl DesktopSession {
             .await
             .map_err(|_| "Cloud balance refresh failed".to_string())?;
         if !response.status().is_success() {
-            return Err(format!("Cloud balance HTTP {}", response.status().as_u16()));
+            let error = crate::auth::AuthClientError::from_response(response).await;
+            if error.is_authorization_rejected() {
+                session.authenticated = false;
+                self.save(&session)?;
+            }
+            return Err(error.to_string());
         }
         crate::http::bounded_json(response, 1024 * 1024).await
     }
@@ -284,6 +295,9 @@ impl DesktopSession {
 
     pub fn restore_and_logout(&self, snapshots: &SnapshotManager) -> Result<(), String> {
         let _lock = self.lock()?;
+        if !self.recovery_pending() && !snapshots.has_active_snapshot() {
+            return Ok(());
+        }
         crate::ensure_kiro_stopped()?;
         if snapshots.has_active_snapshot() {
             snapshots.restore_official().map_err(|e| e.to_string())?;
@@ -311,14 +325,43 @@ impl DesktopSession {
         Ok(())
     }
     pub async fn unbind(&self, snapshots: &SnapshotManager, card: &str) -> Result<(), String> {
+        let gateway = self.load()?.gateway;
+        self.unbind_with_gateway(snapshots, card, &gateway).await
+    }
+    /// Cloud device bindings outlive local restoration. A verified card can
+    /// unbind this device without recreating takeover state or touching the IDE.
+    pub async fn unbind_with_gateway(
+        &self,
+        snapshots: &SnapshotManager,
+        card: &str,
+        fallback_gateway: &str,
+    ) -> Result<(), String> {
         let _lock = self.lock()?;
-        crate::ensure_kiro_stopped()?;
         if card.trim().is_empty() || card.chars().count() > 256 {
             return Err("Re-enter the card key to unbind this device".into());
         }
-        let session = self.load()?;
-        AuthClient::with_ca(self.storage.clone(), session.ca_path.as_deref())
-            .unbind(&session.gateway, card, &session.device)
+        let session = if self.recovery_pending() {
+            Some(self.load()?)
+        } else {
+            None
+        };
+        if session.is_some() || snapshots.has_active_snapshot() {
+            crate::ensure_kiro_stopped()?;
+        }
+        let device = session
+            .as_ref()
+            .map(|s| s.device.clone())
+            .unwrap_or_else(|| crate::generate_device_fingerprint(None));
+        let gateway = session
+            .as_ref()
+            .map(|s| s.gateway.as_str())
+            .unwrap_or(fallback_gateway);
+        let client = match &session {
+            Some(session) => AuthClient::with_ca(self.storage.clone(), session.ca_path.as_deref()),
+            None => AuthClient::new(self.storage.clone()),
+        };
+        client
+            .unbind(gateway, card, &device)
             .await
             .map_err(|e| e.to_string())?;
         let cleanup = (|| {
@@ -336,6 +379,54 @@ mod tests {
     use super::*;
     use axum::{routing::post, Json, Router};
     use serde_json::{json, Value};
+
+    #[tokio::test]
+    async fn unbind_after_local_restore_preserves_official_token() {
+        let root =
+            std::env::temp_dir().join(format!("unbind-without-session-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let storage = TokenStorage::at(root.join("token.json"));
+        fs::write(storage.path(), b"official-token-bytes").unwrap();
+        let desktop = DesktopSession::new(storage.clone(), root.join("session.json"));
+        let snapshots = SnapshotManager::at(root.join("snapshot.json"));
+        let app = Router::new()
+            .route(
+                "/api/v1/portal/challenge",
+                post(|| async { Json(json!({"challengeToken":"fixture"})) }),
+            )
+            .route(
+                "/api/v1/portal/unbind",
+                post(|Json(body): Json<Value>| async move {
+                    assert_eq!(body["card"], "test-card");
+                    assert_eq!(body["device"], crate::generate_device_fingerprint(None));
+                    assert_eq!(body["challenge_token"], "fixture");
+                    Json(json!({"success":true}))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        desktop.restore_and_logout(&snapshots).unwrap();
+        desktop
+            .unbind_with_gateway(&snapshots, "test-card", &gateway)
+            .await
+            .unwrap();
+        assert_eq!(fs::read(storage.path()).unwrap(), b"official-token-bytes");
+        assert!(!desktop.recovery_pending());
+        assert!(!snapshots.has_active_snapshot());
+        // Corrupt recovery state must never be bypassed via the fallback gateway.
+        fs::write(&desktop.path, b"invalid-json").unwrap();
+        assert!(desktop
+            .unbind_with_gateway(&snapshots, "test-card", &gateway)
+            .await
+            .is_err());
+        assert_eq!(fs::read(storage.path()).unwrap(), b"official-token-bytes");
+        server.abort();
+        let _ = server.await;
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn audit_credentials_restore_exact_bytes_and_legacy_sessions() {
@@ -492,6 +583,77 @@ mod tests {
             let _ = fs::remove_file(root.join(name));
         }
         let _ = fs::remove_dir(root);
+    }
+
+    #[tokio::test]
+    async fn client_contract_usage_denial_preserves_recovery_but_invalidates_authorization() {
+        for refresh in [false, true] {
+            for status in [401, 403, 429, 503, 0] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let app = Router::new().fallback(move || async move {
+                    (
+                        axum::http::StatusCode::from_u16(status).unwrap(),
+                        Json(json!({"__type":"AccessDeniedException","message":"remote-secret"})),
+                    )
+                });
+                let server = if status == 0 {
+                    drop(listener);
+                    None
+                } else {
+                    Some(tokio::spawn(async move {
+                        axum::serve(listener, app).await.unwrap();
+                    }))
+                };
+                let root = std::env::temp_dir().join(format!(
+                    "client-contract-{}-{refresh}-{status}",
+                    std::process::id()
+                ));
+                let storage = TokenStorage::at(root.join("token.json"));
+                let desktop = DesktopSession::new(storage.clone(), root.join("session.json"));
+                storage
+                    .save(&KiroAuthToken::new(
+                        "access",
+                        "refresh",
+                        "profile",
+                        if refresh {
+                            "2020-01-01T00:00:00Z"
+                        } else {
+                            "2099-01-01T00:00:00Z"
+                        },
+                    ))
+                    .unwrap();
+                desktop
+                    .save(&Session {
+                        gateway: format!("http://{address}"),
+                        device: "test".into(),
+                        previous_token: Some(PreviousToken::Raw(b"official-backup".to_vec())),
+                        authenticated: true,
+                        ca_path: None,
+                    })
+                    .unwrap();
+                assert!(desktop.usage().await.is_err());
+                let reopened = DesktopSession::new(storage.clone(), root.join("session.json"));
+                assert_eq!(reopened.authenticated(), status != 401 && status != 403);
+                assert!(reopened.recovery_pending());
+                assert!(
+                    matches!(reopened.load().unwrap().previous_token, Some(PreviousToken::Raw(v)) if v == b"official-backup")
+                );
+                assert_eq!(storage.load().unwrap().access_token, "access");
+                assert_eq!(storage.load().unwrap().refresh_token, "refresh");
+                if let Some(server) = server {
+                    server.abort();
+                    let _ = server.await;
+                }
+                if status == 401 || status == 403 {
+                    assert_eq!(reopened.usage().await.unwrap_err(), "Not authenticated");
+                }
+                for name in ["token.json", "session.json", "session.session-lock"] {
+                    fs::remove_file(root.join(name)).unwrap();
+                }
+                fs::remove_dir(root).unwrap();
+            }
+        }
     }
 
     #[tokio::test]
@@ -696,6 +858,19 @@ mod persistent_ca_tests {
             .unbind(
                 &SnapshotManager::at(root.join("snapshot.json")),
                 "test-card",
+            )
+            .await
+            .unwrap();
+        assert!(!desktop.recovery_pending());
+        assert!(!storage.exists());
+        // This helper runs in its own child process. Once restored, unbinding
+        // must use the host's configured CA rather than silently dropping it.
+        std::env::set_var("KIRO_GATEWAY_CA_CERT", &ca);
+        desktop
+            .unbind_with_gateway(
+                &SnapshotManager::at(root.join("snapshot.json")),
+                "test-card",
+                &gateway,
             )
             .await
             .unwrap();

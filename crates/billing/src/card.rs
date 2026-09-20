@@ -68,6 +68,9 @@ pub struct Card {
     /// Status restored by unfreeze; absent on legacy snapshots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frozen_from: Option<CardStatus>,
+    /// Administrative visibility only; does not change authorization or balances.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<u64>,
     pub activated_at: Option<u64>,
     pub valid_until: Option<u64>,
     pub max_devices: u32,
@@ -105,6 +108,7 @@ impl Card {
             credit_reserved: 0,
             status: CardStatus::Unactivated,
             frozen_from: None,
+            archived_at: None,
             activated_at: None,
             valid_until: None,
             max_devices: 1,
@@ -144,6 +148,7 @@ impl Card {
             credit_reserved: 0,
             status: CardStatus::Unactivated,
             frozen_from: None,
+            archived_at: None,
             activated_at: None,
             valid_until: None,
             max_devices: 1,

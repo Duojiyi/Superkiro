@@ -109,6 +109,11 @@ jobs:
       - name: Portal UI Layout and Interaction Regressions
         run: python -B -m unittest -v test_superkiro_portal_ui
         working-directory: .
+      - name: Install Chinese Sans Font for Visual Checks
+        run: sudo apt-get update && sudo apt-get install -y fonts-noto-cjk
+      - name: Portal Pencil Alignment Regressions
+        run: python -B apps/portal-ui/test_pencil_alignment.py -v
+        working-directory: .
 
   security:
     name: Dependency Audit & Secret Scan

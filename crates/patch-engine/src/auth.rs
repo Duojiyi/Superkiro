@@ -22,13 +22,87 @@ pub enum AuthClientError {
     Storage(#[from] TokenStorageError),
 
     #[error("Authentication rejected: {status} - {message}")]
-    AuthRejected { status: u16, message: String },
+    AuthRejected {
+        status: u16,
+        code: &'static str,
+        retry_after: Option<u64>,
+        message: String,
+    },
 
     #[error("Token expired and no refresh token available")]
     NoRefreshToken,
 
     #[error("Invalid server response format: {0}")]
     InvalidResponse(String),
+}
+
+impl AuthClientError {
+    pub fn is_authorization_rejected(&self) -> bool {
+        matches!(
+            self,
+            Self::AuthRejected {
+                status: 401 | 403,
+                ..
+            }
+        )
+    }
+
+    pub(crate) async fn from_response(response: reqwest::Response) -> Self {
+        let status = response.status().as_u16();
+        // Only bounded delta-seconds are retained; never echo a raw header/body.
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v <= 86400);
+        let value = crate::http::bounded_json(response, 65536)
+            .await
+            .unwrap_or_default();
+        let category = value["code"]
+            .as_str()
+            .and_then(auth_category)
+            .or_else(|| value["__type"].as_str().and_then(auth_category));
+        let (code, text) = category.unwrap_or(match status {
+            429 => ("throttled", "Too many requests; retry later"),
+            500..=599 => ("server-error", "Service temporarily unavailable"),
+            _ => ("auth-rejected", "Gateway rejected authorization"),
+        });
+        let retry = retry_after
+            .map(|seconds| format!(" [retry-after:{seconds}]"))
+            .unwrap_or_default();
+        Self::AuthRejected {
+            status,
+            code,
+            retry_after,
+            message: format!("[auth:{code}] {text}{retry}"),
+        }
+    }
+}
+
+fn auth_category(code: &str) -> Option<(&'static str, &'static str)> {
+    Some(match code {
+        "UnrecognizedClientException" | "InvalidTokenException" | "invalid-card" => {
+            ("invalid-card", "Card or token is invalid")
+        }
+        "AccessDeniedException" | "access-denied" => ("access-denied", "Authorization is denied"),
+        "ExpiredTokenException" | "expired" => ("expired", "Authorization has expired"),
+        "DeviceBindingException" | "device-binding" => {
+            ("device-binding", "Device binding requires attention")
+        }
+        "ThrottlingException" | "throttled" => ("throttled", "Too many requests; retry later"),
+        "LockoutException" | "locked-out" => (
+            "locked-out",
+            "Authentication temporarily locked; retry later",
+        ),
+        "SerializationException" | "InvalidRequestException" | "invalid-request" => {
+            ("invalid-request", "Authentication request is invalid")
+        }
+        "InternalServerException" | "TokenGenerationException" | "server-error" => {
+            ("server-error", "Service temporarily unavailable")
+        }
+        _ => return None,
+    })
 }
 
 /// Request body sent to gateway `/oauth/token` endpoint.
@@ -175,13 +249,8 @@ impl AuthClient {
 
         let resp = self.http()?.post(&url).json(&req_body).send().await?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let err_text = "Gateway rejected authentication".to_string();
-            return Err(AuthClientError::AuthRejected {
-                status: status.as_u16(),
-                message: err_text,
-            });
+        if !resp.status().is_success() {
+            return Err(AuthClientError::from_response(resp).await);
         }
 
         let oauth_resp: GatewayOAuthResponse = resp
@@ -230,13 +299,8 @@ impl AuthClient {
 
         let resp = self.http()?.post(&url).json(&req_body).send().await?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let err_text = "Gateway rejected token refresh".to_string();
-            return Err(AuthClientError::AuthRejected {
-                status: status.as_u16(),
-                message: err_text,
-            });
+        if !resp.status().is_success() {
+            return Err(AuthClientError::from_response(resp).await);
         }
 
         let refresh_resp: GatewayRefreshResponse = resp
@@ -280,39 +344,35 @@ impl AuthClient {
     ) -> Result<(), AuthClientError> {
         let gateway = crate::patch::validate_gateway_url(gateway)
             .map_err(|e| AuthClientError::InvalidResponse(e.to_string()))?;
-        let challenge: serde_json::Value = self
+        let response = self
             .http()?
             .post(format!("{gateway}/api/v1/portal/challenge"))
             .json(&serde_json::json!({"action": "unbind"}))
             .send()
-            .await?
-            .error_for_status()
-            .map_err(|e| AuthClientError::AuthRejected {
-                status: e.status().map(|s| s.as_u16()).unwrap_or(502),
-                message: "Challenge rejected".into(),
-            })?
-            .json()
+            .await?;
+        if !response.status().is_success() {
+            return Err(AuthClientError::from_response(response).await);
+        }
+        let challenge = crate::http::bounded_json(response, 65536)
             .await
-            .map_err(|e| AuthClientError::InvalidResponse(e.to_string()))?;
+            .map_err(AuthClientError::InvalidResponse)?;
         let token = challenge
             .get("challengeToken")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .ok_or_else(|| AuthClientError::InvalidResponse("No unbind challenge".into()))?;
-        let result: serde_json::Value = self
+        let response = self
             .http()?
             .post(format!("{gateway}/api/v1/portal/unbind"))
             .json(&serde_json::json!({"card": card, "device": device, "challenge_token": token}))
             .send()
-            .await?
-            .error_for_status()
-            .map_err(|e| AuthClientError::AuthRejected {
-                status: e.status().map(|s| s.as_u16()).unwrap_or(502),
-                message: "Unbind rejected".into(),
-            })?
-            .json()
+            .await?;
+        if !response.status().is_success() {
+            return Err(AuthClientError::from_response(response).await);
+        }
+        let result = crate::http::bounded_json(response, 65536)
             .await
-            .map_err(|e| AuthClientError::InvalidResponse(e.to_string()))?;
+            .map_err(AuthClientError::InvalidResponse)?;
         if result.get("success").and_then(|v| v.as_bool()) != Some(true) {
             return Err(AuthClientError::InvalidResponse(
                 "Gateway did not confirm device unbind".into(),
@@ -360,5 +420,72 @@ mod initialization_tests {
             .await
             .unwrap_err();
         assert!(matches!(error, AuthClientError::Initialization(_)));
+    }
+}
+
+#[cfg(test)]
+mod client_contract_tests {
+    use super::*;
+    use axum::{routing::post, Json, Router};
+    #[tokio::test]
+    async fn rejection_retains_only_whitelisted_category_and_bounded_retry() {
+        for (field, category, retry, expected, seconds) in [
+            (
+                "code",
+                "DeviceBindingException",
+                "60",
+                "device-binding",
+                Some(60),
+            ),
+            (
+                "__type",
+                "ExpiredTokenException",
+                "86400",
+                "expired",
+                Some(86400),
+            ),
+            ("code", "remote-secret", "86401", "auth-rejected", None),
+            (
+                "code",
+                "LockoutException",
+                "remote-secret",
+                "locked-out",
+                None,
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = Router::new().route(
+                "/oauth/token",
+                post(move || async move {
+                    (
+                        axum::http::StatusCode::FORBIDDEN,
+                        [("retry-after", retry)],
+                        Json(serde_json::json!({field:category,"message":"remote-secret"})),
+                    )
+                }),
+            );
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let client = AuthClient::with_ca(TokenStorage::default(), None);
+            let error = client
+                .authenticate(&format!("http://{address}"), "test", Some("device"))
+                .await
+                .unwrap_err();
+            assert!(!error.to_string().contains("remote-secret"));
+            assert!(error.is_authorization_rejected());
+            match error {
+                AuthClientError::AuthRejected {
+                    code, retry_after, ..
+                } => {
+                    assert_eq!(code, expected);
+                    assert_eq!(retry_after, seconds);
+                }
+                other => panic!("{other}"),
+            }
+            server.abort();
+            let _ = server.await;
+        }
     }
 }

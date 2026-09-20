@@ -6,7 +6,7 @@
 //! and token issuance.
 
 use super::{error_response, json_response, BoxFuture, FacadeHandler, Response};
-use crate::auth::AuthState;
+use crate::auth::{AuthError, AuthState};
 use crate::security::BruteForceProtector;
 use axum::{
     body::Body,
@@ -362,6 +362,12 @@ impl FacadeHandler for OAuthTokenHandler {
     }
 }
 
+// Reuse the access-token contract: fixed messages, no card existence/status details.
+fn refresh_auth_error(error: AuthError) -> Response {
+    let (status, kind, message) = error.to_aws_error();
+    error_response(status, kind, &message)
+}
+
 /// Handler for `POST /refreshToken`
 #[derive(Clone, Default)]
 pub struct RefreshTokenHandler {
@@ -443,63 +449,31 @@ impl FacadeHandler for RefreshTokenHandler {
             let (claims, access_token, rotated_refresh_token) =
                 match auth_state.rotate_refresh_token(&raw_rt, 3600, 30 * 86400) {
                     Ok(pair) => pair,
-                    Err(_) => {
-                        return error_response(
-                            StatusCode::UNAUTHORIZED,
-                            "InvalidTokenException",
-                            "Malformed or invalid refresh token",
-                        );
-                    }
+                    Err(error) => return refresh_auth_error(error),
                 };
             let card_id = claims.card_id;
             let expected_version = claims.token_version;
 
             let card = match engine.get_card(&card_id) {
                 Some(c) => c,
-                None => {
-                    return error_response(
-                        StatusCode::UNAUTHORIZED,
-                        "CardNotFoundException",
-                        "Card not found",
-                    );
-                }
+                None => return refresh_auth_error(AuthError::CardNotFound(card_id)),
             };
 
-            // The refresh helper already checked status/version; retain this
-            // explicit check for a clear handler-level invariant.
-            if card.status != CardStatus::Active {
-                return error_response(
-                    StatusCode::UNAUTHORIZED,
-                    "AccessDeniedException",
-                    &format!("Card is {:?}", card.status),
-                );
-            }
-
+            // Retain the post-rotation check without disclosing live card state.
             let now_secs = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-
-            if let Some(valid_until) = card.valid_until {
-                if now_secs >= valid_until {
-                    return error_response(
-                        StatusCode::UNAUTHORIZED,
-                        "ExpiredTokenException",
-                        "Card validity has expired",
-                    );
-                }
+            if card.status != CardStatus::Active
+                || card.valid_until.is_some_and(|until| now_secs >= until)
+            {
+                return refresh_auth_error(AuthError::CardInactive(card_id));
             }
-
-            // Check token_version against card
             if card.token_version != expected_version {
-                return error_response(
-                    StatusCode::UNAUTHORIZED,
-                    "TokenRevokedException",
-                    &format!(
-                        "Token version mismatch: v{} != card v{} (revoked)",
-                        expected_version, card.token_version
-                    ),
-                );
+                return refresh_auth_error(AuthError::TokenRevoked {
+                    token_version: expected_version,
+                    card_version: card.token_version,
+                });
             }
 
             let profile_arn = format!(

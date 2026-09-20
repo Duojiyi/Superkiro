@@ -282,7 +282,8 @@ async fn test_portal_web_page_html_endpoint() {
         .unwrap()
         .contains("text/html"));
 
-    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+    // The standalone page embeds licensed font subsets; keep a bounded 256 KiB budget.
+    let bytes = axum::body::to_bytes(resp.into_body(), 256 * 1024)
         .await
         .unwrap();
     let html_str = String::from_utf8(bytes.to_vec()).unwrap();

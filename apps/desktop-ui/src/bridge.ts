@@ -1,6 +1,6 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
 export interface Authorization { virtualPlanName?: string; remainingPoints?: number; totalPoints?: number; validUntil?: number; isExpired?: boolean; status?: string }
-export interface Status { authenticated?: boolean; has_snapshot?: boolean; recovery_pending?: boolean; kiro_installed?: boolean; kiro_version?: string; kiro_install_path?: string; process_state?: string; model_service_available?: boolean | null; portal_url?: string; platform?: string; app_version?: string; authorization?: Authorization; tray_available?: boolean; memory_maintenance?: Maintenance }
+export interface Status { gateway_url?: string; authenticated?: boolean; has_snapshot?: boolean; recovery_pending?: boolean; kiro_installed?: boolean; kiro_version?: string; kiro_install_path?: string; process_state?: string; model_service_available?: boolean | null; portal_url?: string; platform?: string; app_version?: string; authorization?: Authorization; tray_available?: boolean; memory_maintenance?: Maintenance }
 export interface Usage { usage?: { availableCredits?:number|null; usageBreakdownList?: {dimensionType: string; currentUsageWithPrecision: number; usageLimitWithPrecision: number}[]; virtualPlanName?: string; validUntil?: number; isExpired?: boolean }; settledUsage?: {windowStart?: string|number; windowEnd?: string|number; timezone?: string; totalTokens?: number; todayPoints?: number; todayTokens?: number; referencePrice?: number; daily?: {date: string; points?: number; tokens?: number; usd?: number}[]; models?: {name: string; tokens?: number; points?: number}[]} }
 export interface Memory { total_memory_mb?: number; total_process_count?: number; ide_memory_mb?: number; agent_memory_mb?: number; success_count?: number; failed_count?: number }
 export const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0;
@@ -11,6 +11,18 @@ export function safeError(error: unknown) {
   const text = error instanceof Error ? error.message : String(error);
   if(/MacBundleNameUnsupported|macOS.*Kiro\.app/.test(text))return 'macOS 暂仅支持保留官方包名 Kiro.app 的安装，请恢复官方包名后重新选择。';
   const stage = /^\[connection:(preflight|launch-prepare|authenticate|close|apply|launch)\]/.exec(text)?.[1];
+  const auth = /\[auth:([a-z-]+)\]/.exec(text)?.[1];
+  const authMessages: Record<string,string> = {
+    'invalid-card':'卡密或凭据无效，请重新验证。', 'access-denied':'授权被拒绝，请检查卡密状态及权限。',
+    expired:'授权已到期，请重新验证或更换卡密。', 'device-binding':'设备绑定不匹配，请先解除原设备绑定。',
+    throttled:'请求过于频繁，请稍后重试。', 'locked-out':'认证暂时锁定，请稍后重试。',
+    'invalid-request':'认证请求无效，请检查输入。', 'server-error':'授权服务暂时不可用，请稍后重试。',
+    'auth-rejected':'网关拒绝授权，请检查卡密和设备状态。',
+  };
+  if(auth && Object.hasOwn(authMessages,auth)) {
+    const retry = /\[retry-after:(\d{1,5})\]/.exec(text)?.[1];
+    return (stage ? `[connection:${stage}] ` : '') + authMessages[auth] + (retry && Number(retry)<=86400 ? ` 请在 ${Number(retry)} 秒后重试。` : '');
+  }
   if (stage) {
     const messages: Record<string,string> = {
       preflight:'连接前检查失败，请查看诊断中的安装、网关和配置检查结果。',

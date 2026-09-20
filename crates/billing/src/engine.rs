@@ -2685,6 +2685,11 @@ impl BillingEngine {
             .get_mut(card_id)
             .ok_or_else(|| BillingError::CardNotFound(card_id.to_string()))?;
 
+        if card.status == CardStatus::Voided {
+            return Err(BillingError::InvalidState(
+                "cannot ban a voided card".into(),
+            ));
+        }
         card.status = CardStatus::Banned;
         let prev_note = card.note.as_deref().unwrap_or("");
         card.note = Some(
@@ -2872,7 +2877,17 @@ impl BillingEngine {
             .get_mut(card_id)
             .ok_or_else(|| BillingError::CardNotFound(card_id.to_string()))?;
 
-        if card.status != CardStatus::Unactivated {
+        // The state lock serializes retries, including concurrent batch callers.
+        if card.status == CardStatus::Voided {
+            return Ok(card.clone());
+        }
+        if card.status != CardStatus::Unactivated
+            || card.activated_at.is_some()
+            || card.valid_until.is_some()
+            || card.credit_used != 0
+            || card.credit_reserved != 0
+            || !card.bound_devices.is_empty()
+        {
             return Err(BillingError::CannotVoidActivatedCard {
                 card_id: card_id.to_string(),
                 current_status: card.status,
@@ -2897,6 +2912,101 @@ impl BillingEngine {
             exposed_model: "void_card".to_string(),
             provider_id: "system".to_string(),
             target_model: "void_card".to_string(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            credits_charged: 0,
+            provider_cost_micro_cny: 0,
+            rate_card_version: None,
+            ts_secs: now_secs,
+            operator_id: Some(op.to_string()),
+            reason: Some(res.to_string()),
+        };
+        candidate.ledger.push(entry.clone());
+        let updated_card = card.clone();
+
+        self.commit_candidate_snapshot(&candidate, || {
+            self.cards
+                .write()
+                .unwrap()
+                .insert(card_id.to_string(), updated_card.clone());
+            self.ledger.write().unwrap().push(entry);
+            updated_card
+        })
+    }
+
+    /// Archive visibility metadata only, preserving card status and the financial ledger.
+    pub fn set_card_archived(
+        &self,
+        card_id: &str,
+        archived: bool,
+        operator_id: &str,
+        reason: &str,
+        now_secs: u64,
+    ) -> Result<Card, BillingError> {
+        let op = operator_id.trim();
+        if op.is_empty() {
+            return Err(BillingError::InvalidAdjustment(
+                "Operator ID is required to archive/unarchive card".to_string(),
+            ));
+        }
+        let res = reason.trim();
+        if res.is_empty() {
+            return Err(BillingError::InvalidAdjustment(
+                "Reason is required to archive/unarchive card".to_string(),
+            ));
+        }
+
+        let _state_guard = self.state_lock.write().unwrap();
+        let sequence = self
+            .snapshot_sequence
+            .load(Ordering::Acquire)
+            .saturating_add(1);
+        let previous_checksum = self.last_snapshot_checksum.read().unwrap().clone();
+        let mut candidate = self.export_snapshot_locked(sequence, previous_checksum);
+
+        let card = candidate
+            .cards
+            .get_mut(card_id)
+            .ok_or_else(|| BillingError::CardNotFound(card_id.to_string()))?;
+
+        if card.archived_at.is_some() == archived {
+            return Ok(card.clone());
+        }
+        if archived
+            && (card.credit_reserved != 0
+                || !(matches!(
+                    card.status,
+                    CardStatus::Banned | CardStatus::Expired | CardStatus::Voided
+                ) || card.valid_until.is_some_and(|until| now_secs >= until)))
+        {
+            return Err(BillingError::InvalidState(
+                "only banned, expired, or voided cards without reservations can be archived".into(),
+            ));
+        }
+        card.archived_at = archived.then_some(now_secs);
+        let action = if archived {
+            "archive_card"
+        } else {
+            "unarchive_card"
+        };
+
+        let adjustment_id = format!(
+            "{}-{}-{}-{}",
+            action,
+            card_id,
+            now_secs,
+            candidate.ledger.len()
+        );
+        let entry = LedgerEntry {
+            id: format!("ledger-{}", adjustment_id),
+            card_id: card_id.to_string(),
+            kind: LedgerKind::Adjustment,
+            invocation_id: Some(adjustment_id),
+            exposed_model: action.to_string(),
+            provider_id: "system".to_string(),
+            target_model: action.to_string(),
             input_tokens: 0,
             output_tokens: 0,
             cache_creation_tokens: 0,
@@ -3420,6 +3530,11 @@ impl BillingEngine {
             .get_mut(card_id)
             .ok_or_else(|| BillingError::CardNotFound(card_id.to_string()))?;
 
+        if card.status == CardStatus::Voided {
+            return Err(BillingError::InvalidState(
+                "cannot adjust a voided card".into(),
+            ));
+        }
         if delta_micro_credits > 0 {
             card.credit_total = card.credit_total.saturating_add(delta_micro_credits);
         } else {
