@@ -588,6 +588,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
 
   useEffect(() => {setSelectedCardIds([]); setCardPage(0);}, [searchQuery, groupFilter, cardStatusFilter, activeTab]);
   useEffect(() => {setSelectedCardIds([]);}, [cardPage]);
+  const changeCardFilter = (update: () => void) => {setSelectedCardIds([]); setCardPage(0); update();};
   const filteredCards = cards.filter((c) => {
     if (groupFilter !== 'ALL' && c.groupId !== groupFilter) return false;
     if ((cardStatusFilter === 'CURRENT' && (c.status === 'voided' || c.archivedAt != null)) || (cardStatusFilter === 'ARCHIVED' && c.archivedAt == null) || (!['ALL', 'CURRENT', 'ARCHIVED'].includes(cardStatusFilter) && c.status.toUpperCase() !== cardStatusFilter.toUpperCase())) {
@@ -600,7 +601,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
     return true;
   });
   const cardFiltersChanged = !!searchQuery || groupFilter !== 'ALL' || cardStatusFilter !== 'CURRENT';
-  const resetCardFilters = () => {setSearchQuery(''); setGroupFilter('ALL'); setCardStatusFilter('CURRENT'); setCardPage(0);};
+  const resetCardFilters = () => {setSelectedCardIds([]); setSearchQuery(''); setGroupFilter('ALL'); setCardStatusFilter('CURRENT'); setCardPage(0);};
   const pageCount = Math.max(1, Math.ceil(filteredCards.length / 50));
   const currentCardPage = Math.min(cardPage, pageCount - 1);
   const pageCards = filteredCards.slice(currentCardPage * 50, (currentCardPage + 1) * 50);
@@ -654,13 +655,13 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
                     type="text"
                     disabled={cardBulkBusy} aria-label="搜索卡密" placeholder="搜索卡密 ID / 备注 / 设备标识"
                     value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
+                    onChange={(e) => changeCardFilter(() => setSearchQuery(e.target.value))}
                     className="px-3 py-1.5 bg-white border border-[#E5E8E5] rounded text-xs text-[#23272B]"
                   /></label>
-                  <label>模型与计费分组<select disabled={cardBulkBusy} aria-label="分组筛选" value={groupFilter} onChange={e => setGroupFilter(e.target.value)}><option value="ALL">全部分组</option>{Array.from(new Set(cards.map(c => c.groupId))).map(id => <option key={id} value={id}>{String(cardGroups.find(group => group.id === id)?.name ?? id)} · {id}</option>)}</select></label>
+                  <label>模型与计费分组<select disabled={cardBulkBusy} aria-label="分组筛选" value={groupFilter} onChange={e => changeCardFilter(() => setGroupFilter(e.target.value))}><option value="ALL">全部分组</option>{Array.from(new Set(cards.map(c => c.groupId))).map(id => <option key={id} value={id}>{String(cardGroups.find(group => group.id === id)?.name ?? id)} · {id}</option>)}</select></label>
                   <label>卡密状态<select disabled={cardBulkBusy} aria-label="状态筛选"
                     value={cardStatusFilter}
-                    onChange={(e) => setCardStatusFilter(e.target.value)}
+                    onChange={(e) => changeCardFilter(() => setCardStatusFilter(e.target.value))}
                     className="px-3 py-1.5 bg-white border border-[#E5E8E5] rounded text-xs text-[#23272B]"
                   >
                     <option value="CURRENT">工作列表（未删除、未归档）</option><option value="ARCHIVED">已归档记录</option><option value="ALL">全部状态（含已删除、已归档）</option>

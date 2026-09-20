@@ -75,8 +75,11 @@ async function waitFor(ready) {
 
     await page.getByRole('checkbox').first().check();
     await page.getByLabel('搜索卡密', {exact: true}).fill('  FIXTURE-CARD-0  ');
+    const filteredCardCheckbox = page.getByRole('checkbox', {name: '选择卡密 fixture-card-0', exact: true});
+    await filteredCardCheckbox.waitFor();
+    await page.waitForFunction(() => !document.querySelector('input[aria-label="选择卡密 fixture-card-0"]')?.checked);
     assert.equal(await page.getByRole('checkbox').count(), 1);
-    assert(!(await page.getByRole('checkbox').first().isChecked()));
+    assert(!(await filteredCardCheckbox.isChecked()));
     assert((await page.getByLabel('分组筛选').locator('option').allTextContents()).includes('PRO · fixture-group-0'));
     await page.getByLabel('分组筛选').selectOption('fixture-group-1');
     await page.getByText('没有符合当前筛选条件的卡密。', {exact: true}).waitFor();
