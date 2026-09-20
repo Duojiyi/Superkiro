@@ -40,6 +40,7 @@ pub struct BillingSettings {
     /// USD to CNY exchange rate (e.g. 7.25).
     pub usd_cny_rate: f64,
     /// Unix timestamp when the exchange rate was updated.
+    #[serde(default)]
     pub rate_updated_at_secs: u64,
 }
 

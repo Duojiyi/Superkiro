@@ -4,7 +4,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const assert = require('node:assert/strict');
-const root = path.resolve(__dirname, '../.build-check');
+const root = path.resolve(__dirname, '../dist');
 const output = path.resolve(__dirname, '../visual-check');
 fs.mkdirSync(output, {recursive: true});
 const server = http.createServer((req, res) => {
@@ -24,38 +24,18 @@ const server = http.createServer((req, res) => {
     page.on('pageerror', e => errors.push(e.message));
     await page.route('**/*', route => new URL(route.request().url()).hostname === '127.0.0.1' ? route.continue() : route.abort());
     await page.goto(`http://127.0.0.1:${server.address().port}/admin/`);
-    const pages = [['overview', '运营概览'], ['cards', '卡密资产'], ['groups', '分组与权益'], ['providers', '供应商与 Key'], ['pricing', '模型与定价'], ['trace', '调用追踪'], ['finance', '财务对账'], ['security', '安全与审计'], ['announcements', '公告管理']];
-    for (const [id, name] of pages) {
-      await page.getByRole('navigation').getByRole('button', {name, exact: true}).click();
-      await page.getByRole('heading', {name, exact: true, level: 2}).waitFor();
-      await page.screenshot({path: path.join(output, `${id}-desktop.png`), fullPage: true});
-      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `${id} desktop overflow`);
-    }
-    await page.getByRole('navigation').getByRole('button', {name: '模型与定价', exact: true}).click();
-    await page.getByText('高级配置 JSON · 新增条目与价格版本', {exact: true}).click();
-    for (const value of ['null', '{"models":{}}', '{"models":[null,1]}', '{']) {
-      await page.getByRole('textbox', {name: '配置 JSON', exact: true}).fill(value);
-      await page.waitForTimeout(30);
-      assert.equal(await page.getByRole('heading', {name: '模型与定价', exact: true, level: 2}).count(), 1);
-    }
-    await page.getByRole('navigation').getByRole('button', {name: '卡密资产', exact: true}).click();
-    await page.getByRole('button', {name: '＋ 批量生成', exact: true}).click();
-    const modal = page.locator('.fixed.inset-0');
-    const options = await modal.getByRole('combobox', {name: '积分套餐'}).locator('option').allTextContents();
-    assert.deepEqual(options, ['PRO · 1,000 积分 · 单设备', 'PRO+ · 2,000 积分 · 单设备', 'PRO Max · 5,000 积分 · 单设备', 'Power · 10,000 积分 · 单设备']);
-    await page.screenshot({path: path.join(output, 'card-creation-desktop.png')});
-    await modal.getByRole('button', {name: '取消', exact: true}).click();
-    await page.getByRole('button', {name: '管理员登录', exact: true}).click();
-    assert.equal(await page.locator('input[type=password]').count(), 1);
-    await page.screenshot({path: path.join(output, 'authentication-desktop.png')});
-    await page.locator('.fixed.inset-0').getByRole('button', {name: '取消', exact: true}).click();
-    await page.setViewportSize({width: 390, height: 844});
-    for (const [id, name] of pages) {
-      await page.getByRole('navigation').getByRole('button', {name, exact: true}).click();
-      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `${id} mobile overflow`);
-      if (id === 'overview' || id === 'cards') await page.screenshot({path: path.join(output, `${id}-mobile.png`), fullPage: true});
+    await page.getByRole('heading', {name: '管理员登录', exact: true}).waitFor();
+    for (const [width, height] of [[1440,1080],[390,844]]) {
+      await page.setViewportSize({width,height});
+      assert.equal(await page.getByRole('navigation').count(),0);
+      assert.equal(await page.getByRole('dialog').count(),0);
+      assert.equal(await page.getByRole('button',{name:'取消',exact:true}).count(),0);
+      await page.keyboard.press('Escape');
+      assert.equal(await page.locator('.workspace,.sidebar').count(),0);
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),true);
+      await page.screenshot({path:path.join(output,`login-${width}.png`),fullPage:true});
     }
     assert.deepEqual(errors, []);
-    console.log(`PASS: all nine tabs, desktop/mobile overflow, four card tiers, password form, no runtime errors. Screenshots: ${output}`);
+    console.log(`PASS: independent login page, desktop/mobile overflow, no cancel bypass or admin shell, no runtime errors. Screenshots: ${output}`);
   } finally {await browser.close();}
 })().catch(error => {console.error(error); process.exitCode = 1;}).finally(() => server.close());

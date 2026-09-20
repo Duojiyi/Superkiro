@@ -349,6 +349,7 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
 
             // 5. Credit Reservation (Spec §6.2)
             let mut has_reservation = false;
+            let reservation_lease = self.billing.protect_reservation(&invocation_key);
             let mut reserved_estimated_input = 2_000u64;
             let mut reserved_max_output = 4_096u32;
             if claims.is_some() || real_provider {
@@ -990,7 +991,8 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                     .cloned(),
             )
             .with_permit(capacity_permit)
-            .with_estimated_input(reserved_estimated_input);
+            .with_estimated_input(reserved_estimated_input)
+            .with_reservation_lease(reservation_lease);
 
             let watchdog_stream = WatchdogStream::new(upstream_stream, WatchdogConfig::default());
             let guarded_stream = create_stream_guard(

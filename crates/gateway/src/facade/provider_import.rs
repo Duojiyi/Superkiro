@@ -148,6 +148,16 @@ impl FacadeHandler for ProviderImportHandler {
                 }
             };
 
+            // Reject unsupported ownership directives before permissive raw-export parsing.
+            if serde_json::from_str::<serde_json::Value>(body_str)
+                .ok()
+                .and_then(|value| value.get("target_group_id").cloned())
+                .is_some_and(|value| !value.is_null())
+            {
+                return error_response(StatusCode::BAD_REQUEST, "InvalidRequestException",
+                    "target_group_id is not supported by import; existing provider ownership is preserved");
+            }
+
             // Attempt to parse as envelope first; if it doesn't match envelope with content,
             // treat the entire body as raw client export JSON.
             let (format, raw_json_str, target_group) =
@@ -160,7 +170,11 @@ impl FacadeHandler for ProviderImportHandler {
                         };
                         (env.format, content_str, env.target_group_id)
                     } else {
-                        (SourceFormat::Auto, body_str.to_string(), None)
+                        (
+                            SourceFormat::Auto,
+                            body_str.to_string(),
+                            env.target_group_id,
+                        )
                     }
                 } else {
                     (SourceFormat::Auto, body_str.to_string(), None)
@@ -218,29 +232,42 @@ impl FacadeHandler for ProviderImportHandler {
 
             // Import stages credentials and capabilities only. Model exposure requires
             // explicit commercial publication with group permissions and pricing.
-            let _ = target_group;
+            if target_group.is_some() {
+                return error_response(StatusCode::BAD_REQUEST, "InvalidRequestException",
+                    "target_group_id is not supported by import; existing provider ownership is preserved");
+            }
+            let (mut providers, keys): (Vec<_>, Vec<_>) = imported
+                .iter()
+                .map(|item| item.to_provider_and_key())
+                .unzip();
+            // A runtime registry alone cannot transactionally preserve ownership.
+            if self.runtime.is_some() && self.billing.is_none() {
+                return error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ServiceUnavailableException",
+                    "provider import requires billing persistence",
+                );
+            }
 
             if let Some(billing) = &self.billing {
-                let (providers, keys): (Vec<_>, Vec<_>) = imported
-                    .iter()
-                    .map(|item| item.to_provider_and_key())
-                    .unzip();
-                if let Err(error) = billing.upsert_providers_checked(providers, keys) {
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        [("content-type", "application/json")],
-                        axum::Json(serde_json::json!({
-                            "success": false,
-                            "error": format!("Failed to persist imported providers: {error}"),
-                        })),
-                    )
-                        .into_response();
+                match billing.import_providers_checked(providers.clone(), keys.clone()) {
+                    Ok(committed) => providers = committed,
+                    Err(error) => {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            [("content-type", "application/json")],
+                            axum::Json(serde_json::json!({
+                                "success": false,
+                                "error": format!("Failed to persist imported providers: {error}"),
+                            })),
+                        )
+                            .into_response();
+                    }
                 }
             }
 
             if let Some(runtime) = &self.runtime {
-                for item in &imported {
-                    let (provider, key) = item.to_provider_and_key();
+                for (provider, key) in providers.into_iter().zip(keys) {
                     runtime.register(provider, key);
                 }
             }

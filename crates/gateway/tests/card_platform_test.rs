@@ -10,6 +10,7 @@ use serde_json::json;
 
 fn setup_test_env() -> (BillingEngine, CardPlatformManager, CardTemplate) {
     let billing = BillingEngine::new();
+    billing.set_master_kek(billing::MasterKek::from_bytes([37; 32]));
     let platform = CardPlatformManager::new();
     let template = CardTemplate::monthly("tpl-month-pro", "group-pro-plus");
     (billing, platform, template)

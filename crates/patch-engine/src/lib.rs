@@ -70,3 +70,6 @@ mod tests {
 }
 
 mod http;
+
+#[cfg(windows)]
+mod windows_process;

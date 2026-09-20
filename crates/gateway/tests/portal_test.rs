@@ -286,11 +286,33 @@ async fn test_portal_web_page_html_endpoint() {
         .await
         .unwrap();
     let html_str = String::from_utf8(bytes.to_vec()).unwrap();
-    assert!(html_str.contains("KIRO 自助服务门户"));
-    assert!(html_str.contains("卡密查询"));
-    assert!(html_str.contains("一键激活"));
-    assert!(html_str.contains("设备换绑"));
-    assert!(html_str.contains("卡密充值"));
+    // Check the embedded page contract, not marketing copy or visual styling.
+    // Browser tests cover routing, read-only verification and confirmed unbinding.
+    for marker in [
+        "Superkiro",
+        r#"id="home""#,
+        r#"id="device""#,
+        r#"id="docs""#,
+        r#"href="/""#,
+        r#"href="/device""#,
+        r#"href="/docs""#,
+        r#"href="/admin/""#,
+        r#"id="verify-form""#,
+        r#"id="card""#,
+        r#"type="password""#,
+        r#"id="bound-device""#,
+        r#"id="confirm-dialog""#,
+        r#"id="confirm-unbind""#,
+        "/downloads/releases.json",
+        r#"data-download="windows-x64""#,
+        r#"data-download="macos-arm64""#,
+        r#"data-download="macos-x64""#,
+    ] {
+        assert!(
+            html_str.contains(marker),
+            "missing portal contract: {marker}"
+        );
+    }
 }
 
 #[tokio::test]

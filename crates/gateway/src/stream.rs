@@ -31,6 +31,7 @@ pub struct BillingSettler {
     pub permit: Option<crate::guardrail::CapacityPermit>,
     pub estimated_input_tokens: u64,
     settlement_attempted: bool,
+    reservation_lease: Option<billing::engine::ReservationLease>,
     metrics: Option<crate::ops::metrics::RequestMetrics>,
 }
 
@@ -52,8 +53,14 @@ impl BillingSettler {
             permit: None,
             estimated_input_tokens: 0,
             settlement_attempted: false,
+            reservation_lease: None,
             metrics: None,
         }
+    }
+
+    pub fn with_reservation_lease(mut self, lease: billing::engine::ReservationLease) -> Self {
+        self.reservation_lease = Some(lease);
+        self
     }
 
     pub fn with_metrics(mut self, metrics: Option<crate::ops::metrics::RequestMetrics>) -> Self {

@@ -1,0 +1,90 @@
+# NOTE: Run 'cd ../apps/admin-ui && npm install && npm run build' before docker-compose up
+# ==============================================================================
+# Kiro BYOK 单机一体化生产部署编排 (Single-Server All-In-One Compose)
+# 
+# 启动方式：
+#   cp .env.example .env && vim .env
+#   docker compose up -d
+# ==============================================================================
+
+services:
+  gateway:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: kiro-gateway
+    restart: unless-stopped
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1g
+    cpus: "1.0"
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    env_file:
+      - .env
+    environment:
+      - HOST=0.0.0.0
+      - PORT=19820
+      - AUTH_SECRET=${AUTH_SECRET:?AUTH_SECRET must be set}
+      - CARD_PLATFORM_KEY=${CARD_PLATFORM_KEY:?CARD_PLATFORM_KEY must be set}
+      - ADMIN_KEY=${ADMIN_KEY:?ADMIN_KEY must be set}
+      - ADMIN_BROWSER_LOGIN=${ADMIN_BROWSER_LOGIN:?ADMIN_BROWSER_LOGIN must be true}
+      - ADMIN_ORIGIN=${ADMIN_ORIGIN:?ADMIN_ORIGIN must be an exact HTTPS origin}
+      - ADMIN_PASSWORD_HASH=${ADMIN_PASSWORD_HASH:?ADMIN_PASSWORD_HASH must be set}
+      - KIRO_MASTER_KEK=${KIRO_MASTER_KEK:?KIRO_MASTER_KEK must be a 64-hex KEK}
+      - KIRO_MASTER_KEK_FILE=${KIRO_MASTER_KEK_FILE:-}
+      - REQUIRE_ENCRYPTED_SNAPSHOTS=true
+      - TRUSTED_PROXY_HEADERS=true
+      - TRUSTED_PROXY_CIDRS=${TRUSTED_PROXY_CIDRS:-172.16.0.0/12}
+    volumes:
+      - ../data:/app/data
+    networks:
+      - kiro-net
+    expose:
+      - "19820"
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: kiro-caddy
+    restart: unless-stopped
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    cpus: "0.5"
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - DOMAIN=${DOMAIN:?DOMAIN must be set}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ../apps/admin-ui/dist:/app/admin-ui:ro
+      - ../apps/portal-ui:/app/portal-ui:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - kiro-net
+    depends_on:
+      gateway:
+        condition: service_healthy
+
+networks:
+  kiro-net:
+    driver: bridge
+
+volumes:
+  caddy_data:
+  caddy_config:
+

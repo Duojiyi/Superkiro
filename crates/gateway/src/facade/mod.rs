@@ -16,6 +16,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 pub mod admin;
+pub mod admin_login;
 pub mod card_platform;
 pub mod client;
 pub mod commercial;
@@ -160,6 +161,9 @@ impl FacadeRegistry {
         let protector = crate::security::BruteForceProtector::default();
         let challenge_mgr = crate::security::PortalChallengeManager::default();
 
+        self.register(client::AnnouncementsHandler {
+            billing: billing.clone(),
+        });
         self.register(portal::PortalChallengeHandler {
             challenge_mgr: challenge_mgr.clone(),
             rate_limiter: rate_limiter.clone(),
@@ -257,6 +261,10 @@ impl FacadeRegistry {
                 auth: auth.clone(),
             })
             .register(admin::AdminCardsHandler {
+                billing: billing.clone(),
+                auth: auth.clone(),
+            })
+            .register(admin::AdminCardRevealHandler {
                 billing: billing.clone(),
                 auth: auth.clone(),
             })
@@ -441,6 +449,7 @@ impl FacadeRegistry {
                 || path == "/oauth/token/refresh"
                 || path == "/refreshToken"
                 || path == "/client/negotiate"
+                || path == "/api/v1/announcements"
                 || path == "/client/beacon"
                 || path == "/client/brand"
                 || path == "/portal"
@@ -540,10 +549,12 @@ impl FacadeRegistry {
             admin_router = admin_router.route(path, method_router);
         }
 
-        let admin_router = admin_router.layer(axum::middleware::from_fn_with_state(
-            admin_auth,
-            crate::facade::admin::admin_auth_middleware,
-        ));
+        let admin_router = admin_router
+            .layer(axum::middleware::from_fn_with_state(
+                admin_auth,
+                crate::facade::admin::admin_auth_middleware,
+            ))
+            .layer(axum::middleware::from_fn(admin::card_secret_no_store));
 
         // Build public router
         let mut public_by_path: HashMap<&'static str, Vec<Arc<dyn FacadeHandler>>> = HashMap::new();

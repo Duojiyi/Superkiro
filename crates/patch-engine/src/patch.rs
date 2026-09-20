@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use thiserror::Error;
@@ -39,7 +39,7 @@ pub enum PatchError {
     #[error("Extension changed after patching or was upgraded; original backup retained, automatic overwrite refused")]
     ExtensionChanged,
 
-    #[error("JavaScript validation failed (Node.js is required): {0}")]
+    #[error("JavaScript validation failed: {0}")]
     InvalidJavaScript(String),
 
     #[error("Invalid gateway URL: {0}")]
@@ -128,6 +128,15 @@ pub enum PatchStatus {
     UpgradeDetected,
 }
 
+#[derive(Serialize, Deserialize)]
+struct PatchState {
+    original_len: u64,
+    original_hash: String,
+    patched_hash: String,
+    #[serde(default)]
+    previous_patched_hash: Option<String>,
+}
+
 /// Helper for inspecting and modifying `extension.js`.
 #[derive(Debug, Clone)]
 pub struct ExtensionPatcher {
@@ -188,7 +197,7 @@ impl ExtensionPatcher {
             return Err(PatchError::ExtensionChanged);
         }
         let rendered = render_patch(&content, "https://gateway.invalid", &PatchRecipe::default())?;
-        validate_javascript(&rendered)?;
+        validate_javascript(&self.extension_path, &rendered)?;
         Ok(true)
     }
 
@@ -225,12 +234,14 @@ impl ExtensionPatcher {
 
         if self.status() == PatchStatus::Patched {
             self.verify_patched_content()?;
-            let repaired = repair_proxy_tls(&content);
+            let repaired = repair_credit_display(&repair_proxy_tls(&content));
             if repaired != content {
-                validate_javascript(&repaired)?;
+                validate_javascript(&self.extension_path, &repaired)?;
+                let mut state = self.read_state()?;
+                state.previous_patched_hash = Some(content_hash(content.as_bytes()));
+                state.patched_hash = content_hash(repaired.as_bytes());
+                self.write_state(&state)?;
                 self.atomic_write(&repaired)?;
-                fs::write(self.state_path(), content_hash(repaired.as_bytes()))
-                    .map_err(|e| PatchError::Io(self.state_path(), e.to_string()))?;
             }
             return Ok(());
         }
@@ -238,9 +249,17 @@ impl ExtensionPatcher {
             return Err(PatchError::ExtensionChanged);
         }
         let full_patched = render_patch(&content, gateway_url, recipe)?;
-        validate_javascript(&full_patched)?;
+        validate_javascript(&self.extension_path, &full_patched)?;
 
         // No backup or live mutation until both the URL and complete JS parse pass.
+        // Persist original identity before the first backup write. A failed/partial
+        // backup must never be inferred to be trustworthy from its mere existence.
+        self.write_state(&PatchState {
+            original_len: content.len() as u64,
+            original_hash: content_hash(content.as_bytes()),
+            patched_hash: content_hash(full_patched.as_bytes()),
+            previous_patched_hash: None,
+        })?;
         let backup_path = self.backup_path();
         let mut backup = fs::OpenOptions::new()
             .write(true)
@@ -251,8 +270,6 @@ impl ExtensionPatcher {
             .write_all(content.as_bytes())
             .and_then(|_| backup.sync_all())
             .map_err(|e| PatchError::Io(backup_path.clone(), e.to_string()))?;
-        fs::write(self.state_path(), content_hash(full_patched.as_bytes()))
-            .map_err(|e| PatchError::Io(self.state_path(), e.to_string()))?;
         self.atomic_write(&full_patched)?;
         Ok(())
     }
@@ -261,15 +278,60 @@ impl ExtensionPatcher {
         self.extension_path.with_extension("js.kpatch-state")
     }
 
+    fn read_state(&self) -> Result<PatchState, PatchError> {
+        serde_json::from_slice(
+            &fs::read(self.state_path()).map_err(|_| PatchError::ExtensionChanged)?,
+        )
+        .map_err(|_| PatchError::ExtensionChanged)
+    }
+    fn write_state(&self, state: &PatchState) -> Result<(), PatchError> {
+        atomic_write_file(&self.state_path(), &serde_json::to_vec(state).unwrap())
+    }
     pub fn verify_patched_content(&self) -> Result<(), PatchError> {
-        let expected =
-            fs::read_to_string(self.state_path()).map_err(|_| PatchError::ExtensionChanged)?;
-        let actual = fs::read(&self.extension_path)
-            .map_err(|e| PatchError::Io(self.extension_path.clone(), e.to_string()))?;
-        if expected != content_hash(&actual) || !self.backup_path().is_file() {
+        let state = self.read_state()?;
+        let actual = fs::read(&self.extension_path).map_err(|_| PatchError::ExtensionChanged)?;
+        let actual_hash = content_hash(&actual);
+        if state.patched_hash != actual_hash
+            && state.previous_patched_hash.as_ref() != Some(&actual_hash)
+        {
             return Err(PatchError::ExtensionChanged);
         }
+        self.restore_material()?;
         Ok(())
+    }
+    /// Preflight before any settings or extension rollback. Unknown legacy backups
+    /// deliberately require manual recovery; do not bless them with a new digest.
+    pub fn verify_restore(&self) -> Result<(), PatchError> {
+        self.restore_material().map(|_| ())
+    }
+    fn restore_material(&self) -> Result<Option<Vec<u8>>, PatchError> {
+        if !self.state_path().exists() && !self.backup_path().exists() {
+            return if self.status() == PatchStatus::Patched {
+                Err(PatchError::ExtensionChanged)
+            } else {
+                Ok(None)
+            };
+        }
+        let state = self.read_state()?;
+        let current = fs::read(&self.extension_path).map_err(|_| PatchError::ExtensionChanged)?;
+        let original_matches = |bytes: &[u8]| {
+            bytes.len() as u64 == state.original_len && content_hash(bytes) == state.original_hash
+        };
+        let backup = match fs::read(self.backup_path()) {
+            Ok(bytes) if original_matches(&bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && original_matches(&current) => {
+                current.clone()
+            }
+            _ => return Err(PatchError::ExtensionChanged),
+        };
+        let current_hash = content_hash(&current);
+        if !original_matches(&current)
+            && current_hash != state.patched_hash
+            && state.previous_patched_hash.as_ref() != Some(&current_hash)
+        {
+            return Err(PatchError::ExtensionChanged);
+        }
+        Ok(Some(backup))
     }
 
     /// Restore the original unpatched `extension.js` from backup.
@@ -284,27 +346,23 @@ impl ExtensionPatcher {
             crate::runtime::ProcessState::Stopped => {}
         }
 
-        let backup_path = self.backup_path();
-        if !backup_path.exists() {
-            return Ok(false);
-        }
+        self.restore_validated()
+    }
 
-        // An upgrade already restored an official bundle. Never write the old
-        // version over it. Retain its backup as evidence for manual recovery.
-        if self.status() == PatchStatus::UpgradeDetected {
+    fn restore_validated(&self) -> Result<bool, PatchError> {
+        let Some(original) = self.restore_material()? else {
             return Ok(false);
-        }
-        self.verify_patched_content()?;
-
-        // Restore through the same atomic path used for patching.  A direct
-        // copy can leave a truncated JavaScript bundle if the process dies.
-        let original = fs::read(&backup_path)
-            .map_err(|e| PatchError::Io(self.extension_path.clone(), e.to_string()))?;
+        };
         self.atomic_write_bytes(&original)?;
-
-        // Remove backup
-        fs::remove_file(&backup_path).map_err(|e| PatchError::Io(backup_path, e.to_string()))?;
-        let _ = fs::remove_file(self.state_path());
+        // Removal order is retryable: state authenticates already-restored bytes
+        // even if the process dies after deleting the backup.
+        match fs::remove_file(self.backup_path()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(PatchError::Io(self.backup_path(), e.to_string())),
+        }
+        fs::remove_file(self.state_path())
+            .map_err(|e| PatchError::Io(self.state_path(), e.to_string()))?;
         Ok(true)
     }
 
@@ -313,37 +371,39 @@ impl ExtensionPatcher {
     }
 
     fn atomic_write_bytes(&self, content: &[u8]) -> Result<(), PatchError> {
-        let temp_file = self.extension_path.with_file_name(format!(
-            "{}.tmp.{}.{}",
-            self.extension_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("extension.js"),
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-
-        {
-            let mut file = File::create(&temp_file)
-                .map_err(|e| PatchError::Io(temp_file.clone(), e.to_string()))?;
-            file.write_all(content)
-                .map_err(|e| PatchError::Io(temp_file.clone(), e.to_string()))?;
-            file.sync_all()
-                .map_err(|e| PatchError::Io(temp_file.clone(), e.to_string()))?;
-        }
-
-        if let Err(e) = atomic_replace(&temp_file, &self.extension_path) {
-            let _ = fs::remove_file(&temp_file);
-            return Err(PatchError::Io(self.extension_path.clone(), e.to_string()));
-        }
-
-        Ok(())
+        atomic_write_file(&self.extension_path, content)
     }
 }
 
+fn atomic_write_file(path: &Path, content: &[u8]) -> Result<(), PatchError> {
+    let temp_file = path.with_file_name(format!(
+        "{}.tmp.{}.{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("extension.js"),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+
+    {
+        let mut file = File::create(&temp_file)
+            .map_err(|e| PatchError::Io(temp_file.clone(), e.to_string()))?;
+        file.write_all(content)
+            .map_err(|e| PatchError::Io(temp_file.clone(), e.to_string()))?;
+        file.sync_all()
+            .map_err(|e| PatchError::Io(temp_file.clone(), e.to_string()))?;
+    }
+
+    if let Err(e) = atomic_replace(&temp_file, path) {
+        let _ = fs::remove_file(&temp_file);
+        return Err(PatchError::Io(path.to_path_buf(), e.to_string()));
+    }
+
+    Ok(())
+}
 fn content_hash(content: &[u8]) -> String {
     ring::digest::digest(&ring::digest::SHA256, content)
         .as_ref()
@@ -404,11 +464,120 @@ fn render_patch(content: &str, gateway: &str, recipe: &PatchRecipe) -> Result<St
     if replaced == 0 || body.contains(&recipe.needle) {
         return Err(PatchError::NeedleNotFound);
     }
-    Ok(format!("{}\n{}", recipe.marker, repair_proxy_tls(&body)))
+    Ok(format!(
+        "{}\n{}",
+        recipe.marker,
+        repair_credit_display(&repair_proxy_tls(&body))
+    ))
 }
 
-fn validate_javascript(content: &str) -> Result<(), PatchError> {
-    let mut command = Command::new("node");
+// Only the runtime belonging to this extension may validate a real installation.
+fn javascript_command(extension_path: &Path) -> Result<Command, PatchError> {
+    let extension = fs::canonicalize(extension_path)
+        .map_err(|e| PatchError::InvalidJavaScript(e.to_string()))?;
+    let suffix = Path::new("app/extensions/kiro.kiro-agent/dist/extension.js");
+    if !extension.ends_with(suffix) {
+        // Standalone fixture bundles do not have an Electron installation.
+        return Ok(Command::new("node"));
+    }
+    let invalid = || {
+        PatchError::InvalidJavaScript(
+            "Invalid Kiro installation or unavailable RunAsNode runtime".into(),
+        )
+    };
+    let app = extension.ancestors().nth(4).ok_or_else(invalid)?;
+    let resources = app.parent().ok_or_else(invalid)?;
+    if !resources
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("resources"))
+    {
+        return Err(invalid());
+    }
+    let root = resources.parent().ok_or_else(invalid)?;
+    let product: serde_json::Value =
+        serde_json::from_slice(&fs::read(app.join("product.json")).map_err(|_| invalid())?)
+            .map_err(|_| invalid())?;
+    if product["applicationName"].as_str() != Some("kiro") {
+        return Err(invalid());
+    }
+    let executable = if cfg!(windows) {
+        root.join("Kiro.exe")
+    } else if cfg!(target_os = "macos") {
+        crate::detect::resolve_macos_executable(root).map_err(|_| invalid())?
+    } else {
+        root.join("kiro")
+    };
+    let executable = fs::canonicalize(executable).map_err(|_| invalid())?;
+    let expected_parent = if cfg!(target_os = "macos") {
+        root.join("MacOS")
+    } else {
+        root.to_path_buf()
+    };
+    if !executable.is_file() || executable.parent() != Some(expected_parent.as_path()) {
+        return Err(invalid());
+    }
+    let fuse_binary = if cfg!(target_os = "macos") {
+        macos_fuse_binary(root)?
+    } else {
+        executable.clone()
+    };
+    verify_run_as_node(&fuse_binary)?;
+    let mut command = Command::new(executable);
+    command.env("ELECTRON_RUN_AS_NODE", "1");
+    Ok(command)
+}
+
+// macOS keeps the fuse wire in the framework, not the MacOS/Kiro launcher stub.
+fn macos_fuse_binary(contents: &Path) -> Result<PathBuf, PatchError> {
+    let invalid = || PatchError::InvalidJavaScript("Invalid Kiro Electron framework path".into());
+    let contents = fs::canonicalize(contents).map_err(|_| invalid())?;
+    let binary = fs::canonicalize(
+        contents.join("Frameworks/Electron Framework.framework/Versions/A/Electron Framework"),
+    )
+    .map_err(|_| invalid())?;
+    if !binary.is_file() || !binary.starts_with(&contents) {
+        return Err(invalid());
+    }
+    Ok(binary)
+}
+
+fn verify_run_as_node(executable: &Path) -> Result<(), PatchError> {
+    let invalid = || PatchError::InvalidJavaScript("Unavailable Electron RunAsNode fuse".into());
+    // A disabled Electron fuse ignores ELECTRON_RUN_AS_NODE and could launch the IDE.
+    // Read the fuse wire without executing the binary; fail closed for unknown versions.
+    let mut file = File::open(executable).map_err(|_| invalid())?;
+    let sentinel = b"dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX";
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 65536];
+    loop {
+        let count = file.read(&mut chunk).map_err(|_| invalid())?;
+        if count == 0 {
+            return Err(invalid());
+        }
+        buffer.extend_from_slice(&chunk[..count]);
+        if let Some(wire) = buffer
+            .windows(sentinel.len() + 3)
+            .find(|wire| wire.starts_with(sentinel))
+        {
+            if wire[sentinel.len()] != 1
+                || wire[sentinel.len() + 1] == 0
+                || wire[sentinel.len() + 2] != b'1'
+            {
+                return Err(invalid());
+            }
+            break;
+        }
+        let keep = buffer.len().saturating_sub(sentinel.len() + 2);
+        buffer.drain(..keep);
+    }
+    Ok(())
+}
+
+fn validate_javascript(extension_path: &Path, content: &str) -> Result<(), PatchError> {
+    check_javascript(javascript_command(extension_path)?, content)
+}
+
+fn check_javascript(mut command: Command, content: &str) -> Result<(), PatchError> {
     command
         .args(["--check", "--input-type=commonjs"])
         .env_remove("NODE_OPTIONS")
@@ -481,6 +650,24 @@ fn repair_proxy_tls(content: &str) -> String {
         )
 }
 
+// Kiro 1.1.14's getItemContent interpolates full-precision usage into the
+// status bar. Match only its display return expression: never round the shared
+// usage model, percentages, monetary charges, or the gateway/ledger payload.
+// Optional compatibility repair: an unknown formatter is left untouched, not an
+// injection failure. Do not require exactly one match or guess at other layouts.
+fn repair_credit_display(content: &str) -> String {
+    content.replace(
+        r#"return a&&a.currentUsage<a.usageLimit?`${d} Bonus ${a.currentUsage} / ${a.usageLimit} (${a.daysRemaining} days left)`:n>0||l>0?`${d} Overage ${n} (${r.symbol}${l.toFixed(2)})`:`${d} ${s} / ${u}`"#,
+        // Intl defaults to halfExpand (half up for nonnegative credits), avoiding
+        // toFixed's binary tie surprises such as 1.15 -> 1.1.
+        r#"const creditDisplay=new Intl.NumberFormat("en-US",{minimumFractionDigits:1,maximumFractionDigits:1,useGrouping:false});return a&&a.currentUsage<a.usageLimit?`${d} Bonus ${creditDisplay.format(a.currentUsage)} / ${creditDisplay.format(a.usageLimit)} (${a.daysRemaining} days left)`:n>0||l>0?`${d} Overage ${creditDisplay.format(n)} (${r.symbol}${l.toFixed(2)})`:`${d} ${creditDisplay.format(s)} / ${creditDisplay.format(u)}`"#,
+    )
+}
+
+#[cfg(test)]
+#[path = "../tests/patch/credit_display.rs"]
+mod credit_display_tests;
+
 #[cfg(test)]
 mod proxy_tls_tests {
     use super::*;
@@ -498,3 +685,11 @@ mod proxy_tls_tests {
         assert!(!rendered.contains(original));
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/patch/javascript_validation.rs"]
+mod javascript_validation_tests;
+
+#[cfg(test)]
+#[path = "../tests/patch/recovery.rs"]
+mod recovery_tests;

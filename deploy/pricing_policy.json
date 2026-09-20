@@ -1,0 +1,71 @@
+{
+  "id": "official-024-20260920",
+  "credit_face_value_cny": 0.03,
+  "credits_per_official_usd": 8,
+  "upstream_multiplier": 0.08,
+  "retail_multiplier": 0.24,
+  "tiers": [
+    {
+      "id": "tier-1000",
+      "name": "PRO",
+      "points": 1000,
+      "price_cny": 30
+    },
+    {
+      "id": "tier-2000",
+      "name": "PRO+",
+      "points": 2000,
+      "price_cny": 55
+    },
+    {
+      "id": "tier-5000",
+      "name": "PRO Max",
+      "points": 5000,
+      "price_cny": 130
+    },
+    {
+      "id": "tier-10000",
+      "name": "Power",
+      "points": 10000,
+      "price_cny": 250
+    }
+  ],
+  "official_prices_per_m": {
+    "claude-opus-4-6": [
+      5,
+      25,
+      6.25,
+      0.5
+    ],
+    "claude-opus-4-7": [
+      5,
+      25,
+      6.25,
+      0.5
+    ],
+    "claude-opus-4-8": [
+      5,
+      25,
+      6.25,
+      0.5
+    ],
+    "claude-opus-5": [
+      5,
+      25,
+      6.25,
+      0.5
+    ],
+    "claude-sonnet-4-6": [
+      3,
+      15,
+      3.75,
+      0.3
+    ],
+    "claude-sonnet-5": [
+      2,
+      10,
+      2.5,
+      0.2
+    ]
+  }
+}

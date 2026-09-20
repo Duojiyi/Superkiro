@@ -23,7 +23,7 @@ use axum::{
 use billing::card::CardStatus;
 use billing::engine::BillingEngine;
 use billing::observability::{Announcement, AnnouncementLevel};
-use billing::{generate_batch, CardTemplate};
+use billing::CardTemplate;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -56,6 +56,7 @@ pub struct AdminAuthState {
     sessions: Arc<std::sync::RwLock<HashMap<String, u64>>>,
     session_epoch: Arc<AtomicU64>,
     legacy_key_allowed: bool,
+    pub browser: Option<super::admin_login::BrowserAuth>,
 }
 
 impl std::fmt::Debug for AdminAuthState {
@@ -81,10 +82,13 @@ impl AdminAuthState {
         Self::with_legacy_mode(key.into(), true)
     }
 
-    /// Production constructor. The bootstrap key is accepted only by the
-    /// session endpoint; all other admin requests require a short-lived token.
+    /// Production constructor. Browser requests require a secure session cookie.
+    /// Missing/invalid browser configuration fails closed in the middleware.
     pub fn new_production(key: impl Into<String>) -> Self {
-        Self::with_legacy_mode(key.into(), false)
+        Self {
+            browser: super::admin_login::BrowserAuth::from_env().ok(),
+            ..Self::with_legacy_mode(key.into(), false)
+        }
     }
 
     fn with_legacy_mode(key: String, legacy_key_allowed: bool) -> Self {
@@ -93,6 +97,7 @@ impl AdminAuthState {
             sessions: Arc::new(std::sync::RwLock::new(HashMap::new())),
             session_epoch: Arc::new(AtomicU64::new(1)),
             legacy_key_allowed,
+            browser: None,
         }
     }
 
@@ -170,12 +175,16 @@ impl AdminAuthState {
         let now = now_secs();
         let ttl = ttl_secs.clamp(60, 3600);
         let exp = now.saturating_add(ttl);
-        static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
-        let jti = format!(
-            "adm-{}-{}",
-            now,
-            NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed)
-        );
+        // Random IDs prevent a pre-restart session matching a newly issued one.
+        use ring::rand::SecureRandom;
+        let mut random = [0u8; 32];
+        ring::rand::SystemRandom::new()
+            .fill(&mut random)
+            .map_err(|_| "session randomness unavailable")?;
+        let jti = random
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
         let claims = AdminSessionClaims {
             sub: "admin".to_string(),
             role: "admin".to_string(),
@@ -268,6 +277,12 @@ pub async fn admin_auth_middleware(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
+    if let Some(browser) = &auth.browser {
+        return super::admin_login::handle(&auth, browser, req, next).await;
+    }
+    if !auth.legacy_key_allowed {
+        return unauthorized_response();
+    }
     let is_session_bootstrap =
         req.uri().path() == "/api/v1/admin/session" && req.method() == Method::POST;
     let authenticated = if is_session_bootstrap {
@@ -397,7 +412,7 @@ fn unauthorized_response() -> Response {
         [(header::CONTENT_TYPE, "application/json")],
         axum::Json(serde_json::json!({
             "success": false,
-            "error": "Unauthorized: invalid or missing admin credentials (x-admin-key)",
+            "error": "Unauthorized: administrator login required",
         })),
     )
         .into_response()
@@ -433,6 +448,7 @@ impl FacadeHandler for AdminMeHandler {
                     "role": "admin",
                     "authenticated": true,
                     "serverTime": now_secs(),
+                    "csrfToken": super::admin_login::csrf_token(req.headers()),
                 }),
             )
         })
@@ -565,14 +581,44 @@ impl FacadeHandler for AdminFinancialsHandler {
             if !self.auth.verify(req.headers()) {
                 return unauthorized_response();
             }
-            let dashboard = self.billing.get_margin_dashboard(None, None);
-            let rankings = self.billing.get_model_cost_rankings(None, None);
+            // One snapshot keeps estimates, coverage and their settings consistent.
+            let snapshot = self.billing.export_snapshot();
+            let dashboard = billing::observability::compute_margin_dashboard(
+                &snapshot.ledger,
+                &snapshot.settings,
+            );
+            let rankings = billing::observability::compute_model_cost_rankings(
+                &snapshot.ledger,
+                &snapshot.settings,
+            );
+            let costed_requests = snapshot
+                .ledger
+                .iter()
+                .filter(|entry| {
+                    entry.kind == billing::ledger::LedgerKind::Usage
+                        && entry.rate_card_version.is_some()
+                })
+                .count() as u64;
+            let uncosted_requests = dashboard.total_requests.saturating_sub(costed_requests);
             json_response(
                 StatusCode::OK,
                 &serde_json::json!({
                     "success": true,
                     "dashboard": dashboard,
                     "modelRankings": rankings,
+                    "basis": "retained_usage_ledger_estimate_not_cash_revenue",
+                    "settings": snapshot.settings,
+                    "actualRevenueMicroCny": null,
+                    "actualGrossProfitMicroCny": null,
+                    "estimates": {
+                        "usageFaceValueMicroCny": dashboard.revenue_micro_cny,
+                        "configuredProviderCostMicroCny": dashboard.provider_cost_micro_cny,
+                        "faceValueLessCostMicroCny": if uncosted_requests == 0 { Some(dashboard.gross_profit_micro_cny) } else { None },
+                        "faceValueMarginPercentage": if uncosted_requests == 0 && dashboard.revenue_micro_cny > 0 { Some(dashboard.gross_margin_percentage) } else { None },
+                        "costedRequests": costed_requests,
+                        "uncostedRequests": uncosted_requests,
+                        "retainedLedgerOnly": true,
+                    },
                 }),
             )
         })
@@ -822,25 +868,20 @@ impl FacadeHandler for AdminBatchCardsHandler {
                 );
             }
             let now = now_secs();
-            let generated = match generate_batch(&template, body.count, body.note.as_deref(), now) {
-                Ok(cards) => cards,
-                Err(error) => {
-                    return error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "GenerationException",
-                        &error.to_string(),
-                    )
-                }
-            };
-            let cards_to_persist: Vec<billing::Card> =
-                generated.iter().map(|item| item.card.clone()).collect();
-            if let Err(error) = self.billing.upsert_cards_checked(cards_to_persist) {
-                return error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "PersistenceException",
-                    &error.to_string(),
-                );
-            }
+            let generated =
+                match self
+                    .billing
+                    .issue_cards(&template, body.count, body.note.as_deref(), now)
+                {
+                    Ok(cards) => cards,
+                    Err(error) => {
+                        return error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "GenerationException",
+                            &error.to_string(),
+                        )
+                    }
+                };
             let response_cards: Vec<_> = generated
                 .iter()
                 .map(|generated| {
@@ -855,10 +896,19 @@ impl FacadeHandler for AdminBatchCardsHandler {
                     })
                 })
                 .collect();
-            json_response(
+            eprintln!(
+                "{}",
+                serde_json::json!({"event": "admin_cards_issued", "count": response_cards.len()})
+            );
+            let mut response = json_response(
                 StatusCode::OK,
                 &serde_json::json!({ "success": true, "count": response_cards.len(), "cards": response_cards }),
-            )
+            );
+            response.headers_mut().insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            );
+            response
         })
     }
 }
@@ -927,6 +977,85 @@ impl FacadeHandler for AdminStatsHandler {
 // 3. Admin Cards List Handler (GET /api/v1/admin/cards)
 // ---------------------------------------------------------------------------
 
+/// Runs outside admin authentication so even rejected secret-bearing requests are not cached.
+pub async fn card_secret_no_store(req: Request<Body>, next: axum::middleware::Next) -> Response {
+    let reveal = req.uri().path() == "/api/v1/admin/cards/reveal";
+    let sensitive = matches!(
+        req.uri().path(),
+        "/api/v1/admin/cards/reveal" | "/api/v1/admin/cards/batch"
+    );
+    let mut response = next.run(req).await;
+    if reveal && matches!(response.status().as_u16(), 400 | 401 | 403 | 429) {
+        eprintln!(
+            "{}",
+            serde_json::json!({"event":"admin_card_reveal_rejected",
+            "timestamp":crate::now_secs(),"httpStatus":response.status().as_u16()})
+        );
+    }
+    if sensitive {
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+    }
+    response
+}
+
+pub struct AdminCardRevealHandler {
+    pub billing: BillingEngine,
+    pub auth: Arc<AdminAuthState>,
+}
+
+impl FacadeHandler for AdminCardRevealHandler {
+    fn method(&self) -> Method {
+        Method::POST
+    }
+    fn path(&self) -> &'static str {
+        "/api/v1/admin/cards/reveal"
+    }
+    fn handle<'a>(&'a self, req: Request<Body>) -> BoxFuture<'a, Response> {
+        Box::pin(async move {
+            let mut response = async {
+                if !self.auth.verify(req.headers()) { return unauthorized_response(); }
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                struct RevealRequest { card_id: String }
+                let body = match axum::body::to_bytes(req.into_body(), 4096).await {
+                    Ok(bytes) => serde_json::from_slice::<RevealRequest>(&bytes).ok(),
+                    Err(_) => None,
+                };
+                let Some(body) = body.filter(|b| valid_text(&b.card_id, 128)) else {
+                    return error_response(StatusCode::BAD_REQUEST, "InvalidRequestException", "invalid cardId");
+                };
+                let result = self.billing.reveal_card_code(&body.card_id);
+                // Never include raw card codes, session cookies or request bodies.
+                eprintln!("{}", serde_json::json!({
+                    "event": "admin_card_reveal", "actor": "admin",
+                    "cardId": body.card_id, "timestamp": crate::now_secs(),
+                    "result": match &result {
+                        Ok(Some(_)) => "success",
+                        Ok(None) | Err(billing::BillingError::CardNotFound(_)) => "not_recoverable",
+                        Err(_) => "recovery_failed",
+                    }
+                }));
+                match result {
+                    Ok(Some(raw_code)) => json_response(StatusCode::OK,
+                        &serde_json::json!({"success": true, "rawCode": raw_code})),
+                    Ok(None) | Err(billing::BillingError::CardNotFound(_)) => error_response(
+                        StatusCode::NOT_FOUND, "NotFoundException", "Card code is not recoverable"),
+                    Err(_) => error_response(StatusCode::SERVICE_UNAVAILABLE,
+                        "RecoveryException", "Card code recovery failed"),
+                }
+            }.await;
+            response.headers_mut().insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            );
+            response
+        })
+    }
+}
+
 pub struct AdminCardsHandler {
     pub billing: BillingEngine,
     pub auth: Arc<AdminAuthState>,
@@ -936,6 +1065,7 @@ pub struct AdminCardsHandler {
 #[serde(rename_all = "camelCase")]
 pub struct AdminCardItem {
     pub id: String,
+    pub code_recoverable: bool,
     pub status: String,
     pub credit_total: i64,
     pub credit_used: i64,
@@ -981,6 +1111,7 @@ impl FacadeHandler for AdminCardsHandler {
                 .take(limit)
                 .map(|c| AdminCardItem {
                     id: c.id.clone(),
+                    code_recoverable: c.code_encrypted.is_some(),
                     status: match c.status {
                         CardStatus::Active => "active",
                         CardStatus::Unactivated => "unactivated",
@@ -1126,6 +1257,7 @@ pub struct AdminCardAdjustRequest {
     pub card_id: String,
     pub delta_points: f64,
     pub reason: Option<String>,
+    #[serde(alias = "idempotency_key")]
     pub idempotency_key: Option<String>,
 }
 
@@ -1186,8 +1318,32 @@ impl FacadeHandler for AdminCardAdjustHandler {
                 }
             };
 
-            let idempotency_key = idempotency_header
-                .or_else(|| req_data.idempotency_key.filter(|s| !s.trim().is_empty()));
+            let body_key = req_data.idempotency_key.as_deref().map(str::trim);
+            if idempotency_header
+                .as_deref()
+                .zip(body_key)
+                .is_some_and(|(a, b)| a != b)
+            {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRequestException",
+                    "conflicting idempotency keys",
+                );
+            }
+            let idempotency_key = idempotency_header.as_deref().or(body_key);
+            let Some(idempotency_key) = idempotency_key.filter(|key| {
+                !key.is_empty()
+                    && key.len() <= 128
+                    && key
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b))
+            }) else {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRequestException",
+                    "a valid idempotency_key is required (1-128 ASCII letters, digits, -_.:)",
+                );
+            };
 
             if !req_data.delta_points.is_finite()
                 || req_data.delta_points == 0.0
@@ -1227,7 +1383,7 @@ impl FacadeHandler for AdminCardAdjustHandler {
                 "admin",
                 &reason,
                 now,
-                idempotency_key.as_deref(),
+                Some(idempotency_key),
             ) {
                 Ok(_entry) => {
                     let card = self.billing.get_card(&req_data.card_id);

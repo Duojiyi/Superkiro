@@ -1,3 +1,6 @@
+export class AdminApiError extends Error {
+  constructor(message:string, public readonly status:number){super(message);this.name='AdminApiError';}
+}
 /**
  * Kiro BYOK Admin Console Frontend API Contract & Client.
  *
@@ -21,13 +24,20 @@ export interface AdminStats {
 }
 
 export interface AdminSessionResponse {
-  accessToken: string;
-  tokenType: string;
+  success: boolean;
   expiresIn: number;
-  expiresAt: number;
+  expiresAt?: number;
+  twoFactorEnabled?: boolean;
+  totpRequired?: boolean;
 }
 
+export interface FinancialSettings {credit_face_value_cny:number;usd_cny_rate:number;rate_updated_at_secs:number}
 export interface AdminFinancials {
+  basis?: string;
+  settings?: FinancialSettings;
+  actualRevenueMicroCny?: number|null;
+  actualGrossProfitMicroCny?: number|null;
+  estimates?: {usageFaceValueMicroCny:number;configuredProviderCostMicroCny:number;faceValueLessCostMicroCny:number|null;faceValueMarginPercentage:number|null;costedRequests:number;uncostedRequests:number;retainedLedgerOnly:boolean};
   success: boolean;
   dashboard: {
     total_requests: number;
@@ -42,6 +52,7 @@ export interface AdminFinancials {
 
 export interface AdminCardItem {
   id: string;
+  codeRecoverable: boolean;
   status: 'active' | 'unactivated' | 'frozen' | 'banned' | 'voided' | 'expired';
   creditTotal: number;
   creditUsed: number;
@@ -97,83 +108,102 @@ export interface AdminAnnouncement {
 
 export class AdminApiClient {
   private baseUrl: string;
-  private adminKey: string;
-  private sessionToken: string;
+  private csrfToken = '';
+  // Identity is established only by a successful explicit login, never browser storage.
+  authenticatedUsername: string|null = null;
+  private sessionVersion = 0;
+  private requests = new Set<AbortController>();
+  onUnauthorized?: () => void;
+  twoFactorEnabled: boolean | undefined;
+  totpRequired = false;
+  private expiryTimer?: ReturnType<typeof setTimeout>;
+  private expiresAt = 0;
 
-  constructor(baseUrl: string = '', adminKey: string = '') {
-    this.baseUrl = baseUrl;
-    // Keep administrator credentials only for the lifetime of this page.
-    this.adminKey = adminKey;
-    this.sessionToken = '';
-  }
+  constructor(baseUrl: string = '') { this.baseUrl = baseUrl; }
 
-  setAdminKey(key: string) {
-    this.adminKey = key;
-  }
-
-  async establishSession(): Promise<AdminSessionResponse> {
-    const res = await fetch(`${this.baseUrl}/api/v1/admin/session`, {
-      method: 'POST',
-      headers: { 'x-admin-key': this.adminKey, Accept: 'application/json' },
+  async establishSession(username: string, password: string, totpCode?: string): Promise<AdminSessionResponse> {
+    this.clearSession();
+    const session = await this.request<AdminSessionResponse>('/api/v1/admin/session', {
+      method: 'POST', body: JSON.stringify({ username, password, totpCode }),
     });
-    if (!res.ok) throw new Error('未授权：管理员密钥无效');
-    const session = (await res.json()) as AdminSessionResponse;
-    this.sessionToken = session.accessToken;
-    this.adminKey = '';
+    if (session.success !== true) throw new Error('登录失败，请重试');
+    await this.checkAuth();
+    this.authenticatedUsername=username;
     return session;
   }
 
   clearSession() {
-    this.sessionToken = '';
-    this.adminKey = '';
+    clearTimeout(this.expiryTimer);this.expiresAt=0;
+    this.authenticatedUsername=null;this.csrfToken = ''; this.sessionVersion++;
+    for (const controller of this.requests) controller.abort();
+    this.requests.clear();
   }
 
   async logout(all: boolean = false): Promise<void> {
-    try {
-      if (this.sessionToken) {
-        await this.request('/api/v1/admin/session/revoke', {
-          method: 'POST',
-          body: JSON.stringify({ all }),
-        });
-      }
-    } catch (_) {
-      // Clean up locally regardless of network outcome
-    } finally {
-      this.clearSession();
-    }
-  }
-
-  getAdminKey(): string {
-    return this.adminKey;
-  }
-
-  private async request<T>(path: string, options: RequestInit = {}): Promise<T> {
-    const headers = new Headers(options.headers || {});
-    if (this.sessionToken) {
-      headers.set('Authorization', `Bearer ${this.sessionToken}`);
-    }
-    headers.set('Accept', 'application/json');
-    if (options.body !== undefined) headers.set('Content-Type', 'application/json');
-
-    const res = await fetch(`${this.baseUrl}${path}`, {
-      ...options,
-      headers,
+    const headers = new Headers({'Content-Type': 'application/json', 'x-csrf-token': this.csrfToken});
+    this.clearSession();
+    const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),15000);
+    try {const res = await fetch(`${this.baseUrl}/api/v1/admin/session/revoke`, {
+      signal:controller.signal,
+      method: 'POST', headers, body: JSON.stringify({all}), credentials: 'same-origin', cache: 'no-store',
     });
-
-    if (!res.ok) {
-      if (res.status === 401) {
-        throw new Error('未授权：请配置有效管理员密钥 (x-admin-key)');
-      }
-      const errJson = await res.json().catch(() => ({}));
-      throw new Error(errJson.error || `请求失败 (${res.status})`);
-    }
-
-    return await res.json();
+    if (!res.ok && res.status !== 401) throw new Error('会话撤销失败');
+    }finally{clearTimeout(timer);}
   }
 
-  async checkAuth(): Promise<{ success: boolean; role: string }> {
-    if (!this.sessionToken && this.adminKey) await this.establishSession();
-    return this.request('/api/v1/admin/me');
+  private async request<T>(path: string, options: RequestInit = {}, blob = false): Promise<T> {
+    if(this.expiresAt && Date.now()>=this.expiresAt){this.clearSession();this.onUnauthorized?.();}
+    if (path !== '/api/v1/admin/session' && !this.csrfToken) throw new Error('请先登录');
+    const headers = new Headers(options.headers || {});
+    if (options.method && !['GET', 'HEAD', 'OPTIONS'].includes(options.method)) headers.set('x-csrf-token', this.csrfToken);
+    if (!headers.has('Accept')) headers.set('Accept', 'application/json');
+    if (options.body !== undefined) headers.set('Content-Type', 'application/json');
+    const version = this.sessionVersion;
+    const controller = new AbortController();
+    this.requests.add(controller);
+    const timer=setTimeout(()=>controller.abort(),15000);
+    try {
+      const res = await fetch(`${this.baseUrl}${path}`, {
+        ...options, headers, signal: controller.signal, credentials: 'same-origin', cache: 'no-store',
+      });
+      if (version !== this.sessionVersion) throw new Error('管理会话已改变，请重新加载');
+      if (!res.ok) {
+        if (res.status === 401 && !(path === '/api/v1/admin/session' && options.method === 'POST')) {
+          this.clearSession(); this.onUnauthorized?.();
+        }
+        const errorVersion=this.sessionVersion;
+        const error = await res.json().catch(() => ({}));
+        if(path==='/api/v1/admin/session' && errorVersion===this.sessionVersion){this.twoFactorEnabled=typeof error.twoFactorEnabled==='boolean'?error.twoFactorEnabled:undefined;this.totpRequired=error.totpRequired===true;}
+        throw new AdminApiError(error.error || (res.status === 401 ? '用户名或密码错误' : `请求失败 (${res.status})`),res.status);
+      }
+      const result = await (blob ? res.blob() : res.json());
+      if (version !== this.sessionVersion) throw new Error('管理会话已改变，请重新加载');
+      return result;
+    } catch(error){if(controller.signal.aborted&&version===this.sessionVersion)throw new Error('请求超时，结果未确认；写操作请核对后重试');throw error;} finally {clearTimeout(timer);this.requests.delete(controller);}
+  }
+
+  async checkAuth(): Promise<{ success: boolean; role: string; csrfToken: string; expiresAt?: number; twoFactorEnabled?: boolean; totpRequired?: boolean }> {
+    const version = this.sessionVersion;
+    const result = await this.request<{ success: boolean; role: string; csrfToken: string; expiresAt?: number; twoFactorEnabled?: boolean; totpRequired?: boolean }>('/api/v1/admin/session');
+    if (version !== this.sessionVersion) throw new Error('管理会话已改变，请重新加载');
+    if (result.success !== true || result.role !== 'admin' || typeof result.csrfToken !== 'string' || !result.csrfToken) {
+      this.clearSession(); this.onUnauthorized?.();
+      throw new Error('管理会话无效');
+    }
+    if(this.csrfToken!==result.csrfToken)this.authenticatedUsername=null;
+    this.csrfToken = result.csrfToken;
+    this.twoFactorEnabled=result.twoFactorEnabled;this.totpRequired=result.totpRequired===true;
+    clearTimeout(this.expiryTimer);
+    if(result.expiresAt!==undefined){
+      if(!Number.isFinite(result.expiresAt)||result.expiresAt*1000<=Date.now()){this.clearSession();this.onUnauthorized?.();throw new Error('管理会话已到期');}
+      this.expiresAt=result.expiresAt*1000;
+      this.expiryTimer=setTimeout(()=>{this.clearSession();this.onUnauthorized?.();},Math.min(2147483647,this.expiresAt-Date.now()));
+    }
+    return result;
+  }
+
+  async revealCard(cardId: string): Promise<{ success: boolean; rawCode: string }> {
+    return this.request('/api/v1/admin/cards/reveal', {method: 'POST', body: JSON.stringify({cardId})});
   }
 
   async getCommercialConfig(): Promise<{success: boolean; config: CommercialConfig}> {
@@ -188,7 +218,13 @@ export class AdminApiClient {
   }
 
   async getCards(): Promise<AdminCardsResponse> {
-    return this.request('/api/v1/admin/cards?offset=0&limit=500');
+    const cards: AdminCardItem[] = [];
+    for (let offset = 0; ; offset += 500) {
+      const page = await this.request<AdminCardsResponse>(`/api/v1/admin/cards?offset=${offset}&limit=500`);
+      if (!page.success) throw new Error('卡密列表读取失败');
+      cards.push(...page.cards);
+      if (page.cards.length < 500) return {...page, cards, count: cards.length};
+    }
   }
 
   async updateCardStatus(
@@ -205,11 +241,12 @@ export class AdminApiClient {
   async adjustBalance(
     cardId: string,
     deltaPoints: number,
-    reason?: string
+    reason: string,
+    idempotencyKey: string
   ): Promise<AdminCardAdjustResponse> {
     return this.request('/api/v1/admin/cards/adjust', {
       method: 'POST',
-      body: JSON.stringify({ cardId, deltaPoints, reason }),
+      body: JSON.stringify({ cardId, deltaPoints, reason, idempotencyKey }),
     });
   }
 
@@ -255,11 +292,9 @@ export class AdminApiClient {
   }
 
   async exportLedger(format: 'json' | 'csv'): Promise<Blob> {
-    const response = await fetch(`${this.baseUrl}/api/v1/admin/exports/ledger.${format}`, {
-      headers: { Authorization: `Bearer ${this.sessionToken}`, Accept: format === 'csv' ? 'text/csv' : 'application/json' },
-    });
-    if (!response.ok) throw new Error(`导出失败 (${response.status})`);
-    return response.blob();
+    return this.request<Blob>(`/api/v1/admin/exports/ledger.${format}`, {
+      headers: { Accept: format === 'csv' ? 'text/csv' : 'application/json' },
+    }, true);
   }
 
   async importProvider(content: Record<string, unknown>): Promise<{success: boolean}> {
@@ -285,6 +320,7 @@ export class AdminApiClient {
 export const adminApi = new AdminApiClient();
 
 export interface CommercialConfig {
+  settings?: FinancialSettings;
   revision: string;
   groups: Array<Record<string, unknown>>;
   models: Array<Record<string, unknown>>;

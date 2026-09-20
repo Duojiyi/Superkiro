@@ -7,6 +7,7 @@ use axum::Router;
 use patch_engine::beacon::{BeaconClient, ClientNegotiateRequest, HealthBeacon};
 use patch_engine::detect::inspect_installation_dir;
 use patch_engine::doctor::{Doctor, TakeoverStatus};
+use patch_engine::patch::{ExtensionPatcher, PatchStatus};
 use patch_engine::process::{launch_kiro, ProcessError};
 use patch_engine::settings::SettingsManager;
 use patch_engine::token_storage::TokenStorage;
@@ -26,10 +27,11 @@ async fn test_doctor_diagnostics_and_one_click_repair() {
     let doctor = Doctor::new(settings_mgr.clone(), token_storage.clone());
 
     // Every installation and credential path is synthetic; the gateway is a local mock.
+    let install_dir = temp_dir.join("Kiro.app");
     let app_dir = if cfg!(target_os = "macos") {
-        temp_dir.join("Contents/Resources/app")
+        install_dir.join("Contents/Resources/app")
     } else {
-        temp_dir.join("resources/app")
+        install_dir.join("resources/app")
     };
     let agent_dir = app_dir.join("extensions/kiro.kiro-agent");
     fs::create_dir_all(agent_dir.join("dist")).unwrap();
@@ -55,11 +57,32 @@ async fn test_doctor_diagnostics_and_one_click_repair() {
         .await
         .unwrap();
     });
-    let report_initial = doctor.diagnose(&url, Some(&temp_dir)).await;
+    let report_initial = doctor.diagnose(&url, Some(&install_dir)).await;
     assert_eq!(report_initial.overall_status, TakeoverStatus::NotTakenOver);
     assert_eq!(report_initial.items.len(), 7);
-    let install = inspect_installation_dir(&temp_dir).unwrap();
+    let mut install = inspect_installation_dir(&install_dir).unwrap();
+    // Installation-shaped fixtures must not bypass the embedded runtime check.
+    let installed_extension = agent_dir.join("dist/extension.js");
+    let original = fs::read(&installed_extension).unwrap();
+    let error = doctor.one_click_fix(&url, &install).unwrap_err();
+    assert!(error.to_string().contains("JavaScript validation failed"));
+    assert_eq!(fs::read(&installed_extension).unwrap(), original);
+    assert!(!ExtensionPatcher::new(&installed_extension)
+        .backup_path()
+        .exists());
+
+    // Exercise successful repair with the supported standalone Node fixture path,
+    // never executing an IDE or manufacturing a fake Electron executable.
+    let standalone_agent = temp_dir.join("standalone-agent");
+    let standalone_extension = standalone_agent.join("dist/extension.js");
+    fs::create_dir_all(standalone_extension.parent().unwrap()).unwrap();
+    fs::write(&standalone_extension, &original).unwrap();
+    install.agent_extension_dir = Some(standalone_agent);
     doctor.one_click_fix(&url, &install).unwrap();
+    assert_eq!(
+        ExtensionPatcher::new(&standalone_extension).status(),
+        PatchStatus::Patched
+    );
     assert!(settings_mgr.is_byok_active(Some(&url)));
     server.abort();
     let _ = server.await;

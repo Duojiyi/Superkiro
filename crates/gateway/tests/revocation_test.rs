@@ -192,7 +192,7 @@ async fn test_audit_b_freeze_and_unfreeze_lifecycle_revocation() {
 }
 
 #[tokio::test]
-async fn test_audit_b_device_rebind_eviction_revokes_evicted_device() {
+async fn test_audit_b_explicit_rebind_revokes_old_device() {
     let (billing, auth) = setup_system();
     // max_devices = 1: each new device evicts previous device
     let card = create_card("card-rebind-1", "grp-pro", 1, 5);
@@ -218,7 +218,15 @@ async fn test_audit_b_device_rebind_eviction_revokes_evicted_device() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    // Device Beta binds -> evicts Device Alpha!
+    assert!(matches!(
+        billing.bind_device("card-rebind-1", "device-beta", 1050),
+        Err(billing::BillingError::DeviceAlreadyBound)
+    ));
+    assert!(auth.verify_token(&token_alpha).is_ok());
+    billing
+        .unbind_device("card-rebind-1", "device-alpha")
+        .unwrap();
+    // Fill the empty slot immediately after explicit unbinding.
     billing
         .bind_device("card-rebind-1", "device-beta", 1_050)
         .unwrap();

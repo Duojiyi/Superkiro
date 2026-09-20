@@ -1,20 +1,13 @@
-//! Active Memory Guard and AI Subprocess Cleaner (inspired by cursor-keepalive).
+//! Kiro-only memory sampling and optional maintenance.
 //!
-//! Solves the universal problem of VSCode/Cursor/Kiro-based IDEs:
-//! - Working set memory bloat over time as V8 heap and renderer memory grow.
-//! - Orphaned AI agent subprocesses (Node.js, Python, CMD, PowerShell, MCP servers)
-//!   lingering in the background and consuming gigabytes of RAM.
-//!
-//! Capabilities:
-//! - `EmptyWorkingSet`: Win32 kernel working set compaction, releasing 50%~80% inactive RAM without killing processes.
-//! - `Process Tree Collector`: Tracks Kiro main process, renderers, Extension Host, and all AI agent child processes.
-//! - `Orphan Process Purger`: Detects and terminates abandoned zombie agent processes whose parent IDE process has exited.
-//! - `IDE Cache Purger`: Cleans non-active cache and logs older than a configurable threshold.
+//! Windows working-set trimming does not guarantee a fixed reduction; pages can
+//! be loaded again immediately. A single snapshot cannot establish orphan
+//! ownership, so unrelated processes are never selected for cleanup.
 
 use serde::{Deserialize, Serialize};
-#[cfg(target_os = "windows")]
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+#[cfg(not(windows))]
 use std::process::Command;
 use std::time::{Duration, SystemTime};
 
@@ -41,6 +34,8 @@ pub struct ProcessMemoryInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MemorySnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     pub total_memory_mb: u64,
     pub ide_memory_mb: u64,
     pub agent_memory_mb: u64,
@@ -54,6 +49,8 @@ pub struct MemorySnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrimResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     pub success_count: usize,
     pub failed_count: usize,
     pub initial_memory_mb: u64,
@@ -101,7 +98,7 @@ impl MemoryGuard {
     /// Classify a process based on binary name and parentage.
     pub fn classify_process(name: &str) -> ProcessCategory {
         let lower = name.to_ascii_lowercase();
-        if lower.contains("kiro") || lower.contains("cursor") || lower.contains("code") {
+        if Self::is_kiro_root(name) {
             ProcessCategory::MainIde
         } else if lower == "node.exe"
             || lower == "node"
@@ -123,42 +120,59 @@ impl MemoryGuard {
 
     /// Sample the current process tree and gather memory metrics.
     pub fn sample_memory() -> MemorySnapshot {
-        #[cfg(target_os = "windows")]
-        let mut snapshot = MemorySnapshot::default();
-
-        #[cfg(target_os = "windows")]
-        {
-            let procs = Self::sample_windows_processes();
-            for p in procs {
-                snapshot.total_memory_mb += p.memory_mb;
-                if p.memory_mb > snapshot.peak_process_mb {
-                    snapshot.peak_process_mb = p.memory_mb;
-                }
-
-                match p.category {
-                    ProcessCategory::MainIde | ProcessCategory::RendererOrGpu => {
-                        snapshot.ide_memory_mb += p.memory_mb;
-                    }
-                    ProcessCategory::AgentSubprocess | ProcessCategory::LanguageServer => {
-                        snapshot.agent_memory_mb += p.memory_mb;
-                        snapshot.agent_process_count += 1;
-                    }
-                    _ => {}
-                }
-
-                if p.is_orphan {
-                    snapshot.orphan_process_count += 1;
-                    snapshot.orphan_memory_mb += p.memory_mb;
-                }
-
-                snapshot.processes.push(p);
-            }
-            snapshot.total_process_count = snapshot.processes.len();
+        match Self::collect_processes() {
+            Ok(processes) => Self::summarize(processes),
+            Err(error) => MemorySnapshot {
+                error: Some(error.to_string()),
+                ..Default::default()
+            },
         }
+    }
 
-        #[cfg(not(target_os = "windows"))]
-        let snapshot = Self::sample_unix_processes();
+    fn is_kiro_root(name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        matches!(lower.as_str(), "kiro" | "kiro.exe")
+            || lower.ends_with("/kiro.app/contents/macos/kiro")
+            || lower.ends_with("/kiro.app/contents/macos/electron")
+            || lower.ends_with("/kiro")
+    }
 
+    fn summarize(entries: Vec<ProcessMemoryInfo>) -> MemorySnapshot {
+        let mut owned: HashSet<u32> = entries
+            .iter()
+            .filter(|p| Self::is_kiro_root(&p.name))
+            .map(|p| p.pid)
+            .collect();
+        loop {
+            let before = owned.len();
+            for p in &entries {
+                if owned.contains(&p.parent_pid) {
+                    owned.insert(p.pid);
+                }
+            }
+            if before == owned.len() {
+                break;
+            }
+        }
+        let mut snapshot = MemorySnapshot::default();
+        for mut p in entries.into_iter().filter(|p| owned.contains(&p.pid)) {
+            // A single snapshot cannot prove ownership of an orphan. Never guess.
+            p.is_orphan = false;
+            p.category = Self::classify_process(&p.name);
+            if p.category == ProcessCategory::Other {
+                p.category = ProcessCategory::AgentSubprocess;
+            }
+            snapshot.total_memory_mb += p.memory_mb;
+            snapshot.peak_process_mb = snapshot.peak_process_mb.max(p.memory_mb);
+            if p.category == ProcessCategory::MainIde {
+                snapshot.ide_memory_mb += p.memory_mb;
+            } else {
+                snapshot.agent_memory_mb += p.memory_mb;
+                snapshot.agent_process_count += 1;
+            }
+            snapshot.processes.push(p);
+        }
+        snapshot.total_process_count = snapshot.processes.len();
         snapshot
     }
 
@@ -186,11 +200,29 @@ impl MemoryGuard {
         let (success, fail) = (0, pids_to_trim.len());
 
         let after_snapshot = Self::sample_memory();
-        let released = initial_snapshot
-            .total_memory_mb
-            .saturating_sub(after_snapshot.total_memory_mb);
+        Self::trim_result(initial_snapshot, after_snapshot, success, fail)
+    }
+
+    fn trim_result(
+        initial_snapshot: MemorySnapshot,
+        after_snapshot: MemorySnapshot,
+        success: usize,
+        fail: usize,
+    ) -> TrimResult {
+        let error = initial_snapshot
+            .error
+            .clone()
+            .or(after_snapshot.error.clone());
+        let released = if error.is_none() {
+            initial_snapshot
+                .total_memory_mb
+                .saturating_sub(after_snapshot.total_memory_mb)
+        } else {
+            0
+        };
 
         TrimResult {
+            error,
             success_count: success,
             failed_count: fail,
             initial_memory_mb: initial_snapshot.total_memory_mb,
@@ -286,136 +318,73 @@ impl MemoryGuard {
     // Internal Platform Implementations
     // ---------------------------------------------------------------------------
 
-    #[cfg(target_os = "windows")]
-    fn sample_windows_processes() -> Vec<ProcessMemoryInfo> {
-        let mut result = Vec::new();
-
-        // 1. Gather all running processes via tasklist or wmic/cim
-        // Use tasklist for zero external dependency execution
-        let output = match Command::new("tasklist")
-            .args(["/FO", "CSV", "/NH"])
-            .output()
+    fn collect_processes() -> std::io::Result<Vec<ProcessMemoryInfo>> {
+        #[cfg(windows)]
         {
-            Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
-            Err(_) => return result,
-        };
-
-        let mut all_pids = HashSet::new();
-        let mut entries = Vec::new();
-
-        for line in output.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let parts: Vec<&str> = line.split("\",\"").collect();
-            if parts.len() >= 5 {
-                let name = parts[0].trim_matches('"').to_string();
-                let pid_str = parts[1].trim_matches('"');
-                let mem_str = parts[4].trim_matches('"').replace([' ', 'K', ','], "");
-
-                if let (Ok(pid), Ok(mem_kib)) = (pid_str.parse::<u32>(), mem_str.parse::<u64>()) {
-                    all_pids.insert(pid);
-                    entries.push((name, pid, mem_kib / 1024)); // KiB to MiB
-                }
-            }
-        }
-
-        // 2. Identify Kiro main processes and AI agent processes
-        let has_kiro = entries.iter().any(|(n, _, _)| {
-            let lower = n.to_ascii_lowercase();
-            lower.contains("kiro") || lower.contains("cursor")
-        });
-
-        for (name, pid, mem_mb) in entries {
-            let category = Self::classify_process(&name);
-            let is_candidate = category != ProcessCategory::Other;
-
-            if is_candidate {
-                let lower = name.to_ascii_lowercase();
-                // A process is only flagged as an orphan if it bears explicit IDE agent markers
-                // (e.g. kiro, cursor, mcp, tsserver) when no main IDE instance is active.
-                // Generic node.exe, python.exe, or cmd.exe are never blindly terminated.
-                let has_agent_marker = lower.contains("kiro")
-                    || lower.contains("cursor")
-                    || lower.contains("mcp")
-                    || lower.contains("tsserver");
-                let is_orphan = !has_kiro
-                    && has_agent_marker
-                    && (category == ProcessCategory::AgentSubprocess
-                        || category == ProcessCategory::LanguageServer);
-
-                result.push(ProcessMemoryInfo {
+            let entries = crate::windows_process::enumerate()?
+                .into_iter()
+                .map(|(pid, parent_pid, name)| ProcessMemoryInfo {
                     pid,
-                    parent_pid: 0,
+                    parent_pid,
                     name,
-                    memory_mb: mem_mb,
-                    category,
-                    is_orphan,
-                });
-            }
-        }
-
-        result
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    fn sample_unix_processes() -> MemorySnapshot {
-        let mut snapshot = MemorySnapshot::default();
-        if let Ok(out) = Command::new("ps")
-            .args(["-eo", "pid,ppid,rss,comm"])
-            .output()
-        {
-            let text = String::from_utf8_lossy(&out.stdout);
-            let mut entries = Vec::new();
-            for line in text.lines().skip(1) {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 4 {
-                    if let (Ok(pid), Ok(ppid), Ok(rss_kib)) = (
-                        parts[0].parse::<u32>(),
-                        parts[1].parse::<u32>(),
-                        parts[2].parse::<u64>(),
-                    ) {
-                        let name = parts[3].to_string();
-                        entries.push((pid, ppid, rss_kib, name));
+                    memory_mb: 0,
+                    category: ProcessCategory::Other,
+                    is_orphan: false,
+                })
+                .collect();
+            let mut owned = Self::summarize(entries).processes;
+            let mut sampled = Vec::with_capacity(owned.len());
+            for mut p in owned.drain(..) {
+                match crate::windows_process::working_set_mb(p.pid) {
+                    Ok(memory) => p.memory_mb = memory,
+                    Err(error) => {
+                        // A child may exit between enumeration and sampling. Only
+                        // ignore confirmed exits; access failures remain visible.
+                        if crate::windows_process::enumerate()?
+                            .iter()
+                            .any(|entry| entry.0 == p.pid)
+                        {
+                            return Err(error);
+                        }
+                        continue;
                     }
                 }
+                sampled.push(p);
             }
-
-            let has_kiro = entries.iter().any(|(_, _, _, n)| {
-                let lower = n.to_ascii_lowercase();
-                lower.contains("kiro") || lower.contains("cursor")
-            });
-
-            for (pid, ppid, rss_kib, name) in entries {
-                let category = Self::classify_process(&name);
-                if category != ProcessCategory::Other {
-                    let mem_mb = rss_kib / 1024;
-                    snapshot.total_memory_mb += mem_mb;
-
-                    let lower = name.to_ascii_lowercase();
-                    let has_agent_marker = lower.contains("kiro")
-                        || lower.contains("cursor")
-                        || lower.contains("mcp")
-                        || lower.contains("tsserver");
-                    let is_orphan = !has_kiro
-                        && has_agent_marker
-                        && (category == ProcessCategory::AgentSubprocess
-                            || category == ProcessCategory::LanguageServer);
-
-                    snapshot.processes.push(ProcessMemoryInfo {
-                        pid,
-                        parent_pid: ppid,
-                        name,
-                        memory_mb: mem_mb,
-                        category,
-                        is_orphan,
-                    });
-                }
-            }
-            snapshot.total_process_count = snapshot.processes.len();
+            Ok(sampled)
         }
-        snapshot
+        #[cfg(not(windows))]
+        {
+            let out = Command::new("ps")
+                .args(["-eo", "pid=,ppid=,rss=,comm="])
+                .output()?;
+            if !out.status.success() {
+                return Err(std::io::Error::other("Process sampling failed"));
+            }
+            let text = String::from_utf8_lossy(&out.stdout);
+            let mut entries = Vec::new();
+            for line in text.lines().filter(|line| !line.trim().is_empty()) {
+                // ps pads numeric columns, so consume those separately and preserve spaces in comm.
+                let mut rest = line.trim();
+                let mut numbers = Vec::new();
+                for _ in 0..3 {
+                    let end = rest
+                        .find(char::is_whitespace)
+                        .ok_or_else(|| std::io::Error::other("Malformed ps output"))?;
+                    numbers.push(rest[..end].parse::<u64>().map_err(std::io::Error::other)?);
+                    rest = rest[end..].trim_start();
+                }
+                entries.push(ProcessMemoryInfo {
+                    pid: numbers[0] as u32,
+                    parent_pid: numbers[1] as u32,
+                    memory_mb: numbers[2] / 1024,
+                    name: rest.to_string(),
+                    category: ProcessCategory::Other,
+                    is_orphan: false,
+                });
+            }
+            Ok(entries)
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -487,14 +456,73 @@ impl MemoryGuard {
         if let Some(appdata) = std::env::var_os("APPDATA") {
             let p = PathBuf::from(appdata);
             dirs.push(p.join("Kiro"));
-            dirs.push(p.join("Cursor"));
-            dirs.push(p.join("Code"));
         }
         if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
             let p = PathBuf::from(home);
-            dirs.push(p.join(".config").join("Kiro"));
-            dirs.push(p.join(".config").join("Cursor"));
+            if cfg!(target_os = "macos") {
+                dirs.push(p.join("Library/Application Support/Kiro"));
+            } else {
+                dirs.push(p.join(".config").join("Kiro"));
+            }
         }
         dirs
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    fn process(pid: u32, parent_pid: u32, name: &str) -> ProcessMemoryInfo {
+        ProcessMemoryInfo {
+            pid,
+            parent_pid,
+            name: name.into(),
+            memory_mb: 100,
+            category: ProcessCategory::Other,
+            is_orphan: false,
+        }
+    }
+    #[test]
+    fn unrelated_editors_and_superkiro_are_not_kiro() {
+        let snapshot = MemoryGuard::summarize(vec![
+            process(1, 0, "Superkiro.exe"),
+            process(2, 0, "Code.exe"),
+            process(3, 0, "Cursor.exe"),
+            process(4, 0, "node.exe"),
+        ]);
+        assert_eq!(snapshot.total_memory_mb, 0);
+        assert_eq!(snapshot.total_process_count, 0);
+    }
+    #[test]
+    fn only_kiro_process_tree_is_counted_even_out_of_order() {
+        let snapshot = MemoryGuard::summarize(vec![
+            process(3, 2, "node.exe"),
+            process(2, 1, "renderer.exe"),
+            process(1, 0, "Kiro.exe"),
+            process(4, 0, "node.exe"),
+        ]);
+        assert_eq!(snapshot.total_memory_mb, 300);
+        assert_eq!(snapshot.total_process_count, 3);
+        assert_eq!(snapshot.orphan_process_count, 0);
+    }
+    #[test]
+    fn failed_post_trim_sample_never_claims_released_memory() {
+        let before = MemorySnapshot {
+            total_memory_mb: 1000,
+            ..Default::default()
+        };
+        let after = MemorySnapshot {
+            error: Some("sample failed".into()),
+            ..Default::default()
+        };
+        let result = MemoryGuard::trim_result(before, after, 1, 0);
+        assert!(result.error.is_some());
+        assert_eq!(result.released_memory_mb, 0);
+    }
+    #[test]
+    fn cache_roots_never_include_other_editors() {
+        for root in MemoryGuard::get_default_cache_roots() {
+            assert_eq!(root.file_name().unwrap(), "Kiro");
+        }
     }
 }

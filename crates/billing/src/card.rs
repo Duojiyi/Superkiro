@@ -48,6 +48,9 @@ pub enum CardError {
 pub struct Card {
     pub id: String,
     pub code_hash: String,
+    /// Authenticated recovery payload, absent on legacy cards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_encrypted: Option<String>,
     pub template_id: Option<String>,
     /// Activation duration inherited from the issuing template. `None` is used
     /// for legacy cards whose template metadata is unavailable; those cards use
@@ -62,6 +65,9 @@ pub struct Card {
     pub credit_used: i64,
     pub credit_reserved: i64,
     pub status: CardStatus,
+    /// Status restored by unfreeze; absent on legacy snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen_from: Option<CardStatus>,
     pub activated_at: Option<u64>,
     pub valid_until: Option<u64>,
     pub max_devices: u32,
@@ -89,6 +95,7 @@ impl Card {
         Self {
             id: id.into(),
             code_hash: String::new(),
+            code_encrypted: None,
             template_id: None,
             activation_duration_secs: None,
             group_id: group_id.into(),
@@ -97,6 +104,7 @@ impl Card {
             credit_used: 0,
             credit_reserved: 0,
             status: CardStatus::Unactivated,
+            frozen_from: None,
             activated_at: None,
             valid_until: None,
             max_devices: 1,
@@ -126,6 +134,7 @@ impl Card {
         Self {
             id: id.into(),
             code_hash: code_hash.into(),
+            code_encrypted: None,
             template_id: Some(template.id.clone()),
             activation_duration_secs: Some(template.duration_secs),
             group_id: template.group_id.clone(),
@@ -134,6 +143,7 @@ impl Card {
             credit_used: 0,
             credit_reserved: 0,
             status: CardStatus::Unactivated,
+            frozen_from: None,
             activated_at: None,
             valid_until: None,
             max_devices: 1,
@@ -203,7 +213,7 @@ impl Card {
             CardStatus::Banned => Err(CardError::NotActive(CardStatus::Banned)),
             CardStatus::Voided => Err(CardError::NotActive(CardStatus::Voided)),
             CardStatus::Expired => Err(CardError::Expired),
-            CardStatus::Active => Ok(()), // Already active
+            CardStatus::Active => self.check_active(now_secs), // Never renew an expired card
             CardStatus::Unactivated => {
                 self.activated_at = Some(now_secs);
                 // Template-issued cards carry the authoritative duration. The argument

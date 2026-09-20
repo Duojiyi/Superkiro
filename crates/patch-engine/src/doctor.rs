@@ -79,7 +79,7 @@ pub struct DoctorReport {
 /// Diagnostic health doctor.
 #[derive(Debug, Clone)]
 pub struct Doctor {
-    http: Client,
+    http: Result<Client, String>,
     settings_mgr: SettingsManager,
     token_storage: TokenStorage,
 }
@@ -87,10 +87,12 @@ pub struct Doctor {
 impl Default for Doctor {
     fn default() -> Self {
         Self {
-            http: crate::http::client_builder()
-                .timeout(Duration::from_secs(4))
-                .build()
-                .expect("TLS HTTP client initialization failed"),
+            http: crate::http::client_builder().and_then(|builder| {
+                builder
+                    .timeout(Duration::from_secs(4))
+                    .build()
+                    .map_err(|e| e.to_string())
+            }),
             settings_mgr: SettingsManager::default(),
             token_storage: TokenStorage::default(),
         }
@@ -100,10 +102,12 @@ impl Default for Doctor {
 impl Doctor {
     pub fn new(settings_mgr: SettingsManager, token_storage: TokenStorage) -> Self {
         Self {
-            http: crate::http::client_builder()
-                .timeout(Duration::from_secs(4))
-                .build()
-                .expect("TLS HTTP client initialization failed"),
+            http: crate::http::client_builder().and_then(|builder| {
+                builder
+                    .timeout(Duration::from_secs(4))
+                    .build()
+                    .map_err(|e| e.to_string())
+            }),
             settings_mgr,
             token_storage,
         }
@@ -141,10 +145,16 @@ impl Doctor {
 
         // 2. Gateway Reachability Check
         let health_url = format!("{}/healthz", gw);
-        let gateway_reachable = match self.http.get(&health_url).send().await {
-            Ok(resp) => resp.status().is_success(),
-            Err(_) => false,
+        let gateway_result = match &self.http {
+            Ok(http) => http
+                .get(&health_url)
+                .send()
+                .await
+                .map(|resp| resp.status().is_success())
+                .map_err(|e| e.to_string()),
+            Err(error) => Err(format!("HTTP client initialization failed: {error}")),
         };
+        let gateway_reachable = matches!(gateway_result, Ok(true));
 
         if gateway_reachable {
             items.push(CheckItem {
@@ -156,7 +166,9 @@ impl Doctor {
             items.push(CheckItem {
                 name: "Gateway Connectivity".to_string(),
                 level: CheckLevel::Warning,
-                detail: format!("Gateway unreachable at {}", gw),
+                detail: gateway_result
+                    .err()
+                    .unwrap_or_else(|| format!("Gateway unreachable at {}", gw)),
             });
         }
 
@@ -357,5 +369,24 @@ impl Doctor {
         let _ = crate::mem_guard::MemoryGuard::trim_working_set(None);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod initialization_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn initialization_failure_is_visible_in_diagnostics() {
+        let doctor = Doctor {
+            http: Err("invalid CA".into()),
+            ..Doctor::default()
+        };
+        let report = doctor.diagnose("https://example.com", None).await;
+        assert!(!report.gateway_reachable);
+        assert!(report
+            .items
+            .iter()
+            .any(|item| item.name == "Gateway Connectivity" && item.detail.contains("invalid CA")));
     }
 }

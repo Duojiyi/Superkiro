@@ -1,0 +1,17 @@
+.announcements-trigger{display:inline-flex;align-items:center;justify-content:center;gap:8px;color:#dfcda7;border:1px solid #645e50;background:linear-gradient(145deg,#343631,#242925);border-radius:9px;padding:7px 13px;cursor:pointer}
+.announcements-dot{width:6px;height:6px;border-radius:50%;background:#dfc291;flex-shrink:0}
+dialog.announcements-dialog{box-sizing:border-box;width:min(480px,calc(100vw - 24px));height:min(540px,calc(100dvh - 24px));max-height:calc(100dvh - 24px);max-width:calc(100vw - 24px);padding:20px;border:1px solid #676456;border-radius:18px;color:#eeeae0;background:linear-gradient(145deg,#30332d,#1c2320 65%);box-shadow:inset 0 1px #e3d4ae20,0 24px 90px #0009;overflow:hidden}
+dialog.announcements-dialog[open]{display:flex;flex-direction:column;gap:12px}
+.announcements-dialog::backdrop{background:#080b09b3}
+.announcements-heading,.announcements-pagination{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-shrink:0;min-width:0}
+.announcements-heading h2{margin:0;font-size:20px;color:#e1cfaa}
+.announcements-dialog button{font:inherit;font-size:12px;line-height:1.4;min-height:32px;padding:6px 10px;border:1px solid #676456;border-radius:8px;color:#eeeae0;background:#33382f;cursor:pointer;flex-shrink:0}
+.announcements-dialog button:disabled{opacity:.4;cursor:default}
+.announcements-dialog button:focus-visible,.announcements-trigger:focus-visible{outline:2px solid #dfc291;outline-offset:2px}
+.announcements-meta,.announcements-pagination span{font-size:12px;color:#b8b9a9;flex-shrink:0}
+.announcements-viewport{position:relative;flex:1;min-height:0;min-width:0;overflow:hidden}
+.announcements-text{box-sizing:border-box;width:100%;margin:0;padding:0;white-space:pre-wrap;overflow-wrap:anywhere;font:14px/1.8 system-ui,sans-serif;tab-size:4}
+.announcements-measure{position:absolute;top:0;left:0;visibility:hidden;pointer-events:none}
+.announcements-state{flex:1;min-height:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;font-size:14px;overflow-wrap:anywhere;color:#c1c0b2}
+@media(max-height:400px){dialog.announcements-dialog{padding:12px;gap:6px}.announcements-dialog button{min-height:28px;padding:4px 8px}.announcements-text{font-size:13px;line-height:1.5}}
+@media(forced-colors:active){.announcements-dialog,.announcements-trigger,.announcements-dialog button{border:1px solid ButtonText}.announcements-dot{background:Highlight}}

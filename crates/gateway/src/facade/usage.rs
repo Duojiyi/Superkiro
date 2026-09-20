@@ -59,6 +59,9 @@ pub struct UserInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetUsageLimitsResponse {
+    /// Spendable credits after settled usage and active reservations; null without a card.
+    #[serde(default)]
+    pub available_credits: Option<f64>,
     #[serde(default)]
     pub virtual_plan_name: String,
     #[serde(default)]
@@ -130,6 +133,9 @@ impl FacadeHandler for GetUsageLimitsHandler {
                 .billing()
                 .and_then(|b| b.settled_usage(card_id, now_secs));
             let resp = GetUsageLimitsResponse {
+                available_credits: card
+                    .as_ref()
+                    .map(|c| c.available_credits() as f64 / 1_000_000.0),
                 virtual_plan_name: card
                     .as_ref()
                     .and_then(|c| c.plan_name())

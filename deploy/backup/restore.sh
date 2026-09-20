@@ -4,24 +4,12 @@
 # and complete-generation rollback before modifying live data.
 set -euo pipefail
 
-if [[ "$#" -lt 1 ]]; then
-  echo "Usage: $0 <backup_file.json|backup_manifest.json> [--force]" >&2
+if [[ "$#" -ne 1 || "$1" == --* ]]; then
+  echo "Usage: $0 <backup_file.json|backup_manifest.json> (gateway must be stopped)" >&2
   exit 1
 fi
-
 RAW_INPUT="$1"
-FORCE=false
-if [[ "${2:-}" == "--force" ]] || [[ "${1:-}" == "--force" ]]; then
-  FORCE=true
-  if [[ "${1:-}" == "--force" ]]; then
-    RAW_INPUT="${2:-}"
-  fi
-fi
-
-if [[ -z "${RAW_INPUT}" ]]; then
-  echo "Usage: $0 <backup_file.json|backup_manifest.json> [--force]" >&2
-  exit 1
-fi
+command -v python3 >/dev/null 2>&1 || { echo "Error: python3 is required" >&2; exit 1; }
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 DATA_DIR="${DATA_DIR:-${SCRIPT_DIR}/../../data}"
@@ -37,31 +25,24 @@ GENERATION_SOURCE=""
 
 # Step 1: Prevent running gateway from being overwritten and overwriting back (T07)
 # A running gateway holds dirty in-memory state that will overwrite restored disk state on flush
-GATEWAY_ONLINE=false
-if command -v curl >/dev/null 2>&1; then
-  if curl -s -m 2 "${HEALTH_URL}" >/dev/null 2>&1; then
-    GATEWAY_ONLINE=true
-  fi
+if command -v curl >/dev/null 2>&1 && curl -s -m 2 "${HEALTH_URL}" >/dev/null 2>&1; then
+  echo "Error: stop gateway before restore; live-state overwrite is forbidden." >&2
+  exit 1
 fi
-# Compose does not publish the gateway port in production. Detect its container
-# state too, so an unreachable host port cannot be mistaken for a stopped gateway.
-if [[ "${GATEWAY_ONLINE}" != "true" ]] && command -v docker >/dev/null 2>&1     && [[ -f "${SCRIPT_DIR}/../docker-compose.yml" ]]; then
-  if docker compose -f "${SCRIPT_DIR}/../docker-compose.yml" ps --status running --services 2>/dev/null       | grep -qx gateway; then
-    GATEWAY_ONLINE=true
-  fi
+# Both shipped Compose configurations name the container kiro-gateway.
+# Inspect its runtime identity directly, avoiding wrong-project empty lists and
+# Compose env-file availability. Missing/uninspectable containers fail closed.
+# Keep the gateway stopped for the entire restore; do not race deployment/startup.
+GATEWAY_CONTAINER="${GATEWAY_CONTAINER:-kiro-gateway}"
+command -v docker >/dev/null 2>&1 || { echo "Error: docker is required to confirm gateway is stopped" >&2; exit 1; }
+if ! state="$(docker inspect --type container --format '{{.State.Status}}' -- "${GATEWAY_CONTAINER}")"; then
+  echo "Error: cannot determine gateway container state; restore refused" >&2
+  exit 1
 fi
-
-if [[ "${GATEWAY_ONLINE}" == "true" ]]; then
-  if [[ "${FORCE}" != "true" ]]; then
-    echo "Error: Kiro Gateway is actively running at http://${HOST}:${PORT}." >&2
-    echo "Refusing to restore over live state because the running gateway's in-memory engine will" >&2
-    echo "periodically flush and overwrite the restored state. Stop the gateway service before restore" >&2
-    echo "(or pass --force to bypass at your own risk)." >&2
-    exit 1
-  else
-    echo "[!] Warning: Gateway is running. Proceeding with restore due to --force flag."
-  fi
-fi
+case "${state}" in
+  exited|created) ;;
+  *) echo "Error: gateway must be stopped (container state: ${state})" >&2; exit 1 ;;
+esac
 
 # Step 2: Resolve and validate backup artifact bundle
 BACKUP_PATH="${RAW_INPUT}"
@@ -173,50 +154,127 @@ echo "[√] Sandbox verification passed cleanly."
 
 # Step 4: Complete Rollback Generation Preparation (T07)
 TARGET_DIR="$(dirname -- "${TARGET_FILE}")"
-mkdir -p "${TARGET_DIR}"
+# Matches the non-root UID/GID in deploy/Dockerfile. Override for custom deployments.
+GATEWAY_UID="${GATEWAY_UID:-1000}"
+GATEWAY_GID="${GATEWAY_GID:-1000}"
+[[ "${GATEWAY_UID}" =~ ^[0-9]+$ && "${GATEWAY_GID}" =~ ^[0-9]+$ ]] || { echo "Invalid gateway UID/GID" >&2; exit 1; }
+if [[ ! -d "${TARGET_DIR}" ]]; then
+  mkdir -m 700 -p "${TARGET_DIR}"
+  chown "${GATEWAY_UID}:${GATEWAY_GID}" "${TARGET_DIR}"
+fi
+if [[ "$(id -u)" == 0 ]]; then
+  command -v setpriv >/dev/null 2>&1 || { echo "setpriv is required to verify gateway file access" >&2; exit 1; }
+  setpriv --reuid="${GATEWAY_UID}" --regid="${GATEWAY_GID}" --clear-groups test -w "${TARGET_DIR}"
+else
+  [[ "$(id -u)" == "${GATEWAY_UID}" && "$(id -g)" == "${GATEWAY_GID}" ]] || { echo "Run restore as root or the configured gateway identity" >&2; exit 1; }
+fi
 DATE_STR="$(date +%Y%m%d_%H%M%S)"
 ROLLBACK_DIR="${TARGET_DIR}/.rollback_${DATE_STR}_$$"
 
-if [[ -f "${TARGET_FILE}" ]] || [[ -f "${TARGET_ANCHOR}" ]]; then
-  echo "[*] Preserving complete live state into rollback generation: ${ROLLBACK_DIR}"
-  mkdir -m 700 -p "${ROLLBACK_DIR}"
-  if [[ -f "${TARGET_FILE}" ]]; then
-    cp -p -- "${TARGET_FILE}" "${ROLLBACK_DIR}/"
-  fi
-  if [[ -f "${TARGET_ANCHOR}" ]]; then
-    cp -p -- "${TARGET_ANCHOR}" "${ROLLBACK_DIR}/"
-  fi
-  # Preserve any live generation files
-  find "${TARGET_DIR}" -maxdepth 1 -name "billing_state.json.gen_*" -exec cp -p {} "${ROLLBACK_DIR}/" \; 2>/dev/null || true
-
-  # Record rollback manifest
-  cat > "${ROLLBACK_DIR}/rollback.manifest.json" <<JSON
-{
-  "rollback_created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "target_file": "${TARGET_FILE}",
-  "reason": "pre-restore backup before restoring ${BACKUP_FILE}"
-}
-JSON
+TARGET_BASENAME="$(basename -- "${TARGET_FILE}")"
+ANCHOR_BASENAME="$(basename -- "${TARGET_ANCHOR}")"
+OLD_GENERATION=""
+if [[ -f "${TARGET_ANCHOR}" ]]; then
+  OLD_GENERATION="$(python3 - "${TARGET_ANCHOR}" <<'PY'
+import json, re, sys
+name = json.load(open(sys.argv[1], encoding="utf-8")).get("generation_file") or ""
+if not isinstance(name, str) or (name and (not re.fullmatch(r"[A-Za-z0-9._-]+", name) or name.startswith("."))):
+    sys.exit("Invalid live generation filename")
+print(name)
+PY
+)"
 fi
+# Preserve both the live authority and any existing incoming generation. The
+# latter may share a sequence with a different history after a previous restore.
+ROLLBACK_NAMES=()
+ROLLBACK_PRESENT=()
+for name in "${OLD_GENERATION}" "${GENERATION_FILE}" "${TARGET_BASENAME}" "${ANCHOR_BASENAME}"; do
+  [[ -n "${name}" ]] || continue
+  duplicate=false
+  for saved in "${ROLLBACK_NAMES[@]}"; do
+    [[ "${saved}" != "${name}" ]] || duplicate=true
+  done
+  [[ "${duplicate}" == false ]] || continue
+  ROLLBACK_NAMES+=("${name}")
+done
+mkdir -m 700 -- "${ROLLBACK_DIR}" "${ROLLBACK_DIR}/files"
+for name in "${ROLLBACK_NAMES[@]}"; do
+  source="${TARGET_DIR}/${name}"
+  if [[ -L "${source}" || ( -e "${source}" && ! -f "${source}" ) ]]; then
+    echo "Error: rollback source must be a regular file: ${source}" >&2; exit 1
+  fi
+  if [[ -f "${source}" ]]; then
+    cp -p -- "${source}" "${ROLLBACK_DIR}/files/${name}"
+    ROLLBACK_PRESENT+=(true)
+  else
+    if [[ "${name}" == "${OLD_GENERATION}" ]]; then
+      echo "Error: live authoritative generation is missing: ${source}" >&2; exit 1
+    fi
+    ROLLBACK_PRESENT+=(false)
+  fi
+done
+# Record absence too: a failed first restore must not leave a partial new state.
+python3 - "${ROLLBACK_DIR}/rollback.manifest.json" "${TARGET_FILE}" "${ROLLBACK_NAMES[@]}" <<'PY'
+import json, pathlib, sys
+manifest = pathlib.Path(sys.argv[1])
+manifest.write_text(json.dumps({"target_file": sys.argv[2], "files": {
+    name: (manifest.parent / "files" / name).is_file() for name in sys.argv[3:]
+}}, indent=2), encoding="utf-8")
+PY
 
 # Step 5: Atomic replacement with safe rollback on failure
 TEMP_FILE="${TARGET_FILE}.restore.tmp.$$"
 TEMP_ANCHOR="${TARGET_ANCHOR}.restore.tmp.$$"
 TEMP_GENERATION="${TARGET_DIR}/.${GENERATION_FILE}.restore.tmp.$$"
 
+publication_started=false
 emergency_rollback() {
-  echo "[!] Error during atomic replacement! Initiating emergency rollback from ${ROLLBACK_DIR}..." >&2
-  if [[ -d "${ROLLBACK_DIR}" ]]; then
-    if [[ -f "${ROLLBACK_DIR}/billing_state.json" ]]; then
-      cp -p -- "${ROLLBACK_DIR}/billing_state.json" "${TARGET_FILE}"
+  trap - ERR
+  local failed=false authority_ready=true name index rollback_temp
+  echo "[!] Restore failed; rollback record: ${ROLLBACK_DIR}" >&2
+  if [[ "${publication_started}" == true ]]; then
+    # Dependencies first, mirror next, anchor last. Check every operation and
+    # continue after failures so one bad file does not suppress other recovery.
+    for index in "${!ROLLBACK_NAMES[@]}"; do
+      name="${ROLLBACK_NAMES[index]}"
+      if [[ "${name}" == "${ANCHOR_BASENAME}" && "${authority_ready}" == false ]]; then
+        echo "Error: cannot republish old anchor after authoritative generation rollback failure" >&2
+        continue
+      fi
+      if [[ "${ROLLBACK_PRESENT[index]}" == true ]]; then
+        rollback_temp="${TARGET_DIR}/.${name}.rollback.tmp.$$"
+        if cp -p -- "${ROLLBACK_DIR}/files/${name}" "${rollback_temp}" &&
+            mv -f -- "${rollback_temp}" "${TARGET_DIR}/${name}"; then
+          :
+        else
+          failed=true
+          if [[ "${name}" == "${OLD_GENERATION}" || ( -z "${OLD_GENERATION}" && "${name}" == "${TARGET_BASENAME}" ) ]]; then
+            authority_ready=false
+          fi
+          echo "Error: rollback failed for ${name}" >&2
+        fi
+        rm -f -- "${rollback_temp}" || failed=true
+      elif [[ "${name}" == "${TARGET_BASENAME}" || "${name}" == "${ANCHOR_BASENAME}" ]]; then
+        rm -f -- "${TARGET_DIR}/${name}" || failed=true
+      fi
+    done
+    # Remove a newly introduced generation only after the incoming anchor is
+    # removed/reverted. If rollback failed, preserve it for manual recovery.
+    if [[ "${failed}" == false && -n "${GENERATION_FILE}" ]]; then
+      for index in "${!ROLLBACK_NAMES[@]}"; do
+        if [[ "${ROLLBACK_NAMES[index]}" == "${GENERATION_FILE}" && "${ROLLBACK_PRESENT[index]}" == false ]]; then
+          rm -f -- "${TARGET_DIR}/${GENERATION_FILE}" || failed=true
+        fi
+      done
     fi
-    if [[ -f "${ROLLBACK_DIR}/billing_state.json.anchor" ]]; then
-      cp -p -- "${ROLLBACK_DIR}/billing_state.json.anchor" "${TARGET_ANCHOR}"
-    fi
-    find "${ROLLBACK_DIR}" -maxdepth 1 -name "billing_state.json.gen_*" -exec cp -p {} "${TARGET_DIR}/" \; 2>/dev/null || true
-    echo "[√] Live state successfully restored from rollback generation." >&2
   fi
-  rm -f -- "${TEMP_FILE}" "${TEMP_ANCHOR}" "${TEMP_GENERATION}"
+  rm -f -- "${TEMP_FILE}" "${TEMP_ANCHOR}" "${TEMP_GENERATION}" || failed=true
+  if [[ "${failed}" == true ]]; then
+    echo "Error: rollback incomplete; preserve data and rollback directory for manual recovery." >&2
+  else
+    echo "Live state successfully restored to its pre-restore state." >&2
+  fi
+  exit 1
 }
 trap emergency_rollback ERR
 
@@ -226,12 +284,20 @@ if [[ -n "${GENERATION_SOURCE}" ]]; then
   cp -- "${GENERATION_SOURCE}" "${TEMP_GENERATION}"
 fi
 chmod 600 "${TEMP_FILE}" "${TEMP_ANCHOR}" ${GENERATION_SOURCE:+"${TEMP_GENERATION}"}
+chown "${GATEWAY_UID}:${GATEWAY_GID}" "${TEMP_FILE}" "${TEMP_ANCHOR}" ${GENERATION_SOURCE:+"${TEMP_GENERATION}"}
+if [[ "$(id -u)" == 0 ]]; then
+  for restored in "${TEMP_FILE}" "${TEMP_ANCHOR}" ${GENERATION_SOURCE:+"${TEMP_GENERATION}"}; do
+    setpriv --reuid="${GATEWAY_UID}" --regid="${GATEWAY_GID}" --clear-groups test -r "${restored}"
+  done
+fi
 
-mv -f -- "${TEMP_FILE}" "${TARGET_FILE}"
-mv -f -- "${TEMP_ANCHOR}" "${TARGET_ANCHOR}"
+# Publish the authoritative generation before its anchor, the commit point.
+publication_started=true
 if [[ -n "${GENERATION_SOURCE}" ]]; then
   mv -f -- "${TEMP_GENERATION}" "${TARGET_DIR}/${GENERATION_FILE}"
 fi
+mv -f -- "${TEMP_FILE}" "${TARGET_FILE}"
+mv -f -- "${TEMP_ANCHOR}" "${TARGET_ANCHOR}"
 
 # Directory sync if supported
 if command -v sync >/dev/null 2>&1; then

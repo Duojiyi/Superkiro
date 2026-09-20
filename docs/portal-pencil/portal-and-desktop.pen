@@ -1,0 +1,2376 @@
+{
+  "version": "2.18",
+  "children": [
+    {
+      "type": "text",
+      "id": "Jjfbp",
+      "x": 80,
+      "y": 80,
+      "name": "Title_Screen_01",
+      "fill": "#F59E0B",
+      "content": "01 · 商业卡密尊享激活门禁 (441 × 541 · 独立模态窗口)",
+      "fontFamily": "Inter",
+      "fontSize": 15,
+      "fontWeight": "bold"
+    },
+    {
+      "type": "frame",
+      "id": "QZXoK",
+      "x": 80,
+      "y": 110,
+      "name": "Screen_01_商业卡密激活门禁",
+      "clip": true,
+      "width": 441,
+      "height": 541,
+      "fill": {
+        "type": "image",
+        "enabled": true,
+        "url": "window_01_activation.png",
+        "mode": "fill"
+      },
+      "cornerRadius": 22,
+      "stroke": "#ffffff18",
+      "strokeWidth": 1,
+      "effect": {
+        "type": "shadow",
+        "shadowType": "outer",
+        "color": "#000000cc",
+        "offset": {
+          "x": 0,
+          "y": 20
+        },
+        "blur": 40
+      }
+    },
+    {
+      "type": "text",
+      "id": "hmnAz",
+      "x": 600,
+      "y": 80,
+      "name": "Title_Screen_02",
+      "fill": "#22D3EE",
+      "content": "02 · 极速接管主控台 [加速中] (427 × 546 · 核心主窗口)",
+      "fontFamily": "Inter",
+      "fontSize": 15,
+      "fontWeight": "bold"
+    },
+    {
+      "type": "frame",
+      "id": "P5n5N",
+      "x": 600,
+      "y": 110,
+      "name": "Screen_02_运行接管主控台_加速态",
+      "clip": true,
+      "width": 427,
+      "height": 546,
+      "fill": {
+        "type": "image",
+        "enabled": true,
+        "url": "window_02_active_dashboard.png",
+        "mode": "fill"
+      },
+      "cornerRadius": 22,
+      "stroke": "#ffffff18",
+      "strokeWidth": 1,
+      "effect": {
+        "type": "shadow",
+        "shadowType": "outer",
+        "color": "#000000cc",
+        "offset": {
+          "x": 0,
+          "y": 20
+        },
+        "blur": 40
+      }
+    },
+    {
+      "type": "text",
+      "id": "r62spU",
+      "x": 1100,
+      "y": 80,
+      "name": "Title_Screen_03",
+      "fill": "#94A3B8",
+      "content": "03 · 极速接管主控台 [待机态] (442 × 544 · 核心主窗口)",
+      "fontFamily": "Inter",
+      "fontSize": 15,
+      "fontWeight": "bold"
+    },
+    {
+      "type": "frame",
+      "id": "K6W1xh",
+      "x": 1100,
+      "y": 110,
+      "name": "Screen_03_运行接管主控台_待机态",
+      "clip": true,
+      "width": 442,
+      "height": 544,
+      "fill": {
+        "type": "image",
+        "enabled": true,
+        "url": "window_03_standby.png",
+        "mode": "fill"
+      },
+      "cornerRadius": 22,
+      "stroke": "#ffffff18",
+      "strokeWidth": 1,
+      "effect": {
+        "type": "shadow",
+        "shadowType": "outer",
+        "color": "#000000cc",
+        "offset": {
+          "x": 0,
+          "y": 20
+        },
+        "blur": 40
+      }
+    },
+    {
+      "type": "text",
+      "id": "z27I4v",
+      "x": 80,
+      "y": 730,
+      "name": "Title_Screen_04",
+      "fill": "#10B981",
+      "content": "04 · 系统健康守护与一键自愈 (691 × 358 · 独立诊断与体检窗口)",
+      "fontFamily": "Inter",
+      "fontSize": 15,
+      "fontWeight": "bold"
+    },
+    {
+      "type": "frame",
+      "id": "goL8P",
+      "x": 80,
+      "y": 760,
+      "name": "Screen_04_系统健康守护与自愈",
+      "clip": true,
+      "width": 691,
+      "height": 358,
+      "fill": {
+        "type": "image",
+        "enabled": true,
+        "url": "window_04_health_guardian.png",
+        "mode": "fill"
+      },
+      "cornerRadius": 22,
+      "stroke": "#ffffff18",
+      "strokeWidth": 1,
+      "effect": {
+        "type": "shadow",
+        "shadowType": "outer",
+        "color": "#000000cc",
+        "offset": {
+          "x": 0,
+          "y": 20
+        },
+        "blur": 40
+      }
+    },
+    {
+      "type": "text",
+      "id": "hUYL2",
+      "x": 850,
+      "y": 730,
+      "name": "Title_Screen_05",
+      "fill": "#818CF8",
+      "content": "05 · 偏好设置与设备管理中心 (690 × 357 · 设置抽屉/管理窗口)",
+      "fontFamily": "Inter",
+      "fontSize": 15,
+      "fontWeight": "bold"
+    },
+    {
+      "type": "frame",
+      "id": "iqJ1D",
+      "x": 850,
+      "y": 760,
+      "name": "Screen_05_偏好设置与设备管理中心",
+      "clip": true,
+      "width": 690,
+      "height": 357,
+      "fill": {
+        "type": "image",
+        "enabled": true,
+        "url": "window_05_settings.png",
+        "mode": "fill"
+      },
+      "cornerRadius": 22,
+      "stroke": "#ffffff18",
+      "strokeWidth": 1,
+      "effect": {
+        "type": "shadow",
+        "shadowType": "outer",
+        "color": "#000000cc",
+        "offset": {
+          "x": 0,
+          "y": 20
+        },
+        "blur": 40
+      }
+    },
+    {
+      "type": "frame",
+      "id": "J3qlw",
+      "x": 1682,
+      "y": 80,
+      "name": "云端自助门户 / 卡密查询",
+      "clip": true,
+      "width": 1200,
+      "height": 850,
+      "fill": "#F5F6F8",
+      "layout": "vertical",
+      "children": [
+        {
+          "type": "frame",
+          "id": "N44n75",
+          "name": "品牌导航",
+          "width": "fill_container",
+          "fill": "#101D2B",
+          "gap": 40,
+          "padding": [
+            26,
+            48
+          ],
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "text",
+              "id": "qBEWO",
+              "name": "品牌",
+              "fill": "#F4D7A0",
+              "textGrowth": "fixed-width",
+              "width": "fill_container",
+              "content": "KIRO / 用户服务",
+              "fontFamily": "Noto Sans SC",
+              "fontSize": 22,
+              "fontWeight": "normal"
+            },
+            {
+              "type": "text",
+              "id": "BFSVa",
+              "name": "站点说明",
+              "fill": "#CAD4E1",
+              "textGrowth": "fixed-width",
+              "width": "fill_container",
+              "content": "自助门户",
+              "fontFamily": "Noto Sans SC",
+              "fontSize": 14,
+              "fontWeight": "normal"
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "F819ED",
+          "name": "门户主体",
+          "width": "fill_container",
+          "height": "fill_container",
+          "gap": 40,
+          "padding": 48,
+          "children": [
+            {
+              "type": "frame",
+              "id": "CR23N",
+              "name": "服务导航",
+              "width": 208,
+              "height": "fill_container",
+              "layout": "vertical",
+              "gap": 12,
+              "children": [
+                {
+                  "type": "text",
+                  "id": "kXyrb",
+                  "name": "导航标题",
+                  "fill": "#263141",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "你的服务，由你掌握",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 18,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "frame",
+                  "id": "xfX7o",
+                  "name": "卡密查询",
+                  "width": "fill_container",
+                  "fill": "#173D42",
+                  "cornerRadius": 8,
+                  "padding": 16,
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "MqBvm",
+                      "name": "卡密查询",
+                      "fill": "#FFFFFF",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "卡密查询",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 15,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "kw7Kl",
+                  "name": "一键激活",
+                  "width": "fill_container",
+                  "fill": "#E8ECF0",
+                  "cornerRadius": 8,
+                  "padding": 16,
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "rRT2w",
+                      "name": "一键激活",
+                      "fill": "#4A5869",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "一键激活",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 15,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "Dn0r5",
+                  "name": "设备换绑",
+                  "width": "fill_container",
+                  "fill": "#E8ECF0",
+                  "cornerRadius": 8,
+                  "padding": 16,
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "lhRIF",
+                      "name": "设备换绑",
+                      "fill": "#4A5869",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "设备换绑",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 15,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "cj2IA",
+                  "name": "卡密充值",
+                  "width": "fill_container",
+                  "fill": "#E8ECF0",
+                  "cornerRadius": 8,
+                  "padding": 16,
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "q0YPt",
+                      "name": "卡密充值",
+                      "fill": "#4A5869",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "卡密充值",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 15,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "text",
+                  "id": "CZ645",
+                  "name": "隐私说明",
+                  "fill": "#637285",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "卡密是你的访问凭据。\n请勿向他人分享完整卡密。",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 12,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "sYkvc",
+              "name": "查询工作区",
+              "width": "fill_container",
+              "layout": "vertical",
+              "gap": 24,
+              "children": [
+                {
+                  "type": "text",
+                  "id": "Hyynp",
+                  "name": "步骤",
+                  "fill": "#59746D",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "SELF-SERVICE / 01",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 12,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "text",
+                  "id": "hrCkh",
+                  "name": "标题",
+                  "fill": "#263141",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "查看你的卡密与设备",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 32,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "text",
+                  "id": "CDbNe",
+                  "name": "说明",
+                  "fill": "#637285",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "查询有效期、授权状态与绑定设备。无需注册额外账号。",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 14,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "frame",
+                  "id": "C7EFS",
+                  "name": "卡密查询表单",
+                  "width": "fill_container",
+                  "fill": "#FFFFFF",
+                  "cornerRadius": 12,
+                  "stroke": "#DEE4E9",
+                  "strokeWidth": 1,
+                  "layout": "vertical",
+                  "gap": 18,
+                  "padding": 28,
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "TNjz0",
+                      "name": "表单标题",
+                      "fill": "#263141",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "输入卡密",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 18,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "qoNaR",
+                      "name": "卡密输入框",
+                      "width": "fill_container",
+                      "fill": "#F7F9FA",
+                      "cornerRadius": 6,
+                      "stroke": "#BAC7D0",
+                      "strokeWidth": 1,
+                      "padding": 18,
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "BbFW0",
+                          "name": "占位符",
+                          "fill": "#748190",
+                          "textGrowth": "fixed-width",
+                          "width": "fill_container",
+                          "content": "输入或粘贴完整卡密",
+                          "fontFamily": "Noto Sans SC",
+                          "fontSize": 14,
+                          "fontWeight": "normal"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "text",
+                      "id": "WNzc6",
+                      "name": "安全提示",
+                      "fill": "#637285",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "仅用于本次验证，不在浏览器持久保存。",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 12,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "Avzc5",
+                      "name": "查询按钮",
+                      "width": "fill_container",
+                      "fill": "#173D42",
+                      "cornerRadius": 6,
+                      "padding": 16,
+                      "justifyContent": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "QVZ1R",
+                          "name": "按钮文字",
+                          "fill": "#FFFFFF",
+                          "textGrowth": "fixed-width",
+                          "width": "fill_container",
+                          "content": "查询卡密 →",
+                          "fontFamily": "Noto Sans SC",
+                          "fontSize": 15,
+                          "fontWeight": "normal"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "aTS3m",
+                  "name": "未查询状态",
+                  "width": "fill_container",
+                  "cornerRadius": 12,
+                  "stroke": "#DCE3E8",
+                  "strokeWidth": 1,
+                  "layout": "vertical",
+                  "gap": 16,
+                  "padding": 28,
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "AXLU0",
+                      "name": "状态标题",
+                      "fill": "#263141",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "等待查询",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 20,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "type": "text",
+                      "id": "LDa9k",
+                      "name": "状态说明",
+                      "fill": "#637285",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "验证成功后，这里会显示你的授权与设备信息。",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 14,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "S78MPc",
+                      "name": "授权摘要",
+                      "width": "fill_container",
+                      "gap": 24,
+                      "children": [
+                        {
+                          "type": "frame",
+                          "id": "L1cICS",
+                          "name": "授权状态",
+                          "width": "fill_container",
+                          "layout": "vertical",
+                          "gap": 12,
+                          "children": [
+                            {
+                              "type": "text",
+                              "id": "pTgzd",
+                              "name": "字段",
+                              "fill": "#637285",
+                              "textGrowth": "fixed-width",
+                              "width": "fill_container",
+                              "content": "授权状态",
+                              "fontFamily": "Noto Sans SC",
+                              "fontSize": 12,
+                              "fontWeight": "normal"
+                            },
+                            {
+                              "type": "text",
+                              "id": "fwbFX",
+                              "name": "待加载",
+                              "fill": "#263141",
+                              "textGrowth": "fixed-width",
+                              "width": "fill_container",
+                              "content": "—",
+                              "fontFamily": "Noto Sans SC",
+                              "fontSize": 24,
+                              "fontWeight": "normal"
+                            }
+                          ]
+                        },
+                        {
+                          "type": "frame",
+                          "id": "H3AfG",
+                          "name": "有效期",
+                          "width": "fill_container",
+                          "layout": "vertical",
+                          "gap": 12,
+                          "children": [
+                            {
+                              "type": "text",
+                              "id": "wDFRV",
+                              "name": "字段",
+                              "fill": "#637285",
+                              "textGrowth": "fixed-width",
+                              "width": "fill_container",
+                              "content": "有效期",
+                              "fontFamily": "Noto Sans SC",
+                              "fontSize": 12,
+                              "fontWeight": "normal"
+                            },
+                            {
+                              "type": "text",
+                              "id": "BUqyv",
+                              "name": "待加载",
+                              "fill": "#263141",
+                              "textGrowth": "fixed-width",
+                              "width": "fill_container",
+                              "content": "—",
+                              "fontFamily": "Noto Sans SC",
+                              "fontSize": 24,
+                              "fontWeight": "normal"
+                            }
+                          ]
+                        },
+                        {
+                          "type": "frame",
+                          "id": "T9fLR5",
+                          "name": "绑定设备",
+                          "width": "fill_container",
+                          "layout": "vertical",
+                          "gap": 12,
+                          "children": [
+                            {
+                              "type": "text",
+                              "id": "ZUYd2",
+                              "name": "字段",
+                              "fill": "#637285",
+                              "textGrowth": "fixed-width",
+                              "width": "fill_container",
+                              "content": "绑定设备",
+                              "fontFamily": "Noto Sans SC",
+                              "fontSize": 12,
+                              "fontWeight": "normal"
+                            },
+                            {
+                              "type": "text",
+                              "id": "WLgMa",
+                              "name": "待加载",
+                              "fill": "#263141",
+                              "textGrowth": "fixed-width",
+                              "width": "fill_container",
+                              "content": "—",
+                              "fontFamily": "Noto Sans SC",
+                              "fontSize": 24,
+                              "fontWeight": "normal"
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "text",
+                  "id": "N7AfDe",
+                  "name": "操作提示",
+                  "fill": "#637285",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "需要在桌面客户端接管 Kiro？请使用客户端完成本地配置。",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 12,
+                  "fontWeight": "normal"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "frame",
+      "id": "wMOmA",
+      "x": 2962,
+      "y": 80,
+      "name": "云端自助门户 / 一键激活",
+      "clip": true,
+      "width": 1200,
+      "height": 850,
+      "fill": "#F5F6F8",
+      "layout": "vertical",
+      "children": [
+        {
+          "type": "frame",
+          "id": "v6y5U",
+          "name": "品牌导航",
+          "width": "fill_container",
+          "fill": "#101D2B",
+          "gap": 40,
+          "padding": [
+            26,
+            48
+          ],
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "text",
+              "id": "G4tlYZ",
+              "name": "品牌",
+              "fill": "#F4D7A0",
+              "textGrowth": "fixed-width",
+              "width": "fill_container",
+              "content": "KIRO / 用户服务",
+              "fontFamily": "Noto Sans SC",
+              "fontSize": 22,
+              "fontWeight": "normal"
+            },
+            {
+              "type": "text",
+              "id": "Vb3cW",
+              "name": "站点说明",
+              "fill": "#CAD4E1",
+              "textGrowth": "fixed-width",
+              "width": "fill_container",
+              "content": "自助门户",
+              "fontFamily": "Noto Sans SC",
+              "fontSize": 14,
+              "fontWeight": "normal"
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "vCdvF",
+          "name": "门户主体",
+          "width": "fill_container",
+          "height": "fill_container",
+          "gap": 40,
+          "padding": 48,
+          "children": [
+            {
+              "type": "frame",
+              "id": "nnwcR",
+              "name": "服务导航",
+              "width": 208,
+              "height": "fill_container",
+              "layout": "vertical",
+              "gap": 12,
+              "children": [
+                {
+                  "type": "text",
+                  "id": "XIx1p",
+                  "name": "导航标题",
+                  "fill": "#263141",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "你的服务，由你掌握",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 18,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "frame",
+                  "id": "AItm0",
+                  "name": "卡密查询",
+                  "width": "fill_container",
+                  "fill": "#E8ECF0",
+                  "cornerRadius": 8,
+                  "padding": 16,
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "spmYk",
+                      "name": "卡密查询",
+                      "fill": "#4A5869",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "卡密查询",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 15,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "FfTNB",
+                  "name": "一键激活",
+                  "width": "fill_container",
+                  "fill": "#173D42",
+                  "cornerRadius": 8,
+                  "padding": 16,
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "M7A1l",
+                      "name": "一键激活",
+                      "fill": "#FFFFFF",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "一键激活",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 15,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "b5GjGv",
+                  "name": "设备换绑",
+                  "width": "fill_container",
+                  "fill": "#E8ECF0",
+                  "cornerRadius": 8,
+                  "padding": 16,
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "v9WGQ",
+                      "name": "设备换绑",
+                      "fill": "#4A5869",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "设备换绑",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 15,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "GhxTH",
+                  "name": "卡密充值",
+                  "width": "fill_container",
+                  "fill": "#E8ECF0",
+                  "cornerRadius": 8,
+                  "padding": 16,
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "hoCuF",
+                      "name": "卡密充值",
+                      "fill": "#4A5869",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "卡密充值",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 15,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "text",
+                  "id": "g9WQhr",
+                  "name": "隐私说明",
+                  "fill": "#637285",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "卡密是你的访问凭据。\n请勿向他人分享完整卡密。",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 12,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "wEOCK",
+              "name": "查询工作区",
+              "width": "fill_container",
+              "layout": "vertical",
+              "gap": 24,
+              "children": [
+                {
+                  "type": "text",
+                  "id": "fB7ef",
+                  "name": "步骤",
+                  "fill": "#59746D",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "SELF-SERVICE / 02",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 12,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "text",
+                  "id": "MnMgP",
+                  "name": "标题",
+                  "fill": "#263141",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "激活你的专属授权",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 32,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "text",
+                  "id": "zsB2b",
+                  "name": "说明",
+                  "fill": "#637285",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "完成云端授权；本地接管请在桌面客户端操作。",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 14,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "frame",
+                  "id": "cUW06",
+                  "name": "卡密查询表单",
+                  "width": "fill_container",
+                  "fill": "#FFFFFF",
+                  "cornerRadius": 12,
+                  "stroke": "#DEE4E9",
+                  "strokeWidth": 1,
+                  "layout": "vertical",
+                  "gap": 18,
+                  "padding": 28,
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "QSpav",
+                      "name": "表单标题",
+                      "fill": "#263141",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "完整卡密",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 18,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "bPwAh",
+                      "name": "卡密输入框",
+                      "width": "fill_container",
+                      "fill": "#F7F9FA",
+                      "cornerRadius": 6,
+                      "stroke": "#BAC7D0",
+                      "strokeWidth": 1,
+                      "padding": 18,
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "qpXij",
+                          "name": "占位符",
+                          "fill": "#748190",
+                          "textGrowth": "fixed-width",
+                          "width": "fill_container",
+                          "content": "输入完整卡密",
+                          "fontFamily": "Noto Sans SC",
+                          "fontSize": 14,
+                          "fontWeight": "normal"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "xWa7n",
+                      "name": "设备标识（选填）",
+                      "width": "fill_container",
+                      "layout": "vertical",
+                      "gap": 10,
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "DhByG",
+                          "name": "标签",
+                          "fill": "#263141",
+                          "content": "设备标识（选填）",
+                          "fontFamily": "Noto Sans SC",
+                          "fontSize": 14,
+                          "fontWeight": "normal"
+                        },
+                        {
+                          "type": "frame",
+                          "id": "uys06",
+                          "name": "第二输入框",
+                          "width": "fill_container",
+                          "fill": "#F7F9FA",
+                          "cornerRadius": 6,
+                          "stroke": "#BAC7D0",
+                          "strokeWidth": 1,
+                          "padding": 18,
+                          "children": [
+                            {
+                              "type": "text",
+                              "id": "bU4J0",
+                              "name": "占位符",
+                              "fill": "#748190",
+                              "content": "输入设备标识（选填）",
+                              "fontFamily": "Noto Sans SC",
+                              "fontSize": 14,
+                              "fontWeight": "normal"
+                            }
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "type": "text",
+                      "id": "eZf3i",
+                      "name": "安全提示",
+                      "fill": "#637285",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "提交前核对卡密及设备标识。",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 12,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "Y9RSM5",
+                      "name": "查询按钮",
+                      "width": "fill_container",
+                      "fill": "#173D42",
+                      "cornerRadius": 6,
+                      "padding": 16,
+                      "justifyContent": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "SxXGM",
+                          "name": "按钮文字",
+                          "fill": "#FFFFFF",
+                          "textGrowth": "fixed-width",
+                          "width": "fill_container",
+                          "content": "确认激活 →",
+                          "fontFamily": "Noto Sans SC",
+                          "fontSize": 15,
+                          "fontWeight": "normal"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "h7CIk",
+                  "name": "未查询状态",
+                  "width": "fill_container",
+                  "cornerRadius": 12,
+                  "stroke": "#DCE3E8",
+                  "strokeWidth": 1,
+                  "layout": "vertical",
+                  "gap": 16,
+                  "padding": 28,
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "H7fyI",
+                      "name": "状态标题",
+                      "fill": "#263141",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "操作前请确认",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 20,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "type": "text",
+                      "id": "y8eZ8o",
+                      "name": "状态说明",
+                      "fill": "#637285",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "提交前核对卡密及设备标识。",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 14,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "text",
+                  "id": "h9kYI",
+                  "name": "操作提示",
+                  "fill": "#637285",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "需要在桌面客户端接管 Kiro？请使用客户端完成本地配置。",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 12,
+                  "fontWeight": "normal"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "frame",
+      "id": "C5RTfE",
+      "x": 4242,
+      "y": 80,
+      "name": "云端自助门户 / 设备换绑",
+      "clip": true,
+      "width": 1200,
+      "height": 850,
+      "fill": "#F5F6F8",
+      "layout": "vertical",
+      "children": [
+        {
+          "type": "frame",
+          "id": "PD8XU",
+          "name": "品牌导航",
+          "width": "fill_container",
+          "fill": "#101D2B",
+          "gap": 40,
+          "padding": [
+            26,
+            48
+          ],
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "text",
+              "id": "aoTXA",
+              "name": "品牌",
+              "fill": "#F4D7A0",
+              "textGrowth": "fixed-width",
+              "width": "fill_container",
+              "content": "KIRO / 用户服务",
+              "fontFamily": "Noto Sans SC",
+              "fontSize": 22,
+              "fontWeight": "normal"
+            },
+            {
+              "type": "text",
+              "id": "kFMiz",
+              "name": "站点说明",
+              "fill": "#CAD4E1",
+              "textGrowth": "fixed-width",
+              "width": "fill_container",
+              "content": "自助门户",
+              "fontFamily": "Noto Sans SC",
+              "fontSize": 14,
+              "fontWeight": "normal"
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "Zapef",
+          "name": "门户主体",
+          "width": "fill_container",
+          "height": "fill_container",
+          "gap": 40,
+          "padding": 48,
+          "children": [
+            {
+              "type": "frame",
+              "id": "MfLnP",
+              "name": "服务导航",
+              "width": 208,
+              "height": "fill_container",
+              "layout": "vertical",
+              "gap": 12,
+              "children": [
+                {
+                  "type": "text",
+                  "id": "JNsHO",
+                  "name": "导航标题",
+                  "fill": "#263141",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "你的服务，由你掌握",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 18,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "frame",
+                  "id": "AtZQ4",
+                  "name": "卡密查询",
+                  "width": "fill_container",
+                  "fill": "#E8ECF0",
+                  "cornerRadius": 8,
+                  "padding": 16,
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "e1s0sV",
+                      "name": "卡密查询",
+                      "fill": "#4A5869",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "卡密查询",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 15,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "wmOjy",
+                  "name": "一键激活",
+                  "width": "fill_container",
+                  "fill": "#E8ECF0",
+                  "cornerRadius": 8,
+                  "padding": 16,
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "W9qghh",
+                      "name": "一键激活",
+                      "fill": "#4A5869",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "一键激活",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 15,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "NVsfr",
+                  "name": "设备换绑",
+                  "width": "fill_container",
+                  "fill": "#173D42",
+                  "cornerRadius": 8,
+                  "padding": 16,
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "Q1l75X",
+                      "name": "设备换绑",
+                      "fill": "#FFFFFF",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "设备换绑",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 15,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "eJhs7",
+                  "name": "卡密充值",
+                  "width": "fill_container",
+                  "fill": "#E8ECF0",
+                  "cornerRadius": 8,
+                  "padding": 16,
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "yemi8",
+                      "name": "卡密充值",
+                      "fill": "#4A5869",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "卡密充值",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 15,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "text",
+                  "id": "m9xphy",
+                  "name": "隐私说明",
+                  "fill": "#637285",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "卡密是你的访问凭据。\n请勿向他人分享完整卡密。",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 12,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "U58zjn",
+              "name": "查询工作区",
+              "width": "fill_container",
+              "layout": "vertical",
+              "gap": 24,
+              "children": [
+                {
+                  "type": "text",
+                  "id": "tqW93",
+                  "name": "步骤",
+                  "fill": "#59746D",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "SELF-SERVICE / 03",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 12,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "text",
+                  "id": "f6ZANJ",
+                  "name": "标题",
+                  "fill": "#263141",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "为新的工作站准备就绪",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 32,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "text",
+                  "id": "CSIgS",
+                  "name": "说明",
+                  "fill": "#637285",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "换绑会影响原设备的授权，请先保存当前工作。",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 14,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "frame",
+                  "id": "Ncr2R",
+                  "name": "卡密查询表单",
+                  "width": "fill_container",
+                  "fill": "#FFFFFF",
+                  "cornerRadius": 12,
+                  "stroke": "#DEE4E9",
+                  "strokeWidth": 1,
+                  "layout": "vertical",
+                  "gap": 18,
+                  "padding": 28,
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "Begjl",
+                      "name": "表单标题",
+                      "fill": "#263141",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "完整卡密",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 18,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "bQEfY",
+                      "name": "卡密输入框",
+                      "width": "fill_container",
+                      "fill": "#F7F9FA",
+                      "cornerRadius": 6,
+                      "stroke": "#BAC7D0",
+                      "strokeWidth": 1,
+                      "padding": 18,
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "tKHj6",
+                          "name": "占位符",
+                          "fill": "#748190",
+                          "textGrowth": "fixed-width",
+                          "width": "fill_container",
+                          "content": "输入完整卡密",
+                          "fontFamily": "Noto Sans SC",
+                          "fontSize": 14,
+                          "fontWeight": "normal"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "XV5HB",
+                      "name": "原设备指纹",
+                      "width": "fill_container",
+                      "layout": "vertical",
+                      "gap": 10,
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "l1hl2",
+                          "name": "标签",
+                          "fill": "#263141",
+                          "content": "原设备指纹",
+                          "fontFamily": "Noto Sans SC",
+                          "fontSize": 14,
+                          "fontWeight": "normal"
+                        },
+                        {
+                          "type": "frame",
+                          "id": "FHCKH",
+                          "name": "第二输入框",
+                          "width": "fill_container",
+                          "fill": "#F7F9FA",
+                          "cornerRadius": 6,
+                          "stroke": "#BAC7D0",
+                          "strokeWidth": 1,
+                          "padding": 18,
+                          "children": [
+                            {
+                              "type": "text",
+                              "id": "jA79C",
+                              "name": "占位符",
+                              "fill": "#748190",
+                              "content": "输入原设备指纹",
+                              "fontFamily": "Noto Sans SC",
+                              "fontSize": 14,
+                              "fontWeight": "normal"
+                            }
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "type": "text",
+                      "id": "qf4VD",
+                      "name": "安全提示",
+                      "fill": "#637285",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "验证通过后获取挑战凭据，再确认解除原设备绑定。",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 12,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "I1Mux",
+                      "name": "查询按钮",
+                      "width": "fill_container",
+                      "fill": "#173D42",
+                      "cornerRadius": 6,
+                      "padding": 16,
+                      "justifyContent": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "q2wht",
+                          "name": "按钮文字",
+                          "fill": "#FFFFFF",
+                          "textGrowth": "fixed-width",
+                          "width": "fill_container",
+                          "content": "验证并继续 →",
+                          "fontFamily": "Noto Sans SC",
+                          "fontSize": 15,
+                          "fontWeight": "normal"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "h0ESSN",
+                  "name": "未查询状态",
+                  "width": "fill_container",
+                  "cornerRadius": 12,
+                  "stroke": "#DCE3E8",
+                  "strokeWidth": 1,
+                  "layout": "vertical",
+                  "gap": 16,
+                  "padding": 28,
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "F56VUq",
+                      "name": "状态标题",
+                      "fill": "#263141",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "操作前请确认",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 20,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "type": "text",
+                      "id": "dPTau",
+                      "name": "状态说明",
+                      "fill": "#637285",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "验证通过后获取挑战凭据，再确认解除原设备绑定。",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 14,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "text",
+                  "id": "OcmJH",
+                  "name": "操作提示",
+                  "fill": "#637285",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "需要在桌面客户端接管 Kiro？请使用客户端完成本地配置。",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 12,
+                  "fontWeight": "normal"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "frame",
+      "id": "mqSN7",
+      "x": 5522,
+      "y": 80,
+      "name": "云端自助门户 / 卡密充值",
+      "clip": true,
+      "width": 1200,
+      "height": 850,
+      "fill": "#F5F6F8",
+      "layout": "vertical",
+      "children": [
+        {
+          "type": "frame",
+          "id": "arKFc",
+          "name": "品牌导航",
+          "width": "fill_container",
+          "fill": "#101D2B",
+          "gap": 40,
+          "padding": [
+            26,
+            48
+          ],
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "text",
+              "id": "uCKdw",
+              "name": "品牌",
+              "fill": "#F4D7A0",
+              "textGrowth": "fixed-width",
+              "width": "fill_container",
+              "content": "KIRO / 用户服务",
+              "fontFamily": "Noto Sans SC",
+              "fontSize": 22,
+              "fontWeight": "normal"
+            },
+            {
+              "type": "text",
+              "id": "N68tJA",
+              "name": "站点说明",
+              "fill": "#CAD4E1",
+              "textGrowth": "fixed-width",
+              "width": "fill_container",
+              "content": "自助门户",
+              "fontFamily": "Noto Sans SC",
+              "fontSize": 14,
+              "fontWeight": "normal"
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "hi3dP",
+          "name": "门户主体",
+          "width": "fill_container",
+          "height": "fill_container",
+          "gap": 40,
+          "padding": 48,
+          "children": [
+            {
+              "type": "frame",
+              "id": "ljpF7",
+              "name": "服务导航",
+              "width": 208,
+              "height": "fill_container",
+              "layout": "vertical",
+              "gap": 12,
+              "children": [
+                {
+                  "type": "text",
+                  "id": "BGgaa",
+                  "name": "导航标题",
+                  "fill": "#263141",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "你的服务，由你掌握",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 18,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "frame",
+                  "id": "ZvdDs",
+                  "name": "卡密查询",
+                  "width": "fill_container",
+                  "fill": "#E8ECF0",
+                  "cornerRadius": 8,
+                  "padding": 16,
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "j2DFM",
+                      "name": "卡密查询",
+                      "fill": "#4A5869",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "卡密查询",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 15,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "ioF1k",
+                  "name": "一键激活",
+                  "width": "fill_container",
+                  "fill": "#E8ECF0",
+                  "cornerRadius": 8,
+                  "padding": 16,
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "rijte",
+                      "name": "一键激活",
+                      "fill": "#4A5869",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "一键激活",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 15,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "UeGiS",
+                  "name": "设备换绑",
+                  "width": "fill_container",
+                  "fill": "#E8ECF0",
+                  "cornerRadius": 8,
+                  "padding": 16,
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "p4Au6",
+                      "name": "设备换绑",
+                      "fill": "#4A5869",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "设备换绑",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 15,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "I512KI",
+                  "name": "卡密充值",
+                  "width": "fill_container",
+                  "fill": "#173D42",
+                  "cornerRadius": 8,
+                  "padding": 16,
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "r4hnw",
+                      "name": "卡密充值",
+                      "fill": "#FFFFFF",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "卡密充值",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 15,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "text",
+                  "id": "unPJi",
+                  "name": "隐私说明",
+                  "fill": "#637285",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "卡密是你的访问凭据。\n请勿向他人分享完整卡密。",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 12,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "A0rx9",
+              "name": "查询工作区",
+              "width": "fill_container",
+              "layout": "vertical",
+              "gap": 24,
+              "children": [
+                {
+                  "type": "text",
+                  "id": "VxCHN",
+                  "name": "步骤",
+                  "fill": "#59746D",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "SELF-SERVICE / 04",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 12,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "text",
+                  "id": "b0ngd",
+                  "name": "标题",
+                  "fill": "#263141",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "延续你的工作流",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 32,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "text",
+                  "id": "xLH2q",
+                  "name": "说明",
+                  "fill": "#637285",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "充值前请核对主卡，避免将额度充入错误的卡密。",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 14,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "frame",
+                  "id": "tKH51",
+                  "name": "卡密查询表单",
+                  "width": "fill_container",
+                  "fill": "#FFFFFF",
+                  "cornerRadius": 12,
+                  "stroke": "#DEE4E9",
+                  "strokeWidth": 1,
+                  "layout": "vertical",
+                  "gap": 18,
+                  "padding": 28,
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "W8j0ed",
+                      "name": "表单标题",
+                      "fill": "#263141",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "主卡卡密",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 18,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "E81VZ",
+                      "name": "卡密输入框",
+                      "width": "fill_container",
+                      "fill": "#F7F9FA",
+                      "cornerRadius": 6,
+                      "stroke": "#BAC7D0",
+                      "strokeWidth": 1,
+                      "padding": 18,
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "x3RbI",
+                          "name": "占位符",
+                          "fill": "#748190",
+                          "textGrowth": "fixed-width",
+                          "width": "fill_container",
+                          "content": "输入主卡卡密",
+                          "fontFamily": "Noto Sans SC",
+                          "fontSize": 14,
+                          "fontWeight": "normal"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "y1bm2A",
+                      "name": "充值卡密",
+                      "width": "fill_container",
+                      "layout": "vertical",
+                      "gap": 10,
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "BIP65",
+                          "name": "标签",
+                          "fill": "#263141",
+                          "content": "充值卡密",
+                          "fontFamily": "Noto Sans SC",
+                          "fontSize": 14,
+                          "fontWeight": "normal"
+                        },
+                        {
+                          "type": "frame",
+                          "id": "F441X",
+                          "name": "第二输入框",
+                          "width": "fill_container",
+                          "fill": "#F7F9FA",
+                          "cornerRadius": 6,
+                          "stroke": "#BAC7D0",
+                          "strokeWidth": 1,
+                          "padding": 18,
+                          "children": [
+                            {
+                              "type": "text",
+                              "id": "vgWCd",
+                              "name": "占位符",
+                              "fill": "#748190",
+                              "content": "输入充值卡密",
+                              "fontFamily": "Noto Sans SC",
+                              "fontSize": 14,
+                              "fontWeight": "normal"
+                            }
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "type": "text",
+                      "id": "uAIaz",
+                      "name": "安全提示",
+                      "fill": "#637285",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "验证通过后获取挑战凭据，再确认充值；勿重复提交。",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 12,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "KRpyt",
+                      "name": "查询按钮",
+                      "width": "fill_container",
+                      "fill": "#173D42",
+                      "cornerRadius": 6,
+                      "padding": 16,
+                      "justifyContent": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "s9TZW",
+                          "name": "按钮文字",
+                          "fill": "#FFFFFF",
+                          "textGrowth": "fixed-width",
+                          "width": "fill_container",
+                          "content": "验证充值信息 →",
+                          "fontFamily": "Noto Sans SC",
+                          "fontSize": 15,
+                          "fontWeight": "normal"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "EoIOp",
+                  "name": "未查询状态",
+                  "width": "fill_container",
+                  "cornerRadius": 12,
+                  "stroke": "#DCE3E8",
+                  "strokeWidth": 1,
+                  "layout": "vertical",
+                  "gap": 16,
+                  "padding": 28,
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "ceTWY",
+                      "name": "状态标题",
+                      "fill": "#263141",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "操作前请确认",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 20,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "type": "text",
+                      "id": "QEivV",
+                      "name": "状态说明",
+                      "fill": "#637285",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "验证通过后获取挑战凭据，再确认充值；勿重复提交。",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 14,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "text",
+                  "id": "igZ2u",
+                  "name": "操作提示",
+                  "fill": "#637285",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "需要在桌面客户端接管 Kiro？请使用客户端完成本地配置。",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 12,
+                  "fontWeight": "normal"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "frame",
+      "id": "C0RPFY",
+      "x": 1682,
+      "y": 1010,
+      "name": "云端自助门户 / 移动端查询",
+      "clip": true,
+      "width": 390,
+      "height": 844,
+      "fill": "#F5F6F8",
+      "layout": "vertical",
+      "children": [
+        {
+          "type": "frame",
+          "id": "p8TBho",
+          "name": "移动端页眉",
+          "width": "fill_container",
+          "fill": "#101D2B",
+          "padding": 24,
+          "children": [
+            {
+              "type": "text",
+              "id": "abihc",
+              "name": "品牌",
+              "fill": "#F4D7A0",
+              "textGrowth": "fixed-width",
+              "width": "fill_container",
+              "content": "KIRO / 用户服务",
+              "fontFamily": "Noto Sans SC",
+              "fontSize": 20,
+              "fontWeight": "normal"
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "ifG2p",
+          "name": "移动端主体",
+          "width": "fill_container",
+          "layout": "vertical",
+          "gap": 22,
+          "padding": 24,
+          "children": [
+            {
+              "type": "text",
+              "id": "GqJIl",
+              "name": "标题",
+              "fill": "#263141",
+              "textGrowth": "fixed-width",
+              "width": "fill_container",
+              "content": "你的授权，一目了然",
+              "fontFamily": "Noto Sans SC",
+              "fontSize": 26,
+              "fontWeight": "normal"
+            },
+            {
+              "type": "text",
+              "id": "lurPm",
+              "name": "引导",
+              "fill": "#637285",
+              "textGrowth": "fixed-width",
+              "width": "fill_container",
+              "content": "查询卡密、管理设备与充值。",
+              "fontFamily": "Noto Sans SC",
+              "fontSize": 14,
+              "fontWeight": "normal"
+            },
+            {
+              "type": "frame",
+              "id": "NQxre",
+              "name": "服务切换",
+              "width": "fill_container",
+              "gap": 6,
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "h5iqH",
+                  "name": "查询",
+                  "width": "fill_container",
+                  "fill": "#173D42",
+                  "cornerRadius": 6,
+                  "padding": [
+                    12,
+                    8
+                  ],
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "g5dRUY",
+                      "name": "标签",
+                      "fill": "#FFFFFF",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "查询",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 13,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "JQwP2",
+                  "name": "激活",
+                  "width": "fill_container",
+                  "fill": "#E5EAEE",
+                  "cornerRadius": 6,
+                  "padding": [
+                    12,
+                    8
+                  ],
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "fEEyG",
+                      "name": "标签",
+                      "fill": "#526171",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "激活",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 13,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "AS8bO",
+                  "name": "换绑",
+                  "width": "fill_container",
+                  "fill": "#E5EAEE",
+                  "cornerRadius": 6,
+                  "padding": [
+                    12,
+                    8
+                  ],
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "qLkWX",
+                      "name": "标签",
+                      "fill": "#526171",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "换绑",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 13,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "mNr4o",
+                  "name": "充值",
+                  "width": "fill_container",
+                  "fill": "#E5EAEE",
+                  "cornerRadius": 6,
+                  "padding": [
+                    12,
+                    8
+                  ],
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "wkeBA",
+                      "name": "标签",
+                      "fill": "#526171",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "充值",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 13,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "TeAWK",
+              "name": "查询表单",
+              "width": "fill_container",
+              "fill": "#FFFFFF",
+              "cornerRadius": 12,
+              "layout": "vertical",
+              "gap": 18,
+              "padding": 20,
+              "children": [
+                {
+                  "type": "text",
+                  "id": "EaiiG",
+                  "name": "标签",
+                  "fill": "#263141",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "完整卡密",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 16,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "frame",
+                  "id": "aiXej",
+                  "name": "输入框",
+                  "width": "fill_container",
+                  "fill": "#F7F9FA",
+                  "cornerRadius": 6,
+                  "stroke": "#BAC7D0",
+                  "strokeWidth": 1,
+                  "padding": 16,
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "x7iJtv",
+                      "name": "占位符",
+                      "fill": "#748190",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "输入或粘贴卡密",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 13,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "text",
+                  "id": "H0IHnb",
+                  "name": "安全提示",
+                  "fill": "#637285",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "不会在浏览器持久保存你的卡密。",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 12,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "frame",
+                  "id": "T7hmC",
+                  "name": "查询按钮",
+                  "width": "fill_container",
+                  "fill": "#173D42",
+                  "cornerRadius": 6,
+                  "padding": 16,
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "Fpqoh",
+                      "name": "文字",
+                      "fill": "#FFFFFF",
+                      "textGrowth": "fixed-width",
+                      "width": "fill_container",
+                      "content": "查询卡密 →",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 14,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "text",
+              "id": "dBMAW",
+              "name": "等待标题",
+              "fill": "#263141",
+              "textGrowth": "fixed-width",
+              "width": "fill_container",
+              "content": "等待查询",
+              "fontFamily": "Noto Sans SC",
+              "fontSize": 20,
+              "fontWeight": "normal"
+            },
+            {
+              "type": "text",
+              "id": "YAiDV",
+              "name": "状态说明",
+              "fill": "#637285",
+              "textGrowth": "fixed-width",
+              "width": "fill_container",
+              "content": "验证成功后显示授权、有效期和绑定设备。",
+              "fontFamily": "Noto Sans SC",
+              "fontSize": 14,
+              "fontWeight": "normal"
+            },
+            {
+              "type": "text",
+              "id": "mMwes",
+              "name": "操作说明",
+              "fill": "#637285",
+              "textGrowth": "fixed-width",
+              "width": "fill_container",
+              "content": "换绑和充值需二次确认。\n本地 Kiro 接管请在桌面客户端完成。",
+              "fontFamily": "Noto Sans SC",
+              "fontSize": 12,
+              "fontWeight": "normal"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "frame",
+      "id": "pYG09",
+      "x": 2152,
+      "y": 1010,
+      "name": "云端自助门户 / 换绑二次确认",
+      "clip": true,
+      "width": 500,
+      "height": 430,
+      "fill": "#FFFFFF",
+      "cornerRadius": 16,
+      "layout": "vertical",
+      "gap": 22,
+      "padding": 36,
+      "children": [
+        {
+          "type": "text",
+          "id": "N8qrv",
+          "name": "步骤",
+          "fill": "#59746D",
+          "textGrowth": "fixed-width",
+          "width": "fill_container",
+          "content": "设备验证通过 / 最终确认",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 12,
+          "fontWeight": "normal"
+        },
+        {
+          "type": "text",
+          "id": "dBAD0",
+          "name": "标题",
+          "fill": "#263141",
+          "textGrowth": "fixed-width",
+          "width": "fill_container",
+          "content": "确认解除原设备绑定？",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 26,
+          "fontWeight": "normal"
+        },
+        {
+          "type": "text",
+          "id": "R1xevo",
+          "name": "警告",
+          "fill": "#685242",
+          "textGrowth": "fixed-width",
+          "width": "fill_container",
+          "content": "原设备将无法继续使用这张卡密。请确认工作已保存，再继续操作。",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 15,
+          "fontWeight": "normal"
+        },
+        {
+          "type": "text",
+          "id": "Wse7B",
+          "name": "验证结果",
+          "fill": "#637285",
+          "textGrowth": "fixed-width",
+          "width": "fill_container",
+          "content": "原设备：验证后显示脱敏标识\n此页面为交互设计，不代表已执行解绑。",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 13,
+          "fontWeight": "normal"
+        },
+        {
+          "type": "frame",
+          "id": "eJUvm",
+          "name": "操作区",
+          "width": "fill_container",
+          "gap": 12,
+          "children": [
+            {
+              "type": "frame",
+              "id": "XxGdp",
+              "name": "返回检查",
+              "width": "fill_container",
+              "fill": "#EEF1F3",
+              "cornerRadius": 6,
+              "padding": 16,
+              "children": [
+                {
+                  "type": "text",
+                  "id": "hwxKG",
+                  "name": "按钮",
+                  "fill": "#263141",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "返回检查",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 14,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "PqxTk",
+              "name": "确认解绑",
+              "width": "fill_container",
+              "fill": "#934635",
+              "cornerRadius": 6,
+              "padding": 16,
+              "children": [
+                {
+                  "type": "text",
+                  "id": "Lyhyx",
+                  "name": "按钮",
+                  "fill": "#FFFFFF",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "确认解绑",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 14,
+                  "fontWeight": "normal"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "fileToken": "81bd6a07-39b4-472b-89cb-678a463b1524"
+}

@@ -177,6 +177,10 @@ async fn main() {
         }
         "sample-memory" => {
             let res = MemoryGuard::sample_memory();
+            if let Some(error) = &res.error {
+                println!("{}", json!({"success": false, "error": error}));
+                std::process::exit(1);
+            }
             println!("{}", serde_json::to_string(&res).unwrap_or_default());
         }
         _ => {

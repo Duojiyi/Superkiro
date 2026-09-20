@@ -197,7 +197,15 @@ fn failed_intent_write_retains_usage_until_storage_recovers() {
         180
     );
     assert_eq!(recovered.get_card("card").unwrap().outstanding_debt(), 80);
-    assert!(recovered.retry_pending_settlement("use").is_err());
+    assert_eq!(
+        recovered
+            .retry_pending_settlement("use")
+            .unwrap()
+            .credits_charged,
+        180
+    );
+    assert_eq!(recovered.ledger_entries().len(), 1);
+    assert_eq!(recovered.get_card("card").unwrap().outstanding_debt(), 80);
 }
 
 #[test]

@@ -41,24 +41,32 @@ class DesktopRuntimeTests(unittest.TestCase):
                 browser.assert_called_once_with(homepage, new=2)
                 self.assertFalse(controls.open_external("https://160.202.47.98/portal", bridge.SESSION_TOKEN))
 
-    def test_packaging_contains_runtime_assets_without_private_ca(self):
+    def test_native_packaging_embeds_ui_and_uses_rust_not_python_runtime(self):
         build = Path(bridge.__file__).parent / "scripts" / "build_desktop.py"
-        with patch("subprocess.run") as run, patch("os.chdir"):
-            runpy.run_path(str(build), run_name="build_test")
-        command = run.call_args.args[0]
-        data = [command[i + 1] for i, arg in enumerate(command) if arg == "--add-data"]
-        self.assertEqual(len(data), 3)
-        self.assertEqual({Path(item.split(os.pathsep)[0]).name for item in data},
-                         {"index.html", "desktop.css", "desktop.js"})
-        self.assertNotIn("server-ca.pem", " ".join(command))
-        self.assertIn("--add-binary", command)
+        module = runpy.run_path(str(build), run_name="build_test")
+        with tempfile.TemporaryDirectory() as root, patch("sys.platform", "win32"), \
+                patch("shutil.which", return_value="npm.cmd"), \
+                patch("shutil.copy2") as copy, patch("subprocess.run") as run:
+            module["main"].__globals__["ROOT"] = Path(root)
+            module["main"]()
+            commands = [call.args[0] for call in run.call_args_list]
+            self.assertEqual(commands[:2], [["npm.cmd", "ci"], ["npm.cmd", "run", "build"]])
+            self.assertIn("desktop-host", commands[2])
+            self.assertIn("--locked", commands[2])
+            self.assertIn("--release", commands[2])
+            self.assertIn("+crt-static", run.call_args.kwargs["env"]["RUSTFLAGS"])
+            self.assertEqual(copy.call_args.args[1], Path(root) / "dist" / "Superkiro.exe")
+            self.assertNotIn("PyInstaller", str(commands))
+            self.assertNotIn("server-ca.pem", str(commands))
 
-    def test_packaging_rejects_missing_runtime_resource(self):
+    def test_native_packaging_rejects_missing_build_dependency(self):
         build = Path(bridge.__file__).parent / "scripts" / "build_desktop.py"
-        with patch("subprocess.run") as run, patch("os.chdir"), patch.object(Path, "is_file", return_value=False):
-            with self.assertRaisesRegex(FileNotFoundError, "Missing desktop resource"):
-                runpy.run_path(str(build), run_name="build_test")
-            self.assertFalse(any("PyInstaller" in call.args[0] for call in run.call_args_list))
+        module = runpy.run_path(str(build), run_name="build_test")
+        with patch("sys.platform", "win32"), patch("shutil.which", return_value=None), \
+                patch("subprocess.run") as run:
+            with self.assertRaisesRegex(SystemExit, "Node.js/npm"):
+                module["main"]()
+            run.assert_not_called()
 
     def test_window_controls_require_current_session(self):
         controls = bridge.DesktopWindow()

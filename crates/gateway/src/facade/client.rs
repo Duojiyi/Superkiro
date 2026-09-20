@@ -242,3 +242,48 @@ impl FacadeHandler for ClientBrandHandler {
         })
     }
 }
+
+/// Public, read-only announcements; display fields and Unix-second timestamps only.
+pub struct AnnouncementsHandler {
+    pub billing: billing::BillingEngine,
+}
+
+impl FacadeHandler for AnnouncementsHandler {
+    fn method(&self) -> Method {
+        Method::GET
+    }
+    fn path(&self) -> &'static str {
+        "/api/v1/announcements"
+    }
+    fn handle<'a>(&'a self, _req: Request<Body>) -> BoxFuture<'a, Response> {
+        Box::pin(async move {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let announcements: Vec<_> = self
+                .billing
+                .list_active_announcements(now)
+                .into_iter()
+                .map(|item| {
+                    serde_json::json!({
+                        "id": item.id, "level": item.level, "title": item.title,
+                        "content": item.content, "expires_at": item.expires_at,
+                        "created_at": item.created_at,
+                    })
+                })
+                .collect();
+            let mut response = json_response(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "success": true, "announcements": announcements,
+                }),
+            );
+            response.headers_mut().insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            );
+            response
+        })
+    }
+}

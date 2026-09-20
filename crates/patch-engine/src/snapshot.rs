@@ -10,7 +10,7 @@ use crate::settings::{PriorSettingsState, SettingsError, SettingsManager};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -119,26 +119,7 @@ impl SnapshotManager {
     /// Record a takeover snapshot to disk before applying changes.
     pub fn save(&self, snapshot: &TakeoverSnapshot) -> Result<(), SnapshotError> {
         let data = serde_json::to_string_pretty(snapshot)?;
-        if let Some(parent) = self.snapshot_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let temp_path = self.snapshot_path.with_file_name(format!(
-            "{}.tmp.{}.{}",
-            self.snapshot_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or(SNAPSHOT_FILENAME),
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        let mut file = File::create(&temp_path)?;
-        file.write_all(data.as_bytes())?;
-        file.sync_all()?;
-        atomic_replace(&temp_path, &self.snapshot_path)?;
+        crate::token_storage::private_atomic_write(&self.snapshot_path, data.as_bytes())?;
         Ok(())
     }
 
@@ -176,16 +157,7 @@ impl SnapshotManager {
 
     fn operation_lock(&self) -> Result<OperationLock, SnapshotError> {
         let path = self.snapshot_path.with_extension("operation-lock");
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        // An abandoned lock requires explicit operator recovery; never guess that
-        // another process is dead and overwrite its only rollback record.
-        fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
-        Ok(OperationLock(path))
+        Ok(OperationLock::acquire(path)?)
     }
 
     /// Execute takeover: takes snapshot, merges settings, and applies patch.
@@ -289,9 +261,7 @@ impl SnapshotManager {
         let snapshot = self.load()?;
         if let Some(path) = &snapshot.extension_path {
             let patcher = ExtensionPatcher::new(path);
-            if patcher.status() == crate::patch::PatchStatus::Patched {
-                patcher.verify_patched_content()?;
-            }
+            patcher.verify_restore()?;
         }
 
         // 1. Revert settings.json
@@ -321,22 +291,21 @@ impl SnapshotManager {
     }
 }
 
-pub(crate) struct OperationLock(PathBuf);
+// Keep the inode in place: unlinking a lock file allows two independent owners.
+pub(crate) struct OperationLock(#[allow(dead_code)] File);
 impl OperationLock {
     pub(crate) fn acquire(path: PathBuf) -> std::io::Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::OpenOptions::new()
+        let file = fs::OpenOptions::new()
+            .read(true)
             .write(true)
-            .create_new(true)
-            .open(&path)?;
-        Ok(Self(path))
-    }
-}
-impl Drop for OperationLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        file.try_lock().map_err(std::io::Error::from)?;
+        Ok(Self(file))
     }
 }
 
@@ -367,5 +336,55 @@ pub(crate) fn atomic_replace(temp: &Path, target: &Path) -> std::io::Result<()> 
     #[cfg(not(windows))]
     {
         fs::rename(temp, target)
+    }
+}
+
+#[cfg(test)]
+mod os_lock_tests {
+    use super::*;
+    #[test]
+    fn lock_child() {
+        let Some(path) = std::env::var_os("SUPERKIRO_LOCK_FIXTURE") else {
+            return;
+        };
+        let path = PathBuf::from(path);
+        let _lock = OperationLock::acquire(path.clone()).unwrap();
+        fs::write(path.with_extension("ready"), b"ready").unwrap();
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    #[test]
+    fn process_death_releases_lock_without_unlinking() {
+        let root = std::env::temp_dir().join(format!("os-lock-fixture-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("operation.lock");
+        fs::write(&path, b"legacy abandoned lock").unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "snapshot::os_lock_tests::lock_child"])
+            .env("SUPERKIRO_LOCK_FIXTURE", &path)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !path.with_extension("ready").exists() {
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("child did not acquire fixture lock");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(OperationLock::acquire(path.clone()).is_err());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(path.exists());
+        let lock = OperationLock::acquire(path.clone()).unwrap();
+        assert!(OperationLock::acquire(path.clone()).is_err());
+        drop(lock);
+        drop(OperationLock::acquire(path.clone()).unwrap());
+        fs::remove_file(path.with_extension("ready")).unwrap();
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(root).unwrap();
     }
 }

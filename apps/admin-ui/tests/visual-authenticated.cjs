@@ -2,7 +2,7 @@
 const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
 const http=require('node:http'), fs=require('node:fs'), path=require('node:path'), assert=require('node:assert/strict');
 const fixture=require('./fixture-api.cjs')();
-const root=path.resolve(__dirname,'../.build-check'), output=path.resolve(__dirname,'../visual-check/authenticated');
+const root=path.resolve(__dirname,'../dist'), output=path.resolve(__dirname,'../visual-check/authenticated');
 fs.mkdirSync(output,{recursive:true});
 const errors=[];
 const server=http.createServer(async(req,res)=>{
@@ -22,9 +22,9 @@ const server=http.createServer(async(req,res)=>{
   page.on('pageerror',e=>errors.push(e.message)); page.on('dialog',d=>d.accept());
   await page.route('**/*',route=>new URL(route.request().url()).origin===`http://127.0.0.1:${server.address().port}`?route.continue():route.abort());
   await page.goto(`http://127.0.0.1:${server.address().port}/admin/`);
-  await page.getByRole('button',{name:'管理员登录',exact:true}).click();
-  await page.locator('input[type=password]').fill('fixture-admin-key');
-  await page.getByRole('button',{name:'保存并验证',exact:true}).click();
+  await page.getByLabel('密码',{exact:true}).waitFor();
+  await page.locator('input[type=password]').fill('fixture-password');
+  await page.getByRole('button',{name:'登录',exact:true}).click();
   await page.getByText('管理员 · 会话有效',{exact:true}).waitFor();
   await page.locator('.metric').filter({hasText:'请求成功率'}).getByText('78.3%',{exact:true}).waitFor();
   assert.equal(await page.locator('.metric').filter({hasText:'成功请求'}).locator('strong').textContent(),'18');
@@ -43,8 +43,14 @@ const server=http.createServer(async(req,res)=>{
    await shot(`${id}-desktop.png`);
   }
   await nav('卡密资产');
+  assert.equal(await page.getByRole('button',{name:'不可恢复',exact:true}).isDisabled(),true);
   await page.getByRole('textbox',{name:'搜索卡密',exact:true}).fill('fixture-card-0');
   assert.equal(await page.locator('tbody tr').count(),1);
+  await page.getByRole('button',{name:'查看卡密',exact:true}).click();
+  await page.getByLabel('卡密明文',{exact:true}).waitFor();
+  assert.equal(await page.getByLabel('卡密明文',{exact:true}).inputValue(),'FIXTURE-RECOVERED-CODE');
+  await page.getByRole('button',{name:'关闭并清除',exact:true}).click();
+  assert.equal(await page.getByLabel('卡密明文',{exact:true}).count(),0);
   await page.getByRole('button',{name:'冻结',exact:true}).click();
   await page.getByRole('button',{name:'解冻',exact:true}).waitFor();
   await page.getByRole('button',{name:'解冻',exact:true}).click();
@@ -73,8 +79,24 @@ const server=http.createServer(async(req,res)=>{
   await nav('财务对账');const exportFile=page.waitForEvent('download');await page.getByRole('button',{name:'导出对账 CSV',exact:true}).click();await exportFile;
   await page.setViewportSize({width:390,height:844});
   for(const[id,name]of pages){await nav(name);assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,`${id} mobile overflow`);await shot(`${id}-mobile.png`);if(id==='providers'){const scrolled=await page.locator('table').first().evaluate(e=>{e.scrollLeft=e.scrollWidth;return e.scrollLeft>0;});assert.equal(scrolled,true,'mobile provider table actions scroll into view');await shot('providers-mobile-scrolled.png');}}
+  await page.setViewportSize({width:1440,height:1080});
+  await nav('卡密资产');
+  await page.getByRole('textbox',{name:'搜索卡密',exact:true}).fill('fixture-card-0');
+  fixture.expire();
+  await page.getByRole('button',{name:'刷新',exact:true}).click();
+  await page.getByLabel('密码',{exact:true}).waitFor();
+  assert.equal(await page.getByRole('navigation').count(),0);
+  assert.equal(await page.getByRole('textbox',{name:'搜索卡密',exact:true}).count(),0);
+  await page.getByLabel('密码',{exact:true}).fill('fixture-password');
+  await page.getByRole('button',{name:'登录',exact:true}).click();
+  await page.getByText('管理员 · 会话有效',{exact:true}).waitFor();
+  await nav('卡密资产');
+  assert.equal(await page.getByRole('textbox',{name:'搜索卡密',exact:true}).inputValue(),'');
+  await page.getByRole('button',{name:'退出',exact:true}).click();
+  await page.getByLabel('密码',{exact:true}).waitFor();
+  assert.equal(await page.locator('tbody').getByText('fixture-card-0',{exact:true}).count(),0);
   assert.deepEqual(errors,[]);
-  fs.writeFileSync(path.join(output,'results.json'),JSON.stringify({status:'PASS',fixtureOnly:true,pages:9,viewports:['1440x1080','390x844'],checks:['authenticated session','nonempty tables','18 successes / 23 completed = 78.3%','12 chart bins total 24','card search','freeze/unfreeze','all four issuance tiers','one-time card results','CSV downloads','trace filter/detail','no document overflow','no runtime errors'],writes:fixture.writes},null,2));
+  fs.writeFileSync(path.join(output,'results.json'),JSON.stringify({status:'PASS',fixtureOnly:true,pages:9,viewports:['1440x1080','390x844'],checks:['cookie login/expiry/logout', 'workspace unmounted and filters cleared on expiry', 'reveal/hide', 'unrecoverable disabled','nonempty tables','18 successes / 23 completed = 78.3%','12 chart bins total 24','card search','freeze/unfreeze','all four issuance tiers','one-time card results','CSV downloads','trace filter/detail','no document overflow','no runtime errors'],writes:fixture.writes},null,2));
   console.log(`PASS: authenticated nonempty nine pages, chart metrics, search, freeze/unfreeze, four issuance tiers, CSV exports, trace details, desktop/mobile overflow. ${output}`);
  }finally{await browser.close();}
 })().catch(e=>{console.error(e);process.exitCode=1;}).finally(()=>server.close());

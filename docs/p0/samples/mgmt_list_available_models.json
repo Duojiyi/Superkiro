@@ -1,0 +1,29 @@
+{
+  "models": [
+    {
+      "modelId": "claude-3-7-sonnet",
+      "modelName": "Claude 3.7 Sonnet (Hybrid Reasoning)",
+      "description": "Anthropic flagship model with hybrid reasoning capabilities.",
+      "maxTokens": 64000,
+      "supportsTools": true,
+      "supportsVision": true,
+      "defaultEffortLevel": "high"
+    },
+    {
+      "modelId": "deepseek-v3",
+      "modelName": "DeepSeek V3",
+      "description": "DeepSeek latest MoE general reasoning model.",
+      "maxTokens": 32000,
+      "supportsTools": true,
+      "supportsVision": false
+    },
+    {
+      "modelId": "gpt-4o",
+      "modelName": "GPT-4o",
+      "description": "OpenAI flagship omni model.",
+      "maxTokens": 16384,
+      "supportsTools": true,
+      "supportsVision": true
+    }
+  ]
+}

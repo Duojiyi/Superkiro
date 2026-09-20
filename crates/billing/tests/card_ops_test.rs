@@ -2,7 +2,7 @@
 //!
 //! Covers:
 //! - Device binding, multi-device limit, and idempotency
-//! - Rebind eviction, quota limit, cooldown, and token_version increment
+//! - Explicit rebind, quota limit, cooldown, and token_version increment
 //! - Manual unbind and device listing
 //! - Freeze, unfreeze, ban, and batch status mutations
 //! - Top-up code generation, batch generation, redemption, balance and validity extension, replay rejection
@@ -49,7 +49,14 @@ fn test_device_binding_within_limit_and_idempotence() {
     let devices = engine.list_devices("card-dev-1").unwrap();
     assert_eq!(devices.len(), 1);
 
-    // Bind second device replaces the sole binding, even for legacy capacity=2
+    // Occupied bindings cannot be replaced, even for legacy capacity=2
+    let before = engine.get_card("card-dev-1").unwrap();
+    assert!(matches!(
+        engine.bind_device("card-dev-1", "device-beta", 1100),
+        Err(BillingError::DeviceAlreadyBound)
+    ));
+    assert_eq!(engine.get_card("card-dev-1").unwrap(), before);
+    engine.unbind_device("card-dev-1", "device-alpha").unwrap();
     assert!(engine
         .bind_device("card-dev-1", "device-beta", 1_100)
         .is_ok());
@@ -63,48 +70,31 @@ fn test_device_binding_within_limit_and_idempotence() {
 }
 
 #[test]
-fn test_rebind_eviction_cooldown_and_limit() {
+fn test_explicit_rebind_cooldown_and_limit() {
     let engine = BillingEngine::new();
-    // max_devices = 2, max_rebinds = 2, cooldown = 300s
-    let card = create_test_card("card-rebind", 2, 2, 300);
-    engine.upsert_card(card);
-
-    assert!(engine.bind_device("card-rebind", "dev-1", 1_000).is_ok());
-
-    // 3rd device triggers rebind (evicts dev-1, consumes 1 rebind quota)
-    assert!(engine.bind_device("card-rebind", "dev-3", 1_050).is_ok());
-    let card = engine.get_card("card-rebind").unwrap();
-    assert_eq!(card.bound_devices, vec!["dev-3".to_string()]);
-    assert_eq!(card.rebind_count, 1);
-    assert_eq!(card.last_rebind_at, Some(1_050));
-    assert_eq!(card.token_version, 2); // incremented from initial 1 to revoke evicted device's tokens!
-
-    // 4th device before cooldown expires (1_050 + 300 = 1_350)
-    let err = engine
-        .bind_device("card-rebind", "dev-4", 1_200)
-        .unwrap_err();
+    engine.upsert_card(create_test_card("card-rebind", 2, 2, 300));
+    engine.bind_device("card-rebind", "dev-1", 1000).unwrap();
+    engine.unbind_device("card-rebind", "dev-1").unwrap();
+    engine.bind_device("card-rebind", "dev-2", 1050).unwrap();
+    let before = engine.get_card("card-rebind").unwrap();
     assert!(matches!(
-        err,
-        BillingError::RebindCooldown {
-            remaining_secs: 150
-        }
+        engine.unbind_device("card-rebind", "dev-2"),
+        Err(BillingError::RebindCooldown { .. })
     ));
-
-    // 4th device after cooldown expires: succeeds, consumes 2nd rebind quota
-    assert!(engine.bind_device("card-rebind", "dev-4", 1_360).is_ok());
-    let card = engine.get_card("card-rebind").unwrap();
-    assert_eq!(card.bound_devices, vec!["dev-4".to_string()]);
-    assert_eq!(card.rebind_count, 2);
-    assert_eq!(card.token_version, 3);
-
-    // 5th device after cooldown: max_rebinds = 2 is exceeded!
-    let err = engine
-        .bind_device("card-rebind", "dev-5", 2_000)
-        .unwrap_err();
+    assert_eq!(engine.get_card("card-rebind").unwrap(), before);
+    let mut elapsed = before;
+    elapsed.last_rebind_at = Some(1);
+    engine.upsert_card(elapsed);
+    engine.unbind_device("card-rebind", "dev-2").unwrap();
+    engine.bind_device("card-rebind", "dev-3", 1360).unwrap();
+    let before = engine.get_card("card-rebind").unwrap();
+    assert_eq!(before.rebind_count, 2);
+    assert_eq!(before.token_version, 3);
     assert!(matches!(
-        err,
-        BillingError::RebindLimitExceeded { current: 2, max: 2 }
+        engine.unbind_device("card-rebind", "dev-3"),
+        Err(BillingError::RebindLimitExceeded { current: 2, max: 2 })
     ));
+    assert_eq!(engine.get_card("card-rebind").unwrap(), before);
 }
 
 #[test]

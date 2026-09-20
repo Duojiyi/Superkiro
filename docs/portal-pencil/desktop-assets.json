@@ -1,0 +1,42 @@
+[
+  {
+    "file": "window_01_activation.png",
+    "size": [
+      441,
+      541
+    ],
+    "sha256": "620cae0573f043b32d287f526b4ae3566a4d45a9507fe704d22005fc5cd617eb"
+  },
+  {
+    "file": "window_02_active_dashboard.png",
+    "size": [
+      427,
+      546
+    ],
+    "sha256": "dfeaa57f66e2278a8ecbdc3af2788419a3c520f4ce04bd8d110c770db699e700"
+  },
+  {
+    "file": "window_03_standby.png",
+    "size": [
+      442,
+      544
+    ],
+    "sha256": "245670776920ef6367de645f8c2620deb7f908a7106e835336b70a94d770fb11"
+  },
+  {
+    "file": "window_04_health_guardian.png",
+    "size": [
+      691,
+      358
+    ],
+    "sha256": "b2e168ca438ccc378e172cf68f44c9fb75eb8cc10f2dcc10171fc5a58df4f7da"
+  },
+  {
+    "file": "window_05_settings.png",
+    "size": [
+      690,
+      357
+    ],
+    "sha256": "603355ac99259c0e3ed27b3c6ae33ea76ed4128ae7fa8199d48b0e8fab623038"
+  }
+]

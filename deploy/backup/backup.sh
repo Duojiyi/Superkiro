@@ -7,93 +7,46 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BACKUP_DIR="${BACKUP_DIR:-${SCRIPT_DIR}/../../backups}"
 DATA_DIR="${DATA_DIR:-${SCRIPT_DIR}/../../data}"
 DATA_FILE="${DATA_FILE:-${DATA_DIR}/billing_state.json}"
+# Generation filenames in the anchor are relative to the configured snapshot.
+DATA_DIR="$(dirname -- "${DATA_FILE}")"
 ANCHOR_FILE="${ANCHOR_FILE:-${DATA_FILE}.anchor}"
 RETENTION_DAYS="${RETENTION_DAYS:-7}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-19820}"
 HEALTH_URL="${HEALTH_URL:-http://${HOST}:${PORT}/healthz}"
-# Set ADMIN_BASE_URL to the reachable HTTPS/Caddy URL in Compose deployments.
-ADMIN_BASE_URL="${ADMIN_BASE_URL:-http://${HOST}:${PORT}}"
-ADMIN_KEY="${ADMIN_KEY:-}"
-FORCE="${FORCE:-false}"
-
+# Online backup uses server-backup.py with cookie/CSRF authentication.
 umask 077
-
-# Parse optional command line flags
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --force)
-      FORCE="true"
-      shift
-      ;;
-    --admin-key)
-      ADMIN_KEY="$2"
-      shift 2
-      ;;
-    *)
-      echo "Unknown option: $1" >&2
-      exit 1
-      ;;
-  esac
-done
-
-# Step 1: Quiescence / Consistency Check (T07)
-# Verify whether gateway is actively running
-GATEWAY_ONLINE=false
-if command -v curl >/dev/null 2>&1; then
-  if curl -s -m 2 "${HEALTH_URL}" >/dev/null 2>&1; then
-    GATEWAY_ONLINE=true
-  fi
-fi
-# Compose does not publish the gateway port in production. Detect its container
-# state too, so an unreachable host port cannot be mistaken for a stopped gateway.
-if [[ "${GATEWAY_ONLINE}" != "true" ]] && command -v docker >/dev/null 2>&1     && [[ -f "${SCRIPT_DIR}/../docker-compose.yml" ]]; then
-  if docker compose -f "${SCRIPT_DIR}/../docker-compose.yml" ps --status running --services 2>/dev/null       | grep -qx gateway; then
-    GATEWAY_ONLINE=true
-  fi
+if [[ $# -gt 0 ]]; then
+  echo "No bypass flags are supported. Use server-backup.py online, or stop gateway for cold backup." >&2
+  exit 1
 fi
 
-if [[ "${GATEWAY_ONLINE}" == "true" ]]; then
-  if [[ -n "${ADMIN_KEY}" ]]; then
-    echo "[*] Gateway is running at http://${HOST}:${PORT}. Triggering synchronized snapshot flush via Admin API..."
-    SESSION_RESP="$(curl -s -f -m 5 -X POST "${ADMIN_BASE_URL}/api/v1/admin/session" \
-      -H "x-admin-key: ${ADMIN_KEY}" -H "Content-Type: application/json" || true)"
-    ADMIN_TOKEN=""
-    if command -v python3 >/dev/null 2>&1; then
-      ADMIN_TOKEN="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("accessToken", ""))' <<<"${SESSION_RESP}")"
-    fi
-    SYNC_RESP="$(curl -s -f -m 5 -X POST "${ADMIN_BASE_URL}/api/v1/admin/snapshot/sync" \
-      -H "Authorization: Bearer ${ADMIN_TOKEN}" \
-      -H "Content-Type: application/json" || true)"
-    if echo "${SYNC_RESP}" | grep -q '"synchronized"'; then
-      echo "[√] Application snapshot synchronized successfully."
-    else
-      echo "Error: Failed to trigger synchronized snapshot via Admin API. Response: ${SYNC_RESP}" >&2
-      if [[ "${FORCE}" != "true" ]]; then
-        exit 1
-      fi
-    fi
-  else
-    if [[ "${FORCE}" != "true" ]]; then
-      echo "Error: Gateway is actively running at http://${HOST}:${PORT}." >&2
-      echo "To prevent partial reads and race conditions, provide ADMIN_KEY to trigger synchronized export via admin API," >&2
-      echo "or stop the gateway service before running backup.sh (or pass --force to bypass at your own risk)." >&2
-      exit 1
-    else
-      echo "[!] Warning: Gateway is running and ADMIN_KEY is not set. Proceeding due to --force flag."
-    fi
-  fi
+# Step 1: Require positive evidence that the deployment container is stopped.
+# Both shipped Compose files use container_name: kiro-gateway. Inspect that
+# runtime identity directly: Compose config/env/project errors must not look
+# like an empty (stopped) service list. Override for a custom container name.
+# A missing container is unknown, not proof of quiescence. Keep the gateway
+# stopped throughout backup; do not race this script with deployment/startup.
+GATEWAY_CONTAINER="${GATEWAY_CONTAINER:-kiro-gateway}"
+if ! command -v docker >/dev/null 2>&1; then
+  echo "Error: docker is required to confirm gateway is stopped" >&2
+  exit 1
+fi
+if ! GATEWAY_STATE="$(docker inspect --type container --format '{{.State.Status}}' -- "${GATEWAY_CONTAINER}")"; then
+  echo "Error: cannot determine gateway container state; refusing cold backup" >&2
+  exit 1
+fi
+case "${GATEWAY_STATE}" in
+  exited|created) ;;
+  *) echo "Error: gateway state '${GATEWAY_STATE}' is not confirmed stopped; use server-backup.py online" >&2; exit 1 ;;
+esac
+# A responding endpoint is an additional veto, never evidence of a stop.
+if command -v curl >/dev/null 2>&1 && curl -s -m 2 "${HEALTH_URL}" >/dev/null 2>&1; then
+  echo "Error: gateway endpoint still responds; refusing cold backup" >&2
+  exit 1
 fi
 
 # Step 2: Validate live source files
-if [[ ! -f "${DATA_FILE}" ]]; then
-  echo "Error: billing snapshot '${DATA_FILE}' not found" >&2
-  exit 1
-fi
-if [[ ! -s "${DATA_FILE}" ]]; then
-  echo "Error: billing snapshot '${DATA_FILE}' is empty (0 bytes)" >&2
-  exit 1
-fi
 if [[ ! -f "${ANCHOR_FILE}" ]]; then
   echo "Error: billing snapshot anchor '${ANCHOR_FILE}' not found" >&2
   exit 1
@@ -103,6 +56,7 @@ if ! command -v sha256sum >/dev/null 2>&1; then
   exit 1
 fi
 
+command -v python3 >/dev/null 2>&1 || { echo "Error: python3 is required" >&2; exit 1; }
 mkdir -p "${BACKUP_DIR}"
 
 # Step 3: Paired generation, anchor, and manifest creation (T07)
@@ -128,7 +82,6 @@ cleanup() {
 trap cleanup EXIT
 
 # Copy to temporary staging files
-cp -- "${DATA_FILE}" "${TMP_FILE}"
 cp -- "${ANCHOR_FILE}" "${TMP_ANCHOR}"
 # A committed anchor may point at a generation file when the convenience
 # mirror is stale. Carry that generation into the bundle as well.
@@ -149,9 +102,12 @@ if [[ -n "${GENERATION_FILE}" ]]; then
   fi
   cp -- "${DATA_DIR}/${GENERATION_FILE}" "${BACKUP_DIR}/.${GENERATION_FILE}.tmp.$$"
   GENERATION_TMP="${BACKUP_DIR}/.${GENERATION_FILE}.tmp.$$"
+  cp -- "${GENERATION_TMP}" "${TMP_FILE}"
 else
+  cp -- "${DATA_FILE}" "${TMP_FILE}"
   GENERATION_TMP=""
 fi
+[[ -s "${TMP_FILE}" ]] || { echo "Error: authoritative snapshot is empty" >&2; exit 1; }
 chmod 600 "${TMP_FILE}" "${TMP_ANCHOR}" ${GENERATION_TMP:+"${GENERATION_TMP}"}
 
 # Compute cryptographic digests
@@ -205,7 +161,8 @@ echo "[$(date -Iseconds)] SHA-256: ${CHECKSUM_FILE}"
 echo "[$(date -Iseconds)] Manifest: ${MANIFEST_FILE}"
 
 # Step 5: Complete-Generation Retention Pruning (T07)
-# Prunes entire backup sets together based on manifests; never deletes loose individual files
+# Cold bundles live at the root. Never descend into server-backup.py bundles.
+# Prunes paired cold files only; shared authoritative generation files are retained.
 if command -v find >/dev/null 2>&1; then
   while IFS= read -r manifest; do
     if [[ -n "${manifest}" ]]; then
@@ -213,7 +170,7 @@ if command -v find >/dev/null 2>&1; then
       echo "[*] Pruning expired backup generation: ${BASE}"
       rm -f -- "${manifest}" "${BASE}.json" "${BASE}.json.anchor" "${BASE}.json.sha256"
     fi
-  done < <(find "${BACKUP_DIR}" -type f -name 'billing_state_*.manifest.json' -mtime +"${RETENTION_DAYS}" 2>/dev/null || true)
+  done < <(find "${BACKUP_DIR}" -maxdepth 1 -type f -name 'billing_state_*.manifest.json' -mtime +"${RETENTION_DAYS}" 2>/dev/null || true)
 fi
 
 echo "[$(date -Iseconds)] Backup retention pruning completed."

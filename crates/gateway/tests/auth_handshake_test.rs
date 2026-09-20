@@ -153,69 +153,63 @@ async fn test_subsequent_login_from_same_device_is_idempotent() {
 }
 
 #[tokio::test]
-async fn test_rebind_eviction_and_cooldown_rejection() {
-    let (engine, _auth_state, _protector, token_handler, _refresh_handler) =
-        setup_test_environment();
-
+async fn test_new_device_requires_explicit_unbind() {
+    let (engine, auth, _protector, token_handler, _refresh_handler) = setup_test_environment();
     let raw_key = "CARD-REBIND-789";
     let mut card = Card::new("card-rebind", "grp-pro", 100_000_000);
     card.code_hash = hash_card_code(raw_key);
     card.status = CardStatus::Active;
-    card.max_devices = 1;
     card.max_rebinds = 2;
-    card.rebind_cooldown_secs = 600; // 10 minutes
+    card.rebind_cooldown_secs = 600;
     engine.upsert_card(card);
-
-    // Device 1 binds
-    let req1 = Request::builder()
-        .method("POST")
-        .uri("/oauth/token")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&serde_json::json!({
-                "card_key": raw_key,
-                "device_id": "dev_one"
-            }))
-            .unwrap(),
-        ))
+    let login = |device| {
+        Request::builder()
+            .method("POST")
+            .uri("/oauth/token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"card_key":raw_key,"device_id":device}).to_string(),
+            ))
+            .unwrap()
+    };
+    let first = token_handler.handle(login("dev_one")).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let bytes = first.into_body().collect().await.unwrap().to_bytes();
+    let tokens: OAuthTokenResponse = serde_json::from_slice(&bytes).unwrap();
+    let before = engine.get_card("card-rebind").unwrap();
+    let rejected = token_handler.handle(login("dev_two")).await;
+    assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+    let bytes = rejected.into_body().collect().await.unwrap().to_bytes();
+    let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(error["__type"], "DeviceBindingException");
+    assert!(error["message"]
+        .as_str()
+        .unwrap()
+        .contains("unbind it on the portal"));
+    assert_eq!(engine.get_card("card-rebind").unwrap(), before);
+    assert!(auth.verify_token(&tokens.access_token).is_ok());
+    let rotated = auth
+        .rotate_refresh_token(&tokens.refresh_token, 3600, 3600)
         .unwrap();
-    assert_eq!(token_handler.handle(req1).await.status(), StatusCode::OK);
-
-    // Device 2 binds (evicts dev_one, increments token_version to 2)
-    let req2 = Request::builder()
-        .method("POST")
-        .uri("/oauth/token")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&serde_json::json!({
-                "card_key": raw_key,
-                "device_id": "dev_two"
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
-    assert_eq!(token_handler.handle(req2).await.status(), StatusCode::OK);
-
+    engine.unbind_device("card-rebind", "dev_one").unwrap();
+    assert!(auth.verify_token(&tokens.access_token).is_err());
+    assert!(auth.rotate_refresh_token(&rotated.2, 3600, 3600).is_err());
+    assert_eq!(
+        token_handler.handle(login("dev_two")).await.status(),
+        StatusCode::OK
+    );
     let card = engine.get_card("card-rebind").unwrap();
-    assert_eq!(card.bound_devices, vec!["dev_two".to_string()]);
+    assert_eq!(card.bound_devices, vec!["dev_two"]);
     assert_eq!(card.rebind_count, 1);
     assert_eq!(card.token_version, 2);
-
-    // Device 3 binds immediately -> rejected by rebind cooldown (HTTP 429)
-    let req3 = Request::builder()
-        .method("POST")
-        .uri("/oauth/token")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&serde_json::json!({
-                "card_key": raw_key,
-                "device_id": "dev_three"
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
-    let resp3 = token_handler.handle(req3).await;
-    assert_eq!(resp3.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        token_handler.handle(login("dev_three")).await.status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        token_handler.handle(login("dev_two")).await.status(),
+        StatusCode::OK
+    );
 }
 
 #[tokio::test]
@@ -326,4 +320,45 @@ async fn test_login_brute_force_lockout() {
         .unwrap();
     let resp6 = token_handler.handle(req6).await;
     assert_eq!(resp6.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn same_computer_can_use_new_card_without_sharing_card_across_devices() {
+    let (engine, auth, _, handler, _) = setup_test_environment();
+    for key in ["old-card", "new-card"] {
+        let mut card = Card::new(key, "grp-pro", 1_000_000_000);
+        card.code_hash = hash_card_code(key);
+        card.status = CardStatus::Unactivated;
+        engine.upsert_card(card);
+    }
+    for (key, device, expected) in [
+        ("old-card", "same-computer", StatusCode::OK),
+        ("new-card", "same-computer", StatusCode::OK),
+        ("new-card", "different-computer", StatusCode::FORBIDDEN),
+    ] {
+        let response = handler
+            .handle(
+                Request::builder()
+                    .method("POST")
+                    .uri("/oauth/token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"card_key":key,"device_id":device}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(response.status(), expected, "{key} on {device}");
+        if expected == StatusCode::OK {
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let token: OAuthTokenResponse = serde_json::from_slice(&body).unwrap();
+            assert_eq!(auth.verify_token(&token.access_token).unwrap().card_id, key);
+        }
+    }
+    for key in ["old-card", "new-card"] {
+        assert_eq!(
+            engine.get_card(key).unwrap().bound_devices,
+            vec!["same-computer"]
+        );
+    }
 }

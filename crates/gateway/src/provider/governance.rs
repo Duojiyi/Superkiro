@@ -351,15 +351,16 @@ pub async fn execute_stream_with_failover(
                 let err_msg = e.to_string();
                 failure_records.push((key_id.clone(), err_msg));
 
+                let failed_at = crate::now_secs().max(now_secs);
                 if is_cooldown_error(&e) {
                     if let ProviderError::Http(status, _) = e {
                         if status.as_u16() == 401 {
                             pool.mark_key_unhealthy(&key_id);
                         } else {
-                            pool.mark_key_failure(&key_id, now_secs, default_cooldown);
+                            pool.mark_key_failure(&key_id, failed_at, default_cooldown);
                         }
                     } else {
-                        pool.mark_key_failure(&key_id, now_secs, default_cooldown);
+                        pool.mark_key_failure(&key_id, failed_at, default_cooldown);
                     }
                     // Failover continues to next key
                 } else {

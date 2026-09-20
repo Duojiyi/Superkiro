@@ -12,6 +12,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 2
 
 jobs:
   check-and-test:
@@ -26,7 +27,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - uses: actions/setup-python@v5
         with:
@@ -35,9 +36,20 @@ jobs:
       - name: Desktop Bridge and Release Default Regressions
         run: python -B -m unittest -v test_desktop_bridge_regression test_desktop_runtime
 
+      - name: Offline Publication and Backup Regressions
+        run: python -B -m unittest discover -s deploy -p "test_publish_native*.py" -v
+
+      - name: Offline Artifact Mapping Regressions
+        run: python -B -m unittest discover -s deploy -p "test_artifact_provenance.py" -v
+
+      - name: Backup Transport Regressions
+        run: python -B -m unittest discover -s deploy/backup -p "test_*.py" -v
+
       - name: Deployment Script Syntax
         if: runner.os == 'Linux'
-        run: bash -n deploy/backup/backup.sh deploy/backup/restore.sh
+        run: |
+          bash -n deploy/backup/backup.sh
+          bash -n deploy/backup/restore.sh
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -51,10 +63,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Lint with Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --exclude desktop-host --all-targets --locked -- -D warnings
 
       - name: Run Tests
-        run: cargo test --workspace --locked --no-fail-fast
+        run: cargo test --workspace --exclude desktop-host --locked --no-fail-fast
 
 
   frontend:
@@ -67,23 +79,32 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: apps/admin-ui/package-lock.json
       - run: npm ci
-      - run: npm run build -- --outDir .build-check
-      - run: node tests/contracts.cjs
+      - run: npm run build
+      - run: npm test
       - run: npm install --no-save --package-lock=false playwright@1.61.0
       - run: npx playwright install --with-deps chromium
       - run: node tests/visual.cjs
       - run: node tests/visual-authenticated.cjs
+      - run: node tests/auth-gate.cjs
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
       - run: python -m pip install playwright==1.61.0
       - run: python -m playwright install chromium
-      - name: Desktop UI Layout and Interaction Regressions
-        run: python -B -m unittest -v test_superkiro_desktop_ui
+      - name: Build and Test React Desktop UI
+        run: |
+          npm --prefix apps/desktop-ui ci
+          npm --prefix apps/desktop-ui run build
+          npm --prefix apps/desktop-ui test
+          python -B apps/desktop-ui/verify_layout.py
+          python -B apps/desktop-ui/verify_browser.py
+        working-directory: .
+      - name: Portal UI Layout and Interaction Regressions
+        run: python -B -m unittest -v test_superkiro_portal_ui
         working-directory: .
 
   security:

@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Command;
 use std::sync::{LazyLock, Mutex};
 use thiserror::Error;
@@ -48,50 +49,30 @@ impl std::fmt::Display for ProcessState {
 /// If detection tool fails, non-zero exits, or permissions are denied, returns `Unknown`.
 /// Modifying Kiro files is strictly forbidden unless state is `Stopped`.
 pub fn detect_kiro_process_state() -> ProcessState {
-    if cfg!(target_os = "macos") {
-        // Match the Kiro bundle, never unrelated Electron applications.
-        return match Command::new("pgrep")
-            .args(["-f", r"/Kiro[.]app/Contents/MacOS/(Kiro|Electron)( |$)"])
-            .output()
-        {
-            Ok(output) if output.status.success() && !output.stdout.is_empty() => {
-                ProcessState::Running
-            }
-            Ok(output) if output.status.code() == Some(1) => ProcessState::Stopped,
-            _ => ProcessState::Unknown,
-        };
+    detect_kiro_process_state_until(std::time::Instant::now() + std::time::Duration::from_secs(3))
+}
+
+pub(crate) fn detect_kiro_process_state_until(deadline: std::time::Instant) -> ProcessState {
+    if std::time::Instant::now() >= deadline {
+        return ProcessState::Unknown;
     }
-    let names = if cfg!(target_os = "windows") {
-        vec!["Kiro.exe", "kiro.exe"]
-    } else {
-        vec!["kiro", "Kiro"]
-    };
-    for name in names {
-        match check_single_process_state(name) {
-            ProcessState::Running => return ProcessState::Running,
-            ProcessState::Unknown => return ProcessState::Unknown,
-            ProcessState::Stopped => continue,
-        }
+    #[cfg(unix)]
+    {
+        unix_process_state_until(
+            |name| is_kiro_executable(name, cfg!(target_os = "macos")),
+            deadline,
+        )
     }
-    ProcessState::Stopped
+    #[cfg(not(unix))]
+    check_single_process_state("Kiro.exe")
 }
 
 fn check_single_process_state(image_name: &str) -> ProcessState {
-    if cfg!(target_os = "windows") {
-        let filter = format!("IMAGENAME eq {}", image_name);
-        match Command::new("tasklist")
-            .args(["/FI", &filter, "/NH"])
-            .output()
-        {
-            Ok(output) => {
-                if !output.status.success() {
-                    return ProcessState::Unknown;
-                }
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if stdout
-                    .to_ascii_lowercase()
-                    .contains(&image_name.to_ascii_lowercase())
-                {
+    #[cfg(windows)]
+    {
+        match crate::windows_process::enumerate() {
+            Ok(entries) => {
+                if entries.iter().any(|p| p.2.eq_ignore_ascii_case(image_name)) {
                     ProcessState::Running
                 } else {
                     ProcessState::Stopped
@@ -99,19 +80,69 @@ fn check_single_process_state(image_name: &str) -> ProcessState {
             }
             Err(_) => ProcessState::Unknown,
         }
+    }
+    #[cfg(unix)]
+    {
+        unix_process_state(|name| {
+            Path::new(name).file_name().and_then(|n| n.to_str()) == Some(image_name)
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = image_name;
+        ProcessState::Unknown
+    }
+}
+
+// Read executable names, never command-line arguments or a caller-supplied regex.
+#[cfg(unix)]
+fn unix_process_state(matches: impl Fn(&str) -> bool) -> ProcessState {
+    unix_process_state_until(
+        matches,
+        std::time::Instant::now() + std::time::Duration::from_secs(3),
+    )
+}
+
+#[cfg(unix)]
+fn unix_process_state_until(
+    matches: impl Fn(&str) -> bool,
+    deadline: std::time::Instant,
+) -> ProcessState {
+    match crate::process::capture_helper_until(
+        Command::new("/bin/ps").args(["-A", "-ww", "-o", "comm="]),
+        deadline,
+    ) {
+        Ok(bytes) => match std::str::from_utf8(&bytes) {
+            Ok(text) => process_names_state(text, matches),
+            Err(_) => ProcessState::Unknown,
+        },
+        Err(_) => ProcessState::Unknown,
+    }
+}
+
+#[cfg(any(unix, test))]
+fn process_names_state(text: &str, matches: impl Fn(&str) -> bool) -> ProcessState {
+    let mut found_name = false;
+    for name in text.lines().map(str::trim).filter(|name| !name.is_empty()) {
+        found_name = true;
+        if matches(name) {
+            return ProcessState::Running;
+        }
+    }
+    if found_name {
+        ProcessState::Stopped
     } else {
-        match Command::new("pgrep").args(["-x", image_name]).output() {
-            Ok(output) => {
-                if output.status.success() && !output.stdout.is_empty() {
-                    ProcessState::Running
-                } else if output.status.code() == Some(1) {
-                    ProcessState::Stopped
-                } else {
-                    ProcessState::Unknown
-                }
-            }
-            Err(_) => ProcessState::Unknown,
-        }
+        ProcessState::Unknown
+    }
+}
+
+#[cfg(any(unix, test))]
+fn is_kiro_executable(name: &str, macos: bool) -> bool {
+    if macos {
+        name.ends_with("/Kiro.app/Contents/MacOS/Kiro")
+            || name.ends_with("/Kiro.app/Contents/MacOS/Electron")
+    } else {
+        matches!(name, "kiro" | "Kiro")
     }
 }
 
@@ -140,29 +171,44 @@ pub fn is_process_running_by_name(image_name: &str) -> bool {
 
 /// Check if a specific process ID is currently alive on the host.
 pub fn is_pid_alive(pid: u32) -> bool {
-    if cfg!(target_os = "windows") {
-        let filter = format!("PID eq {}", pid);
-        let output = Command::new("tasklist")
-            .args(["/FI", &filter, "/NH"])
-            .output();
-
-        match output {
-            Ok(out) => {
-                if !out.status.success() {
-                    return false;
-                }
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                stdout.contains(&pid.to_string())
-            }
-            Err(_) => false,
-        }
-    } else {
-        let status = Command::new("kill").args(["-0", &pid.to_string()]).output();
-        match status {
-            Ok(out) => out.status.success(),
-            Err(_) => false,
-        }
+    #[cfg(windows)]
+    {
+        // A failed query is not evidence that a lock owner has exited.
+        crate::windows_process::enumerate()
+            .map(|entries| entries.iter().any(|p| p.0 == pid))
+            .unwrap_or(true)
     }
+    #[cfg(unix)]
+    {
+        // Do not pass zero/negative process-group identifiers to kill(2).
+        let Ok(pid) = i32::try_from(pid) else {
+            return true;
+        };
+        if pid == 0 {
+            return true;
+        }
+        extern "C" {
+            fn kill(pid: i32, signal: i32) -> i32;
+        }
+        let result = unsafe { kill(pid, 0) };
+        let error = if result == 0 {
+            None
+        } else {
+            std::io::Error::last_os_error().raw_os_error()
+        };
+        pid_probe_is_alive(result, error)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+#[cfg(any(unix, test))]
+fn pid_probe_is_alive(result: i32, errno: Option<i32>) -> bool {
+    // ESRCH is 3 on Linux/macOS. EPERM and all other failures are inconclusive.
+    result == 0 || errno != Some(3)
 }
 
 /// RAII Guard ensuring only one instance of the Kiro BYOK desktop client is running (Spec §9, T08).
@@ -358,5 +404,69 @@ mod tests {
 
         drop(lock);
         assert!(!test_lock.exists());
+    }
+}
+
+#[cfg(test)]
+mod unix_detection_tests {
+    use super::*;
+
+    #[test]
+    fn executable_matching_excludes_arguments_and_other_editors() {
+        for name in [
+            "/usr/bin/python3",
+            "/Applications/Other.app/Contents/MacOS/Electron",
+            "Superkiro",
+            "Code",
+            "Cursor",
+        ] {
+            assert!(!is_kiro_executable(name, true));
+            assert!(!is_kiro_executable(name, false));
+        }
+        assert!(is_kiro_executable(
+            "/Applications/Kiro.app/Contents/MacOS/Electron",
+            true
+        ));
+        assert!(is_kiro_executable(
+            "/Volumes/My Disk/Kiro.app/Contents/MacOS/Kiro",
+            true
+        ));
+        assert!(is_kiro_executable("kiro", false));
+        assert!(is_kiro_executable("Kiro", false));
+        // ps comm contains only the executable, even when argv mentions the Kiro bundle.
+        assert_eq!(
+            process_names_state("/sbin/launchd\n/usr/bin/python3\n", |n| is_kiro_executable(
+                n, true
+            )),
+            ProcessState::Stopped
+        );
+        assert_eq!(
+            process_names_state("/Applications/Kiro.app/Contents/MacOS/Electron\n", |n| {
+                is_kiro_executable(n, true)
+            }),
+            ProcessState::Running
+        );
+        assert_eq!(
+            process_names_state("   \n", |_| false),
+            ProcessState::Unknown
+        );
+    }
+
+    #[test]
+    fn only_esrch_proves_pid_is_dead() {
+        assert!(pid_probe_is_alive(0, None));
+        assert!(!pid_probe_is_alive(-1, Some(3)));
+        for errno in [Some(1), Some(13), Some(22), None] {
+            assert!(pid_probe_is_alive(-1, errno));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_probe_and_ps_work_on_this_host() {
+        assert!(is_pid_alive(std::process::id()));
+        assert!(is_pid_alive(0));
+        assert!(is_pid_alive(u32::MAX));
+        assert_eq!(unix_process_state(|_| true), ProcessState::Running);
     }
 }

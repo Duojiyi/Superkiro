@@ -15,6 +15,8 @@ pub struct CommercialUpdate {
     pub expected_revision: String,
     pub reason: String,
     #[serde(default)]
+    pub settings: Option<BillingSettings>,
+    #[serde(default)]
     pub groups: Vec<Group>,
     #[serde(default)]
     pub models: Vec<ModelMap>,
@@ -26,6 +28,7 @@ pub struct CommercialUpdate {
 #[derive(Debug, Serialize)]
 pub struct CommercialConfig {
     pub revision: String,
+    pub settings: BillingSettings,
     pub audit: Vec<CommercialAudit>,
     pub groups: Vec<Group>,
     pub models: Vec<ModelMap>,
@@ -41,7 +44,8 @@ fn view(s: &BillingSnapshot) -> CommercialConfig {
     rate_cards.sort_by(|a, b| a.id.cmp(&b.id));
     let mut versions = s.rate_card_versions.clone();
     versions.sort_by(|a, b| a.id.cmp(&b.id));
-    let bytes = serde_json::to_vec(&(&groups, &models, &rate_cards, &versions)).unwrap();
+    let bytes =
+        serde_json::to_vec(&(&groups, &models, &rate_cards, &versions, &s.settings)).unwrap();
     let revision = ring::digest::digest(&ring::digest::SHA256, &bytes)
         .as_ref()
         .iter()
@@ -49,6 +53,7 @@ fn view(s: &BillingSnapshot) -> CommercialConfig {
         .collect();
     CommercialConfig {
         revision,
+        settings: s.settings.clone(),
         audit: s.commercial_audit_logs.clone(),
         groups,
         models,
@@ -77,7 +82,9 @@ impl BillingEngine {
         if !text(&u.reason, 500) {
             return Err(invalid("Publication reason required (max 500 bytes)"));
         }
-        if u.groups.len() + u.models.len() + u.rate_cards.len() + u.versions.len() == 0 {
+        if u.groups.len() + u.models.len() + u.rate_cards.len() + u.versions.len() == 0
+            && u.settings.is_none()
+        {
             return Err(invalid("Empty publication"));
         }
         let _guard = self.state_lock.write().unwrap();
@@ -96,6 +103,15 @@ impl BillingEngine {
             || !c.pending_settlements.is_empty()
         {
             return Err(invalid("Requests are still settling; publish when idle"));
+        }
+        if let Some(mut settings) = u.settings {
+            if !positive(settings.credit_face_value_cny) || !positive(settings.usd_cny_rate) {
+                return Err(invalid(
+                    "Face value and exchange rate must be finite, positive, and at most 1000",
+                ));
+            }
+            settings.rate_updated_at_secs = now;
+            c.settings = settings;
         }
         let mut ids = std::collections::HashSet::new();
         for r in u.rate_cards {
@@ -242,6 +258,7 @@ impl BillingEngine {
         });
         let result = view(&c);
         self.commit_candidate_snapshot(&c, || {
+            *self.settings.write().unwrap() = c.settings.clone();
             *self.commercial_audit_logs.write().unwrap() = c.commercial_audit_logs.clone();
             *self.groups.write().unwrap() = c.groups.clone();
             *self.model_maps.write().unwrap() = c.model_maps.clone();
@@ -260,6 +277,7 @@ mod tests {
         CommercialUpdate {
             expected_revision: e.commercial_config().revision,
             reason: "reviewed publication".into(),
+            settings: None,
             groups: vec![Group::pro_plus("new-tier", "New tier")],
             models: vec![],
             rate_cards: vec![RateCard::new("default", "Default", 100)],

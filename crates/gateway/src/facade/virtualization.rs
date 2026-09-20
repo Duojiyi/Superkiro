@@ -170,10 +170,11 @@ impl VirtualizationStore {
         if let Some(ref billing) = self.billing {
             if let Some(bg) = billing.get_group(target_id) {
                 // Fetch models from billing mapped to this group (respecting visibility and sort_order)
-                let billing_models = billing.list_models_for_group(&bg.id, true);
+                let billing_models = billing.list_models_for_group(&bg.id, false);
                 let models: Vec<ModelInfo> = if !billing_models.is_empty() {
                     billing_models
                         .into_iter()
+                        .filter(|m| m.visible)
                         .map(|m| ModelInfo {
                             model_id: m.exposed_model_id.clone(),
                             model_name: Some(m.exposed_model_id.clone()),
@@ -203,7 +204,7 @@ impl VirtualizationStore {
                 let default_model_id = models
                     .first()
                     .map(|m| m.model_id.clone())
-                    .unwrap_or_else(|| "claude-sonnet-4.5".to_string());
+                    .unwrap_or_default();
 
                 return VirtualGroup {
                     group_id: bg.id,

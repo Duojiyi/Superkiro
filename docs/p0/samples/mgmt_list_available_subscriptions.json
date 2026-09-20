@@ -1,0 +1,18 @@
+{
+  "subscriptions": [
+    {
+      "subscriptionId": "sub_pro_tier",
+      "tier": "PRO",
+      "displayName": "Kiro Pro (BYOK Virtual Plan)",
+      "status": "ACTIVE",
+      "autoRenew": true,
+      "quotaUnits": "micro_credits",
+      "capabilities": [
+        "tools",
+        "agent",
+        "reasoning",
+        "vision"
+      ]
+    }
+  ]
+}

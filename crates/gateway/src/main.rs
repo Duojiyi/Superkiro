@@ -215,6 +215,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if admin_key == auth_secret {
         return Err("ADMIN_KEY must be different from AUTH_SECRET".into());
     }
+    gateway::facade::admin_login::BrowserAuth::from_env()?;
     registry.register_admin_facades_secure(billing.clone(), admin_key);
 
     // 6. 注册客户端协商、信标与白标
@@ -305,13 +306,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let janitor_billing = billing.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut recovery = billing::engine::PendingSettlementRecovery::default();
+        let recovery_started = std::time::Instant::now();
         loop {
             interval.tick().await;
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            let reclaimed = janitor_billing.run_janitor(now);
+            // Snapshot persistence is blocking IO; do not block an async worker.
+            let engine = janitor_billing.clone();
+            let retry_now = recovery_started.elapsed().as_secs();
+            let result = tokio::task::spawn_blocking(move || {
+                for (invocation_id, result) in recovery.tick(&engine, retry_now) {
+                    match result {
+                        Ok(_) => eprintln!("[kiro-billing] pending settlement recovered: invocation={invocation_id}"),
+                        Err(error) => eprintln!("[kiro-billing] ERROR pending recovery: invocation={invocation_id} error={error}; hold retained, retry backs off up to 300s"),
+                    }
+                }
+                (recovery, engine.run_janitor(now))
+            }).await;
+            let reclaimed;
+            match result {
+                Ok((schedule, count)) => {
+                    recovery = schedule;
+                    reclaimed = count;
+                }
+                Err(error) => {
+                    eprintln!("[kiro-billing] ERROR maintenance task failed: {error}");
+                    recovery = billing::engine::PendingSettlementRecovery::default();
+                    continue;
+                }
+            }
             if reclaimed > 0 {
                 eprintln!("[kiro-billing] reclaimed {reclaimed} expired reservations");
             }

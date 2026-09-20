@@ -12,7 +12,10 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum AuthClientError {
-    #[error("Network HTTP error: {0}")]
+    #[error("HTTP client initialization failed: {0}")]
+    Initialization(String),
+
+    #[error("Network HTTP error: {}", network_error(.0))]
     Network(#[from] reqwest::Error),
 
     #[error("Storage error: {0}")]
@@ -79,7 +82,7 @@ pub struct GatewayRefreshResponse {
 /// High-level authentication client for Kiro BYOK desktop/CLI.
 #[derive(Debug, Clone)]
 pub struct AuthClient {
-    http: Client,
+    http: Result<Client, String>,
     storage: TokenStorage,
 }
 
@@ -91,14 +94,34 @@ impl Default for AuthClient {
 
 impl AuthClient {
     /// Create an AuthClient with custom TokenStorage (e.g. for isolated testing).
+    /// Initialization failures are returned by HTTP operations; construction never falls back
+    /// to a client that ignores the configured CA.
     pub fn new(storage: TokenStorage) -> Self {
-        let http = crate::http::client_builder()
-            .timeout(Duration::from_secs(15))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("TLS HTTP client initialization failed");
+        Self::with_ca(
+            storage,
+            std::env::var_os("KIRO_GATEWAY_CA_CERT")
+                .as_deref()
+                .map(std::path::Path::new),
+        )
+    }
+
+    /// Explicit session trust, independent of the environment after restart.
+    pub fn with_ca(storage: TokenStorage, ca: Option<&std::path::Path>) -> Self {
+        let http = crate::http::client_builder_with_ca(ca).and_then(|builder| {
+            builder
+                .timeout(Duration::from_secs(15))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|e| e.to_string())
+        });
 
         Self { http, storage }
+    }
+
+    fn http(&self) -> Result<&Client, AuthClientError> {
+        self.http
+            .as_ref()
+            .map_err(|e| AuthClientError::Initialization(e.clone()))
     }
 
     /// Access reference to underlying token storage.
@@ -150,7 +173,7 @@ impl AuthClient {
 
         let url = format!("{}/oauth/token", gateway_base_url.trim_end_matches('/'));
 
-        let resp = self.http.post(&url).json(&req_body).send().await?;
+        let resp = self.http()?.post(&url).json(&req_body).send().await?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -205,7 +228,7 @@ impl AuthClient {
 
         let url = format!("{}/refreshToken", gateway_base_url.trim_end_matches('/'));
 
-        let resp = self.http.post(&url).json(&req_body).send().await?;
+        let resp = self.http()?.post(&url).json(&req_body).send().await?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -258,7 +281,7 @@ impl AuthClient {
         let gateway = crate::patch::validate_gateway_url(gateway)
             .map_err(|e| AuthClientError::InvalidResponse(e.to_string()))?;
         let challenge: serde_json::Value = self
-            .http
+            .http()?
             .post(format!("{gateway}/api/v1/portal/challenge"))
             .json(&serde_json::json!({"action": "unbind"}))
             .send()
@@ -277,7 +300,7 @@ impl AuthClient {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| AuthClientError::InvalidResponse("No unbind challenge".into()))?;
         let result: serde_json::Value = self
-            .http
+            .http()?
             .post(format!("{gateway}/api/v1/portal/unbind"))
             .json(&serde_json::json!({"card": card, "device": device, "challenge_token": token}))
             .send()
@@ -301,5 +324,41 @@ impl AuthClient {
     /// Logout and clean local token storage.
     pub fn logout(&self) -> Result<bool, AuthClientError> {
         Ok(self.storage.clear()?)
+    }
+}
+
+// reqwest Display omits the transport/TLS cause. Keep its source chain for diagnostics.
+fn network_error(error: &reqwest::Error) -> String {
+    use std::error::Error;
+    let mut message = String::from("request failed");
+    let mut source = error.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
+}
+
+#[cfg(test)]
+mod initialization_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn initialization_failure_is_returned_before_network_requests() {
+        let client = AuthClient {
+            http: Err("invalid CA".into()),
+            storage: TokenStorage::default(),
+        };
+        let error = client
+            .authenticate("https://example.com", "test-card", Some("test-device"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AuthClientError::Initialization(_)));
+        let error = client
+            .unbind("https://example.com", "test-card", "test-device")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AuthClientError::Initialization(_)));
     }
 }

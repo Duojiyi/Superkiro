@@ -9,11 +9,11 @@ fn test_classify_process() {
     );
     assert_eq!(
         MemoryGuard::classify_process("cursor.exe"),
-        ProcessCategory::MainIde
+        ProcessCategory::Other
     );
     assert_eq!(
         MemoryGuard::classify_process("Code.exe"),
-        ProcessCategory::MainIde
+        ProcessCategory::Other
     );
     assert_eq!(
         MemoryGuard::classify_process("node.exe"),

@@ -1,0 +1,9 @@
+{
+  "usageLimits": {
+    "monthlyRequestCount": 0,
+    "monthlyRequestLimit": 100000000,
+    "creditsRemaining": 85000000,
+    "creditsTotal": 100000000,
+    "resetDate": "2026-10-01T00:00:00Z"
+  }
+}

@@ -18,9 +18,9 @@ use axum::{
 use billing::card::CardStatus;
 use billing::engine::BillingEngine;
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -159,7 +159,6 @@ pub struct AuthState {
     billing: Option<BillingEngine>,
     used_refresh_tokens: Arc<RwLock<HashMap<String, u64>>>,
     refresh_versions: Arc<RwLock<HashMap<String, u64>>>,
-    refresh_nonce: Arc<AtomicU64>,
     /// `new()` is retained for legacy/unit-test stores. Production state is
     /// connected through `with_billing()` and requires issuer/audience claims.
     require_claim_context: bool,
@@ -174,7 +173,6 @@ impl AuthState {
             billing: None,
             used_refresh_tokens: Arc::new(RwLock::new(HashMap::new())),
             refresh_versions: Arc::new(RwLock::new(HashMap::new())),
-            refresh_nonce: Arc::new(AtomicU64::new(1)),
             require_claim_context: false,
         }
     }
@@ -187,7 +185,6 @@ impl AuthState {
             billing: Some(billing),
             used_refresh_tokens: Arc::new(RwLock::new(HashMap::new())),
             refresh_versions: Arc::new(RwLock::new(HashMap::new())),
-            refresh_nonce: Arc::new(AtomicU64::new(1)),
             require_claim_context: true,
         }
     }
@@ -327,6 +324,10 @@ impl AuthState {
             .duration_since(UNIX_EPOCH)
             .map_err(|e| AuthError::InvalidSignature(e.to_string()))?
             .as_secs();
+        let mut nonce = [0u8; 32];
+        SystemRandom::new()
+            .fill(&mut nonce)
+            .map_err(|_| AuthError::InvalidSignature("refresh randomness unavailable".into()))?;
         let claims = RefreshClaims {
             card_id: card_id.to_string(),
             group_id: group_id.to_string(),
@@ -334,11 +335,7 @@ impl AuthState {
             refresh_version,
             exp: now.saturating_add(ttl_secs),
             iat: now,
-            jti: format!(
-                "rt-{}-{}",
-                now,
-                self.refresh_nonce.fetch_add(1, Ordering::Relaxed)
-            ),
+            jti: nonce.iter().map(|b| format!("{b:02x}")).collect(),
             kind: "refresh".to_string(),
             iss: "kiro-byok".to_string(),
             aud: "kiro-gateway".to_string(),
@@ -360,6 +357,7 @@ impl AuthState {
     ) -> Result<(AuthClaims, String, String), AuthError> {
         let mut validation = Validation::new(jsonwebtoken::Algorithm::HS256);
         validation.validate_exp = true;
+        validation.leeway = 0;
         validation.validate_aud = self.require_claim_context;
         if self.require_claim_context {
             validation.set_issuer(&["kiro-byok"]);
@@ -393,17 +391,25 @@ impl AuthState {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            let mut used = self
-                .used_refresh_tokens
-                .write()
-                .map_err(|_| AuthError::InvalidSignature("refresh store poisoned".to_string()))?;
-            used.retain(|_, exp| *exp > now);
-            if used.contains_key(&refresh.jti) {
-                return Err(AuthError::InvalidSignature(
-                    "refresh token already used".to_string(),
-                ));
+            if refresh.exp <= now {
+                return Err(AuthError::Expired);
             }
-            used.insert(refresh.jti.clone(), refresh.exp);
+            if let Some(billing) = &self.billing {
+                billing
+                    .consume_refresh_token(&refresh.jti, refresh.exp, now)
+                    .map_err(|e| AuthError::InvalidSignature(e.to_string()))?;
+            } else {
+                let mut used = self.used_refresh_tokens.write().map_err(|_| {
+                    AuthError::InvalidSignature("refresh store poisoned".to_string())
+                })?;
+                used.retain(|_, exp| *exp > now);
+                if used.contains_key(&refresh.jti) {
+                    return Err(AuthError::InvalidSignature(
+                        "refresh token already used".to_string(),
+                    ));
+                }
+                used.insert(refresh.jti.clone(), refresh.exp);
+            }
         }
         let new_claims = claims;
         let new_refresh_version = refresh.refresh_version;

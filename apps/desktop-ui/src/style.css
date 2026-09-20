@@ -1,0 +1,267 @@
+:root{font-family:Inter,"Segoe UI","Microsoft YaHei",sans-serif;color:#edf0e9;background:transparent;font-synthesis:none;font-weight:400;font-size:14px;color-scheme:dark;--muted:#9aa6a1;--line:#343d38;--mint:#bed5c7}*{box-sizing:border-box}body{margin:0;min-width:300px}button,input{font:inherit}button{color:inherit;background:#1d2322;border:1px solid var(--line);border-radius:11px;min-height:44px;padding:11px 16px;cursor:pointer;transition:background .15s,border-color .15s,transform .15s}button:hover:not(:disabled){background:#313a35;border-color:#75897c}button:active:not(:disabled){transform:translateY(1px);background:#3c4941}button:disabled{opacity:.43;cursor:not-allowed}button:focus-visible,input:focus-visible,summary:focus-visible{outline:2px solid #dfc291;outline-offset:4px}.shell{width:100%;max-width:620px;min-height:100dvh;margin:auto;padding:30px;background:radial-gradient(ellipse at 100% 0,#242b28 0,transparent 52%),#101415;border:1px solid #424b45;border-radius:24px;overflow:hidden}.login-shell{max-width:480px;padding:30px 38px}header{display:flex;align-items:center;height:24px;margin:8px 0 28px}.brand{font-size:21px;font-weight:600;letter-spacing:.4px}.window-drag{flex:1;align-self:stretch}.window-controls{display:flex;gap:7px}.window-controls button{font-size:25px;padding:0;width:30px;min-height:30px;border:0;background:transparent;color:var(--muted)}nav{display:flex;padding:4px;background:#090f0c;border:1px solid var(--line);border-radius:14px;margin-bottom:26px;gap:4px}nav button{flex:1;border:0;background:transparent;color:var(--muted);padding:12px 6px;display:flex;align-items:center;justify-content:center;gap:9px;min-width:0}nav button span{font-size:21px}nav button[aria-current=page]{background:#303a34;color:#edf0e9}main{animation:enter .38s ease-out}h1{font-size:29px;line-height:1.25;font-weight:500;margin:18px 0 12px;letter-spacing:-.5px}h2{font-size:17px;line-height:1.5;font-weight:500;margin:22px 0 12px}p{line-height:1.7;margin:12px 0}.subtitle,.muted{color:var(--muted)}.muted{font-size:12px}.subtitle{margin-top:0}.row{display:flex;align-items:center;justify-content:space-between;gap:12px}.row>*{min-width:0}.row h1{margin-top:0}.text{border:0;background:none;padding:4px 0;min-height:32px;font-size:13px;color:var(--muted)}.text:hover:not(:disabled){background:none;color:#eef3e9}.full{display:block;width:100%;margin:10px 0}.primary{color:#181d1b;background:linear-gradient(180deg,#bbc3ba,#eeeee5);border-color:#cdd2c9;font-weight:650}.primary:hover:not(:disabled){background:linear-gradient(180deg,#cbd2ca,#f5f5ed);border-color:#e2e5dc}.actions{display:flex;gap:10px;margin:10px 0}.actions button{flex:1}.positive{color:var(--mint)}.warning{color:#e6b891}.status-badge{font-size:12px;color:var(--mint);border:1px solid #4a5e50;border-radius:20px;padding:6px 10px}.wave{height:116px;display:flex;align-items:center;gap:3px;overflow:hidden;margin:8px 0 20px;mask-image:linear-gradient(90deg,transparent,#000 15%,#000 85%,transparent)}.wave i{flex:1;min-width:1px;background:linear-gradient(transparent,#c7ceb5,transparent);opacity:.62}.responding{animation:response 1.6s ease-in-out infinite}.balance{margin-top:22px}.balance-value{font-size:68px;line-height:1.2;letter-spacing:-2px;margin:12px 0}progress{width:100%;height:6px;appearance:none;border:0;border-radius:20px;background:#29332c;overflow:hidden;margin:12px 0}progress::-webkit-progress-bar{background:#29332c}progress::-webkit-progress-value{background:linear-gradient(90deg,#aac6b6,#dbc79a);border-radius:20px}.metrics{display:flex;border-top:1px solid var(--line);border-bottom:1px solid var(--line);margin:24px 0;padding:22px 0;gap:18px}.metrics>div{flex:1;min-width:0}.metrics span{display:block;color:var(--muted);font-size:12px;margin-bottom:12px}.metrics strong{font-size:18px;font-weight:500;overflow-wrap:anywhere}.panel{border:1px solid var(--line);border-radius:14px;background:#1b2220;padding:20px;margin:20px 0}.panel h2{margin-top:0}.panel p:last-child{margin-bottom:0}.alert{border-color:#7b6045;background:#2b2720}.spaced{margin:42px 0}.empty{text-align:center;padding:58px 12px;color:var(--muted)}.empty h2{color:#e6ece5}.empty-bars{display:flex;justify-content:center;align-items:end;gap:8px;height:50px;margin-bottom:24px}.empty-bars i{width:12px;height:24px;background:#46584c;border-radius:4px}.empty-bars i:nth-child(2){height:45px}.empty-bars i:nth-child(3){height:34px}.checklist{list-style:none;padding:0;margin:24px 0}.checklist li{display:flex;justify-content:space-between;padding:15px 0;border-bottom:1px solid var(--line);gap:16px}.path-box{border:1px solid var(--line);border-radius:10px;background:#1a211e;padding:16px;color:var(--muted);overflow-wrap:anywhere}.divider{border-top:1px solid var(--line);margin-top:20px;padding-top:2px}.memory-value{font-size:23px;font-weight:400}.spark{height:45px;display:flex;align-items:end;gap:4px;margin:20px 0 12px}.spark i{flex:1;max-width:20px;min-width:2px;border-radius:3px;background:#819f90}.segments{display:flex;gap:8px}.segments button{flex:1;color:var(--muted)}.segments button[aria-pressed=true]{color:#edf0e9;background:#35453b}.usage-chart{display:flex;align-items:end;gap:18px;height:170px;margin:42px 8px 35px;color:var(--muted);font-size:13px}.chart-column{position:relative;flex:1;background:linear-gradient(#bdcba6,#5b7967);border-radius:6px 6px 0 0;min-width:0}.chart-column span{position:absolute;top:-24px;left:50%;transform:translateX(-50%);white-space:nowrap}.chart-column small{position:absolute;bottom:-25px;left:50%;transform:translateX(-50%);white-space:nowrap}.model-list .row{padding:12px 0;border-bottom:1px solid var(--line);font-size:12px}.model-list .row span:first-child{overflow-wrap:anywhere}.login .wave{height:150px;margin-top:50px}.login h1{margin:32px 0 24px;font-size:28px}.login input:not([type=checkbox]),input[type=url],dialog input{width:100%;min-height:48px;background:#101715;border:1px solid #455349;border-radius:10px;padding:12px 14px;color:#eef2e9}input[type=checkbox]{accent-color:#bed5c7;width:15px;height:15px;vertical-align:middle}.login-options{margin:12px 0 24px;font-size:12px;color:var(--muted)}.login>.muted{margin-top:25px}.login #login-error:empty{display:none}details{margin:24px 0;color:var(--muted);font-size:12px}summary{cursor:pointer;min-height:32px}details label{display:block;margin:12px 0}details input{margin-top:10px}.notice{position:relative;display:flex;align-items:start;gap:12px;border:1px solid #68745f;background:#252f26;border-radius:12px;padding:12px 14px;margin-top:22px;font-size:12px;line-height:1.7}.notice span{flex:1}.notice button{background:none;border:0;padding:0;min-height:24px;font-size:20px}dialog{color:#edf0e9;width:min(420px,calc(100vw - 32px));padding:24px;border:1px solid #586458;border-radius:18px;background:#1c2420;box-shadow:0 24px 90px #0008}dialog::backdrop{background:#0009}dialog h2{font-size:22px;margin:0}dialog p{color:var(--muted);margin:18px 0 30px;line-height:1.8}dialog input{margin:12px 0}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.9 ui-monospace,monospace}.back{margin-bottom:12px}.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap}@keyframes enter{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}@keyframes response{50%{opacity:.55}}@media(prefers-reduced-motion:reduce){*,*::before,*::after,*::backdrop{animation:none!important;transition:none!important}}@media(max-width:420px){.shell,.login-shell{padding:20px;border-radius:18px}nav button{gap:5px;font-size:12px}nav button span{font-size:17px}.row{flex-wrap:wrap}.window-controls{flex-wrap:nowrap}.brand{font-size:19px}.balance-value{font-size:56px}.metrics{gap:10px}.metrics strong{font-size:15px}.memory-value{font-size:20px}.usage-chart{gap:10px}.login .wave{margin-top:25px;height:115px}}@media(forced-colors:active){button,.panel,nav,input{border:1px solid ButtonText}}
+/* Compact design viewports: 620 × 820, login 480 × 620. */
+header{margin-bottom:20px}nav{margin-bottom:20px}nav button{padding:7px 6px;min-height:38px}.page-overview .wave{height:76px;margin:6px 0 12px}.page-overview h1{margin:14px 0 8px}.page-overview .balance{margin-top:14px}.page-overview .balance-value{font-size:60px;margin:8px 0}.page-overview .metrics{margin:18px 0;padding:16px 0}.page-settings h1{margin:12px 0}.page-settings h2{margin:12px 0 8px}.page-settings p{margin:8px 0}.page-settings .divider{margin-top:14px}.page-settings .spark{height:28px;margin:12px 0 8px}.page-settings .path-box{padding:12px 14px}.page-settings .memory-value{font-size:22px}.page-settings .row{min-height:32px}.page-settings .text{min-height:28px}.page-settings .divider>.muted:last-of-type{font-size:11px}.login .wave{margin-top:18px;height:130px}.login h1{margin-top:24px}
+.page-overview .wave{height:68px}.page-settings h2{margin-top:10px}.page-settings p{margin:6px 0}.page-settings .spark{height:20px}
+.page-settings .divider{margin-top:12px}
+
+/* Login reference: centered single peak and vertical silver metal button. */
+.login .wave{width:70%;margin-left:auto;margin-right:auto;gap:6px}.login .wave i{background:linear-gradient(transparent,#c6ceca 48%,#e3dfcf 52%,transparent)}
+
+/* Transparent root lets the Windows host show the desktop outside the shell radius. */
+html,body,#root{background:transparent}
+/* Reserve error text space without shrinking controls or removing recovery. */
+.login:has(input[aria-invalid="true"]) .wave{height:82px}
+
+/* Decorative metal reflections, never a signal of traffic or process activity. */
+.shell{position:relative;isolation:isolate}
+.shell::before{content:"";position:absolute;z-index:-1;pointer-events:none;top:-160px;left:-25%;width:150%;height:360px;background:radial-gradient(ellipse,#cfdbc222,transparent 65%);animation:metal-drift 12s ease-in-out infinite alternate}
+.wave i{animation:metal-glint 4.8s ease-in-out infinite}
+.primary{position:relative;overflow:hidden}
+.primary::after{content:"";position:absolute;pointer-events:none;inset:0;background:linear-gradient(110deg,transparent 25%,#ffffff65 50%,transparent 75%);transform:translateX(-130%)}
+.primary:hover:not(:disabled)::after,.primary:focus-visible::after{animation:metal-sweep .8s ease-out}
+.pending-indicator{flex:none;width:16px;height:16px;margin-right:14px;border:2px solid #bed5c740;border-top-color:#e3dfcf;border-radius:50%;animation:pending-spin .8s linear infinite}
+.empty,.notice,.memory-status,dialog[open],.page-doctor .panel{animation:enter .3s ease-out}
+dialog[open]::backdrop{animation:backdrop-in .2s ease-out}
+nav button,.segments button{transition:background .2s,color .2s,box-shadow .2s,transform .15s}
+nav button[aria-current=page]{box-shadow:inset 0 1px #d5ded322}
+.chart-column{max-width:72px;transition:height .35s ease-out}
+/* Sample heights stay literal: no looping or synthetic motion on memory bars. */
+@keyframes metal-drift{from{transform:translateX(-12%);opacity:.45}to{transform:translateX(12%);opacity:1}}
+@keyframes metal-glint{0%,100%{opacity:.45;transform:scaleY(.48)}50%{opacity:1;transform:scaleY(1)}}
+@keyframes metal-sweep{to{transform:translateX(130%)}}
+@keyframes pending-spin{to{transform:rotate(360deg)}}
+@keyframes backdrop-in{from{opacity:0}to{opacity:1}}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after,*::backdrop{animation:none!important;transition:none!important}}
+
+/* Native titlebar hit targets: text must not select or initiate HTML dragging. */
+header [data-tauri-drag-region],header[data-tauri-drag-region]{user-select:none;-webkit-user-select:none;-webkit-user-drag:none;cursor:default}
+header{height:32px;margin-top:0}
+.window-drag{min-width:24px}
+
+/* The native viewport is fixed. Only its inset content scrolls, never the shell. */
+html,body,#root{width:100%;height:100%;min-width:0;overflow:hidden}
+.shell{height:100dvh;min-height:0;display:flex;flex-direction:column}
+.shell>header,.shell>nav{flex-shrink:0}
+.content-scroll{flex:1;min-height:0;min-width:0;overflow:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:#59665e transparent;padding:4px;overflow-wrap:anywhere}
+.content-scroll:focus-visible{outline:1px solid #dfc291;outline-offset:-1px}
+.content-scroll>.notice{margin:0 0 14px}
+.notice button{flex-shrink:0}
+main,main>section{min-width:0}
+@media(max-height:680px){
+ .shell,.login-shell{padding:20px 24px}
+ .shell>header{margin-bottom:12px}
+ .shell>nav{margin-bottom:12px}
+ .login .wave,.login:has(input[aria-invalid="true"]) .wave{height:70px;margin-top:4px;margin-bottom:12px}
+ .login h1{margin:12px 0 16px}
+ .login-options{margin:10px 0 14px}
+ .login>.muted{margin-top:12px}
+}
+@media(max-width:360px){
+ .shell,.login-shell{padding:14px}
+ .login-options{gap:6px}
+ .actions{flex-wrap:wrap}
+ .actions button{flex-basis:140px}
+}
+
+/* Native-sized pages: fit primary workflows without hiding overflow or controls. */
+.shell{padding:20px 28px;border-radius:20px}
+header{height:40px;margin:0 0 12px;flex-shrink:0;user-select:none}
+.brand{font-size:20px}.window-controls button{width:34px;min-height:34px}
+nav{margin-bottom:14px}.content-scroll{padding:2px 4px}
+.login-shell{padding:20px 28px}
+.login .wave,.login:has(input[aria-invalid="true"]) .wave{height:76px;margin:4px auto 18px}
+.login h1{font-size:26px;margin:14px 0 18px}
+.login-options{margin:10px 0 14px}.login>.muted{margin:14px 0 2px;font-size:11px}
+.login input:not([type=checkbox]):focus-visible,dialog input:focus-visible{outline:none;border-color:#d3c8a5;box-shadow:0 0 0 2px #d3c8a52b}
+.page-overview h1{font-size:28px;margin:12px 0 6px}
+.page-overview .wave{height:54px;margin:4px 0 8px}
+.page-overview .balance{margin-top:10px}.page-overview .balance-value{font-size:54px;margin:6px 0}
+.page-overview .balance p{margin:6px 0}.page-overview progress{margin:9px 0}
+.page-overview .metrics{margin:16px 0;padding:14px 0}.page-overview .metrics span{margin-bottom:8px}
+.page-overview section>.muted:last-child{margin:6px 0;font-size:11px}
+.page-settings h1,.page-doctor h1{font-size:26px;margin:4px 0 10px}
+.page-settings h2{font-size:15px;margin:8px 0 4px}
+.page-settings .path-box{padding:9px 12px;font-size:12px;max-height:60px;overflow:auto}
+.page-settings .divider{margin-top:8px}.page-settings .actions{margin:8px 0}
+.page-settings .spark{height:18px;margin:6px 0}
+.page-settings .muted{font-size:11px;line-height:1.5}
+.page-settings .row{min-height:26px}.page-settings p{margin:4px 0}
+.page-doctor .panel{padding:14px;margin:12px 0}.page-doctor .panel p{font-size:12px;line-height:1.6}
+.page-doctor .checklist{margin:12px 0}.page-doctor .checklist li{padding:9px 0;font-size:13px}
+.page-doctor section>.muted{font-size:11px;line-height:1.5}
+.page-report pre{font-size:11px;line-height:1.6;padding:14px;margin:12px 0}
+.page-usage .empty{padding:36px 12px}
+@media(prefers-reduced-motion:reduce){.wave i{transform:none}}
+
+/* Full-data desktop layout, including persistent status banners. */
+.content-scroll>.notice{padding:8px 10px;margin:0 0 8px;font-size:11px;line-height:1.5}
+.page-overview .wave{height:42px;margin:2px 0 6px}
+.page-overview .balance-value{font-size:46px;margin:3px 0}
+.page-overview .metrics{margin:10px 0;padding:10px 0}
+.page-overview .balance p{font-size:11px;line-height:1.4}
+.page-usage h1{font-size:26px;margin:4px 0 8px}
+.page-usage .metrics{margin:12px 0;padding:12px 0}
+.page-usage .usage-chart{height:116px;margin:30px 0 28px}
+.page-usage h2{font-size:15px;margin:10px 0 6px}
+.page-usage .muted{font-size:11px;line-height:1.4;margin:6px 0}
+.model-list .row{padding:7px 0;font-size:12px;gap:8px;min-width:0}
+.model-list .row span:first-child{flex:1;min-width:0;overflow-wrap:anywhere}
+.model-list .row span:not(:first-child){flex-shrink:0}
+.model-pagination{display:flex;align-items:center;justify-content:flex-end;gap:12px;margin-top:8px;font-size:11px}
+.model-pagination button{min-height:28px;padding:4px 10px;font-size:11px}
+.page-doctor .panel{margin:8px 0;padding:10px 12px}
+.page-doctor .checklist li{padding:7px 0}
+
+.model-list .row span:first-child{white-space:nowrap;text-overflow:ellipsis;overflow:hidden}
+.page-usage .chart-column span{max-width:70px;font-size:11px}
+.page-settings .path-box{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* Compact windows keep workflows visible; settings use explicit groups, not clipping. */
+.settings-selector{display:none}
+select{font:inherit;color:inherit;background:#1d2322;border:1px solid var(--line);border-radius:8px;padding:6px}
+select:focus-visible,.path-box:focus-visible{outline:2px solid #dfc291;outline-offset:2px}
+.page-settings .path-box:focus{white-space:normal;max-height:none;overflow-wrap:anywhere}
+@media(max-height:600px){
+ .login:has(input[aria-invalid="true"]) .wave{height:64px}
+ .login-shell:has(.notice) .login .wave{height:24px;margin-bottom:10px}
+ .shell:not(.login-shell){padding:12px 18px}
+ .shell:not(.login-shell)>header{margin-bottom:6px;height:34px}
+ .shell>nav{margin-bottom:6px}
+ .content-scroll{padding:2px}
+ main:not(.page-login) button{min-height:30px;padding:5px 10px;font-size:12px}
+ main:not(.page-login) .text{padding:3px 0}
+ main:not(.page-login) h1{font-size:22px;margin:4px 0 6px}
+ main:not(.page-login) h2{font-size:14px;margin:6px 0}
+ main:not(.page-login) p{font-size:12px;line-height:1.5;margin:6px 0}
+ main:not(.page-login) .full,main:not(.page-login) .actions{margin:6px 0}
+ main:not(.page-login) .spaced{margin:14px 0}
+ main:not(.page-login) .empty{padding:18px 10px}
+ .page-overview .wave{height:18px;margin:0}
+ .page-overview .balance{margin-top:4px}
+ .page-overview .balance-value{font-size:36px;margin:2px 0}
+ .page-overview progress{margin:4px 0}
+ .page-overview .metrics,.page-usage .metrics{margin:6px 0;padding:6px 0}
+ .page-overview .metrics span,.page-usage .metrics span{margin-bottom:4px}
+ .page-overview .metrics strong,.page-usage .metrics strong{font-size:17px}
+ .settings-selector{display:flex;align-items:center;gap:8px;font-size:12px}
+ .settings-group[data-active=false]{display:none}
+ .page-settings .divider{border:0;margin-top:0}
+ .page-settings .memory-value{font-size:18px}
+ .page-settings .path-box{white-space:normal;max-height:none;overflow-wrap:anywhere}
+ .page-doctor .panel{padding:8px 10px;margin:6px 0}
+ .page-doctor .checklist{display:grid;grid-template-columns:1fr 1fr;column-gap:16px;margin:6px 0}
+ .page-doctor .checklist li{font-size:11px;padding:3px 0;gap:6px;align-items:center}
+ .page-doctor .checklist li>span:last-child{flex-shrink:0}
+ .page-report .back{margin-bottom:2px}
+ .page-report pre{font-size:11px;line-height:1.35;padding:8px;margin:4px 0}
+ .page-usage .model-pagination{margin-top:4px}
+ .page-connecting .wave{height:38px;margin:6px 0}
+
+ .page-overview section>.full:not(.text),.page-report section>.full{display:inline-block;width:calc(50% - 4px);vertical-align:top}
+ .page-overview section>.full:not(.text)+.full:not(.text),.page-report section>.full+.full{margin-left:8px}
+ .page-overview .balance{display:grid;grid-template-columns:1fr auto;align-items:center;column-gap:12px}
+ .page-overview .balance>.row:first-child,.page-overview .balance>progress,.page-overview .balance>.row:last-child,.page-overview .balance>.warning{grid-column:1/-1}
+ .page-overview .balance>.muted{max-width:190px;text-align:right}
+ .page-usage .usage-chart{height:24px;margin:22px 0}
+ .page-usage .metrics>div{display:flex;align-items:center;gap:8px}
+ .page-usage .metrics span{margin:0}
+ .page-usage .metrics{padding:4px 0;margin:4px 0}
+ .page-usage .model-list .row{padding:3px 0;font-size:11px}
+ .page-usage .subtitle{font-size:11px}
+ .page-usage .muted{font-size:11px;margin:4px 0}
+}
+
+/* Focused controls and transient success feedback. */
+.website-button{padding:6px 10px;white-space:nowrap;font-size:12px;min-height:32px}
+.memory-card,.account-card{border:1px solid var(--line);border-radius:14px;padding:12px 14px;margin-top:12px;background:rgba(255,255,255,.025)}
+.memory-card .spark{height:28px;margin:8px 0}
+.memory-card .memory-value{font-size:24px}
+.settings-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}
+.settings-actions button{min-height:36px;padding:7px 10px}
+.settings-actions .danger-action{grid-column:1/-1;color:#e7b6a8}
+.close-preference{margin:8px 0;font-size:13px;gap:12px}
+.plan-label{color:#dfc291;font-size:12px}
+.toast{position:absolute;z-index:30;top:76px;left:20px;right:20px;margin:0!important;padding-bottom:17px;box-shadow:0 10px 30px #0006;animation:toast-enter .25s ease-out;overflow:hidden}
+.toast-countdown{position:absolute;bottom:0;left:0;right:0;height:3px;background:#dfc291;transform-origin:left;animation:toast-time 5s linear forwards}
+@keyframes toast-enter{from{opacity:0;transform:translateY(-14px)}to{opacity:1;transform:translateY(0)}}
+@keyframes toast-time{to{transform:scaleX(0)}}
+@media(max-height:600px){.memory-card,.account-card{padding:10px;margin-top:8px}.settings-actions{gap:8px}.toast{top:56px}.website-button{padding:4px 7px}}
+@media(prefers-reduced-motion:reduce){.toast{animation:none}}
+
+/* Keep the complete standard settings page inside its native viewport. */
+.page-settings .memory-card{display:grid;grid-template-columns:1fr auto;column-gap:12px;padding:8px 14px}
+.page-settings .memory-card>.row{grid-column:1/-1;min-height:25px}
+.page-settings .memory-card h2{margin:4px 0}
+.page-settings .memory-card .spark{grid-column:1;grid-row:3;height:16px;margin:4px 0}
+.page-settings .memory-card>.memory-status{grid-column:1;font-size:11px;margin:2px 0}
+.page-settings .memory-card>button{grid-column:2;grid-row:3/5;align-self:center;min-height:32px;padding:5px 12px;font-size:12px}
+.page-settings .settings-actions{grid-template-columns:repeat(3,1fr);gap:6px;margin-top:8px}
+.page-settings .settings-actions .danger-action{grid-column:2/4}
+.page-settings .settings-actions button{min-height:32px;padding:5px 8px;font-size:12px}
+.page-settings .account-card{padding:8px 14px}
+.page-settings .account-card h2{margin:4px 0}
+.page-settings .account-card .row{min-height:26px}
+.page-settings .close-preference{margin:4px 0}
+.page-settings .path-box{padding:8px 12px}
+.page-settings .actions{margin:8px 0}
+@media(max-height:600px){.page-settings .memory-card[data-active=false]{display:none}}
+/* Compact, two-page shell: breathe within the content, not beneath it. */
+header{gap:10px}
+header .website-button,header .announcements-trigger{height:34px;min-height:34px;padding:6px 11px;border:1px solid #d9dfd51c;border-radius:10px;background:#d9dfd508;color:#cdd5cd;font-size:12px;line-height:20px;white-space:nowrap}
+header .website-button:hover,header .announcements-trigger:hover{background:#d9dfd512;border-color:#d9dfd545;color:#f1f4ed}
+header .window-controls{margin-left:4px;gap:4px}
+nav{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}
+.login-shell .page-login{padding-top:0}
+.login-shell .login .wave{height:clamp(76px,calc(100dvh - 360px),180px);margin:4px auto 22px}
+.content-scroll:has(.page-overview){display:flex;flex-direction:column}
+.page-overview{flex:1;display:flex;flex-direction:column}
+.page-overview .overview-dashboard{flex:1;display:flex;flex-direction:column}
+.page-overview .overview-dashboard>.wave{flex:1;min-height:42px;max-height:110px;margin:12px 0}
+.page-overview .overview-dashboard>.balance{padding:14px 0}
+.page-overview .overview-dashboard>.metrics{display:flex;align-items:center;margin-top:auto}
+.page-overview .overview-dashboard>.metrics>div{display:flex;justify-content:space-between;align-items:center;width:100%;gap:16px}
+.page-overview .overview-dashboard>.metrics span{margin:0}
+.page-overview .overview-dashboard>.full{flex-shrink:0}
+@media(max-height:600px){
+ header{gap:8px}
+ .login-shell:has(.notice) .login .wave{height:24px;margin:4px auto 10px}
+ .page-overview .overview-dashboard>.wave{flex:0;min-height:18px;height:18px;margin:0}
+ .page-overview .overview-dashboard>.balance{padding:0}
+ .page-overview .overview-dashboard>.full{display:block;width:100%;margin:4px 0}
+ .page-overview .overview-dashboard>.full+.full{margin-left:0}
+}
+
+
+.overview-actions{display:grid;grid-template-columns:1fr;gap:10px;margin:10px 0 6px}
+.overview-actions>.full{width:100%;margin:0}
+@media(max-height:600px){.overview-actions{grid-template-columns:1fr 1fr;gap:8px;margin:6px 0}.overview-actions>.full{margin:0}}
+
+/* Real process composition, with explicit empty and error states. */
+.page-settings .memory-card{display:block;padding:10px 16px}
+.memory-visual{display:grid;grid-template-columns:120px minmax(0,1fr);gap:24px;align-items:center;min-height:140px;padding:10px 0}
+.memory-ring{position:relative;width:120px;aspect-ratio:1}
+.memory-ring svg{width:100%;height:100%;overflow:visible}
+.memory-ring circle{fill:none;stroke-width:8}
+.memory-ring-track{stroke:#d4dfd113}
+.memory-ring-children{stroke:#71847a}
+.memory-ring-app{stroke:#dfcca3;transition:stroke-dasharray .5s ease}
+.memory-ring-label{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;align-items:center;gap:5px}
+.memory-ring-label strong{font-size:24px;font-weight:500;font-variant-numeric:tabular-nums}
+.memory-ring-label span,.memory-caption{color:var(--muted);font-size:11px}
+.memory-legend{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:12px 0;font-size:12px}
+.memory-legend>span{display:flex;align-items:center;gap:7px}
+.memory-legend i{width:6px;height:6px;border-radius:50%;background:#dfcca3}
+.memory-legend.children i{background:#71847a}
+.memory-legend strong{font-weight:500;white-space:nowrap}
+.memory-breakdown p{font-size:11px!important}
+.memory-trend{height:22px;display:flex;align-items:flex-end;gap:3px;margin-top:12px}
+.memory-trend i{flex:1;max-width:12px;background:#a3b2a4;border-radius:2px 2px 0 0;opacity:.6}
+.memory-footer{display:flex;align-items:center;justify-content:space-between;gap:8px;border-top:1px solid var(--line);padding-top:10px}
+.memory-footer .memory-status{font-size:11px;margin:0;flex:1}
+.memory-controls{display:flex;align-items:center;gap:12px;flex-shrink:0}
+.memory-controls button{font-size:12px;padding:6px 10px;min-height:30px}
+@media(max-height:600px){.page-settings .memory-card{padding:10px 12px}.memory-visual{grid-template-columns:120px minmax(0,1fr);gap:16px;min-height:136px;padding:6px 0}.memory-ring{width:120px}.memory-ring-label strong{font-size:20px}.memory-footer{padding-top:6px}.memory-controls{gap:6px}}
+@media(prefers-reduced-motion:reduce){.memory-ring-app{transition:none}}
+
+@media(min-height:601px){.content-scroll:has(>.notice) .page-settings>section>.row:first-child{display:none}}
+.content-scroll:has(>.notice) .page-settings .memory-card{padding-top:10px;padding-bottom:10px}

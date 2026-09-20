@@ -38,6 +38,7 @@ launch.log
 
 # Visual Regression Test Artifacts & Screen Captures
 *.png
+!crates/desktop-host/icons/icon.png
 *.jpg
 *.jpeg
 *.svg.bak

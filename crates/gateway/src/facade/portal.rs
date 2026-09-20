@@ -330,7 +330,14 @@ impl FacadeHandler for PortalActivateHandler {
                     }
                     card.activation_duration_secs.unwrap_or(30 * 86_400)
                 }
-                CardStatus::Active => 0,
+                CardStatus::Active => {
+                    // Active is a stored lifecycle state, not proof that the card
+                    // is still valid. Check even when no device was supplied.
+                    if card.check_active(now).is_err() {
+                        return portal_deny_response();
+                    }
+                    0
+                }
                 _ => return portal_deny_response(),
             };
 

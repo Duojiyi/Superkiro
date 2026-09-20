@@ -1,0 +1,25 @@
+[Unit]
+Description=Superkiro authenticated snapshot backup
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+User=root
+UMask=0077
+Environment=ADMIN_ORIGIN=https://kiro.rent
+Environment=RETENTION_DAYS=7
+ExecStart=/usr/bin/python3 /opt/kiro-byok/deploy/backup/server-backup.py
+Restart=on-failure
+RestartSec=40
+TimeoutStartSec=180
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/kiro-byok/backups
+
+[Install]
+WantedBy=multi-user.target

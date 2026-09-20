@@ -177,6 +177,7 @@ async fn test_admin_card_adjust_balance() {
     let adjust_req = Request::builder()
         .method(Method::POST)
         .uri("/api/v1/admin/cards/adjust")
+        .header("idempotency-key", "test-admin-adjust-01")
         .header("x-admin-key", TEST_ADMIN_KEY)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(
@@ -405,6 +406,7 @@ async fn test_admin_session_single_revoke_vs_revoke_all() {
 #[tokio::test]
 async fn test_admin_batch_cards_and_provider_toggle() {
     let (billing, app) = setup_admin_app();
+    billing.set_master_kek(billing::MasterKek::from_bytes([37; 32]));
 
     // 1. POST /api/v1/admin/cards/batch
     let batch_req = Request::builder()
@@ -425,6 +427,7 @@ async fn test_admin_batch_cards_and_provider_toggle() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["cache-control"], "no-store");
     let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
         .await
         .unwrap();
@@ -437,7 +440,11 @@ async fn test_admin_batch_cards_and_provider_toggle() {
     // Verify all 5 were persisted into billing
     for card in cards {
         let card_id = card["cardId"].as_str().unwrap();
-        assert!(billing.get_card(card_id).is_some());
+        assert!(billing.get_card(card_id).unwrap().code_encrypted.is_some());
+        assert_eq!(
+            billing.reveal_card_code(card_id).unwrap().as_deref(),
+            card["rawCode"].as_str()
+        );
     }
 
     // 2. GET /api/v1/admin/providers
@@ -541,6 +548,7 @@ async fn commercial_publication_requires_auth_and_fresh_revision() {
 #[tokio::test]
 async fn tier_issuance_validates_catalog_group_and_single_device() {
     let (billing, app) = setup_admin_app();
+    billing.set_master_kek(billing::MasterKek::from_bytes([37; 32]));
     for body in [
         json!({"count":1,"templateId":"unknown"}),
         json!({"count":1,"maxDevices":2}),

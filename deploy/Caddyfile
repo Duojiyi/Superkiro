@@ -1,0 +1,75 @@
+# ==============================================================================
+# Single-Server Caddyfile (Automatic TLS + Admin UI + Zero-Config Reverse Proxy)
+# ==============================================================================
+
+(kiro_routing) {
+    # 0. 规范化 /admin 路径跳转
+    redir /admin /admin/ 308
+
+    # 1. 运营管理后台前端界面 (Cloud Management Admin Console SPA)
+    @portal path /portal /portal/
+    handle @portal {
+        root * /app/portal-ui
+        rewrite * /index.html
+        file_server
+        header Cache-Control "no-store"
+        header Referrer-Policy "no-referrer"
+    }
+
+    handle_path /admin/* {
+        # Public login shell only; never add a Basic challenge here.
+        # Gateway requires ADMIN_BROWSER_LOGIN=true + ADMIN_ORIGIN + ADMIN_PASSWORD_HASH
+        # and fails closed when browser authentication is not configured.
+        root * /app/admin-ui
+        try_files {path} /index.html
+        file_server
+        header Cache-Control "no-store, no-cache, must-revalidate"
+        header Pragma "no-cache"
+    }
+
+    # 2. 网关主服务反向代理 (Kiro Gateway + Self-Service Portal /portal + Kiro IDE Facades)
+    handle {
+        reverse_proxy gateway:19820 {
+            # 保持连接与流式响应保活 (Event-Stream / SSE)
+            flush_interval -1
+            
+            # 传递真实客户端来源 IP
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+
+    # 安全响应头与传输压缩
+    encode gzip zstd
+    header {
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Frame-Options "DENY"
+        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'"
+        Permissions-Policy "camera=(), microphone=(), geolocation=()"
+    }
+
+    # 访问日志输出
+    log {
+        output stdout
+        format console
+    }
+}
+
+# 标准 HTTP (Port 80): 生产强制重定向至 HTTPS，仅保留 /healthz 探测 (P1-04)
+:80 {
+    @not_healthz {
+        not path /healthz
+    }
+    redir @not_healthz https://{host}{uri} permanent
+    handle /healthz {
+        reverse_proxy gateway:19820
+    }
+}
+
+# 绑定域名访问 (自动申请与管理 Let's Encrypt TLS 证书)
+{$DOMAIN:chimerahub.org} {
+    import kiro_routing
+}

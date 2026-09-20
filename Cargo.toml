@@ -5,6 +5,7 @@ members = [
     "crates/gateway",
     "crates/billing",
     "crates/patch-engine",
+    "crates/desktop-host",
 ]
 
 [workspace.package]

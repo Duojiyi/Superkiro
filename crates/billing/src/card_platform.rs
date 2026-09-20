@@ -7,7 +7,6 @@
 
 use crate::card::CardStatus;
 use crate::engine::BillingEngine;
-use crate::generator::generate_card;
 use crate::template::CardTemplate;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -178,9 +177,13 @@ impl CardPlatformManager {
             .fulfill_card_order(&req.order_id, &fingerprint, || {
                 let mut dispensed = Vec::with_capacity(req.count);
                 let mut cards = Vec::with_capacity(req.count);
-                for _ in 0..req.count {
-                    let generated = generate_card(template, req.note.as_deref(), now_secs)
-                        .map_err(|e| crate::engine::BillingError::InvalidState(e.to_string()))?;
+                for mut generated in billing.generate_recoverable_cards(
+                    template,
+                    req.count,
+                    req.note.as_deref(),
+                    now_secs,
+                )? {
+                    generated.card.note = req.note.clone();
                     dispensed.push(DispensedCardItem {
                         card_id: generated.card.id.clone(),
                         raw_code: generated.raw_code,

@@ -53,14 +53,14 @@ export default function ProviderKeyEditor({ selectedKey, onSaved }: {selectedKey
       <details><summary>新增或更新供应商渠道</summary><div className="space-y-2 pt-2">
         <label className="block">上游地址<input type="url" className={cls} value={baseUrl} onChange={e=>setBaseUrl(e.target.value)} placeholder="https://api.example.com" /></label>
         <label className="block">接口格式<select className={cls} value={format} onChange={e=>setFormat(e.target.value)}><option value="anthropic">Anthropic</option><option value="openai">OpenAI</option></select></label>
-        <button className="p-2 bg-[#EFF1EF] rounded" onClick={()=>void createProvider()}>使用下方密钥与模型草稿导入渠道</button>
+        <button className="p-2 bg-[#EFF1EF] rounded" disabled={!provider.trim() || !secret || !baseUrl.trim()} onClick={()=>void createProvider()}>使用下方密钥与模型草稿导入渠道</button>
       </div></details>
       <label className="block">Key ID<input className={cls} value={keyId} onChange={e=>setKeyId(e.target.value)} /></label>
       <label className="block">API Key（新增必填，更新可留空）<input type="password" autoComplete="new-password" className={cls} value={secret} onChange={e=>setSecret(e.target.value)} /></label>
       <label className="block">允许模型（每行一个精确 ID）<textarea rows={6} className={cls} value={models} onChange={e=>setModels(e.target.value)} /></label>
       <label className="block">权重<input type="number" min={1} max={1000} className={cls} value={weight} onChange={e=>setWeight(Number(e.target.value))} /></label>
       <label><input type="checkbox" checked={enabled} onChange={e=>setEnabled(e.target.checked)} /> 启用</label>
-      <div className="flex gap-3"><button className="p-2 bg-[#EFF1EF] rounded" onClick={()=>void act('discover')}>获取模型草稿</button><button className="p-2 bg-[#B94B39] text-white rounded" onClick={()=>void act('save')}>确认保存权限</button></div>
+      <div className="flex gap-3"><button className="p-2 bg-[#EFF1EF] rounded" disabled={!provider.trim() || !keyId.trim()} onClick={()=>void act('discover')}>获取模型草稿</button><button className="p-2 bg-[#B94B39] text-white rounded" disabled={!provider.trim() || !keyId.trim() || !Number.isInteger(weight) || weight < 1 || weight > 1000} onClick={()=>void act('save')}>确认保存权限</button></div>
     </fieldset>
     <p role="status" className="text-[#A87029] text-sm">{busy ? '处理中…' : message}</p>
   </section><section className="notice-panel"><h3>发现结果{discovery ? ` · ${discovery.key}` : ''}</h3><p className="muted">发现仅生成候选列表，不证明模型可调用，不自动修改已保存权限。</p>{discovery ? <><p>来源 Key：{discovery.key} · {discovery.models.length} 个候选模型</p><p>{discovery.incomplete ? '只取得第一页，目录完整性尚未确认。' : '已取得上游返回的模型目录。'}</p><ul>{discovery.models.map(model => <li key={model}>{model}</li>)}</ul><div className="actions"><button className="primary" onClick={() => {setModels(discovery.models.join('\n')); setMessage('已加入未保存的权限草稿，请核对后确认保存。');}}>填入权限草稿</button></div></> : <p className="empty-state">选择或填写 Key，再获取候选模型。</p>}</section></div>;

@@ -89,3 +89,25 @@ pre {max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere;}
   .provider-heading button {white-space: nowrap;}
   .request-chart {gap: 4px;}
 }
+
+/* Authentication is a separate page, never an overlay above admin content. */
+.auth-page {color:#23272b; min-height:100dvh; display:grid; place-items:center; padding:24px; background:#f6f7f8;}
+.auth-card {width:100%; max-width:360px; padding:32px; border:1px solid #e5e8e5; border-radius:16px; background:white;}
+.auth-brand {color:#7b8388; font-size:13px; margin-bottom:8px;}
+.auth-card h1 {font-size:24px; font-weight:650; margin:0 0 28px;}
+.auth-card form,.auth-card label {display:grid; gap:10px;}
+.auth-card form {gap:20px;}
+.auth-card input {width:100%; min-height:42px; padding:8px 10px; border:1px solid #d5d9d5; border-radius:6px;}
+.auth-card button {min-height:42px;}
+.auth-card [role=alert] {color:#a33729; font-size:13px; overflow-wrap:anywhere;}
+
+/* Dialog content must remain usable on narrow screens and with long card IDs. */
+[role="dialog"] > div, [role="dialog"] > section {min-width:0; max-width:100%; max-height:90dvh; overflow:auto; overflow-wrap:anywhere;}
+[role="dialog"] input, [role="dialog"] select, [role="dialog"] textarea {max-width:100%;}
+[role="dialog"] .flex {flex-wrap:wrap;}
+@media(max-width:700px) {
+  .fixed.inset-0 {padding:16px;}
+  .fixed.inset-0 > div, .fixed.inset-0 > section {padding:20px;}
+  .metric-grid {grid-template-columns:minmax(0,1fr);}
+  .topbar > div {flex-wrap:wrap;}
+}

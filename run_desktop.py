@@ -25,7 +25,7 @@ SESSION_TOKEN = secrets.token_hex(16)
 LAST_HEARTBEAT = time.time()
 HEARTBEAT_LOCK = threading.Lock()
 SERVER_SHUTDOWN = threading.Event()
-BUILD_MODE = "debug"
+BUILD_MODE = "release"
 
 def desktop_preferences_path():
     if sys.platform == "win32":
@@ -52,18 +52,36 @@ def desktop_environment():
 
 def run_patch_cli(args: list[str], payload: dict | None = None) -> tuple[int, str]:
     binary = 'patch-cli.exe' if sys.platform == 'win32' else 'patch-cli'
-    target_bin = os.path.join(BASE_DIR, 'bin', binary) if getattr(sys, 'frozen', False) else os.path.join(BASE_DIR, 'target', BUILD_MODE, binary)
+    target_root = os.environ.get('CARGO_TARGET_DIR', 'target')
+    if not os.path.isabs(target_root):
+        target_root = os.path.join(BASE_DIR, target_root)
+    target_bin = os.path.join(BASE_DIR, 'bin', binary) if getattr(sys, 'frozen', False) else os.path.join(target_root, BUILD_MODE, binary)
     if os.path.isfile(target_bin):
         cmd = [target_bin] + args
     else:
-        return 1, json.dumps({'success': False, 'error': 'Build patch-cli first: cargo build -p patch-engine --bin patch-cli'})
+        hint = 'Reinstall the desktop package; bundled patch-cli is missing.' if getattr(sys, 'frozen', False) else 'Build patch-cli first: cargo build ' + ('--release ' if BUILD_MODE == 'release' else '') + '-p patch-engine --bin patch-cli'
+        return 1, json.dumps({'success': False, 'error': f'{hint} Expected: {target_bin}'})
     try:
         res = subprocess.run(cmd, input=json.dumps(payload) if payload is not None else None,
                              capture_output=True, text=True, encoding='utf-8', cwd=BASE_DIR,
                              timeout=120, env=desktop_environment(), creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
-    except (OSError, subprocess.TimeoutExpired):
-        return 1, json.dumps({'success': False, 'error': 'Desktop command failed or timed out; inspect recovery state before retrying'})
-    out = res.stdout.strip() or res.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return 1, json.dumps({'success': False, 'error': 'Desktop command timed out after 120s; inspect recovery state before retrying'})
+    except OSError as error:
+        return 1, json.dumps({'success': False, 'error': f'Cannot start {target_bin}: {error}'})
+    out = res.stdout.strip()
+    if res.returncode != 0:
+        try:
+            failure = json.loads(out)
+        except ValueError:
+            failure = None
+        if not isinstance(failure, dict) or not failure.get('error'):
+            detail = res.stderr.strip() or out or 'No diagnostic output'
+            # Never reflect stdin credentials, including when a helper echoes them.
+            for key, value in (payload or {}).items():
+                if isinstance(value, str) and value:
+                    detail = detail.replace(value, '[redacted]')
+            out = json.dumps({'success': False, 'error': f'patch-cli exited {res.returncode}: {detail}'})
     return res.returncode, out
 
 def verify_card(gateway: str, card: str) -> dict:
@@ -501,7 +519,7 @@ class DesktopWindow:
 
 def main():
     global LAST_HEARTBEAT, BUILD_MODE
-    BUILD_MODE = "debug" if "--dev" in sys.argv else "release"
+    BUILD_MODE = "release" if "--dev" in sys.argv else "release"
     try:
         import webview
     except ImportError:

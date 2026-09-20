@@ -3,7 +3,8 @@
 //! Spec §2.1, §2.5, §9, §14.5, P0-2, P0-3.
 
 use patch_engine::patch::{
-    get_launcher_env, ExtensionPatcher, PatchStatus, PATCH_MARKER_V1, RUNTIME_ENDPOINT_NEEDLE,
+    get_launcher_env, ExtensionPatcher, PatchError, PatchStatus, PATCH_MARKER_V1,
+    RUNTIME_ENDPOINT_NEEDLE,
 };
 use patch_engine::settings::SettingsManager;
 use patch_engine::snapshot::SnapshotManager;
@@ -173,8 +174,11 @@ fn test_extension_patcher_lifecycle() {
     // Now backup exists but file lacks marker -> UpgradeDetected
     assert_eq!(patcher.status(), PatchStatus::UpgradeDetected);
 
-    // Never overwrite an upgraded bundle with the previous version.
-    assert!(!patcher.restore().unwrap());
+    // An unknown upgraded digest must fail closed, preserving recovery evidence.
+    assert!(matches!(
+        patcher.restore(),
+        Err(PatchError::ExtensionChanged)
+    ));
     assert_eq!(patcher.status(), PatchStatus::UpgradeDetected);
     assert!(patcher.backup_path().exists());
     assert_eq!(fs::read_to_string(&ext_file).unwrap(), upgraded_bundle);

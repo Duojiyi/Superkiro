@@ -1,0 +1,10 @@
+{
+  "profiles": [
+    {
+      "profileArn": "arn:aws:sso:::profile/kiro-byok-profile",
+      "profileName": "KiroBYOKProfile",
+      "status": "ACTIVE",
+      "isDefault": true
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+[package]
+name = "desktop-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "Superkiro"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+patch-engine = { path = "../patch-engine" }
+serde_json.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
+tauri-plugin-single-instance = "=2.4.4"
+keyring = { version = "3", features = ["windows-native", "apple-native"] }
+rfd = "0.15"
+open = "5"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

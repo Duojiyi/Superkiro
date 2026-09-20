@@ -39,14 +39,20 @@ fn legacy_entitlement_is_not_guessed_from_balance() {
 }
 
 #[test]
-fn single_device_rebind_and_cross_card_conflict() {
+fn single_device_per_card_allows_same_device_on_other_cards() {
     let engine = BillingEngine::new();
     let mut card = Card::new("a", "g", 1_000_000_000);
     card.max_devices = 3; // old capacity does not enable extra devices
     engine.upsert_card(card);
     engine.upsert_card(Card::new("b", "g", 1_000_000_000));
     engine.bind_device("a", "first", 1).unwrap();
-    assert!(engine.bind_device("b", "first", 2).is_err());
+    engine.bind_device("b", "first", 2).unwrap();
+    assert_eq!(engine.get_card("b").unwrap().bound_devices, vec!["first"]);
+    assert!(matches!(
+        engine.bind_device("a", "second", 2),
+        Err(billing::BillingError::DeviceAlreadyBound)
+    ));
+    engine.unbind_device("a", "first").unwrap();
     engine.bind_device("a", "second", 2).unwrap();
     let card = engine.get_card("a").unwrap();
     assert_eq!(card.max_devices, 1);

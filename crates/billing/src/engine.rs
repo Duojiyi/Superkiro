@@ -34,6 +34,9 @@ pub enum BillingError {
     #[error("Reservation '{0}' has already been released")]
     ReservationAlreadyReleased(String),
 
+    #[error("Card is already bound to another device; unbind it on the portal before logging in on a new device")]
+    DeviceAlreadyBound,
+
     #[error("Device rebind limit reached ({current}/{max})")]
     RebindLimitExceeded { current: u32, max: u32 },
 
@@ -122,6 +125,8 @@ use crate::observability::{
 #[derive(Debug, Clone)]
 pub struct BillingEngine {
     cards: Arc<RwLock<HashMap<String, Card>>>,
+    consumed_refresh_tokens: Arc<RwLock<HashMap<String, u64>>>,
+    active_reservations: Arc<Mutex<HashMap<String, usize>>>,
     reservations: Arc<RwLock<HashMap<String, CreditReservation>>>,
     ledger: Arc<RwLock<Vec<LedgerEntry>>>,
     rates: Arc<RwLock<HashMap<String, PricingRates>>>,
@@ -165,6 +170,25 @@ pub struct BillingEngine {
     require_anchor: Arc<RwLock<bool>>,
 }
 
+/// Request-owned protection against orphan reclamation.
+#[derive(Debug)]
+pub struct ReservationLease {
+    active: Arc<Mutex<HashMap<String, usize>>>,
+    invocation_id: String,
+}
+
+impl Drop for ReservationLease {
+    fn drop(&mut self) {
+        let mut active = self.active.lock().unwrap();
+        if let Some(count) = active.get_mut(&self.invocation_id) {
+            *count -= 1;
+            if *count == 0 {
+                active.remove(&self.invocation_id);
+            }
+        }
+    }
+}
+
 const SNAPSHOT_VERSION: u32 = 2;
 const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
 
@@ -194,6 +218,8 @@ pub struct BillingSnapshot {
     #[serde(default)]
     pub previous_checksum: Option<String>,
     pub cards: HashMap<String, Card>,
+    #[serde(default)]
+    pub consumed_refresh_tokens: HashMap<String, u64>,
     #[serde(default)]
     pub reservations: HashMap<String, CreditReservation>,
     pub ledger: Vec<LedgerEntry>,
@@ -425,6 +451,54 @@ impl Default for BillingEngine {
     }
 }
 
+/// Runtime retry schedule. Durable pending intents remain the source of truth.
+/// Restart resets delays so recovery begins immediately; retries never reprice usage.
+#[derive(Default)]
+pub struct PendingSettlementRecovery {
+    retries: HashMap<String, (u64, u64)>,
+}
+
+impl PendingSettlementRecovery {
+    /// At most 64 attempts per tick, with 30s exponential backoff capped at 5 minutes.
+    /// Errors are returned to the runtime for alerting, never discarded or refunded.
+    pub fn tick(
+        &mut self,
+        engine: &BillingEngine,
+        now_secs: u64,
+    ) -> Vec<(String, Result<LedgerEntry, BillingError>)> {
+        let ids: std::collections::HashSet<_> = engine
+            .pending_settlements
+            .read()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        self.retries.retain(|id, _| ids.contains(id));
+        let mut due: Vec<_> = ids
+            .into_iter()
+            .filter_map(|id| {
+                let (next, delay) = self.retries.get(&id).copied().unwrap_or((0, 0));
+                (next <= now_secs).then_some((next, id, delay))
+            })
+            .collect();
+        due.sort();
+        due.into_iter()
+            .take(64)
+            .map(|(_, id, delay)| {
+                let result = engine.retry_pending_settlement(&id);
+                if result.is_ok() {
+                    self.retries.remove(&id);
+                } else {
+                    let delay = delay.saturating_mul(2).clamp(30, 300);
+                    self.retries
+                        .insert(id.clone(), (now_secs.saturating_add(delay), delay));
+                }
+                (id, result)
+            })
+            .collect()
+    }
+}
+
 impl BillingEngine {
     pub fn new() -> Self {
         let groups = Arc::new(RwLock::new(HashMap::new()));
@@ -445,6 +519,8 @@ impl BillingEngine {
 
         Self {
             cards: Arc::new(RwLock::new(HashMap::new())),
+            consumed_refresh_tokens: Arc::new(RwLock::new(HashMap::new())),
+            active_reservations: Arc::new(Mutex::new(HashMap::new())),
             reservations: Arc::new(RwLock::new(HashMap::new())),
             ledger: Arc::new(RwLock::new(Vec::new())),
             rates: Arc::new(RwLock::new(HashMap::new())),
@@ -489,6 +565,59 @@ impl BillingEngine {
         }
     }
 
+    /// Hold before reserving, and keep alive through stream settlement. The janitor
+    /// only reclaims orphans; a live request must not expire during backpressure.
+    /// This process-local ownership is intentionally not restored after a crash.
+    pub fn protect_reservation(&self, invocation_id: &str) -> ReservationLease {
+        let _state_guard = self.state_lock.write().unwrap();
+        *self
+            .active_reservations
+            .lock()
+            .unwrap()
+            .entry(invocation_id.to_string())
+            .or_default() += 1;
+        ReservationLease {
+            active: self.active_reservations.clone(),
+            invocation_id: invocation_id.to_string(),
+        }
+    }
+
+    /// Consume a refresh JTI in the same durable transaction as billing state.
+    pub fn consume_refresh_token(
+        &self,
+        jti: &str,
+        expires: u64,
+        now: u64,
+    ) -> Result<(), BillingError> {
+        let _state_guard = self.state_lock.write().unwrap();
+        if expires <= now || jti.is_empty() || jti.len() > 256 {
+            return Err(BillingError::InvalidState(
+                "expired or empty refresh token".into(),
+            ));
+        }
+        let mut candidate = self.export_snapshot_locked(
+            self.snapshot_sequence
+                .load(Ordering::Acquire)
+                .saturating_add(1),
+            self.last_snapshot_checksum.read().unwrap().clone(),
+        );
+        candidate
+            .consumed_refresh_tokens
+            .retain(|_, exp| *exp > now);
+        if candidate.consumed_refresh_tokens.contains_key(jti) {
+            return Err(BillingError::InvalidState(
+                "refresh token already used".into(),
+            ));
+        }
+        candidate
+            .consumed_refresh_tokens
+            .insert(jti.to_string(), expires);
+        self.commit_candidate_snapshot(&candidate, || {
+            *self.consumed_refresh_tokens.write().unwrap() =
+                candidate.consumed_refresh_tokens.clone();
+        })
+    }
+
     /// Export engine state as a serializable snapshot.
     pub fn export_snapshot(&self) -> BillingSnapshot {
         let _state_guard = self.state_lock.read().unwrap();
@@ -514,6 +643,7 @@ impl BillingEngine {
             sequence,
             previous_checksum,
             cards: self.cards.read().unwrap().clone(),
+            consumed_refresh_tokens: self.consumed_refresh_tokens.read().unwrap().clone(),
             reservations: self.reservations.read().unwrap().clone(),
             ledger: self.ledger.read().unwrap().clone(),
             rates: self.rates.read().unwrap().clone(),
@@ -559,6 +689,7 @@ impl BillingEngine {
                     .saturating_add(reservation.reserved_micro_credits);
             }
         }
+        *self.consumed_refresh_tokens.write().unwrap() = snapshot.consumed_refresh_tokens;
         *self.cards.write().unwrap() = cards;
         *self.reservations.write().unwrap() = reservations;
         *self.ledger.write().unwrap() = snapshot.ledger;
@@ -1161,6 +1292,21 @@ impl BillingEngine {
     where
         I: IntoIterator<Item = Card>,
     {
+        self.write_cards_checked(cards, false)
+    }
+
+    /// Issuance is insert-only: a collision must never replace an existing balance.
+    pub fn insert_new_cards_checked<I>(&self, cards: I) -> Result<(), BillingError>
+    where
+        I: IntoIterator<Item = Card>,
+    {
+        self.write_cards_checked(cards, true)
+    }
+
+    fn write_cards_checked<I>(&self, cards: I, insert_only: bool) -> Result<(), BillingError>
+    where
+        I: IntoIterator<Item = Card>,
+    {
         let cards_vec: Vec<Card> = cards.into_iter().collect();
         let _state_guard = self.state_lock.write().unwrap();
         let sequence = self
@@ -1171,6 +1317,11 @@ impl BillingEngine {
         let mut candidate = self.export_snapshot_locked(sequence, previous_checksum);
 
         for card in &cards_vec {
+            if insert_only && candidate.cards.contains_key(&card.id) {
+                return Err(BillingError::InvalidState(
+                    "Card ID collision; batch not issued".into(),
+                ));
+            }
             candidate.cards.insert(card.id.clone(), card.clone());
         }
 
@@ -1182,26 +1333,94 @@ impl BillingEngine {
         })
     }
 
+    /// Issue recoverable cards atomically; missing KEK never falls back to plaintext.
+    pub fn issue_cards(
+        &self,
+        template: &crate::template::CardTemplate,
+        count: usize,
+        note: Option<&str>,
+        now_secs: u64,
+    ) -> Result<Vec<crate::generator::GeneratedCard>, BillingError> {
+        let generated = self.generate_recoverable_cards(template, count, note, now_secs)?;
+        self.insert_new_cards_checked(generated.iter().map(|item| item.card.clone()))?;
+        Ok(generated)
+    }
+
+    pub(crate) fn generate_recoverable_cards(
+        &self,
+        template: &crate::template::CardTemplate,
+        count: usize,
+        note: Option<&str>,
+        now_secs: u64,
+    ) -> Result<Vec<crate::generator::GeneratedCard>, BillingError> {
+        let kek = self.master_kek().ok_or_else(|| {
+            BillingError::InvalidState("MasterKek required for card issuance".into())
+        })?;
+        let mut generated = crate::generator::generate_batch(template, count, note, now_secs)?;
+        for item in &mut generated {
+            // Authenticated identity and purpose prevent ciphertext substitution.
+            let payload = serde_json::to_string(&(
+                "card-code-v1",
+                &item.card.id,
+                &item.card.code_hash,
+                &item.raw_code,
+            ))
+            .map_err(|_| BillingError::InvalidState("Card encryption failed".into()))?;
+            item.card.code_encrypted = Some(
+                kek.encrypt(&payload)
+                    .map_err(|_| BillingError::InvalidState("Card encryption failed".into()))?,
+            );
+        }
+        Ok(generated)
+    }
+
+    /// Legacy cards have no recovery material. Never return unverified plaintext.
+    pub fn reveal_card_code(&self, card_id: &str) -> Result<Option<String>, BillingError> {
+        let card = self
+            .get_card(card_id)
+            .ok_or_else(|| BillingError::CardNotFound(card_id.to_owned()))?;
+        let Some(ciphertext) = card.code_encrypted.as_deref() else {
+            return Ok(None);
+        };
+        let failed = || BillingError::InvalidState("Card code recovery failed".into());
+        // The KEK wire format is ASCII hex; reject malformed UTF-8 text before decoding.
+        if !ciphertext.is_ascii() {
+            return Err(failed());
+        }
+        let kek = self.master_kek().ok_or_else(failed)?;
+        let plaintext = kek.decrypt(ciphertext).map_err(|_| failed())?;
+        let (purpose, id, hash, raw): (String, String, String, String) =
+            serde_json::from_str(&plaintext).map_err(|_| failed())?;
+        if purpose != "card-code-v1"
+            || id != card.id
+            || hash != card.code_hash
+            || !crate::card::constant_time_eq(
+                crate::card::hash_card_code(&raw).as_bytes(),
+                card.code_hash.as_bytes(),
+            )
+        {
+            return Err(failed());
+        }
+        Ok(Some(raw))
+    }
+
     /// Get card snapshot.
     pub fn get_card(&self, card_id: &str) -> Option<Card> {
         let r = self.cards.read().unwrap();
         r.get(card_id).cloned()
     }
 
-    /// Find a card by its secret code or stored SHA-256 hash.
+    /// Find a card by its raw secret only. Stored hashes are not credentials.
     /// Card IDs are intentionally excluded so public authentication cannot be
     /// performed with an identifier that is visible in normal API responses.
-    pub fn find_card_by_secret(&self, raw_or_hash: &str) -> Option<Card> {
-        if raw_or_hash.trim().is_empty() {
+    pub fn find_card_by_secret(&self, raw_secret: &str) -> Option<Card> {
+        if raw_secret.trim().is_empty() {
             return None;
         }
-        let hash = crate::card::hash_card_code(raw_or_hash);
+        let hash = crate::card::hash_card_code(raw_secret);
         let r = self.cards.read().unwrap();
         r.values()
-            .find(|c| {
-                crate::card::constant_time_eq(c.code_hash.as_bytes(), hash.as_bytes())
-                    || crate::card::constant_time_eq(c.code_hash.as_bytes(), raw_or_hash.as_bytes())
-            })
+            .find(|c| crate::card::constant_time_eq(c.code_hash.as_bytes(), hash.as_bytes()))
             .cloned()
     }
 
@@ -1210,7 +1429,17 @@ impl BillingEngine {
     pub fn find_card_by_code_or_id(&self, raw_or_hash_or_id: &str) -> Option<Card> {
         self.find_card_by_secret(raw_or_hash_or_id).or_else(|| {
             let cards = self.cards.read().unwrap();
-            cards.get(raw_or_hash_or_id).cloned()
+            cards.get(raw_or_hash_or_id).cloned().or_else(|| {
+                cards
+                    .values()
+                    .find(|c| {
+                        crate::card::constant_time_eq(
+                            c.code_hash.as_bytes(),
+                            raw_or_hash_or_id.as_bytes(),
+                        )
+                    })
+                    .cloned()
+            })
         })
     }
 
@@ -1282,24 +1511,14 @@ impl BillingEngine {
         let previous_checksum = self.last_snapshot_checksum.read().unwrap().clone();
         let mut candidate = self.export_snapshot_locked(sequence, previous_checksum);
 
-        let device = device_fp.unwrap_or("").trim();
-        if !device.is_empty()
-            && candidate
-                .cards
-                .values()
-                .any(|c| c.id != card_id && c.bound_devices.iter().any(|d| d == device))
-        {
-            return Err(BillingError::InvalidState(
-                "device already bound to another card; explicitly unbind first".into(),
-            ));
-        }
+        // A card has one device; a device may use independently purchased cards.
         let card = candidate
             .cards
             .get_mut(card_id)
             .ok_or_else(|| BillingError::CardNotFound(card_id.to_string()))?;
         card.activate(now_secs, duration_secs)?;
         if let Some(device) = device_fp.filter(|d| !d.trim().is_empty()) {
-            bind_device_locked(card, device.trim(), now_secs)?;
+            bind_device_locked(card, device.trim())?;
         }
         let updated_card = card.clone();
 
@@ -1340,7 +1559,34 @@ impl BillingEngine {
         I: IntoIterator<Item = Provider>,
         K: IntoIterator<Item = ProviderKey>,
     {
-        let providers: Vec<Provider> = providers.into_iter().collect();
+        self.upsert_provider_batch(providers, keys, false)
+            .map(|_| ())
+    }
+
+    /// Import preserves existing routing ownership atomically with credential updates.
+    pub fn import_providers_checked<I, K>(
+        &self,
+        providers: I,
+        keys: K,
+    ) -> Result<Vec<Provider>, BillingError>
+    where
+        I: IntoIterator<Item = Provider>,
+        K: IntoIterator<Item = ProviderKey>,
+    {
+        self.upsert_provider_batch(providers, keys, true)
+    }
+
+    fn upsert_provider_batch<I, K>(
+        &self,
+        providers: I,
+        keys: K,
+        preserve_group: bool,
+    ) -> Result<Vec<Provider>, BillingError>
+    where
+        I: IntoIterator<Item = Provider>,
+        K: IntoIterator<Item = ProviderKey>,
+    {
+        let mut providers: Vec<Provider> = providers.into_iter().collect();
         let mut keys: Vec<ProviderKey> = keys.into_iter().collect();
         let kek = if keys.is_empty() {
             None
@@ -1367,7 +1613,12 @@ impl BillingEngine {
         let previous_checksum = self.last_snapshot_checksum.read().unwrap().clone();
         let mut candidate = self.export_snapshot_locked(sequence, previous_checksum);
 
-        for provider in &providers {
+        for provider in &mut providers {
+            if preserve_group {
+                if let Some(existing) = candidate.providers.get(&provider.id) {
+                    provider.group_id = existing.group_id.clone();
+                }
+            }
             candidate
                 .providers
                 .insert(provider.id.clone(), provider.clone());
@@ -1376,7 +1627,7 @@ impl BillingEngine {
             candidate.provider_keys.insert(key.id.clone(), key.clone());
         }
 
-        let providers_clone = providers;
+        let providers_clone = providers.clone();
         let keys_clone = keys;
 
         self.commit_candidate_snapshot(&candidate, || {
@@ -1388,7 +1639,8 @@ impl BillingEngine {
             for key in keys_clone {
                 key_store.insert(key.id.clone(), key);
             }
-        })
+        })?;
+        Ok(providers)
     }
 
     pub fn list_providers(&self) -> Vec<Provider> {
@@ -1830,10 +2082,10 @@ impl BillingEngine {
         };
 
         let settings = candidate.settings.clone();
-        let (charge, cost_micro_cny, version_id) = if let Some(rcv) = resolved_rcv {
+        let (charge, mut cost_micro_cny, version_id) = if let Some(ref rcv) = resolved_rcv {
             let cost = rcv.calculate_cost_micro_cny(tokens, &settings);
             let charge = rcv.calculate_charge(tokens, group_margin, model_multiplier, &settings);
-            (charge, cost, Some(rcv.id))
+            (charge, cost, Some(rcv.id.clone()))
         } else {
             let rates_read = self.rates.read().unwrap();
             let model_rate = rates_read.get(exposed_model).unwrap_or(&self.default_rates);
@@ -1847,6 +2099,37 @@ impl BillingEngine {
                     * 10_000.0,
             );
             (charge, cost, None)
+        };
+
+        // Provider-qualified model prices take precedence over shared target-model prices.
+        let qualified_model = format!("{provider_id}/{target_model}");
+        let cost_version = [qualified_model.as_str(), target_model, "*"]
+            .into_iter()
+            .find_map(|model| {
+                candidate
+                    .rate_card_versions
+                    .iter()
+                    .filter(|v| {
+                        v.rate_card_id == rate_card_id
+                            && v.model == model
+                            && v.effective_from_secs <= reservation_created_at
+                    })
+                    .max_by_key(|v| v.effective_from_secs)
+            })
+            .or_else(|| {
+                model_map
+                    .filter(|m| {
+                        m.target_provider_id == provider_id && m.target_model == target_model
+                    })
+                    .and(resolved_rcv.as_ref())
+            });
+        let cost_source = if let Some(version) = cost_version {
+            cost_micro_cny = version.calculate_cost_micro_cny(tokens, &settings);
+            format!("provider_cost:rate_card_version={}", version.id)
+        } else {
+            // ponytail: legacy configurations lack a cost catalog; label the estimate
+            // until an operator configures the actual provider/model price.
+            "provider_cost:estimated_missing_target_rate".to_string()
         };
 
         if charge < 0 {
@@ -1875,7 +2158,7 @@ impl BillingEngine {
             rate_card_version: version_id,
             ts_secs: now_secs,
             operator_id: None,
-            reason: None,
+            reason: Some(cost_source),
         };
         let pending = PendingSettlement {
             entry,
@@ -1921,6 +2204,19 @@ impl BillingEngine {
         invocation_id: &str,
     ) -> Result<LedgerEntry, BillingError> {
         let _state_guard = self.state_lock.write().unwrap();
+        if let Some(entry) = self
+            .ledger
+            .read()
+            .unwrap()
+            .iter()
+            .find(|entry| {
+                entry.kind == LedgerKind::Usage
+                    && entry.invocation_id.as_deref() == Some(invocation_id)
+            })
+            .cloned()
+        {
+            return Ok(entry);
+        }
         let pending = self
             .pending_settlements
             .read()
@@ -1956,6 +2252,16 @@ impl BillingEngine {
             ));
         }
         let entry = pending.entry.clone();
+        if entry.invocation_id.as_deref() != Some(invocation_id)
+            || entry.card_id != reservation.card_id
+            || entry.kind != LedgerKind::Usage
+            || entry.credits_charged < 0
+            || entry.provider_cost_micro_cny < 0
+        {
+            return Err(BillingError::InvalidState(
+                "invalid pending settlement identity or amount".into(),
+            ));
+        }
         if entry.credits_charged == 0 && reservation.reserved_micro_credits > 0 {
             return Err(BillingError::MissingUsage);
         }
@@ -2101,6 +2407,11 @@ impl BillingEngine {
 
         for res in candidate.reservations.values_mut() {
             if res.is_expired(now_secs)
+                && !self
+                    .active_reservations
+                    .lock()
+                    .unwrap()
+                    .contains_key(&res.invocation_id)
                 && !candidate
                     .pending_settlements
                     .contains_key(&res.invocation_id)
@@ -2150,6 +2461,9 @@ impl BillingEngine {
                     r.state = ReservationState::Released;
                 }
             }
+            for id in &prune_ids {
+                reservations.remove(id);
+            }
             reclaimed_count
         });
 
@@ -2176,16 +2490,12 @@ impl BillingEngine {
     ///
     /// If device is already bound, returns Ok.
     /// Binds an empty slot; legacy multi-device records require explicit unbinding.
-    /// Replacing the sole device triggers a rebind subject to:
-    /// - `rebind_count < max_rebinds`
-    /// - `rebind_cooldown_secs` check
-    ///
-    /// Rebinding increments `token_version` to immediately revoke sessions from evicted devices.
+    /// A different device is rejected until explicit unbinding frees the slot.
     pub fn bind_device(
         &self,
         card_id: &str,
         device_fp: &str,
-        now_secs: u64,
+        _now_secs: u64,
     ) -> Result<(), BillingError> {
         let _state_guard = self.state_lock.write().unwrap();
         let sequence = self
@@ -2196,22 +2506,12 @@ impl BillingEngine {
         let mut candidate = self.export_snapshot_locked(sequence, previous_checksum);
 
         let device_fp = device_fp.trim();
-        let device = device_fp;
-        if !device.is_empty()
-            && candidate
-                .cards
-                .values()
-                .any(|c| c.id != card_id && c.bound_devices.iter().any(|d| d == device))
-        {
-            return Err(BillingError::InvalidState(
-                "device already bound to another card; explicitly unbind first".into(),
-            ));
-        }
+        // A card has one device; a device may use independently purchased cards.
         let card = candidate
             .cards
             .get_mut(card_id)
             .ok_or_else(|| BillingError::CardNotFound(card_id.to_string()))?;
-        let changed = bind_device_locked(card, device_fp, now_secs)?;
+        let changed = bind_device_locked(card, device_fp)?;
         if !changed {
             return Ok(());
         }
@@ -2225,7 +2525,9 @@ impl BillingEngine {
 
     /// Unbind a specific device fingerprint from a card.
     ///
-    /// Revokes existing tokens by incrementing `token_version`.
+    /// Consumes one rebind subject to the configured quota/cooldown,
+    /// and revokes existing tokens. Filling the empty slot completes this change
+    /// without consuming another rebind or waiting for the newly started cooldown.
     pub fn unbind_device(&self, card_id: &str, device_fp: &str) -> Result<(), BillingError> {
         let _state_guard = self.state_lock.write().unwrap();
         let sequence = self
@@ -2241,7 +2543,14 @@ impl BillingEngine {
             .ok_or_else(|| BillingError::CardNotFound(card_id.to_string()))?;
 
         if let Some(pos) = card.bound_devices.iter().position(|d| d == device_fp) {
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            check_rebind_allowed(card, now_secs)?;
             card.bound_devices.remove(pos);
+            card.rebind_count = card.rebind_count.saturating_add(1);
+            card.last_rebind_at = Some(now_secs);
             card.token_version = card.token_version.saturating_add(1);
         } else {
             return Err(BillingError::DeviceNotFound {
@@ -2285,6 +2594,16 @@ impl BillingEngine {
             .get_mut(card_id)
             .ok_or_else(|| BillingError::CardNotFound(card_id.to_string()))?;
 
+        if !matches!(
+            card.status,
+            CardStatus::Unactivated | CardStatus::Active | CardStatus::Expired
+        ) {
+            return Err(BillingError::InvalidState(format!(
+                "cannot freeze {:?}",
+                card.status
+            )));
+        }
+        card.frozen_from = Some(card.status);
         card.status = CardStatus::Frozen;
         let prev_note = card.note.as_deref().unwrap_or("");
         card.note = Some(
@@ -2319,9 +2638,27 @@ impl BillingEngine {
             .get_mut(card_id)
             .ok_or_else(|| BillingError::CardNotFound(card_id.to_string()))?;
 
-        if card.status == CardStatus::Frozen {
-            card.status = CardStatus::Active;
+        if card.status != CardStatus::Frozen {
+            return Err(BillingError::InvalidState(format!(
+                "cannot unfreeze {:?}",
+                card.status
+            )));
         }
+        let restored = card.frozen_from.unwrap_or_else(|| {
+            if card.activated_at.is_none() {
+                CardStatus::Unactivated
+            } else {
+                CardStatus::Active
+            }
+        });
+        if !matches!(
+            restored,
+            CardStatus::Unactivated | CardStatus::Active | CardStatus::Expired
+        ) {
+            return Err(BillingError::InvalidState("invalid frozen origin".into()));
+        }
+        card.status = restored;
+        card.frozen_from = None;
         let updated_card = card.clone();
 
         self.commit_candidate_snapshot(&candidate, || {
@@ -3057,7 +3394,11 @@ impl BillingEngine {
                     .cloned()
             });
             if let Some(existing) = existing {
-                if existing.card_id == card_id && existing.credits_charged == delta_micro_credits {
+                if existing.card_id == card_id
+                    && existing.credits_charged == delta_micro_credits
+                    && existing.operator_id.as_deref() == Some(op)
+                    && existing.reason.as_deref() == Some(res)
+                {
                     return Ok(existing);
                 } else {
                     return Err(BillingError::InvalidAdjustment(format!(
@@ -4000,10 +4341,21 @@ fn validate_snapshot(snapshot: &BillingSnapshot) -> std::io::Result<()> {
         || snapshot.ledger.len() > 50_000_000
         || snapshot.providers.len() > 100_000
         || snapshot.provider_keys.len() > 1_000_000
+        || snapshot.consumed_refresh_tokens.len() > 10_000_000
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "billing snapshot contains invalid or excessive state",
+        ));
+    }
+    if snapshot
+        .consumed_refresh_tokens
+        .iter()
+        .any(|(jti, exp)| jti.is_empty() || jti.len() > 256 || *exp == 0)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "billing snapshot contains invalid consumed refresh tokens",
         ));
     }
     if !snapshot.settings.credit_face_value_cny.is_finite()
@@ -4136,11 +4488,25 @@ fn validate_snapshot(snapshot: &BillingSnapshot) -> std::io::Result<()> {
     Ok(())
 }
 
-fn bind_device_locked(
-    card: &mut Card,
-    device_fp: &str,
-    now_secs: u64,
-) -> Result<bool, BillingError> {
+fn check_rebind_allowed(card: &Card, now_secs: u64) -> Result<(), BillingError> {
+    if card.rebind_count >= card.max_rebinds {
+        return Err(BillingError::RebindLimitExceeded {
+            current: card.rebind_count,
+            max: card.max_rebinds,
+        });
+    }
+    if let Some(last) = card.last_rebind_at {
+        let cooldown_until = last.saturating_add(card.rebind_cooldown_secs);
+        if now_secs < cooldown_until {
+            return Err(BillingError::RebindCooldown {
+                remaining_secs: cooldown_until.saturating_sub(now_secs),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn bind_device_locked(card: &mut Card, device_fp: &str) -> Result<bool, BillingError> {
     card.check_device_policy()?;
     if device_fp.trim().is_empty() {
         return Err(BillingError::InvalidState(
@@ -4156,31 +4522,7 @@ fn bind_device_locked(
         card.bound_devices.push(device_fp.to_string());
         return Ok(true);
     }
-    if card.rebind_count >= card.max_rebinds {
-        return Err(BillingError::RebindLimitExceeded {
-            current: card.rebind_count,
-            max: card.max_rebinds,
-        });
-    }
-    if let Some(last) = card.last_rebind_at {
-        let cooldown_until = last.saturating_add(card.rebind_cooldown_secs);
-        if now_secs < cooldown_until {
-            return Err(BillingError::RebindCooldown {
-                remaining_secs: cooldown_until.saturating_sub(now_secs),
-            });
-        }
-    }
-    if card.bound_devices.is_empty() {
-        return Err(BillingError::InvalidState(
-            "card has no device slot but reports full capacity".to_string(),
-        ));
-    }
-    card.bound_devices.remove(0);
-    card.bound_devices.push(device_fp.to_string());
-    card.rebind_count = card.rebind_count.saturating_add(1);
-    card.last_rebind_at = Some(now_secs);
-    card.token_version = card.token_version.saturating_add(1);
-    Ok(true)
+    Err(BillingError::DeviceAlreadyBound)
 }
 
 #[cfg(test)]
@@ -4305,5 +4647,148 @@ mod durability_regressions {
         assert_eq!(entry.credits_charged, 180);
         assert_eq!(recovered.get_card("card").unwrap().outstanding_debt(), 80);
         BillingEngine::verify_snapshot_integrity(&path, None).unwrap();
+    }
+    #[test]
+    fn automatic_recovery_backoff_restart_and_invalid_intent() {
+        let path = state_path("automatic-recovery");
+        let engine = BillingEngine::new();
+        engine.set_persistence_path(&path);
+        let mut card = Card::new("card", "group", 1000);
+        card.activate(1, 0).unwrap();
+        engine.upsert_card(card);
+        engine
+            .reserve("card", "use", &ReservationEstimateParams::new(0, 1), 1, 10)
+            .unwrap();
+        // Before intent commit: no partial debit; restart reclaims the orphan without a durable intent.
+        *engine.injected_persistence_fault.write().unwrap() = true;
+        assert!(engine
+            .settle(
+                "use",
+                &UsageTokens {
+                    output_tokens: 3,
+                    ..Default::default()
+                },
+                "m",
+                "p",
+                "t",
+                2
+            )
+            .is_err());
+        let before = BillingEngine::new();
+        before.load_from_file(&path).unwrap();
+        assert!(before.list_pending_settlements().is_empty());
+        assert_eq!(before.get_card("card").unwrap().credit_reserved, 0);
+        assert_eq!(before.get_card("card").unwrap().credit_used, 0);
+        let engine = before;
+        engine
+            .reserve("card", "use", &ReservationEstimateParams::new(0, 1), 1, 10)
+            .unwrap();
+        *engine.fail_after_pending.write().unwrap() = true;
+        assert!(engine
+            .settle(
+                "use",
+                &UsageTokens {
+                    output_tokens: 3,
+                    ..Default::default()
+                },
+                "m",
+                "p",
+                "t",
+                2
+            )
+            .is_err());
+        let recovered = BillingEngine::new();
+        recovered.load_from_file(&path).unwrap();
+        let mut recovery = PendingSettlementRecovery::default();
+        *recovered.injected_persistence_fault.write().unwrap() = true;
+        let mut now = 100;
+        for delay in [30, 60, 120, 240, 300, 300] {
+            let results = recovery.tick(&recovered, now);
+            assert_eq!(results.len(), 1);
+            assert!(results[0].1.is_err());
+            assert!(recovery.tick(&recovered, now + delay - 1).is_empty());
+            assert_eq!(recovered.run_janitor(now + delay), 0);
+            assert!(recovered.release("use").is_err());
+            assert_eq!(recovered.get_card("card").unwrap().credit_used, 0);
+            now += delay;
+        }
+        *recovered.injected_persistence_fault.write().unwrap() = false;
+        // A corrupt invocation field must alert and retain the hold, not disappear from the retry queue.
+        recovered
+            .pending_settlements
+            .write()
+            .unwrap()
+            .get_mut("use")
+            .unwrap()
+            .entry
+            .invocation_id = None;
+        assert!(recovery.tick(&recovered, now)[0].1.is_err());
+        assert_eq!(recovered.get_card("card").unwrap().credit_reserved, 60);
+        // Restart from the uncorrupted durable intent resets backoff and succeeds.
+        let restarted = BillingEngine::new();
+        restarted.load_from_file(&path).unwrap();
+        *restarted.injected_mirror_fault.write().unwrap() = true;
+        let mut fresh = PendingSettlementRecovery::default();
+        assert!(fresh.tick(&restarted, now)[0].1.is_ok());
+        assert!(fresh.tick(&restarted, now).is_empty());
+        restarted.retry_pending_settlement("use").unwrap();
+        assert_eq!(restarted.get_card("card").unwrap().credit_used, 180);
+        assert_eq!(restarted.get_card("card").unwrap().credit_reserved, 0);
+        assert_eq!(restarted.ledger_entries().len(), 1);
+        assert!(restarted.last_snapshot_mirror_error().is_some());
+        *restarted.injected_mirror_fault.write().unwrap() = false;
+        restarted.run_janitor(700000);
+        assert!(restarted.export_snapshot().reservations.is_empty());
+        let disk = BillingEngine::new();
+        disk.load_from_file(&path).unwrap();
+        assert!(disk.export_snapshot().reservations.is_empty());
+        disk.retry_pending_settlement("use").unwrap();
+        assert_eq!(disk.ledger_entries().len(), 1);
+    }
+
+    #[test]
+    fn automatic_recovery_limits_batch_without_starvation() {
+        let engine = BillingEngine::new();
+        let mut card = Card::new("card", "group", 10000);
+        card.activate(1, 0).unwrap();
+        card.max_concurrency = 100;
+        engine.upsert_card(card);
+        for i in 0..65 {
+            engine
+                .reserve(
+                    "card",
+                    &format!("use-{i:03}"),
+                    &ReservationEstimateParams::new(0, 1),
+                    1,
+                    10,
+                )
+                .unwrap();
+        }
+        let mut snapshot = engine.export_snapshot();
+        let tokens = UsageTokens {
+            output_tokens: 1,
+            ..Default::default()
+        };
+        let prototype = engine.settle("use-000", &tokens, "m", "p", "t", 2).unwrap();
+        for i in 0..65 {
+            let id = format!("use-{i:03}");
+            let mut entry = prototype.clone();
+            entry.id = format!("led-{id}");
+            entry.invocation_id = Some(id.clone());
+            snapshot
+                .pending_settlements
+                .insert(id, PendingSettlement { entry, tokens });
+        }
+        engine.import_snapshot(snapshot);
+        let mut recovery = PendingSettlementRecovery::default();
+        let first = recovery.tick(&engine, 100);
+        assert_eq!(first.len(), 64);
+        assert!(first.iter().all(|(_, result)| result.is_ok()));
+        let second = recovery.tick(&engine, 100);
+        assert_eq!(second.len(), 1);
+        assert!(second[0].1.is_ok());
+        assert!(recovery.tick(&engine, 100).is_empty());
+        assert_eq!(engine.get_card("card").unwrap().credit_used, 3900);
+        assert_eq!(engine.get_card("card").unwrap().credit_reserved, 0);
     }
 }

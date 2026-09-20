@@ -20,6 +20,9 @@ pub enum DetectError {
     #[error("Failed to read metadata file '{0}': {1}")]
     MetadataRead(PathBuf, String),
 
+    #[error("macOS currently requires the official bundle name Kiro.app; restore that name and select the installation again (MacBundleNameUnsupported)")]
+    MacBundleNameUnsupported,
+
     #[allow(dead_code)]
     #[error("Failed to parse metadata JSON in '{0}': {1}")]
     MetadataParse(PathBuf, String),
@@ -138,6 +141,20 @@ pub fn detect_kiro(custom_path: Option<&Path>) -> Result<KiroInstallation, Detec
 
 /// Inspect a directory to verify whether it contains a valid Kiro installation and extract metadata.
 pub fn inspect_installation_dir(dir: &Path) -> Result<KiroInstallation, DetectError> {
+    // Canonicalize the launch path too: accepting an alias but launching through
+    // that alias would disagree with the process detector's bundle identity.
+    let canonical = if cfg!(target_os = "macos") {
+        Some(
+            fs::canonicalize(dir)
+                .map_err(|_| DetectError::InvalidInstallation(dir.to_path_buf()))?,
+        )
+    } else {
+        None
+    };
+    let dir = canonical.as_deref().unwrap_or(dir);
+    if cfg!(target_os = "macos") && !supported_mac_bundle(dir) {
+        return Err(DetectError::MacBundleNameUnsupported);
+    }
     let executable_path = resolve_executable_path(dir)?;
 
     let app_dir = if cfg!(target_os = "macos") {
@@ -244,12 +261,7 @@ fn resolve_executable_path(dir: &Path) -> Result<PathBuf, DetectError> {
             return Ok(exe_lower);
         }
     } else if cfg!(target_os = "macos") {
-        for name in ["Kiro", "Electron"] {
-            let exe = dir.join("Contents").join("MacOS").join(name);
-            if exe.is_file() {
-                return Ok(exe);
-            }
-        }
+        return resolve_macos_executable(&dir.join("Contents"));
     } else {
         let exe = dir.join("kiro");
         if exe.exists() {
@@ -268,5 +280,36 @@ fn resolve_executable_path(dir: &Path) -> Result<PathBuf, DetectError> {
         Ok(dir.join("Contents").join("MacOS").join("Kiro"))
     } else {
         Ok(dir.join("kiro"))
+    }
+}
+
+// Both detection and JavaScript preflight must accept exactly the same launchers.
+pub(crate) fn resolve_macos_executable(contents: &Path) -> Result<PathBuf, DetectError> {
+    for name in ["Kiro", "Electron"] {
+        let exe = contents.join("MacOS").join(name);
+        if exe.is_file() {
+            return Ok(exe);
+        }
+    }
+    Err(DetectError::InvalidInstallation(contents.to_path_buf()))
+}
+
+fn supported_mac_bundle(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == "Kiro.app")
+}
+#[cfg(test)]
+mod mac_identity_tests {
+    use super::*;
+    #[test]
+    fn renamed_bundles_are_not_accepted_by_name_based_lifecycle() {
+        assert!(supported_mac_bundle(Path::new("/Volumes/My Disk/Kiro.app")));
+        for path in [
+            "/Applications/My Kiro.app",
+            "/Applications/Kiro Copy.app",
+            "/Applications/kiro.app",
+            "/Applications/Kiro.app/Contents",
+        ] {
+            assert!(!supported_mac_bundle(Path::new(path)));
+        }
     }
 }

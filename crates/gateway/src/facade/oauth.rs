@@ -268,6 +268,13 @@ impl FacadeHandler for OAuthTokenHandler {
             ) {
                 Ok(updated) => updated,
                 Err(err) => match err {
+                    billing::BillingError::DeviceAlreadyBound => {
+                        return error_response(
+                            StatusCode::FORBIDDEN,
+                            "DeviceBindingException",
+                            "Card is already bound to another device; unbind it on the portal before logging in on a new device",
+                        );
+                    }
                     billing::BillingError::RebindCooldown { remaining_secs } => {
                         return error_response(
                             StatusCode::TOO_MANY_REQUESTS,

@@ -183,11 +183,73 @@ impl TokenStorage {
     }
 }
 
+/// Restrict a newly created, empty staging entry before writing any secrets.
+fn restrict_private(path: &Path, directory: bool) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            path,
+            fs::Permissions::from_mode(if directory { 0o700 } else { 0o600 }),
+        )?;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let output = std::process::Command::new("whoami")
+            .args(["/user", "/fo", "csv", "/nh"])
+            .creation_flags(0x08000000)
+            .output()?;
+        let identity = String::from_utf8_lossy(&output.stdout);
+        let sid = identity
+            .trim()
+            .split(',')
+            .next_back()
+            .unwrap_or("")
+            .trim_matches('"');
+        if !output.status.success() || !sid.starts_with("S-1-") {
+            return Err(std::io::Error::other("Cannot resolve private file owner"));
+        }
+        let rights = if directory { "(OI)(CI)(F)" } else { "(F)" };
+        let status = std::process::Command::new("icacls")
+            .arg(path)
+            .args(["/inheritance:r", "/grant:r", &format!("*{sid}:{rights}")])
+            .creation_flags(0x08000000)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        if !status.success() {
+            return Err(std::io::Error::other("Cannot restrict private file ACL"));
+        }
+    }
+    Ok(())
+}
+
+fn create_private_parents(path: &Path) -> std::io::Result<()> {
+    if path.as_os_str().is_empty() || path.is_dir() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        create_private_parents(parent)?;
+    }
+    #[allow(unused_mut)]
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
+    restrict_private(path, true)
+}
+
 pub(crate) fn private_atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        create_private_parents(parent)?;
     }
-    let temp = path.with_extension(format!(
+    // Never chmod shared HOME/cache directories. A private sibling directory protects
+    // staging data; atomic rename preserves the file's private mode/DACL at destination.
+    let staging = path.with_extension(format!(
         "tmp.{}.{}",
         std::process::id(),
         SystemTime::now()
@@ -195,7 +257,17 @@ pub(crate) fn private_atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result
             .unwrap_or_default()
             .as_nanos()
     ));
+    #[allow(unused_mut)]
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&staging)?;
+    let temp = staging.join("data");
     let result = (|| {
+        restrict_private(&staging, true)?;
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -204,34 +276,7 @@ pub(crate) fn private_atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result
             options.mode(0o600);
         }
         let mut file = options.open(&temp)?;
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            let output = std::process::Command::new("whoami")
-                .args(["/user", "/fo", "csv", "/nh"])
-                .creation_flags(0x08000000)
-                .output()?;
-            let identity = String::from_utf8_lossy(&output.stdout);
-            let sid = identity
-                .trim()
-                .split(',')
-                .next_back()
-                .unwrap_or("")
-                .trim_matches('"');
-            if !output.status.success() || !sid.starts_with("S-1-") {
-                return Err(std::io::Error::other("Cannot resolve token file owner"));
-            }
-            let status = std::process::Command::new("icacls")
-                .arg(&temp)
-                .args(["/inheritance:r", "/grant:r", &format!("*{sid}:(F)")])
-                .creation_flags(0x08000000)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()?;
-            if !status.success() {
-                return Err(std::io::Error::other("Cannot restrict token file ACL"));
-            }
-        }
+        restrict_private(&temp, false)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
@@ -240,6 +285,7 @@ pub(crate) fn private_atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result
     if result.is_err() {
         let _ = fs::remove_file(&temp);
     }
+    let _ = fs::remove_dir(&staging);
     result
 }
 
@@ -367,3 +413,7 @@ mod tests {
         let _ = fs::remove_dir_all(temp_dir);
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/privacy/audit.rs"]
+mod audit_privacy;
