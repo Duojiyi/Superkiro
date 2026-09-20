@@ -32,6 +32,19 @@ fn audit_snapshot_and_staging_permissions_and_replace_cleanup() {
     fs::create_dir(&root).unwrap();
     let staging = root.join("staging");
     fs::create_dir(&staging).unwrap();
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Explicit grants must be removed too, not merely inherited ACEs.
+        assert!(std::process::Command::new("icacls")
+            .arg(&staging)
+            .args(["/grant", "*S-1-1-0:(OI)(CI)(RX)"])
+            .creation_flags(0x08000000)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success());
+    }
     restrict_private(&staging, true).unwrap();
     assert_private(&staging, true);
     let temp = staging.join("empty");

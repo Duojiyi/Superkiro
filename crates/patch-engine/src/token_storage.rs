@@ -196,24 +196,13 @@ fn restrict_private(path: &Path, directory: bool) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        let output = std::process::Command::new("whoami")
-            .args(["/user", "/fo", "csv", "/nh"])
-            .creation_flags(0x08000000)
-            .output()?;
-        let identity = String::from_utf8_lossy(&output.stdout);
-        let sid = identity
-            .trim()
-            .split(',')
-            .next_back()
-            .unwrap_or("")
-            .trim_matches('"');
-        if !output.status.success() || !sid.starts_with("S-1-") {
-            return Err(std::io::Error::other("Cannot resolve private file owner"));
-        }
-        let rights = if directory { "(OI)(CI)(F)" } else { "(F)" };
-        let status = std::process::Command::new("icacls")
-            .arg(path)
-            .args(["/inheritance:r", "/grant:r", &format!("*{sid}:{rights}")])
+        // Replace the entire DACL: icacls /inheritance:r /grant:r leaves
+        // unrelated explicit ACEs intact on some Windows temp directories.
+        let status = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command",
+                "$ErrorActionPreference='Stop'; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User; if ($env:PRIVATE_DIRECTORY -eq 'true') {$acl=New-Object System.Security.AccessControl.DirectorySecurity; $rule=New-Object System.Security.AccessControl.FileSystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow')} else {$acl=New-Object System.Security.AccessControl.FileSecurity; $rule=New-Object System.Security.AccessControl.FileSystemAccessRule($sid,'FullControl','Allow')}; $acl.SetAccessRuleProtection($true,$false); $acl.AddAccessRule($rule); if ($env:PRIVATE_DIRECTORY -eq 'true') {[System.IO.Directory]::SetAccessControl($env:PRIVATE_PATH,$acl)} else {[System.IO.File]::SetAccessControl($env:PRIVATE_PATH,$acl)}"])
+            .env("PRIVATE_PATH", path)
+            .env("PRIVATE_DIRECTORY", directory.to_string())
             .creation_flags(0x08000000)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
