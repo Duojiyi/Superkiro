@@ -47,7 +47,8 @@ def validate_history(names, item):
     # Historical immutable artifacts remain authoritative after the current
     # manifest advances to another version. Run under the deployment lock.
     pattern = re.compile(r'Superkiro-' + re.escape(item['version'])
-                         + r'-([0-9a-f]{64})-windows-x64\.exe')
+                         + r'-([0-9a-f]{64})-' + re.escape(item['platform'] + '-' + item['arch'])
+                         + (r'\.exe' if item['platform'] == 'windows' else r'\.app\.tar\.gz'))
     for name in names:
         match = pattern.fullmatch(name)
         if match and match.group(1) != item['sha256']:

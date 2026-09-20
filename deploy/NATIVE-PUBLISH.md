@@ -23,3 +23,11 @@ Windows x64、macOS arm64/x64 构建 job 将 `*.provenance.json` 与制品一起
 provenance 是未签名元数据，不是 SLSA/可信证明、Authenticode、Developer ID、公证或真实 Kiro 验收。`signature_verification=not_performed`，`publication_approved=false`。现有发布批准仍须针对最终字节，签名后摘要变化必须重新生成映射并重新验收。当前 CI 仍只产出未签名候选，不自动对外发布，也未配置任何签名凭据。
 
 发布负责人还须把该映射与公开版本、最终签名验证记录、下载摘要、服务端候选 release-state/image digest、配置 revision 和验收记录关联存档；本次不追认历史 EXE 的源码，不声称已统一生产前后端版本。
+
+## macOS 发布入口
+
+`python deploy/publish_native_macos.py --source <最终.app.tar.gz> --version <公开版本> --arch arm64或x64 --acceptance <验收记录.json>`，SSH 凭据同样只经标准输入传入。
+
+验收结构与 Windows 相同，但 `platform=macos`，`arch=arm64` 或 `x64`。入口离线检查单一 `Superkiro.app` 目录、Mach-O 架构、可执行权限、应用标识，拒绝路径穿越、重复成员、链接及特殊文件。当前 Tauri 包不需要链接；若未来引入 Framework 链接，应先扩展受限校验并添加测试，不绕过验证。检查不解包、不执行程序，不等于真实 Mac 验收或 Apple 公证。
+
+Windows 与 Mac 复用部署锁、历史版本防替换、原子清单更新以及公网下载摘要校验。每个架构分别验收、分别批准。GitHub 构建映射中 `publication_approved=false` 不能直接当作验收记录。
