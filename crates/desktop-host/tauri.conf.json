@@ -5,7 +5,7 @@
   "identifier": "app.superkiro.desktop",
   "build": {
     "frontendDist": "../../apps/desktop-ui/dist",
-    "beforeBuildCommand": "npm --prefix ../../apps/desktop-ui run build"
+    "beforeBuildCommand": "npm --prefix ../apps/desktop-ui run build"
   },
   "app": {
     "macOSPrivateApi": true,

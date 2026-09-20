@@ -1,7 +1,22 @@
 [extend]
 useDefault = true
 
-[allowlist]
+[[allowlists]]
 description = "Explicit nonfunctional encryption test fixture, not a provider credential"
 regexTarget = "secret"
 regexes = ['^sk-ant-api03-abcdef1234567890-SECRET-KEY-TOKEN$']
+
+# Published RFC 4226 seed, restricted to its test file.
+[[allowlists]]
+description = "RFC 4226 public test vector"
+condition = "AND"
+paths = ['^crates/gateway/tests/admin_browser_login_test\.rs$']
+regexTarget = "secret"
+regexes = ['^GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ$']
+
+[[allowlists]]
+description = "Pencil document UUID metadata, not an authentication credential"
+condition = "AND"
+paths = ['^docs/portal-pencil(-v2)?/.*\.pen$']
+regexTarget = "line"
+regexes = ['"fileToken": "81bd6a07-39b4-472b-89cb-678a463b1524"']

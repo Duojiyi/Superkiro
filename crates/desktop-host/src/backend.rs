@@ -1227,7 +1227,7 @@ mod restore_confirmation_tests {
         let result = confirmed_restore_stop(&json!({"close_kiro_confirmed":true}), || {
             Err(patch_engine::process::ProcessError::UnknownState)
         })
-        .and_then(|_| -> Result<(), String> { panic!("must not restore after failed stop") });
+        .map(|_| -> Result<(), String> { panic!("must not restore after failed stop") });
         assert!(result.unwrap_err().contains("Cannot stop Kiro for restore"));
     }
 

@@ -2,7 +2,28 @@
 const https = require('node:https');
 const fs = require('node:fs');
 const path = require('node:path');
-const server = https.createServer({key:fs.readFileSync(path.join(__dirname,'local-test-key.pem')),cert:fs.readFileSync(path.join(__dirname,'local-test-cert.pem'))},(req,res)=>{
+const {spawnSync} = require('node:child_process');
+const dir = path.dirname(process.argv[2]);
+const ca = path.join(dir, 'local-test-ca.pem');
+const key = path.join(dir, 'local-test-key.pem');
+const cert = path.join(dir, 'local-test-cert.pem');
+function ensureFixtures() {
+  const run = (args) => {
+    let result = spawnSync('openssl', args, {cwd: dir, stdio: 'ignore'});
+    if (result.error?.code === 'ENOENT' && process.platform === 'win32') {
+      result = spawnSync(path.join(process.env.ProgramFiles || 'C:/Program Files', 'Git/usr/bin/openssl.exe'), args, {cwd: dir, stdio: 'ignore'});
+    }
+    if (result.status !== 0) throw new Error('openssl failed while creating local TLS fixtures');
+  };
+  const caKey = path.join(dir, 'local-test-ca-key.pem');
+  const csr = path.join(dir, 'local-test.csr');
+  run(['req','-x509','-newkey','rsa:2048','-nodes','-keyout',caKey,'-out',ca,'-days','2','-subj','/CN=Superkiro Test CA']);
+  run(['req','-new','-newkey','rsa:2048','-nodes','-keyout',key,'-out',csr,'-subj','/CN=localhost']);
+  run(['x509','-req','-in',csr,'-CA',ca,'-CAkey',caKey,'-CAcreateserial','-out',cert,'-days','2','-sha256','-extfile',path.join(__dirname,'local-test.ext')]);
+  for (const file of [caKey, csr, path.join(dir, 'local-test-ca.srl')]) { try { fs.unlinkSync(file); } catch {} }
+}
+ensureFixtures();
+const server = https.createServer({key:fs.readFileSync(key),cert:fs.readFileSync(cert)},(req,res)=>{
   let body=''; req.on('data',c=>body+=c); req.on('end',()=>{
     let result;
     switch(req.url) {

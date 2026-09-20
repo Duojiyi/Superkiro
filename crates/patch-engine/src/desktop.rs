@@ -665,7 +665,7 @@ mod persistent_ca_tests {
             ))
             .unwrap();
         let ca = root.join("retained-ca.pem");
-        fs::copy(fixtures.join("local-test-ca.pem"), &ca).unwrap();
+        fs::copy(root.join("local-test-ca.pem"), &ca).unwrap();
         let session = Session {
             gateway: gateway.clone(),
             device: "test-device".into(),
@@ -691,7 +691,7 @@ mod persistent_ca_tests {
         // Missing persisted trust never silently falls back to public/default CA.
         fs::remove_file(&ca).unwrap();
         assert!(desktop.usage().await.is_err());
-        fs::copy(fixtures.join("local-test-ca.pem"), &ca).unwrap();
+        fs::copy(root.join("local-test-ca.pem"), &ca).unwrap();
         desktop
             .unbind(
                 &SnapshotManager::at(root.join("snapshot.json")),
@@ -702,7 +702,14 @@ mod persistent_ca_tests {
         assert!(!desktop.recovery_pending());
         assert!(!storage.exists());
         drop(server);
-        for name in ["port", "retained-ca.pem", "session.session-lock"] {
+        for name in [
+            "port",
+            "retained-ca.pem",
+            "session.session-lock",
+            "local-test-ca.pem",
+            "local-test-cert.pem",
+            "local-test-key.pem",
+        ] {
             fs::remove_file(root.join(name)).unwrap();
         }
         fs::remove_dir(root).unwrap();
