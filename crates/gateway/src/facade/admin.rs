@@ -553,15 +553,25 @@ impl FacadeHandler for AdminProviderStatusHandler {
                     "provider_id is invalid",
                 );
             }
-            if !self
+            match self
                 .billing
                 .set_provider_enabled(body.provider_id.trim(), body.enabled)
             {
-                return error_response(
-                    StatusCode::NOT_FOUND,
-                    "ResourceNotFoundException",
-                    "provider not found",
-                );
+                Ok(true) => {}
+                Ok(false) => {
+                    return error_response(
+                        StatusCode::NOT_FOUND,
+                        "ResourceNotFoundException",
+                        "provider not found",
+                    );
+                }
+                Err(_error) => {
+                    return error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "PersistenceException",
+                        "provider status could not be durably persisted; please retry",
+                    );
+                }
             }
             if let Some(ref runtime) = self.runtime {
                 runtime.sync_from_billing(&self.billing);
@@ -1115,7 +1125,13 @@ impl FacadeHandler for AdminCardsHandler {
                 return unauthorized_response();
             }
 
-            let cards = self.billing.list_all_cards();
+            let mut cards = self.billing.list_all_cards();
+            cards.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+            let card_ids: Vec<&str> = cards.iter().map(|card| card.id.as_str()).collect();
+            let revision_input = serde_json::to_vec(&card_ids).expect("card IDs are serializable");
+            let revision = billing::card::hex_encode(
+                ring::digest::digest(&ring::digest::SHA256, &revision_input).as_ref(),
+            );
             let micro = billing::MICRO_CREDITS_PER_CREDIT as f64;
             let offset = parse_query(req.uri(), "offset")
                 .and_then(|value| value.parse::<usize>().ok())
@@ -1163,6 +1179,7 @@ impl FacadeHandler for AdminCardsHandler {
                     "count": items.len(),
                     "offset": offset,
                     "limit": limit,
+                    "revision": revision,
                     "cards": items,
                 }),
             )

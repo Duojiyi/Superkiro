@@ -1781,20 +1781,33 @@ impl BillingEngine {
         keys
     }
 
-    pub fn set_provider_enabled(&self, provider_id: &str, enabled: bool) -> bool {
-        let changed = {
-            let _state_guard = self.state_lock.write().unwrap();
-            if let Some(provider) = self.providers.write().unwrap().get_mut(provider_id) {
-                provider.enabled = enabled;
-                true
-            } else {
-                false
-            }
+    pub fn set_provider_enabled(
+        &self,
+        provider_id: &str,
+        enabled: bool,
+    ) -> Result<bool, BillingError> {
+        let _state_guard = self.state_lock.write().unwrap();
+        let sequence = self
+            .snapshot_sequence
+            .load(Ordering::Acquire)
+            .saturating_add(1);
+        let previous_checksum = self.last_snapshot_checksum.read().unwrap().clone();
+        let mut candidate = self.export_snapshot_locked(sequence, previous_checksum);
+
+        let Some(provider) = candidate.providers.get_mut(provider_id) else {
+            return Ok(false);
         };
-        if changed {
-            self.sync_to_disk();
-        }
-        changed
+        provider.enabled = enabled;
+        let updated_provider = provider.clone();
+        let updated_provider_id = updated_provider.id.clone();
+
+        self.commit_candidate_snapshot(&candidate, || {
+            self.providers
+                .write()
+                .unwrap()
+                .insert(updated_provider_id, updated_provider);
+            true
+        })
     }
 
     /// Step 1: Pre-request credit reservation (Spec §6.2).
@@ -3286,13 +3299,28 @@ impl BillingEngine {
             return Err(BillingError::Card(CardError::NotActive(card.status)));
         }
 
+        let duration_ext = topup.duration_extension_secs;
+        if duration_ext > 0 {
+            if card.status == CardStatus::Unactivated {
+                return Err(BillingError::InvalidState(
+                    "activate the card before redeeming a duration top-up; the top-up code has not been used"
+                        .to_string(),
+                ));
+            }
+            if card.valid_until.is_none() {
+                return Err(BillingError::InvalidState(
+                    "duration top-ups are not supported for perpetual cards; the top-up code has not been used"
+                        .to_string(),
+                ));
+            }
+        }
+
         // 3. Mark redeemed
         topup.is_used = true;
         topup.used_by_card_id = Some(card_id.to_string());
         topup.used_at = Some(now_secs);
         let topup_id = topup.id.clone();
         let credit_amount = topup.credit_amount;
-        let duration_ext = topup.duration_extension_secs;
         let updated_topup = topup.clone();
 
         // 4. Update card credits & validity

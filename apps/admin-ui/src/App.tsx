@@ -15,10 +15,15 @@ type Tab = 'overview' | 'cards' | 'groups' | 'providers' | 'models' | 'traces' |
 
 type AuthState = 'checking' | 'authenticated' | 'unauthenticated';
 
+function ListEmptyState({loading, failed, empty, onRetry}: {loading: boolean; failed?: boolean; empty: string; onRetry: () => void}) {
+  return <div className="list-empty" role="status"><p>{loading ? '正在读取，请稍候…' : failed ? '读取失败，暂时无法确认是否有记录。' : empty}</p>{failed && !loading && <button onClick={onRetry}>重新读取数据</button>}</div>;
+}
+
 export default function App() {
   const [rechecking,setRechecking]=useState(false),[recheckError,setRecheckError]=useState('');
   const recheckPending=useRef(false);
   const [authState, setAuthState] = useState<AuthState>('checking');
+  const [workspaceVersion, setWorkspaceVersion] = useState(0);
   const [username, setUsername] = useState('admin');
   const [password, setPassword] = useState('');
   const [totpCode,setTotpCode]=useState('');
@@ -36,6 +41,9 @@ export default function App() {
       setPassword('');setTotpCode(''); setAuthState('unauthenticated');
       setError('');
     };
+    adminApi.onSessionChanged = () => {
+      if (current) setWorkspaceVersion(version => version + 1);
+    };
     adminApi.checkAuth().then(() => {
       if (current && version === attempt.current) setAuthState('authenticated');
     }).catch(() => {
@@ -43,7 +51,7 @@ export default function App() {
         adminApi.clearSession(); setAuthState('unauthenticated');
       }
     }).finally(()=>{if(current)setTotpRequired(adminApi.totpRequired);});
-    return () => {current = false; ++attempt.current; adminApi.onUnauthorized = undefined; adminApi.clearSession();};
+    return () => {current = false; ++attempt.current; adminApi.onUnauthorized = undefined; adminApi.onSessionChanged = undefined; adminApi.clearSession();};
   }, []);
 
   useEffect(()=>{
@@ -72,7 +80,7 @@ export default function App() {
   }
 
   async function logout(all: boolean) {
-    if (all && !window.confirm('确认撤销所有管理员会话？')) return;
+    if (all && !window.confirm('确认撤销所有管理员会话？所有已登录管理员都需要重新登录。')) return;
     if (pending.current) return;
     const version = ++attempt.current;
     pending.current = true; setBusy(true); setPassword('');setTotpCode(''); setError('');
@@ -85,7 +93,7 @@ export default function App() {
   }
 
   if (authState === 'checking') return <main className="auth-page"><p role="status">正在检查会话…</p></main>;
-  if (authState === 'authenticated') return <><div ref={node=>{if(node)node.inert=rechecking||!!recheckError;}} aria-hidden={rechecking||!!recheckError||undefined}><AdminWorkspace onLogout={logout} operator={adminApi.authenticatedUsername} onReauthenticate={()=>{++attempt.current;adminApi.clearSession();setAuthState('unauthenticated');setError('请重新登录确认调账账户，未确认意图不会自动提交。');}} /></div>{(rechecking||recheckError)&&<div className="fixed inset-0 z-[100] bg-white/80 flex items-center justify-center" role="status" aria-live="polite">{rechecking?'正在检查会话…':<section><p>{recheckError}</p><button onClick={()=>window.dispatchEvent(new Event('focus'))}>重新验证会话</button></section>}</div>}</>;
+  if (authState === 'authenticated') return <><div ref={node=>{if(node)node.inert=rechecking||!!recheckError;}} aria-hidden={rechecking||!!recheckError||undefined}><AdminWorkspace key={workspaceVersion} onLogout={logout} operator={adminApi.authenticatedUsername} onReauthenticate={()=>{++attempt.current;adminApi.clearSession();setAuthState('unauthenticated');setError('请重新登录确认调账账户，未确认意图不会自动提交。');}} /></div>{(rechecking||recheckError)&&<div className="fixed inset-0 z-[100] bg-white/80 flex items-center justify-center" role="status" aria-live="polite">{rechecking?'正在检查会话…':<section><p>{recheckError}</p><button onClick={()=>window.dispatchEvent(new Event('focus'))}>重新验证会话</button></section>}</div>}</>;
   return <main className="auth-page"><section className="auth-card" aria-labelledby="login-title">
     <p className="auth-brand">Superkiro</p><h1 id="login-title">管理员登录</h1>
     <form onSubmit={event => {event.preventDefault(); void login();}} aria-busy={busy}>
@@ -144,10 +152,13 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
   const [showNoticeModal, setShowNoticeModal] = useState(false);
   const [mutationBusy, setMutationBusy] = useState(false);
   const [providerBusy, setProviderBusy] = useState(false);
+  const [pruning, setPruning] = useState(false);
   const [revealedCard, setRevealedCard] = useState<{cardId: string; rawCode: string} | null>(null);
   const [revealing, setRevealing] = useState(false);
   const [actionError, setActionError] = useState('');
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const toastTimer = useRef<ReturnType<typeof setTimeout>>();
+  useEffect(() => () => clearTimeout(toastTimer.current), []);
 
   // Live data
   const [stats, setStats] = useState<AdminStats | null>(null);
@@ -171,26 +182,34 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
     document.getElementById('key-editor')?.scrollIntoView({behavior: 'smooth'});
   };
   const [providerKeys, setProviderKeys] = useState<Array<Record<string, unknown>>>([]);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [dataFailures, setDataFailures] = useState<Record<string, boolean>>({});
   const [syncedAt, setSyncedAt] = useState<string | null>(null);
   const [loadError, setLoadError] = useState('');
   const [groupFilter, setGroupFilter] = useState('ALL');
   const [traceQuery, setTraceQuery] = useState('');
   const [tracePage, setTracePage] = useState(0);
-  const traceStatusLabel = (value: unknown) => ({success: '成功', error: '失败', client_aborted: '客户端中断', pending: '处理中', running: '处理中'}[String(value)] ?? String(value ?? '未知'));
-  const filteredTraces = traces.filter(trace => !traceQuery.trim() || [trace.id, trace.card_id, trace.exposed_model, trace.status, traceStatusLabel(trace.status)].some(value => String(value ?? '').toLowerCase().includes(traceQuery.trim().toLowerCase())));
+  const [traceStatusFilter, setTraceStatusFilter] = useState('ALL');
+  const traceStatusLabel = (value: unknown) => ({success: '成功', error: '失败', client_aborted: '客户端中断', pending: '处理中', running: '处理中', in_progress: '处理中'}[String(value)] ?? String(value ?? '未知'));
+  const filteredTraces = traces.filter(trace =>
+    (traceStatusFilter === 'ALL' || (traceStatusFilter === 'in_progress' ? ['pending', 'running', 'in_progress'].includes(String(trace.status)) : trace.status === traceStatusFilter)) &&
+    (!traceQuery.trim() || [trace.id, trace.card_id, trace.exposed_model, trace.status, traceStatusLabel(trace.status)].some(value => String(value ?? '').toLowerCase().includes(traceQuery.trim().toLowerCase()))));
+  const traceFiltersChanged = !!traceQuery || traceStatusFilter !== 'ALL';
+  const resetTraceFilters = () => {setTraceQuery(''); setTraceStatusFilter('ALL'); setTracePage(0);};
   const tracePageCount = Math.max(1, Math.ceil(filteredTraces.length / 20));
   const currentTracePage = Math.min(tracePage, tracePageCount - 1);
   const [selectedTrace, setSelectedTrace] = useState<Record<string, unknown> | null>(null);
   const [audit, setAudit] = useState<Array<Record<string, unknown>>>([]);
   const [auditError, setAuditError] = useState('');
+  const [auditLoading, setAuditLoading] = useState(false);
   const [providersLoaded, setProvidersLoaded] = useState(false);
   useEffect(() => {
     if (activeTab !== 'security' || !isAuthenticated) {setAudit([]); return;}
-    let current = true;
-    adminApi.getCommercialConfig().then(result => {if (current) {setAudit(result.config.audit); setAuditError('');}}).catch(() => {if (current) setAuditError('配置审计读取失败，请稍后重试。');});
+    if (loading) return;
+    let current = true; setAuditLoading(true);
+    adminApi.getCommercialConfig().then(result => {if (!result.success) throw new Error('未确认配置审计'); if (current) {setAudit(result.config.audit); setAuditError('');}}).catch(() => {if (current) setAuditError('配置审计读取失败，已有记录可能不是最新结果。');}).finally(() => {if (current) setAuditLoading(false);});
     return () => {current = false;};
-  }, [activeTab, isAuthenticated, syncedAt]);
+  }, [activeTab, isAuthenticated, loading]);
 
   // Selected card for adjustment
   const [selectedCard, setSelectedCard] = useState<AdminCardItem | null>(null);
@@ -205,7 +224,9 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
   const adjusting=useRef(false), writing=useRef(false);
 
   // Batch generation form
-  const [batchCount, setBatchCount] = useState<number>(50);
+  const [batchCount, setBatchCount] = useState('50');
+  const batchCountValue = Number(batchCount);
+  const validBatchCount = /^\d+$/.test(batchCount) && Number.isInteger(batchCountValue) && batchCountValue >= 1 && batchCountValue <= 500;
   const [batchGroup, setBatchGroup] = useState<string>('');
   const [batchTemplate, setBatchTemplate] = useState('tier-2000');
   const [cardGroups, setCardGroups] = useState<Array<Record<string, unknown>>>([]);
@@ -222,8 +243,9 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
   const checkingNotices = useRef(false);
 
   const showToast = (msg: string) => {
+    clearTimeout(toastTimer.current);
     setToastMessage(msg);
-    setTimeout(() => setToastMessage(null), 3000);
+    toastTimer.current = setTimeout(() => setToastMessage(null), 5000);
   };
 
   const refreshData = useCallback(async (preserveSelection = false) => {
@@ -245,7 +267,9 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
       ]);
 
       if (!mounted.current) return;
-      if (![statsRes, cardsRes, noticesRes, financialsRes, tracesRes, providersRes, configRes].every(r => r?.success)) setLoadError(`部分数据读取失败，保留最近一次结果。${failures.join('；')}`);
+      const unavailable = {stats: !statsRes?.success, cards: !cardsRes.success, announcements: !noticesRes.success, financials: !financialsRes?.success, traces: !tracesRes.success, providers: !providersRes.success, config: !configRes.success};
+      setDataFailures(unavailable);
+      if (Object.values(unavailable).some(Boolean)) setLoadError(`部分数据读取失败。已有结果保留上次读取内容，不代表最新状态；空白不表示没有记录。${failures.join('；')}`);
       else setSyncedAt(new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}));
       if (configRes.success && configRes.config) {
         const groups = configRes.config.groups; setCardGroups(groups);
@@ -270,6 +294,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
       }
     } catch (err) {
       console.error('Failed to load admin data:', err);
+      if (mounted.current) setLoadError('读取未完成，请重新刷新；当前显示的结果可能不是最新状态。');
     } finally {
       setLoading(false);
     }
@@ -282,15 +307,16 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
     const previous = document.activeElement as HTMLElement | null;
     const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
     const focusable = () => Array.from(dialog?.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex="0"]') || []);
-    const background = Array.from(document.querySelectorAll<HTMLElement>('.admin-app > aside, .admin-app > main'));
+    const background = Array.from(document.querySelectorAll<HTMLElement>('.admin-app > aside, .admin-app > main, .admin-app > .skip-link'));
     background.forEach(node => {node.inert = true;});
     const overflow = document.body.style.overflow;
     document.body.style.overflow = 'hidden';
-    focusable()[0]?.focus();
+    (focusable()[0] ?? dialog)?.focus();
     const keydown = (event: KeyboardEvent) => {
-      if(event.key==='Escape'){const close=Array.from(dialog?.querySelectorAll<HTMLButtonElement>('button:not([disabled])')??[]).find(button=>['取消','关闭并清除'].includes(button.textContent??''));if(close){event.preventDefault();close.click();}return;}
+      if(event.key==='Escape'){const close=Array.from(dialog?.querySelectorAll<HTMLButtonElement>('button:not([disabled])')??[]).find(button=>['取消','关闭并清除','确认并清除'].includes(button.textContent??''));if(close){event.preventDefault();close.click();}return;}
       if (event.key !== 'Tab') return;
       const nodes = focusable(); const first = nodes[0]; const last = nodes[nodes.length - 1];
+      if (!first) {event.preventDefault(); dialog?.focus(); return;}
       if (!dialog?.contains(document.activeElement)) {event.preventDefault(); first?.focus();}
       else if (event.shiftKey && document.activeElement === first) {event.preventDefault(); last?.focus();}
       else if (!event.shiftKey && document.activeElement === last) {event.preventDefault(); first?.focus();}
@@ -300,10 +326,11 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
   }, [showBatchModal, showAdjustModal, showKekModal, showNoticeModal, revealedCard, generatedCards.length]);
 
   const handleCardStatus = async (cardId: string, action: 'freeze' | 'unfreeze' | 'ban') => {
-    if(writing.current || cardBulkBusy)return;
-    if (!window.confirm(`确认对卡密 ${cardId} 执行${action === 'freeze' ? '冻结' : action === 'ban' ? '封禁' : '解冻'}？`)) return;
+    if(writing.current || cardBulkBusy || loading || dataFailures.cards)return;
+    const impact = {freeze: '冻结后暂停使用，可通过解冻恢复；不会删除卡密或修改余额。', unfreeze: '解除冻结后仍受有效期和余额限制，不会续期或增加积分。', ban: '封禁后停止使用，本页面不支持解除封禁；不自动退款，请谨慎确认。'}[action];
+    if (!window.confirm(`确认对卡密 ${cardId} 执行${action === 'freeze' ? '冻结' : action === 'ban' ? '封禁' : '解冻'}？\n${impact}`)) return;
     try {
-      writing.current=true;setMutationBusy(true);const res = await adminApi.updateCardStatus(cardId, action, `管理员手动操作：${{freeze: '冻结', unfreeze: '解冻', ban: '封禁'}[action]}`);
+      writing.current=true;setMutationBusy(true);setActionError('');const res = await adminApi.updateCardStatus(cardId, action, `管理员手动操作：${{freeze: '冻结', unfreeze: '解冻', ban: '封禁'}[action]}`);
       if (!res.success) throw new Error('服务器未确认状态变更，请刷新核对。');
       if (res.success) {
         showToast(`卡密 ${cardId} 已${action === 'freeze' ? '冻结' : action === 'unfreeze' ? '解冻' : '封禁'}`);
@@ -315,7 +342,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
   };
 
   const handleCardBulk = async (action: 'freeze' | 'unfreeze' | 'ban' | 'void' | 'archive' | 'unarchive' | 'export') => {
-    if (writing.current || cardBulkBusy || loading || mutationBusy || revealing) return;
+    if (writing.current || cardBulkBusy || loading || dataFailures.cards || mutationBusy || revealing) return;
     const targets = pageCards.filter(card => selectedCardIds.includes(card.id));
     if (!targets.length) return;
     if (action === 'void') {
@@ -397,7 +424,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
     // Existing nonzero legacy intents must replay the original numeric payload, never round it again.
     try{delta=adjustment.current&&Number(adjustAmount)===adjustment.current.delta?adjustment.current.delta:adjustmentPointsToMicro(adjustAmount)/1_000_000;}catch{setActionError('请输入非零、最多六位小数的调账积分，范围为 ±1,000,000；未发送请求。');return;}
     if (!adjustReason.trim()||adjustReason.trim().length>500) { setActionError('请填写 1–500 字的调账原因，不要包含密码或令牌'); return; }
-    if (!window.confirm(`确认调整 ${selectedCard.id} 的积分 ${delta > 0 ? '+' : ''}${delta}？`)) return;
+    if (!window.confirm(`确认调整 ${selectedCard.id} 的积分 ${delta > 0 ? '+' : ''}${delta}？\n原因：${adjustReason.trim()}\n确认后将写入账本；关闭弹窗不会撤销已发送的调账。`)) return;
     let sent=false;
     try {
       adjusting.current=true;setMutationBusy(true); setActionError('');
@@ -427,14 +454,14 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
   const issuanceSummary = `套餐：${selectedTier?.name ?? '未选择'} · ${selectedTier?.points.toLocaleString() ?? '—'} 积分 · 有效期 30 天 · 模型与计费分组：${String(selectedGroup?.name ?? selectedGroup?.id ?? '未选择')}`;
 
   const handleBatchGenerate = async () => {
-    if (issuanceRecovery || writing.current || loading || !tiers.some(t => t.id === batchTemplate) || !selectedGroup || !Number.isInteger(batchCount) || batchCount < 1 || batchCount > 500) return;
+    if (issuanceRecovery || writing.current || loading || !tiers.some(t => t.id === batchTemplate) || !selectedGroup || !validBatchCount) return;
     if (!window.confirm(`确认生成 ${batchCount} 张 卡密？\n${issuanceSummary}\n每张仅限一台设备，积分与权益以服务端校验为准。`)) return;
     try {
       writing.current=true;setLoading(true);
       const reference = `批次 ${new Date().toISOString()} ${crypto.randomUUID()}`;
       setIssuanceReference(reference);
-      sessionStorage.setItem(issuanceStorageKey, JSON.stringify({reference, count: batchCount, group: batchGroup, template: batchTemplate, startedAt: new Date().toISOString()}));
-      const res = await adminApi.batchCards(batchCount, batchGroup, batchTemplate, reference);
+      sessionStorage.setItem(issuanceStorageKey, JSON.stringify({reference, count: batchCountValue, group: batchGroup, template: batchTemplate, startedAt: new Date().toISOString()}));
+      const res = await adminApi.batchCards(batchCountValue, batchGroup, batchTemplate, reference);
       if (!res.success) throw new Error('服务器未确认生成结果');
       if (res.success) {
         showToast(`成功批量生成 ${res.cards.length} 张卡密！已持久化入库`);
@@ -474,11 +501,12 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
   };
 
   const handleToggleProvider = async (providerId: string, currentEnabled: boolean) => {
-    if (writing.current) return;
+    if (writing.current || loading || dataFailures.providers) return;
     if (!window.confirm(`确认${currentEnabled ? '停用' : '启用'}供应商 ${providerId}？这会影响该供应商的模型路由。`)) return;
     writing.current = true; setProviderBusy(true); setActionError('');
     try {
       const res = await adminApi.updateProviderStatus(providerId, !currentEnabled);
+      if (!res.success) throw new Error('服务端未确认状态变更');
       if (res.success) {
         showToast(`供应商 ${providerId} 状态已更新为: ${!currentEnabled ? '已启用' : '已停用'}`);
         await refreshData();
@@ -504,6 +532,19 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
     } catch (err: any) {
       setActionError(`导出失败：${err.message}`);
     }
+  };
+
+  const handlePruneTraces = async () => {
+    if (writing.current || pruning) return;
+    if (!window.confirm('确认永久清理 30 天以前的调用追踪？清理后无法在后台查看这些追踪，请先完成审计与备份。')) return;
+    writing.current = true; setPruning(true); setActionError('');
+    try {
+      const result = await adminApi.pruneTraces(Math.floor(Date.now() / 1000) - 30 * 86400);
+      if (!result.success) throw new Error('服务端未确认清理结果');
+      showToast(`已清理 ${result.pruned} 条调用追踪`);
+      await refreshData();
+    } catch (err) {setActionError(`清理结果未确认：${err instanceof Error ? err.message : String(err)}。请刷新核对，勿重复提交。`);}
+    finally {writing.current = false; setPruning(false);}
   };
 
   const refreshNoticesForReview = async () => {
@@ -552,12 +593,14 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
     if ((cardStatusFilter === 'CURRENT' && (c.status === 'voided' || c.archivedAt != null)) || (cardStatusFilter === 'ARCHIVED' && c.archivedAt == null) || (!['ALL', 'CURRENT', 'ARCHIVED'].includes(cardStatusFilter) && c.status.toUpperCase() !== cardStatusFilter.toUpperCase())) {
       return false;
     }
-    if (searchQuery) {
-      const q = searchQuery.toLowerCase();
+    if (searchQuery.trim()) {
+      const q = searchQuery.trim().toLowerCase();
       return c.id.toLowerCase().includes(q) || (c.note && c.note.toLowerCase().includes(q)) || c.boundDevices.some(d => d.toLowerCase().includes(q));
     }
     return true;
   });
+  const cardFiltersChanged = !!searchQuery || groupFilter !== 'ALL' || cardStatusFilter !== 'CURRENT';
+  const resetCardFilters = () => {setSearchQuery(''); setGroupFilter('ALL'); setCardStatusFilter('CURRENT'); setCardPage(0);};
   const pageCount = Math.max(1, Math.ceil(filteredCards.length / 50));
   const currentCardPage = Math.min(cardPage, pageCount - 1);
   const pageCards = filteredCards.slice(currentCardPage * 50, (currentCardPage + 1) * 50);
@@ -577,18 +620,19 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
         </div>
       )}
 
+      <a className="skip-link" href="#admin-workspace">跳到工作区</a>
       <aside className="sidebar">
         <div><h1>Superkiro</h1><p className="brand-caption">SUPERKIRO / CONTROL</p>
           <nav aria-label="管理导航">{(Object.keys(pages) as Tab[]).map(id => <button key={id} aria-current={activeTab === id ? 'page' : undefined} onClick={() => navigate(id)}>{pages[id][0]}</button>)}</nav>
         </div>
         <div className="sidebar-footer"><p>管理员 · {isAuthenticated ? '会话有效' : '尚未认证'}</p><button onClick={() => navigate('security')}>安全设置</button><span> / </span><button onClick={() => void handleLogout(false)}>退出</button></div>
       </aside>
-      <main className="workspace">
+      <main className="workspace" id="admin-workspace" tabIndex={-1}>
         <header className="topbar"><span>工作台 / {pages[activeTab][0]}</span><div><span>{syncedAt ? `最近同步 ${syncedAt}` : '尚未同步'}</span><button onClick={() => navigate('security')}>管理会话</button><button disabled={loading || cardBulkBusy} onClick={() => refreshData()}>{loading ? '刷新中…' : '刷新'}</button></div></header>
         <div className="page-content" key={isAuthenticated ? 'authenticated' : 'anonymous'}>
           <div className="page-heading"><div><h2>{pages[activeTab][0]}</h2><p>{pages[activeTab][1]}</p></div>{activeTab === 'overview' && <button disabled title="现有接口仅返回最近追踪，不支持完整日期聚合" className="sample-range">最近样本 · 日期筛选未支持</button>}{activeTab === 'cards' && <button className="primary" disabled={!isAuthenticated} onClick={() => setShowBatchModal(true)}>＋ 批量生成</button>}{activeTab === 'providers' && <button disabled={!isAuthenticated} className="primary" onClick={() => selectProviderKey()}>＋ 添加供应商</button>}</div>
           {!operator&&<p role="status" className="notice-panel">刷新后需重新登录确认账户，才能新建或恢复调账。<button onClick={onReauthenticate}>重新登录确认调账账户</button></p>}
-          {actionError && <div role="alert" className="notice-panel">{actionError} <button onClick={() => setActionError('')}>关闭提示</button></div>}{loadError && <p role="alert" className="notice-panel">{loadError}</p>}
+          {actionError && <div role="alert" className="notice-panel">{actionError} <button onClick={() => setActionError('')}>关闭提示</button></div>}{loadError && <div role="alert" className="notice-panel"><p>{loadError}</p><button disabled={loading || cardBulkBusy} onClick={() => void refreshData()}>重新读取数据</button></div>}
           {activeTab === 'overview' && <div className="space-y-6">
             <div className="metric-grid">
               <section className="panel metric"><p>成功请求</p><strong>{traces.length ? successfulTraces.toLocaleString() : '—'}</strong><small>最近 {traces.length} 条追踪样本 · 非全天</small></section>
@@ -596,25 +640,25 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
               <section className="panel metric"><p>已结算积分</p><strong>{financials ? (financials.dashboard.total_credits_charged / 1_000_000).toLocaleString() : '—'}</strong><small>仅含已完成结算</small></section>
               <section className="panel metric"><p>已配置采购成本估算</p><strong>{estimatedMoney(financialEstimates(financials)?.configuredProviderCostMicroCny)}</strong><small>仅保留账本；覆盖范围见财务对账</small></section>
             </div>
-            <div className="overview-grid"><section className="panel"><h3>请求量</h3><p className="muted">最近读取的 {traces.length} 条调用追踪 · 非全天统计 · 本地时区按两小时合并（可跨日）</p><div className="request-chart" role="img" aria-label={`最近 ${traces.length} 条追踪按本地时段分布`}>{traces.length ? traceBins.map((count, hour) => { return <div className="chart-column" title={`${hour * 2}:00–${hour * 2 + 2}:00 · ${count} 条`} key={hour}><span>{count}</span><div style={{height: `${count / Math.max(1, ...traceBins) * 180}px`}}/><small>{String(hour * 2).padStart(2, '0')}</small></div>; }) : <p className="empty-state">暂无调用追踪数据</p>}</div></section>
+            <div className="overview-grid"><section className="panel"><h3>请求量</h3><p className="muted">最近读取的 {traces.length} 条调用追踪 · 非全天统计 · 本地时区按两小时合并（可跨日）</p><div className="request-chart" role="img" aria-label={`最近 ${traces.length} 条追踪按本地时段分布`}>{traces.length ? traceBins.map((count, hour) => { return <div className="chart-column" title={`${hour * 2}:00–${hour * 2 + 2}:00 · ${count} 条`} key={hour}><span>{count}</span><div style={{height: `${count / Math.max(1, ...traceBins) * 180}px`}}/><small>{String(hour * 2).padStart(2, '0')}</small></div>; }) : <ListEmptyState loading={loading} failed={dataFailures.traces} empty="暂无调用追踪数据" onRetry={() => void refreshData()} />}</div></section>
             <section className="panel attention"><h3>需要关注</h3><h4>{providersLoaded ? providerKeys.filter(k => Number(k.cooldown_until ?? 0) > Date.now() / 1000).length : '—'} 个 Key 正在冷却</h4><button onClick={() => navigate('providers')}>查看供应商状态 →</button><h4>{stats ? stats.frozenCards + stats.bannedCards : '—'} 张异常卡密</h4><button onClick={() => navigate('cards')}>查看卡密资产 →</button><p className="muted">成本覆盖及面值估算见财务对账，不代表实际毛利。</p></section></div>
-            <section className="panel"><h3>服务健康</h3><table><thead><tr><th>服务</th><th>状态</th><th>Key 数量</th><th>操作</th></tr></thead><tbody>{providers.map(p => <tr key={String(p.id)}><td>{String(p.name || p.id)}</td><td>{p.enabled === false ? '已停用' : '已启用 · 健康状态见 Key'}</td><td>{providerKeys.filter(k => k.provider_id === p.id).length}</td><td><button onClick={() => navigate('providers')}>查看 Key →</button></td></tr>)}{!providers.length && <tr><td colSpan={4} className="empty-state">暂无服务端供应商数据</td></tr>}</tbody></table></section>
+            <section className="panel"><h3>服务健康</h3><table><thead><tr><th>服务</th><th>状态</th><th>Key 数量</th><th>操作</th></tr></thead><tbody>{providers.map(p => <tr key={String(p.id)}><td>{String(p.name || p.id)}</td><td>{p.enabled === false ? '已停用' : '已启用 · 健康状态见 Key'}</td><td>{providerKeys.filter(k => k.provider_id === p.id).length}</td><td><button onClick={() => navigate('providers')}>查看 Key →</button></td></tr>)}{!providers.length && <tr><td colSpan={4} className="empty-state"><ListEmptyState loading={loading} failed={dataFailures.providers} empty="尚未配置供应商" onRetry={() => void refreshData()} /></td></tr>}</tbody></table></section>
           </div>}
 
           {/* TAB 2: CARDS */}
           {activeTab === 'cards' && (
             <div className="space-y-4">
-              <div className="flex justify-between items-center">
-                <div className="flex gap-2">
-                  <input
+              <div className="card-filters" role="search" aria-label="卡密筛选">
+                <div className="filter-fields">
+                  <label>搜索卡密<input
                     type="text"
                     disabled={cardBulkBusy} aria-label="搜索卡密" placeholder="搜索卡密 ID / 备注 / 设备标识"
                     value={searchQuery}
                     onChange={(e) => setSearchQuery(e.target.value)}
-                    className="px-3 py-1.5 bg-white border border-[#E5E8E5] rounded text-xs text-[#23272B] w-64 focus:outline-none focus:border-[#E9C8C1]"
-                  />
-                  <select disabled={cardBulkBusy} aria-label="分组筛选" value={groupFilter} onChange={e => setGroupFilter(e.target.value)}><option value="ALL">全部分组</option>{Array.from(new Set(cards.map(c => c.groupId))).map(id => <option key={id}>{id}</option>)}</select>
-                  <select disabled={cardBulkBusy} aria-label="状态筛选"
+                    className="px-3 py-1.5 bg-white border border-[#E5E8E5] rounded text-xs text-[#23272B]"
+                  /></label>
+                  <label>模型与计费分组<select disabled={cardBulkBusy} aria-label="分组筛选" value={groupFilter} onChange={e => setGroupFilter(e.target.value)}><option value="ALL">全部分组</option>{Array.from(new Set(cards.map(c => c.groupId))).map(id => <option key={id} value={id}>{String(cardGroups.find(group => group.id === id)?.name ?? id)} · {id}</option>)}</select></label>
+                  <label>卡密状态<select disabled={cardBulkBusy} aria-label="状态筛选"
                     value={cardStatusFilter}
                     onChange={(e) => setCardStatusFilter(e.target.value)}
                     className="px-3 py-1.5 bg-white border border-[#E5E8E5] rounded text-xs text-[#23272B]"
@@ -624,7 +668,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
                     <option value="UNACTIVATED">未激活</option>
                     <option value="FROZEN">已冻结</option>
                     <option value="BANNED">已封禁</option><option value="EXPIRED">已到期</option><option value="VOIDED">已删除（作废记录）</option>
-                  </select>
+                  </select></label>
                 </div>
                 <div className="flex gap-2">
                   <button
@@ -637,6 +681,8 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
                 </div>
               </div>
 
+              <div className="filter-summary"><p role="status">匹配 {filteredCards.length} / 已读取 {cards.length} 张卡密 · 仅筛选已加载记录{dataFailures.cards ? '（上次读取结果）' : ''}</p>{cardFiltersChanged && <button disabled={cardBulkBusy} onClick={resetCardFilters}>重置卡密筛选</button>}</div>
+              {mutationBusy && <p role="status">正在提交卡密操作，请等待结果，勿重复操作…</p>}
               {adjustment.current && <section className="notice-panel" aria-label="未确认调账恢复"><p>卡 {adjustment.current.cardId} 有未确认调账。即使原卡已被删除或归档，也可使用原幂等键核对，不会创建第二笔调账。</p><button disabled={cardBulkBusy || mutationBusy || loading} onClick={() => {
                 try {
                   if (!operator) return;
@@ -650,13 +696,13 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
               <section className="panel" aria-label="批量卡密管理">
                 <p>已选 {selectedCardIds.length} 张卡密 · 批量操作仅针对当前页所选卡密。</p>
                 <p className="muted">删除支持已激活卡密，永久撤销使用权限并保留财务记录，不自动退款。有在途请求时请先冻结，等待结算后重试。仅需清理列表可归档已封禁或到期记录，取消归档不会恢复授权。列表与总量统计保留已作废、归档卡的账面余额，不代表可消费积分。导出文件包含完整卡密，请妥善保管。筛选、翻页或刷新后需重新选择。</p><div className="actions">
-                  <button disabled={cardBulkBusy || loading || !pageCards.length} onClick={() => setSelectedCardIds(pageCards.map(card => card.id))}>当前页全选</button>
+                  <button disabled={cardBulkBusy || !!dataFailures.cards || loading || !pageCards.length} onClick={() => setSelectedCardIds(pageCards.map(card => card.id))}>当前页全选</button>
                   <button disabled={cardBulkBusy || !selectedCardIds.length} onClick={() => setSelectedCardIds([])}>清空选择</button>
-                  {(['freeze', 'unfreeze', 'ban', 'void', 'archive', 'unarchive', 'export'] as const).map(action => <button className={(action === 'ban' || action === 'void') ? 'danger' : action === 'export' ? 'primary' : 'secondary'} key={action} disabled={cardBulkBusy || loading || mutationBusy || revealing || !selectedCardIds.length} onClick={() => void handleCardBulk(action)}>{{freeze: '批量冻结', unfreeze: '批量解冻', ban: '批量封禁', void: '批量删除（永久作废）', archive: '批量归档', unarchive: '取消归档', export: '导出已选卡密'}[action]}</button>)}
+                  {(['freeze', 'unfreeze', 'ban', 'void', 'archive', 'unarchive', 'export'] as const).map(action => <button className={(action === 'ban' || action === 'void') ? 'danger' : action === 'export' ? 'primary' : 'secondary'} key={action} disabled={cardBulkBusy || !!dataFailures.cards || loading || mutationBusy || revealing || !selectedCardIds.length} onClick={() => void handleCardBulk(action)}>{{freeze: '批量冻结', unfreeze: '批量解冻', ban: '批量封禁', void: '批量删除（永久作废）', archive: '批量归档', unarchive: '取消归档', export: '导出已选卡密'}[action]}</button>)}
                 </div>
                 {cardBulkBusy && <p role="status">正在逐项处理，请勿重复提交…</p>}
                 {!!cardBulkResults.length && <div aria-label="批量操作结果" role="status"><p>本次逐项结果（不含卡密明文）：</p>{cardBulkResults.map(item => <p key={item.id}>{item.id}：{item.result}</p>)}</div>}
-                <div className="actions"><button disabled={cardBulkBusy || loading || currentCardPage === 0} onClick={() => {setSelectedCardIds([]); setCardPage(currentCardPage - 1);}}>上一页</button><span>第 {currentCardPage + 1} / {pageCount} 页 · 每页 50 条 · 共 {filteredCards.length} 条</span><button disabled={cardBulkBusy || loading || currentCardPage + 1 >= pageCount} onClick={() => {setSelectedCardIds([]); setCardPage(currentCardPage + 1);}}>下一页</button></div>
+                <div className="actions"><button disabled={cardBulkBusy || !!dataFailures.cards || loading || currentCardPage === 0} onClick={() => {setSelectedCardIds([]); setCardPage(currentCardPage - 1);}}>上一页</button><span>第 {currentCardPage + 1} / {pageCount} 页 · 每页 50 条 · 共 {filteredCards.length} 条</span><button disabled={cardBulkBusy || !!dataFailures.cards || loading || currentCardPage + 1 >= pageCount} onClick={() => {setSelectedCardIds([]); setCardPage(currentCardPage + 1);}}>下一页</button></div>
               </section>
               <p className="table-hint">左右滑动表格查看全部信息和操作。</p>
               <table className="w-full text-left border-collapse bg-white rounded-xl border border-[#E5E8E5] overflow-hidden">
@@ -674,7 +720,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
                   {filteredCards.length > 0 ? (
                     pageCards.map((card) => (
                       <tr key={card.id}>
-                        <td><input type="checkbox" aria-label={`选择卡密 ${card.id}`} disabled={cardBulkBusy || loading} checked={selectedCardIds.includes(card.id)} onChange={e => {const checked = e.currentTarget.checked; setSelectedCardIds(ids => checked ? [...ids, card.id] : ids.filter(id => id !== card.id));}} /></td>
+                        <td><input type="checkbox" aria-label={`选择卡密 ${card.id}`} disabled={cardBulkBusy || !!dataFailures.cards || loading} checked={selectedCardIds.includes(card.id)} onChange={e => {const checked = e.currentTarget.checked; setSelectedCardIds(ids => checked ? [...ids, card.id] : ids.filter(id => id !== card.id));}} /></td>
                         <td className="p-3 font-mono text-[#475467]">{card.id}{card.note && <small className="card-note">{card.note}</small>}</td>
                         <td className="p-3" title={card.groupId}>{String(cardGroups.find(group => group.id === card.groupId)?.name ?? card.groupId)}</td>
                         <td className="p-3">
@@ -710,7 +756,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
                             catch (err: any) {setActionError(`查看失败：${err.message}`);} finally {setRevealing(false);}
                           }}>{card.codeRecoverable ? '查看卡密' : '无可用明文'}</button>{!card.codeRecoverable && <small className="block muted">此卡未保留明文，请查阅原发放记录。</small>}
                           <button
-                            disabled={card.status === 'voided' || cardBulkBusy || mutationBusy}
+                            disabled={card.status === 'voided' || cardBulkBusy || loading || !!dataFailures.cards || mutationBusy}
                             title={card.status === 'voided' ? '已删除卡密不可调账，请通过账本查看作废记录' : '调整积分并保留账本记录'}
                             onClick={() => {
                               if(cardBulkBusy || card.status === 'voided')return;
@@ -727,7 +773,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
                           </button>
                           {card.status === 'active' && (
                             <button
-                              disabled={cardBulkBusy || mutationBusy} onClick={() => handleCardStatus(card.id, 'freeze')}
+                              disabled={cardBulkBusy || loading || !!dataFailures.cards || mutationBusy} onClick={() => handleCardStatus(card.id, 'freeze')}
                               className="text-[#A87029] hover:underline"
                             >
                               冻结
@@ -735,7 +781,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
                           )}
                           {card.status === 'frozen' && (
                             <button
-                              disabled={cardBulkBusy || mutationBusy} onClick={() => handleCardStatus(card.id, 'unfreeze')}
+                              disabled={cardBulkBusy || loading || !!dataFailures.cards || mutationBusy} onClick={() => handleCardStatus(card.id, 'unfreeze')}
                               className="text-[#39816D] hover:underline"
                             >
                               解冻
@@ -743,7 +789,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
                           )}
                           {!['banned', 'voided'].includes(card.status) && (
                             <button
-                              disabled={cardBulkBusy || mutationBusy} onClick={() => handleCardStatus(card.id, 'ban')}
+                              disabled={cardBulkBusy || loading || !!dataFailures.cards || mutationBusy} onClick={() => handleCardStatus(card.id, 'ban')}
                               className="danger"
                             >
                               封禁
@@ -755,7 +801,8 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
                   ) : (
                     <tr>
                       <td colSpan={7} className="p-6 text-center text-[#7B8388]">
-                        {isAuthenticated ? '暂无匹配的卡密记录' : '请先登录以获取实时卡密数据'}
+                        <ListEmptyState loading={loading} failed={dataFailures.cards} empty={!cards.length ? '尚无卡密记录。可通过「批量生成」创建卡密。' : '没有符合当前筛选条件的卡密。'} onRetry={() => void refreshData()} />
+                        {!loading && !dataFailures.cards && cards.length > 0 && <button disabled={cardBulkBusy} onClick={() => {resetCardFilters(); setCardStatusFilter('ALL');}}>查看全部记录</button>}
                       </td>
                     </tr>
                   )}
@@ -768,13 +815,14 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
             <h3>上次制卡结果待核对</h3>{issuanceReference && <p className="card-note">{issuanceReference}</p>}<p>请求可能已经入库，已暂停再次制卡。请刷新卡密列表，按下方批次编号搜索，并核对数量；已生成的卡密可在列表中查看或导出。</p>
             <div className="actions"><button disabled={!issuanceReference} onClick={() => {setSearchQuery(issuanceReference);setGroupFilter('ALL');setCardStatusFilter('ALL');}}>按本批次筛选</button><button disabled={issuanceChecking || loading} onClick={() => void refreshIssuanceForReview()}>{issuanceChecking ? '正在刷新卡密…' : '刷新卡密以核对'}</button><button disabled={issuanceChecking || issuanceRecovery !== 'review'} onClick={() => {if(!window.confirm('确认已核对最新卡密列表？已有本次生成结果时，请勿重复制卡。解除限制不会自动生成。'))return;try{sessionStorage.removeItem(issuanceStorageKey);setIssuanceRecovery(null);setActionError('');}catch{setActionError('无法清除待核对记录，仍禁止制卡。请检查浏览器存储。');}}}>已核对列表，解除制卡限制</button></div>
           </section>}
-          {activeTab === 'cards' && <div className="two-columns page-supplement"><section className="panel"><h3>批量生成卡密</h3><p>PRO 1,000 · PRO+ 2,000 · PRO Max 5,000 · Power 10,000</p><p className="muted">每张卡密仅限一台设备。支持恢复的卡密可在列表中按需查看，请安全交付。</p><div className="actions"><button className="primary" disabled={!isAuthenticated} onClick={() => setShowBatchModal(true)}>预览生成清单</button></div></section><section className="notice-panel"><h3>额度调整需要留下原因</h3><p>从卡密记录选择调账，填写增减积分与操作原因，确认后写入账本。结果未确认时保持原参数重试，不要另起调账。</p><p className="muted">当前显示 {filteredCards.length} 条匹配记录，已分页读取卡密列表。</p></section></div>}
+          {activeTab === 'cards' && <div className="two-columns page-supplement"><section className="panel"><h3>批量生成卡密</h3><p>PRO 1,000 · PRO+ 2,000 · PRO Max 5,000 · Power 10,000</p><p className="muted">每张卡密仅限一台设备。支持恢复的卡密可在列表中按需查看，请安全交付。</p><div className="actions"><button className="primary" disabled={!isAuthenticated} onClick={() => setShowBatchModal(true)}>预览生成清单</button></div></section><section className="notice-panel"><h3>额度调整需要留下原因</h3><p>从卡密记录选择调账，填写增减积分与操作原因，确认后写入账本。结果未确认时保持原参数重试，不要另起调账。</p><p className="muted">当前匹配 {filteredCards.length} 条记录；筛选在已读取列表内进行，每页显示 50 条。</p></section></div>}
           {/* TAB 3: GROUPS */}
           {activeTab === 'groups' && isAuthenticated && <CommercialEditor key="groups" kind="groups" onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy} />}
 
           {/* TAB 4: PROVIDERS */}
           {activeTab === 'providers' && isAuthenticated && (
             <div className="space-y-4">
+              {providerBusy && <p role="status">正在更新供应商状态，请等待结果…</p>}
               <div className="flex justify-between items-center">
                 <h3 className="font-semibold text-[#23272B]">供应商连接与 API 密钥</h3>
                 <div className="flex gap-2">
@@ -795,7 +843,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
                           {p.enabled !== false ? '● 启用中' : '○ 已停用'}
                         </span>
                         <button
-                          disabled={providerBusy} aria-busy={providerBusy}
+                          disabled={providerBusy || loading || !!dataFailures.providers} aria-busy={providerBusy}
                           onClick={() => handleToggleProvider(p.id, p.enabled !== false)}
                           className={`px-2.5 py-1 text-xs rounded border transition-colors ${p.enabled !== false ? 'bg-[#FFF5EA] hover:bg-[#FFF5EA] text-[#A87029] border-amber-800' : 'bg-[#EDF5F0] hover:bg-[#EDF5F0] text-[#39816D] border-emerald-800'}`}
                         >
@@ -834,7 +882,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
                 ))
               ) : (
                 <div className="p-6 rounded-xl bg-white border border-[#E5E8E5] text-[#7B8388] text-xs text-center">
-                  暂无已读取的供应商记录，请先认证并刷新。
+                  <ListEmptyState loading={loading} failed={dataFailures.providers} empty="尚未配置供应商。请使用「添加供应商」配置连接与密钥。" onRetry={() => void refreshData()} />
                 </div>
               )}
             </div>
@@ -845,7 +893,12 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
           {/* TAB 5: MODELS */}
           {activeTab === 'models' && isAuthenticated && <CommercialEditor key="models" kind="models" onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy} />}
 
-          {activeTab === 'traces' && <div className="space-y-6"><section className="panel trace-toolbar"><label>搜索调用记录<input aria-label="搜索调用记录" placeholder="请求 ID、卡密、模型或状态" value={traceQuery} onChange={e => {setTraceQuery(e.target.value); setTracePage(0);}} /></label><p className="muted">最近 {traces.length} 条记录，匹配 {filteredTraces.length} 条。仅筛选已加载记录。</p><div className="actions"><button disabled={currentTracePage === 0} onClick={() => setTracePage(currentTracePage - 1)}>上一页</button><span>第 {currentTracePage + 1} / {tracePageCount} 页 · 每页 20 条</span><button disabled={currentTracePage + 1 >= tracePageCount} onClick={() => setTracePage(currentTracePage + 1)}>下一页</button></div></section><section className="panel"><table><thead><tr><th>请求 ID</th><th>模型</th><th>首字耗时</th><th>结算</th><th>结果</th><th>操作</th></tr></thead><tbody>{filteredTraces.slice(currentTracePage * 20, (currentTracePage + 1) * 20).map((trace, index) => <tr key={String(trace.id ?? index)} className={selectedTrace === trace ? 'selected-row' : ''}><td>{String(trace.id ?? '—')}</td><td>{String(trace.exposed_model ?? '—')}</td><td>{trace.ttft_ms == null ? '—' : `${trace.ttft_ms} ms`}</td><td>{trace.credits_charged == null ? '—' : `${(Number(trace.credits_charged)/1_000_000).toFixed(6)} 积分`}</td><td><span className={`status-badge status-${String(trace.status)}`}>{traceStatusLabel(trace.status)}</span></td><td><button onClick={() => {setSelectedTrace(trace); requestAnimationFrame(() => document.getElementById('trace-detail')?.focus());}}>详情 →</button></td></tr>)}{!filteredTraces.length && <tr><td colSpan={6} className="empty-state">{traceQuery.trim() ? '没有符合条件的请求，请调整筛选条件。' : '暂无调用记录'}</td></tr>}</tbody></table></section>
+          {activeTab === 'traces' && <div className="space-y-6"><section className="panel trace-toolbar" role="search" aria-label="追踪筛选">
+            <div className="filter-fields"><label>搜索调用记录<input aria-label="搜索调用记录" placeholder="请求 ID、卡密、模型或状态" value={traceQuery} onChange={e => {setTraceQuery(e.target.value); setTracePage(0);}} /></label>
+              <label>请求结果<select aria-label="追踪状态筛选" value={traceStatusFilter} onChange={e => {setTraceStatusFilter(e.target.value); setTracePage(0);}}><option value="ALL">全部结果</option><option value="error">失败</option><option value="client_aborted">客户端中断</option><option value="in_progress">处理中</option><option value="success">成功</option></select></label></div>
+            <div className="filter-summary"><p className="muted" role="status">最近 {traces.length} 条记录，匹配 {filteredTraces.length} 条。仅筛选已加载记录。</p>{traceFiltersChanged && <button onClick={resetTraceFilters}>清除追踪筛选</button>}</div>
+            <div className="actions"><button disabled={currentTracePage === 0} onClick={() => setTracePage(currentTracePage - 1)}>上一页</button><span>第 {currentTracePage + 1} / {tracePageCount} 页 · 每页 20 条</span><button disabled={currentTracePage + 1 >= tracePageCount} onClick={() => setTracePage(currentTracePage + 1)}>下一页</button></div></section>
+            <section className="panel"><table><caption className="sr-only">最近调用追踪，仅包含已加载样本</caption><thead><tr><th>请求 ID</th><th>模型</th><th>首字耗时</th><th>结算</th><th>结果</th><th>操作</th></tr></thead><tbody>{filteredTraces.slice(currentTracePage * 20, (currentTracePage + 1) * 20).map((trace, index) => <tr key={String(trace.id ?? index)} className={selectedTrace === trace ? 'selected-row' : ''}><td>{String(trace.id ?? '—')}</td><td>{String(trace.exposed_model ?? '—')}</td><td>{trace.ttft_ms == null ? '—' : `${trace.ttft_ms} ms`}</td><td>{trace.credits_charged == null ? '—' : `${(Number(trace.credits_charged)/1_000_000).toFixed(6)} 积分`}</td><td><span className={`status-badge status-${String(trace.status)}`}>{traceStatusLabel(trace.status)}</span></td><td><button onClick={() => {setSelectedTrace(trace); document.getElementById('trace-detail')?.focus();}}>详情 →</button></td></tr>)}{!filteredTraces.length && <tr><td colSpan={6} className="empty-state"><ListEmptyState loading={loading} failed={dataFailures.traces} empty={traces.length ? '没有符合条件的请求，请调整或清除筛选。' : '暂无调用记录。这里只显示服务端保留的最近样本。'} onRetry={() => void refreshData()} /></td></tr>}</tbody></table></section>
             <div className="two-columns"><section id="trace-detail" tabIndex={-1} className="panel"><h3>请求详情</h3>{selectedTrace ? <><p>{String(selectedTrace.id)}</p><p className="muted">{new Date(Number(selectedTrace.ts)*1000).toLocaleString()} · 卡密 {String(selectedTrace.card_id)}</p><p>Tokens：{String(selectedTrace.input_tokens ?? '—')} / {String(selectedTrace.output_tokens ?? '—')} · 速率 {String(selectedTrace.tokens_per_second ?? '—')} Tokens/s</p><pre>{JSON.stringify(selectedTrace.attempt_chain ?? [], null, 2)}</pre><button className="primary" onClick={async () => {try {await navigator.clipboard.writeText(String(selectedTrace.id)); showToast('已复制请求 ID');} catch {showToast('复制失败，请手动复制请求 ID');}}}>复制请求 ID</button></> : <p className="muted">选择请求查看重试链路、Tokens 与结算详情。</p>}</section></div>
             <section className="notice-panel"><h3>失败处理</h3><p>临时错误仅在首段输出前按策略重试。发生部分输出后不重放流，避免重复内容与扣费。</p></section>
           </div>}
@@ -870,15 +923,14 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
                         <span className="text-[#23272B] font-medium">{String(row.model_id ?? '')}</span>
                         <span className="text-[#7B8388]">账本成本记录：{estimatedMoney(row.provider_cost_micro_cny)} · 0 不代表采购免费，覆盖范围见上方</span>
                       </div>
-                    )) : <p className="text-xs text-[#7B8388]">暂无服务端财务数据。</p>}
+                    )) : <ListEmptyState loading={loading} failed={dataFailures.financials} empty="暂无模型账本成本记录，不能据此判断成本为零。" onRetry={() => void refreshData()} />}
                   </div>
                 <div className="p-4 rounded-xl bg-white border border-[#E5E8E5] space-y-3">
-                  <h4 className="font-bold text-[#23272B] text-sm">数据保留策略 (Data Retention & Pruning)</h4>
+                  <h4 className="font-bold text-[#23272B] text-sm">调用追踪保留与清理</h4>
                   <p className="text-xs text-[#7B8388]">手动清理 30 天以前的调用链日志。清理不可撤销，请先完成审计与备份。</p>
                   <div className="flex items-center gap-3 pt-2">
-                    <button onClick={async () => { if (!window.confirm('确认永久清理 30 天以前的调用追踪？')) return; try { const result = await adminApi.pruneTraces(Math.floor(Date.now() / 1000) - 30 * 86400); showToast(`已清理 ${result.pruned} 条 trace`); await refreshData(); } catch (err: any) { setActionError(`清理失败：${err.message}`); } }} className="px-3 py-1.5 bg-[#FBEAE5] hover:bg-[#FBEAE5] text-[#B94B39] border border-rose-800 rounded text-xs font-medium">
-                      执行就地安全清理 (Prune &gt;30d)
-                    </button>
+                    <button disabled={pruning} aria-busy={pruning} onClick={() => void handlePruneTraces()} className="danger">{pruning ? '正在清理，请稍候…' : '永久清理 30 天前的追踪'}</button>
+                    {pruning && <p role="status">清理正在提交，请勿重复操作。</p>}
                     <span className="text-xs text-[#7B8388]">按服务端接口执行，结果可复核</span>
                   </div>
                 </div>
@@ -892,7 +944,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
               <div className="actions"><button disabled={noticeChecking} onClick={() => void refreshNoticesForReview()}>{noticeChecking ? '正在刷新公告…' : '刷新公告以核对'}</button>
                 <button disabled={noticeChecking || noticeRecovery !== 'review'} onClick={() => {if (window.confirm('确认已核对刷新后的公告列表？若已有相同公告，请勿再次发布。解除限制不会自动提交。')) {try{sessionStorage.removeItem(noticeStorageKey);setNoticeRecovery(null);setActionError('');}catch{setActionError('无法清除待核对记录，仍禁止发布。');}}}}>已核对列表，解除发布限制</button></div>
             </section>}
-            <section className="panel"><table><thead><tr><th>标题</th><th>范围</th><th>发布时间</th><th>状态</th><th>操作</th></tr></thead><tbody>{announcements.map(notice => <tr key={notice.id}><td>{notice.title}</td><td>全部用户</td><td>{new Date(notice.created_at * 1000).toLocaleString()}</td><td>{!notice.enabled ? '已停用' : notice.expires_at && notice.expires_at < Date.now()/1000 ? '已到期' : '已发布'}</td><td><details><summary>预览</summary><p>{notice.content}</p></details></td></tr>)}{!announcements.length && <tr><td colSpan={5} className="empty-state">暂无已读取的公告</td></tr>}</tbody></table></section>
+            <section className="panel"><table><thead><tr><th>标题</th><th>范围</th><th>发布时间</th><th>状态</th><th>操作</th></tr></thead><tbody>{announcements.map(notice => <tr key={notice.id}><td>{notice.title}</td><td>全部用户</td><td>{new Date(notice.created_at * 1000).toLocaleString()}</td><td>{!notice.enabled ? '已停用' : notice.expires_at && notice.expires_at < Date.now()/1000 ? '已到期' : '已发布'}</td><td><details><summary>预览</summary><p>{notice.content}</p></details></td></tr>)}{!announcements.length && <tr><td colSpan={5} className="empty-state"><ListEmptyState loading={loading} failed={dataFailures.announcements} empty="尚无公告。可在下方编辑并预览，确认后发布。" onRetry={() => void refreshData()} /></td></tr>}</tbody></table></section>
             <div className="two-columns"><section className="panel"><h3>编辑公告</h3><div className="field-grid"><label>标题<input aria-label="公告标题" value={noticeTitle} onChange={e => setNoticeTitle(e.target.value)} /></label><label>等级<select aria-label="公告等级" value={noticeLevel} onChange={e => setNoticeLevel(e.target.value as typeof noticeLevel)}><option value="info">普通提示</option><option value="warning">预警通知</option><option value="critical">紧急通知</option></select></label><label className="full-width">正文<textarea rows={4} aria-label="正文内容" value={noticeContent} onChange={e => setNoticeContent(e.target.value)} /></label></div></section><section className="panel"><h3>用户侧预览</h3><h4>{noticeTitle || '尚未填写标题'}</h4><p className="preview-content">{noticeContent || '填写正文后在此预览。'}</p><p className="muted">全部用户 · 发布后有效期 7 天</p><div className="actions"><button className="primary" disabled={!isAuthenticated || !!noticeRecovery || !noticeTitle.trim() || !noticeContent.trim()} onClick={() => setShowNoticeModal(true)}>预览并确认发布</button></div></section></div>
             <section className="notice-panel"><h3>发布确认</h3><p>公告发布后对全部用户可见，有效期为 7 天。请确认正文、通知等级和服务状态准确。</p></section>
           </div>}
@@ -900,12 +952,12 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
           {/* TAB 9: SECURITY */}
           {activeTab === 'security' && (
             <div className="space-y-4">
-              <section className="panel"><h3>配置发布审计</h3><p className="muted">记录分组、模型与定价的配置发布。卡密调账记录请在财务对账中查看。</p><table><thead><tr><th>时间</th><th>操作人 / 原因</th><th>原版本</th><th>发布版本</th></tr></thead><tbody>{audit.map((row, index) => <tr key={index}><td>{row.created_at_secs ? new Date(Number(row.created_at_secs) * 1000).toLocaleString() : '—'}</td><td>{String(row.operator ?? '—')} · {String(row.reason ?? '—')}</td><td>{String(row.previous_revision ?? '—')}</td><td>{String(row.revision ?? '—')}</td></tr>)}{!audit.length && <tr><td colSpan={4} className="empty-state">{auditError || '暂无已读取的配置审计记录'}</td></tr>}</tbody></table></section>
+              <section className="panel"><h3>配置发布审计</h3><p className="muted">记录分组、模型与定价的配置发布。卡密调账记录请在财务对账中查看。</p><table><thead><tr><th>时间</th><th>操作人 / 原因</th><th>原版本</th><th>发布版本</th></tr></thead><tbody>{audit.map((row, index) => <tr key={index}><td>{row.created_at_secs ? new Date(Number(row.created_at_secs) * 1000).toLocaleString() : '—'}</td><td>{String(row.operator ?? '—')} · {String(row.reason ?? '—')}</td><td>{String(row.previous_revision ?? '—')}</td><td>{String(row.revision ?? '—')}</td></tr>)}{!audit.length && <tr><td colSpan={4} className="empty-state"><ListEmptyState loading={loading || auditLoading} failed={!!auditError} empty="暂无配置发布审计记录" onRetry={() => void refreshData()} /></td></tr>}</tbody></table></section>
               <div className="flex justify-between items-center">
                 <h3 className="font-semibold text-[#23272B]">部署安全状态</h3>
                 <button onClick={() => showToast('KEK 轮换必须通过外部密钥管理/部署流程执行')} className="px-3 py-1.5 bg-[#EFF1EF] hover:bg-[#EFF1EF] text-[#23272B] rounded text-xs font-medium">KEK 轮换说明</button>
               </div>
-              <div className="two-columns"><section className="panel"><h3>管理员会话</h3><p>使用管理员账号和密码登录，会话有效期 15 分钟。</p><p>当前会话：{isAuthenticated ? '有效' : '未认证'}</p><div className="actions"><button className="primary" onClick={() => void handleLogout(false)}>退出登录</button><button className="danger" disabled={!isAuthenticated} onClick={() => {if (window.confirm('确认退出所有管理员会话？所有已登录管理员都需要重新登录。')) void handleLogout(true);}}>全部会话下线</button></div></section><section className="panel"><h3>双因素验证</h3><p>{adminApi.twoFactorEnabled === true ? '已启用：登录时需输入动态验证码。' : adminApi.twoFactorEnabled === false ? '未启用：当前仅使用账号和密码登录。' : '暂时无法确认双因素验证状态，请重新验证会话。'}</p><p className="muted">双因素验证由服务器配置管理，本页面不支持修改。</p></section></div>
+              <div className="two-columns"><section className="panel"><h3>管理员会话</h3><p>使用管理员账号和密码登录，会话有效期 15 分钟。</p><p>当前会话：{isAuthenticated ? '有效' : '未认证'}</p><div className="actions"><button className="primary" onClick={() => void handleLogout(false)}>退出登录</button><button className="danger" disabled={!isAuthenticated} onClick={() => void handleLogout(true)}>全部会话下线</button></div></section><section className="panel"><h3>双因素验证</h3><p>{adminApi.twoFactorEnabled === true ? '已启用：登录时需输入动态验证码。' : adminApi.twoFactorEnabled === false ? '未启用：当前仅使用账号和密码登录。' : '暂时无法确认双因素验证状态，请重新验证会话。'}</p><p className="muted">双因素验证由服务器配置管理，本页面不支持修改。</p></section></div>
               <div className="grid grid-cols-2 gap-4">
                 <div className="p-4 rounded-xl bg-white border border-[#E5E8E5] space-y-3">
                   <h4 className="font-bold text-[#23272B] text-sm">主密钥 (KEK) 保护状态</h4>
@@ -930,7 +982,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
         </div>
       </main>
 
-      {revealedCard && isAuthenticated && <div role="dialog" aria-modal="true" aria-label="查看卡密" className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
+      {revealedCard && isAuthenticated && <div role="dialog" tabIndex={-1} aria-modal="true" aria-label="查看卡密" className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
         <section className="bg-white p-6 rounded-xl space-y-4"><h3>卡密：{revealedCard.cardId}</h3>
           <p role="alert">{actionError}</p><p>仅在需要时查看，请勿分享截图。关闭后清除当前明文。</p>
           <input aria-label="卡密明文" readOnly value={revealedCard.rawCode} onFocus={e => e.target.select()} />
@@ -938,7 +990,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
         </section></div>}
       {/* Administrator login */}
       {generatedCards.length > 0 && isAuthenticated && (
-        <div role="dialog" aria-modal="true" aria-label="新生成的卡密" className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
+        <div role="dialog" tabIndex={-1} aria-modal="true" aria-label="新生成的卡密" className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
           <div className="bg-white border border-[#E5E8E5] p-6 rounded-xl w-full max-w-2xl max-h-[90vh] overflow-auto space-y-4">
             <p role="alert">{actionError}</p><h3 className="font-bold text-[#23272B]">已生成 {generatedCards.length} 张卡密</h3>
             <p className="text-[#A87029] text-sm">关闭后清除本次生成结果，支持恢复的卡密可在列表中按需查看。下载文件包含敏感凭据，请妥善保管。</p>
@@ -959,39 +1011,40 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
 
       {/* Batch Generator Modal */}
       {showBatchModal && (
-        <div role="dialog" aria-modal="true" aria-label="批量生成卡密" className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
+        <div role="dialog" tabIndex={-1} aria-modal="true" aria-label="批量生成卡密" aria-busy={loading} className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
           <div className="bg-white border border-[#E5E8E5] p-6 rounded-xl w-96 space-y-4">
             {actionError && <p role="alert">{actionError}</p>}
             <h3 className="font-bold text-[#23272B] text-base">批量生成卡密</h3>
             <div className="space-y-3 text-xs">
               <div>
-                <label className="text-[#7B8388] block mb-1">积分套餐 · 单卡单设备</label>
+                <label htmlFor="batch-template" className="text-[#7B8388] block mb-1">积分套餐 · 单卡单设备</label>
                 <select
-                  aria-label="积分套餐" value={batchTemplate}
+                  id="batch-template" disabled={loading} aria-label="积分套餐" value={batchTemplate}
                   onChange={(e) => setBatchTemplate(e.target.value)}
                   className="w-full bg-[#EFF1EF] border border-[#E5E8E5] p-2 rounded text-[#23272B]"
                 >
                   {tiers.map(tier => <option key={tier.id} value={tier.id}>{tier.name} · {tier.points.toLocaleString()} 积分 · ¥{tier.price_cny} · 单设备</option>)}
                 </select>
               </div>
-              <div><label className="text-[#7B8388] block mb-1">模型与计费分组</label><select aria-label="模型与计费分组" className="w-full" value={batchGroup} onChange={e => setBatchGroup(e.target.value)} disabled={!issuableGroups.length}><option value="" disabled>{issuableGroups.length ? '请选择模型与计费分组' : '暂无可发卡分组，无法发卡'}</option>{issuableGroups.map(group => <option key={String(group.id)} value={String(group.id)}>{String(group.name ?? group.id)}</option>)}</select></div>
+              <div><label htmlFor="batch-group" className="text-[#7B8388] block mb-1">模型与计费分组</label><select id="batch-group" aria-label="模型与计费分组" className="w-full" value={batchGroup} onChange={e => setBatchGroup(e.target.value)} disabled={loading || !issuableGroups.length}><option value="" disabled>{issuableGroups.length ? '请选择模型与计费分组' : '暂无可发卡分组，无法发卡'}</option>{issuableGroups.map(group => <option key={String(group.id)} value={String(group.id)}>{String(group.name ?? group.id)}</option>)}</select></div>
               <p className="muted">套餐决定积分额度、名称和 30 天有效期；分组决定模型和价格。四档套餐可共用分组，切换套餐不改变分组。</p>
               <p className="muted" aria-label="发卡摘要">{issuanceSummary}</p>
               <div>
-                <label className="text-[#7B8388] block mb-1">生成数量 (1 ~ 500)</label>
+                <label htmlFor="batch-count" className="text-[#7B8388] block mb-1">生成数量（1–500 张）</label>
                 <input
                   type="number"
-                  aria-label="生成数量" min="1"
+                  id="batch-count" disabled={loading} aria-label="生成数量" aria-describedby="batch-count-help" aria-invalid={!validBatchCount} min="1" step="1"
                   max="500"
                   value={batchCount}
-                  onChange={(e) => setBatchCount(Math.max(1, Math.min(500, parseInt(e.target.value) || 1)))}
+                  onChange={(e) => setBatchCount(e.target.value)}
                   className="w-full bg-[#EFF1EF] border border-[#E5E8E5] p-2 rounded text-[#23272B] font-mono"
                 />
               </div>
             </div>
+            <p id="batch-count-help" className={!validBatchCount ? "field-error" : "muted"}>{!validBatchCount ? '请输入 1–500 的整数，不会自动修改你输入的数量。' : `本次生成 ${batchCountValue} 张；合计 ${((selectedTier?.points ?? 0) * batchCountValue).toLocaleString()} 积分。`}</p>
             <div className="flex justify-end gap-2 pt-2">
               <button disabled={loading} onClick={() => setShowBatchModal(false)} className="px-3 py-1.5 bg-[#EFF1EF] text-[#23272B] rounded text-xs">取消</button>
-              <button onClick={handleBatchGenerate} disabled={!!issuanceRecovery || loading || !selectedGroup} className="px-3 py-1.5 bg-[#B94B39] text-white hover:bg-[#B94B39] text-white rounded text-xs font-medium disabled:opacity-50">
+              <button onClick={handleBatchGenerate} disabled={!!issuanceRecovery || loading || !selectedGroup || !validBatchCount} className="px-3 py-1.5 bg-[#B94B39] text-white hover:bg-[#B94B39] text-white rounded text-xs font-medium disabled:opacity-50">
                 {loading ? '正在生成并入库...' : '生成并入库'}
               </button>
             </div>
@@ -1001,38 +1054,40 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
 
       {/* Adjust Balance Modal */}
       {showAdjustModal && (
-        <div role="dialog" aria-modal="true" aria-label="卡密调账" className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
+        <div role="dialog" tabIndex={-1} aria-modal="true" aria-label="卡密调账" aria-busy={mutationBusy} className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
           <div className="bg-white border border-[#E5E8E5] p-6 rounded-xl w-96 space-y-4">
             {actionError && <p role="alert">{actionError}</p>}
-            <h3 className="font-bold text-[#23272B] text-base">人工调账 (写入账本条目)</h3><p className="muted">关闭弹窗不撤销已发送请求；结果未确认时，重新打开此卡可用原参数重试。</p>
+            <h3 className="font-bold text-[#23272B] text-base">人工调账 · 记录积分增减</h3><p className="muted">关闭弹窗不撤销已发送请求；结果未确认时，重新打开此卡可用原参数重试。</p>
             {adjustment.current&&isZeroMicroAdjustment(adjustment.current)&&<div role="alert"><p>旧意图金额换算为零微积分，无法入账。清除后可重新填写，不会自动提交。</p><button disabled={mutationBusy} onClick={()=>{if(!adjustment.current||!window.confirm('该原意图换算为零微积分，无法入账。确认清除无效意图？'))return;try{clearAdjustment(sessionStorage,adjustment.current);adjustment.current=null;setAdjustAmount('');setActionError('无效意图已清除，请重新填写金额；未发送请求。');}catch{setActionError('本地记录清除失败，请检查浏览器存储。');}}}>清除零微积分意图</button></div>}
             {selectedCard && (
               <div className="text-xs text-[#B94B39] font-mono">
-                目标卡密: {selectedCard.id} (当前积分: {selectedCard.pointsAvailable.toFixed(2)})
+                目标卡密: {selectedCard.id} (上次读取的可用积分: {selectedCard.pointsAvailable.toFixed(2)})
               </div>
             )}
             <div className="space-y-3 text-xs">
               <div>
-                <label className="text-[#7B8388] block mb-1">增减积分数量 (负数为扣减)</label>
+                <label htmlFor="adjust-amount" className="text-[#7B8388] block mb-1">增减积分数量（负数为扣减）</label>
                 <input
                   type="number"
                   step="any"
-                  aria-label="增减积分数量" disabled={mutationBusy||!!adjustment.current} value={adjustAmount}
+                  id="adjust-amount" aria-describedby="adjust-help" aria-label="增减积分数量" disabled={mutationBusy||!!adjustment.current} value={adjustAmount}
                   onChange={(e) => setAdjustAmount(e.target.value)}
                   className="w-full bg-[#EFF1EF] border border-[#E5E8E5] p-2 rounded text-[#23272B] font-mono"
                 />
               </div>
               <div>
-                <label className="text-[#7B8388] block mb-1">调账原因说明 (写入 reason 留痕)</label>
+                <label htmlFor="adjust-reason" className="text-[#7B8388] block mb-1">调账原因（写入审计记录）</label>
                 <input
                   type="text"
                   placeholder="例: 补偿上游抖动中断 10 积分"
-                  maxLength={500} aria-label="调账原因说明" disabled={mutationBusy||!!adjustment.current} value={adjustReason}
+                  id="adjust-reason" maxLength={500} aria-label="调账原因说明" disabled={mutationBusy||!!adjustment.current} value={adjustReason}
                   onChange={(e) => setAdjustReason(e.target.value)}
                   className="w-full bg-[#EFF1EF] border border-[#E5E8E5] p-2 rounded text-[#23272B]"
                 />
               </div>
             </div>
+            <p id="adjust-help" className="muted">正数增加积分，负数扣减积分；最多六位小数，不能为 0。原因限 1–500 字，请勿填写密码、卡密或令牌。</p>
+            {mutationBusy && <p role="status">正在提交调账，请勿关闭页面或重复提交…</p>}
             <div className="flex justify-end gap-2 pt-2">
               <button disabled={mutationBusy} onClick={() => { setShowAdjustModal(false); setSelectedCard(null); }} className="px-3 py-1.5 bg-[#EFF1EF] text-[#23272B] rounded text-xs">取消</button>
               <button disabled={mutationBusy} onClick={handleAdjustSubmit} className="px-3 py-1.5 bg-[#B94B39] text-white rounded text-xs font-medium">确认调账</button>
@@ -1043,7 +1098,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
 
       {/* KEK Rotation Modal */}
       {showKekModal && (
-        <div role="dialog" aria-modal="true" aria-label="主密钥轮换说明" className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
+        <div role="dialog" tabIndex={-1} aria-modal="true" aria-label="主密钥轮换说明" className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
           <div className="bg-white border border-[#E5E8E5] p-6 rounded-xl w-96 space-y-4">
             {actionError && <p role="alert">{actionError}</p>}
             <h3 className="font-bold text-[#23272B] text-base">主密钥 (KEK) 轮换向导</h3>
@@ -1063,44 +1118,46 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
 
       {/* Notice Modal */}
       {showNoticeModal && (
-        <div role="dialog" aria-modal="true" aria-label="发布服务公告" className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
+        <div role="dialog" tabIndex={-1} aria-modal="true" aria-label="发布服务公告" aria-busy={mutationBusy} className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
           <div className="bg-white border border-[#E5E8E5] p-6 rounded-xl w-96 space-y-4">
             {actionError && <p role="alert">{actionError}</p>}
             <h3 className="font-bold text-[#23272B] text-base">发布服务公告</h3>
             <div className="space-y-3 text-xs">
               <div>
-                <label className="text-[#7B8388] block mb-1">公告标题</label>
+                <label htmlFor="notice-title" className="text-[#7B8388] block mb-1">公告标题（最多 256 字）</label>
                 <input
                   type="text"
                   placeholder="例: 维护通知"
-                  aria-label="公告标题" value={noticeTitle}
+                  id="notice-title" disabled={mutationBusy} aria-label="公告标题" value={noticeTitle}
                   onChange={(e) => setNoticeTitle(e.target.value)}
                   className="w-full bg-[#EFF1EF] border border-[#E5E8E5] p-2 rounded text-[#23272B]"
                 />
               </div>
               <div>
-                <label className="text-[#7B8388] block mb-1">公告等级</label>
+                <label htmlFor="notice-level" className="text-[#7B8388] block mb-1">公告等级</label>
                 <select
-                  aria-label="公告等级" value={noticeLevel}
+                  id="notice-level" disabled={mutationBusy} aria-label="公告等级" value={noticeLevel}
                   onChange={(e) => setNoticeLevel(e.target.value as any)}
                   className="w-full bg-[#EFF1EF] border border-[#E5E8E5] p-2 rounded text-[#23272B]"
                 >
-                  <option value="info">Info (普通提示)</option>
-                  <option value="warning">Warning (预警通知)</option>
-                  <option value="critical">Critical (紧急降级)</option>
+                  <option value="info">普通提示</option>
+                  <option value="warning">预警通知</option>
+                  <option value="critical">紧急通知</option>
                 </select>
               </div>
               <div>
-                <label className="text-[#7B8388] block mb-1">正文内容</label>
+                <label htmlFor="notice-content" className="text-[#7B8388] block mb-1">正文内容（最多 20,000 字）</label>
                 <textarea
                   rows={3}
                   placeholder="输入下发给客户端的公告内容..."
-                  aria-label="正文内容" value={noticeContent}
+                  id="notice-content" disabled={mutationBusy} aria-label="正文内容" value={noticeContent}
                   onChange={(e) => setNoticeContent(e.target.value)}
                   className="w-full bg-[#EFF1EF] border border-[#E5E8E5] p-2 rounded text-[#23272B]"
                 />
               </div>
             </div>
+            <p className="muted">面向全部用户，发布后有效期 7 天。请核对维护时间、影响范围和联系方式，勿包含内部凭据。</p>
+            {mutationBusy && <p role="status">正在发布公告，请等待服务端确认，勿重复提交…</p>}
             <div className="flex justify-end gap-2 pt-2">
               <button disabled={mutationBusy} onClick={() => setShowNoticeModal(false)} className="px-3 py-1.5 bg-[#EFF1EF] text-[#23272B] rounded text-xs">取消</button>
               <button disabled={mutationBusy || !!noticeRecovery} onClick={handleCreateNotice} className="px-3 py-1.5 bg-[#B94B39] text-white rounded text-xs font-medium">立即发布</button>

@@ -79,5 +79,25 @@ const session = () => ok({success:true,role:'admin',csrfToken:'fixture-csrf'});
   await logout.checkAuth();const done=assert.rejects(logout.logout(),/撤销失败/);
   await assert.rejects(logout.getStats(),/请先登录/);assert.equal(revocationHeaders.get('x-csrf-token'),'fixture-csrf');
   revoke.resolve({ok:false,status:503});await done;await assert.rejects(logout.getStats(),/请先登录/);
-  console.log('PASS: anonymous request gate, invalid sessions, JSON/blob response races, old/current 401 isolation, immediate logout and revoke failure');
+  // A shared cookie can change without this tab explicitly logging out.
+  // Changed CSRF aborts old work; unchanged CSRF retains in-flight work and drafts.
+  for(const kind of ['json', 'blob', 'error']) {
+    const delayed=deferred(),entered=deferred(); let token='first',signal,changes=0;
+    const shared=client(async(url,options)=>{
+      if(url.endsWith('/session'))return ok({success:true,role:'admin',csrfToken:token});
+      signal=options.signal;
+      return {ok:kind!=='error',status:503,json:()=>{entered.resolve();return delayed.promise;},blob:()=>{entered.resolve();return delayed.promise;}};
+    });
+    shared.onSessionChanged=()=>changes++;
+    await shared.checkAuth();shared.authenticatedUsername='admin';
+    const request=kind==='blob'?shared.exportLedger('csv'):shared.revealCard('private-card');
+    const rejected=assert.rejects(request,/会话已改变/);
+    await entered.promise;await shared.checkAuth();assert.equal(signal.aborted,false);assert.equal(changes,0);
+    token='second';await shared.checkAuth();
+    assert.equal(signal.aborted,true);assert.equal(changes,1);assert.equal(shared.authenticatedUsername,null);
+    delayed.resolve(kind==='error'?{error:'old private error'}:{rawCode:'old private code'});await rejected;
+    await shared.checkAuth();assert.equal(changes,1);
+    shared.clearSession();
+  }
+  console.log('PASS: shared-cookie rotation, anonymous request gate, invalid sessions, JSON/blob response races, old/current 401 isolation, immediate logout and revoke failure');
 })().catch(error=>{console.error(error);process.exitCode=1;});

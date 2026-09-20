@@ -830,3 +830,202 @@ async fn metrics_require_admin_not_client_authorization() {
         .unwrap()
         .starts_with("text/plain"));
 }
+
+#[tokio::test]
+async fn provider_status_requires_durable_commit_before_runtime_update() {
+    use gateway::provider::ProviderRuntimeRegistry;
+
+    let dir = std::env::temp_dir().join(format!(
+        "kiro_provider_status_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let path = dir.join("billing_state.json");
+    let billing = BillingEngine::new();
+    billing.set_master_kek(billing::MasterKek::from_bytes([43; 32]));
+    billing.upsert_provider(billing::Provider::new(
+        "provider",
+        "Test",
+        billing::ProviderFormat::OpenAi,
+        "https://example.invalid",
+    ));
+    billing.save_to_file(&path).unwrap();
+    let runtime = ProviderRuntimeRegistry::new();
+    runtime.sync_from_billing(&billing);
+    let mut registry = FacadeRegistry::new().with_runtime(runtime.clone());
+    registry.register_admin_facades(billing.clone(), TEST_ADMIN_KEY.to_string());
+    let app = registry.into_router();
+
+    // Exercise both failed disable and failed enable, retries, and a missing provider.
+    for (id, enabled, fault, expected_status, expected_enabled) in [
+        (
+            "provider",
+            false,
+            true,
+            StatusCode::SERVICE_UNAVAILABLE,
+            true,
+        ),
+        ("missing", false, true, StatusCode::NOT_FOUND, true),
+        ("provider", false, false, StatusCode::OK, false),
+        ("provider", false, false, StatusCode::OK, false),
+        (
+            "provider",
+            true,
+            true,
+            StatusCode::SERVICE_UNAVAILABLE,
+            false,
+        ),
+        ("provider", true, false, StatusCode::OK, true),
+    ] {
+        let persisted = std::fs::read(&path).unwrap();
+        let sequence = billing.snapshot_sequence();
+        billing.inject_persistence_fault(fault);
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/admin/providers/status")
+            .header("x-admin-key", TEST_ADMIN_KEY)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"providerId": id, "enabled": enabled}).to_string(),
+            ))
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app.clone(), request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected_status);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        if expected_status == StatusCode::OK {
+            assert_eq!(result["success"], true);
+            assert_eq!(result["enabled"], enabled);
+            assert!(billing.snapshot_sequence() > sequence);
+            assert!(billing.persistence_ready());
+        } else {
+            assert_ne!(result["success"], true);
+            assert_eq!(billing.snapshot_sequence(), sequence);
+            assert_eq!(std::fs::read(&path).unwrap(), persisted);
+        }
+        assert_eq!(
+            billing.get_provider("provider").unwrap().enabled,
+            expected_enabled
+        );
+        assert_eq!(
+            runtime.pool_for("provider").unwrap().provider().enabled,
+            expected_enabled
+        );
+        assert!(billing.get_provider("missing").is_none());
+        let recovered = BillingEngine::new();
+        recovered.set_master_kek(billing::MasterKek::from_bytes([43; 32]));
+        recovered.load_from_file(&path).unwrap();
+        let recovered_runtime = ProviderRuntimeRegistry::new();
+        recovered_runtime.sync_from_billing(&recovered);
+        assert_eq!(
+            recovered.get_provider("provider").unwrap().enabled,
+            expected_enabled
+        );
+        assert_eq!(
+            recovered_runtime
+                .pool_for("provider")
+                .unwrap()
+                .provider()
+                .enabled,
+            expected_enabled
+        );
+    }
+    assert!(dir
+        .canonicalize()
+        .unwrap()
+        .starts_with(std::env::temp_dir().canonicalize().unwrap()));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn admin_cards_pagination_is_sorted_and_revision_detects_insertions() {
+    let billing = BillingEngine::new();
+    billing.upsert_card(Card::new("card-02", "group", 1_000));
+    billing.upsert_card(Card::new("card-04", "group", 1_000));
+
+    let mut registry = FacadeRegistry::new();
+    registry.register_admin_facades(billing.clone(), TEST_ADMIN_KEY.to_string());
+    let app = registry.into_router();
+
+    let page_request = |uri: &'static str| {
+        Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .header("x-admin-key", TEST_ADMIN_KEY)
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    let response = tower::ServiceExt::oneshot(
+        app.clone(),
+        page_request("/api/v1/admin/cards?offset=0&limit=2"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let first_page: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let first_ids: Vec<_> = first_page["cards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|card| card["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(first_ids, ["card-02", "card-04"]);
+    assert_eq!(first_page["count"], 2);
+    assert_eq!(first_page["revision"].as_str().unwrap().len(), 64);
+    let first_revision = first_page["revision"].as_str().unwrap().to_string();
+
+    // The new ID sorts between the two cards already observed by page zero.
+    billing.upsert_card(Card::new("card-03", "group", 1_000));
+
+    let response = tower::ServiceExt::oneshot(
+        app.clone(),
+        page_request("/api/v1/admin/cards?offset=2&limit=2"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let second_page: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let second_ids: Vec<_> = second_page["cards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|card| card["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(second_ids, ["card-04"]);
+    assert_eq!(second_page["count"], 1);
+    assert_ne!(second_page["revision"].as_str().unwrap(), first_revision);
+
+    // A fresh page observes the complete stable order and the same new revision.
+    let response =
+        tower::ServiceExt::oneshot(app, page_request("/api/v1/admin/cards?offset=0&limit=500"))
+            .await
+            .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let full_page: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let full_ids: Vec<_> = full_page["cards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|card| card["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(full_ids, ["card-02", "card-03", "card-04"]);
+    assert_eq!(full_page["count"], 3);
+    assert_eq!(full_page["revision"], second_page["revision"]);
+}

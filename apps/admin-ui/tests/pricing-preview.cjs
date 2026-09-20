@@ -8,7 +8,7 @@ function load(file, imports = {}) {
   const code = ts.transpileModule(fs.readFileSync(path.join(__dirname, '../src', file), 'utf8'), {
     compilerOptions: {module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, jsx: ts.JsxEmit.ReactJSX},
   }).outputText;
-  vm.runInNewContext(code, {exports, require: name => imports[name], window: {confirm: () => true}});
+  vm.runInNewContext(code, {exports, require: name => imports[name], TextEncoder, window: {confirm: () => true}});
   return exports;
 }
 const pricing = load('pricing.ts');
@@ -40,7 +40,7 @@ const version = {id: 'new-price', model: 'test-model', rate_card_id: 'r', pricin
 let states, cursor;
 const jsx = (type, props) => ({type, props});
 const Editor = load('CommercialEditor.tsx', {'./pricing': pricing, './api': {adminApi: {}}, react: {
-  useEffect: () => {}, useState: initial => {const index = cursor++; if (!(index in states)) states[index] = initial; return [states[index], value => {states[index] = typeof value === 'function' ? value(states[index]) : value;}];},
+  useEffect: () => {}, useRef: initial => ({current: initial}), useState: initial => {const index = cursor++; if (!(index in states)) states[index] = initial; return [states[index], value => {states[index] = typeof value === 'function' ? value(states[index]) : value;}];},
 }, 'react/jsx-runtime': {jsx, jsxs: jsx}}).default;
 const render = () => {cursor = 0; return Editor({kind: 'models', onDirtyChange: () => {}, onBusyChange: () => {}});};
 function nodes(node) {if (!node || typeof node !== 'object') return []; if (Array.isArray(node)) return node.flatMap(nodes); return [node, ...nodes(node.props?.children)];}

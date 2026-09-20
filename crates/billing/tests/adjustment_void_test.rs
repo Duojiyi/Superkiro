@@ -156,7 +156,7 @@ fn test_ledger_reconciliation_mathematical_consistency() {
     let engine = BillingEngine::new();
     let initial_credits = 100 * MICRO_CREDITS_PER_CREDIT;
     let mut card = Card::new("card-reconcile", "group-default", initial_credits);
-    card.status = CardStatus::Active;
+    card.activate(NOW_SECS, 30 * 86_400).unwrap();
     engine.upsert_card(card);
 
     // 1. First usage: reserve + settle

@@ -7,7 +7,7 @@ export default defineConfig({
   server: {
     port: 3000,
     proxy: {
-      '/admin': {
+      '/api': {
         target: 'http://127.0.0.1:19820',
         changeOrigin: true,
       },

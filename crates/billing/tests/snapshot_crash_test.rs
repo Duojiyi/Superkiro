@@ -279,3 +279,183 @@ fn test_ledger_archival_drains_ledger_and_preserves_card_balance() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn topup_duration_rejection_preserves_card_code_and_ledger_across_restart() {
+    use billing::{generate_topup_code, BillingError};
+    use serde_json::json;
+
+    for perpetual in [false, true] {
+        let dir = temp_state_dir("topup_duration_rejection");
+        let path = dir.join("billing_state.json");
+        let engine = BillingEngine::new();
+        engine.set_master_kek(MasterKek::from_bytes([41; 32]));
+        let mut card = Card::new("card", "group", 1_000);
+        if perpetual {
+            card.activate(100, 0).unwrap();
+        } else {
+            card.activation_duration_secs = Some(30 * 86_400);
+        }
+        engine.upsert_card(card);
+        let topup = generate_topup_code(500, 7 * 86_400, 100).unwrap();
+        let topup_id = topup.topup.id.clone();
+        engine.upsert_topup_code(topup.topup);
+        engine.save_to_file(&path).unwrap();
+        let before = engine.export_snapshot();
+        let persisted = fs::read(&path).unwrap();
+
+        let error = engine
+            .redeem_topup("card", &topup.raw_code, 101, "test")
+            .unwrap_err();
+        assert!(matches!(&error, BillingError::InvalidState(_)));
+        let message = error.to_string();
+        assert!(message.contains(if perpetual { "perpetual" } else { "activate" }));
+        assert!(message.contains("code has not been used"));
+        assert_eq!(engine.snapshot_sequence(), before.sequence);
+        assert_eq!(fs::read(&path).unwrap(), persisted);
+        assert_eq!(
+            json!(engine.get_card("card")),
+            json!(before.cards.get("card"))
+        );
+        assert_eq!(
+            json!(engine.export_snapshot().topup_codes),
+            json!(before.topup_codes)
+        );
+        assert_eq!(json!(engine.ledger_entries()), json!(before.ledger));
+
+        let recovered = BillingEngine::new();
+        recovered.set_master_kek(MasterKek::from_bytes([41; 32]));
+        recovered.load_from_file(&path).unwrap();
+        assert_eq!(
+            json!(recovered.get_card("card")),
+            json!(before.cards.get("card"))
+        );
+        assert!(!recovered.export_snapshot().topup_codes[&topup_id].is_used);
+        assert!(recovered.ledger_entries().is_empty());
+
+        // Rejected codes remain usable, including on the same card after activation.
+        let target = if perpetual {
+            let mut finite = Card::new("finite", "group", 1_000);
+            finite.activate(200, 30 * 86_400).unwrap();
+            recovered.upsert_card(finite);
+            "finite"
+        } else {
+            recovered.activate_card("card", 200, 30 * 86_400).unwrap();
+            "card"
+        };
+        recovered
+            .redeem_topup(target, &topup.raw_code, 201, "test")
+            .unwrap();
+        let restarted = BillingEngine::new();
+        restarted.set_master_kek(MasterKek::from_bytes([41; 32]));
+        restarted.load_from_file(&path).unwrap();
+        let card = restarted.get_card(target).unwrap();
+        assert_eq!(card.credit_total, 1_500);
+        assert_eq!(card.valid_until, Some(200 + 37 * 86_400));
+        assert_eq!(restarted.ledger_entries().len(), 1);
+        assert_eq!(
+            restarted.export_snapshot().topup_codes[&topup_id]
+                .used_by_card_id
+                .as_deref(),
+            Some(target)
+        );
+        assert!(matches!(
+            restarted.redeem_topup(target, &topup.raw_code, 202, "test"),
+            Err(BillingError::InvalidOrRedeemedTopupCode)
+        ));
+        assert!(dir
+            .canonicalize()
+            .unwrap()
+            .starts_with(std::env::temp_dir().canonicalize().unwrap()));
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn topup_credit_only_preserves_unactivated_and_perpetual_validity() {
+    for perpetual in [false, true] {
+        let engine = BillingEngine::new();
+        let mut card = Card::new("card", "group", 1_000);
+        if perpetual {
+            card.activate(100, 0).unwrap();
+        } else {
+            card.activation_duration_secs = Some(30 * 86_400);
+        }
+        engine.upsert_card(card.clone());
+        let topup = billing::generate_topup_code(500, 0, 100).unwrap();
+        engine.upsert_topup_code(topup.topup);
+        engine
+            .redeem_topup("card", &topup.raw_code, 101, "test")
+            .unwrap();
+        let updated = engine.get_card("card").unwrap();
+        assert_eq!(updated.credit_total, 1_500);
+        assert_eq!(updated.status, card.status);
+        assert_eq!(updated.valid_until, card.valid_until);
+        assert_eq!(
+            updated.activation_duration_secs,
+            card.activation_duration_secs
+        );
+        assert_eq!(updated.activated_at, card.activated_at);
+    }
+}
+
+#[test]
+fn topup_write_failure_preserves_code_until_durable_retry() {
+    use billing::{generate_topup_code, BillingError};
+    use serde_json::json;
+
+    let dir = temp_state_dir("topup_write_failure");
+    let path = dir.join("billing_state.json");
+    let engine = BillingEngine::new();
+    let mut card = Card::new("card", "group", 1_000);
+    card.activate(100, 30 * 86_400).unwrap();
+    engine.upsert_card(card);
+    let topup = generate_topup_code(500, 7 * 86_400, 100).unwrap();
+    let topup_id = topup.topup.id.clone();
+    engine.upsert_topup_code(topup.topup);
+    engine.save_to_file(&path).unwrap();
+    let before = engine.export_snapshot();
+    let persisted = fs::read(&path).unwrap();
+    engine.inject_persistence_fault(true);
+    assert!(matches!(
+        engine.redeem_topup("card", &topup.raw_code, 101, "test"),
+        Err(BillingError::Persistence(_))
+    ));
+    assert_eq!(engine.snapshot_sequence(), before.sequence);
+    assert_eq!(fs::read(&path).unwrap(), persisted);
+    assert_eq!(
+        json!(engine.get_card("card")),
+        json!(before.cards.get("card"))
+    );
+    assert!(!engine.export_snapshot().topup_codes[&topup_id].is_used);
+    assert!(engine.ledger_entries().is_empty());
+
+    let recovered = BillingEngine::new();
+    recovered.load_from_file(&path).unwrap();
+    assert_eq!(
+        json!(recovered.get_card("card")),
+        json!(before.cards.get("card"))
+    );
+    assert!(!recovered.export_snapshot().topup_codes[&topup_id].is_used);
+    recovered
+        .redeem_topup("card", &topup.raw_code, 102, "test")
+        .unwrap();
+    let restarted = BillingEngine::new();
+    restarted.load_from_file(&path).unwrap();
+    assert_eq!(restarted.get_card("card").unwrap().credit_total, 1_500);
+    assert_eq!(
+        restarted.get_card("card").unwrap().valid_until,
+        Some(100 + 37 * 86_400)
+    );
+    assert!(restarted.export_snapshot().topup_codes[&topup_id].is_used);
+    assert_eq!(restarted.ledger_entries().len(), 1);
+    assert!(matches!(
+        restarted.redeem_topup("card", &topup.raw_code, 103, "test"),
+        Err(BillingError::InvalidOrRedeemedTopupCode)
+    ));
+    assert!(dir
+        .canonicalize()
+        .unwrap()
+        .starts_with(std::env::temp_dir().canonicalize().unwrap()));
+    fs::remove_dir_all(dir).unwrap();
+}

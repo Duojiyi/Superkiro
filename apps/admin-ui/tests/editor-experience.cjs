@@ -1,0 +1,137 @@
+// Editor experience regression: final build + loopback fixture, never production.
+const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
+const http=require('node:http'),fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
+const fixture=require('./fixture-api.cjs')();
+const root=path.resolve(__dirname,'../dist');
+const server=http.createServer(async(req,res)=>{
+  try{
+    if(req.url.startsWith('/api/'))return await fixture.handle(req,res);
+    const file=path.resolve(root,decodeURIComponent(req.url.split('?')[0]).replace(/^\/admin\/?/,'')||'index.html');
+    if(!file.startsWith(root+path.sep)||!fs.existsSync(file)){res.writeHead(404);return res.end();}
+    res.setHeader('Content-Type',file.endsWith('.js')?'text/javascript':file.endsWith('.css')?'text/css':'text/html');res.end(fs.readFileSync(file));
+  }catch(error){res.writeHead(500);res.end(JSON.stringify({error:error.message}));}
+});
+const until=async ready=>{const end=Date.now()+10000;while(!ready()){assert(Date.now()<end,'timed out waiting for fixture request');await new Promise(resolve=>setTimeout(resolve,10));}};
+(async()=>{
+  let browser;
+  try{
+    await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+    browser=await chromium.launch({headless:true,...(process.env.CHROME_PATH?{executablePath:process.env.CHROME_PATH}:{})});
+    const page=await browser.newPage({viewport:{width:1280,height:900}}),errors=[];
+    page.setDefaultTimeout(10000);
+    const origin=`http://127.0.0.1:${server.address().port}`;
+    page.on('pageerror',error=>{errors.push(error.message);console.error('Browser error:',error.message);});
+    await page.route('**/*',route=>new URL(route.request().url()).origin===origin?route.continue():route.abort());
+    const button=name=>page.getByRole('button',{name,exact:true});
+    const nav=name=>page.getByRole('navigation').getByRole('button',{name,exact:true}).click();
+    const status=text=>page.getByRole('status').filter({hasText:text}).waitFor();
+    const accept=()=>page.once('dialog',dialog=>dialog.accept());
+    const dismiss=()=>page.once('dialog',dialog=>dialog.dismiss());
+    await page.goto(origin+'/admin/');await page.getByLabel('密码',{exact:true}).fill('fixture-password');await button('登录').click();
+    await button('刷新').waitFor();
+    let config=(await (await page.request.get(origin+'/api/v1/admin/commercial-config')).json()).config;
+    config.versions=config.versions.map(version=>({...version,margin_multiplier:1,currency:'USD',input_price_per_m:1,output_price_per_m:1,cache_read_price_per_m:1,cache_creation_price_per_m:1}));
+    let failRead=false,postMode='hold',held=null,posts=[];
+    await page.route('**/api/v1/admin/commercial-config',async route=>{
+      if(route.request().method()==='GET')return route.fulfill(failRead?{status:503,json:{error:'fixture read unavailable'}}:{json:{success:true,config}});
+      const body=route.request().postDataJSON();posts.push(body);
+      // Simulate a committed write, even when its acknowledgement will be lost.
+      config={...config,...(body.settings?{settings:{...config.settings,...body.settings}}:{}),...(body.models?{models:body.models}:{}),...(body.groups?{groups:body.groups}:{}),versions:[...config.versions,...(body.versions||[])],revision:`fixture-editor-${posts.length}`};
+      if(postMode==='hold'){held=route;return;}
+      return route.fulfill({json:{success:true,config}});
+    });
+    // Discovery must merge, deduplicate, preserve manual edits, and never save implicitly.
+    let keyPosts=[],importPosts=0,savedKey=null,failKeysRead=false,keyWriteMode='lost';
+    await page.route('**/api/v1/admin/providers',async route=>{
+      if(failKeysRead)return route.fulfill({status:503,json:{error:'fixture key read unavailable'}});
+      const response=await route.fetch(),body=await response.json();
+      if(savedKey)body.keys[0]={...body.keys[0],...savedKey,id:savedKey.key_id};
+      return route.fulfill({json:body});
+    });
+    await page.route('**/api/v1/admin/providers/keys',async route=>{savedKey=route.request().postDataJSON();keyPosts.push(savedKey);if(keyWriteMode==='negative')return route.fulfill({json:{success:false}});await route.abort('failed');});
+    await page.route('**/api/v1/admin/providers/import',route=>{importPosts++;return route.fulfill({json:{success:true}});});
+    let candidates=['candidate-model','manual-model','candidate-model'];
+    await page.route('**/api/v1/admin/providers/keys/discover',route=>route.fulfill({json:{success:true,models:candidates,has_more:true}}));
+    await nav('供应商与 Key');await button('编辑 →').first().click();
+    const models=page.getByLabel('允许模型（每行一个精确 ID）');
+    await models.fill('manual-model\n manual-model \nprivate-model');
+    await button('获取模型草稿').click();await button('填入权限草稿').click();
+    assert.deepEqual((await models.inputValue()).split('\n'),['manual-model','private-model','candidate-model']);
+    assert.equal(keyPosts.length,0);
+    candidates=[];await button('获取模型草稿').click();await status('上游未返回候选模型');
+    assert(await button('填入权限草稿').isDisabled());assert((await models.inputValue()).includes('private-model'));
+    const weight=page.getByLabel('权重',{exact:true});
+    for(const value of ['','0','1.5','1001']){await weight.fill(value);await button('确认保存权限').click();await status('权重须为 1 至 1000 的整数');assert.equal(keyPosts.length,0);}
+    await weight.fill('3');
+    await page.getByText('新增或更新供应商渠道',{exact:true}).click();
+    await page.getByLabel('API Key（新增必填，更新可留空）',{exact:true}).fill('fixture-not-a-real-secret');
+    await page.getByLabel('上游地址',{exact:true}).fill('http://upstream.invalid');
+    await button('使用下方密钥与模型草稿导入渠道').click();await status('上游地址须使用 HTTPS');assert.equal(importPosts,0);
+    await page.getByLabel('上游地址',{exact:true}).fill('https://upstream.invalid');
+    let importConfirmation='';page.once('dialog',dialog=>{importConfirmation=dialog.message();return dialog.dismiss();});
+    await button('使用下方密钥与模型草稿导入渠道').click();
+    assert(importConfirmation.includes('fixture-provider-key-1'));assert(importConfirmation.includes('重置为启用、权重 1'));assert.equal(importPosts,0);
+    // A lost save acknowledgement locks mutations; failed review cannot clear that lock.
+    accept();await button('确认保存权限').click();await status('写入结果未确认');
+    assert.equal(keyPosts.length,1);assert(await button('确认保存权限').isDisabled());assert(await button('使用下方密钥与模型草稿导入渠道').isDisabled());
+    failKeysRead=true;accept();await button('重新读取 Key 核对').click();await status('核对失败');
+    assert(await button('确认保存权限').isDisabled());assert((await models.inputValue()).includes('private-model'));
+    failKeysRead=false;accept();await button('重新读取 Key 核对').click();await status('已重新读取 Key 权限');
+    assert.equal(await page.getByLabel('API Key（新增必填，更新可留空）',{exact:true}).inputValue(),'');
+    assert.equal(await weight.inputValue(),'3');assert.equal(keyPosts.length,1);
+    keyWriteMode='negative';accept();await button('确认保存权限').click();await status('服务器未确认操作成功');assert(await button('确认保存权限').isEnabled());
+    console.log('PASS: discovery merges without data loss; Key validation, import impact, uncertain-write lock and failed review');
+    await nav('运营概览');await nav('供应商与 Key');
+    await page.waitForFunction(()=>document.querySelector('#key-editor textarea')?.value.includes('private-model'));
+    assert.equal(await weight.inputValue(),'3');
+    // Price template changes and malformed advanced JSON cannot erase price inputs.
+    await nav('模型与定价');
+    const template=page.getByLabel('选择价格版本模板'),version=page.getByLabel('新版本 ID',{exact:true}),date=page.getByLabel('生效时间（本地时区）',{exact:true});
+    await template.selectOption('fixture-price-0');await version.fill('editor-price');await date.fill('2099-01-01T10:00');
+    dismiss();await template.selectOption('fixture-price-1');assert.equal(await template.inputValue(),'fixture-price-0');assert.equal(await version.inputValue(),'editor-price');assert.equal(await date.inputValue(),'2099-01-01T10:00');
+    await page.getByText('高级配置 JSON · 新增条目与价格版本',{exact:true}).click();
+    const json=page.getByLabel('配置 JSON',{exact:true}),original=await json.inputValue();
+    await json.fill('{ broken');await button('加入价格草稿').click();await status('高级配置 JSON 无效');assert.equal(await json.inputValue(),'{ broken');assert.equal(await version.inputValue(),'editor-price');
+    await json.fill(original);const multiplier=page.getByLabel('价格版本扣费倍率（1 = 不加倍）',{exact:true});
+    await multiplier.fill('0');await button('加入价格草稿').click();await status('须大于 0、至多 1000');
+    await multiplier.fill('1');await date.fill('2000-01-01T10:00');await button('加入价格草稿').click();await status('生效时间须晚于当前时间');
+    await date.fill('2099-01-01T10:00');await button('加入价格草稿').click();await status('价格版本已加入本页草稿');
+    const staged=JSON.parse(await json.inputValue()).versions[0];
+    await template.selectOption('fixture-price-1');await version.fill('editor-price');await date.fill('2099-01-02T10:00');await button('加入价格草稿').click();await status('版本 ID 已在本页草稿中');assert.deepEqual(JSON.parse(await json.inputValue()).versions,[staged]);
+    accept();await button('取消价格编辑').click();
+    const reason=page.getByLabel('变更原因',{exact:true});
+    await reason.fill('变'.repeat(167));await button('确认并发布').click();await status('不超过 500 字节');assert.equal(posts.length,0);
+    await reason.fill('fixture editor validation');const context=page.getByLabel('上下文长度',{exact:true});
+    await context.fill('');await button('确认并发布').click();await status('上下文长度须为');assert.equal(await context.inputValue(),'');assert.equal(posts.length,0);
+    assert.equal(JSON.parse(await json.inputValue()).models[0].context_window,'');
+    await context.fill('200000');
+    console.log('PASS: template cancel, invalid JSON, nonpositive rates, retroactive dates, staged ID collision and blank numeric inputs preserve drafts');
+    // Reentrant clicks send only one publication, and an unsuccessful reread keeps the draft.
+    accept();await button('确认并发布').evaluate(element=>{element.click();element.click();});await until(()=>held);
+    assert.equal(posts.length,1);assert(await button('处理中…').isDisabled());
+    await held.abort('failed');held=null;await status('发布已暂停');assert(await button('确认并发布').isDisabled());
+    const beforeReload=await json.inputValue();failRead=true;accept();await button('重新读取配置').click();await status('读取失败，原草稿已保留');
+    assert.equal(await json.inputValue(),beforeReload);assert(await button('确认并发布').isDisabled());assert.equal(posts.length,1);
+    failRead=false;accept();await button('重新读取配置').click();await status('当前配置已加载');assert.deepEqual(JSON.parse(await json.inputValue()).versions,[]);
+    console.log('PASS: one in-flight publication; lost acknowledgement locks publish until a successful, confirmed reread');
+    // Financials reject invalid values and retain drafts when review itself fails.
+    await nav('财务对账');const face=page.getByLabel('积分面值（元 / 积分）',{exact:true}),financialReason=page.getByLabel('财务配置变更原因',{exact:true});
+    await face.fill('0');await financialReason.fill('fixture invalid');assert(await button('确认并发布财务配置').isDisabled());
+    await face.fill('0.02');await financialReason.fill('变'.repeat(167));assert(await button('确认并发布财务配置').isDisabled());assert.equal(posts.length,1);
+    await financialReason.fill('fixture finance write');await page.getByLabel('采购汇率（CNY / USD）',{exact:true}).fill('7.3');
+    let financeConfirmation='';page.once('dialog',dialog=>{financeConfirmation=dialog.message();return dialog.accept();});
+    await button('确认并发布财务配置').click();await until(()=>held);assert(financeConfirmation.includes('0.01 → 0.02'));assert(financeConfirmation.includes('7.2 → 7.3'));
+    await held.abort('failed');held=null;await status('发布已暂停');assert.equal(posts.length,2);assert(await button('确认并发布财务配置').isDisabled());
+    failRead=true;accept();await button('重新读取财务配置').click();await status('原输入已保留；重新读取成功前不可发布');
+    assert.equal(await face.inputValue(),'0.02');assert.equal(await financialReason.inputValue(),'fixture finance write');assert(await button('确认并发布财务配置').isDisabled());
+    failRead=false;accept();await button('重新读取财务配置').click();await status('当前财务配置已读取');assert.equal(await face.inputValue(),'0.02');
+    // Success followed by a read failure must never be reported as an uncertain publication.
+    postMode='success';await page.route('**/api/v1/admin/financials',route=>route.fulfill({status:503,json:{error:'fixture estimates unavailable'}}));
+    await face.fill('0.03');await financialReason.fill('fixture successful publish');accept();await button('确认并发布财务配置').click();await status('配置已发布');
+    await page.getByRole('alert').filter({hasText:'部分数据读取失败'}).waitFor();await status('无需重复发布');
+    assert.equal(posts.length,3);assert.equal(await face.inputValue(),'0.03');assert.equal(await financialReason.inputValue(),'');
+    await financialReason.fill('unchanged');await button('确认并发布财务配置').click();await status('数值与当前版本一致');assert.equal(posts.length,3);
+    assert.deepEqual(errors,[]);
+    console.log('PASS: financial validation, before/after confirmation, failed-read draft retention and publish success distinct from estimates refresh');
+  }finally{if(browser)await browser.close();await new Promise(resolve=>server.close(resolve));}
+})().catch(error=>{console.error(error);process.exitCode=1;});

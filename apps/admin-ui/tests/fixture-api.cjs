@@ -1,11 +1,13 @@
 // Test-only authenticated API. Never imported by the application or served by production.
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 module.exports = function fixtureApi() {
   const now = 1789790400;
   const writes = [];
   const groups = ['PRO', 'PRO+', 'PRO Max', 'Power'].map((name, i) => ({id: `fixture-group-${i}`, name, virtual_plan_name: name, virtual_usage_limit: [1000,2000,5000,10000][i], rate_card_id: 'fixture-rate', margin_multiplier: 1}));
   const models = ['claude-sonnet', 'gpt-5', 'gemini-pro'].map((name, i) => ({id: `fixture-model-${i}`, exposed_model_id: name, target_provider_id: 'fixture-provider', target_model: name, group_id: groups[i].id, context_window: 200000, max_output: 8192, credit_multiplier: 1, visible: true, supports_tools: true, supports_vision: true, supports_reasoning: true}));
   const cards = ['active', 'unactivated', 'frozen', 'banned', 'expired', 'active'].map((status, i) => ({id: `fixture-card-${i}`, codeRecoverable: i !== 1, status, creditTotal: 2000000000, creditUsed: i*100000000, availableCredits: 2000000000-i*100000000, pointsTotal: 2000, pointsAvailable: 2000-i*100, boundDevices: status === 'unactivated' ? [] : [`fixture-device-${i}`], maxDevices: 1, activatedAt: now-86400, validUntil: now+2592000, groupId: groups[i%4].id, note: '本地视觉测试数据'}));
+  const cardRevision = () => crypto.createHash('sha256').update(cards.map(card => card.id).join('\n')).digest('hex');
   const traces = Array.from({length: 24}, (_, i) => ({id: `fixture-trace-${i}`, card_id: cards[i%6].id, ts: now-i*3600, exposed_model: models[i%3].exposed_model_id, status: i<18 ? 'success' : i<21 ? 'error' : i<23 ? 'client_aborted' : 'in_progress', ttft_ms: 240+i*31, input_tokens: 1200+i*25, output_tokens: 480, tokens_per_second: 42, credits_charged: i<18 ? 1500000 : 0, attempt_chain: [{provider_id: 'fixture-provider', key_id: 'fixture-key', success: i<18, error: i<18 ? null : 'fixture upstream timeout', latency_ms: 580}]}));
   const config = {settings:{credit_face_value_cny:0.01,usd_cny_rate:7.2,rate_updated_at_secs:now},revision:'fixture-rev-2', groups, models, rate_cards:[{id:'fixture-rate', name:'测试价格表'}], versions: models.map((m,i) => ({id:`fixture-price-${i}`, model:m.exposed_model_id, rate_card_id:'fixture-rate', pricing_mode:'fixed', effective_from_secs:now-86400, fixed_input_credit_per_m:3000000, fixed_output_credit_per_m:15000000, fixed_cache_read_credit_per_m:300000, fixed_cache_creation_credit_per_m:3750000})), audit:[{operator:'fixture-admin', reason:'本地测试：更新模型价格', previous_revision:'fixture-rev-1', revision:'fixture-rev-2', created_at_secs:now}]};
   let authenticated = false;
@@ -24,7 +26,7 @@ module.exports = function fixtureApi() {
     if(endpoint==='cards/reveal') return reply({success:true,rawCode:'FIXTURE-RECOVERED-CODE'});
     if(endpoint==='session/revoke') {authenticated=false; res.setHeader('Set-Cookie','fixture_session=; Max-Age=0; Path=/'); return reply({success:true});}
     if(endpoint==='stats') return reply({success:true,totalCards:cards.length,activeCards:2,unactivatedCards:1,frozenCards:1,bannedCards:1,totalCredits:12000000000,usedCredits:1500000000,remainingCredits:10500000000,totalPoints:12000,usedPoints:1500,remainingPoints:10500});
-    if(endpoint==='cards') return reply({success:true,count:cards.length,cards});
+    if(endpoint==='cards') return reply({success:true,count:cards.length,cards,revision:cardRevision()});
     if(endpoint==='traces') return reply({success:true,traces});
     if(endpoint==='commercial-config') {
       if(req.method==='POST') {assert.deepEqual(Object.keys(body).sort(),['expected_revision','reason','settings']);assert.equal(body.expected_revision,config.revision);assert.deepEqual(Object.keys(body.settings).sort(),['credit_face_value_cny','usd_cny_rate']);config.settings={...body.settings,rate_updated_at_secs:now+1};config.revision='fixture-rev-3';}

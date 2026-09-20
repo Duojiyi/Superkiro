@@ -25,27 +25,39 @@ FINGERPRINT = 'sTYVluUx3J9nai3Cj67JvjQ5+DRuqLjjiWXT1s+wyiI'
 
 
 def connect(password, use_proxy=True):
-    if not use_proxy:
-        sock = socket.create_connection((HOST, 22), 15)
-    else:
-        sock = socket.create_connection(('127.0.0.1', 7897), 15)
-        sock.sendall(f'CONNECT {HOST}:22 HTTP/1.1\r\nHost: {HOST}:22\r\n\r\n'.encode())
-        reply = b''
-        while not reply.endswith(b'\r\n\r\n'):
-            part = sock.recv(1)
-            if not part or len(reply) > 8192:
-                raise RuntimeError('Invalid SSH proxy response')
-            reply += part
-        assert b' 200 ' in reply.split(b'\r\n')[0], 'SSH proxy rejected tunnel'
-    transport = paramiko.Transport(sock)
-    transport.start_client(timeout=20)
-    fingerprint = base64.b64encode(hashlib.sha256(transport.get_remote_server_key().asbytes()).digest()).decode().rstrip('=')
-    assert fingerprint == FINGERPRINT, 'SSH host key changed'
-    transport.auth_password('root', password)
-    transport.set_keepalive(20)
-    client = paramiko.SSHClient()
-    client._transport = transport
-    return client
+    sock = None
+    transport = None
+    try:
+        if not use_proxy:
+            sock = socket.create_connection((HOST, 22), 15)
+        else:
+            sock = socket.create_connection(('127.0.0.1', 7897), 15)
+            sock.sendall(f'CONNECT {HOST}:22 HTTP/1.1\r\nHost: {HOST}:22\r\n\r\n'.encode())
+            reply = b''
+            while not reply.endswith(b'\r\n\r\n'):
+                part = sock.recv(1)
+                if not part or len(reply) > 8192:
+                    raise RuntimeError('Invalid SSH proxy response')
+                reply += part
+            if b' 200 ' not in reply.split(b'\r\n')[0]:
+                raise RuntimeError('SSH proxy rejected tunnel')
+        transport = paramiko.Transport(sock)
+        transport.start_client(timeout=20)
+        fingerprint = base64.b64encode(hashlib.sha256(transport.get_remote_server_key().asbytes()).digest()).decode().rstrip('=')
+        # Security checks must also run under python -O, before sending credentials.
+        if fingerprint != FINGERPRINT:
+            raise RuntimeError('SSH host key changed')
+        transport.auth_password('root', password)
+        transport.set_keepalive(20)
+        client = paramiko.SSHClient()
+        client._transport = transport
+        return client
+    except Exception:
+        if transport is not None:
+            transport.close()
+        elif sock is not None:
+            sock.close()
+        raise
 
 
 def main():

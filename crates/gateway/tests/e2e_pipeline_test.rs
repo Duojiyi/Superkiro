@@ -178,7 +178,9 @@ async fn test_e2e_conversation_pipeline_with_provider_and_billing_settlement() {
     );
 
     // 8. Test Idempotent Replay (Spec §4.7)
-    // Sending the same invocation_id again must return the cached short-circuit
+    // The completion cache does not contain the original event stream, so a
+    // completed invocation must return an explicit protocol error rather than a
+    // synthetic successful assistant response.
     let mut replay_req = Request::builder()
         .method(Method::POST)
         .uri("/generateAssistantResponse")
@@ -191,15 +193,22 @@ async fn test_e2e_conversation_pipeline_with_provider_and_billing_settlement() {
     replay_req.extensions_mut().insert(replay_claims);
 
     let replay_resp = app.clone().oneshot(replay_req).await.unwrap();
-    assert_eq!(replay_resp.status(), StatusCode::OK);
+    assert_eq!(replay_resp.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        replay_resp.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/x-amz-json-1.1"
+    );
 
     let bytes = replay_resp.into_body().collect().await.unwrap().to_bytes();
-    let mut replay_decoder = EventStreamDecoder::new();
-    replay_decoder.feed(&bytes).unwrap();
-    let replay_frame = replay_decoder.decode().unwrap().unwrap();
-    assert_eq!(replay_frame.event_type(), Some("assistantResponseEvent"));
-    let replay_evt: AssistantResponseEvent = serde_json::from_slice(&replay_frame.payload).unwrap();
-    assert!(replay_evt.content.contains("idempotent replay"));
+    let replay_error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        replay_error["__type"],
+        "InvocationAlreadyCompletedException"
+    );
+    assert!(replay_error["message"]
+        .as_str()
+        .unwrap()
+        .contains("use a new invocation id"));
 
     // Credit must not be billed twice!
     let card_after_replay = billing.get_card("card-e2e-001").unwrap();

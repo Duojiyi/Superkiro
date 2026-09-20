@@ -26,7 +26,7 @@ const server=http.createServer(async(req,res)=>{
     const cards=Array.from({length:55},(_,i)=>({id:`bulk-${i}`,codeRecoverable:i!==2,status:'active',groupId:'fixture',pointsTotal:10,pointsAvailable:10,boundDevices:[],maxDevices:1}));
     let statusCalls=[],revealCalls=[],held;
     await page.route('**/*',route=>new URL(route.request().url()).origin===origin?route.continue():route.abort());
-    await page.route('**/api/v1/admin/cards?*',route=>route.fulfill({json:{success:true,cards,count:cards.length}}));
+    await page.route('**/api/v1/admin/cards?*',route=>route.fulfill({json:{success:true,cards,count:cards.length,revision:'fixture-bulk-1'}}));
     await page.route('**/api/v1/admin/cards/status',async route=>{
       const body=route.request().postDataJSON(); statusCalls.push(body);
       if(body.cardId==='bulk-0' && statusCalls.length===1){held=route;return;}

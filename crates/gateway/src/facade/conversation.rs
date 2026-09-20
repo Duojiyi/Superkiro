@@ -212,17 +212,14 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                     );
                 }
                 Err(crate::idempotency::IdempotencyError::AlreadyCompleted(_)) => {
-                    // Idempotent short-circuit
-                    let frame = encode_assistant_response(
-                        "Request already completed (idempotent replay).",
-                        Some("kiro-byok-cached"),
+                    // The completion cache contains billing metadata only, not the
+                    // original event stream. Never turn an unreplayable request
+                    // into a synthetic successful assistant answer.
+                    return error_response(
+                        StatusCode::CONFLICT,
+                        "InvocationAlreadyCompletedException",
+                        "Request with amz-sdk-invocation-id has already completed; use a new invocation id",
                     );
-                    return (
-                        StatusCode::OK,
-                        [(header::CONTENT_TYPE, "application/vnd.amazon.eventstream")],
-                        frame,
-                    )
-                        .into_response();
                 }
                 Err(crate::idempotency::IdempotencyError::AlreadyFailed(_)) => {
                     return error_response(

@@ -66,7 +66,7 @@ for (const input of ['', '-1', 'NaN', 'Infinity', '1e3', '1.0000001', '900719925
   await assert.rejects(expired.checkAuth(), error=>error.name==='AdminApiError'&&error.status===401&&error.message==='expired'); assert.equal(unauthorized, true);
   await expired.logout(); // 401 confirms there is no remaining authenticated session.
   let pageCount = 0;
-  const {AdminApiClient: PagedClient} = load('api.ts', {fetch: async (url) => ({ok:true, json:async () => url.endsWith('/session') ? {success:true,role:'admin',csrfToken:'test-csrf'} : ({success:true,cards:pageCount++ === 0 ? Array.from({length:500}, (_,i)=>({id:String(i)})) : [{id:'last'}]})})});
+  const {AdminApiClient: PagedClient} = load('api.ts', {fetch: async (url) => ({ok:true, json:async () => url.endsWith('/session') ? {success:true,role:'admin',csrfToken:'test-csrf'} : ({success:true,revision:'fixture-cards',cards:pageCount++ === 0 ? Array.from({length:500}, (_,i)=>({id:String(i)})) : [{id:'last'}]})})});
   const paged = new PagedClient(); await paged.checkAuth();
   const pages = await paged.getCards(); assert.equal(pages.cards.length,501); assert.equal(pageCount,2);
   console.log('PASS: exact price conversion, invalid price rejection, cookie/CSRF, expiry/logout failures, pagination, reveal, daily-operation payloads, four tiers and revision publishing');

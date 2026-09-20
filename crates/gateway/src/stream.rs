@@ -144,6 +144,24 @@ impl StreamGuardConfig {
     }
 }
 
+const DEFAULT_SEND_DEADLINE: Duration = Duration::from_secs(600);
+
+async fn send_frame(
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    frame: Bytes,
+    deadline: tokio::time::Instant,
+) -> bool {
+    // Do not enqueue a frame once the absolute request deadline has elapsed,
+    // even when the bounded channel currently has capacity.
+    if tokio::time::Instant::now() >= deadline {
+        return false;
+    }
+    matches!(
+        tokio::time::timeout_at(deadline, tx.send(Ok(frame))).await,
+        Ok(Ok(()))
+    )
+}
+
 #[derive(Default)]
 struct ToolBuffer {
     id: String,
@@ -172,13 +190,37 @@ pub fn create_stream_guard(
     upstream_stream: impl Stream<Item = Result<ProviderStreamEvent, ProviderError>> + Send + 'static,
     config: StreamGuardConfig,
     tool_registry: Option<ToolRegistry>,
+    idempotency_guard: Option<IdempotencyGuard>,
+    billing_settler: Option<BillingSettler>,
+) -> FrameStream {
+    create_stream_guard_with_send_deadline(
+        upstream_stream,
+        config,
+        tool_registry,
+        idempotency_guard,
+        billing_settler,
+        DEFAULT_SEND_DEADLINE,
+    )
+}
+
+/// Testable variant of [`create_stream_guard`] with a shorter absolute send deadline.
+/// Production callers should use [`create_stream_guard`], which uses the 10-minute
+/// request ceiling shared with the upstream watchdog.
+pub fn create_stream_guard_with_send_deadline(
+    upstream_stream: impl Stream<Item = Result<ProviderStreamEvent, ProviderError>> + Send + 'static,
+    config: StreamGuardConfig,
+    tool_registry: Option<ToolRegistry>,
     mut idempotency_guard: Option<IdempotencyGuard>,
     mut billing_settler: Option<BillingSettler>,
+    send_timeout: Duration,
 ) -> FrameStream {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let send_deadline = tokio::time::Instant::now() + send_timeout;
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(config.keepalive_interval);
+        let deadline_sleep = tokio::time::sleep_until(send_deadline);
+        tokio::pin!(deadline_sleep);
         interval.tick().await;
         let mut upstream = Box::pin(upstream_stream);
         let mut tool_buffers: BTreeMap<usize, ToolBuffer> = BTreeMap::new();
@@ -199,8 +241,9 @@ pub fn create_stream_guard(
         'stream: loop {
             tokio::select! {
                 _ = tx.closed() => break,
+                _ = &mut deadline_sleep => break,
                 _ = interval.tick() => {
-                    if tx.send(Ok(Bytes::from(kiro_wire::encoder::encode_keepalive()))).await.is_err() {
+                    if !send_frame(&tx, Bytes::from(kiro_wire::encoder::encode_keepalive()), send_deadline).await {
                         break;
                     }
                 }
@@ -235,7 +278,7 @@ pub fn create_stream_guard(
                                 }
                             };
                             if let Some(frame) = frame {
-                                if tx.send(Ok(Bytes::from(frame))).await.is_err() { break; }
+                                if !send_frame(&tx, Bytes::from(frame), send_deadline).await { break; }
                             }
                         }
                         Some(Ok(ProviderStreamEvent::Usage(next))) => {
@@ -254,7 +297,7 @@ pub fn create_stream_guard(
                                 kiro_wire::encoder::encode_context_usage((usage.total_tokens as f64 / context_window as f64).clamp(0.0, 1.0)),
                             ];
                             for frame in frames {
-                                if tx.send(Ok(Bytes::from(frame))).await.is_err() { break 'stream; }
+                                if !send_frame(&tx, Bytes::from(frame), send_deadline).await { break 'stream; }
                             }
                         }
                         Some(Ok(ProviderStreamEvent::StopReason(reason))) => {
@@ -269,13 +312,13 @@ pub fn create_stream_guard(
                                     "InternalServerException",
                                     "Upstream completed without producing any output",
                                 );
-                                let _ = tx.send(Ok(Bytes::from(frame))).await;
+                                let _ = send_frame(&tx, Bytes::from(frame), send_deadline).await;
                                 break;
                             }
                             for (_, buf) in std::mem::take(&mut tool_buffers) {
                                 if !buf.name.is_empty() || !buf.id.is_empty() {
                                     let frame = kiro_wire::encoder::encode_tool_use(&buf.name, &buf.id, &buf.arguments, true);
-                                    if tx.send(Ok(Bytes::from(frame))).await.is_err() { break 'stream; }
+                                    if !send_frame(&tx, Bytes::from(frame), send_deadline).await { break 'stream; }
                                 }
                             }
                             completed = true;
@@ -292,9 +335,11 @@ pub fn create_stream_guard(
                             };
                             let friendly = format!("\n\n**上游模型服务异常**：{error}\n");
                             let frame = kiro_wire::encoder::encode_assistant_response(&friendly, Some(&config.model_id));
-                            let _ = tx.send(Ok(Bytes::from(frame))).await;
+                            if !send_frame(&tx, Bytes::from(frame), send_deadline).await {
+                                break 'stream;
+                            }
                             let frame = kiro_wire::encoder::encode_exception("InternalServerException", &error);
-                            let _ = tx.send(Ok(Bytes::from(frame))).await;
+                            let _ = send_frame(&tx, Bytes::from(frame), send_deadline).await;
                             break;
                         }
                     }
@@ -328,7 +373,7 @@ pub fn create_stream_guard(
                         "InternalServerException",
                         "Billing settlement failed; request retained for reconciliation",
                     );
-                    let _ = tx.send(Ok(Bytes::from(frame))).await;
+                    let _ = send_frame(&tx, Bytes::from(frame), send_deadline).await;
                     eprintln!("[kiro-gateway] settlement failed: {error}");
                 }
             }
@@ -358,7 +403,7 @@ pub fn create_stream_guard(
                 None,
                 Some(stop_reason.as_deref().unwrap_or("end_turn")),
             );
-            if tx.send(Ok(Bytes::from(frame))).await.is_ok() {
+            if send_frame(&tx, Bytes::from(frame), send_deadline).await {
                 if let Some(guard) = idempotency_guard.take() {
                     guard.commit(CompletedInvocation {
                         completed_at: Instant::now(),

@@ -39,6 +39,11 @@ jobs:
       - name: Offline Publication and Backup Regressions
         run: python -B -m unittest discover -s deploy -p "test_publish_native*.py" -v
 
+      - name: SSH Host-Key Verification (including optimized Python)
+        run: |
+          python -B -m unittest -v deploy.test_ssh_transport
+          python -O -B -m unittest -v deploy.test_ssh_transport
+
       - name: Offline Artifact Mapping Regressions
         run: python -B -m unittest discover -s deploy -p "test_artifact_provenance.py" -v
 
@@ -94,6 +99,7 @@ jobs:
       - run: npm run test:card-bulk
       - run: npm run test:iteration
       - run: npm run test:issuance
+      - run: npm run test:experience
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'

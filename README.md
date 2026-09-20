@@ -6,13 +6,25 @@ The portal remains in `apps/portal-ui`; the redesigned admin is in `apps/admin-u
 ## Local development
 
 ```sh
-python -m pip install -r requirements-desktop.txt
-cargo build --locked -p patch-engine --bin patch-cli
-python run_desktop.py --dev
-cd apps/admin-ui
-npm ci
-npm run build
+npm --prefix apps/desktop-ui ci
+npm --prefix apps/desktop-ui run build
+cargo run --locked -p desktop-host --bin Superkiro
+
+# Web administration (a separate frontend)
+npm --prefix apps/admin-ui ci
+npm --prefix apps/admin-ui run dev
 ```
+
+The admin development page is `http://localhost:3000/admin/`; Vite serves the UI
+and proxies `/api` to the local gateway on port 19820. Browser authentication
+requires a trusted HTTPS reverse proxy and a matching `ADMIN_ORIGIN`, plus
+`ADMIN_BROWSER_LOGIN=true` and `ADMIN_PASSWORD_HASH`. Plain HTTP is only a UI
+preview, not a supported administrator login setup.
+
+The desktop runtime is Rust/Tauri 2 with a React frontend. On Windows,
+`启动Debug客户端.bat` builds and starts this same native client. `run_desktop.py`
+and `requirements-desktop.txt` remain for legacy bridge regression checks, not
+the current desktop launch or packaging path.
 
 Debug uses the same customer UI as release. Card validation does not activate Kiro;
 connection changes require an explicit action and confirmation before closing Kiro.
@@ -20,12 +32,14 @@ connection changes require an explicit action and confirmation before closing Ki
 ## Native packages
 
 ```sh
-python -m pip install pyinstaller==6.16.0
 python scripts/build_desktop.py
 ```
 
-GitHub Actions `Desktop Packages` builds Windows x64, macOS Apple Silicon and Intel
-on their native runners. macOS bundles are archived with `ditto` to preserve executable
+The Windows build needs Rust/MSVC, Node.js/npm and Python on the build machine;
+end users need WebView2, not Python or Node.js.
+
+GitHub Actions `Desktop Native Packages` builds Windows x64, macOS Apple Silicon and Intel
+on their native runners. macOS bundles are archived with `tar` to preserve executable
 permissions. Artifacts are **unsigned test builds**, not notarized commercial releases.
 Apple Developer signing/notarization credentials and Windows signing credentials are
 not included. Do not disable Gatekeeper or TLS validation to work around failures.

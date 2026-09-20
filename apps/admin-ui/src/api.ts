@@ -82,6 +82,7 @@ export interface AdminCardsResponse {
   cards: AdminCardItem[];
   offset?: number;
   limit?: number;
+  revision?: string;
 }
 
 export interface AdminCardStatusResponse {
@@ -115,6 +116,7 @@ export class AdminApiClient {
   private sessionVersion = 0;
   private requests = new Set<AbortController>();
   onUnauthorized?: () => void;
+  onSessionChanged?: () => void;
   twoFactorEnabled: boolean | undefined;
   totpRequired = false;
   private expiryTimer?: ReturnType<typeof setTimeout>;
@@ -174,6 +176,7 @@ export class AdminApiClient {
         }
         const errorVersion=this.sessionVersion;
         const error = await res.json().catch(() => ({}));
+        if (errorVersion !== this.sessionVersion) throw new Error('管理会话已改变，请重新加载');
         if(path==='/api/v1/admin/session' && errorVersion===this.sessionVersion){this.twoFactorEnabled=typeof error.twoFactorEnabled==='boolean'?error.twoFactorEnabled:undefined;this.totpRequired=error.totpRequired===true;}
         throw new AdminApiError(error.error || (res.status === 401 ? '用户名或密码错误' : `请求失败 (${res.status})`),res.status);
       }
@@ -191,6 +194,9 @@ export class AdminApiClient {
       this.clearSession(); this.onUnauthorized?.();
       throw new Error('管理会话无效');
     }
+    const changed = !!this.csrfToken && this.csrfToken !== result.csrfToken;
+    // A cookie changed in another tab: old requests and sensitive UI belong to the old session.
+    if (changed) this.clearSession();
     if(this.csrfToken!==result.csrfToken)this.authenticatedUsername=null;
     this.csrfToken = result.csrfToken;
     this.twoFactorEnabled=result.twoFactorEnabled;this.totpRequired=result.totpRequired===true;
@@ -200,6 +206,7 @@ export class AdminApiClient {
       this.expiresAt=result.expiresAt*1000;
       this.expiryTimer=setTimeout(()=>{this.clearSession();this.onUnauthorized?.();},Math.min(2147483647,this.expiresAt-Date.now()));
     }
+    if (changed) this.onSessionChanged?.();
     return result;
   }
 
@@ -219,11 +226,20 @@ export class AdminApiClient {
   }
 
   async getCards(): Promise<AdminCardsResponse> {
-    const cards: AdminCardItem[] = [];
+    const cards: AdminCardItem[] = [], seen = new Set<string>();
+    const version = this.sessionVersion;
+    let revision: string | undefined;
     for (let offset = 0; ; offset += 500) {
       const page = await this.request<AdminCardsResponse>(`/api/v1/admin/cards?offset=${offset}&limit=500`);
-      if (!page.success) throw new Error('卡密列表读取失败');
-      cards.push(...page.cards);
+      if (version !== this.sessionVersion) throw new Error('管理会话已改变，请重新加载');
+      if (page.success !== true || !Array.isArray(page.cards)) throw new Error('卡密列表读取失败');
+      if (!page.revision) throw new Error('服务端未提供卡密分页版本，请升级服务端后刷新核对');
+      if (offset === 0) revision = page.revision;
+      else if (page.revision !== revision) throw new Error('卡密列表在读取期间发生变化，请重新刷新后核对；本次不使用不完整列表');
+      for (const card of page.cards) {
+        if (!card.id || seen.has(card.id)) throw new Error('卡密分页包含重复或无效记录，请刷新后重试');
+        seen.add(card.id); cards.push(card);
+      }
       if (page.cards.length < 500) return {...page, cards, count: cards.length};
     }
   }

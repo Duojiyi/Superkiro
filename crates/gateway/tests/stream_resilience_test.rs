@@ -6,11 +6,14 @@ use billing::engine::BillingEngine;
 use billing::reservation::ReservationEstimateParams;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
+use gateway::guardrail::CapacityGuardrail;
 use gateway::idempotency::IdempotencyManager;
 use gateway::provider::{
     ProviderDelta, ProviderError, ProviderStreamEvent, ReceiverStream, TokenUsage,
 };
-use gateway::stream::{create_stream_guard, BillingSettler, StreamGuardConfig};
+use gateway::stream::{
+    create_stream_guard, create_stream_guard_with_send_deadline, BillingSettler, StreamGuardConfig,
+};
 use kiro_wire::decoder::EventStreamDecoder;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -890,4 +893,180 @@ async fn empty_completed_stream_releases_credits_and_allows_retry() {
         assert!(manager.get_completed(inv_id).is_none());
         assert!(manager.try_acquire(inv_id).is_ok());
     }
+}
+
+#[tokio::test]
+async fn completed_tool_invocation_settles_once_and_replay_is_rejected() {
+    let (billing, card_id) = create_test_billing();
+    let inv_id = "inv-tool-completed-replay";
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let params = ReservationEstimateParams {
+        estimated_input_tokens: 1000,
+        max_output_tokens: 2000,
+        input_rate_per_m: 15_000_000,
+        output_rate_per_m: 60_000_000,
+        credit_multiplier: 1.0,
+        margin_multiplier: 1.0,
+        model: Some("claude-3-5-sonnet".to_string()),
+    };
+    billing
+        .reserve(&card_id, inv_id, &params, now_secs, 300)
+        .unwrap();
+
+    let events = vec![
+        Ok(ProviderStreamEvent::Delta(ProviderDelta::ToolCallChunk {
+            index: 0,
+            id: Some("call-tool-1".to_string()),
+            name: Some("read_file".to_string()),
+            arguments: r#"{"path":"README.md"}"#.to_string(),
+        })),
+        Ok(ProviderStreamEvent::Usage(TokenUsage {
+            uncached_prompt_tokens: 40,
+            prompt_tokens: 40,
+            completion_tokens: 12,
+            total_tokens: 52,
+            output_tokens_final: true,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+        })),
+        Ok(ProviderStreamEvent::Done),
+    ];
+    let idemp_mgr = IdempotencyManager::default();
+    let settler = BillingSettler::new(
+        billing.clone(),
+        inv_id.to_string(),
+        "claude-3-5-sonnet".to_string(),
+        "provider-1".to_string(),
+        "claude-3-5-sonnet".to_string(),
+    );
+    let frames = collect_and_decode_frames(create_stream_guard(
+        futures_util::stream::iter(events),
+        StreamGuardConfig::default(),
+        None,
+        Some(idemp_mgr.try_acquire(inv_id).unwrap()),
+        Some(settler),
+    ))
+    .await;
+
+    let tool_frame = frames
+        .iter()
+        .find(|(name, _)| name == "toolUseEvent")
+        .expect("completed tool invocation must emit a tool event");
+    let tool_event: serde_json::Value = serde_json::from_slice(&tool_frame.1).unwrap();
+    assert_eq!(tool_event["name"], "read_file");
+    assert_eq!(tool_event["toolUseId"], "call-tool-1");
+    assert_eq!(tool_event["input"], r#"{"path":"README.md"}"#);
+    assert_eq!(billing.get_card(&card_id).unwrap().credit_reserved, 0);
+    assert_eq!(
+        billing.list_ledger_entries_for_card(&card_id, None).len(),
+        1,
+        "tool completion must settle exactly once"
+    );
+    assert!(idemp_mgr.get_completed(inv_id).is_some());
+    assert!(matches!(
+        idemp_mgr.try_acquire(inv_id),
+        Err(gateway::idempotency::IdempotencyError::AlreadyCompleted(_))
+    ));
+}
+
+// A client that stops consuming must not leave the provider, reservation, or
+// concurrency permit alive forever while the worker waits on the bounded frame
+// channel.  This uses a short absolute deadline so the real blocked-send path
+// is exercised without waiting for the production ten-minute ceiling.
+#[tokio::test]
+async fn send_backpressure_deadline_drops_upstream_settles_once_and_releases_permit() {
+    let (billing, card_id) = create_test_billing();
+    let inv_id = "inv-send-backpressure-deadline";
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let params = ReservationEstimateParams {
+        estimated_input_tokens: 1000,
+        max_output_tokens: 2000,
+        input_rate_per_m: 15_000_000,
+        output_rate_per_m: 60_000_000,
+        credit_multiplier: 1.0,
+        margin_multiplier: 1.0,
+        model: Some("claude-3-5-sonnet".to_string()),
+    };
+    billing
+        .reserve(&card_id, inv_id, &params, now_secs, 300)
+        .unwrap();
+
+    // The output channel inside the guard has capacity 64.  Queue one more
+    // text event than that and never poll the returned FrameStream, forcing a
+    // send to await until the injected 50ms absolute deadline.
+    let (upstream_tx, upstream_rx) = mpsc::channel(128);
+    for _ in 0..=64 {
+        upstream_tx
+            .send(Ok(ProviderStreamEvent::Delta(ProviderDelta::Text(
+                "x".to_string(),
+            ))))
+            .await
+            .unwrap();
+    }
+
+    let capacity = CapacityGuardrail::new(1, 1);
+    let permit = capacity.try_acquire().unwrap();
+    let idemp_mgr = IdempotencyManager::default();
+    let idemp_guard = idemp_mgr.try_acquire(inv_id).unwrap();
+    let settler = BillingSettler::new(
+        billing.clone(),
+        inv_id.to_string(),
+        "claude-3-5-sonnet".to_string(),
+        "provider-1".to_string(),
+        "claude-3-5-sonnet".to_string(),
+    )
+    .with_estimated_input(1000)
+    .with_permit(permit);
+    let config = StreamGuardConfig {
+        keepalive_interval: Duration::from_secs(60),
+        model_id: "claude-3-5-sonnet".to_string(),
+        context_window: None,
+    };
+
+    let stream = create_stream_guard_with_send_deadline(
+        ReceiverStream::new(upstream_rx),
+        config,
+        None,
+        Some(idemp_guard),
+        Some(settler),
+        Duration::from_millis(50),
+    );
+
+    // Wait until the worker has completed settlement after the blocked send.
+    for _ in 0..30 {
+        if billing.list_ledger_entries_for_card(&card_id, None).len() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // The receiver is dropped before settlement, so the provider-side sender
+    // observes cancellation rather than remaining attached to the worker.
+    assert!(upstream_tx
+        .send(Ok(ProviderStreamEvent::Delta(ProviderDelta::Text(
+            "after-deadline".to_string(),
+        ))))
+        .await
+        .is_err());
+    assert_eq!(
+        billing.list_ledger_entries_for_card(&card_id, None).len(),
+        1,
+        "blocked send must settle exactly once"
+    );
+    assert_eq!(billing.get_card(&card_id).unwrap().credit_reserved, 0);
+    assert_eq!(capacity.current_concurrency(), 0);
+    assert!(matches!(
+        idemp_mgr.try_acquire(inv_id),
+        Err(gateway::idempotency::IdempotencyError::AlreadyFailed(_))
+    ));
+
+    // Keep the unconsumed receiver alive until all state assertions above have
+    // observed the worker's terminal cleanup.
+    drop(stream);
 }
