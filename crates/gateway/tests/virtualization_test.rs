@@ -447,5 +447,6 @@ async fn test_audit_b_get_usage_limits_reflects_live_card_credits_and_plan() {
     let breakdown = &body.usage_breakdown_list[0];
     assert_eq!(breakdown.usage_limit, 50.0);
     assert_eq!(breakdown.current_usage, 12.5);
-    assert_eq!(breakdown.display_name, "算力积分");
+    assert_eq!(breakdown.display_name, "Credit");
+    assert_eq!(breakdown.display_name_plural, "Credits");
 }
