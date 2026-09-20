@@ -444,7 +444,6 @@ impl FacadeRegistry {
         for h in self.handlers {
             let path = h.path();
             if path == "/healthz"
-                || path == "/metrics"
                 || path == "/oauth/token"
                 || path == "/oauth/token/refresh"
                 || path == "/refreshToken"
@@ -457,7 +456,7 @@ impl FacadeRegistry {
                 || path.starts_with("/api/v1/cards/")
             {
                 public_routes.insert((path, h.method()), h);
-            } else if path.starts_with("/api/v1/admin/") {
+            } else if path == "/metrics" || path.starts_with("/api/v1/admin/") {
                 admin_routes.insert((path, h.method()), h);
             } else {
                 protected_routes.insert((path, h.method()), h);

@@ -738,3 +738,44 @@ it('keeps recovery evidence and gives actionable support guidance after restore 
  fireEvent.click(screen.getByRole('button',{name:'查看连接诊断'}));
  expect(screen.getByRole('button',{name:'重新检测 ↻'})).toBeTruthy();
 });
+
+
+describe('launch and restored usage contracts',()=>{
+ it('blocks repeated launches and restore while the host launch result is unknown',async()=>{
+  setup(true);const original=invoke.getMockImplementation()!;
+  invoke.mockImplementation((c,p)=>p.path==='/api/launch'?Promise.reject(new Error('timeout')):original(c,p));
+  render(<App/>);await login();await connect();
+  fireEvent.click(screen.getByRole('button',{name:'打开 Kiro ↗'}));
+  await screen.findByText(/连接超时，操作结果未确认/);
+  expect((screen.getByRole('button',{name:'打开 Kiro ↗'}) as HTMLButtonElement).disabled).toBe(true);
+  fireEvent.click(screen.getByRole('button',{name:'还原 Kiro 配置'}));
+  await screen.findByRole('heading',{name:'连接诊断'});
+  expect(invoke.mock.calls.filter(([,p])=>p.path==='/api/launch')).toHaveLength(1);
+  expect(invoke.mock.calls.some(([,p])=>p.path==='/api/restore')).toBe(false);
+ });
+ it('does not report a successful launch without an explicit success result',async()=>{
+  setup(true);const original=invoke.getMockImplementation()!;
+  invoke.mockImplementation((c,p)=>p.path==='/api/launch'?Promise.resolve({}):original(c,p));
+  render(<App/>);await login();await connect();
+  fireEvent.click(screen.getByRole('button',{name:'打开 Kiro ↗'}));
+  await screen.findByText(/连接超时，操作结果未确认/);
+  expect(screen.queryByText('已发送 Kiro 启动请求。')).toBeNull();
+ });
+ it('clears settled today usage after restore while retaining the confirmed balance',async()=>{
+  setup(true);const original=invoke.getMockImplementation()!;
+  invoke.mockImplementation((c,p)=>p.path==='/api/usage'?Promise.resolve({usage:{availableCredits:87,usageBreakdownList:[{dimensionType:'CREDIT',currentUsageWithPrecision:13,usageLimitWithPrecision:100}]},settledUsage:{timezone:'UTC',todayPoints:13}}):original(c,p));
+  render(<App/>);await login();await connect();await screen.findByText('13 积分');
+  fireEvent.click(screen.getByRole('button',{name:'还原 Kiro 配置'}));fireEvent.submit(document.querySelector('dialog form')!);
+  await screen.findByText('Kiro 配置已还原，当前卡密与积分信息已保留。');
+  expect(screen.queryByText('13 积分')).toBeNull();expect(screen.getByText('— 积分')).toBeTruthy();
+  expect(document.querySelector('.balance-value')?.textContent).toBe('87');
+  fireEvent.click(screen.getByRole('button',{name:'刷新 ↻'}));
+  await waitFor(()=>expect((screen.getByRole('button',{name:'刷新 ↻'}) as HTMLButtonElement).disabled).toBe(false));
+  expect(screen.queryByText('13 积分')).toBeNull();
+ });
+});
+
+it('explains rebind policy errors without exposing remote details',()=>{
+  expect(safeError('[auth:rebind-cooldown] remote-secret [retry-after:123]')).toBe('换绑仍在冷却期，请等待冷却结束后重试。 请在 123 秒后重试。');
+  expect(safeError('[auth:rebind-limit] remote-secret')).toBe('换绑次数已用尽，请联系支持方；稍后重试不会恢复次数。');
+});

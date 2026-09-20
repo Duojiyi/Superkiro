@@ -17,6 +17,8 @@ export function safeError(error: unknown) {
     expired:'授权已到期，请重新验证或更换卡密。', 'device-binding':'设备绑定不匹配，请先解除原设备绑定。',
     throttled:'请求过于频繁，请稍后重试。', 'locked-out':'认证暂时锁定，请稍后重试。',
     'invalid-request':'认证请求无效，请检查输入。', 'server-error':'授权服务暂时不可用，请稍后重试。',
+    'rebind-cooldown':'换绑仍在冷却期，请等待冷却结束后重试。',
+    'rebind-limit':'换绑次数已用尽，请联系支持方；稍后重试不会恢复次数。',
     'auth-rejected':'网关拒绝授权，请检查卡密和设备状态。',
   };
   if(auth && Object.hasOwn(authMessages,auth)) {

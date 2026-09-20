@@ -339,7 +339,10 @@ fn parse_settings_bytes(raw: &[u8]) -> Result<Map<String, Value>, SettingsError>
     }
     match serde_json::from_str::<Value>(&strip_jsonc(content))? {
         Value::Object(map) => Ok(map),
-        _ => Ok(Map::new()),
+        _ => Err(SettingsError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "settings.json must contain an object",
+        ))),
     }
 }
 
@@ -449,4 +452,38 @@ fn strip_jsonc(input: &str) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod shape_tests {
+    use super::*;
+
+    #[test]
+    fn non_object_settings_are_never_overwritten_or_deleted() {
+        let root = env::temp_dir().join(format!("settings-shape-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let manager = SettingsManager::at(root.join("settings.json"));
+        for bytes in [
+            b"[\"user data\"]".as_slice(),
+            b"null",
+            b"42",
+            b"true",
+            b"\"text\"",
+        ] {
+            fs::write(manager.path(), bytes).unwrap();
+            assert!(manager.merge_byok("https://fixture.invalid").is_err());
+            assert_eq!(fs::read(manager.path()).unwrap(), bytes);
+            for had_settings_file in [false, true] {
+                let prior = PriorSettingsState {
+                    had_settings_file,
+                    prior_raw: had_settings_file.then(|| b"{}".to_vec()),
+                    ..Default::default()
+                };
+                assert!(manager.revert(&prior).is_err());
+                assert_eq!(fs::read(manager.path()).unwrap(), bytes);
+            }
+        }
+        fs::remove_file(manager.path()).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
 }

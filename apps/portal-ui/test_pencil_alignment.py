@@ -8,6 +8,18 @@ from playwright.sync_api import expect
 
 
 class PencilAlignmentTests(PortalBrowserTests):
+    def test_pencil_production_csp_allows_embedded_fonts(self):
+        violations = []
+        self.page.on('console', lambda message: violations.append(message.text)
+                     if message.type == 'error' and 'Content Security Policy' in message.text else None)
+        response = self.page.goto(self.origin + '/')
+        self.assertIn("font-src 'self' data:", response.headers['content-security-policy'])
+        self.page.evaluate('document.fonts.ready')
+        fonts = self.page.evaluate('Array.from(document.fonts, f => ({family:f.family,status:f.status}))')
+        self.assertTrue(fonts)
+        self.assertTrue(all(f['status'] == 'loaded' for f in fonts), fonts)
+        self.assertEqual(violations, [])
+
     def test_pencil_desktop(self):
         self.goto('/')
         self.page.evaluate('document.fonts.ready')

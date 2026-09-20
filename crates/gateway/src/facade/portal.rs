@@ -19,7 +19,7 @@ use axum::{
     response::IntoResponse,
 };
 use billing::card::CardStatus;
-use billing::engine::BillingEngine;
+use billing::engine::{BillingEngine, BillingError};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -524,15 +524,19 @@ impl FacadeHandler for PortalUnbindHandler {
 
             if let Err(e) = self.billing.unbind_device(&card.id, &req_data.device) {
                 let _ = self.protector.record_failure(&ip, now);
-                return (
-                    StatusCode::BAD_REQUEST,
-                    [(header::CONTENT_TYPE, "application/json")],
-                    axum::Json(serde_json::json!({
-                        "success": false,
-                        "error": format!("Unbind error: {}", e),
-                    })),
-                )
-                    .into_response();
+                // Only allowlisted policy details leave the server; never expose billing IDs.
+                let detail = match e {
+                    BillingError::RebindCooldown { remaining_secs } => serde_json::json!({
+                        "success": false, "code": "rebind_cooldown",
+                        "retryAfterSecs": remaining_secs, "error": "Device rebind cooldown",
+                    }),
+                    BillingError::RebindLimitExceeded { .. } => serde_json::json!({
+                        "success": false, "code": "rebind_limit_exceeded",
+                        "error": "Device rebind limit reached",
+                    }),
+                    _ => return portal_deny_response(),
+                };
+                return json_response(StatusCode::BAD_REQUEST, &detail);
             }
 
             // Success resets consecutive failure counter

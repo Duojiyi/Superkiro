@@ -365,6 +365,11 @@ impl DesktopSession {
             .await
             .map_err(|e| e.to_string())?;
         let cleanup = (|| {
+            // Remote revocation remains effective even if local restoration fails.
+            if let Some(mut session) = session {
+                session.authenticated = false;
+                self.save(&session)?;
+            }
             if snapshots.has_active_snapshot() {
                 snapshots.restore_official().map_err(|e| e.to_string())?;
             }
@@ -380,6 +385,70 @@ mod tests {
     use axum::{routing::post, Json, Router};
     use serde_json::{json, Value};
 
+    #[tokio::test]
+    async fn successful_unbind_invalidates_session_even_when_local_restore_fails() {
+        let root =
+            std::env::temp_dir().join(format!("unbind-cleanup-failure-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let storage = TokenStorage::at(root.join("token.json"));
+        fs::write(storage.path(), b"revoked-token").unwrap();
+        let desktop = DesktopSession::new(storage.clone(), root.join("session.json"));
+        let snapshots = SnapshotManager::at(root.join("snapshot.json"));
+        fs::write(snapshots.snapshot_path(), b"broken snapshot").unwrap();
+        let app = Router::new()
+            .route(
+                "/api/v1/portal/challenge",
+                post(|| async { Json(json!({"challengeToken":"fixture"})) }),
+            )
+            .route(
+                "/api/v1/portal/unbind",
+                post(|| async { Json(json!({"success":true})) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        desktop
+            .save(&Session {
+                gateway: gateway.clone(),
+                device: "fixture-device".into(),
+                previous_token: Some(PreviousToken::Raw(b"official-token".to_vec())),
+                authenticated: true,
+                ca_path: None,
+            })
+            .unwrap();
+        let error = desktop
+            .unbind_with_gateway(&snapshots, "test-card", &gateway)
+            .await
+            .unwrap_err();
+        server.abort();
+        let _ = server.await;
+        assert!(error.contains("Remote unbind succeeded"), "{error}");
+        let reopened = DesktopSession::new(storage.clone(), desktop.path.clone());
+        assert!(!reopened.authenticated());
+        assert!(reopened.recovery_pending());
+        assert!(
+            matches!(reopened.load().unwrap().previous_token, Some(PreviousToken::Raw(v)) if v == b"official-token")
+        );
+        assert_eq!(
+            fs::read(snapshots.snapshot_path()).unwrap(),
+            b"broken snapshot"
+        );
+        assert_eq!(fs::read(storage.path()).unwrap(), b"revoked-token");
+        for path in [
+            storage.path().to_path_buf(),
+            desktop.path.clone(),
+            snapshots.snapshot_path().to_path_buf(),
+            desktop.path.with_extension("session-lock"),
+            snapshots.snapshot_path().with_extension("operation-lock"),
+        ] {
+            if path.exists() {
+                fs::remove_file(path).unwrap();
+            }
+        }
+        fs::remove_dir(root).unwrap();
+    }
     #[tokio::test]
     async fn unbind_after_local_restore_preserves_official_token() {
         let root =

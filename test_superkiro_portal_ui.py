@@ -1,5 +1,6 @@
 """Offline browser contracts for the native portal; no production cards or downloads."""
 import json
+import re
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -22,6 +23,8 @@ class StaticHandler(BaseHTTPRequestHandler):
             data = (UI / 'index.html').read_bytes()
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
+            policy = re.findall(r'Content-Security-Policy "([^"]+)"', (ROOT / 'deploy/Caddyfile.ip').read_text())[0]
+            self.send_header('Content-Security-Policy', policy)
             self.end_headers()
             self.wfile.write(data)
         else:
@@ -56,6 +59,7 @@ class PortalBrowserTests(unittest.TestCase):
         self.manifest_status = 200
         self.fail_action = None
         self.fail_status = 400
+        self.fail_payload = {}
         self.bad_challenge = False
         self.bad_unbind = False
         self.query = dict(success=True, status='active', remainingPoints=1842.5,
@@ -82,7 +86,7 @@ class PortalBrowserTests(unittest.TestCase):
         self.assertNotIn(CARD, route.request.url)
         if action == self.fail_action:
             route.fulfill(status=self.fail_status, headers={'Retry-After': '30'},
-                          json={'success': False, 'error': CARD + DEVICE})
+                          json={'success': False, 'error': CARD + DEVICE, **self.fail_payload})
         elif action == 'query':
             route.fulfill(json=self.query)
         elif action == 'challenge':
@@ -377,6 +381,53 @@ class PortalBrowserTests(unittest.TestCase):
         expect(self.page.locator('#account')).to_be_hidden()
         expect(self.page.locator('#card')).to_have_value('')
         expect(self.page.locator('#verify')).to_be_enabled()
+
+    def test_19_device_docs_do_not_promise_unconditional_binding(self):
+        self.goto('/docs/device')
+        section = self.page.locator('[data-doc="device"]')
+        expect(section).to_contain_text('新客户端能否启用仍受卡密状态、余额和有效期限制')
+        expect(section).not_to_contain_text('可立即在新客户端绑定')
+
+    def test_17_unbind_success_does_not_promise_valid_authorization(self):
+        for status in ['frozen', 'expired', 'banned', 'active']:
+            with self.subTest(status=status):
+                self.query.update(status=status, isExpired=status == 'expired', remainingPoints=0)
+                self.goto('/device')
+                self.verify()
+                self.page.locator('#request-unbind').click()
+                self.page.locator('#confirm-unbind').click()
+                message = self.page.locator('#device-message')
+                expect(message).to_contain_text('旧设备已解绑')
+                expect(message).to_contain_text('取决于卡密状态、余额和有效期')
+                expect(message).not_to_contain_text('现在可以')
+                expect(self.page.locator('#recovery')).to_contain_text('不会解除冻结')
+                self.assertTrue(message.evaluate("el=>getComputedStyle(el).fontFamily").startswith('"Microsoft YaHei"'))
+
+    def test_18_unbind_policy_errors_are_whitelisted(self):
+        cases = [
+            ({'code': 'rebind_limit_exceeded'}, '换绑次数已用尽'),
+            ({'code': 'rebind_cooldown', 'retryAfterSecs': 123}, '请等待 123 秒'),
+            ({'code': 'rebind_cooldown', 'retryAfterSecs': CARD}, '剩余时间未确认'),
+            ({'code': 'rebind_cooldown', 'retryAfterSecs': -1}, '剩余时间未确认'),
+            ({'code': 'rebind_cooldown', 'retryAfterSecs': 1.5}, '剩余时间未确认'),
+            ({'code': 'rebind_cooldown', 'retryAfterSecs': 9007199254740992}, '剩余时间未确认'),
+            ({'code': 'rebind_cooldown'}, '剩余时间未确认'),
+            ({'code': 'unknown_' + CARD}, '验证未通过'),
+        ]
+        for payload, expected in cases:
+            with self.subTest(payload=payload):
+                self.fail_action = 'unbind'
+                self.fail_payload = payload
+                self.goto('/device')
+                self.verify()
+                self.page.locator('#request-unbind').click()
+                self.page.locator('#confirm-unbind').click()
+                message = self.page.locator('#device-message')
+                expect(message).to_contain_text(expected)
+                expect(message).not_to_contain_text(CARD)
+                expect(message).not_to_contain_text(DEVICE)
+                expect(self.page.locator('#recovery')).to_be_hidden()
+                expect(self.page.locator('#verify-form')).to_be_visible()
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

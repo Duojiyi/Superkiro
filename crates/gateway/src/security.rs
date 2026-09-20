@@ -219,6 +219,12 @@ impl BruteForceProtector {
     /// Record a failed login attempt and return whether the identifier was locked out.
     pub fn record_failure(&self, identifier: &str, now_secs: u64) -> Result<(), BruteForceError> {
         let mut records = self.records.write().unwrap();
+        // Drop inactive sources instead of retaining failed attempts for process lifetime.
+        // Active lockouts must survive expiry of the shorter counting window.
+        records.retain(|_, record| match record.locked_until {
+            Some(until) => until > now_secs,
+            None => now_secs.saturating_sub(record.first_failure_at) <= self.config.window_secs,
+        });
         let entry = records
             .entry(identifier.to_string())
             .or_insert_with(|| AttemptRecord {
@@ -593,5 +599,33 @@ impl PortalChallengeManager {
         }
         nonces.insert(claims.nonce, claims.exp);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod brute_force_cleanup_tests {
+    use super::*;
+
+    #[test]
+    fn expired_sources_are_pruned_without_dropping_active_lockouts() {
+        let protector = BruteForceProtector::new(BruteForceConfig {
+            max_failures: 2,
+            window_secs: 60,
+            lockout_secs: 300,
+        });
+        assert!(protector.record_failure("expired", 1000).is_ok());
+        assert!(protector.record_failure("locked", 1000).is_ok());
+        assert!(protector.record_failure("locked", 1000).is_err());
+        assert!(protector.record_failure("new", 1100).is_ok());
+        assert!(!protector.records.read().unwrap().contains_key("expired"));
+        assert_eq!(
+            protector.check_lockout("locked", 1100),
+            Err(BruteForceError::LockedOut {
+                remaining_secs: 200
+            })
+        );
+        assert!(protector.record_failure("later", 1300).is_ok());
+        assert_eq!(protector.records.read().unwrap().len(), 1);
+        assert!(protector.check_lockout("locked", 1300).is_ok());
     }
 }

@@ -68,6 +68,11 @@ impl AuthClientError {
             500..=599 => ("server-error", "Service temporarily unavailable"),
             _ => ("auth-rejected", "Gateway rejected authorization"),
         });
+        let retry_after = retry_after.or_else(|| {
+            (code == "rebind-cooldown")
+                .then(|| value["retryAfterSecs"].as_u64().filter(|v| *v <= 86400))
+                .flatten()
+        });
         let retry = retry_after
             .map(|seconds| format!(" [retry-after:{seconds}]"))
             .unwrap_or_default();
@@ -90,6 +95,11 @@ fn auth_category(code: &str) -> Option<(&'static str, &'static str)> {
         "DeviceBindingException" | "device-binding" => {
             ("device-binding", "Device binding requires attention")
         }
+        "rebind_cooldown" => ("rebind-cooldown", "Device rebind cooldown; retry later"),
+        "rebind_limit_exceeded" => (
+            "rebind-limit",
+            "Device rebind limit reached; contact support",
+        ),
         "ThrottlingException" | "throttled" => ("throttled", "Too many requests; retry later"),
         "LockoutException" | "locked-out" => (
             "locked-out",
@@ -427,6 +437,74 @@ mod initialization_tests {
 mod client_contract_tests {
     use super::*;
     use axum::{routing::post, Json, Router};
+    #[tokio::test]
+    async fn rebind_policy_uses_bounded_body_retry_without_echoing_details() {
+        for (category, retry, expected, seconds) in [
+            (
+                "rebind_cooldown",
+                serde_json::json!(123),
+                "rebind-cooldown",
+                Some(123),
+            ),
+            (
+                "rebind_cooldown",
+                serde_json::json!("remote-secret"),
+                "rebind-cooldown",
+                None,
+            ),
+            (
+                "rebind_cooldown",
+                serde_json::json!(86401),
+                "rebind-cooldown",
+                None,
+            ),
+            (
+                "rebind_limit_exceeded",
+                serde_json::json!(123),
+                "rebind-limit",
+                None,
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = Router::new().route(
+                "/",
+                post(move || {
+                    let retry = retry.clone();
+                    async move {
+                        (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "code": category, "retryAfterSecs": retry, "error": "remote-secret"
+                            })),
+                        )
+                    }
+                }),
+            );
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let response = reqwest::Client::new()
+                .post(format!("http://{address}/"))
+                .send()
+                .await
+                .unwrap();
+            let error = AuthClientError::from_response(response).await;
+            assert!(!error.is_authorization_rejected());
+            assert!(!error.to_string().contains("remote-secret"));
+            match error {
+                AuthClientError::AuthRejected {
+                    code, retry_after, ..
+                } => {
+                    assert_eq!(code, expected);
+                    assert_eq!(retry_after, seconds);
+                }
+                other => panic!("{other}"),
+            }
+            server.abort();
+            let _ = server.await;
+        }
+    }
     #[tokio::test]
     async fn rejection_retains_only_whitelisted_category_and_bounded_retry() {
         for (field, category, retry, expected, seconds) in [

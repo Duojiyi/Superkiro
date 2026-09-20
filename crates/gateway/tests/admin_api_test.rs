@@ -791,3 +791,37 @@ async fn test_adjust_authenticated_operator_and_legacy_idempotency() {
         13_000_000
     );
 }
+
+#[tokio::test]
+async fn metrics_require_admin_not_client_authorization() {
+    let (_, app) = setup_admin_app();
+    let auth = gateway::auth::AuthState::new("test-auth-secret-key-32bytes-long-ok!!");
+    let token = auth
+        .issue_token("card-admin-01", "group-admin", 0, 3600)
+        .unwrap();
+    for bearer in [None, Some(token)] {
+        let mut req = Request::builder().uri("/metrics");
+        if let Some(token) = bearer {
+            req = req.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let resp = tower::ServiceExt::oneshot(app.clone(), req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("kiro_requests"));
+    }
+    let req = Request::builder()
+        .uri("/metrics")
+        .header("x-admin-key", TEST_ADMIN_KEY)
+        .body(Body::empty())
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers()[header::CONTENT_TYPE]
+        .to_str()
+        .unwrap()
+        .starts_with("text/plain"));
+}

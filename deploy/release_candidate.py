@@ -83,6 +83,24 @@ def write_remote(ssh, path, content):
         sftp.posix_rename(path + '.next', path)
 
 
+def portal_caddy_config(content):
+    """Preserve live routing/secrets; add only the embedded-font CSP permission."""
+    text = content.decode('utf-8')
+    pattern = r'Content-Security-Policy "([^"\n]+)"'
+    matches = list(re.finditer(pattern, text))
+    if len(matches) != 1:
+        raise RuntimeError('Expected exactly one production CSP header')
+    match = matches[0]
+    policy = match.group(1)
+    fonts = [part.strip() for part in policy.split(';') if part.strip().startswith('font-src')]
+    if fonts:
+        if fonts != ["font-src 'self' data:"]:
+            raise RuntimeError('Custom font policy requires explicit review')
+        return content
+    policy = policy.rstrip('; ') + "; font-src 'self' data:"
+    return (text[:match.start(1)] + policy + text[match.end(1):]).encode('utf-8')
+
+
 def save_report(ssh, report):
     content = json.dumps(report, indent=2).encode()
     path = ROOT / 'deployment-candidate-results.json'
@@ -269,7 +287,7 @@ def main(credentials=None, ssh=None):
                     raise RuntimeError('Unexpected gateway image configuration')
                 report['previous_image'] = matches[0]
                 compose = compose.replace('    image: ' + matches[0], '    image: ' + report['image'], 1)
-                caddy = sftp.open(old + '/deploy/Caddyfile.ip').read()
+                caddy = portal_caddy_config(sftp.open(old + '/deploy/Caddyfile.ip').read())
                 archive = ROOT / '.acceptance' / f'release-{release}.tar.gz'
                 archive.parent.mkdir(parents=True, exist_ok=True)
                 for relative in SOURCE_PATHS + ['apps/admin-ui/dist/index.html', 'apps/portal-ui/index.html']:

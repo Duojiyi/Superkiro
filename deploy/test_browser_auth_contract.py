@@ -30,6 +30,15 @@ class BrowserSessionContract(unittest.TestCase):
         self.assertIn('verify_admin_browser(browser, web, card, passed)', source)
         self.assertNotIn('storage_state(', source)
 
+    def test_staged_font_policy_is_narrow_and_preserves_live_configuration(self):
+        original = b"route-secret-placeholder\nContent-Security-Policy \"default-src 'self'; frame-ancestors 'none'\"\n"
+        updated = release_candidate.portal_caddy_config(original)
+        self.assertEqual(updated, original.replace(b"frame-ancestors 'none'", b"frame-ancestors 'none'; font-src 'self' data:"))
+        self.assertEqual(release_candidate.portal_caddy_config(updated), updated)
+        for invalid in (b'', original + original, original.replace(b"default-src 'self'", b"font-src 'none'")):
+            with self.assertRaises(RuntimeError):
+                release_candidate.portal_caddy_config(invalid)
+
     def test_readiness_distinguishes_new_login_from_legacy_rollback(self):
         page = Mock(status_code=200, headers={'Content-Type': 'text/html'})
         api = Mock(status_code=401, headers={})

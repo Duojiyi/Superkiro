@@ -464,3 +464,128 @@ async fn test_portal_consecutive_failure_lockout() {
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert!(json["error"].as_str().unwrap().contains("Locked out"));
 }
+
+#[tokio::test]
+async fn test_portal_unbind_public_error_contract() {
+    async fn post(
+        app: &axum::Router,
+        path: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app.clone(), request)
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+    for case in [
+        "cooldown",
+        "limit",
+        "missing-card",
+        "missing-device",
+        "invalid-challenge",
+        "frozen",
+    ] {
+        let (billing, _, card_id, raw_code) = setup_portal();
+        let now = gateway::now_secs();
+        let mut card = billing.get_card(&card_id).unwrap();
+        card.activate(now, 86400).unwrap();
+        card.bound_devices = vec!["private-device".into()];
+        card.max_rebinds = if case == "limit" { 0 } else { 5 };
+        card.rebind_cooldown_secs = 300;
+        if case == "cooldown" {
+            card.last_rebind_at = Some(now);
+        }
+        if case == "frozen" {
+            card.status = billing::card::CardStatus::Frozen;
+        }
+        billing.upsert_card(card.clone());
+        let mut registry = FacadeRegistry::new();
+        registry.register_portal_facades(billing.clone(), None);
+        let app = registry.into_router_with_auth(gateway::auth::AuthState::new(
+            "test-portal-secret-key-32bytes-long-ok!!",
+        ));
+        let (status, challenge) =
+            post(&app, "/api/v1/portal/challenge", json!({"action":"unbind"})).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, result) = post(&app, "/api/v1/portal/unbind", json!({
+            "card": if case == "missing-card" { "unknown-secret" } else { &raw_code },
+            "device": if case == "missing-device" { "unknown-device" } else { "private-device" },
+            "challengeToken": if case == "invalid-challenge" { json!("invalid-token") } else { challenge["challengeToken"].clone() },
+        })).await;
+        if case == "frozen" {
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(result["success"], true);
+            assert_eq!(result["remainingDevices"], json!([]));
+            assert_eq!(
+                billing.get_card(&card_id).unwrap().status,
+                billing::card::CardStatus::Frozen
+            );
+            let (status, _) = post(
+                &app,
+                "/api/v1/portal/activate",
+                json!({"card":raw_code,"device":"new-device"}),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "unbind cannot make frozen authorization usable"
+            );
+            continue;
+        }
+        assert_eq!(
+            status,
+            if case == "invalid-challenge" {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::BAD_REQUEST
+            },
+            "{case}"
+        );
+        assert_eq!(result["success"], false);
+        assert_eq!(
+            billing.get_card(&card_id).unwrap(),
+            card,
+            "{case} must not mutate the card"
+        );
+        let serialized = result.to_string();
+        for secret in [
+            &raw_code,
+            &card_id,
+            "private-device",
+            "unknown-secret",
+            "unknown-device",
+            "invalid-token",
+        ] {
+            assert!(!serialized.contains(secret), "{case} leaked {secret}");
+        }
+        match case {
+            "cooldown" => {
+                assert_eq!(result["code"], "rebind_cooldown");
+                assert!((1..=300).contains(&result["retryAfterSecs"].as_u64().unwrap()));
+            }
+            "limit" => {
+                assert_eq!(result["code"], "rebind_limit_exceeded");
+                assert!(result.get("retryAfterSecs").is_none());
+            }
+            "missing-card" | "missing-device" => assert_eq!(
+                result,
+                json!({"success":false,"error":"Invalid card or request parameters"})
+            ),
+            _ => {
+                assert!(result.get("code").is_none());
+                assert!(result.get("retryAfterSecs").is_none());
+            }
+        }
+    }
+}

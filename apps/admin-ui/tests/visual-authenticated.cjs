@@ -37,7 +37,7 @@ const server=http.createServer(async(req,res)=>{
   const shot=async name=>{await page.locator('.fixed.top-4').waitFor({state:'hidden'});await page.screenshot({path:path.join(output,name),fullPage:true});};
   for(const [id,name] of pages){
    await nav(name);
-   if(id==='pricing'){await page.getByRole('combobox',{name:'选择价格版本模板'}).selectOption('fixture-price-0');assert.equal(await page.getByLabel('输入',{exact:true}).inputValue(),'3');}
+   if(id==='pricing'){await page.getByRole('combobox',{name:'选择价格版本模板'}).selectOption('fixture-price-0');assert.equal(await page.getByLabel(/^未缓存输入售价（积分 \/ 百万 Tokens）/).inputValue(),'3');}
    assert.ok(await page.locator('tbody tr').count(),`${id} nonempty table`);
    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,`${id} desktop overflow`);
    await shot(`${id}-desktop.png`);

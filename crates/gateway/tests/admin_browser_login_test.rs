@@ -11,6 +11,7 @@ use tower::ServiceExt;
 const KEY: &str = "browser-test-signing-key-32bytes-long";
 fn app(billing: &BillingEngine) -> axum::Router {
     let mut registry = FacadeRegistry::new();
+    registry.register(gateway::facade::MetricsHandler::default());
     registry.register_admin_facades_secure(billing.clone(), KEY.into());
     registry.into_router_with_auth(gateway::auth::AuthState::new(
         "browser-test-client-secret-32bytes-long",
@@ -118,6 +119,23 @@ async fn production_cookie_login_csrf_reveal_logout_and_fail_closed() {
     assert!(session["expiresIn"].as_u64().unwrap() <= 900);
     assert_eq!(session["twoFactorEnabled"], false);
     let csrf = session["csrfToken"].as_str().unwrap();
+    for (auth_cookie, expected) in [
+        (None, StatusCode::UNAUTHORIZED),
+        (Some(cookie), StatusCode::OK),
+    ] {
+        let mut req = Request::builder().uri("/metrics");
+        if let Some(cookie) = auth_cookie {
+            req = req.header("cookie", cookie);
+        }
+        let response = app
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+    }
+
     for (token, expected) in [
         (None, StatusCode::FORBIDDEN),
         (Some("wrong"), StatusCode::FORBIDDEN),

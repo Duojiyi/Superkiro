@@ -675,6 +675,25 @@ impl BillingEngine {
             card.credit_reserved = 0;
         }
         let mut reservations = snapshot.reservations;
+        // Migrate legacy snapshots once, not on every model request.
+        for entry in &snapshot.ledger {
+            if entry.kind == LedgerKind::Usage {
+                if let Some(id) = &entry.invocation_id {
+                    reservations.entry(id.clone()).or_insert_with(|| {
+                        let mut reservation = CreditReservation::new(
+                            format!("res-{id}"),
+                            &entry.card_id,
+                            id,
+                            0,
+                            entry.ts_secs,
+                            0,
+                        );
+                        reservation.state = ReservationState::Settled;
+                        reservation
+                    });
+                }
+            }
+        }
         reservations.retain(|id, reservation| {
             reservation.state != ReservationState::Held
                 || snapshot.pending_settlements.contains_key(id)
@@ -2433,7 +2452,9 @@ impl BillingEngine {
             .reservations
             .values()
             .filter(|res| {
-                res.state != ReservationState::Held
+                // ponytail: retain settled IDs for replay safety, including after ledger archival.
+                // Compact tombstones only when snapshot size warrants a schema migration.
+                res.state == ReservationState::Released
                     && res.created_at_secs < prune_before
                     && !candidate
                         .pending_settlements
@@ -4853,10 +4874,16 @@ mod durability_regressions {
         assert!(restarted.last_snapshot_mirror_error().is_some());
         *restarted.injected_mirror_fault.write().unwrap() = false;
         restarted.run_janitor(700000);
-        assert!(restarted.export_snapshot().reservations.is_empty());
+        assert_eq!(
+            restarted.export_snapshot().reservations["use"].state,
+            ReservationState::Settled
+        );
         let disk = BillingEngine::new();
         disk.load_from_file(&path).unwrap();
-        assert!(disk.export_snapshot().reservations.is_empty());
+        assert_eq!(
+            disk.export_snapshot().reservations["use"].state,
+            ReservationState::Settled
+        );
         disk.retry_pending_settlement("use").unwrap();
         assert_eq!(disk.ledger_entries().len(), 1);
     }
