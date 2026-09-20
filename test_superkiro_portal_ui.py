@@ -299,6 +299,10 @@ class PortalBrowserTests(unittest.TestCase):
         self.page.keyboard.press('Escape')
         expect(self.page.locator('[data-mac]').first).to_be_focused()
         self.assertTrue(all(url.startswith(self.origin) for url in self.requests))
+        # Keep the 250ms motion state deterministic on loaded CI runners.
+        self.page.locator('.stage').scroll_into_view_if_needed()
+        self.page.clock.install()
+        self.page.clock.pause_at(self.page.evaluate('Date.now() + 1000'))
         self.page.emulate_media(reduced_motion='no-preference')
         expect(self.page.locator('.stage')).to_have_class('stage running')
         self.page.locator('.footer').scroll_into_view_if_needed()
