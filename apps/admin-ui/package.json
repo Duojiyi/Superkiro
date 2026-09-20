@@ -8,6 +8,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "test": "node tests/contracts.cjs && node tests/pricing-preview.cjs && node tests/auth-session.cjs && node tests/session-deadline.cjs",
+    "test:issuance": "node tests/issuance.cjs",
     "test:card-bulk": "node tests/card-bulk.cjs",
     "test:iteration": "node tests/iteration.cjs",
     "test:browser": "node tests/auth-gate.cjs",

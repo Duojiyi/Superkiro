@@ -4,7 +4,11 @@ Scope: `apps/admin-ui/**` only. No backend, desktop, runner, production calls, r
 
 ## Backend contract
 
-Card creation keeps the entitlement group independent of the issuance tier. Groups come from the existing commercial-config endpoint. Creation is disabled until a real group has been loaded.
+Card creation keeps the model/billing group (模型与计费分组) independent of the issuance tier. Groups come from the existing commercial-config endpoint; only `issuance_enabled !== false` groups are offered for new cards (missing flags retain the legacy default of true). Eligibility never depends on a group ID or name.
+
+There is no hard-coded default group and no first-group fallback. Exactly one eligible group is selected automatically; multiple eligible groups require an explicit selection; zero eligible groups disable issuance. A still-eligible selection is retained when configuration refreshes; otherwise the same single/multiple/zero rules apply. Historical cards retain name lookup across all groups, including groups closed to new issuance.
+
+The four tiers currently share model/billing configuration and differ in credit allowance. The tier determines the card name, points and 30-day validity; the group determines models and prices. Changing the tier never changes the selected group. The compact issuance summary and confirmation show the tier, points, validity and group separately, so a group named PRO+ cannot be mistaken for the selected tier.
 
 | Label | Points | templateId |
 | --- | ---: | --- |
@@ -13,12 +17,13 @@ Card creation keeps the entitlement group independent of the issuance tier. Grou
 | PRO Max | 5,000 | tier-5000 |
 | Power | 10,000 | tier-10000 |
 
-POST `/api/v1/admin/cards/batch` sends `{count, groupId, templateId, maxDevices: 1}`. It does not send `creditTotal`. Default template is explicitly `tier-2000`; enforcement remains server-side. No new endpoints were introduced.
+An explicit, nonblank `groupId` is required by the UI API client; the server validates eligibility and rejects disabled groups. POST `/api/v1/admin/cards/batch` sends `{count, groupId, templateId, maxDevices: 1}`. It does not send `creditTotal`. Default template is explicitly `tier-2000`; enforcement remains server-side. No new endpoints were introduced.
 
 ## Implementation
 
 - White sidebar and header, neutral workspace, rust-red actions, pale emphasis panels, nine Chinese navigation labels, Superkiro document title and branding.
 - Live overview, searchable card assets, real provider/Key selection, independent discovery results and permission drafts, structured existing group/model fields, fixed-price version drafts with exact micro-credit conversion, traces with selection/details, financial exports, announcement preview/confirmation, configuration audit and retained security forms.
+- The group editor exposes “允许发放新卡”, checked when the field is absent. Edits and publishing preserve `issuance_enabled` and unrelated group fields; disabling new issuance does not change existing card balances.
 - Publishing retains revision checks, reasons, immutable price history and confirmation. Advanced JSON remains available for initial entries, unsupported pricing modes, and full configuration coverage.
 - Single-card/single-device issuance wording; no editable multi-device issuance setting. Existing cards display the actual server-returned device limit rather than pretending a migration has occurred.
 - Unavailable data is empty/unconfigured. No approved-design numbers or rows were copied into runtime data. Overview chart is explicitly a histogram of the latest retrieved traces, not a complete daily chart. Financial ledger costs are distinguished from verified procurement costs and actual cash revenue.
@@ -86,3 +91,7 @@ Generated verification outputs: `.build-check/` and `visual-check/`. Do not trea
 - Machine-readable checks and test mutation payloads: `visual-check/authenticated/results.json`.
 
 Remaining reference differences are intentional capability boundaries, not claimed pixel parity: no daily aggregate date filter, no server-side draft count, no verified cash revenue/procurement setup, no full-operation audit or TOTP enrollment, no targeted announcement delivery, no standalone connectivity test or browser KEK rotation. Existing API-backed forms and advanced configuration remain available. Fixture acceptance does not replace integration testing against a real authenticated backend.
+
+## Issuance UX regression (2026-09-20)
+
+Run `npm run build`, `npm test`, then `npm run test:issuance` with `PLAYWRIGHT_MODULE` configured as above. The issuance browser test serves `dist/` with a loopback-only fixture and covers disabled-group filtering, legacy default true, single-group auto-selection, explicit multi-group selection, all four tier switches retaining the group, zero eligible groups, confirmation details, and checkbox persistence. Existing iteration/visual-authenticated tests explicitly select a group when their fixture provides multiple choices.

@@ -842,9 +842,13 @@ impl FacadeHandler for AdminBatchCardsHandler {
                     "count must be between 1 and 1000",
                 );
             }
-            let group_id = body
-                .group_id
-                .unwrap_or_else(|| "group-pro-plus".to_string());
+            let Some(group_id) = body.group_id else {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRequestException",
+                    "Select an issuance group explicitly",
+                );
+            };
             if !valid_text(&group_id, 64) {
                 return error_response(
                     StatusCode::BAD_REQUEST,
@@ -860,7 +864,10 @@ impl FacadeHandler for AdminBatchCardsHandler {
                     "unknown tier template",
                 );
             };
-            if self.billing.get_group(&group_id).is_none()
+            if self
+                .billing
+                .get_group(&group_id)
+                .is_none_or(|group| !group.issuance_enabled)
                 || body.max_devices.is_some_and(|n| n != 1)
                 || body
                     .credit_total
@@ -869,7 +876,7 @@ impl FacadeHandler for AdminBatchCardsHandler {
                 return error_response(
                     StatusCode::BAD_REQUEST,
                     "InvalidRequestException",
-                    "issuance requires an existing group, matching tier credits, and maxDevices=1",
+                    "issuance requires an enabled group, matching tier credits, and maxDevices=1",
                 );
             }
             let now = now_secs();

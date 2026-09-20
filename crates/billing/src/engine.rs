@@ -502,7 +502,7 @@ impl PendingSettlementRecovery {
 impl BillingEngine {
     pub fn new() -> Self {
         let groups = Arc::new(RwLock::new(HashMap::new()));
-        let default_group = Group::pro_plus("group-pro-plus", "Kiro Pro+ Group");
+        let default_group = Group::pro_plus("group-pro-plus", "标准模型与计费组");
         groups
             .write()
             .unwrap()
@@ -839,6 +839,15 @@ impl BillingEngine {
         );
         let (cards, response_json) = generate()?;
         for card in &cards {
+            if candidate
+                .groups
+                .get(&card.group_id)
+                .is_some_and(|g| !g.issuance_enabled)
+            {
+                return Err(BillingError::InvalidState(
+                    "Group does not allow new card issuance".into(),
+                ));
+            }
             if candidate.cards.contains_key(&card.id) {
                 return Err(BillingError::InvalidState(
                     "generated card ID collision".into(),
@@ -1336,6 +1345,16 @@ impl BillingEngine {
         let mut candidate = self.export_snapshot_locked(sequence, previous_checksum);
 
         for card in &cards_vec {
+            if insert_only
+                && candidate
+                    .groups
+                    .get(&card.group_id)
+                    .is_some_and(|g| !g.issuance_enabled)
+            {
+                return Err(BillingError::InvalidState(
+                    "Group does not allow new card issuance".into(),
+                ));
+            }
             if insert_only && candidate.cards.contains_key(&card.id) {
                 return Err(BillingError::InvalidState(
                     "Card ID collision; batch not issued".into(),

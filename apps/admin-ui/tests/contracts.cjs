@@ -23,7 +23,7 @@ for (const input of ['', '-1', 'NaN', 'Infinity', '1e3', '1.0000001', '900719925
   assert.deepEqual(JSON.parse(calls[0].options.body), {username: 'admin', password: 'test-password'});
   assert.equal(calls[0].options.headers.has('x-admin-key'), false);
   for (const templateId of ['tier-1000', 'tier-2000', 'tier-5000', 'tier-10000']) {
-    const group = 'group-pro-plus';
+    const group = 'arbitrary-billing-group';
     await api.batchCards(2, group, templateId);
     const call = calls.at(-1);
     assert.equal(call.url, '/api/v1/admin/cards/batch');
@@ -33,6 +33,7 @@ for (const input of ['', '-1', 'NaN', 'Infinity', '1e3', '1.0000001', '900719925
     assert.equal(call.options.credentials, 'same-origin');
     assert.equal(call.options.cache, 'no-store');
   }
+  for (const group of [undefined, '', '   ']) await assert.rejects(() => api.batchCards(1, group), /请选择模型与计费分组/);
   await api.publishCommercialConfig({expected_revision: 'revision-test', reason: 'test', groups: []});
   assert.equal(JSON.parse(calls.at(-1).options.body).expected_revision, 'revision-test');
   assert.equal(calls.at(-1).url, '/api/v1/admin/commercial-config');

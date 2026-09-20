@@ -59,7 +59,7 @@ const server=http.createServer(async(req,res)=>{
   for(const tier of [1000,2000,5000,10000]){
    await page.getByRole('button',{name:'＋ 批量生成',exact:true}).click();
    await page.getByRole('combobox',{name:'积分套餐',exact:true}).selectOption(`tier-${tier}`);
-   await page.getByRole('combobox',{name:'权益分组',exact:true}).selectOption('fixture-group-1');
+   await page.getByRole('combobox',{name:'模型与计费分组',exact:true}).selectOption('fixture-group-1');
    await page.getByRole('spinbutton',{name:'生成数量',exact:true}).fill('2');
    if(tier===2000)await shot('card-creation-desktop.png');
    await page.getByRole('button',{name:'生成并入库',exact:true}).click();

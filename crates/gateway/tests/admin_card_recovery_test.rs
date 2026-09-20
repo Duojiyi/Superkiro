@@ -99,7 +99,9 @@ async fn batch_without_kek_fails_closed() {
     ));
     let req = Request::post("/api/v1/admin/cards/batch")
         .header("x-admin-key", KEY)
-        .body(Body::from(json!({"count": 1}).to_string()))
+        .body(Body::from(
+            json!({"count": 1, "groupId": "group-pro-plus"}).to_string(),
+        ))
         .unwrap();
     let response = app.oneshot(req).await.unwrap();
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);

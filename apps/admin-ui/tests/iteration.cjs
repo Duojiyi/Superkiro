@@ -31,7 +31,7 @@ const server=http.createServer(async(req,res)=>{
     // A committed batch with a lost response must remain locked even after reload.
     let posts=0;
     await page.route('**/api/v1/admin/cards/batch',async route=>{posts++;await route.fetch();await route.abort('failed');});
-    await nav('＋ 批量生成');await page.getByLabel('生成数量',{exact:true}).fill('3');page.once('dialog',d=>d.accept());await nav('生成并入库');
+    await nav('＋ 批量生成');await page.getByLabel('模型与计费分组',{exact:true}).selectOption('fixture-group-0');await page.getByLabel('生成数量',{exact:true}).fill('3');page.once('dialog',d=>d.accept());await nav('生成并入库');
     await page.getByRole('region',{name:'制卡结果核对'}).waitFor();assert.equal(posts,1);
     await page.reload();await nav('卡密资产');
     await page.getByRole('region',{name:'制卡结果核对'}).waitFor();

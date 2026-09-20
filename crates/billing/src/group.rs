@@ -20,6 +20,9 @@ pub enum ProviderBindingMode {
 pub struct Group {
     pub id: String,
     pub name: String,
+    /// Disable new issuance without changing existing cards or model access.
+    #[serde(default = "issuance_enabled_by_default")]
+    pub issuance_enabled: bool,
     pub provider_binding_mode: ProviderBindingMode,
     pub rate_card_id: String,
     pub margin_multiplier: f64,
@@ -28,12 +31,17 @@ pub struct Group {
     pub system_prompt_prefix: Option<String>,
 }
 
+fn issuance_enabled_by_default() -> bool {
+    true
+}
+
 impl Group {
     /// Create a standard Pro+ group (Spec §1.4).
     pub fn pro_plus(id: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             id: id.into(),
             name: name.into(),
+            issuance_enabled: true,
             provider_binding_mode: ProviderBindingMode::Shared,
             rate_card_id: "default".to_string(),
             margin_multiplier: 1.0,
@@ -53,6 +61,7 @@ impl Group {
         Self {
             id: id.into(),
             name: name.into(),
+            issuance_enabled: true,
             provider_binding_mode: ProviderBindingMode::Dedicated,
             rate_card_id: "enterprise".to_string(),
             margin_multiplier: 1.2,

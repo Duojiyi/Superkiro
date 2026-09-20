@@ -549,11 +549,16 @@ async fn commercial_publication_requires_auth_and_fresh_revision() {
 async fn tier_issuance_validates_catalog_group_and_single_device() {
     let (billing, app) = setup_admin_app();
     billing.set_master_kek(billing::MasterKek::from_bytes([37; 32]));
+    let mut disabled = billing::Group::pro_plus("disabled", "Not for issuance");
+    disabled.issuance_enabled = false;
+    billing.upsert_group(disabled);
     for body in [
-        json!({"count":1,"templateId":"unknown"}),
-        json!({"count":1,"maxDevices":2}),
-        json!({"count":1,"maxDevices":0}),
-        json!({"count":1,"creditTotal":100}),
+        json!({"count":1,"templateId":"tier-1000"}),
+        json!({"count":1,"templateId":"tier-1000","groupId":"disabled"}),
+        json!({"count":1,"templateId":"unknown","groupId":"group-pro-plus"}),
+        json!({"count":1,"maxDevices":2,"groupId":"group-pro-plus"}),
+        json!({"count":1,"maxDevices":0,"groupId":"group-pro-plus"}),
+        json!({"count":1,"creditTotal":100,"groupId":"group-pro-plus"}),
         json!({"count":1,"groupId":"missing"}),
     ] {
         let req = Request::builder()
@@ -583,7 +588,7 @@ async fn tier_issuance_validates_catalog_group_and_single_device() {
             .header("x-admin-key", TEST_ADMIN_KEY)
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
-                json!({"count":1,"templateId":format!("tier-{points}"),"maxDevices":1}).to_string(),
+                json!({"count":1,"groupId":"group-pro-plus","templateId":format!("tier-{points}"),"maxDevices":1}).to_string(),
             ))
             .unwrap();
         let resp = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();

@@ -285,7 +285,8 @@ export class AdminApiClient {
     });
   }
 
-  async batchCards(count: number, groupId = 'group-pro-plus', templateId = 'tier-2000', note?: string): Promise<{ success: boolean; cards: GeneratedCard[] }> {
+  async batchCards(count: number, groupId: string, templateId = 'tier-2000', note?: string): Promise<{ success: boolean; cards: GeneratedCard[] }> {
+    if (!groupId?.trim()) throw new Error('请选择模型与计费分组');
     return this.request('/api/v1/admin/cards/batch', {
       method: 'POST',
       body: JSON.stringify({ count, groupId, templateId, maxDevices: 1, ...(note ? {note} : {}) }),

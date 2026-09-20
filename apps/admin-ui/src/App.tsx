@@ -7,7 +7,7 @@ import {loadAdjustment,saveAdjustment,clearAdjustment,isZeroMicroAdjustment,isUn
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { adminApi, AdminApiError, AdminStats, AdminCardItem, AdminAnnouncement, AdminFinancials, GeneratedCard } from './api';
 
-const pages = {overview: ['运营概览', '查看请求成功率、积分结算与供应商成本概况。'], cards: ['卡密资产', '管理卡密发放、余额、有效期和设备绑定。'], groups: ['分组与权益', '配置套餐分组、用量上限及关联价格表。'], providers: ['供应商与 Key', '管理供应商连接、API 密钥及可用模型。'], models: ['模型与定价', '配置模型路由、访问权限和计费价格。'], traces: ['调用追踪', '定位失败原因，不记录用户提示词或上游响应正文。'], reconciliation: ['财务对账', '结算积分、估算成本、实际充值分别呈现。'], announcements: ['公告管理', '创建和发布面向全部用户的服务公告。'], security: ['安全与审计', '管理登录会话，查看认证配置和配置发布记录。']} as const;
+const pages = {overview: ['运营概览', '查看请求成功率、积分结算与供应商成本概况。'], cards: ['卡密资产', '管理卡密发放、余额、有效期和设备绑定。'], groups: ['分组与权益', '配置模型与计费分组、用量上限及关联价格表。'], providers: ['供应商与 Key', '管理供应商连接、API 密钥及可用模型。'], models: ['模型与定价', '配置模型路由、访问权限和计费价格。'], traces: ['调用追踪', '定位失败原因，不记录用户提示词或上游响应正文。'], reconciliation: ['财务对账', '结算积分、估算成本、实际充值分别呈现。'], announcements: ['公告管理', '创建和发布面向全部用户的服务公告。'], security: ['安全与审计', '管理登录会话，查看认证配置和配置发布记录。']} as const;
 const tiers = [{"id": "tier-1000", "name": "PRO", "points": 1000, "price_cny": 30}, {"id": "tier-2000", "name": "PRO+", "points": 2000, "price_cny": 55}, {"id": "tier-5000", "name": "PRO Max", "points": 5000, "price_cny": 130}, {"id": "tier-10000", "name": "Power", "points": 10000, "price_cny": 250}];
 
 type Tab = 'overview' | 'cards' | 'groups' | 'providers' | 'models' | 'traces' | 'reconciliation' | 'announcements' | 'security';
@@ -206,7 +206,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
 
   // Batch generation form
   const [batchCount, setBatchCount] = useState<number>(50);
-  const [batchGroup, setBatchGroup] = useState<string>('group-pro-plus');
+  const [batchGroup, setBatchGroup] = useState<string>('');
   const [batchTemplate, setBatchTemplate] = useState('tier-2000');
   const [cardGroups, setCardGroups] = useState<Array<Record<string, unknown>>>([]);
 
@@ -249,8 +249,9 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
       else setSyncedAt(new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}));
       if (configRes.success && configRes.config) {
         const groups = configRes.config.groups; setCardGroups(groups);
-        setBatchGroup(current => groups.some(group => group.id === current) ? current : String(groups[0]?.id ?? ''));
-      } else setCardGroups([]);
+        const issuable = groups.filter(group => group.issuance_enabled !== false);
+        setBatchGroup(current => issuable.some(group => group.id === current) ? current : issuable.length === 1 ? String(issuable[0].id) : '');
+      } else { setCardGroups([]); setBatchGroup(''); }
       if (statsRes && statsRes.success) {
         setStats(statsRes);
       }
@@ -420,9 +421,14 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
     } finally {adjusting.current=false;setMutationBusy(false);}
   };
 
+  const issuableGroups = cardGroups.filter(group => group.issuance_enabled !== false);
+  const selectedTier = tiers.find(tier => tier.id === batchTemplate);
+  const selectedGroup = issuableGroups.find(group => group.id === batchGroup);
+  const issuanceSummary = `套餐：${selectedTier?.name ?? '未选择'} · ${selectedTier?.points.toLocaleString() ?? '—'} 积分 · 有效期 30 天 · 模型与计费分组：${String(selectedGroup?.name ?? selectedGroup?.id ?? '未选择')}`;
+
   const handleBatchGenerate = async () => {
-    if (issuanceRecovery || writing.current || loading || !tiers.some(t => t.id === batchTemplate) || !cardGroups.some(group => group.id === batchGroup) || !Number.isInteger(batchCount) || batchCount < 1 || batchCount > 500) return;
-    if (!window.confirm(`确认生成 ${batchCount} 张 ${tiers.find(t => t.id === batchTemplate)?.name} 卡密？每张仅限一台设备，积分与权益以服务端校验为准。`)) return;
+    if (issuanceRecovery || writing.current || loading || !tiers.some(t => t.id === batchTemplate) || !selectedGroup || !Number.isInteger(batchCount) || batchCount < 1 || batchCount > 500) return;
+    if (!window.confirm(`确认生成 ${batchCount} 张 卡密？\n${issuanceSummary}\n每张仅限一台设备，积分与权益以服务端校验为准。`)) return;
     try {
       writing.current=true;setLoading(true);
       const reference = `批次 ${new Date().toISOString()} ${crypto.randomUUID()}`;
@@ -968,7 +974,9 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
                   {tiers.map(tier => <option key={tier.id} value={tier.id}>{tier.name} · {tier.points.toLocaleString()} 积分 · ¥{tier.price_cny} · 单设备</option>)}
                 </select>
               </div>
-              <div><label className="text-[#7B8388] block mb-1">权益分组（服务端配置）</label><select aria-label="权益分组" className="w-full" value={batchGroup} onChange={e => setBatchGroup(e.target.value)} disabled={!cardGroups.length}>{!cardGroups.length && <option value="">请先登录并读取分组配置</option>}{cardGroups.map(group => <option key={String(group.id)} value={String(group.id)}>{String(group.name ?? group.id)}</option>)}</select></div>
+              <div><label className="text-[#7B8388] block mb-1">模型与计费分组</label><select aria-label="模型与计费分组" className="w-full" value={batchGroup} onChange={e => setBatchGroup(e.target.value)} disabled={!issuableGroups.length}><option value="" disabled>{issuableGroups.length ? '请选择模型与计费分组' : '暂无可发卡分组，无法发卡'}</option>{issuableGroups.map(group => <option key={String(group.id)} value={String(group.id)}>{String(group.name ?? group.id)}</option>)}</select></div>
+              <p className="muted">套餐决定积分额度、名称和 30 天有效期；分组决定模型和价格。四档套餐可共用分组，切换套餐不改变分组。</p>
+              <p className="muted" aria-label="发卡摘要">{issuanceSummary}</p>
               <div>
                 <label className="text-[#7B8388] block mb-1">生成数量 (1 ~ 500)</label>
                 <input
@@ -983,7 +991,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
             </div>
             <div className="flex justify-end gap-2 pt-2">
               <button disabled={loading} onClick={() => setShowBatchModal(false)} className="px-3 py-1.5 bg-[#EFF1EF] text-[#23272B] rounded text-xs">取消</button>
-              <button onClick={handleBatchGenerate} disabled={!!issuanceRecovery || loading || !cardGroups.some(group => group.id === batchGroup)} className="px-3 py-1.5 bg-[#B94B39] text-white hover:bg-[#B94B39] text-white rounded text-xs font-medium disabled:opacity-50">
+              <button onClick={handleBatchGenerate} disabled={!!issuanceRecovery || loading || !selectedGroup} className="px-3 py-1.5 bg-[#B94B39] text-white hover:bg-[#B94B39] text-white rounded text-xs font-medium disabled:opacity-50">
                 {loading ? '正在生成并入库...' : '生成并入库'}
               </button>
             </div>
