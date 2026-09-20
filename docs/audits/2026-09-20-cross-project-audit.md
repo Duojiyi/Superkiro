@@ -46,7 +46,14 @@
 - 管理后台：构建、单元/契约、匿名权限、公开登录、九页真实交互、可用性、批量卡密、迭代浏览器套件全部通过。
 - 官网：18 项交互测试、5 项 Pencil/字体 CSP 检查通过；代理补充的 device 文档断言单独通过。
 - 桥接/运行时/部署 CSP：28 项通过；安装包发布 9 项、来源校验 5 项通过。
-- Rust 全量最终版本与备份脚本结果待本地执行结束补记；严格 Clippy 已通过。
+- b0167a5 本地 Rust workspace 全量回归 523 通过、1 忽略，退出码 0；严格 Clippy 已通过。GitHub Windows Rust、前端、安全扫描均通过，Linux Rust 出现操作锁竞态，见下文。
+- 本机备份脚本 46 项：38 通过、2 跳过、6 项 Git Bash 子进程 30 秒超时，不能记为全通过；同提交 GitHub Ubuntu/Windows 备份步骤均通过。
 - git diff --check 通过；本轮修改 diff 的 Gitleaks 脱敏扫描通过。
 
 详细本地日志位于 .acceptance/review-*。测试期间曾因旧测试进程占用 Windows 可执行文件出现 LNK1104，等待旧进程结束后重跑；该失败不计为通过。首轮与最终代码不同或被中止的执行不计入最终通过数。
+
+## CI 追加发现：Unix 操作锁释放
+
+- b0167a5 Linux CI 的认证失效后再次读取用量测试一次返回会话锁被占用。原实现只关闭文件；Unix fork/dup 共享 open file description，其他线程启动子进程时继承的描述符可能使锁延迟释放。
+- OperationLock 在 Drop 中显式 unlock，仍保留锁文件 inode，不删除文件、不放宽锁冲突断言。新增 Unix dup 回归确定性覆盖句柄仍存活时释放所有权、以及旧句柄关闭不影响新持有者。追加修复本地 patch-engine lib 60 通过、1 忽略，严格 Clippy 通过。新增 Unix 用例仍待 Linux CI；独立复核认可锁语义，但尚未直接复现原 CI 的 fork 调度，不能断言已证实唯一根因。
+- b0167a5 的 Windows、macOS x64、macOS arm64 安装包构建均成功；追加锁修复后必须重建，不能混用来源提交。生产未更新。

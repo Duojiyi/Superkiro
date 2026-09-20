@@ -292,7 +292,14 @@ impl SnapshotManager {
 }
 
 // Keep the inode in place: unlinking a lock file allows two independent owners.
-pub(crate) struct OperationLock(#[allow(dead_code)] File);
+pub(crate) struct OperationLock(File);
+impl Drop for OperationLock {
+    fn drop(&mut self) {
+        // A forked child can briefly retain the open file description before exec.
+        // Release ownership explicitly instead of waiting for its last handle to close.
+        let _ = self.0.unlock();
+    }
+}
 impl OperationLock {
     pub(crate) fn acquire(path: PathBuf) -> std::io::Result<Self> {
         if let Some(parent) = path.parent() {
@@ -342,6 +349,22 @@ pub(crate) fn atomic_replace(temp: &Path, target: &Path) -> std::io::Result<()> 
 #[cfg(test)]
 mod os_lock_tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn dropping_owner_unlocks_even_with_a_duplicated_descriptor() {
+        let path = std::env::temp_dir().join(format!("os-lock-duplicate-{}", std::process::id()));
+        let lock = OperationLock::acquire(path.clone()).unwrap();
+        // dup shares the open file description, just as inheritance across fork does.
+        let duplicate = lock.0.try_clone().unwrap();
+        assert!(OperationLock::acquire(path.clone()).is_err());
+        drop(lock);
+        let next = OperationLock::acquire(path.clone()).unwrap();
+        drop(duplicate);
+        assert!(OperationLock::acquire(path.clone()).is_err());
+        drop(next);
+        fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn lock_child() {
         let Some(path) = std::env::var_os("SUPERKIRO_LOCK_FIXTURE") else {
