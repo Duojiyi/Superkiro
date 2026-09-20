@@ -93,6 +93,7 @@ jobs:
       - run: npm run test:usability
       - run: npm run test:card-bulk
       - run: npm run test:iteration
+      - run: npm run test:issuance
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
