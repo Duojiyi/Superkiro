@@ -22,6 +22,9 @@ def run(ssh):
                     expect(page.locator('h1:visible')).to_be_visible()
                     assert page.evaluate('document.documentElement.scrollWidth <= innerWidth+1')
                     if route=='/':
+                        # A misplaced keyframes brace previously swallowed these rules.
+                        expect(page.locator('.platform-grid')).to_have_css('display', 'grid')
+                        expect(page.locator('.release code').first).to_have_css('display', 'block')
                         expect(page.locator('[data-download="windows-x64"]:visible').first).to_have_attribute('href', __import__('re').compile(r'.*?/downloads/Superkiro-.*'))
                     page.screenshot(path=str(out/f'{label}-{width}.png'),full_page=True)
                     passed(label+' '+str(width))
