@@ -96,6 +96,11 @@ def verify_admin_browser(browser, credentials, card, passed):
         for label in ['运营概览', '卡密资产', '分组与权益', '供应商与 Key', '模型与定价', '调用追踪', '财务对账', '公告管理', '安全与审计']:
             nav.get_by_role('button', name=label, exact=True).click()
             expect(page.get_by_role('heading', name=label, exact=True)).to_be_visible()
+            if label in ('分组与权益', '模型与定价'):
+                expect(page.get_by_role('status')).to_contain_text('当前配置已加载')
+                expect(page.get_by_role('button', name='重新读取配置', exact=True)).to_be_enabled()
+            elif label == '财务对账':
+                expect(page.get_by_role('button', name='重新读取财务配置', exact=True)).to_be_enabled()
             passed('admin ' + label)
         with page.expect_response(lambda r: r.url == BASE + '/api/v1/admin/session/revoke' and r.request.method == 'POST') as logout:
             page.get_by_role('button', name='退出', exact=True).click()

@@ -3,6 +3,17 @@
 [advisories]
 version = 2
 unmaintained = "all"
+# Reviewed 2026-09-20: these are maintenance notices, not vulnerability waivers.
+# Keep all-target auditing. Revisit on Tauri/GTK/urlpattern upgrades; remove each
+# exception when its dependency disappears (cargo-deny reports unused ignores).
+ignore = [
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error 1.0.4 is required by GTK 0.18 glib-macros/gtk3-macros via Tauri on Linux; no compatible fixed release. Remove when Tauri leaves this GTK macro stack." },
+    { id = "RUSTSEC-2025-0081", reason = "unic-char-property 0.9.0 is required by urlpattern 0.3 via tauri-utils; no fixed release. Remove when Tauri's urlpattern dependency replaces UNIC." },
+    { id = "RUSTSEC-2025-0075", reason = "unic-char-range 0.9.0 is required by urlpattern 0.3 via tauri-utils; no fixed release. Remove when Tauri's urlpattern dependency replaces UNIC." },
+    { id = "RUSTSEC-2025-0080", reason = "unic-common 0.9.0 is required by urlpattern 0.3 via tauri-utils; no fixed release. Remove when Tauri's urlpattern dependency replaces UNIC." },
+    { id = "RUSTSEC-2025-0100", reason = "unic-ucd-ident 0.9.0 is required by urlpattern 0.3 via tauri-utils; no fixed release. Remove when Tauri's urlpattern dependency replaces UNIC." },
+    { id = "RUSTSEC-2025-0098", reason = "unic-ucd-version 0.9.0 is required by urlpattern 0.3 via tauri-utils; no fixed release. Remove when Tauri's urlpattern dependency replaces UNIC." },
+]
 
 [licenses]
 version = 2
@@ -14,6 +25,21 @@ allow = [
     "BSD-3-Clause",
     "ISC",
     "CDLA-Permissive-2.0",
+]
+
+# Limit additional licenses to the reviewed locked desktop dependencies; new
+# versions require review instead of globally allowing these license families.
+# MPL-2.0 is file-level copyleft: preserve notices and provide recipients access
+# to the covered source (including any modifications) when distributing binaries.
+# Zlib and Apache-2.0 WITH LLVM-exception also require their applicable notices.
+exceptions = [
+    { name = "cssparser", version = "=0.36.0", allow = ["MPL-2.0"] },
+    { name = "cssparser-macros", version = "=0.6.1", allow = ["MPL-2.0"] },
+    { name = "dtoa-short", version = "=0.3.5", allow = ["MPL-2.0"] },
+    { name = "option-ext", version = "=0.2.0", allow = ["MPL-2.0"] },
+    { name = "selectors", version = "=0.36.1", allow = ["MPL-2.0"] },
+    { name = "foldhash", version = "=0.2.0", allow = ["Zlib"] },
+    { name = "target-lexicon", version = "=0.12.16", allow = ["Apache-2.0 WITH LLVM-exception"] },
 ]
 
 [bans]

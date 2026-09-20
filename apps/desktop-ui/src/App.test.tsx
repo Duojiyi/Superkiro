@@ -344,6 +344,8 @@ describe('persisted operation failure diagnostics',()=>{
   render(<App/>);await screen.findByRole('heading',{name:'本机配置待恢复'});
   await screen.findByText(/阶段 authenticate · 错误码 auth-rejected · HTTP 401/);
   fireEvent.click(screen.getByRole('button',{name:'重新检测 ↻'}));await waitFor(()=>expect((screen.getByRole('button',{name:'查看诊断报告'}) as HTMLButtonElement).disabled).toBe(false));
+  // Doctor completion enables the button before the operation summary finishes loading.
+  await screen.findByText(/阶段 authenticate · 错误码 auth-rejected · HTTP 401/);
   fireEvent.click(screen.getByRole('button',{name:'查看诊断报告'}));expect(document.body.textContent).toContain('错误码 auth-rejected');expect(document.body.textContent).not.toContain('private-secret');
  });
  it('operation read failure does not fail doctor or prevent report preview',async()=>{
