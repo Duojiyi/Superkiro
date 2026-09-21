@@ -16,11 +16,43 @@ use gateway::provider::anthropic::AnthropicProvider;
 use gateway::provider::openai::OpenAiProvider;
 use gateway::provider::{ModelProvider, ProviderConfig};
 use gateway::security::{validate_trusted_proxy_config, BruteForceProtector};
+use gateway::translate::VisionFallbackConfig;
 use gateway::SERVICE_NAME;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+fn vision_fallback_config() -> Option<VisionFallbackConfig> {
+    // Vision subrequest costs are not settled by the main-model biller yet.
+    // Require explicit operator opt-in; never enable from credentials alone.
+    let enabled = env_flag("VISION_FALLBACK_ENABLED", false);
+    if !enabled {
+        return None;
+    }
+    let api_key = std::env::var("VISION_FALLBACK_API_KEY")
+        .ok()?
+        .trim()
+        .to_string();
+    let base_url = std::env::var("VISION_FALLBACK_BASE_URL")
+        .ok()?
+        .trim()
+        .to_string();
+    let model = std::env::var("VISION_FALLBACK_MODEL")
+        .ok()?
+        .trim()
+        .to_string();
+    if api_key.is_empty() || base_url.is_empty() || model.is_empty() {
+        return None;
+    }
+    Some(VisionFallbackConfig {
+        enabled,
+        fallback_provider_url: Some(base_url),
+        fallback_api_key: Some(api_key),
+        fallback_model: model,
+        max_tokens: bounded_env_u32("VISION_FALLBACK_MAX_TOKENS", 1024, 128, 8192).ok()?,
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -288,7 +320,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             guardrail: CapacityGuardrail::new(max_inflight, 2),
             card_rate_limiter: CardRateLimiter::new(card_qps),
             intercept_intent: true,
-            vision_config: None,
+            vision_config: vision_fallback_config(),
             vision_cache: Default::default(),
             content_guardrail: Default::default(),
         };

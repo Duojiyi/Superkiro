@@ -86,6 +86,16 @@ const until=async ready=>{const end=Date.now()+10000;while(!ready()){assert(Date
     assert.equal(await weight.inputValue(),'3');
     // Price template changes and malformed advanced JSON cannot erase price inputs.
     await nav('模型与定价');
+    const tokenContext=page.getByLabel('上下文长度',{exact:true}),tokenOutput=page.getByLabel('最大输出',{exact:true});
+    await tokenContext.waitFor();
+    const originalContext=await tokenContext.inputValue(),originalOutput=await tokenOutput.inputValue();
+    await tokenContext.fill('1M');await tokenOutput.fill('128K');
+    assert.equal(await tokenContext.inputValue(),'1000000');assert.equal(await tokenOutput.inputValue(),'128000');
+    assert(await page.getByText('1M Tokens（1,000,000）',{exact:false}).isVisible());
+    await tokenContext.fill(originalContext);await tokenOutput.fill(originalOutput);
+    await page.getByRole('button',{name:'编辑配置 →',exact:true}).first().click();
+    assert(await page.locator('.mapping-editor').evaluate(element=>element===document.activeElement));
+    assert.equal(await page.locator('.editor-checks').getAttribute('open'),null);
     const template=page.getByLabel('选择价格版本模板'),version=page.getByLabel('新版本 ID',{exact:true}),date=page.getByLabel('生效时间（本地时区）',{exact:true});
     await template.selectOption('fixture-price-0');await version.fill('editor-price');await date.fill('2099-01-01T10:00');
     dismiss();await template.selectOption('fixture-price-1');assert.equal(await template.inputValue(),'fixture-price-0');assert.equal(await version.inputValue(),'editor-price');assert.equal(await date.inputValue(),'2099-01-01T10:00');

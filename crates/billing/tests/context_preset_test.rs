@@ -75,3 +75,25 @@ fn test_context_usage_calculation_and_compression_triggers() {
     assert_eq!(m5.remaining_tokens, 0);
     assert!(m5.should_compress);
 }
+
+#[test]
+fn unknown_names_do_not_inherit_family_capabilities() {
+    for name in [
+        "gemini",
+        "gemini-custom",
+        "gemini-2.0-flash-unknown",
+        "g",
+        "claude-future",
+        "gpt-4-unknown",
+        "",
+    ] {
+        let preset = ModelContextLibrary::resolve(name);
+        assert_eq!(preset.context_window, 128_000, "{name}");
+        assert_eq!(preset.max_output, 8_192, "{name}");
+        assert!(!preset.supports_reasoning);
+    }
+    assert_eq!(
+        ModelContextLibrary::resolve("GEMINI-2.0-FLASH").context_window,
+        1_048_576
+    );
+}

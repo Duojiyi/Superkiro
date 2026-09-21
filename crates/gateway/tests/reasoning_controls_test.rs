@@ -105,3 +105,18 @@ fn independent_system_prompt_survives_translation() {
         "Use the supplied workspace instructions."
     );
 }
+
+#[test]
+fn high_output_budget_includes_thinking_without_inflation() {
+    let mut value = wire();
+    value["additionalModelRequestFields"] = json!({"output_config":{"effort":"max"}});
+    let mut request = translated(value, "claude-sonnet-4-5");
+    request.max_tokens = Some(128_000);
+    let body = AnthropicProvider.translate_request(&request).unwrap();
+    assert_eq!(body["max_tokens"], 128_000);
+    assert_eq!(body["thinking"]["budget_tokens"], 24_576);
+    assert_eq!(
+        OpenAiProvider.translate_request(&request).unwrap()["max_tokens"],
+        128_000
+    );
+}

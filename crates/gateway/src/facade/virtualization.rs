@@ -179,10 +179,10 @@ impl VirtualizationStore {
                             model_id: m.exposed_model_id.clone(),
                             model_name: Some(m.exposed_model_id.clone()),
                             description: Some(format!("Model mapped to target {}", m.target_model)),
-                            token_limits: Some(TokenLimits {
-                                max_input_tokens: m.context_window,
-                                max_output_tokens: m.max_output.clamp(1, 32_000),
-                            }),
+                            token_limits: Some(TokenLimits::configured(
+                                m.context_window,
+                                m.max_output,
+                            )),
                             supports_reasoning: m.supports_reasoning,
                             supports_vision: m.supports_vision,
                             default_effort_level: if m.supports_reasoning {

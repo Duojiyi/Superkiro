@@ -18,6 +18,18 @@ pub struct TokenLimits {
     pub max_output_tokens: u64,
 }
 
+impl TokenLimits {
+    /// Match commercial config validation: 0 < output <= context <= 10M.
+    /// Also bound legacy or programmatically inserted mappings before u32 conversion.
+    pub(super) fn configured(context_window: u64, max_output: u64) -> Self {
+        let max_input_tokens = context_window.clamp(1, 10_000_000);
+        Self {
+            max_input_tokens,
+            max_output_tokens: max_output.clamp(1, max_input_tokens),
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -132,5 +144,29 @@ impl FacadeHandler for ListAvailableModelsHandler {
 
             json_response(StatusCode::OK, &resp)
         })
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::TokenLimits;
+
+    #[test]
+    fn configured_limits_preserve_valid_values_and_bound_legacy_data() {
+        for (context, output, expected_context, expected_output) in [
+            (1_000_000, 128_000, 1_000_000, 128_000),
+            (10_000_000, 10_000_000, 10_000_000, 10_000_000),
+            (0, 0, 1, 1),
+            (1_000, 2_000, 1_000, 1_000),
+            (u64::MAX, u64::MAX, 10_000_000, 10_000_000),
+        ] {
+            assert_eq!(
+                TokenLimits::configured(context, output),
+                TokenLimits {
+                    max_input_tokens: expected_context,
+                    max_output_tokens: expected_output,
+                }
+            );
+        }
     }
 }

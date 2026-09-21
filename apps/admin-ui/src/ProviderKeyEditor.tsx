@@ -110,7 +110,7 @@ export default function ProviderKeyEditor({ selectedKey, onSaved, onDirtyChange,
   const cls = 'block w-full p-2 bg-white border border-[#E5E8E5] rounded';
   return <div className="two-columns page-supplement"><section id="key-editor" className="panel p-4 border border-[#E5E8E5] rounded space-y-3">
     <h3>API 密钥与模型授权</h3>
-    <p className="text-sm text-[#7B8388]">先从上方列表选择 Key，再调整模型权限。相同 Key ID 为更新操作；留空密钥保留原值，手动新增时须填写密钥。发现模型、保存权限和发布用户目录是三个独立步骤。</p>
+    <p className="muted">选择 Key 后调整权限；更新时密钥留空保留原值。</p><details><summary>新增、发现与发布规则</summary><p>相同 Key ID 为更新操作；手动新增时须填写密钥。发现模型、保存权限和发布用户目录是三个独立步骤。</p></details>
     <fieldset disabled={busy} className="field-grid" onChange={() => setDirty(true)}>
       <label className="block">供应商 ID<input className={cls} value={provider} onChange={e=>setProvider(e.target.value)} /></label>
       <details><summary>新增或更新供应商渠道</summary><div className="space-y-2 pt-2">

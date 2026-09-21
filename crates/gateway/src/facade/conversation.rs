@@ -583,8 +583,10 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                         fallback_targets = m.full_target_chain();
                         model_supports_vision = m.supports_vision;
                         model_supports_reasoning = m.supports_reasoning;
-                        configured_context_window =
-                            Some(m.context_window.clamp(1, u32::MAX as u64) as u32);
+                        configured_context_window = Some(
+                            super::models::TokenLimits::configured(m.context_window, m.max_output)
+                                .max_input_tokens as u32,
+                        );
                         mapped_model = true;
                     } else if kiro_req
                         .conversation_state
@@ -1111,11 +1113,60 @@ fn max_output_tokens_for_model(
             billing
                 .list_models_for_group(&group.id, false)
                 .into_iter()
-                .find(|model| {
-                    model.matches_model(target_model) || model.target_model == target_model
+                .find(|model| model.matches_model(target_model))
+                .map(|model| {
+                    super::models::TokenLimits::configured(model.context_window, model.max_output)
+                        .max_output_tokens
                 })
-                .map(|model| model.max_output)
         })
         .unwrap_or(4_096);
-    configured.clamp(1, 32_000) as u32
+    configured as u32
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+    use billing::group::{Group, ModelMap};
+
+    #[test]
+    fn reservation_matches_routing_not_another_models_target() {
+        let billing = BillingEngine::default();
+        billing.upsert_group(Group::pro_plus("capability-group", "Capabilities"));
+        let claims = AuthClaims {
+            card_id: "card".into(),
+            group_id: "capability-group".into(),
+            token_version: 0,
+            exp: u64::MAX,
+            iat: 0,
+        };
+        let mut shadow = ModelMap::new("shadow", "capability-group", "other", "provider", "alias");
+        shadow.max_output = 8192;
+        shadow.sort_order = -1;
+        billing.upsert_model_map(shadow);
+        let mut model = ModelMap::new(
+            "model",
+            "capability-group",
+            "public",
+            "provider",
+            "upstream",
+        )
+        .with_alias("alias");
+        model.context_window = 1_000_000;
+        model.max_output = 128_000;
+        billing.upsert_model_map(model);
+        for id in ["public", "alias"] {
+            assert_eq!(
+                max_output_tokens_for_model(id, Some(&claims), &billing),
+                128_000
+            );
+        }
+        assert_eq!(
+            max_output_tokens_for_model("upstream", Some(&claims), &billing),
+            4096
+        );
+        assert_eq!(
+            max_output_tokens_for_model("gemini-unknown", None, &billing),
+            4096
+        );
+    }
 }

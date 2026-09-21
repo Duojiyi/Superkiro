@@ -15,6 +15,26 @@ def version(model,rate_card,stamp):
         result['fixed_'+kind+'_credit_per_m']=int(Decimal(str(price))*8*1_000_000)
     return result
 
+def validate_model_limits(model):
+    context, output = model.get('context_window'), model.get('max_output')
+    if (type(context) is not int or type(output) is not int
+            or not 0 < output <= context <= 10_000_000):
+        raise RuntimeError('Invalid model capabilities: require 0 < output <= context <= 10M')
+
+
+def validate_pricing_limits(model):
+    validate_model_limits(model)
+    windows = POLICY.get('verified_context_windows', {})
+    if not isinstance(windows, dict):
+        raise RuntimeError('Invalid verified_context_windows pricing policy')
+    limit = windows.get(model['exposed_model_id'], 200000)
+    if type(limit) is not int or not 0 < limit <= 10_000_000:
+        raise RuntimeError('Invalid verified pricing context limit')
+    if model['context_window'] > limit:
+        raise RuntimeError('Long context pricing needs manual rate confirmation; '
+                           'update POLICY.verified_context_windows for this exact model')
+
+
 def main():
     credentials=json.load(sys.stdin);ssh=pinned_connection(credentials)
     try:
@@ -36,7 +56,7 @@ def main():
             g=groups[m['group_id']]
             if m['target_model']!=m['exposed_model_id'] or m['fallback_chain'] or m['aliases'] or m['credit_multiplier']!=1 or g['margin_multiplier']!=1:
               raise RuntimeError('Unexpected mapping/multiplier; review required')
-            if m['context_window']>200000:raise RuntimeError('Long context pricing needs separate support')
+            validate_pricing_limits(m)
             expected.append(version(m['exposed_model_id'],g['rate_card_id'],stamp))
           # Re-running after a completed deployment must not silently add another version.
           if any(v['id'].startswith('official024-') for v in before['versions']):raise RuntimeError('Pricing already published; inspect live versions before any update')

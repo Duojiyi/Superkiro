@@ -46,6 +46,10 @@ const server=http.createServer(async(req,res)=>{
     const button=name=>page.getByRole('button',{name,exact:true});
     const check=id=>page.getByLabel(`选择卡密 bulk-${id}`,{exact:true});
     await check(0).waitFor();
+    assert.equal(await page.locator('.bulk-more').getAttribute('open'),null);
+    assert(await button('批量删除（永久作废）').isVisible(),'delete remains discoverable with more actions collapsed');
+    assert.equal(await button('批量删除（永久作废）').getAttribute('class'),'danger');
+    await page.getByText('更多操作',{exact:true}).click();
     assert(await button('批量冻结').isDisabled());
     assert.equal(await page.getByRole('checkbox').count(),50);
     await button('当前页全选').click();assert.equal(await page.getByRole('checkbox',{checked:true}).count(),50);
@@ -135,6 +139,8 @@ const server=http.createServer(async(req,res)=>{
     await page.reload();await page.getByRole('navigation').getByRole('button',{name:'卡密资产',exact:true}).click();
     await button('重新登录确认调账账户').click();await page.getByLabel('密码',{exact:true}).fill('fixture-password');await button('登录').click();
     await page.getByRole('navigation').getByRole('button',{name:'卡密资产',exact:true}).click();await check(5).check();
+    assert.equal(await page.locator('.bulk-more').getAttribute('open'),null);
+    assert(await button('批量删除（永久作废）').isVisible());
     const beforePendingVoid=statusCalls.length;
     await button('批量删除（永久作废）').click();await page.getByRole('alert').filter({hasText:'本次未发送删除请求'}).waitFor();assert.equal(statusCalls.length,beforePendingVoid);
     cards[5].status='voided';await button('刷新').click();await page.waitForFunction(()=>!document.querySelector('input[type=checkbox]').disabled);

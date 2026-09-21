@@ -29,6 +29,26 @@ pub enum DetectError {
 }
 
 /// Discovered Kiro IDE installation snapshot.
+pub const MINIMUM_SUPPORTED_KIRO_VERSION: &str = "1.1.14";
+
+/// Returns whether a Kiro version is supported by the current patch recipe.
+pub fn kiro_version_is_supported(version: &str) -> bool {
+    fn parts(value: &str) -> Option<[u64; 3]> {
+        let mut out = [0; 3];
+        let mut values = value.split('.');
+        for slot in &mut out {
+            *slot = values.next()?.parse().ok()?;
+        }
+        if values.next().is_some() {
+            return None;
+        }
+        Some(out)
+    }
+    parts(version)
+        .zip(parts(MINIMUM_SUPPORTED_KIRO_VERSION))
+        .is_some_and(|(actual, minimum)| actual >= minimum)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KiroInstallation {
     /// Root directory of the installation (e.g. `%LOCALAPPDATA%\Programs\Kiro`).
@@ -297,6 +317,20 @@ pub(crate) fn resolve_macos_executable(contents: &Path) -> Result<PathBuf, Detec
 fn supported_mac_bundle(path: &Path) -> bool {
     path.file_name().is_some_and(|name| name == "Kiro.app")
 }
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+    #[test]
+    fn enforces_minimum_supported_version() {
+        assert!(!kiro_version_is_supported("1.1.13"));
+        assert!(!kiro_version_is_supported("1.1.9"));
+        assert!(kiro_version_is_supported("1.1.14"));
+        assert!(kiro_version_is_supported("1.2.0"));
+        assert!(!kiro_version_is_supported("unknown"));
+        assert!(!kiro_version_is_supported("1.1.14-beta"));
+    }
+}
+
 #[cfg(test)]
 mod mac_identity_tests {
     use super::*;

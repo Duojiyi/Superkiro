@@ -1,3 +1,4 @@
+import { parseTokenInput, formatTokens } from './tokens';
 import { priceToMicroPerMillion, formatMicroPrice, previewFixedCharge, type PriceUnit } from './pricing';
 import { useEffect, useRef, useState } from 'react';
 import { adminApi, AdminApiError, CommercialConfig } from './api';
@@ -9,7 +10,7 @@ export default function CommercialEditor({ kind,onDirtyChange,onBusyChange }: {k
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
   useEffect(()=>{onBusyChange(busy);return()=>onBusyChange(false);},[busy,onBusyChange]);
-  const [selected, setSelected] = useState(0);
+  const [selected, setSelected] = useState<string | null>(null);
   const [priceDraft, setPriceDraft] = useState<Record<string, unknown> | null>(null);
   const [priceInputs, setPriceInputs] = useState<Record<string, string>>({});
   useEffect(()=>{onDirtyChange(draft!==loadedDraft||!!reason.trim()||!!priceDraft);},[draft,loadedDraft,reason,priceDraft,onDirtyChange]);
@@ -50,7 +51,11 @@ export default function CommercialEditor({ kind,onDirtyChange,onBusyChange }: {k
     parsedDraft = value;
   } catch (error) { draftError = error instanceof SyntaxError ? '配置 JSON 格式无效，请检查逗号、引号和括号。' : String(error); }
   const rows = Array.isArray(parsedDraft[kind]) ? parsedDraft[kind].filter(row => row && typeof row === 'object' && !Array.isArray(row)) : [];
-  const selectedRow = rows[selected];
+  const selectedRow = selected === null ? rows[0] : rows.find(row => row.id === selected);
+  const editorRef = useRef<HTMLElement>(null);
+  const originalRows = config?.[kind] ?? [];
+  const isEdited = (row: Record<string, unknown>) => JSON.stringify(row) !== JSON.stringify(originalRows.find(original => original.id === row.id));
+  const focusEditor = () => { editorRef.current?.scrollIntoView({block: 'start'}); editorRef.current?.focus({preventScroll: true}); };
   const previewFields = ['fixed_input_credit_per_m', 'fixed_output_credit_per_m', 'fixed_cache_creation_credit_per_m', 'fixed_cache_read_credit_per_m'];
   const previewGroup = config?.groups.find(group => group.id === selectedRow?.group_id);
   let preview = '', previewError = '';
@@ -92,7 +97,8 @@ export default function CommercialEditor({ kind,onDirtyChange,onBusyChange }: {k
     } catch (error) { setMessage('切换单位前请修正售价：' + String(error)); }
   };
   const updateField = (field: string, value: unknown) => {
-    const next = rows.map((row, index) => index === selected ? {...row, [field]: value} : row);
+    if (!selectedRow || rows.filter(row => row.id === selectedRow.id).length !== 1) {setMessage('当前条目 ID 重复或不存在，请先修正高级配置；未修改任何条目。'); return;}
+    const next = rows.map(row => row.id === selectedRow?.id ? {...row, [field]: value} : row);
     setDraft(JSON.stringify({...parsedDraft, [kind]: next}, null, 2));
   };
   const numericFields = ['virtual_usage_limit', 'margin_multiplier', 'context_window', 'max_output', 'credit_multiplier'];
@@ -100,7 +106,7 @@ export default function CommercialEditor({ kind,onDirtyChange,onBusyChange }: {k
   const labels: Record<string, string> = {name: '分组名称', issuance_enabled: '允许发放新卡', virtual_plan_name: '虚拟套餐名称（非发卡套餐）', virtual_usage_limit: '虚拟用量上限（非发卡积分）', rate_card_id: '价格表 ID', margin_multiplier: '分组扣费倍率（1 = 不加倍）', exposed_model_id: '展示模型 ID', target_provider_id: '供应商 ID', target_model: '上游模型 ID', group_id: '分组 ID', context_window: '上下文长度', max_output: '最大输出', credit_multiplier: '模型扣费倍率（1 = 不加倍）', visible: '发布到用户目录', supports_tools: '工具调用', supports_vision: '视觉', supports_reasoning: '推理'};
   const apply = (next: CommercialConfig) => {
     const value = JSON.stringify(kind === 'groups' ? {groups: next.groups} : {models: next.models, rate_cards: next.rate_cards, versions: []}, null, 2);
-    setConfig(next); setSelected(0); setPriceDraft(null); setPriceInputs({}); setReason(''); setLoadedDraft(value); setDraft(value); setNeedsReview(false);
+    setConfig(next); setSelected(String(next[kind][0]?.id ?? '')); setPriceDraft(null); setPriceInputs({}); setReason(''); setLoadedDraft(value); setDraft(value); setNeedsReview(false);
   };
   const load = async () => {
     if (pending.current) return;
@@ -171,10 +177,11 @@ export default function CommercialEditor({ kind,onDirtyChange,onBusyChange }: {k
   };
   return <div className="space-y-6">
     {kind === 'models' && <div className="step-bar"><span>01 选择模型</span><span>02 映射路由</span><span>03 积分价格</span><span>04 校验发布</span></div>}
-    <section className="panel"><h3>{kind === 'groups' ? '模型与计费分组' : '模型目录与路由'}</h3><p className="muted">{kind === 'groups' ? '套餐决定积分额度、名称和 30 天有效期；分组决定模型和价格，切换套餐不改变分组。关闭发放仅禁止新卡，不改变已发卡密。' : '模型发现不等于 Key 授权。请核对可用路由和价格后发布。'}</p>
-      <table><thead><tr>{(kind === 'groups' ? ['分组', '虚拟套餐（非发卡套餐）', '价格表', '操作'] : ['展示名称', '上游模型 ID', '供应商 / Key 池', '操作']).map(label => <th key={label}>{label}</th>)}</tr></thead><tbody>{rows.map((row, index) => <tr key={String(row.id ?? index)} className={selected === index ? 'selected-row' : ''}><td>{String(row[kind === 'groups' ? 'name' : 'exposed_model_id'] ?? row.id)}</td><td>{String(row[kind === 'groups' ? 'virtual_plan_name' : 'target_model'] ?? '—')}</td><td>{String(row[kind === 'groups' ? 'rate_card_id' : 'target_provider_id'] ?? '—')}</td><td><button disabled={busy} onClick={() => setSelected(index)}>编辑配置 →</button></td></tr>)}{!rows.length && <tr><td colSpan={4} className="empty-state">暂无已读取的配置</td></tr>}</tbody></table>
+    <section className="panel"><h3>{kind === 'groups' ? '模型与计费分组' : '模型目录与路由'}</h3><p className="muted">{kind === 'groups' ? '分组决定模型和价格；关闭发放仅禁止新卡，不影响已发卡密。' : '模型发现不等于 Key 授权。请核对可用路由和价格后发布。'}</p>
+      <div className="editor-list"><table><thead><tr>{(kind === 'groups' ? ['分组', '虚拟套餐（非发卡套餐）', '价格表', '操作'] : ['展示名称', '上游模型 ID', '供应商 / Key 池', '操作']).map(label => <th key={label}>{label}</th>)}</tr></thead><tbody>{rows.map((row, index) => <tr key={String(row.id ?? index)} className={selectedRow?.id === row.id ? 'selected-row' : ''}><td>{String(row[kind === 'groups' ? 'name' : 'exposed_model_id'] ?? row.id)}</td><td>{String(row[kind === 'groups' ? 'virtual_plan_name' : 'target_model'] ?? '—')}</td><td>{String(row[kind === 'groups' ? 'rate_card_id' : 'target_provider_id'] ?? '—')}</td><td><button disabled={busy} onClick={() => {setSelected(String(row.id)); focusEditor();}}>编辑配置 →</button>{isEdited(row) && <span className="edited-badge">已修改</span>}</td></tr>)}{!rows.length && <tr><td colSpan={4} className="empty-state">暂无已读取的配置</td></tr>}</tbody></table></div>
+      <div className="editor-jump"><label>定位配置<select aria-label="定位配置" disabled={busy} value={String(selectedRow?.id ?? '')} onChange={e => {setSelected(e.target.value); focusEditor();}}><option value="" disabled>请选择条目</option>{rows.map(row => <option key={String(row.id)} value={String(row.id)}>{isEdited(row) ? '[已修改] ' : ''}{String(row.name ?? row.exposed_model_id ?? row.id)}</option>)}</select></label><span className="muted">{rows.filter(isEdited).length} 项已修改 · 尚未发布</span></div>
     </section>
-    <div className="two-columns"><section className="panel"><h3>正在编辑 · {String(selectedRow?.name ?? selectedRow?.exposed_model_id ?? '请选择条目')}</h3><fieldset disabled={busy || !selectedRow} className="field-grid">{selectedRow && fields.filter(field => field === 'issuance_enabled' || field in selectedRow).map(field => <label key={field}>{labels[field]}{field === 'issuance_enabled' || typeof selectedRow[field] === 'boolean' ? <input type="checkbox" checked={field === 'issuance_enabled' ? selectedRow[field] !== false : Boolean(selectedRow[field])} onChange={e => updateField(field, e.target.checked)} /> : <input type={numericFields.includes(field) ? 'number' : 'text'} step={['context_window', 'max_output'].includes(field) ? '1' : 'any'} value={String(selectedRow[field] ?? '')} onChange={e => updateField(field, numericFields.includes(field) && e.target.value.trim() ? Number(e.target.value) : e.target.value)} />}</label>)}</fieldset></section><section className="panel"><h3>发布前检查</h3><p className="muted">版本：{config?.revision ?? '尚未读取'}</p><p>填写变更原因后发布。发布前会检查版本冲突、路由配置和未结算请求。</p><p className="muted">{kind === 'groups' ? '分组倍率须大于 0、至多 1000；1 表示不加倍。虚拟用量上限不是卡密余额；修改分组不会给已发卡密充值。' : '模型与价格版本倍率须大于 0、至多 1000；1 表示不加倍。最大输出不得超过上下文长度。已有映射不能迁移分组；发布到用户目录前须有启用且授权兼容的 Key。'}</p></section></div>
+    <div className="compact-editor"><section ref={editorRef} tabIndex={-1} className="panel mapping-editor"><h3>正在编辑 · {String(selectedRow?.name ?? selectedRow?.exposed_model_id ?? '请选择条目')}</h3><fieldset disabled={busy || !selectedRow} className="field-grid">{selectedRow && fields.filter(field => field === 'issuance_enabled' || field in selectedRow).map(field => <label key={field}>{labels[field]}{['context_window', 'max_output'].includes(field) && '（Tokens）'}{field === 'issuance_enabled' || typeof selectedRow[field] === 'boolean' ? <input type="checkbox" checked={field === 'issuance_enabled' ? selectedRow[field] !== false : Boolean(selectedRow[field])} onChange={e => updateField(field, e.target.checked)} /> : <input aria-label={labels[field]} placeholder={['context_window', 'max_output'].includes(field) ? '整数或 K / M，例如 128K' : undefined} type={numericFields.includes(field) && !['context_window', 'max_output'].includes(field) ? 'number' : 'text'} step={['context_window', 'max_output'].includes(field) ? '1' : 'any'} value={String(selectedRow[field] ?? '')} onChange={e => updateField(field, ['context_window', 'max_output'].includes(field) ? parseTokenInput(e.target.value) : numericFields.includes(field) && e.target.value.trim() ? Number(e.target.value) : e.target.value)} />}{['context_window', 'max_output'].includes(field) && <small>{formatTokens(selectedRow[field])} · 1K = 1,000；1M = 1,000,000</small>}</label>)}</fieldset></section><details className="editor-checks"><summary>发布前检查 · 版本 {config?.revision ?? '尚未读取'}</summary><p className="muted">版本：{config?.revision ?? '尚未读取'}</p><p>填写变更原因后发布。发布前会检查版本冲突、路由配置和未结算请求。</p><p className="muted">{kind === 'groups' ? '分组倍率须大于 0、至多 1000；1 表示不加倍。虚拟用量上限不是卡密余额；修改分组不会给已发卡密充值。' : '模型与价格版本倍率须大于 0、至多 1000；1 表示不加倍。最大输出不得超过上下文长度。已有映射不能迁移分组；发布到用户目录前须有启用且授权兼容的 Key。'}</p></details></div>
     {kind === 'models' && <section className="panel pricing-editor">
       <div className="pricing-heading"><div><h3>积分价格</h3><p className="muted">客户固定售价 · 自动换算微积分 · 与采购成本独立</p></div><span className="pricing-badge">版本化定价</span></div>
       <div className="pricing-template"><label>选择价格版本模板<select disabled={busy} aria-label="选择价格版本模板" value={String(priceDraft?.source_id ?? '')} onChange={e => selectTemplate(e.target.value)}><option value="">从现有版本创建新草稿</option>{config?.versions.filter(v => v.pricing_mode === 'fixed').map(v => <option key={String(v.id)} value={String(v.id)}>{String(v.model)} · {String(v.id)}</option>)}</select></label><details><summary>价格版本与生效规则</summary><p>历史版本只读。新版本沿用模板的模型与价格表，只能在未来时间生效，请预留发布操作时间。1 积分 = 1,000,000 微积分。草稿仅保留在当前页面；成本加成、按次计费及首个价格版本使用高级配置。</p></details></div>
@@ -202,7 +209,7 @@ export default function CommercialEditor({ kind,onDirtyChange,onBusyChange }: {k
     </section>}
     <section className="p-6 rounded-xl bg-white border border-[#E5E8E5] space-y-4">
     <h3 className="font-semibold text-[#23272B]">{kind === 'groups' ? '分组配置' : '模型映射与版本化定价'}</h3>
-    <p className="text-[#7B8388] text-sm">修改后填写原因并发布；离开页面会丢弃未发布草稿。发布会按 ID 新增或更新条目，从 JSON 删除一行不等于删除服务端条目。新增条目及完整参数可在高级配置中编辑。</p>
+    <details><summary>发布与草稿规则</summary><p className="text-[#7B8388] text-sm">修改后填写原因并发布；离开页面会丢弃未发布草稿。发布会按 ID 新增或更新条目，从 JSON 删除一行不等于删除服务端条目。新增条目及完整参数可在高级配置中编辑。</p></details>
     <p role="status" className="text-[#A87029] text-sm">{message}</p>
     {config && draftError && <p role="alert">{draftError} 原输入已保留，修正后才能加入价格或发布。</p>}
     <p className="muted">{dirty ? `有未发布的编辑 · 已加入 ${Array.isArray(parsedDraft.versions) ? parsedDraft.versions.length : 0} 个价格版本` : '当前没有未发布的编辑'}{needsReview ? ' · 请重新读取后核对，当前禁止发布' : ''}</p>
@@ -213,7 +220,7 @@ export default function CommercialEditor({ kind,onDirtyChange,onBusyChange }: {k
     <button disabled={busy || needsReview || !config || !reason.trim()} onClick={()=>void publish()} className="px-4 py-2 rounded bg-[#B94B39] text-white disabled:opacity-50">{busy ? '处理中…' : '确认并发布'}</button>
     {kind === 'models' && <section className="panel" aria-label="历史价格版本">
       <h3>价格版本列表（只读）</h3>
-      <p className="muted">包括历史及已发布的未来版本，不代表全部正在生效。客户基准售价已从微积分自动换算为积分；实际扣费还需叠乘价格版本、分组和模型倍率。时间按本地时区显示。</p>
+      <details><summary>价格与倍率说明</summary><p className="muted">包括历史及已发布的未来版本，不代表全部正在生效。客户基准售价已从微积分自动换算为积分；实际扣费还需叠乘价格版本、分组和模型倍率。时间按本地时区显示。</p></details>
       <div className="overflow-auto"><table><thead><tr><th>版本 / 模型 / 价格表</th><th>客户基准售价（倍率前）</th><th>价格版本倍率</th><th>采购参考价（与客户售价分开）</th><th>生效时间（本地时区）</th></tr></thead><tbody>
         {config?.versions.map(version => <tr key={String(version.id)}>
           <td>{String(version.id)}<br/>{String(version.model)}<br/>{String(version.rate_card_id)}</td>

@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod backend;
+mod errors;
 mod window_preferences;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -18,11 +19,13 @@ async fn api(
     path: String,
     method: String,
     body: Value,
-) -> Result<Value, String> {
-    local_window(&window)?;
+) -> Result<Value, Value> {
+    local_window(&window).map_err(|e| errors::classify(&e, &path, &method))?;
     let host = Arc::clone(state.inner());
     if method == "GET" && path.split('?').next() == Some("/api/operation") {
-        return host.operation_status();
+        return host
+            .operation_status()
+            .map_err(|e| errors::classify(&e, &path, &method));
     }
     if (method == "GET"
         && matches!(
@@ -31,7 +34,9 @@ async fn api(
         ))
         || (method == "POST" && path.split('?').next() == Some("/api/heartbeat"))
     {
-        return backend::dispatch(&host, &path, &method, body).await;
+        return backend::dispatch(&host, &path, &method, body)
+            .await
+            .map_err(|e| errors::classify(&e, &path, &method));
     }
     tauri::async_runtime::spawn(async move {
         // The detached task retains its lock despite a webview timeout.
@@ -48,7 +53,8 @@ async fn api(
             );
         let worker_host = Arc::clone(&host);
         let worker_path = path.clone();
-        backend::run_operation(&host, &path, tracked, async move {
+        let operation_method = method.clone();
+        backend::run_operation(&host, &path, tracked, &operation_method, async move {
             // Blocking helpers cannot starve the operation status endpoint.
             tauri::async_runtime::spawn_blocking(move || {
                 tauri::async_runtime::block_on(backend::dispatch(
@@ -64,7 +70,7 @@ async fn api(
         .await
     })
     .await
-    .map_err(|_| "Desktop engine failed unexpectedly; inspect state before retrying".to_string())?
+    .map_err(|_| errors::classify("Desktop engine failed unexpectedly", "", "POST"))?
 }
 
 fn local_window(window: &WebviewWindow) -> Result<(), String> {
@@ -181,6 +187,18 @@ fn resize_screen(window: &WebviewWindow, page: &str) -> Result<(), String> {
 
 #[tauri::command]
 async fn native(
+    window: WebviewWindow,
+    state: tauri::State<'_, Arc<backend::Host>>,
+    method: String,
+    args: Vec<Value>,
+) -> Result<Value, Value> {
+    let operation = method.clone();
+    native_inner(window, state, method, args)
+        .await
+        .map_err(|e| errors::classify(&e, "native", &operation))
+}
+
+async fn native_inner(
     window: WebviewWindow,
     state: tauri::State<'_, Arc<backend::Host>>,
     method: String,

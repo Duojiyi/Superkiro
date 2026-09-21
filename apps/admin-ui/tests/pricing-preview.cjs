@@ -34,12 +34,12 @@ assert.throws(() => charge([1, 1, 1, 1], ['1', '1', '1', '1'], [Infinity, 1, 1])
 
 // Exercise the component's real event handlers without a browser or extra dependencies.
 const fields = ['fixed_input_credit_per_m', 'fixed_output_credit_per_m', 'fixed_cache_creation_credit_per_m', 'fixed_cache_read_credit_per_m'];
-const model = {exposed_model_id: 'test-model', target_model: 'upstream', group_id: 'g', credit_multiplier: 4};
+const model = {id: 'model-1', exposed_model_id: 'test-model', target_model: 'upstream', group_id: 'g', credit_multiplier: 4};
 const group = {id: 'g', rate_card_id: 'r', margin_multiplier: 3};
 const version = {id: 'new-price', model: 'test-model', rate_card_id: 'r', pricing_mode: 'fixed', margin_multiplier: 2, effective_from_secs: 2000000000, currency: 'USD', input_price_per_m: 99, output_price_per_m: 99, cache_read_price_per_m: 99, cache_creation_price_per_m: 99};
 let states, cursor;
 const jsx = (type, props) => ({type, props});
-const Editor = load('CommercialEditor.tsx', {'./pricing': pricing, './api': {adminApi: {}}, react: {
+const Editor = load('CommercialEditor.tsx', {'./tokens': load('tokens.ts'), './pricing': pricing, './api': {adminApi: {}}, react: {
   useEffect: () => {}, useRef: initial => ({current: initial}), useState: initial => {const index = cursor++; if (!(index in states)) states[index] = initial; return [states[index], value => {states[index] = typeof value === 'function' ? value(states[index]) : value;}];},
 }, 'react/jsx-runtime': {jsx, jsxs: jsx}}).default;
 const render = () => {cursor = 0; return Editor({kind: 'models', onDirtyChange: () => {}, onBusyChange: () => {}});};
@@ -48,7 +48,7 @@ function text(node) {if (node == null || typeof node === 'boolean') return ''; i
 const find = (tree, type, label) => nodes(tree).find(node => node.type === type && text(node).startsWith(label));
 function setup() {
   const draft = JSON.stringify({models: [model], rate_cards: [], versions: []});
-  states = [{groups: [group], versions: []}, draft, draft, '', '', false, 0, {...version}, Object.fromEntries(fields.map((field, i) => [field, String(i + 1)])), 'million', ['1000', '1000', '1000', '1000']];
+  states = [{groups: [group], versions: []}, draft, draft, '', '', false, 'model-1', {...version}, Object.fromEntries(fields.map((field, i) => [field, String(i + 1)])), 'million', ['1000', '1000', '1000', '1000']];
   return render();
 }
 let tree = setup();
@@ -103,3 +103,33 @@ assert(text(history).includes('未提供有效时间'));
 assert.equal(nodes(history).filter(node => ['input', 'select', 'textarea'].includes(node.type)).length, 0);
 assert.equal(JSON.stringify(states[0]), before);
 console.log('Local date conversion and read-only human-readable historical prices passed');
+
+// Token inputs are explicit decimal units, without model-name inference or a 32K cap.
+const tokens = load('tokens.ts');
+for (const [input, expected] of [['128K',128000],['1M',1000000],['1.001K',1001],['0.000001M',1],['64k',64000],['200000',200000]]) assert.equal(tokens.parseTokenInput(input),expected);
+for (const input of ['', '-1','0','1.1','1e6','NaN','Infinity','1.0001K','9007199254740992']) assert.equal(tokens.parseTokenInput(input),input);
+assert.equal(tokens.formatTokens(200000),'200K Tokens（200,000）');
+assert.equal(tokens.formatTokens(1000000),'1M Tokens（1,000,000）');
+setup();
+states[1] = JSON.stringify({models: [{...model,context_window:200000,max_output:64000},{...model,id:'model-2',context_window:128000,max_output:32000}], versions:[]});
+const field = name => nodes(render()).find(node => node.type === 'input' && node.props['aria-label'] === name);
+assert.equal(field('最大输出').props.value,'64000');
+field('上下文长度').props.onChange({target:{value:'1M'}});
+assert.equal(JSON.parse(states[1]).models[0].context_window,1000000);
+const reordered = JSON.parse(states[1]); reordered.models.reverse(); states[1] = JSON.stringify(reordered);
+assert.equal(field('上下文长度').props.value,'1000000','selection follows ID after JSON reorder');
+field('最大输出').props.onChange({target:{value:'128K'}});
+assert.equal(JSON.parse(states[1]).models[1].max_output,128000);
+assert.equal(JSON.parse(states[1]).models[0].max_output,32000,'other model remains untouched');
+field('上下文长度').props.onChange({target:{value:''}});
+assert.equal(field('上下文长度').props.value,'');
+states[1] = JSON.stringify({models:[reordered.models[0]]});
+assert(!field('上下文长度'),'removed selection must not silently edit another model');
+console.log('PASS: decimal K/M tokens, original values, uncapped output, invalid drafts and stable model selection');
+
+setup();
+states[1] = JSON.stringify({models:[{...model,context_window:200000},{...model,context_window:128000}]});
+const duplicateDraft = states[1];
+field('上下文长度').props.onChange({target:{value:'1M'}});
+assert.equal(states[1],duplicateDraft,'duplicate IDs cannot cause multiple rows to be edited');
+assert(states[4].includes('ID 重复或不存在'));

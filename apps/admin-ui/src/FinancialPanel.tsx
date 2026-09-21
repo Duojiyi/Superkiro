@@ -46,7 +46,7 @@ export default function FinancialPanel({data,onPublished,onDirtyChange,onBusyCha
   }
   const e=financialEstimates(data),margin=e?.faceValueMarginPercentage;
   return <div className="two-columns"><section className="panel"><h3>财务估算配置</h3>
-    <p className="muted">积分面值不是实收单价；采购汇率用于 USD 成本换算。采购价格在模型价格版本中配置。修改会影响成本加成计费和估算口径，不会给卡密充值或调整余额；固定积分售价需在“模型与定价”另行调整。</p>
+    <details><summary>面值、汇率与计费影响</summary><p className="muted">积分面值不是实收单价；采购汇率用于 USD 成本换算。采购价格在模型价格版本中配置。修改会影响成本加成计费和估算口径，不会给卡密充值或调整余额；固定积分售价需在“模型与定价”另行调整。</p></details>
     <form onSubmit={event=>{event.preventDefault();void publish();}}><fieldset disabled={busy||!config?.settings} className="field-grid">
       <label>积分面值（元 / 积分）<input type="number" min="0" step="any" max="1000" required aria-invalid={!!inputError} aria-describedby="financial-value-help" value={face} onChange={event=>setFace(event.target.value)}/></label>
       <label>采购汇率（CNY / USD）<input type="number" min="0" step="any" max="1000" required aria-invalid={!!inputError} aria-describedby="financial-value-help" value={rate} onChange={event=>setRate(event.target.value)}/></label>

@@ -158,7 +158,7 @@ impl ModelContextLibrary {
         ]
     }
 
-    /// Resolve preset by model ID (fuzzy, prefix, and fallback matching).
+    /// Resolve an exact preset or dated snapshot; unknown IDs use conservative defaults.
     pub fn resolve(model_id: &str) -> ModelContextPreset {
         let normalized = model_id.to_lowercase();
         let presets = Self::builtin();
@@ -168,39 +168,15 @@ impl ModelContextLibrary {
             return p.clone();
         }
 
-        // 2. Alias / prefix matching
-        for p in &presets {
-            if normalized.starts_with(&p.model_id)
-                || (!normalized.is_empty() && p.model_id.starts_with(&normalized))
-            {
-                return p.clone();
-            }
-        }
-
-        // Specific alias mapping
-        if normalized.contains("claude") {
-            if normalized.contains("haiku") {
-                return Self::resolve("claude-3-5-haiku");
-            }
-            return Self::resolve("claude-3-5-sonnet");
-        }
-        if normalized.contains("deepseek") {
-            if normalized.contains("reasoner") || normalized.contains("r1") {
-                return Self::resolve("deepseek-reasoner");
-            }
-            return Self::resolve("deepseek-chat");
-        }
-        if normalized.contains("gpt-4") {
-            if normalized.contains("mini") {
-                return Self::resolve("gpt-4o-mini");
-            }
-            return Self::resolve("gpt-4o");
-        }
-        if normalized.contains("gemini") {
-            return Self::resolve("gemini-2.0-flash");
-        }
-        if normalized.contains("qwen") {
-            return Self::resolve("qwen-2.5-coder");
+        // Only recognize dated snapshots of known IDs, not arbitrary family names.
+        if let Some(p) = presets.iter().find(|p| {
+            normalized
+                .strip_prefix(&format!("{}-", p.model_id))
+                .is_some_and(|suffix| {
+                    suffix.len() == 8 && suffix.bytes().all(|c| c.is_ascii_digit())
+                })
+        }) {
+            return p.clone();
         }
 
         // 3. Fallback safe default

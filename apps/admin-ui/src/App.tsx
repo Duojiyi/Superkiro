@@ -694,16 +694,17 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
                   adjustment.current = saved; setSelectedCard(card); setAdjustAmount(String(saved.delta)); setAdjustReason(saved.reason); setShowAdjustModal(true);
                 } catch {setActionError('调账恢复记录无法读取，请人工核对账本；未发送请求。');}
               }}>核对未确认调账</button></section>}
-              <section className="panel" aria-label="批量卡密管理">
+              <section className="panel bulk-toolbar" aria-label="批量卡密管理">
                 <p>已选 {selectedCardIds.length} 张卡密 · 批量操作仅针对当前页所选卡密。</p>
-                <p className="muted">删除支持已激活卡密，永久撤销使用权限并保留财务记录，不自动退款。有在途请求时请先冻结，等待结算后重试。仅需清理列表可归档已封禁或到期记录，取消归档不会恢复授权。列表与总量统计保留已作废、归档卡的账面余额，不代表可消费积分。导出文件包含完整卡密，请妥善保管。筛选、翻页或刷新后需重新选择。</p><div className="actions">
+                <div className="actions">
                   <button disabled={cardBulkBusy || !!dataFailures.cards || loading || !pageCards.length} onClick={() => setSelectedCardIds(pageCards.map(card => card.id))}>当前页全选</button>
                   <button disabled={cardBulkBusy || !selectedCardIds.length} onClick={() => setSelectedCardIds([])}>清空选择</button>
-                  {(['freeze', 'unfreeze', 'ban', 'void', 'archive', 'unarchive', 'export'] as const).map(action => <button className={(action === 'ban' || action === 'void') ? 'danger' : action === 'export' ? 'primary' : 'secondary'} key={action} disabled={cardBulkBusy || !!dataFailures.cards || loading || mutationBusy || revealing || !selectedCardIds.length} onClick={() => void handleCardBulk(action)}>{{freeze: '批量冻结', unfreeze: '批量解冻', ban: '批量封禁', void: '批量删除（永久作废）', archive: '批量归档', unarchive: '取消归档', export: '导出已选卡密'}[action]}</button>)}
+                  {(['freeze', 'unfreeze', 'export', 'void'] as const).map(action => <button className={action === 'void' ? 'danger' : action === 'export' ? 'primary' : 'secondary'} key={action} disabled={cardBulkBusy || !!dataFailures.cards || loading || mutationBusy || revealing || !selectedCardIds.length} onClick={() => void handleCardBulk(action)}>{{freeze: '批量冻结', unfreeze: '批量解冻', ban: '批量封禁', void: '批量删除（永久作废）', archive: '批量归档', unarchive: '取消归档', export: '导出已选卡密'}[action]}</button>)}
+                  <details className="bulk-more"><summary>更多操作</summary><div className="actions">{(['archive', 'unarchive', 'ban'] as const).map(action => <button className={action === 'ban' ? 'danger' : 'secondary'} key={action} disabled={cardBulkBusy || !!dataFailures.cards || loading || mutationBusy || revealing || !selectedCardIds.length} onClick={() => void handleCardBulk(action)}>{{freeze: '批量冻结', unfreeze: '批量解冻', ban: '批量封禁', void: '批量删除（永久作废）', archive: '批量归档', unarchive: '取消归档', export: '导出已选卡密'}[action]}</button>)}</div><p className="muted">封禁与永久作废会撤销使用权限；作废不自动退款。</p></details>
                 </div>
                 {cardBulkBusy && <p role="status">正在逐项处理，请勿重复提交…</p>}
                 {!!cardBulkResults.length && <div aria-label="批量操作结果" role="status"><p>本次逐项结果（不含卡密明文）：</p>{cardBulkResults.map(item => <p key={item.id}>{item.id}：{item.result}</p>)}</div>}
-                <div className="actions"><button disabled={cardBulkBusy || !!dataFailures.cards || loading || currentCardPage === 0} onClick={() => {setSelectedCardIds([]); setCardPage(currentCardPage - 1);}}>上一页</button><span>第 {currentCardPage + 1} / {pageCount} 页 · 每页 50 条 · 共 {filteredCards.length} 条</span><button disabled={cardBulkBusy || !!dataFailures.cards || loading || currentCardPage + 1 >= pageCount} onClick={() => {setSelectedCardIds([]); setCardPage(currentCardPage + 1);}}>下一页</button></div>
+                <details className="bulk-help"><summary>操作规则与导出安全</summary><p className="muted">删除支持已激活卡密，永久撤销使用权限并保留财务记录，不自动退款。有在途请求时请先冻结，等待结算后重试。仅需清理列表可归档已封禁或到期记录，取消归档不会恢复授权。列表与总量统计保留已作废、归档卡的账面余额，不代表可消费积分。导出文件包含完整卡密，请妥善保管。筛选、翻页或刷新后需重新选择。</p></details>
               </section>
               <p className="table-hint">左右滑动表格查看全部信息和操作。</p>
               <table className="w-full text-left border-collapse bg-white rounded-xl border border-[#E5E8E5] overflow-hidden">
@@ -809,6 +810,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
                   )}
                 </tbody>
               </table>
+                <div className="card-pagination"><button disabled={cardBulkBusy || !!dataFailures.cards || loading || currentCardPage === 0} onClick={() => {setSelectedCardIds([]); setCardPage(currentCardPage - 1);}}>上一页</button><span>第 {currentCardPage + 1} / {pageCount} 页 · 每页 50 条 · 共 {filteredCards.length} 条</span><button disabled={cardBulkBusy || !!dataFailures.cards || loading || currentCardPage + 1 >= pageCount} onClick={() => {setSelectedCardIds([]); setCardPage(currentCardPage + 1);}}>下一页</button></div>
             </div>
           )}
 
@@ -816,7 +818,6 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
             <h3>上次制卡结果待核对</h3>{issuanceReference && <p className="card-note">{issuanceReference}</p>}<p>请求可能已经入库，已暂停再次制卡。请刷新卡密列表，按下方批次编号搜索，并核对数量；已生成的卡密可在列表中查看或导出。</p>
             <div className="actions"><button disabled={!issuanceReference} onClick={() => {setSearchQuery(issuanceReference);setGroupFilter('ALL');setCardStatusFilter('ALL');}}>按本批次筛选</button><button disabled={issuanceChecking || loading} onClick={() => void refreshIssuanceForReview()}>{issuanceChecking ? '正在刷新卡密…' : '刷新卡密以核对'}</button><button disabled={issuanceChecking || issuanceRecovery !== 'review'} onClick={() => {if(!window.confirm('确认已核对最新卡密列表？已有本次生成结果时，请勿重复制卡。解除限制不会自动生成。'))return;try{sessionStorage.removeItem(issuanceStorageKey);setIssuanceRecovery(null);setActionError('');}catch{setActionError('无法清除待核对记录，仍禁止制卡。请检查浏览器存储。');}}}>已核对列表，解除制卡限制</button></div>
           </section>}
-          {activeTab === 'cards' && <div className="two-columns page-supplement"><section className="panel"><h3>批量生成卡密</h3><p>PRO 1,000 · PRO+ 2,000 · PRO Max 5,000 · Power 10,000</p><p className="muted">每张卡密仅限一台设备。支持恢复的卡密可在列表中按需查看，请安全交付。</p><div className="actions"><button className="primary" disabled={!isAuthenticated} onClick={() => setShowBatchModal(true)}>预览生成清单</button></div></section><section className="notice-panel"><h3>额度调整需要留下原因</h3><p>从卡密记录选择调账，填写增减积分与操作原因，确认后写入账本。结果未确认时保持原参数重试，不要另起调账。</p><p className="muted">当前匹配 {filteredCards.length} 条记录；筛选在已读取列表内进行，每页显示 50 条。</p></section></div>}
           {/* TAB 3: GROUPS */}
           {activeTab === 'groups' && isAuthenticated && <CommercialEditor key="groups" kind="groups" onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy} />}
 

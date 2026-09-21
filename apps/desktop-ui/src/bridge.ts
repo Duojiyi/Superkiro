@@ -1,6 +1,8 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
+import { ClientError, toClientError } from './errors';
 export interface Authorization { virtualPlanName?: string; remainingPoints?: number; totalPoints?: number; validUntil?: number; isExpired?: boolean; status?: string }
-export interface Status { gateway_url?: string; authenticated?: boolean; has_snapshot?: boolean; recovery_pending?: boolean; kiro_installed?: boolean; kiro_version?: string; kiro_install_path?: string; process_state?: string; model_service_available?: boolean | null; portal_url?: string; platform?: string; app_version?: string; authorization?: Authorization; tray_available?: boolean; memory_maintenance?: Maintenance }
+export const MINIMUM_KIRO_VERSION = '1.1.14';
+export interface Status { kiro_compatible?: boolean; minimum_kiro_version?: typeof MINIMUM_KIRO_VERSION; gateway_url?: string; authenticated?: boolean; has_snapshot?: boolean; recovery_pending?: boolean; kiro_installed?: boolean; kiro_version?: string; kiro_install_path?: string; process_state?: string; model_service_available?: boolean | null; portal_url?: string; platform?: string; app_version?: string; authorization?: Authorization; tray_available?: boolean; memory_maintenance?: Maintenance }
 export interface Usage { usage?: { availableCredits?:number|null; usageBreakdownList?: {dimensionType: string; currentUsageWithPrecision: number; usageLimitWithPrecision: number}[]; virtualPlanName?: string; validUntil?: number; isExpired?: boolean }; settledUsage?: {windowStart?: string|number; windowEnd?: string|number; timezone?: string; totalTokens?: number; todayPoints?: number; todayTokens?: number; referencePrice?: number; daily?: {date: string; points?: number; tokens?: number; usd?: number}[]; models?: {name: string; tokens?: number; points?: number}[]} }
 export interface Memory { total_memory_mb?: number; total_process_count?: number; ide_memory_mb?: number; agent_memory_mb?: number; success_count?: number; failed_count?: number }
 export const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0;
@@ -8,7 +10,10 @@ export const number = (v: unknown) => finite(v) ? v.toLocaleString('zh-CN', {max
 export const configured = (s: Status) => s.authenticated === true && s.has_snapshot === true;
 export const expired = (a: Authorization | null) => a?.isExpired === true || (finite(a?.validUntil) && a.validUntil * 1000 <= Date.now());
 export function safeError(error: unknown) {
+  if (error instanceof ClientError) return error.message;
+  if (error && typeof error === 'object' && 'code' in error) return toClientError(error).message;
   const text = error instanceof Error ? error.message : String(error);
+  if(/unsupported; upgrade to/i.test(text)) { const version = /Kiro ([^;]+) is unsupported/i.exec(text)?.[1] || '当前版本'; const minimum = /to ([0-9.]+) or later/i.exec(text)?.[1] || '1.1.14'; return `${version} 不受支持，请升级 Kiro 至 ${minimum} 或更高版本。`; }
   if(/MacBundleNameUnsupported|macOS.*Kiro\.app/.test(text))return 'macOS 暂仅支持保留官方包名 Kiro.app 的安装，请恢复官方包名后重新选择。';
   const stage = /^\[connection:(preflight|launch-prepare|authenticate|close|apply|launch)\]/.exec(text)?.[1];
   const auth = /\[auth:([a-z-]+)\]/.exec(text)?.[1];
@@ -27,12 +32,12 @@ export function safeError(error: unknown) {
   }
   if (stage) {
     const messages: Record<string,string> = {
-      preflight:'连接前检查失败，请查看诊断中的安装、网关和配置检查结果。',
+      preflight:'连接前检查失败，请确认安装、网关和配置状态。',
       'launch-prepare':'Kiro 启动准备失败，请检查安装完整性和本机权限。',
       authenticate:'连接授权失败，请检查卡密有效性、余额及设备绑定状态。',
       close:'未能关闭 Kiro，请保存文件并手动退出 Kiro。',
       apply:'连接配置应用失败，请检查文件占用与权限；如有待恢复配置，请先还原。',
-      launch:'未能启动 Kiro，请查看诊断并确认配置状态后再启动。',
+      launch:'未能启动 Kiro，请确认配置状态后再启动。',
     };
     return `[connection:${stage}] ${messages[stage]}` + (/timeout|超时/i.test(text) ? ' 操作结果未确认，请勿重复修改配置。' : '');
   }
@@ -42,23 +47,27 @@ export function safeError(error: unknown) {
   if (/Cannot read|read.*failed|读取/i.test(text)) return '读取本地文件或状态失败，请检查安装路径与文件权限后重试。';
   if (/write|permission|access denied|写入|权限/i.test(text)) return '写入配置失败，请检查文件占用与权限。备份仍需保留。';
   if (/credential|keyring|安全存储/i.test(text)) return '系统安全存储操作失败，请检查系统凭据服务。';
-  if (/restore|恢复|还原/i.test(text)) return '还原配置未完成，请保留备份并查看诊断。';
+  if (/restore|恢复|还原/i.test(text)) return '还原配置未完成，请保留备份并重试还原。';
   if (/TLS configuration/i.test(text)) return 'TLS 配置检查失败，请检查受信任证书与 CA 配置。不要关闭证书校验。';
-  if (/certificate|TLS|hostname|证书/i.test(text)) return '证书校验失败，请在诊断中检查，不要关闭证书校验。';
-  if (/timeout|超时/i.test(text)) return '连接超时，操作结果未确认。请查看诊断，不要重复修改配置。';
+  if (/certificate|TLS|hostname|证书/i.test(text)) return '证书校验失败，请检查系统时间和受信任证书，不要关闭证书校验。';
+  if (/timeout|超时/i.test(text)) return '连接超时，操作结果未确认。请等待状态同步，不要重复修改配置。';
   if (/preview/i.test(text)) return '当前为浏览器预览，未连接 Tauri 宿主。没有执行本机操作。';
   return '请求未完成，请检查本地服务、卡密及网络后重试。';
 }
 export async function api<T>(path: string, method = 'GET', body: object = {}): Promise<T> {
-  if (!isTauri()) throw new Error('preview');
+  if (!isTauri()) throw toClientError({code:'SK-PREVIEW-001'});
   let timer:ReturnType<typeof setTimeout>|undefined;
-  const result = await Promise.race([invoke<T & {success?: boolean; error?: string}>('api', {path, method, body}),new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new Error('timeout')),path==='/api/heartbeat'?5000:method==='GET'?15000:125000);})]).finally(()=>clearTimeout(timer));
-  if (result?.success === false) throw new Error(result.error || '请求失败');
-  return result;
+  try {
+    const result = await Promise.race([invoke<T & {success?: boolean; error?: unknown}>('api', {path, method, body}),new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(toClientError({code:'SK-NET-001',outcome:method==='GET'?'failed':'unknown'})),path==='/api/heartbeat'?5000:method==='GET'?15000:125000);})]);
+    if (result?.success === false) throw result.error;
+    return result;
+  } catch (error) { throw toClientError(error); }
+  finally { clearTimeout(timer); }
 }
 export async function native<T = unknown>(method: string, args: unknown[] = []): Promise<T> {
-  if (!isTauri()) throw new Error('preview');
-  return invoke<T>('native', {method, args});
+  if (!isTauri()) throw toClientError({code:'SK-PREVIEW-001'});
+  try { return await invoke<T>('native', {method, args}); }
+  catch (error) { throw toClientError(error); }
 }
 export function gateway(value: string) {
   value = value.trim(); if (!value) return '';

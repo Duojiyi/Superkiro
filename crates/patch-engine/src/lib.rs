@@ -26,8 +26,8 @@ pub use beacon::{
     BeaconClient, BeaconError, ClientNegotiateRequest, ClientNegotiateResponse, HealthBeacon,
 };
 pub use detect::{
-    detect_kiro, get_candidate_install_paths, inspect_installation_dir, DetectError,
-    KiroInstallation,
+    detect_kiro, get_candidate_install_paths, inspect_installation_dir, kiro_version_is_supported,
+    DetectError, KiroInstallation, MINIMUM_SUPPORTED_KIRO_VERSION,
 };
 pub use device::{generate_device_fingerprint, is_valid_device_fingerprint, DEVICE_ID_PREFIX};
 pub use doctor::{CheckItem, CheckLevel, Doctor, DoctorError, DoctorReport, TakeoverStatus};

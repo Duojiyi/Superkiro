@@ -51,17 +51,17 @@ impl Host {
         *state = json!({"id":state["id"].as_u64().unwrap_or(0) + 1,"state":"running","path":path,"error":null});
         Ok(())
     }
-    pub fn finish_operation(&self, result: &Result<Value, String>) {
+    pub fn finish_operation(&self, result: &Result<Value, Value>) {
         if let Ok(mut state) = self.operation_state.lock() {
             state["state"] = json!(if result.is_ok() {
                 "succeeded"
             } else {
                 "failed"
             });
-            // Only fixed labels/status numbers survive. Never persist raw remote errors.
-            let details = operation_error(result.as_ref().err().map(String::as_str));
-            for key in ["stage", "code", "http_status"] {
-                state[key] = details[key].clone();
+            // Persist the exact payload returned to IPC, including its feedback ID.
+            state["support_error"] = result.as_ref().err().cloned().unwrap_or(Value::Null);
+            for key in ["stage", "code"] {
+                state[key] = state["support_error"][key].clone();
             }
             state["error"] = if result.is_err() {
                 json!("Operation failed; inspect status before recovery")
@@ -106,53 +106,6 @@ impl Host {
         Ok(json!({"success":true,"path":path}))
     }
 }
-const CONNECTION_STAGES: &[&str] = &[
-    "preflight",
-    "launch-prepare",
-    "authenticate",
-    "close",
-    "apply",
-    "launch",
-];
-const ERROR_CODES: &[&str] = &[
-    "timeout",
-    "tls",
-    "auth-rejected",
-    "network",
-    "permission",
-    "unknown",
-];
-fn operation_error(error: Option<&str>) -> Value {
-    let Some(error) = error else {
-        return json!({});
-    };
-    let stage = CONNECTION_STAGES
-        .iter()
-        .find(|stage| error.starts_with(&format!("[connection:{stage}]")))
-        .copied()
-        .unwrap_or("unknown");
-    let lower = error.to_ascii_lowercase();
-    let http_status = error
-        .split("Authentication rejected: ")
-        .nth(1)
-        .and_then(|s| s.split_whitespace().next())
-        .and_then(|s| s.parse::<u16>().ok())
-        .filter(|s| (100..600).contains(s));
-    let code = if lower.contains("timeout") || lower.contains("timed out") {
-        "timeout"
-    } else if lower.contains("certificate") || lower.contains("tls") {
-        "tls"
-    } else if http_status.is_some() {
-        "auth-rejected"
-    } else if lower.contains("network") {
-        "network"
-    } else if lower.contains("permission") || lower.contains("access denied") {
-        "permission"
-    } else {
-        "unknown"
-    };
-    json!({"stage":stage,"code":code,"http_status":http_status})
-}
 fn load_operation(config: &Path) -> Value {
     let idle = json!({"id":0,"state":"idle","path":null,"error":null});
     let Ok(bytes) = std::fs::read(config.join("last-operation.json")) else {
@@ -168,17 +121,10 @@ fn load_operation(config: &Path) -> Value {
     clean["finished_at"] = json!(saved["finished_at"].as_u64());
     if saved["state"] == "failed" {
         clean["error"] = json!("Operation failed; inspect status before recovery");
-        clean["stage"] = json!(saved["stage"]
-            .as_str()
-            .filter(|v| CONNECTION_STAGES.contains(v))
-            .unwrap_or("unknown"));
-        clean["code"] = json!(saved["code"]
-            .as_str()
-            .filter(|v| ERROR_CODES.contains(v))
-            .unwrap_or("unknown"));
-        clean["http_status"] = json!(saved["http_status"]
-            .as_u64()
-            .filter(|v| (100..600).contains(v)));
+        clean["support_error"] =
+            crate::errors::validated(&saved["support_error"]).unwrap_or(Value::Null);
+        clean["stage"] = clean["support_error"]["stage"].clone();
+        clean["code"] = clean["support_error"]["code"].clone();
     }
     clean
 }
@@ -188,16 +134,20 @@ pub async fn run_operation(
     host: &Host,
     path: &str,
     tracked: bool,
+    method: &str,
     work: impl std::future::Future<Output = Result<Value, String>>,
-) -> Result<Value, String> {
+) -> Result<Value, Value> {
     let _guard = host
         .operation
         .try_lock()
-        .map_err(|_| "Operation in progress; query /api/operation before retrying".to_string())?;
+        .map_err(|_| crate::errors::classify("Operation in progress", path, method))?;
     if tracked {
-        host.begin_operation(path)?;
+        host.begin_operation(path)
+            .map_err(|e| crate::errors::classify(&e, path, method))?;
     }
-    let result = work.await;
+    let result = work
+        .await
+        .map_err(|e| crate::errors::classify(&e, path, method));
     if tracked {
         host.finish_operation(&result);
     }
@@ -295,6 +245,21 @@ pub fn recovery_pending() -> bool {
             .map(|s| s.recovery_pending())
             .unwrap_or(true)
 }
+fn network_error(error: reqwest::Error) -> String {
+    if error.is_timeout() {
+        return "Network timeout".into();
+    }
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+    while let Some(cause) = source {
+        let text = cause.to_string().to_ascii_lowercase();
+        if text.contains("tls") || text.contains("certificate") {
+            return "TLS failure".into();
+        }
+        source = cause.source();
+    }
+    "Network failure".into()
+}
+
 fn select_fields(value: &Value, keys: &[&str]) -> Value {
     Value::Object(
         keys.iter()
@@ -388,7 +353,7 @@ async fn verify_card(gateway: &str, card: &str) -> Result<Value, String> {
         .json(&json!({"card":card.trim()}))
         .send()
         .await
-        .map_err(|_| "Card verification network failure")?;
+        .map_err(network_error)?;
     if !response.status().is_success() {
         return Err(format!(
             "Card verification HTTP {}",
@@ -429,7 +394,7 @@ async fn fetch_announcements(gateway: &str) -> Result<Value, String> {
         ))
         .send()
         .await
-        .map_err(|_| "Announcements network failure")?;
+        .map_err(network_error)?;
     if response.status() != reqwest::StatusCode::OK {
         return Err(format!("Announcements HTTP {}", response.status().as_u16()));
     }
@@ -596,7 +561,7 @@ pub async fn dispatch(host: &Host, path: &str, method: &str, body: Value) -> Res
             Ok(
                 json!({"process_state":patch_engine::detect_kiro_process_state().to_string(),
                 "kiro_installed":install.is_some(),"kiro_install_path":install.as_ref().map(|i| &i.install_dir),
-                "kiro_version":install.as_ref().map(|i| &i.version),"has_snapshot":SnapshotManager::default().has_active_snapshot(),
+                "kiro_version":install.as_ref().map(|i| &i.version),"kiro_compatible":install.as_ref().is_some_and(|i| patch_engine::kiro_version_is_supported(&i.version)),"minimum_kiro_version":patch_engine::MINIMUM_SUPPORTED_KIRO_VERSION,"has_snapshot":SnapshotManager::default().has_active_snapshot(),
                 "recovery_pending":recovery_pending(),"authenticated":token_readable && session.as_ref().is_some_and(|s| s.authenticated()),"gateway_url":session.as_ref().and_then(|s| s.gateway()),"suggested_gateway_url":gateway,
                 "portal_url":format!("{gateway}/"),"platform":if cfg!(windows) {"win32"} else if cfg!(target_os="macos") {"darwin"} else {"linux"},
                 "model_service_available":null,"tray_available":true,"memory_maintenance":host.maintenance.lock().map_err(|_| "Maintenance state unavailable")?.clone(),"app_version":env!("SUPERKIRO_BUILD_VERSION")}),
@@ -641,6 +606,13 @@ pub async fn dispatch(host: &Host, path: &str, method: &str, body: Value) -> Res
             validate_card(card)?;
             let custom = host.install_path()?;
             let install = detect_kiro(custom.as_deref()).map_err(|e| e.to_string())?;
+            if !patch_engine::kiro_version_is_supported(&install.version) {
+                return Err(format!(
+                    "Kiro {} is unsupported; upgrade to {} or later before enabling the connection",
+                    install.version,
+                    patch_engine::MINIMUM_SUPPORTED_KIRO_VERSION
+                ));
+            }
             DesktopSession::system()?
                 .activate_and_launch(
                     &install,
@@ -677,8 +649,15 @@ pub async fn dispatch(host: &Host, path: &str, method: &str, body: Value) -> Res
         }
         ("POST", "/api/launch") => {
             let custom = host.install_path()?;
-            DesktopSession::system()?
-                .launch(&detect_kiro(custom.as_deref()).map_err(|e| e.to_string())?)?;
+            let install = detect_kiro(custom.as_deref()).map_err(|e| e.to_string())?;
+            if !patch_engine::kiro_version_is_supported(&install.version) {
+                return Err(format!(
+                    "Kiro {} is unsupported; upgrade to {} or later before launching",
+                    install.version,
+                    patch_engine::MINIMUM_SUPPORTED_KIRO_VERSION
+                ));
+            }
+            DesktopSession::system()?.launch(&install)?;
             Ok(json!({"success":true}))
         }
         ("POST", "/api/memory/trim") => {
@@ -940,7 +919,7 @@ mod operation_tests {
             let worker = host.clone();
             let before = host.operation_status().unwrap()["id"].as_u64().unwrap();
             let mut task = tokio::spawn(async move {
-                run_operation(&worker, "/api/activate", true, async move {
+                run_operation(&worker, "/api/activate", true, "POST", async move {
                     started_tx.send(()).unwrap();
                     finish_rx.await.unwrap();
                     if fails {
@@ -964,23 +943,35 @@ mod operation_tests {
             .unwrap();
             assert_eq!(status["state"], "running");
             assert_eq!(status["id"], before + 1);
-            assert!(run_operation(&host, "/api/restore", true, async {
+            assert!(run_operation(&host, "/api/restore", true, "POST", async {
                 panic!("overlapping writer ran")
             })
             .await
             .is_err());
             finish_tx.send(()).unwrap();
-            assert_eq!(task.await.unwrap().is_err(), fails);
+            let result = task.await.unwrap();
+            assert_eq!(result.is_err(), fails);
+            if let Err(payload) = result {
+                assert_eq!(host.operation_status().unwrap()["support_error"], payload);
+                let saved: Value = serde_json::from_slice(
+                    &std::fs::read(root.join("last-operation.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(saved["support_error"], payload);
+                assert_eq!(load_operation(&root)["support_error"], payload);
+            }
             assert_eq!(
                 host.operation_status().unwrap()["state"],
                 if fails { "failed" } else { "succeeded" }
             );
             let terminal = host.operation_status().unwrap();
-            run_operation(&host, "/api/heartbeat", false, async { Ok(Value::Null) })
-                .await
-                .unwrap();
+            run_operation(&host, "/api/heartbeat", false, "POST", async {
+                Ok(Value::Null)
+            })
+            .await
+            .unwrap();
             assert_eq!(host.operation_status().unwrap(), terminal);
-            run_operation(&host, "/api/restore", true, async {
+            run_operation(&host, "/api/restore", true, "POST", async {
                 Ok(json!({"success":true}))
             })
             .await
@@ -996,7 +987,8 @@ mod operation_tests {
         let root = std::env::temp_dir().join(format!("host-diagnostics-{}", std::process::id()));
         let host = Host::new(root.clone()).unwrap();
         host.begin_operation("/api/activate?secret-card").unwrap();
-        host.finish_operation(&Err("[connection:authenticate] Authentication rejected: 403 - secret-card https://private.invalid".into()));
+        let payload = crate::errors::classify("[connection:authenticate] Authentication rejected: 403 - secret-card https://private.invalid", "/api/activate", "POST");
+        host.finish_operation(&Err(payload.clone()));
         let saved = std::fs::read_to_string(root.join("last-operation.json")).unwrap();
         assert!(!saved.contains("secret-card"));
         assert!(!saved.contains("private.invalid"));
@@ -1004,25 +996,9 @@ mod operation_tests {
         let host = Host::new(root.clone()).unwrap();
         let state = host.operation_status().unwrap();
         assert_eq!(state["stage"], "authenticate");
-        assert_eq!(state["code"], "auth-rejected");
-        assert_eq!(state["http_status"], 403);
+        assert_eq!(state["code"], "SK-AUTH-003");
+        assert_eq!(state["support_error"], payload);
         assert_eq!(state["state"], "failed");
-        assert_eq!(
-            operation_error(Some("[connection:apply] permission denied /secret"))["code"],
-            "permission"
-        );
-        assert_eq!(
-            operation_error(Some("[connection:authenticate] TLS certificate invalid"))["code"],
-            "tls"
-        );
-        assert_eq!(
-            operation_error(Some("network timed out"))["code"],
-            "timeout"
-        );
-        assert_eq!(
-            operation_error(Some("sensitive unknown error"))["stage"],
-            "unknown"
-        );
         drop(host);
         std::fs::write(
             root.join("last-operation.json"),
@@ -1030,8 +1006,9 @@ mod operation_tests {
         )
         .unwrap();
         let clean = load_operation(&root);
-        assert_eq!(clean["stage"], "unknown");
-        assert_eq!(clean["code"], "unknown");
+        assert!(clean["stage"].is_null());
+        assert!(clean["code"].is_null());
+        assert!(clean["support_error"].is_null());
         assert!(clean["http_status"].is_null());
         std::fs::remove_file(root.join("last-operation.json")).unwrap();
         std::fs::remove_dir(root).unwrap();
