@@ -59,7 +59,8 @@ def main():
             check(model+' reply complete','ok' in ''.join(x.get('content','') for x in frames).lower() and any(x.get('stopReason')=='end_turn' for x in frames))
             after=req(public,'/getUsageLimits',headers=auth).json()['usageBreakdownList'][0]['currentUsageWithPrecision']
             check(model+' credits debited',after>before)
-            req(public,'/',payload,headers)
+            replay=req(public,'/',payload,headers,expected=409)
+            check(model+' completed replay explicitly rejected',replay.json().get('__type')=='InvocationAlreadyCompletedException')
             repeat=req(public,'/getUsageLimits',headers=auth).json()['usageBreakdownList'][0]['currentUsageWithPrecision']
             check(model+' replay not double charged',repeat==after)
         req(admin,'/api/v1/admin/cards/status',{'cardId':card['cardId'],'action':'ban','reason':'release smoke complete'});card=None
