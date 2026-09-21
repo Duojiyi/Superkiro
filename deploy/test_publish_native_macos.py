@@ -59,7 +59,8 @@ class MacPublicationTests(unittest.TestCase):
             approved, item = prepare(source, '1.2.3', receipt, 'arm64')
             self.assertEqual(approved, data)
             self.assertEqual(item['signature'], 'unsigned')
-            name = item['url'].removeprefix('/downloads/')
+            self.assertEqual(item['url'], '/downloads/Superkiro-1.2.3-Mac-ARM64.app.tar.gz')
+            name = f"Superkiro-1.2.3-{item['sha256']}-macos-arm64.app.tar.gz"
             validate_history([name], item)
             with self.assertRaises(ValueError):
                 validate_history([name], dict(item, sha256='0' * 64))

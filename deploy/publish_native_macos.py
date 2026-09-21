@@ -59,7 +59,7 @@ def prepare(source, version, acceptance, arch):
     if (not isinstance(receipt, dict) or receipt.get('approvedForPublication') is not True
             or any(receipt.get(k) != v for k, v in expected.items())):
         raise ValueError('Acceptance receipt does not approve these exact artifact bytes')
-    return data, dict(expected, url=f'/downloads/Superkiro-{version}-{digest}-macos-{arch}.app.tar.gz',
+    return data, dict(expected, url=f"/downloads/Superkiro-{version}-Mac-{'ARM64' if arch == 'arm64' else 'Intel'}.app.tar.gz",
                       signature='unsigned',
                       systemRequirements='macOS · ' + ('Apple Silicon' if arch == 'arm64' else 'Intel x64')
                       + ' · 无 Developer ID 签名或 Apple 公证 · 解压后运行 .app')

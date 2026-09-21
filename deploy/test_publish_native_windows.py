@@ -4,6 +4,9 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from contextlib import nullcontext
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 from publish_native_windows import prepare, merge_manifest, validate_history
 
 
@@ -27,7 +30,7 @@ class PublicationTests(unittest.TestCase):
 
     def test_exact_approved_bytes_and_immutable_url(self):
         data, item = self.prepare()
-        self.assertIn(item['sha256'], item['url'])
+        self.assertEqual(item['url'], '/downloads/Superkiro-1.2.3-Windows.exe')
         self.exe.write_bytes(b'MZchanged-build')
         self.assertEqual(data, b'MZfixture-not-executable')
         with self.assertRaises(ValueError):
@@ -55,11 +58,26 @@ class PublicationTests(unittest.TestCase):
 
     def test_historical_version_cannot_be_reused_after_manifest_advances(self):
         _, item = self.prepare()
-        original = item['url'].removeprefix('/downloads/')
+        original = f"Superkiro-1.2.3-{item['sha256']}-windows-x64.exe"
         validate_history([original], item)
         validate_history(['Superkiro-1.2.30-' + 'a' * 64 + '-windows-x64.exe'], item)
         with self.assertRaisesRegex(ValueError, 'historically'):
             validate_history([original], dict(item, sha256='b' * 64))
+
+    def test_short_historical_filename_cannot_be_overwritten(self):
+        from publish_native_windows import publish
+        data, item = self.prepare()
+        ssh = MagicMock()
+        sftp = ssh.open_sftp.return_value.__enter__.return_value
+        sftp.listdir.return_value = [item['url'].removeprefix('/downloads/')]
+        transaction = SimpleNamespace(deployment_lock=lambda _: nullcontext(),
+                                      run=lambda *_: '0' * 64 + '  existing.exe')
+        with patch.dict('sys.modules', {'deploy.release_candidate': transaction, 'requests': MagicMock()}), \
+                patch('publish_native_windows.read_manifest', return_value={'releases': []}):
+            with self.assertRaisesRegex(RuntimeError, 'Immutable artifact conflict'):
+                publish(ssh, data, item)
+        sftp.open.assert_not_called()
+        sftp.posix_rename.assert_not_called()
 
     def test_legacy_publisher_cannot_bypass_acceptance(self):
         from publish_downloads import publish

@@ -23,7 +23,7 @@ def prepare(source, version, acceptance):
     if (not isinstance(receipt, dict) or receipt.get('approvedForPublication') is not True
             or any(receipt.get(k) != v for k, v in expected.items())):
         raise ValueError('Acceptance receipt does not approve these exact artifact bytes')
-    item = dict(expected, url=f'/downloads/Superkiro-{version}-{digest}-windows-x64.exe',
+    item = dict(expected, url=f'/downloads/Superkiro-{version}-Windows.exe',
                 signature='unsigned',
                 systemRequirements='Windows 10/11 x64 · WebView2 · 单文件免安装 · Rust + Tauri')
     return data, item
