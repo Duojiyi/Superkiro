@@ -44,10 +44,14 @@ impl TranslationContext {
     }
 }
 
+/// `use_transcriptions` is true only for the current message. Transcriptions are
+/// collected per request for that message alone, so indexing them from a history
+/// message would caption a past image with unrelated text.
 fn format_user_content(
     content: &str,
     images: &[KiroImage],
     ctx: &TranslationContext,
+    use_transcriptions: bool,
 ) -> serde_json::Value {
     if images.is_empty() {
         return serde_json::Value::String(content.to_string());
@@ -82,7 +86,11 @@ fn format_user_content(
         let mut text = content.to_string();
         for (idx, img) in images.iter().enumerate() {
             let shrunk = maybe_shrink_image(&img.format, &img.source.bytes);
-            let transcription = ctx.image_transcriptions.get(idx).map(|s| s.as_str());
+            let transcription = if use_transcriptions {
+                ctx.image_transcriptions.get(idx).map(|s| s.as_str())
+            } else {
+                None
+            };
             let fallback_text = format_fallback_description(
                 idx + 1,
                 &shrunk.format,
@@ -174,7 +182,8 @@ pub fn translate_kiro_to_chat_request(
                 }
                 // Historical user message content (with image support)
                 if !user_msg.content.is_empty() || !user_msg.images.is_empty() {
-                    let content_val = format_user_content(&user_msg.content, &user_msg.images, ctx);
+                    let content_val =
+                        format_user_content(&user_msg.content, &user_msg.images, ctx, false);
                     raw_messages.push(ConversationMessage {
                         role: "user".to_string(),
                         content: content_val,
@@ -203,7 +212,7 @@ pub fn translate_kiro_to_chat_request(
     }
 
     let final_current_content =
-        format_user_content(&current_input.content, &current_input.images, ctx);
+        format_user_content(&current_input.content, &current_input.images, ctx, true);
     raw_messages.push(ConversationMessage {
         role: "user".to_string(),
         content: final_current_content,
