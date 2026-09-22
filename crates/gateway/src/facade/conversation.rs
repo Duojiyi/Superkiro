@@ -438,11 +438,14 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                                 None,
                             );
                         }
-                        billing::engine::BillingError::Persistence(ref msg) => {
+                        billing::engine::BillingError::Persistence(_) => {
                             return error_response(
                                 StatusCode::SERVICE_UNAVAILABLE,
                                 "ServiceUnavailableException",
-                                &format!("Billing persistence unavailable: {}", msg),
+                                // The underlying io::Error carries server filesystem
+                                // paths and the snapshot size, and the caller cannot act
+                                // on either.
+                                "Billing persistence is temporarily unavailable",
                             );
                         }
                         _ => {
@@ -918,7 +921,7 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                             return error_response(
                                 StatusCode::BAD_GATEWAY,
                                 "InternalServerException",
-                                &format!("Upstream provider failover error: {}", e),
+                                &crate::stream::safe_governance_error(&e),
                             );
                         }
                     }

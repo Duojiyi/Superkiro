@@ -6,6 +6,7 @@
 //! requests immediately without leaking resources or double-billing.
 
 use crate::idempotency::{CompletedInvocation, IdempotencyGuard};
+use crate::provider::governance::GovernanceError;
 use crate::provider::{ProviderDelta, ProviderError, ProviderStreamEvent};
 use crate::translate::{from_provider::StreamTranslationState, tools::ToolRegistry};
 use billing::engine::{BillingEngine, BillingError};
@@ -458,6 +459,30 @@ fn resolve_settlement_tokens(
 /// Provider error bodies commonly contain account identifiers, prompts, or
 /// vendor-internal diagnostics.  Expose only a stable category/status to the
 /// client; retain detailed text in server-side logs/telemetry.
+/// Client-facing text for a failover error.
+///
+/// `GovernanceError`'s `Display` embeds internal key ids, provider ids and the
+/// upstream vendor's own response body, so it must never be formatted into a
+/// response. Keep what the caller can act on - how long to wait, how many
+/// candidates were tried - and drop the rest.
+pub(crate) fn safe_governance_error(error: &GovernanceError) -> String {
+    match error {
+        GovernanceError::AllKeysInCooldown {
+            next_recovery_secs, ..
+        } => format!("all upstream keys are in cooldown; retry in {next_recovery_secs}s"),
+        GovernanceError::NoAvailableKeys { .. } => {
+            "no upstream key is available for this model".to_string()
+        }
+        GovernanceError::AllCandidatesExhausted => {
+            "all upstream candidates were exhausted".to_string()
+        }
+        GovernanceError::AllCandidatesFailed { attempts } => {
+            format!("all {} upstream candidates failed", attempts.len())
+        }
+        GovernanceError::NonRetryable(e) | GovernanceError::Provider(e) => safe_provider_error(e),
+    }
+}
+
 pub(crate) fn safe_provider_error(error: &ProviderError) -> String {
     match error {
         ProviderError::Http(status, _) => format!("upstream HTTP status {}", status.as_u16()),
