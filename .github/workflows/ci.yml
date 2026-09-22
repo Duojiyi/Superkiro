@@ -36,16 +36,16 @@ jobs:
       - name: Desktop Bridge and Release Default Regressions
         run: python -B -m unittest -v test_desktop_bridge_regression test_desktop_runtime
 
-      - name: Offline Publication and Backup Regressions
-        run: python -B -m unittest discover -s deploy -p "test_publish_native*.py" -v
+      # Whole suite rather than named files: the release promotion, browser-auth
+      # contract, admin-static and pricing/model publication checks previously
+      # existed but ran nowhere, so a regression in them was invisible.
+      - name: Offline Deployment Regressions
+        run: python -B -m unittest discover -s deploy -p "test_*.py" -v
 
       - name: SSH Host-Key Verification (including optimized Python)
         run: |
           python -B -m unittest -v deploy.test_ssh_transport
           python -O -B -m unittest -v deploy.test_ssh_transport
-
-      - name: Offline Artifact Mapping Regressions
-        run: python -B -m unittest discover -s deploy -p "test_artifact_provenance.py" -v
 
       - name: Backup Transport Regressions
         run: python -B -m unittest discover -s deploy/backup -p "test_*.py" -v
