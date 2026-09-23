@@ -217,7 +217,9 @@ impl BillingEngine {
                 || prices
                     .iter()
                     .any(|p| !p.is_finite() || *p < 0.0 || *p > 1_000_000.0)
-                || fixed.iter().any(|p| *p < 0 || *p > 1_000_000_000_000_000)
+                // A million credits per million tokens (or per call). The old ceiling of
+                // 10^18 priced a single request past what a balance can hold.
+                || fixed.iter().any(|p| *p < 0 || *p > 1_000_000_000_000)
                 || !c.rate_cards.contains_key(&v.rate_card_id)
                 || v.effective_from_secs < now
             {

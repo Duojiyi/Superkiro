@@ -869,3 +869,49 @@ fn test_audit_b_cross_group_rate_card_isolation() {
     assert_eq!(entry_a.rate_card_version.as_deref(), Some("rcv-std"));
     assert_eq!(entry_b.rate_card_version.as_deref(), Some("rcv-ent"));
 }
+
+/// The reservation is the prepaid cap. Estimating input at the uncached price let a
+/// version priced only on cache tokens reserve nothing, pass the balance check on an
+/// empty card, and then charge without bound once the upstream reported cache reads.
+#[test]
+fn a_version_priced_only_on_cache_tokens_still_reserves() {
+    let settings = BillingSettings::default();
+    let mut version = RateCardVersion {
+        id: "rcv-cache-only".to_string(),
+        rate_card_id: "rc".to_string(),
+        model: "m".to_string(),
+        currency: Currency::Usd,
+        pricing_mode: PricingMode::CostPlus,
+        input_price_per_m: 0.0,
+        output_price_per_m: 0.0,
+        cache_creation_price_per_m: 0.0,
+        cache_read_price_per_m: 3.0,
+        fixed_input_credit_per_m: 0,
+        fixed_output_credit_per_m: 0,
+        fixed_cache_creation_credit_per_m: 0,
+        fixed_cache_read_credit_per_m: 0,
+        per_call_credit: 0,
+        margin_multiplier: 1.0,
+        effective_from_secs: 0,
+    };
+    let reserve = version.calculate_reserve_amount(10_000, 0, 1.0, 1.0, &settings);
+    let charge = version.calculate_charge(
+        &UsageTokens {
+            cache_read_tokens: 10_000,
+            ..UsageTokens::default()
+        },
+        1.0,
+        1.0,
+        &settings,
+    );
+    assert!(charge > 0);
+    assert!(
+        reserve >= charge,
+        "reserved {reserve} for a charge of {charge}"
+    );
+
+    version.pricing_mode = PricingMode::Fixed;
+    version.cache_read_price_per_m = 0.0;
+    version.fixed_cache_read_credit_per_m = 5_000_000;
+    assert!(version.calculate_reserve_amount(10_000, 0, 1.0, 1.0, &settings) > 0);
+}

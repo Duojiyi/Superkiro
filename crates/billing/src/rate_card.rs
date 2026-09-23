@@ -203,8 +203,17 @@ impl RateCardVersion {
         let multipliers = self.margin_multiplier * group_margin * model_multiplier;
 
         match self.pricing_mode {
+            // The estimate does not know how the upstream will split input between
+            // uncached, cache-creation and cache-read, so it reserves at the most
+            // expensive of the three. Reserving at the uncached price let a version priced
+            // only on cache tokens reserve nothing, pass the balance check on an empty
+            // card, and then charge without bound.
             PricingMode::CostPlus => {
-                let input_cost = (estimated_input as f64) * self.input_price_per_m / 1_000_000.0;
+                let input_price = self
+                    .input_price_per_m
+                    .max(self.cache_creation_price_per_m)
+                    .max(self.cache_read_price_per_m);
+                let input_cost = (estimated_input as f64) * input_price / 1_000_000.0;
                 let output_cost = (max_output as f64) * self.output_price_per_m / 1_000_000.0;
                 let total_curr = input_cost + output_cost;
                 let total_cny = match self.currency {
@@ -221,8 +230,11 @@ impl RateCardVersion {
                 ceil_nonnegative_to_i64(micro_credits)
             }
             PricingMode::Fixed => {
-                let input_charge =
-                    (estimated_input as f64) * (self.fixed_input_credit_per_m as f64) / 1_000_000.0;
+                let input_credit = self
+                    .fixed_input_credit_per_m
+                    .max(self.fixed_cache_creation_credit_per_m)
+                    .max(self.fixed_cache_read_credit_per_m);
+                let input_charge = (estimated_input as f64) * (input_credit as f64) / 1_000_000.0;
                 let output_charge =
                     (max_output as f64) * (self.fixed_output_credit_per_m as f64) / 1_000_000.0;
                 let base = (input_charge + output_charge) * multipliers;
