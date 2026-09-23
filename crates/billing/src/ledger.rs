@@ -36,6 +36,24 @@ pub struct UsageTokens {
     pub cache_read_tokens: u64,
 }
 
+/// No real request comes near this in any one token class; the largest context
+/// windows are around a million tokens. Counts above it are an upstream reporting
+/// bug, and pricing them unclamped saturated a single charge to `i64::MAX`.
+pub const MAX_TOKENS_PER_CLASS: u64 = 10_000_000;
+
+impl UsageTokens {
+    /// Every class clamped to [`MAX_TOKENS_PER_CLASS`]. Token counts come from the
+    /// upstream and are untrusted.
+    pub fn clamped(&self) -> Self {
+        Self {
+            uncached_input_tokens: self.uncached_input_tokens.min(MAX_TOKENS_PER_CLASS),
+            output_tokens: self.output_tokens.min(MAX_TOKENS_PER_CLASS),
+            cache_creation_tokens: self.cache_creation_tokens.min(MAX_TOKENS_PER_CLASS),
+            cache_read_tokens: self.cache_read_tokens.min(MAX_TOKENS_PER_CLASS),
+        }
+    }
+}
+
 /// Token pricing rates for calculating charges in micro-credits.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PricingRates {

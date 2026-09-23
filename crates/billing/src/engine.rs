@@ -194,6 +194,10 @@ impl Drop for ReservationLease {
 
 const SNAPSHOT_VERSION: u32 = 2;
 const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
+/// Ceiling for one settlement: ten million credits. Far above any real request, and
+/// low enough that `credit_used` cannot overflow — a card in debt cannot reserve
+/// again, so only its in-flight requests can ever add to it.
+const MAX_SETTLEMENT_MICRO_CREDITS: i64 = 10_000_000 * crate::MICRO_CREDITS_PER_CREDIT;
 
 /// Authenticated encrypted snapshot envelope for billing state persistence (Spec §7, P1-03).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -469,6 +473,13 @@ impl PendingSettlementRecovery {
         engine: &BillingEngine,
         now_secs: u64,
     ) -> Vec<(String, Result<LedgerEntry, BillingError>)> {
+        // One failed write refuses every reservation until something commits, and the
+        // refused path is the one that would. Probe instead of waiting. The probe writes
+        // the current in-memory state, so an intent that could only be kept in memory
+        // during the outage becomes durable here rather than being lost on restart.
+        if !engine.persistence_ready() {
+            let _ = engine.sync_to_disk_checked();
+        }
         let ids: std::collections::HashSet<_> = engine
             .pending_settlements
             .read()
@@ -2039,6 +2050,10 @@ impl BillingEngine {
         target_model: &str,
         now_secs: u64,
     ) -> Result<LedgerEntry, BillingError> {
+        // Clamp rather than refuse. A refusal here happens before the intent is durable,
+        // and a request whose settlement is refused is refunded once the janitor
+        // reclaims the hold — so every new refusal would be a free request.
+        let tokens = &tokens.clamped();
         let _state_guard = self.state_lock.write().unwrap();
         let existing = self
             .pending_settlements
@@ -2047,7 +2062,7 @@ impl BillingEngine {
             .get(invocation_id)
             .cloned();
         if let Some(pending) = existing {
-            if pending.tokens != *tokens
+            if pending.tokens.clamped() != *tokens
                 || pending.entry.exposed_model != exposed_model
                 || pending.entry.provider_id != provider_id
                 || pending.entry.target_model != target_model
@@ -2187,6 +2202,7 @@ impl BillingEngine {
                 "calculated settlement charge is negative".to_string(),
             ));
         }
+        let charge = charge.min(MAX_SETTLEMENT_MICRO_CREDITS);
 
         let entry = LedgerEntry {
             id: format!("led-{}", invocation_id),
@@ -2301,7 +2317,10 @@ impl BillingEngine {
                 "pending reservation is not Held".into(),
             ));
         }
-        let entry = pending.entry.clone();
+        let mut entry = pending.entry.clone();
+        // An intent stored by an older release may carry a saturated charge that could
+        // never be added to `credit_used`; clamping it is what lets it complete.
+        entry.credits_charged = entry.credits_charged.min(MAX_SETTLEMENT_MICRO_CREDITS);
         if entry.invocation_id.as_deref() != Some(invocation_id)
             || entry.card_id != reservation.card_id
             || entry.kind != LedgerKind::Usage
@@ -2312,9 +2331,11 @@ impl BillingEngine {
                 "invalid pending settlement identity or amount".into(),
             ));
         }
-        if entry.credits_charged == 0 && reservation.reserved_micro_credits > 0 {
-            return Err(BillingError::MissingUsage);
-        }
+        // A zero charge is a valid outcome — zero prices are valid configuration — and
+        // is recorded like any other. This used to be refused here, after the intent was
+        // durable. Recovery retries without repricing, so the refusal was permanent: the
+        // card could never reserve again, could not be voided, and pricing publication
+        // was refused deployment-wide. Completion may now fail only on persistence.
         let card = candidate
             .cards
             .get_mut(&entry.card_id)
