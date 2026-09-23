@@ -8,6 +8,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+/// Bound on a transcription sub-request. It runs inline before any byte is
+/// streamed, holding a credit reservation and a concurrency slot.
+const VISION_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Returns whether a model identifier natively supports vision/image input.
 pub fn model_supports_vision(model_id: &str) -> bool {
@@ -154,6 +159,7 @@ pub async fn transcribe_image_with_provider(
         .post(&url)
         .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
+        .timeout(VISION_REQUEST_TIMEOUT)
         .json(&body)
         .send()
         .await

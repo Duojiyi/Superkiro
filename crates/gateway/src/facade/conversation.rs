@@ -628,6 +628,18 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                     "Thinking is not enabled for this model; select a configured reasoning model",
                 );
             }
+            // One resolved capability for the whole request. An operator declaration
+            // wins whenever the model is mapped; the name heuristic is only the default
+            // for unmapped targets. A single value keeps the gate, the translation
+            // context and the degradation path from disagreeing with each other.
+            let vision_supported = if mapped_model {
+                model_supports_vision
+            } else {
+                crate::translate::vision::model_supports_vision(&target_model)
+            };
+            let degradation_available = self.vision_config.as_ref().is_some_and(|v| {
+                v.enabled && v.fallback_provider_url.is_some() && v.fallback_api_key.is_some()
+            });
             let historical_images = kiro_req.conversation_state.history.iter().any(|message| matches!(message,
                 kiro_wire::requests::conversation::Message::User(user) if !user.user_input_message.images.is_empty()));
             let current_images = !kiro_req
@@ -636,9 +648,10 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                 .user_input_message
                 .images
                 .is_empty();
-            if !model_supports_vision
-                && (historical_images
-                    || (current_images && !self.vision_config.as_ref().is_some_and(|v| v.enabled)))
+            // Reject only when the target cannot take images and nothing can degrade
+            // them. History is covered by the same escape, so a single attachment no
+            // longer makes every later turn of the conversation fail.
+            if !vision_supported && (historical_images || current_images) && !degradation_available
             {
                 if has_reservation {
                     let _ = self.billing.release(&invocation_key);
@@ -646,15 +659,13 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                 return error_response(
                     StatusCode::BAD_REQUEST,
                     "ValidationException",
-                    "This model does not support image input; select a configured vision model",
+                    "This model is not configured for image input. Send the prompt without an image, or ask your administrator to enable image support for it.",
                 );
             }
 
             // 8. Translate to provider format (Spec §4.3, §14.3 Vision Fallback)
-            let mut ctx = TranslationContext::new(&target_model);
-            if model_supports_vision {
-                ctx = ctx.with_vision_support(true);
-            }
+            let mut ctx =
+                TranslationContext::new(&target_model).with_vision_support(vision_supported);
 
             if !ctx.supports_vision {
                 if let Some(ref v_cfg) = self.vision_config {
@@ -701,25 +712,9 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                 }
             }
 
-            if !model_supports_vision
-                && current_images
-                && ctx.image_transcriptions.len()
-                    != kiro_req
-                        .conversation_state
-                        .current_message
-                        .user_input_message
-                        .images
-                        .len()
-            {
-                if has_reservation {
-                    let _ = self.billing.release(&invocation_key);
-                }
-                return error_response(
-                    StatusCode::BAD_GATEWAY,
-                    "ValidationException",
-                    "Image transcription is unavailable",
-                );
-            }
+            // A missing transcription degrades to the image-metadata placeholder in
+            // to_provider::format_user_content. P4-2 §35 requires an unreachable vision
+            // service to degrade rather than block the conversation trunk.
 
             let mut chat_req = translate_kiro_to_chat_request(&kiro_req, &mut ctx);
             // The wire protocol currently has no client-controlled max_tokens
