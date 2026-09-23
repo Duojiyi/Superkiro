@@ -2,7 +2,7 @@
 //!
 //! Features:
 //! - Process-level runtime detection (`is_kiro_running`) across Windows, macOS, and Linux.
-//! - Anti-collision Single Instance Lock (`SingleInstanceLock`) with stale PID recovery.
+//! - Anti-collision Single Instance Lock (`SingleInstanceLock`) backed by an OS file lock.
 
 use std::collections::HashMap;
 use std::fs;
@@ -13,7 +13,9 @@ use std::process::Command;
 use std::sync::{LazyLock, Mutex};
 use thiserror::Error;
 
-static PROCESS_LOCKS: LazyLock<Mutex<HashMap<PathBuf, (String, usize)>>> =
+// OS locks belong to a handle, not a process, so guards in one process share the handle
+// that holds the lock and count themselves; the lock is released when the last goes.
+static PROCESS_LOCKS: LazyLock<Mutex<HashMap<PathBuf, (fs::File, usize)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -245,12 +247,16 @@ fn pid_probe_is_alive(result: i32, errno: Option<i32>) -> bool {
 
 /// RAII Guard ensuring only one instance of the Kiro BYOK desktop client is running (Spec §9, T08).
 ///
-/// Uses reference counting for same-process multiple guards, verifies cryptographic nonce ownership
-/// before deleting on drop, and recovers safely from stale dead PID locks.
+/// Ownership is an OS file lock, which the kernel releases however the owner exits.
+/// It used to be a PID written into the file and trusted while that PID was alive; a
+/// crash left the file behind, and once Windows recycled the PID for any unrelated
+/// process the client refused to start — silently, since it has no console.
+///
+/// The file is never deleted. Unlinking a lock file lets a second process lock a new
+/// inode while a third still holds the old one, which is two owners at once.
 #[derive(Debug)]
 pub struct SingleInstanceLock {
     lock_path: PathBuf,
-    owner_nonce: String,
 }
 
 impl SingleInstanceLock {
@@ -262,90 +268,53 @@ impl SingleInstanceLock {
     /// Acquire the single instance lock.
     ///
     /// If `custom_path` is None, uses `default_lock_path()`.
-    /// Returns `Err(SingleInstanceError::AlreadyRunning(pid))` if an active instance holds the lock.
+    /// Returns `Err(SingleInstanceError::AlreadyRunning(pid))` if another process holds
+    /// the lock; `pid` is the owner's recorded PID when it can be read, else 0.
     pub fn acquire(custom_path: Option<&Path>) -> Result<Self, SingleInstanceError> {
         let lock_path = match custom_path {
             Some(p) => p.to_path_buf(),
             None => Self::default_lock_path(),
         };
+        let io = |e: std::io::Error| SingleInstanceError::LockIo(lock_path.clone(), e.to_string());
 
-        // 1. Same-process re-entrancy support, scoped to this lock path.
-        if let Some((existing_nonce, count)) = PROCESS_LOCKS.lock().unwrap().get_mut(&lock_path) {
+        let mut locks = PROCESS_LOCKS.lock().unwrap();
+        // Same-process re-entrancy, scoped to this lock path.
+        if let Some((_, count)) = locks.get_mut(&lock_path) {
             *count += 1;
-            return Ok(Self {
-                lock_path,
-                owner_nonce: existing_nonce.clone(),
-            });
+            return Ok(Self { lock_path });
         }
 
-        let pid = std::process::id();
-        let nonce = format!(
-            "{}:{}:{}",
-            pid,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-            rand_nonce()
-        );
-
-        // 2. Check for existing lock file
-        if lock_path.exists() {
-            if let Ok(content) = fs::read_to_string(&lock_path) {
-                let parts: Vec<&str> = content.trim().split(':').collect();
-                if let Some(owner_pid_str) = parts.first() {
-                    if let Ok(owner_pid) = owner_pid_str.parse::<u32>() {
-                        if owner_pid == pid {
-                            let _ = fs::remove_file(&lock_path);
-                        } else if is_pid_alive(owner_pid) {
-                            return Err(SingleInstanceError::AlreadyRunning(owner_pid));
-                        } else {
-                            // Dead PID (stale lock from previous crash)
-                            let _ = fs::remove_file(&lock_path);
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3. Ensure parent directory exists
         if let Some(parent) = lock_path.parent() {
-            let _ = fs::create_dir_all(parent);
+            fs::create_dir_all(parent).map_err(io)?;
         }
-
-        // 4. Create new lock file atomically
-        let mut file = std::fs::OpenOptions::new()
+        let mut file = fs::OpenOptions::new()
+            .read(true)
             .write(true)
-            .create_new(true)
+            .create(true)
+            .truncate(false)
             .open(&lock_path)
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::AlreadyExists {
-                    if let Ok(content) = fs::read_to_string(&lock_path) {
-                        let parts: Vec<&str> = content.trim().split(':').collect();
-                        if let Some(owner_pid_str) = parts.first() {
-                            if let Ok(owner_pid) = owner_pid_str.parse::<u32>() {
-                                if is_pid_alive(owner_pid) {
-                                    return SingleInstanceError::AlreadyRunning(owner_pid);
-                                }
-                            }
-                        }
-                    }
-                }
-                SingleInstanceError::LockIo(lock_path.clone(), e.to_string())
-            })?;
+            .map_err(io)?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => {
+                // Diagnostic only: Windows locks are mandatory, so the owner's record
+                // may be unreadable while it holds the lock.
+                let owner = fs::read_to_string(&lock_path)
+                    .ok()
+                    .and_then(|content| content.trim().split(':').next()?.parse().ok())
+                    .unwrap_or(0);
+                return Err(SingleInstanceError::AlreadyRunning(owner));
+            }
+            Err(fs::TryLockError::Error(e)) => return Err(io(e)),
+        }
+        // Record the owner for diagnostics. Nothing reads this to decide ownership.
+        file.set_len(0).map_err(io)?;
+        file.write_all(format!("{}:{}", std::process::id(), rand_nonce()).as_bytes())
+            .map_err(io)?;
+        let _ = file.sync_all();
 
-        file.write_all(nonce.as_bytes())
-            .map_err(|e| SingleInstanceError::LockIo(lock_path.clone(), e.to_string()))?;
-
-        PROCESS_LOCKS
-            .lock()
-            .unwrap()
-            .insert(lock_path.clone(), (nonce.clone(), 1));
-
-        Ok(Self {
-            lock_path,
-            owner_nonce: nonce,
-        })
+        locks.insert(lock_path.clone(), (file, 1));
+        Ok(Self { lock_path })
     }
 
     /// Absolute path to the active lock file.
@@ -356,29 +325,15 @@ impl SingleInstanceLock {
 
 impl Drop for SingleInstanceLock {
     fn drop(&mut self) {
-        let should_remove = {
-            let mut locks = PROCESS_LOCKS.lock().unwrap();
-            let Some((nonce, count)) = locks.get_mut(&self.lock_path) else {
-                return;
-            };
-            if nonce != &self.owner_nonce {
-                return;
-            }
-            *count -= 1;
-            if *count == 0 {
-                locks.remove(&self.lock_path);
-                true
-            } else {
-                false
-            }
+        let mut locks = PROCESS_LOCKS.lock().unwrap();
+        let Some((_, count)) = locks.get_mut(&self.lock_path) else {
+            return;
         };
-
-        if should_remove {
-            // Last guard for this path: only delete if the lock file still belongs to us.
-            if let Ok(content) = fs::read_to_string(&self.lock_path) {
-                if content.trim() == self.owner_nonce {
-                    let _ = fs::remove_file(&self.lock_path);
-                }
+        *count -= 1;
+        if *count == 0 {
+            // Dropping the handle releases the OS lock; the file stays.
+            if let Some((file, _)) = locks.remove(&self.lock_path) {
+                let _ = file.unlock();
             }
         }
     }
@@ -392,50 +347,58 @@ fn rand_nonce() -> u64 {
 mod tests {
     use super::*;
 
+    /// Ownership is the OS lock, not the file. While any guard lives, another handle
+    /// cannot take the lock; once the last guard drops the lock is free again, and the
+    /// file stays where it is.
     #[test]
     fn test_single_instance_lock_lifecycle() {
         let test_lock =
             std::env::temp_dir().join(format!("test_single_inst_{}.lock", std::process::id()));
+        let _ = fs::remove_file(&test_lock);
+        let contender = || {
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&test_lock)
+                .unwrap()
+                .try_lock()
+        };
 
-        // 1. First acquisition succeeds
         let lock1 = SingleInstanceLock::acquire(Some(&test_lock)).expect("Must acquire lock");
-        assert!(test_lock.exists());
-
-        // 2. Second acquisition from the same process sees re-entrant success
         let lock2 =
             SingleInstanceLock::acquire(Some(&test_lock)).expect("Re-entrant acquire must succeed");
+        assert!(matches!(contender(), Err(fs::TryLockError::WouldBlock)));
 
-        // 3. Drop lock1: lock2 is still active, so file MUST NOT be deleted!
         drop(lock1);
         assert!(
-            test_lock.exists(),
-            "Lock file must remain active while lock2 is alive"
+            matches!(contender(), Err(fs::TryLockError::WouldBlock)),
+            "the lock must stay held while lock2 is alive"
         );
 
-        // 4. Drop lock2: now all guards are released, file should be removed
         drop(lock2);
-        assert!(
-            !test_lock.exists(),
-            "Lock file must be removed when all guards drop"
-        );
+        assert!(test_lock.exists(), "the lock file is never unlinked");
+        contender().expect("the lock must be free once every guard has dropped");
+        drop(SingleInstanceLock::acquire(Some(&test_lock)).expect("reacquire after release"));
+        let _ = fs::remove_file(&test_lock);
     }
 
+    /// A file left behind by a crash names a PID that Windows will eventually hand to
+    /// some unrelated process. Trusting that PID made the client refuse to start, with
+    /// no console to say why. A PID in the file is only a diagnostic now, so a record
+    /// naming a live process that does not hold the lock must not block startup.
     #[test]
     fn test_stale_lock_recovery() {
         let test_lock =
             std::env::temp_dir().join(format!("test_stale_lock_{}.lock", std::process::id()));
+        // Always alive, and never this client: System on Windows, init elsewhere.
+        let live_unrelated_pid = if cfg!(windows) { 4 } else { 1 };
+        assert!(is_pid_alive(live_unrelated_pid));
+        fs::write(&test_lock, format!("{live_unrelated_pid}:left-by-a-crash")).unwrap();
 
-        // Write a fictitious non-existent high PID (e.g. 9999999)
-        fs::write(&test_lock, "9999999:mock-nonce:12345").unwrap();
-        assert!(test_lock.exists());
-
-        // Acquisition should detect dead PID and recover
         let lock = SingleInstanceLock::acquire(Some(&test_lock))
-            .expect("Must recover from stale dead PID");
-        assert!(test_lock.exists());
-
+            .expect("a recycled PID in a stale record must not block startup");
         drop(lock);
-        assert!(!test_lock.exists());
+        let _ = fs::remove_file(&test_lock);
     }
 }
 

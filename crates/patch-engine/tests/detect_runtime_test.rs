@@ -106,7 +106,9 @@ fn test_single_instance_lock_contention_and_stale_recovery() {
     drop(lock_reentrant);
     drop(lock);
 
-    assert!(!lock_file.exists());
+    // The file stays (unlinking a lock file permits two owners); the lock is free.
+    assert!(lock_file.exists());
+    drop(SingleInstanceLock::acquire(Some(&lock_file)).expect("released lock is reacquirable"));
 
     // 3. Stale PID recovery
     // Fictitious dead PID
@@ -117,5 +119,5 @@ fn test_single_instance_lock_contention_and_stale_recovery() {
         SingleInstanceLock::acquire(Some(&lock_file)).expect("Must recover stale dead PID lock");
     assert!(lock_file.exists());
     drop(recovered_lock);
-    assert!(!lock_file.exists());
+    let _ = fs::remove_file(&lock_file);
 }

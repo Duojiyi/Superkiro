@@ -946,7 +946,7 @@ mod operation_tests {
         assert!(host.operation.try_lock().is_err());
         drop(guard);
         drop(host);
-        std::fs::remove_dir(root).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -1021,7 +1021,7 @@ mod operation_tests {
         }
         drop(host);
         std::fs::remove_file(root.join("last-operation.json")).unwrap();
-        std::fs::remove_dir(root).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
     /// A failed restore leaves exactly one piece of evidence: the support payload
     /// in the operation record. A working-set trim shares nothing with it, so it
@@ -1137,7 +1137,7 @@ mod operation_tests {
         assert!(clean["support_error"].is_null());
         assert!(clean["http_status"].is_null());
         std::fs::remove_file(root.join("last-operation.json")).unwrap();
-        std::fs::remove_dir(root).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn usage_rows_are_bounded_without_changing_totals() {
@@ -1394,7 +1394,7 @@ mod restore_confirmation_tests {
             }
         }
         drop(host);
-        std::fs::remove_dir(root).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 

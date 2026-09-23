@@ -113,3 +113,52 @@ fn audit_macos_launchers_share_resolution() {
     fs::remove_dir(macos).unwrap();
     fs::remove_dir(root).unwrap();
 }
+
+/// Private writes must not depend on a shell. They used to rewrite the DACL through
+/// PowerShell twice per write, which Constrained Language Mode and AppLocker block —
+/// and that made takeover impossible on hardened machines. The child re-runs the
+/// private-write flow with PowerShell unreachable; it must still succeed and still
+/// produce an owner-only DACL.
+#[cfg(windows)]
+#[test]
+fn private_writes_do_not_need_powershell() {
+    if std::env::var_os("SUPERKIRO_NO_SHELL_FIXTURE").is_some() {
+        let root = std::env::temp_dir().join(format!("audit-noshell-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let path = root.join("secret.json");
+        private_atomic_write(&path, b"fixture secret").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"fixture secret");
+        fs::remove_dir_all(&root).unwrap();
+        return;
+    }
+    let empty = std::env::temp_dir().join(format!("audit-empty-path-{}", std::process::id()));
+    fs::create_dir_all(&empty).unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "token_storage::audit_privacy::private_writes_do_not_need_powershell",
+            "--nocapture",
+        ])
+        .env("SUPERKIRO_NO_SHELL_FIXTURE", "1")
+        // PowerShell lives outside System32 proper, so an empty PATH makes it
+        // unreachable, as a blocking policy would.
+        .env("PATH", &empty)
+        .output()
+        .unwrap();
+    fs::remove_dir_all(&empty).unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The ACL itself is checked by the oracle above; this only proves no shell.
+    let root = std::env::temp_dir().join(format!("audit-noshell-acl-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir(&root).unwrap();
+    let path = root.join("secret.json");
+    private_atomic_write(&path, b"fixture").unwrap();
+    assert_private(&path, false);
+    fs::remove_dir_all(&root).unwrap();
+}

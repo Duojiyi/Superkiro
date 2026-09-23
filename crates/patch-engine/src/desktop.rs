@@ -874,7 +874,9 @@ mod persistent_ca_tests {
                 .spawn()
                 .unwrap(),
         );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // The fixture generates two RSA-2048 keys with openssl before it binds, which
+        // exceeded 10s on a loaded Windows CI runner. This only guards against a hang.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while !port_file.exists() {
             assert!(
                 std::time::Instant::now() < deadline,

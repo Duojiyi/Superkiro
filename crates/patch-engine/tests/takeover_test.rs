@@ -404,20 +404,31 @@ fn test_single_instance_lock_reentrancy_and_collision() {
     let lock1 = patch_engine::SingleInstanceLock::acquire(Some(&lock_file)).unwrap();
     assert!(lock_file.exists());
 
+    // Any other handle — which is what a second instance holds — is refused.
+    let rival = || {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_file)
+            .unwrap()
+            .try_lock()
+    };
+    assert!(matches!(rival(), Err(fs::TryLockError::WouldBlock)));
+
     // Same-process acquisition is intentionally reentrant.
     let lock2 = patch_engine::SingleInstanceLock::acquire(Some(&lock_file)).unwrap();
     drop(lock2);
-    assert!(lock_file.exists());
+    assert!(matches!(rival(), Err(fs::TryLockError::WouldBlock)));
 
-    // Drop first lock -> file deleted cleanly
+    // Dropping the last guard frees the lock. The file stays: unlinking a lock
+    // file lets a new owner lock a fresh inode while an old one still holds it.
     drop(lock1);
-    assert!(!lock_file.exists());
-
-    // Subsequent lock acquisition succeeds
-    let lock3 = patch_engine::SingleInstanceLock::acquire(Some(&lock_file)).unwrap();
     assert!(lock_file.exists());
+    rival().expect("lock is free after the last guard drops");
+
+    let lock3 = patch_engine::SingleInstanceLock::acquire(Some(&lock_file)).unwrap();
+    assert!(matches!(rival(), Err(fs::TryLockError::WouldBlock)));
     drop(lock3);
-    assert!(!lock_file.exists());
 
     let _ = fs::remove_dir_all(temp_dir);
 }
