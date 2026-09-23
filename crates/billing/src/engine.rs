@@ -194,6 +194,9 @@ impl Drop for ReservationLease {
 
 const SNAPSHOT_VERSION: u32 = 2;
 const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
+/// Request traces are rewritten with the whole state on every mutation; a hundred
+/// thousand of them made traces the largest thing in it.
+const MAX_RETAINED_TRACES: usize = 10_000;
 /// Ceiling for one settlement: ten million credits. Far above any real request, and
 /// low enough that `credit_used` cannot overflow — a card in debt cannot reserve
 /// again, so only its in-flight requests can ever add to it.
@@ -965,7 +968,9 @@ impl BillingEngine {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let json = serde_json::to_string_pretty(snapshot)
+        // Compact: every mutation rewrites the whole state, so indentation was paid for on
+        // each request, and it counted toward the size ceiling. Both forms load everywhere.
+        let json = serde_json::to_string(snapshot)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         if !snapshot.issuance_orders.is_empty() && self.master_kek.read().unwrap().is_none() {
@@ -2400,8 +2405,10 @@ impl BillingEngine {
             provider_cost_micro_cny: entry.provider_cost_micro_cny,
             attempt_chain,
         });
-        if candidate.traces.len() > 100_000 {
-            candidate.traces.drain(..candidate.traces.len() - 100_000);
+        if candidate.traces.len() > MAX_RETAINED_TRACES {
+            candidate
+                .traces
+                .drain(..candidate.traces.len() - MAX_RETAINED_TRACES);
         }
         self.commit_candidate_snapshot(&candidate, || {
             *self.cards.write().unwrap() = candidate.cards.clone();
@@ -3971,8 +3978,8 @@ impl BillingEngine {
             let _state_guard = self.state_lock.write().unwrap();
             let mut traces = self.traces.write().unwrap();
             traces.push(trace);
-            if traces.len() > 100_000 {
-                let overflow = traces.len() - 100_000;
+            if traces.len() > MAX_RETAINED_TRACES {
+                let overflow = traces.len() - MAX_RETAINED_TRACES;
                 traces.drain(..overflow);
             }
         }
