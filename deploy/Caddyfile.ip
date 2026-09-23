@@ -61,7 +61,19 @@
     }
     log {
         output stdout
-        format json
+        # Request headers are credentials on this service: it has carried
+        # x-admin-key, x-card-platform-key and x-csrf-token, and Caddy redacts
+        # only Cookie/Authorization by default, so all three were logged in
+        # cleartext. Deleting the map wholesale rather than naming the known
+        # offenders, because an enumerated list is a promise that no future
+        # route introduces a header-borne secret. Method, URI, status, duration
+        # and client IP are outside this field and are what an access log needs.
+        format filter {
+            wrap json
+            fields {
+                request>headers delete
+            }
+        }
     }
 }
 
