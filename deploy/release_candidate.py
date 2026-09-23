@@ -232,8 +232,6 @@ def promote(ssh, report, extra_readiness=None):
         wait_gateway(ssh, image_id)
         if run(ssh, "docker inspect kiro-caddy --format '{{.State.Running}}'") != 'true':
             raise RuntimeError('Ingress stopped during readiness')
-        if extra_readiness is not None:
-            extra_readiness(report)
         report['status'] = 'deployed'
         save_report(ssh, report)
     except Exception:
@@ -256,13 +254,26 @@ def promote(ssh, report, extra_readiness=None):
                 old_browser_login = str(old_config['services']['gateway'].get('environment', {}).get('ADMIN_BROWSER_LOGIN', '')).lower() == 'true'
                 external_readiness(browser_login=old_browser_login)
                 report['status'] = 'rolled_back'
-            else:
-                # No data rewind after exposure (including an uncertain SSH outcome).
+            elif phase == 'stopping':
+                # Already on the way down and no data backup exists yet, so leaving
+                # them stopped is consistent with how far we got.
                 stop_services(ssh)
+            # Every other phase leaves production running. At 'staging' nothing has
+            # touched it yet, so the previous release is still serving normally. At
+            # 'exposing' the new release is already healthy, serving, and writing to
+            # the data directory: its data cannot be rewound, but that is a reason to
+            # hand the decision to an operator, not to stop the site. A live but
+            # unverified release beats an outage. 'needs_attention' is set above and
+            # the lock is retained, so the next step is deliberate either way.
         except Exception:
             report['status'] = 'rollback_failed' if phase == 'backed_up' else 'needs_attention'
         save_report(ssh, report)
         raise RuntimeError('Candidate promotion failed; inspect persisted release state') from None
+    # Verification, not promotion. The release is already live and recorded as
+    # deployed, so a public asset check failing here reports a problem instead of
+    # tearing down ingress.
+    if extra_readiness is not None:
+        extra_readiness(report)
 
 
 def main(credentials=None, ssh=None):

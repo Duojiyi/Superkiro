@@ -27,6 +27,23 @@ yarn-error.log*
 *.key
 *.cert
 
+# The patterns above miss the filenames this deployment actually uses:
+# `.env.*` does not match `gateway.env`, and `*.cert` does not match `root.crt`.
+*.env
+*.crt
+admin-access.json
+id_rsa
+id_rsa.*
+id_ecdsa
+id_ecdsa.*
+id_ed25519
+id_ed25519.*
+known_hosts
+known_hosts.*
+# Release metadata naming server paths and image digests; written by the
+# staging step and read by promotion. Never belongs in a commit.
+/deployment-candidate-results.json
+
 # Python & Temporary Debug Scripts Artifacts
 __pycache__/
 *.py[cod]
