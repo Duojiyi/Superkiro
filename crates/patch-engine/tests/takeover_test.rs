@@ -458,3 +458,76 @@ fn test_old_snapshot_migrates_proxy_bypass_and_restores_user_rules() {
     }
     let _ = fs::remove_dir(dir);
 }
+
+/// The mirror case: when the patch is already gone, an unrestorable extension
+/// must not block the settings revert. Otherwise a customer whose Kiro updated
+/// itself mid-takeover is left with gateway-pointing settings, a stock
+/// extension, and no way out of either through the product.
+#[test]
+fn an_unrestorable_extension_does_not_block_the_settings_revert() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("kiro_test_restore_escape_{}", std::process::id()));
+    let settings_file = temp_dir.join("settings.json");
+    let ext_file = temp_dir.join("extension.js");
+    let snapshot_file = temp_dir.join("snapshot.json");
+    fs::create_dir_all(&temp_dir).unwrap();
+    fs::write(
+        &settings_file,
+        r#"{"editor.tabSize": 2, "update.mode": "manual"}"#,
+    )
+    .unwrap();
+    let original_ext = format!("const endpoint = \"{}\";", RUNTIME_ENDPOINT_NEEDLE);
+    fs::write(&ext_file, &original_ext).unwrap();
+
+    let settings_mgr = SettingsManager::at(&settings_file);
+    let patcher = ExtensionPatcher::new(&ext_file);
+    let snapshot_mgr = SnapshotManager::at(&snapshot_file);
+    snapshot_mgr
+        .takeover(&settings_mgr, Some(&patcher), "https://gw.escape.test")
+        .unwrap();
+
+    // Kiro upgraded itself over the patch: the marker is gone and the backup no
+    // longer describes what is on disk.
+    // A real upgrade ships a different official build that still carries the
+    // needle; only the patch marker and the backup's digest are gone.
+    fs::write(
+        &ext_file,
+        format!(
+            "/* kiro 2.0 */ const endpoint = \"{}\";",
+            RUNTIME_ENDPOINT_NEEDLE
+        ),
+    )
+    .unwrap();
+    assert_eq!(patcher.status(), PatchStatus::UpgradeDetected);
+
+    let summary = snapshot_mgr
+        .restore_official()
+        .expect("settings must still be recoverable");
+    assert!(summary.settings_restored);
+    assert!(!summary.extension_restored);
+    assert!(
+        summary.extension_unrestorable.is_some(),
+        "the customer must be told the extension could not be rolled back"
+    );
+    // Without this the customer is stranded: a surviving snapshot keeps
+    // `recovery_pending` true, activate refuses while it exists, and every retry
+    // lands in the same arm. Nothing else in the product ever deletes it.
+    assert!(summary.snapshot_removed);
+    assert!(!snapshot_mgr.has_active_snapshot());
+    assert!(
+        !patcher.backup_path().exists(),
+        "obsolete rollback material must not keep blocking re-activation"
+    );
+    // The machine is usable again: a fresh takeover is accepted.
+    snapshot_mgr
+        .takeover(&settings_mgr, Some(&patcher), "https://gw.escape2.test")
+        .expect("the customer must be able to activate again");
+    snapshot_mgr.restore_official().unwrap();
+
+    let after = settings_mgr.read_settings().unwrap();
+    assert_eq!(after.get("update.mode"), Some(&json!("manual")));
+    assert!(!after.contains_key("kiroAuthConfig"));
+    assert!(!after.contains_key("codewhisperer.config"));
+
+    let _ = fs::remove_dir_all(temp_dir);
+}

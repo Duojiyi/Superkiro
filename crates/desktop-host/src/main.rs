@@ -40,17 +40,7 @@ async fn api(
     }
     tauri::async_runtime::spawn(async move {
         // The detached task retains its lock despite a webview timeout.
-        let tracked = method == "POST"
-            && matches!(
-                path.split('?').next(),
-                Some(
-                    "/api/activate"
-                        | "/api/restore"
-                        | "/api/unbind"
-                        | "/api/launch"
-                        | "/api/memory/trim"
-                )
-            );
+        let tracked = backend::is_tracked_operation(&method, &path);
         let worker_host = Arc::clone(&host);
         let worker_path = path.clone();
         let operation_method = method.clone();
