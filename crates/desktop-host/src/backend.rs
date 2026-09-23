@@ -1017,8 +1017,10 @@ mod operation_tests {
         let host = Host::new(root.clone()).unwrap();
 
         run_operation(&host, "/api/restore", true, "POST", async {
-            Err("Cannot stop Kiro for restore: Timed out waiting for Kiro process to terminate"
-                .to_string())
+            Err(
+                "Cannot stop Kiro for restore: Timed out waiting for Kiro process to terminate"
+                    .to_string(),
+            )
         })
         .await
         .unwrap_err();

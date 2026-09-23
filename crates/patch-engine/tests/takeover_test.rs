@@ -465,10 +465,8 @@ fn test_old_snapshot_migrates_proxy_bypass_and_restores_user_rules() {
 /// extension, and no way out of either through the product.
 #[test]
 fn an_unrestorable_extension_does_not_block_the_settings_revert() {
-    let temp_dir = std::env::temp_dir().join(format!(
-        "kiro_test_restore_escape_{}",
-        std::process::id()
-    ));
+    let temp_dir =
+        std::env::temp_dir().join(format!("kiro_test_restore_escape_{}", std::process::id()));
     let settings_file = temp_dir.join("settings.json");
     let ext_file = temp_dir.join("extension.js");
     let snapshot_file = temp_dir.join("snapshot.json");

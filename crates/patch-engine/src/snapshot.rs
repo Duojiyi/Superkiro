@@ -309,13 +309,12 @@ impl SnapshotManager {
 
         // Keep the record whenever residue outlives it; a snapshot is the only
         // thing that still describes what this machine had done to it.
-        let snapshot_removed =
-            if extension_unrestorable.is_none() && self.snapshot_path.exists() {
-                fs::remove_file(&self.snapshot_path)?;
-                true
-            } else {
-                false
-            };
+        let snapshot_removed = if extension_unrestorable.is_none() && self.snapshot_path.exists() {
+            fs::remove_file(&self.snapshot_path)?;
+            true
+        } else {
+            false
+        };
 
         Ok(RestoreSummary {
             settings_restored: true,
@@ -470,7 +469,11 @@ mod restore_order_tests {
         fs::create_dir_all(&dir).unwrap();
         let settings_file = dir.join("settings.json");
         let ext_file = dir.join("extension.js");
-        fs::write(&settings_file, r#"{"editor.tabSize":2,"update.mode":"manual"}"#).unwrap();
+        fs::write(
+            &settings_file,
+            r#"{"editor.tabSize":2,"update.mode":"manual"}"#,
+        )
+        .unwrap();
         fs::write(
             &ext_file,
             format!("const e = \"{}\";", crate::patch::RUNTIME_ENDPOINT_NEEDLE),

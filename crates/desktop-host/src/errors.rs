@@ -199,8 +199,14 @@ mod tests {
             ("[auth:rebind-limit]", "SK-BIND-003"),
             ("[auth:throttled]", "SK-AUTH-004"),
             ("[auth:locked-out]", "SK-AUTH-004"),
-            ("Cannot stop Kiro for restore: Timed out waiting for Kiro process to terminate", "SK-CONNECT-002"),
-            ("Cannot stop Kiro for restore: Cannot safely determine Kiro process state", "SK-CONNECT-002"),
+            (
+                "Cannot stop Kiro for restore: Timed out waiting for Kiro process to terminate",
+                "SK-CONNECT-002",
+            ),
+            (
+                "Cannot stop Kiro for restore: Cannot safely determine Kiro process state",
+                "SK-CONNECT-002",
+            ),
             ("timed out", "SK-NET-001"),
             ("network", "SK-NET-002"),
             ("TLS certificate", "SK-NET-003"),

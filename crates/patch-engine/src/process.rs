@@ -577,7 +577,13 @@ mod restore_tests {
         graceful_ok: bool,
         force_ok: bool,
     ) -> (Result<(), ProcessError>, Vec<&'static str>) {
-        scenario_with(states, graceful_ok, force_ok, Duration::ZERO, Duration::ZERO)
+        scenario_with(
+            states,
+            graceful_ok,
+            force_ok,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
     }
 
     fn scenario_with(
@@ -651,7 +657,9 @@ mod restore_tests {
         }
         for last in [RUNNING, StopObservation::Unobservable] {
             for force_ok in [true, false] {
-                assert!(scenario(&[RUNNING, RUNNING, last], false, force_ok).0.is_err());
+                assert!(scenario(&[RUNNING, RUNNING, last], false, force_ok)
+                    .0
+                    .is_err());
             }
         }
         let (result, calls) = scenario(&[RUNNING, StopObservation::Unobservable], false, true);

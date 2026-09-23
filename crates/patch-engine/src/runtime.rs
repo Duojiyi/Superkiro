@@ -70,10 +70,7 @@ pub(crate) fn detect_kiro_process_state_until(deadline: std::time::Instant) -> P
 /// Count the live processes with this image name, or `None` if the system could
 /// not be observed before `deadline`.
 #[cfg(windows)]
-pub(crate) fn process_count_until(
-    image_name: &str,
-    deadline: std::time::Instant,
-) -> Option<usize> {
+pub(crate) fn process_count_until(image_name: &str, deadline: std::time::Instant) -> Option<usize> {
     loop {
         match crate::windows_process::enumerate() {
             Ok(entries) => {
