@@ -622,7 +622,7 @@ describe('updated desktop UI contracts',()=>{
   expect(screen.queryByText('Test model')).toBeNull();
   expect(document.body.textContent).not.toMatch(/USD|\$|999\.999|888\.888|12\.345|3\.456|4\.567|5\.678/);
  });
- it('expires a success toast at five seconds but leaves errors visible',async()=>{
+ it('expires every notice at five seconds while the error-code panel waits for the user',async()=>{
   setup();const original=invoke.getMockImplementation()!;
   invoke.mockImplementation((c,p)=>c==='native'&&p.method==='open_external'?Promise.reject(supportError('SK-NET-002','failed')):original(c,p));
   render(<App/>);await waitFor(()=>expect((screen.getByLabelText('记住卡密') as HTMLInputElement).disabled).toBe(false));
@@ -635,12 +635,53 @@ describe('updated desktop UI contracts',()=>{
    expect(screen.getByText('系统保存的卡密已清除。')).toBeTruthy();
    await act(async()=>{await vi.advanceTimersByTimeAsync(1);});
    expect(screen.queryByText('系统保存的卡密已清除。')).toBeNull();
+   // A notice that happens to describe a failure is still a notice: it expires
+   // on the same clock. The reportable record is the panel, and that one waits.
    await act(async()=>{fireEvent.click(screen.getByRole('button',{name:'打开官网'}));});
-   const error=screen.getByRole('status').textContent;expect(error).toBeTruthy();
-   await act(async()=>{await vi.advanceTimersByTimeAsync(10000);});
-   expect(screen.getByRole('status').textContent).toBe(error);
+   expect(document.querySelector('.toast')).toBeTruthy();
+   const panel=screen.getByRole('region',{name:'错误反馈'});
+   expect(panel.textContent).toContain('错误码：SK-NET-002');
+   await act(async()=>{await vi.advanceTimersByTimeAsync(5000);});
+   expect(document.querySelector('.toast')).toBeNull();
+   expect(screen.getByRole('region',{name:'错误反馈'}).textContent).toContain('错误码：SK-NET-002');
+   expect(screen.getByRole('button',{name:'关闭错误反馈'})).toBeTruthy();
+  }finally{vi.useRealTimers();}
+ });
+ it('restarts the clock when the identical notice repeats',async()=>{
+  setup();const original=invoke.getMockImplementation()!;
+  invoke.mockImplementation((c,p)=>c==='native'&&p.method==='open_external'?Promise.reject(supportError('SK-NET-002','failed')):original(c,p));
+  render(<App/>);await waitFor(()=>expect((screen.getByLabelText('记住卡密') as HTMLInputElement).disabled).toBe(false));
+  vi.useFakeTimers();
+  try{
+   await act(async()=>{fireEvent.click(screen.getByRole('button',{name:'打开官网'}));});
+   const first=document.querySelector('.toast');expect(first).toBeTruthy();
+   await act(async()=>{await vi.advanceTimersByTimeAsync(4000);});
+   // Same failure, same sentence. React bails out on an identical string, so a
+   // text-keyed timer would let the repeat inherit the first one's last second.
+   await act(async()=>{fireEvent.click(screen.getByRole('button',{name:'打开官网'}));});
+   await act(async()=>{await vi.advanceTimersByTimeAsync(4999);});
+   expect(document.querySelector('.toast')).toBeTruthy();
+   await act(async()=>{await vi.advanceTimersByTimeAsync(1);});
    expect(document.querySelector('.toast')).toBeNull();
   }finally{vi.useRealTimers();}
+ });
+ it('keeps an unread error panel visible while a later operation is still running',async()=>{
+  setup();const original=invoke.getMockImplementation()!;
+  invoke.mockImplementation((c,p)=>c==='native'&&p.method==='open_external'?Promise.reject(supportError('SK-NET-002','failed')):original(c,p));
+  render(<App/>);await waitFor(()=>expect((screen.getByLabelText('记住卡密') as HTMLInputElement).disabled).toBe(false));
+  fireEvent.click(screen.getByRole('button',{name:'打开官网'}));
+  await screen.findByRole('region',{name:'错误反馈'});
+  // Now start an operation that never settles. Blanking the panel when an
+  // operation *begins* destroys an error the user has not read, and once the
+  // notice expires on its own clock nothing is left to read.
+  let settle:(v:unknown)=>void=()=>{};
+  invoke.mockImplementation((c,p)=>c==='native'&&p.method==='open_external'?new Promise(r=>{settle=r;}):original(c,p));
+  fireEvent.click(screen.getByRole('button',{name:'打开官网'}));
+  await new Promise(r=>setTimeout(r,60));
+  expect(screen.getByRole('region',{name:'错误反馈'}).textContent).toContain('错误码：SK-NET-002');
+  // Only a clean success retires it.
+  await act(async()=>{settle(true);await Promise.resolve();});
+  await waitFor(()=>expect(screen.queryByRole('region',{name:'错误反馈'})).toBeNull());
  });
  it.each(['tray','minimize','exit'])('reads and saves the native close preference %s',async behavior=>{
   setup(true);const original=invoke.getMockImplementation()!;
