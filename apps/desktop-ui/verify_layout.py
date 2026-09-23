@@ -104,6 +104,14 @@ try:
                 names = ['重新恢复'] if scenario == 'restore-error' else ['还原 Kiro 配置'] if 'recovery' in scenario else ['登录帮助 ↗','重新登录 →' if scenario in ['error','notice-error'] else '登录 →']
                 if scenario in ['activate-recovery','restore-error']: names += ['复制反馈信息','关闭错误反馈']
                 if page.get_by_role('button',name='关闭提示').count(): names += ['关闭提示']
+                # A notice overlay must not sit on top of the navigation: covering
+                # those tabs also swallows their clicks for as long as it is shown,
+                # which a bounding-box check cannot detect.
+                blocked = page.evaluate("""() => [...document.querySelectorAll('nav>button')].filter(b => {
+                    const r = b.getBoundingClientRect();
+                    return document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2)?.closest('.toast');
+                }).length""")
+                assert blocked == 0, (scenario, width, 'toast covers navigation', blocked)
                 for name in names:
                     button = page.get_by_role('button',name=name,exact=True)
                     button.scroll_into_view_if_needed()

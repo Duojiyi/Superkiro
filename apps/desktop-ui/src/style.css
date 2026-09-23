@@ -185,7 +185,15 @@ select:focus-visible,.path-box:focus-visible{outline:2px solid #dfc291;outline-o
 .toast-countdown{position:absolute;bottom:0;left:0;right:0;height:3px;background:#dfc291;transform-origin:left;animation:toast-time 5s linear forwards}
 @keyframes toast-enter{from{opacity:0;transform:translateY(-14px)}to{opacity:1;transform:translateY(0)}}
 @keyframes toast-time{to{transform:scaleX(0)}}
-@media(max-height:600px){.memory-card,.account-card{padding:10px;margin-top:8px}.settings-actions{gap:8px}.toast{top:56px}.website-button{padding:4px 7px}}
+@media(max-height:600px){.memory-card,.account-card{padding:10px;margin-top:8px}.settings-actions{gap:8px}.website-button{padding:4px 7px}}
+/* Keep the overlay inside the scroll region. Covering the navigation tabs also
+   swallows their clicks, and it put the toast outside the area the layout
+   acceptance measures. Values are one less than the viewport coordinate
+   because .shell has a 1px border and the containing block is its padding box. */
+.shell:has(>nav) .toast{top:142px}
+@media(max-height:600px){.shell:has(>nav) .toast{top:110px}}
+/* A live condition, not an event: in flow, no countdown, no dismiss control. */
+.host-status{border-color:#7b6045;background:#2b2720}
 @media(prefers-reduced-motion:reduce){.toast{animation:none}}
 
 /* Keep the complete standard settings page inside its native viewport. */
