@@ -478,7 +478,7 @@ impl PendingSettlementRecovery {
         // the current in-memory state, so an intent that could only be kept in memory
         // during the outage becomes durable here rather than being lost on restart.
         if !engine.persistence_ready() {
-            let _ = engine.sync_to_disk_checked();
+            let _ = engine.probe_persistence();
         }
         let ids: std::collections::HashSet<_> = engine
             .pending_settlements
@@ -789,6 +789,18 @@ impl BillingEngine {
         if let Err(error) = self.sync_to_disk_checked() {
             eprintln!("[kiro-billing] sync_to_disk failed: {error}");
         }
+    }
+
+    /// Try to restore persistence after a failed write by committing the current state
+    /// — but only a state the loader would accept. Writing whatever is in memory would
+    /// turn an in-memory fault into a service that cannot start.
+    pub fn probe_persistence(&self) -> Result<(), BillingError> {
+        if self.persistence_path.read().unwrap().is_none() {
+            return Ok(());
+        }
+        validate_snapshot(&self.export_snapshot())
+            .map_err(|error| BillingError::Persistence(error.to_string()))?;
+        self.sync_to_disk_checked()
     }
 
     /// Persist the current state and propagate failures to the caller.
