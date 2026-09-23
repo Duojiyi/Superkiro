@@ -488,7 +488,16 @@ fn an_unrestorable_extension_does_not_block_the_settings_revert() {
 
     // Kiro upgraded itself over the patch: the marker is gone and the backup no
     // longer describes what is on disk.
-    fs::write(&ext_file, "const endpoint = \"https://upgraded.example\";").unwrap();
+    // A real upgrade ships a different official build that still carries the
+    // needle; only the patch marker and the backup's digest are gone.
+    fs::write(
+        &ext_file,
+        format!(
+            "/* kiro 2.0 */ const endpoint = \"{}\";",
+            RUNTIME_ENDPOINT_NEEDLE
+        ),
+    )
+    .unwrap();
     assert_eq!(patcher.status(), PatchStatus::UpgradeDetected);
 
     let summary = snapshot_mgr
@@ -500,6 +509,20 @@ fn an_unrestorable_extension_does_not_block_the_settings_revert() {
         summary.extension_unrestorable.is_some(),
         "the customer must be told the extension could not be rolled back"
     );
+    // Without this the customer is stranded: a surviving snapshot keeps
+    // `recovery_pending` true, activate refuses while it exists, and every retry
+    // lands in the same arm. Nothing else in the product ever deletes it.
+    assert!(summary.snapshot_removed);
+    assert!(!snapshot_mgr.has_active_snapshot());
+    assert!(
+        !patcher.backup_path().exists(),
+        "obsolete rollback material must not keep blocking re-activation"
+    );
+    // The machine is usable again: a fresh takeover is accepted.
+    snapshot_mgr
+        .takeover(&settings_mgr, Some(&patcher), "https://gw.escape2.test")
+        .expect("the customer must be able to activate again");
+    snapshot_mgr.restore_official().unwrap();
 
     let after = settings_mgr.read_settings().unwrap();
     assert_eq!(after.get("update.mode"), Some(&json!("manual")));

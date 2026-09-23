@@ -10,12 +10,14 @@ use std::{
 /// This is the single source of truth: the record holds exactly one operation, so
 /// anything listed here overwrites the previous entry's support payload. A
 /// working-set trim changes nothing that needs recovering, and letting it claim
-/// the slot destroyed the only evidence a failed restore leaves behind.
+/// the slot destroyed the only evidence a failed restore leaves behind. Launching
+/// the editor is in the same category: it writes no configuration, so recording it
+/// would let the customer's next click erase the failure support asks them to quote.
 pub fn is_tracked_operation(method: &str, path: &str) -> bool {
     method == "POST"
         && matches!(
             path.split('?').next(),
-            Some("/api/activate" | "/api/restore" | "/api/unbind" | "/api/launch")
+            Some("/api/activate" | "/api/restore" | "/api/unbind")
         )
 }
 
@@ -1002,13 +1004,12 @@ mod operation_tests {
     /// the reason the restore failed could not be recovered afterwards.
     #[tokio::test]
     async fn a_working_set_trim_never_overwrites_a_failed_mutation_record() {
-        assert!(!is_tracked_operation("POST", "/api/memory/trim"));
-        for mutation in [
-            "/api/activate",
-            "/api/restore",
-            "/api/unbind",
-            "/api/launch",
-        ] {
+        // Neither writes configuration, so neither may claim the single record
+        // slot and erase a failure the customer still needs to report.
+        for inert in ["/api/memory/trim", "/api/launch"] {
+            assert!(!is_tracked_operation("POST", inert), "{inert}");
+        }
+        for mutation in ["/api/activate", "/api/restore", "/api/unbind"] {
             assert!(is_tracked_operation("POST", mutation), "{mutation}");
         }
 

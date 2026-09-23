@@ -16,6 +16,8 @@ use thiserror::Error;
 
 /// Header marker placed at the beginning of patched `extension.js`.
 pub const PATCH_MARKER_V1: &str = "/* @patched-kiro-byok v1 */";
+/// Version-agnostic prefix every patch marker starts with.
+pub const PATCH_MARKER_PREFIX: &str = "/* @patched-kiro-byok ";
 
 /// Backup file suffix for original `extension.js`.
 pub const BACKUP_SUFFIX: &str = ".kpatch-backup";
@@ -167,7 +169,7 @@ impl ExtensionPatcher {
         }
 
         let is_marked = match fs::read_to_string(&self.extension_path) {
-            Ok(content) => content.starts_with("/* @patched-kiro-byok "),
+            Ok(content) => content.starts_with(PATCH_MARKER_PREFIX),
             Err(_) => false,
         };
 
@@ -180,6 +182,33 @@ impl ExtensionPatcher {
         }
     }
 
+    /// Positive proof that the patch is no longer on disk: the file was read and
+    /// carries no marker.
+    ///
+    /// `status()` cannot answer this. Every read failure there resolves to "not
+    /// marked" — an unreadable file reports `UpgradeDetected` or `Official` — so
+    /// using it to decide whether a patch is still live lets a transient I/O
+    /// error masquerade as a completed rollback. A read that fails proves nothing.
+    pub fn patch_is_provably_absent(&self) -> bool {
+        fs::read(&self.extension_path)
+            .map(|content| !content.starts_with(PATCH_MARKER_PREFIX.as_bytes()))
+            .unwrap_or(false)
+    }
+
+    /// Drop rollback material for a patch that is provably gone. Kiro replaced
+    /// extension.js with a newer official build, so the backup describes a version
+    /// that is no longer installed; keeping it only blocks re-activation.
+    pub fn discard_obsolete_material(&self) -> Result<(), PatchError> {
+        for path in [self.backup_path(), self.state_path()] {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(PatchError::Io(path, e.to_string())),
+            }
+        }
+        Ok(())
+    }
+
     /// Dry run: verify whether patch can be cleanly applied without writing to disk.
     pub fn dry_run(&self) -> Result<bool, PatchError> {
         if !self.extension_path.exists() {
@@ -189,7 +218,7 @@ impl ExtensionPatcher {
         let content = fs::read_to_string(&self.extension_path)
             .map_err(|e| PatchError::Io(self.extension_path.clone(), e.to_string()))?;
 
-        if content.starts_with("/* @patched-kiro-byok ") {
+        if content.starts_with(PATCH_MARKER_PREFIX) {
             return Ok(true); // Already patched
         }
 

@@ -101,7 +101,15 @@ pub fn classify(raw: &str, path: &str, method: &str) -> Value {
         // saving and quitting Kiro. Left to the generic timeout rule below it
         // became SK-NET-001, whose POST outcome is "unknown" — which wedges the
         // client into "last write unconfirmed" and refuses every later retry.
-        } else if lower.contains("cannot stop kiro") {
+        //
+        // This must cover every producer, not just the restore route: activate
+        // reports "[connection:close] Timed out ..." (desktop.rs), restore and
+        // unbind report "Cannot stop Kiro for restore: ..." (backend.rs), and
+        // unbind's own precondition reports "Kiro IDE is currently running ...".
+        } else if stage == "close"
+            || lower.contains("cannot stop kiro")
+            || lower.contains("kiro ide is currently running")
+        {
             "SK-CONNECT-002"
         } else if lower.contains("timeout") || lower.contains("timed out") {
             "SK-NET-001"

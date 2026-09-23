@@ -231,7 +231,11 @@ fn stop_for_restore_with(
     stall: Duration,
     ceiling: Duration,
 ) -> Result<(), ProcessError> {
-    match state(Instant::now() + ceiling) {
+    // One deadline for the whole sequence. Each phase draws from it, so a slow
+    // shutdown cannot add its phases together and outlast the caller's own
+    // patience — the client gives up at 125s and would blame the network.
+    let overall = Instant::now() + ceiling;
+    match state(Instant::now() + OBSERVATION_BUDGET) {
         StopObservation::Stopped => return Ok(()),
         StopObservation::Unobservable => return Err(ProcessError::UnknownState),
         StopObservation::Running(_) => {}
@@ -240,15 +244,20 @@ fn stop_for_restore_with(
     let _ = graceful();
     // The helper returns once WM_CLOSE has been delivered, not once Kiro is gone,
     // so the editor needs its own window to shut down before force is justified.
-    match wait_for_exit(&mut state, None, grace) {
-        Ok(()) => return Ok(()),
-        Err(ProcessError::UnknownState) => return Err(ProcessError::UnknownState),
-        Err(_) => {}
+    let remaining = overall.saturating_duration_since(Instant::now());
+    if wait_for_exit(&mut state, None, grace.min(remaining)).is_ok() {
+        return Ok(());
     }
-    // Processes can exit between enumeration and termination. The final state,
-    // not a helper exit code, decides whether restoration is safe.
-    let force_result = force(Instant::now() + ceiling);
-    match wait_for_exit(&mut state, Some(stall), ceiling) {
+    // Being unable to look is not a reason to abandon a close the user has already
+    // confirmed: the force needs no observation, and every write downstream is
+    // still gated on its own verified stop. Returning here left the editor
+    // half-closed with the takeover still applied.
+    let force_result = force(overall);
+    match wait_for_exit(
+        &mut state,
+        Some(stall),
+        overall.saturating_duration_since(Instant::now()),
+    ) {
         Ok(()) => Ok(()),
         Err(error) => force_result.and(Err(error)),
     }
@@ -662,9 +671,23 @@ mod restore_tests {
                     .is_err());
             }
         }
-        let (result, calls) = scenario(&[RUNNING, StopObservation::Unobservable], false, true);
-        assert!(matches!(result, Err(ProcessError::UnknownState)));
-        assert!(!calls.contains(&"force"));
+        // Being unable to observe *after* the close was signalled must not abandon
+        // it. The user already confirmed the force, `taskkill` needs no
+        // observation, and every write downstream is gated on its own verified
+        // stop — aborting here left the editor half-closed with the takeover
+        // still applied. An unobservable system before anything is signalled is
+        // a different matter, and is covered above.
+        let (result, calls) = scenario(
+            &[
+                RUNNING,
+                StopObservation::Unobservable,
+                StopObservation::Stopped,
+            ],
+            false,
+            true,
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert!(calls.contains(&"force"));
     }
 
     /// Running out of time is not the same as being unable to look. Reporting a

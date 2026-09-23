@@ -4,7 +4,7 @@
 //! - Takes a complete, self-contained snapshot before applying any takeover or patch.
 //! - Executes 100% clean rollback restoring official Kiro state with zero residue.
 
-use crate::patch::{ExtensionPatcher, PatchError, PatchStatus};
+use crate::patch::{ExtensionPatcher, PatchError};
 use crate::runtime::{detect_kiro_process_state, ProcessState};
 use crate::settings::{PriorSettingsState, SettingsError, SettingsManager};
 use serde::{Deserialize, Serialize};
@@ -292,12 +292,25 @@ impl SnapshotManager {
             let patcher = ExtensionPatcher::new(ext_path);
             match restore_extension(&patcher) {
                 Ok(restored) => extension_restored = restored,
-                // The patch is no longer in place, so nothing is redirecting the
-                // IDE any more and only the settings still name the gateway.
-                // Refusing the whole rollback here would stand between the
-                // customer and the half that is provably safe to undo.
-                Err(error) if patcher.status() != PatchStatus::Patched => {
-                    extension_unrestorable = Some(error.to_string());
+                // Kiro replaced extension.js with a newer official build, so the
+                // backup no longer describes what is installed and the rollback
+                // can never succeed. Nothing is redirecting the IDE any more and
+                // only the settings still name the gateway, so refusing the whole
+                // operation would stand between the customer and the half that is
+                // provably safe to undo — and leave them no exit at all.
+                //
+                // The guard must be positive proof. `status()` resolves every read
+                // failure to "not marked", so using it here would let a transient
+                // I/O error during the force-kill look like a completed rollback
+                // and re-arm the updater over a live patch. Only a successful read
+                // showing no marker counts, and only for the one error that
+                // actually means the material no longer matches.
+                Err(PatchError::ExtensionChanged) if patcher.patch_is_provably_absent() => {
+                    patcher.discard_obsolete_material()?;
+                    extension_unrestorable = Some(
+                        "Kiro replaced extension.js before it could be rolled back;                          the stale patch backup has been discarded"
+                            .to_string(),
+                    );
                 }
                 // The patch is live. Abort before mutating anything.
                 Err(error) => return Err(SnapshotError::Patch(error)),
@@ -307,9 +320,11 @@ impl SnapshotManager {
         let settings_mgr = SettingsManager::at(&snapshot.settings_path);
         settings_mgr.revert(&snapshot.settings_state)?;
 
-        // Keep the record whenever residue outlives it; a snapshot is the only
-        // thing that still describes what this machine had done to it.
-        let snapshot_removed = if extension_unrestorable.is_none() && self.snapshot_path.exists() {
+        // The takeover is over either way: the settings are reverted and the patch
+        // is either rolled back or provably gone along with its material. Keeping
+        // the record back would leave `recovery_pending` true for good — activate
+        // refuses while a snapshot exists, and every retry lands in the same arm.
+        let snapshot_removed = if self.snapshot_path.exists() {
             fs::remove_file(&self.snapshot_path)?;
             true
         } else {
@@ -449,6 +464,7 @@ mod os_lock_tests {
 #[cfg(test)]
 mod restore_order_tests {
     use super::*;
+    use crate::patch::PatchStatus;
     use serde_json::json;
 
     /// A restore whose extension rollback fails must leave the machine exactly as
@@ -513,6 +529,69 @@ mod restore_order_tests {
         assert_eq!(
             settings_mgr.read_settings().unwrap().get("update.mode"),
             Some(&json!("manual"))
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The tolerant arm must not be fooled by the failure it is guarding.
+    ///
+    /// `status()` resolves every read failure to "not marked" — a missing or
+    /// unreadable extension.js reports `NotFound`/`UpgradeDetected`, never
+    /// `Patched`. Deciding "the patch is gone, so it is safe to revert settings"
+    /// from that reading means a transient I/O error during the force-kill can
+    /// re-arm Kiro's updater over a patch that is still live, which is the exact
+    /// disaster the reordering exists to prevent.
+    #[test]
+    fn an_unreadable_extension_is_not_proof_that_the_patch_is_gone() {
+        let dir = env::temp_dir().join(format!("kiro-restore-proof-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let settings_file = dir.join("settings.json");
+        let ext_file = dir.join("extension.js");
+        fs::write(
+            &settings_file,
+            r#"{"editor.tabSize":2,"update.mode":"manual"}"#,
+        )
+        .unwrap();
+        fs::write(
+            &ext_file,
+            format!("const e = \"{}\";", crate::patch::RUNTIME_ENDPOINT_NEEDLE),
+        )
+        .unwrap();
+
+        let settings_mgr = SettingsManager::at(&settings_file);
+        let patcher = ExtensionPatcher::new(&ext_file);
+        let snapshots = SnapshotManager::at(dir.join("snapshot.json"));
+        snapshots
+            .takeover(&settings_mgr, Some(&patcher), "https://gw.proof.test")
+            .unwrap();
+
+        // Stands in for every way the file can become unreadable mid-restore:
+        // `status()` reports NotFound, which is not Patched, yet nothing proves
+        // the patch was rolled back.
+        fs::remove_file(&ext_file).unwrap();
+        assert_ne!(patcher.status(), PatchStatus::Patched);
+        assert!(!patcher.patch_is_provably_absent());
+
+        let error = snapshots
+            .restore_official_with(|_| Err(PatchError::ExtensionChanged))
+            .expect_err("an unreadable extension must not be read as a finished rollback");
+        assert!(matches!(error, SnapshotError::Patch(_)), "{error:?}");
+
+        let after = settings_mgr.read_settings().unwrap();
+        assert_eq!(
+            after.get("update.mode"),
+            Some(&json!("none")),
+            "auto-update was re-armed on the strength of a file that could not be read"
+        );
+        assert!(after.contains_key("kiroAuthConfig"));
+        assert!(
+            snapshots.has_active_snapshot(),
+            "the rollback record must outlive a restore that changed nothing"
+        );
+        assert!(
+            patcher.backup_path().exists(),
+            "rollback material must not be discarded without proof it is obsolete"
         );
         let _ = fs::remove_dir_all(&dir);
     }
