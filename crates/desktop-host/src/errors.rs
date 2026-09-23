@@ -96,6 +96,13 @@ pub fn classify(raw: &str, path: &str, method: &str) -> Value {
             "SK-UNKNOWN-001"
         } else if lower.contains("expired") {
             "SK-AUTH-002"
+        // An editor that will not close is neither a network timeout nor an
+        // uncertain write: nothing was modified, and the user can act on it by
+        // saving and quitting Kiro. Left to the generic timeout rule below it
+        // became SK-NET-001, whose POST outcome is "unknown" — which wedges the
+        // client into "last write unconfirmed" and refuses every later retry.
+        } else if lower.contains("cannot stop kiro") {
+            "SK-CONNECT-002"
         } else if lower.contains("timeout") || lower.contains("timed out") {
             "SK-NET-001"
         } else if lower.contains("certificate") || lower.contains("tls") {
@@ -192,6 +199,8 @@ mod tests {
             ("[auth:rebind-limit]", "SK-BIND-003"),
             ("[auth:throttled]", "SK-AUTH-004"),
             ("[auth:locked-out]", "SK-AUTH-004"),
+            ("Cannot stop Kiro for restore: Timed out waiting for Kiro process to terminate", "SK-CONNECT-002"),
+            ("Cannot stop Kiro for restore: Cannot safely determine Kiro process state", "SK-CONNECT-002"),
             ("timed out", "SK-NET-001"),
             ("network", "SK-NET-002"),
             ("TLS certificate", "SK-NET-003"),
@@ -299,5 +308,31 @@ mod tests {
         let mut extra = value.clone();
         extra["raw"] = json!("secret");
         assert_eq!(validated(&extra), Some(value));
+    }
+}
+
+#[cfg(test)]
+mod stop_failure_tests {
+    use super::*;
+    /// A restore that could not close Kiro must stay actionable and must not be
+    /// reported as an uncertain write. `SK-NET-001` carries outcome "unknown" on
+    /// POST, and the client treats that as "the host may have written something",
+    /// locking out every further attempt behind "last write unconfirmed" — which
+    /// is what turned one failed restore into a permanently stuck client.
+    #[test]
+    fn a_kiro_that_will_not_close_is_actionable_not_an_uncertain_write() {
+        for raw in [
+            "Cannot stop Kiro for restore: Timed out waiting for Kiro process to terminate",
+            "Cannot stop Kiro for restore: Cannot safely determine Kiro process state",
+        ] {
+            let payload = classify(raw, "/api/restore", "POST");
+            assert_eq!(payload["code"], "SK-CONNECT-002", "{raw}");
+            assert_eq!(payload["outcome"], "failed", "{raw}");
+        }
+        // The generic timeout rule still applies to everything else.
+        assert_eq!(
+            classify("credential network timeout", "/api/restore", "POST")["code"],
+            "SK-NET-001"
+        );
     }
 }

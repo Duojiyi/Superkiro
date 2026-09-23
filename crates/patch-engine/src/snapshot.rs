@@ -4,7 +4,7 @@
 //! - Takes a complete, self-contained snapshot before applying any takeover or patch.
 //! - Executes 100% clean rollback restoring official Kiro state with zero residue.
 
-use crate::patch::{ExtensionPatcher, PatchError};
+use crate::patch::{ExtensionPatcher, PatchError, PatchStatus};
 use crate::runtime::{detect_kiro_process_state, ProcessState};
 use crate::settings::{PriorSettingsState, SettingsError, SettingsManager};
 use serde::{Deserialize, Serialize};
@@ -61,6 +61,11 @@ pub struct RestoreSummary {
     pub settings_restored: bool,
     pub extension_restored: bool,
     pub snapshot_removed: bool,
+    /// Set when the patch was already gone and its rollback could not run, so
+    /// the customer can be told what residue is left instead of being handed a
+    /// success that silently skipped half the work.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub extension_unrestorable: Option<String>,
 }
 
 /// Manager for taking snapshots and executing one-click restore to official state.
@@ -247,6 +252,16 @@ impl SnapshotManager {
 
     /// One-click official restore: exact rollback of settings and extension patch.
     pub fn restore_official(&self) -> Result<RestoreSummary, SnapshotError> {
+        self.restore_official_with(ExtensionPatcher::restore)
+    }
+
+    /// `restore_extension` is a seam: the extension rollback is the only step that
+    /// can fail after the process gate has passed, and its ordering against the
+    /// settings revert is the property worth pinning.
+    pub(crate) fn restore_official_with(
+        &self,
+        restore_extension: impl FnOnce(&ExtensionPatcher) -> Result<bool, PatchError>,
+    ) -> Result<RestoreSummary, SnapshotError> {
         match detect_kiro_process_state() {
             ProcessState::Running => return Err(SnapshotError::KiroRunning),
             ProcessState::Unknown => {
@@ -259,34 +274,54 @@ impl SnapshotManager {
 
         let _lock = self.operation_lock()?;
         let snapshot = self.load()?;
-        if let Some(path) = &snapshot.extension_path {
-            let patcher = ExtensionPatcher::new(path);
-            patcher.verify_restore()?;
+
+        // Unwind in the reverse of takeover's order. `merge_byok` freezes Kiro's
+        // auto-update (`update.mode: "none"`) precisely so an update cannot
+        // overwrite the patch; reverting settings first re-arms the updater while
+        // extension.js is still patched. An update landing in that window leaves
+        // a file that matches neither the original nor any known patched hash, so
+        // `restore_material` refuses it and both restore and re-activation are off
+        // the table for good. Rolling the extension back first keeps the freeze in
+        // place until the patch is provably gone.
+        //
+        // `restore` re-reads the rollback material before it writes anything, so a
+        // failure here still leaves the machine untouched and the retry clean.
+        let mut extension_restored = false;
+        let mut extension_unrestorable = None;
+        if let Some(ref ext_path) = snapshot.extension_path {
+            let patcher = ExtensionPatcher::new(ext_path);
+            match restore_extension(&patcher) {
+                Ok(restored) => extension_restored = restored,
+                // The patch is no longer in place, so nothing is redirecting the
+                // IDE any more and only the settings still name the gateway.
+                // Refusing the whole rollback here would stand between the
+                // customer and the half that is provably safe to undo.
+                Err(error) if patcher.status() != PatchStatus::Patched => {
+                    extension_unrestorable = Some(error.to_string());
+                }
+                // The patch is live. Abort before mutating anything.
+                Err(error) => return Err(SnapshotError::Patch(error)),
+            }
         }
 
-        // 1. Revert settings.json
         let settings_mgr = SettingsManager::at(&snapshot.settings_path);
         settings_mgr.revert(&snapshot.settings_state)?;
 
-        // 2. Revert extension.js if it was patched
-        let mut extension_restored = false;
-        if let Some(ref ext_path) = snapshot.extension_path {
-            let patcher = ExtensionPatcher::new(ext_path);
-            extension_restored = patcher.restore()?;
-        }
-
-        // 3. Remove snapshot file
-        let snapshot_removed = if self.snapshot_path.exists() {
-            fs::remove_file(&self.snapshot_path)?;
-            true
-        } else {
-            false
-        };
+        // Keep the record whenever residue outlives it; a snapshot is the only
+        // thing that still describes what this machine had done to it.
+        let snapshot_removed =
+            if extension_unrestorable.is_none() && self.snapshot_path.exists() {
+                fs::remove_file(&self.snapshot_path)?;
+                true
+            } else {
+                false
+            };
 
         Ok(RestoreSummary {
             settings_restored: true,
             extension_restored,
             snapshot_removed,
+            extension_unrestorable,
         })
     }
 }
@@ -409,5 +444,73 @@ mod os_lock_tests {
         fs::remove_file(path.with_extension("ready")).unwrap();
         fs::remove_file(path).unwrap();
         fs::remove_dir(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod restore_order_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A restore whose extension rollback fails must leave the machine exactly as
+    /// it found it. What is at stake is `update.mode: "none"`: takeover sets it so
+    /// a Kiro auto-update cannot overwrite the patch, and reverting settings before
+    /// the patch is gone hands the updater a window in which it can replace
+    /// extension.js with a file matching neither the original nor any known patched
+    /// hash — after which `restore_material` refuses it and neither restore nor
+    /// re-activation is ever possible again.
+    ///
+    /// The seam stands for every way the rollback can fail once the process gate has
+    /// passed: a transient process-enumeration failure at `ExtensionPatcher::restore`,
+    /// or any I/O error writing extension.js back.
+    #[test]
+    fn a_failed_extension_rollback_leaves_the_auto_update_freeze_in_place() {
+        let dir = env::temp_dir().join(format!("kiro-restore-order-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let settings_file = dir.join("settings.json");
+        let ext_file = dir.join("extension.js");
+        fs::write(&settings_file, r#"{"editor.tabSize":2,"update.mode":"manual"}"#).unwrap();
+        fs::write(
+            &ext_file,
+            format!("const e = \"{}\";", crate::patch::RUNTIME_ENDPOINT_NEEDLE),
+        )
+        .unwrap();
+
+        let settings_mgr = SettingsManager::at(&settings_file);
+        let patcher = ExtensionPatcher::new(&ext_file);
+        let snapshots = SnapshotManager::at(dir.join("snapshot.json"));
+        snapshots
+            .takeover(&settings_mgr, Some(&patcher), "https://gw.order.test")
+            .unwrap();
+        assert_eq!(patcher.status(), PatchStatus::Patched);
+
+        let error = snapshots
+            .restore_official_with(|_| Err(PatchError::ExtensionChanged))
+            .expect_err("a failed extension rollback must fail the restore");
+        assert!(matches!(error, SnapshotError::Patch(_)), "{error:?}");
+
+        let after = settings_mgr.read_settings().unwrap();
+        assert_eq!(
+            after.get("update.mode"),
+            Some(&json!("none")),
+            "auto-update was re-armed while extension.js was still patched"
+        );
+        assert!(
+            after.contains_key("kiroAuthConfig"),
+            "settings were rolled back while the patch was still live"
+        );
+        assert_eq!(patcher.status(), PatchStatus::Patched);
+        assert!(snapshots.has_active_snapshot());
+
+        // Nothing was mutated, so the retry is clean.
+        let summary = snapshots.restore_official().unwrap();
+        assert!(summary.settings_restored && summary.extension_restored);
+        assert_eq!(patcher.status(), PatchStatus::Official);
+        assert_eq!(
+            settings_mgr.read_settings().unwrap().get("update.mode"),
+            Some(&json!("manual"))
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

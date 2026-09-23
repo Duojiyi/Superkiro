@@ -64,22 +64,57 @@ pub(crate) fn detect_kiro_process_state_until(deadline: std::time::Instant) -> P
         )
     }
     #[cfg(not(unix))]
-    check_single_process_state("Kiro.exe")
+    check_single_process_state_until("Kiro.exe", deadline)
+}
+
+/// Count the live processes with this image name, or `None` if the system could
+/// not be observed before `deadline`.
+#[cfg(windows)]
+pub(crate) fn process_count_until(
+    image_name: &str,
+    deadline: std::time::Instant,
+) -> Option<usize> {
+    loop {
+        match crate::windows_process::enumerate() {
+            Ok(entries) => {
+                return Some(
+                    entries
+                        .iter()
+                        .filter(|p| p.2.eq_ignore_ascii_case(image_name))
+                        .count(),
+                )
+            }
+            // `CreateToolhelp32Snapshot` fails transiently while the process list
+            // is churning, which is exactly the moment after a force-kill. One
+            // failed sample is not evidence about the system, so retry rather
+            // than reporting a state we never observed.
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn check_single_process_state_until(
+    image_name: &str,
+    deadline: std::time::Instant,
+) -> ProcessState {
+    match process_count_until(image_name, deadline) {
+        Some(0) => ProcessState::Stopped,
+        Some(_) => ProcessState::Running,
+        None => ProcessState::Unknown,
+    }
 }
 
 fn check_single_process_state(image_name: &str) -> ProcessState {
     #[cfg(windows)]
     {
-        match crate::windows_process::enumerate() {
-            Ok(entries) => {
-                if entries.iter().any(|p| p.2.eq_ignore_ascii_case(image_name)) {
-                    ProcessState::Running
-                } else {
-                    ProcessState::Stopped
-                }
-            }
-            Err(_) => ProcessState::Unknown,
-        }
+        check_single_process_state_until(
+            image_name,
+            std::time::Instant::now() + std::time::Duration::from_secs(3),
+        )
     }
     #[cfg(unix)]
     {

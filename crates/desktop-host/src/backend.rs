@@ -5,6 +5,20 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+/// Whether a request is a configuration mutation worth a recoverable record.
+///
+/// This is the single source of truth: the record holds exactly one operation, so
+/// anything listed here overwrites the previous entry's support payload. A
+/// working-set trim changes nothing that needs recovering, and letting it claim
+/// the slot destroyed the only evidence a failed restore leaves behind.
+pub fn is_tracked_operation(method: &str, path: &str) -> bool {
+    method == "POST"
+        && matches!(
+            path.split('?').next(),
+            Some("/api/activate" | "/api/restore" | "/api/unbind" | "/api/launch")
+        )
+}
+
 pub struct Host {
     pub operation: tokio::sync::Mutex<()>,
     operation_state: std::sync::Mutex<Value>,
@@ -38,16 +52,10 @@ impl Host {
             .operation_state
             .lock()
             .map_err(|_| "Operation state unavailable")?;
-        let path = path.split('?').next().filter(|path| {
-            matches!(
-                *path,
-                "/api/activate"
-                    | "/api/restore"
-                    | "/api/unbind"
-                    | "/api/launch"
-                    | "/api/memory/trim"
-            )
-        });
+        let path = path
+            .split('?')
+            .next()
+            .filter(|path| is_tracked_operation("POST", path));
         *state = json!({"id":state["id"].as_u64().unwrap_or(0) + 1,"state":"running","path":path,"error":null});
         Ok(())
     }
@@ -161,9 +169,14 @@ pub fn start_maintenance(host: std::sync::Arc<Host>) {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            let Ok(_operation) = host.operation.try_lock() else {
+            // Skip this cycle while the user is mid-operation, but never hold the
+            // lock across the work below: doing so let a routine background sample
+            // refuse the customer's takeover or restore with "Operation in
+            // progress". Maintenance yields to the user; it does not gate them.
+            let user_busy = host.operation.try_lock().is_err();
+            if user_busy {
                 continue;
-            };
+            }
             let sample =
                 match tauri::async_runtime::spawn_blocking(MemoryGuard::sample_memory).await {
                     Ok(sample) => sample,
@@ -982,6 +995,55 @@ mod operation_tests {
         std::fs::remove_file(root.join("last-operation.json")).unwrap();
         std::fs::remove_dir(root).unwrap();
     }
+    /// A failed restore leaves exactly one piece of evidence: the support payload
+    /// in the operation record. A working-set trim shares nothing with it, so it
+    /// must not be allowed to claim the slot — in production a trim clicked a
+    /// minute after a failed restore replaced the failure with `succeeded`, and
+    /// the reason the restore failed could not be recovered afterwards.
+    #[tokio::test]
+    async fn a_working_set_trim_never_overwrites_a_failed_mutation_record() {
+        assert!(!is_tracked_operation("POST", "/api/memory/trim"));
+        for mutation in [
+            "/api/activate",
+            "/api/restore",
+            "/api/unbind",
+            "/api/launch",
+        ] {
+            assert!(is_tracked_operation("POST", mutation), "{mutation}");
+        }
+
+        let root = std::env::temp_dir().join(format!("host-trim-record-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let host = Host::new(root.clone()).unwrap();
+
+        run_operation(&host, "/api/restore", true, "POST", async {
+            Err("Cannot stop Kiro for restore: Timed out waiting for Kiro process to terminate"
+                .to_string())
+        })
+        .await
+        .unwrap_err();
+        let failure = host.operation_status().unwrap();
+        assert_eq!(failure["state"], "failed");
+        assert_eq!(failure["stage"], "restore");
+
+        run_operation(
+            &host,
+            "/api/memory/trim",
+            is_tracked_operation("POST", "/api/memory/trim"),
+            "POST",
+            async { Ok(json!({"success_count":3})) },
+        )
+        .await
+        .unwrap();
+
+        let after = host.operation_status().unwrap();
+        assert_eq!(after, failure, "a trim replaced the failed restore record");
+        assert!(after["support_error"]["feedback_id"].is_string());
+
+        drop(host);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn operation_diagnostics_are_redacted_and_survive_restart() {
         let root = std::env::temp_dir().join(format!("host-diagnostics-{}", std::process::id()));
