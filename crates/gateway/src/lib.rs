@@ -12,6 +12,7 @@ pub mod provider;
 pub mod security;
 pub mod stream;
 pub mod translate;
+pub mod usage_estimate;
 pub mod watchdog;
 
 pub use notification::{now_secs, NotificationChannel, NotificationDispatcher, NotificationEvent};

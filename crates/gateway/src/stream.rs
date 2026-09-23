@@ -227,7 +227,7 @@ pub fn create_stream_guard_with_send_deadline(
         let mut tool_buffers: BTreeMap<usize, ToolBuffer> = BTreeMap::new();
         let mut usage = crate::provider::TokenUsage::default();
         let mut has_input_usage = false;
-        let mut output_chars = 0usize;
+        let mut output_units = 0u64;
         let mut saw_output = false;
         let mut completed = false;
         let mut rejected_empty = false;
@@ -255,20 +255,20 @@ pub fn create_stream_guard_with_send_deadline(
                             let frame = match delta {
                                 ProviderDelta::Text(text) => {
                                     saw_output |= !text.is_empty();
-                                    output_chars = output_chars.saturating_add(text.chars().count());
+                                    output_units = output_units.saturating_add(crate::usage_estimate::token_units(&text));
                                     Some(kiro_wire::encoder::encode_assistant_response(&text, Some(&config.model_id)))
                                 }
                                 ProviderDelta::Reasoning(text) => {
                                     saw_output |= !text.is_empty();
-                                    output_chars = output_chars.saturating_add(text.chars().count());
+                                    output_units = output_units.saturating_add(crate::usage_estimate::token_units(&text));
                                     Some(kiro_wire::encoder::encode_reasoning(Some(&text), None, None))
                                 }
                                 ProviderDelta::ToolCallChunk { index, id, name, arguments } => {
                                     saw_output |= !arguments.is_empty()
                                         || id.as_ref().is_some_and(|value| !value.is_empty())
                                         || name.as_ref().is_some_and(|value| !value.is_empty());
-                                    output_chars = output_chars.saturating_add(arguments.chars().count())
-                                        .saturating_add(name.as_ref().map_or(0, |n| n.chars().count()));
+                                    output_units = output_units.saturating_add(crate::usage_estimate::token_units(&arguments))
+                                        .saturating_add(name.as_ref().map_or(0, |n| crate::usage_estimate::token_units(n)));
                                     let buf = tool_buffers.entry(index).or_default();
                                     if let Some(id) = id { buf.id = id; }
                                     if let Some(name) = name {
@@ -284,8 +284,11 @@ pub fn create_stream_guard_with_send_deadline(
                         }
                         Some(Ok(ProviderStreamEvent::Usage(next))) => {
                             // Output-only Anthropic message_delta must not erase prompt/cache observations.
+                            // A present-but-zero cache field is not a report of input usage: the
+                            // OpenAI adapter fills it from `cached_tokens`, which is usually 0.
                             has_input_usage |= next.prompt_tokens > 0 || next.uncached_prompt_tokens > 0
-                                || next.cache_read_input_tokens.is_some() || next.cache_creation_input_tokens.is_some();
+                                || next.cache_read_input_tokens.is_some_and(|tokens| tokens > 0)
+                                || next.cache_creation_input_tokens.is_some_and(|tokens| tokens > 0);
                             usage.merge(&next);
                             let wire_usage = kiro_wire::events::TokenUsage {
                                 uncached_input_tokens: usage.uncached_prompt_tokens.min(i64::MAX as u64) as i64,
@@ -361,7 +364,7 @@ pub fn create_stream_guard_with_send_deadline(
             if let Some(tokens) = resolve_settlement_tokens(
                 &usage,
                 has_input_usage,
-                output_chars,
+                output_units,
                 saw_output,
                 settler.estimated_input_tokens,
             )
@@ -428,21 +431,25 @@ pub fn create_stream_guard_with_send_deadline(
 fn resolve_settlement_tokens(
     usage: &crate::provider::TokenUsage,
     has_input_usage: bool,
-    output_chars: usize,
+    output_units: u64,
     saw_output: bool,
     estimated_input: u64,
 ) -> Option<UsageTokens> {
     if !has_input_usage && !saw_output && usage.completion_tokens == 0 {
         return None;
     }
-    let output = if usage.output_tokens_final {
+    let streamed = if saw_output {
+        crate::usage_estimate::tokens_from_units(output_units).max(1)
+    } else {
+        0
+    };
+    // An exact report wins, except a report of zero after text was streamed: that is
+    // an upstream that sent a usage frame of zeros, and trusting it bills visible
+    // output as free.
+    let output = if usage.output_tokens_final && !(saw_output && usage.completion_tokens == 0) {
         usage.completion_tokens
     } else {
-        usage.completion_tokens.max(if saw_output {
-            (output_chars.saturating_add(3) / 4).max(1) as u64
-        } else {
-            0
-        })
+        usage.completion_tokens.max(streamed)
     };
     Some(UsageTokens {
         uncached_input_tokens: if has_input_usage {

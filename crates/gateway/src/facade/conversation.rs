@@ -1040,13 +1040,13 @@ fn valid_model_id(model: &str) -> bool {
 }
 
 fn estimate_input_tokens(request: &GenerateAssistantResponseRequest) -> u64 {
-    // Serialize the complete request so tool schemas, tool results, tool calls,
-    // images, and context metadata are included in the reservation estimate.
-    // This is intentionally conservative; provider usage still settles the final charge.
-    let chars = serde_json::to_string(request)
-        .map(|json| json.chars().count() as u64)
-        .unwrap_or(2_000_000);
-    chars.saturating_div(4).clamp(1, 200_000)
+    // The whole request counts — tool schemas, tool results, history, editor state —
+    // except image payloads, which count at what a provider charges for an image.
+    // Provider usage still settles the final charge whenever it is reported.
+    serde_json::to_value(request)
+        .map(|value| crate::usage_estimate::estimate_json_tokens(&value))
+        .unwrap_or(200_000)
+        .clamp(1, 200_000)
 }
 
 fn validate_conversation_request(
