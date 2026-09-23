@@ -36,9 +36,10 @@ jobs:
       - name: Desktop Bridge and Release Default Regressions
         run: python -B -m unittest -v test_desktop_bridge_regression test_desktop_runtime
 
-      # Needed by the deploy suite below. It was absent because four of those
-      # test files had never actually been executed in CI.
-      - run: python -m pip install requests==2.32.3
+      # Needed by the deploy suite below, which reaches them through
+      # `deploy.release_candidate` -> `test_deployed_server`. They were absent
+      # because four of those test files had never been executed in CI.
+      - run: python -m pip install requests==2.32.3 paramiko==3.5.1
 
       # Whole suite rather than named files: the release promotion, browser-auth
       # contract, admin-static and pricing/model publication checks previously
