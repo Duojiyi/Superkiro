@@ -195,7 +195,7 @@ fn wait_for_exit(
     ceiling: Duration,
 ) -> Result<(), ProcessError> {
     let start = Instant::now();
-    let mut fewest = usize::MAX;
+    let mut previous = None;
     let mut last_progress = start;
     loop {
         // Each observation gets its own budget, so a transient enumeration failure
@@ -205,8 +205,12 @@ fn wait_for_exit(
             StopObservation::Stopped => return Ok(()),
             StopObservation::Unobservable => return Err(ProcessError::UnknownState),
             StopObservation::Running(remaining) => {
-                if remaining < fewest {
-                    fewest = remaining;
+                // Any change means the shutdown is still moving. A measured
+                // shutdown of this editor went 9 -> 11 before falling, so treating
+                // only a decrease as progress would start the stall clock while
+                // the system was plainly still working.
+                if previous != Some(remaining) {
+                    previous = Some(remaining);
                     last_progress = Instant::now();
                 }
             }
@@ -226,7 +230,7 @@ fn wait_for_exit(
 fn stop_for_restore_with(
     mut state: impl FnMut(Instant) -> StopObservation,
     graceful: impl FnOnce() -> Result<(), ProcessError>,
-    force: impl FnOnce(Instant) -> Result<(), ProcessError>,
+    mut force: impl FnMut(Instant) -> Result<(), ProcessError>,
     grace: Duration,
     stall: Duration,
     ceiling: Duration,
@@ -252,14 +256,20 @@ fn stop_for_restore_with(
     // confirmed: the force needs no observation, and every write downstream is
     // still gated on its own verified stop. Returning here left the editor
     // half-closed with the takeover still applied.
-    let force_result = force(overall);
-    match wait_for_exit(
-        &mut state,
-        Some(stall),
-        overall.saturating_duration_since(Instant::now()),
-    ) {
-        Ok(()) => Ok(()),
-        Err(error) => force_result.and(Err(error)),
+    // `taskkill /F /IM` enumerates its targets once, and the editor spawns
+    // processes while shutting down, so a survivor born after the sweep would sit
+    // there until the stall expired. Re-issue against whatever is left rather
+    // than refusing a close that one more sweep would finish.
+    let mut force_result = force(overall);
+    loop {
+        let remaining = overall.saturating_duration_since(Instant::now());
+        match wait_for_exit(&mut state, Some(stall), remaining) {
+            Ok(()) => return Ok(()),
+            Err(ProcessError::TerminateTimeout) if remaining > stall => {
+                force_result = force_result.and(force(overall));
+            }
+            Err(error) => return force_result.and(Err(error)),
+        }
     }
 }
 
@@ -772,6 +782,59 @@ mod restore_tests {
             Duration::from_secs(30),
         );
         assert!(result.is_ok(), "{result:?}");
+    }
+
+    /// The measured shutdown went 9 -> 11 before it fell. A count that rises, or
+    /// holds while one process blocks the rest, is a shutdown still working — not
+    /// a stalled one — and cutting it off refuses a restore that was about to
+    /// succeed, with most of the ceiling unspent.
+    #[test]
+    fn a_rising_then_falling_count_is_progress_not_a_stall() {
+        let counts = RefCell::new(vec![9usize, 10, 11, 11, 10, 6, 2].into_iter());
+        let result = stop_for_restore_with(
+            |_| match counts.borrow_mut().next() {
+                Some(remaining) => StopObservation::Running(remaining),
+                None => StopObservation::Stopped,
+            },
+            || Err(ProcessError::TerminateTimeout),
+            |_| Ok(()),
+            Duration::ZERO,
+            Duration::from_millis(120),
+            Duration::from_secs(30),
+        );
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    /// `taskkill /F /IM` enumerates its targets once, so a helper spawned after
+    /// that sweep survives it. Refusing the whole restore rather than sweeping
+    /// again would leave the customer unable to restore at all.
+    #[test]
+    fn a_survivor_spawned_after_the_sweep_is_swept_again() {
+        let forces = RefCell::new(0usize);
+        let observations = RefCell::new(0usize);
+        let result = stop_for_restore_with(
+            |_| {
+                *observations.borrow_mut() += 1;
+                // One straggler outlives the first sweep and never moves; only a
+                // second sweep clears it.
+                if *forces.borrow() >= 2 {
+                    StopObservation::Stopped
+                } else {
+                    StopObservation::Running(1)
+                }
+            },
+            || Err(ProcessError::TerminateTimeout),
+            |_| {
+                *forces.borrow_mut() += 1;
+                Ok(())
+            },
+            Duration::ZERO,
+            Duration::from_millis(60),
+            Duration::from_millis(900),
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert!(*forces.borrow() >= 2, "the sweep was never repeated");
+        assert!(*observations.borrow() > 2);
     }
 
     #[test]

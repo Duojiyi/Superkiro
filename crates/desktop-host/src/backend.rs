@@ -23,6 +23,10 @@ pub fn is_tracked_operation(method: &str, path: &str) -> bool {
 
 pub struct Host {
     pub operation: tokio::sync::Mutex<()>,
+    /// Raised for the whole of a user mutation. Maintenance reads it instead of
+    /// contending for `operation`, so a background sample can never answer the
+    /// customer's takeover with "Operation in progress".
+    mutating: std::sync::atomic::AtomicBool,
     operation_state: std::sync::Mutex<Value>,
     preferences: PathBuf,
     maintenance: std::sync::Mutex<Value>,
@@ -34,6 +38,7 @@ impl Host {
         std::fs::create_dir_all(&config)?;
         Ok(Self {
             operation: tokio::sync::Mutex::new(()),
+            mutating: std::sync::atomic::AtomicBool::new(false),
             operation_state: std::sync::Mutex::new(load_operation(&config)),
             maintenance: std::sync::Mutex::new(
                 json!({"enabled":true,"mode":if cfg!(windows) {"automatic"} else {"monitor-only"},"threshold_mb":2500,"cooldown_seconds":300,"last_sample_mb":null,"last_error":null,"last_trim":null}),
@@ -138,6 +143,23 @@ fn load_operation(config: &Path) -> Value {
     }
     clean
 }
+/// Lowers the flag however the operation ends, including on an early return.
+struct MutationFlag<'a>(&'a Host);
+impl<'a> MutationFlag<'a> {
+    fn raise(host: &'a Host) -> Self {
+        host.mutating
+            .store(true, std::sync::atomic::Ordering::Release);
+        Self(host)
+    }
+}
+impl Drop for MutationFlag<'_> {
+    fn drop(&mut self) {
+        self.0
+            .mutating
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// The owner is detached by the IPC caller. Dropping a webview waiter must never
 /// drop this future while its blocking worker can still mutate local files.
 pub async fn run_operation(
@@ -151,6 +173,7 @@ pub async fn run_operation(
         .operation
         .try_lock()
         .map_err(|_| crate::errors::classify("Operation in progress", path, method))?;
+    let _mutating = MutationFlag::raise(host);
     if tracked {
         host.begin_operation(path)
             .map_err(|e| crate::errors::classify(&e, path, method))?;
@@ -171,12 +194,15 @@ pub fn start_maintenance(host: std::sync::Arc<Host>) {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            // Skip this cycle while the user is mid-operation, but never hold the
-            // lock across the work below: doing so let a routine background sample
-            // refuse the customer's takeover or restore with "Operation in
-            // progress". Maintenance yields to the user; it does not gate them.
-            let user_busy = host.operation.try_lock().is_err();
-            if user_busy {
+            // Yield to the user without ever gating them. Taking `operation` here
+            // let a routine background sample refuse the customer's takeover with
+            // "Operation in progress"; reading a flag instead cannot. It matters
+            // that this holds for the whole operation rather than an instant:
+            // `trim_working_set` calls EmptyWorkingSet on pids sampled earlier, so
+            // running it against an editor that a restore is force-killing both
+            // lengthens the shutdown the restore is waiting on and risks trimming
+            // a reused pid.
+            if host.mutating.load(std::sync::atomic::Ordering::Acquire) {
                 continue;
             }
             let sample =
@@ -1042,6 +1068,41 @@ mod operation_tests {
         let after = host.operation_status().unwrap();
         assert_eq!(after, failure, "a trim replaced the failed restore record");
         assert!(after["support_error"]["feedback_id"].is_string());
+
+        drop(host);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Maintenance must observe a user mutation without competing for the lock
+    /// that admits one. Holding `operation` across a routine 60-second sample is
+    /// what answered a customer's takeover with "Operation in progress".
+    #[tokio::test]
+    async fn maintenance_can_see_a_mutation_without_being_able_to_block_it() {
+        let root = std::env::temp_dir().join(format!("host-mutation-flag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let host = Host::new(root.clone()).unwrap();
+        let idle = std::sync::atomic::Ordering::Acquire;
+
+        assert!(!host.mutating.load(idle));
+        run_operation(&host, "/api/restore", true, "POST", async {
+            // What the maintenance loop checks, evaluated mid-operation.
+            assert!(
+                host.mutating.load(idle),
+                "maintenance would trim mid-restore"
+            );
+            Ok(json!({"success":true}))
+        })
+        .await
+        .unwrap();
+        assert!(!host.mutating.load(idle), "the flag outlived its operation");
+
+        // And it is lowered when the operation fails, not just when it succeeds.
+        run_operation(&host, "/api/restore", true, "POST", async {
+            Err("Cannot stop Kiro for restore: Timed out".to_string())
+        })
+        .await
+        .unwrap_err();
+        assert!(!host.mutating.load(idle));
 
         drop(host);
         let _ = std::fs::remove_dir_all(&root);
