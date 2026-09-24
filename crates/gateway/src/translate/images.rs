@@ -467,6 +467,32 @@ mod tests {
     }
 
     #[test]
+    fn webp_is_read_like_the_other_formats() {
+        let webp = |width, height| {
+            let image = image::RgbaImage::from_pixel(width, height, image::Rgba([9, 9, 9, 255]));
+            let mut out = Vec::new();
+            image::codecs::webp::WebPEncoder::new_lossless(&mut out)
+                .encode(
+                    image.as_raw(),
+                    width,
+                    height,
+                    image::ExtendedColorType::Rgba8,
+                )
+                .unwrap();
+            out
+        };
+        assert_eq!(validate_image_bytes(&webp(32, 16)), Ok((32, 16)));
+        assert!(matches!(
+            inspect_image(&BASE64.encode(webp(32, 16))),
+            Inspection::Ready(PreparedImage::Original { format: "webp" })
+        ));
+        let Inspection::NeedsShrink(raw) = inspect_image(&BASE64.encode(webp(2000, 10))) else {
+            panic!("a wide WebP needs shrinking");
+        };
+        assert!(shrink_pixels(&raw).is_some());
+    }
+
+    #[test]
     fn transparent_pixels_become_white_not_black() {
         let clear = image::RgbaImage::from_pixel(2000, 10, image::Rgba([0, 0, 0, 0]));
         let mut raw = Vec::new();

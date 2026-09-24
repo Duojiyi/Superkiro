@@ -314,7 +314,7 @@ pub enum GuardrailError {
     #[error("Prompt content too long: {actual} characters exceeds limit of {max}")]
     PromptTooLong { actual: usize, max: usize },
 
-    #[error("Image payload is not valid base64")]
+    #[error("Image is not a readable PNG, JPEG, GIF or WebP image")]
     InvalidImage,
 }
 
