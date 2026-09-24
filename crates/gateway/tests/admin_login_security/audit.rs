@@ -265,3 +265,112 @@ async fn trusted_proxy_child() {
         assert_eq!(app.clone().oneshot(req).await.unwrap().status(), expected);
     }
 }
+
+// A flood of new sources fills the source table with live budgets. A source that logged
+// in before has a lane of its own, so the operator is not shut out with the strangers.
+#[tokio::test]
+async fn a_source_that_logged_in_before_keeps_a_lane_when_strangers_fill_the_table() {
+    let browser = browser();
+    let app = app(browser.clone());
+    let operator = "198.51.100.40";
+    let status = |ip: &'static str| {
+        let app = app.clone();
+        async move {
+            app.oneshot(request(ip, true, VALID))
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    assert_eq!(status(operator).await, StatusCode::OK);
+    // Some time later, any budget the operator had in the shared table has lapsed, and
+    // strangers hold every slot of it.
+    if let Some(budget) = browser.attempts.lock().unwrap().get_mut(operator) {
+        budget.0 = Instant::now() - Duration::from_secs(61);
+    }
+    for n in 0..MAX_LOGIN_SOURCES {
+        browser.reserve_attempt(&format!("stranger-{n}"));
+    }
+    assert_eq!(browser.attempts.lock().unwrap().len(), MAX_LOGIN_SOURCES);
+
+    assert_eq!(status("198.51.100.41").await, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(status(operator).await, StatusCode::OK);
+}
+
+// Strangers keeping every password check busy make logins fail with 429. A source that
+// logged in before still gets the reserved check.
+#[tokio::test]
+async fn a_source_that_logged_in_before_keeps_a_password_check_when_strangers_hold_them_all() {
+    let browser = browser();
+    let app = app(browser.clone());
+    let operator = "198.51.100.50";
+    assert_eq!(
+        app.clone()
+            .oneshot(request(operator, true, VALID))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let held: Vec<_> = (0..MAX_PASSWORD_CHECKS)
+        .map(|_| browser.password_checks.clone().try_acquire_owned().unwrap())
+        .collect();
+
+    assert_eq!(
+        app.clone()
+            .oneshot(request("198.51.100.51", true, VALID))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        app.oneshot(request(operator, true, VALID))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    drop(held);
+}
+
+// One IPv6 subscriber usually holds a whole /64; spread across it, it still has one
+// budget, while another /64 is unaffected.
+#[tokio::test]
+async fn ipv6_addresses_in_one_64_share_one_budget() {
+    let app = app(browser());
+    for n in 0..10 {
+        let ip = format!("[2001:db8:1:2::{:x}]", n + 1);
+        assert_eq!(
+            app.clone()
+                .oneshot(request(&ip, true, WRONG))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        app.clone()
+            .oneshot(request("[2001:db8:1:2::ff]", true, VALID))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        app.oneshot(request("[2001:db8:1:3::1]", true, VALID))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+}
+
+#[test]
+fn login_sources_are_ipv4_addresses_or_ipv6_64s() {
+    assert_eq!(login_source("198.51.100.7"), "198.51.100.7");
+    assert_eq!(login_source("::ffff:198.51.100.7"), "198.51.100.7");
+    assert_eq!(login_source("2001:db8:1:2:3:4:5:6"), "2001:db8:1:2::/64");
+    assert_eq!(login_source("unknown"), "unknown");
+}

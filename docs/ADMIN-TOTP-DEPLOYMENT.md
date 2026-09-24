@@ -26,6 +26,21 @@ no simulated enrollment, recovery codes or enable/disable buttons are supported.
 For recovery, an operator must securely rotate the secret and restart. Removing
 the variable explicitly disables 2FA and must be treated as a security change.
 
+Once the secret is provisioned and a TOTP login has succeeded, also set
+`ADMIN_TOTP_REQUIRED=true`. The gateway then refuses to start without
+`ADMIN_TOTP_SECRET`, so a later deployment that lost the secret cannot silently
+fall back to password-only login. Without TOTP, the gateway logs a reminder at
+startup.
+
+## Login throttling and the operator's lane
+
+Login budgets are ten attempts a minute per source: an IPv4 address, or an IPv6
+/64. At most 4096 sources are tracked, and at most four password checks run at
+once. A source that logged in successfully within the last 30 days keeps its own
+budget table and one reserved password check, so strangers who fill the table or
+keep every check busy cannot lock the operator out. Refusals caused by a full
+table or busy checks are logged at most once a minute.
+
 ## Time, throttling and replay protection
 
 TOTP accepts the previous, current and next 30-second step (clock skew +/- one

@@ -17,6 +17,11 @@ const COOKIE: &str = "__Host-admin_session";
 const TTL: u64 = 900;
 const MAX_LOGIN_SOURCES: usize = 4096;
 const MAX_PASSWORD_CHECKS: usize = 4;
+/// Sources that logged in successfully keep a lane of their own for this long.
+const KNOWN_SOURCE_TTL: Duration = Duration::from_secs(30 * 86_400);
+const MAX_KNOWN_SOURCES: usize = 32;
+/// Password checks only known sources may use, when strangers hold all the others.
+const KNOWN_SOURCE_CHECKS: usize = 1;
 
 #[derive(Clone)]
 pub struct BrowserAuth {
@@ -26,6 +31,13 @@ pub struct BrowserAuth {
     // Source budgets include malformed requests; one peer cannot lock out all peers.
     attempts: Arc<Mutex<HashMap<String, (Instant, u32)>>>,
     password_checks: Arc<Semaphore>,
+    // A source that has logged in before gets its own budgets and a reserved password
+    // check. Strangers can neither fill nor use them, so a flood from new sources, which
+    // fills the source table and keeps every check busy, cannot lock the operator out.
+    known_sources: Arc<Mutex<HashMap<String, Instant>>>,
+    known_attempts: Arc<Mutex<HashMap<String, (Instant, u32)>>>,
+    known_checks: Arc<Semaphore>,
+    refusal_reported: Arc<Mutex<Option<Instant>>>,
 }
 
 impl BrowserAuth {
@@ -46,6 +58,10 @@ impl BrowserAuth {
             totp: None,
             attempts: Arc::new(Mutex::new(HashMap::new())),
             password_checks: Arc::new(Semaphore::new(MAX_PASSWORD_CHECKS)),
+            known_sources: Arc::new(Mutex::new(HashMap::new())),
+            known_attempts: Arc::new(Mutex::new(HashMap::new())),
+            known_checks: Arc::new(Semaphore::new(KNOWN_SOURCE_CHECKS)),
+            refusal_reported: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -64,6 +80,17 @@ impl BrowserAuth {
             Err(std::env::VarError::NotPresent) => {}
             Err(_) => return Err("invalid ADMIN_TOTP_SECRET".into()),
         }
+        // Once TOTP is provisioned, ADMIN_TOTP_REQUIRED=true keeps a later deployment
+        // that lost the secret from silently falling back to password-only login.
+        if browser.totp.is_none() {
+            if std::env::var("ADMIN_TOTP_REQUIRED").as_deref() == Ok("true") {
+                return Err("ADMIN_TOTP_REQUIRED=true but ADMIN_TOTP_SECRET is not set".into());
+            }
+            eprintln!(
+                "[kiro-admin] administrator login is password-only: provision ADMIN_TOTP_SECRET, \
+                 then set ADMIN_TOTP_REQUIRED=true (docs/ADMIN-TOTP-DEPLOYMENT.md)"
+            );
+        }
         Ok(browser)
     }
 
@@ -78,27 +105,119 @@ impl BrowserAuth {
     }
 
     fn reserve_attempt(&self, source: &str) -> bool {
-        let Ok(mut budgets) = self.attempts.lock() else {
-            return false;
-        };
-        let now = Instant::now();
-        let window = Duration::from_secs(60);
-        if !budgets.contains_key(source) && budgets.len() >= MAX_LOGIN_SOURCES {
-            budgets.retain(|_, (start, _)| now.duration_since(*start) < window);
-            // Do not evict live lockouts: source churn must not reset their budgets.
-            if budgets.len() >= MAX_LOGIN_SOURCES {
-                return false;
+        if self.is_known(source) {
+            return take_attempt(&self.known_attempts, source, MAX_KNOWN_SOURCES).unwrap_or(false);
+        }
+        take_attempt(&self.attempts, source, MAX_LOGIN_SOURCES).unwrap_or_else(|| {
+            self.report_refusal("the login source table is full");
+            false
+        })
+    }
+
+    fn is_known(&self, source: &str) -> bool {
+        self.known_sources.lock().is_ok_and(|known| {
+            known
+                .get(source)
+                .is_some_and(|at| at.elapsed() < KNOWN_SOURCE_TTL)
+        })
+    }
+
+    fn remember_source(&self, source: &str) {
+        // The source's budget moves with it to its own lane, spent attempts included.
+        if let (Ok(mut shared), Ok(mut own)) = (self.attempts.lock(), self.known_attempts.lock()) {
+            if let Some(budget) = shared.remove(source) {
+                own.insert(source.to_owned(), budget);
             }
         }
-        let budget = budgets.entry(source.to_owned()).or_insert((now, 0));
-        if now.duration_since(budget.0) >= window {
-            *budget = (now, 0);
+        let Ok(mut known) = self.known_sources.lock() else {
+            return;
+        };
+        known.insert(source.to_owned(), Instant::now());
+        known.retain(|_, at| at.elapsed() < KNOWN_SOURCE_TTL);
+        while known.len() > MAX_KNOWN_SOURCES {
+            let Some(oldest) = known
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(source, _)| source.clone())
+            else {
+                break;
+            };
+            known.remove(&oldest);
         }
-        if budget.1 >= 10 {
-            return false;
+    }
+
+    /// A password check for this login: one of the shared ones, or the reserved one
+    /// when every shared check is busy and the source has logged in before.
+    fn password_check(&self, source: &str) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        if let Ok(permit) = self.password_checks.clone().try_acquire_owned() {
+            return Some(permit);
         }
-        budget.1 += 1;
-        true
+        if self.is_known(source) {
+            if let Ok(permit) = self.known_checks.clone().try_acquire_owned() {
+                return Some(permit);
+            }
+        }
+        self.report_refusal("every password check is busy");
+        None
+    }
+
+    /// Log, at most once a minute, that logins from new sources are being refused.
+    /// Only a log line: it must not become another way to lock anyone out.
+    fn report_refusal(&self, why: &str) {
+        let Ok(mut last) = self.refusal_reported.lock() else {
+            return;
+        };
+        if last.is_some_and(|at| at.elapsed() < Duration::from_secs(60)) {
+            return;
+        }
+        *last = Some(Instant::now());
+        eprintln!(
+            "[kiro-admin] refusing administrator logins from new sources: {why}; \
+             sources that logged in before keep their own lane"
+        );
+    }
+}
+
+/// Take one attempt from `source`'s budget of ten a minute. `None` when the table is
+/// full of live budgets, `Some(false)` when this source's budget is spent.
+fn take_attempt(
+    table: &Mutex<HashMap<String, (Instant, u32)>>,
+    source: &str,
+    capacity: usize,
+) -> Option<bool> {
+    let Ok(mut budgets) = table.lock() else {
+        return Some(false);
+    };
+    let now = Instant::now();
+    let window = Duration::from_secs(60);
+    if !budgets.contains_key(source) && budgets.len() >= capacity {
+        budgets.retain(|_, (start, _)| now.duration_since(*start) < window);
+        // Do not evict live lockouts: source churn must not reset their budgets.
+        if budgets.len() >= capacity {
+            return None;
+        }
+    }
+    let budget = budgets.entry(source.to_owned()).or_insert((now, 0));
+    if now.duration_since(budget.0) >= window {
+        *budget = (now, 0);
+    }
+    if budget.1 >= 10 {
+        return Some(false);
+    }
+    budget.1 += 1;
+    Some(true)
+}
+
+/// What a login budget is kept for: an IPv4 address, or an IPv6 /64, which one
+/// subscriber usually holds whole and could otherwise spread across endless addresses.
+fn login_source(ip: &str) -> String {
+    match ip.parse::<std::net::IpAddr>().map(|ip| ip.to_canonical()) {
+        Ok(std::net::IpAddr::V6(v6)) => {
+            let network = std::net::Ipv6Addr::from(u128::from(v6) & (u128::MAX << 64));
+            format!("{network}/64")
+        }
+        Ok(v4) => v4.to_string(),
+        Err(_) => ip.to_owned(),
     }
 }
 
@@ -278,7 +397,8 @@ pub async fn handle(
     if req.uri().path() == "/api/v1/admin/session" && req.method() == "POST" {
         // Only configured proxy peers may supply forwarded addresses. Missing
         // ConnectInfo intentionally shares a fail-closed "unknown" source budget.
-        if !browser.reserve_attempt(&crate::security::client_ip(&req)) {
+        let source = login_source(&crate::security::client_ip(&req));
+        if !browser.reserve_attempt(&source) {
             return login_throttled();
         }
         if req
@@ -305,7 +425,7 @@ pub async fn handle(
         // Bound expensive work globally, without a long-lived anonymous global
         // lockout or an unbounded spawn_blocking queue. Malformed bodies never
         // acquire a permit. Keep it in the worker even if the caller disconnects.
-        let Ok(permit) = browser.password_checks.clone().try_acquire_owned() else {
+        let Some(permit) = browser.password_check(&source) else {
             return login_throttled();
         };
         let code = credentials.totp_code.clone().unwrap_or_default();
@@ -325,6 +445,7 @@ pub async fn handle(
         {
             return browser.session_error("Invalid administrator credentials or verification code");
         }
+        browser.remember_source(&source);
         let Ok(session) = auth.issue_session(TTL) else {
             return no_store(reply(
                 StatusCode::TOO_MANY_REQUESTS,
