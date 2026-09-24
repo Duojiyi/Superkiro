@@ -27,7 +27,7 @@ const server = https.createServer({key:fs.readFileSync(key),cert:fs.readFileSync
   let body=''; req.on('data',c=>body+=c); req.on('end',()=>{
     let result;
     switch(req.url) {
-      case '/refreshToken': result={accessToken:'renewed',refreshToken:'refresh',profileArn:'profile',expiresAt:'2099-01-01T00:00:00Z'};break;
+      case '/refreshToken': result={accessToken:'renewed',refreshToken:'refresh',profileArn:'arn:aws:codewhisperer:us-east-1:123456789012:profile/test',expiresAt:'2099-01-01T00:00:00Z'};break;
       case '/getUsageLimits':
         if(req.headers.authorization !== 'Bearer renewed') {res.writeHead(401);res.end();return;}
         result={success:true};break;

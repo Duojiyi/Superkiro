@@ -611,7 +611,7 @@ mod tests {
                     assert_eq!(body["refreshToken"], "refresh-secret");
                     Json(
                         json!({"accessToken":"renewed-access", "refreshToken":"renewed-refresh",
-                    "profileArn":"profile", "expiresAt":"2099-01-01T00:00:00Z"}),
+                    "profileArn":"arn:aws:codewhisperer:us-east-1:123456789012:profile/test", "expiresAt":"2099-01-01T00:00:00Z"}),
                     )
                 }),
             )
@@ -786,7 +786,7 @@ mod tests {
                 (
                     axum::http::StatusCode::OK,
                     Json(json!({
-                        "accessToken":card, "refreshToken":"refresh", "profileArn":"profile",
+                        "accessToken":card, "refreshToken":"refresh", "profileArn":"arn:aws:codewhisperer:us-east-1:123456789012:profile/test",
                         "expiresAt":"2099-01-01T00:00:00Z"
                     })),
                 )
