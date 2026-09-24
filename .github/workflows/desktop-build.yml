@@ -77,6 +77,8 @@ jobs:
         with:
           key: desktop-macos-${{ matrix.target }}
       - run: npm --prefix apps/desktop-ui ci
+      # The host embeds the built UI, so its tests need it too.
+      - run: npm --prefix apps/desktop-ui run build
       - run: npm --prefix apps/desktop-ui test
       # The macOS stop, gate and install paths differ from Windows and had never been
       # tested anywhere before a release.
