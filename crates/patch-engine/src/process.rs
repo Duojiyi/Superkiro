@@ -27,6 +27,16 @@ pub enum ProcessError {
     #[error("Cannot safely determine Kiro process state")]
     UnknownState,
 
+    /// A Kiro window is still on screen, most likely its save prompt. Only the user may
+    /// decide to discard what it is asking about.
+    #[error("Kiro is still open; it may be asking whether to save changes")]
+    StillOpen,
+
+    /// Kiro runs with higher privileges than this client, so it can be neither asked to
+    /// close nor ended from here.
+    #[error("Kiro is running as administrator and cannot be closed from here; close it yourself and retry")]
+    Elevated,
+
     #[error("Invalid launch configuration: {0}")]
     InvalidConfiguration(String),
 }
@@ -152,9 +162,8 @@ fn prevent_stdio_inheritance() -> std::io::Result<()> {
     Ok(())
 }
 
-/// Attempt to stop running Kiro IDE processes across platforms.
-///
-/// Sends termination signal and waits up to `timeout` for all Kiro instances to exit.
+/// Ask Kiro to close the way its own close button would, and wait up to `timeout`.
+/// Never forces: an editor that is still open when time runs out stays open.
 pub fn stop_kiro(timeout: Duration) -> Result<(), ProcessError> {
     let deadline = Instant::now() + timeout;
     match crate::runtime::detect_kiro_process_state_until(deadline) {
@@ -162,29 +171,7 @@ pub fn stop_kiro(timeout: Duration) -> Result<(), ProcessError> {
         ProcessState::Unknown => return Err(ProcessError::UnknownState),
         ProcessState::Running => {}
     }
-    if cfg!(target_os = "windows") {
-        // WM_CLOSE lets the editor present its save/cancel prompt. Never force-kill.
-        let mut cmd = Command::new("powershell.exe");
-        cmd.args(["-NoProfile", "-NonInteractive", "-Command",
-            "Get-Process -Name Kiro -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | ForEach-Object { [void]$_.CloseMainWindow() }"]);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000);
-        }
-        run_helper_until(&mut cmd, deadline)?;
-    } else if cfg!(target_os = "macos") {
-        // Native quit permits the editor to ask about unsaved work; never force-kill.
-        run_helper_until(
-            Command::new("osascript").args(["-e", "tell application \"Kiro\" to quit"]),
-            deadline,
-        )?;
-    } else {
-        run_helper_until(
-            Command::new("pkill").args(["-TERM", "-x", "kiro"]),
-            deadline,
-        )?;
-    }
+    request_graceful_close(deadline)?;
     while Instant::now() < deadline {
         match crate::runtime::detect_kiro_process_state_until(deadline) {
             ProcessState::Stopped => return Ok(()),
@@ -197,35 +184,148 @@ pub fn stop_kiro(timeout: Duration) -> Result<(), ProcessError> {
     Err(ProcessError::TerminateTimeout)
 }
 
-/// The editor gets the same budget to close itself as the activate path allows
-/// (`desktop.rs`); it is the same operation and the asymmetry only ever cost the
-/// user unsaved work.
-const RESTORE_GRACE: Duration = Duration::from_secs(30);
-/// After a force-kill, give up only once the process count has stopped falling
-/// for this long. Teardown scales with workspace size, extension count and disk,
-/// so no fixed budget is right for every machine: a measured 11-process shutdown
-/// took 15.7s to leave the process table on one developer machine.
-const RESTORE_STALL: Duration = Duration::from_secs(10);
-/// Absolute ceiling, so a machine that never finishes still returns an answer.
-const RESTORE_CEILING: Duration = Duration::from_secs(60);
-/// Only long enough to deliver WM_CLOSE; `wait_for_exit` owns the waiting, so the
-/// helper's own budget must not double the user's grace window.
-const RESTORE_SIGNAL_BUDGET: Duration = Duration::from_secs(10);
+/// Deliver the editor's own close request, once. Never re-sent: a user who cancels a
+/// save prompt has answered, and asking again would only put the prompt back.
+fn request_graceful_close(deadline: Instant) -> Result<(), ProcessError> {
+    #[cfg(windows)]
+    {
+        let _ = deadline;
+        let pids = crate::windows_process::session_processes("Kiro.exe")
+            .map_err(|_| ProcessError::UnknownState)?;
+        let (mut delivered, mut denied) = (false, false);
+        for window in crate::windows_process::top_level_windows(&pids) {
+            // Unowned, because an owned window is a dialog, and closing a save prompt is
+            // pressing Cancel. Enabled, because a disabled window has a modal open, and
+            // what happens to that is the dialog's business. Every editor window is
+            // asked at once: that is what quitting does.
+            if window.visible && !window.owned && window.enabled {
+                match crate::windows_process::request_close(&window) {
+                    Ok(()) => delivered = true,
+                    Err(error) if error.raw_os_error() == Some(5) => denied = true,
+                    Err(_) => {}
+                }
+            }
+        }
+        if denied && !delivered {
+            return Err(ProcessError::Elevated);
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // An application-level quit lets the editor keep unsaved work as it does on exit.
+        run_helper_until(
+            Command::new("/usr/bin/osascript").args(["-e", "tell application \"Kiro\" to quit"]),
+            deadline,
+        )
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        run_helper_until(
+            Command::new("pkill").args(["-TERM", "-x", "kiro"]),
+            deadline,
+        )
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = deadline;
+        Err(ProcessError::UnknownState)
+    }
+}
+
+/// Whether a Kiro window is on screen. `Some(false)` only on positive evidence that none
+/// is; read twice a second apart, because Electron creates windows hidden until they
+/// are ready to show.
+///
+/// Elsewhere it cannot be proven: macOS does not count minimized or other-Space windows
+/// as on screen, and Wayland has no global window list. `None` counts as visible.
+fn kiro_window_visible() -> Option<bool> {
+    #[cfg(windows)]
+    {
+        let visible = || -> Option<bool> {
+            let pids = crate::windows_process::session_processes("Kiro.exe").ok()?;
+            Some(
+                crate::windows_process::top_level_windows(&pids)
+                    .iter()
+                    .any(|window| window.visible),
+            )
+        };
+        if visible()? {
+            return Some(true);
+        }
+        thread::sleep(Duration::from_secs(1));
+        visible()
+    }
+    #[cfg(not(windows))]
+    None
+}
+
 /// How long a single observation may spend retrying before it is genuinely
 /// unobservable. Kept well clear of every wait budget so the two never conflate.
 const OBSERVATION_BUDGET: Duration = Duration::from_secs(2);
+/// Only long enough to deliver the close request.
+const SIGNAL_BUDGET: Duration = Duration::from_secs(10);
 
-/// Stop Kiro after explicit restore confirmation. Unlike restart, this may discard
-/// unsaved work. Callers must obtain confirmation before invoking it.
-pub fn stop_kiro_for_restore() -> Result<(), ProcessError> {
-    stop_for_restore_with(
-        restore_process_observation,
-        || stop_kiro(RESTORE_SIGNAL_BUDGET),
-        force_kiro_for_restore,
-        RESTORE_GRACE,
-        RESTORE_STALL,
-        RESTORE_CEILING,
-    )
+/// Timings for [`stop_with`]. The worst case stays well inside the client's 125s.
+pub(crate) struct StopTimings {
+    /// How long the editor gets to close itself, save prompt included.
+    pub grace: Duration,
+    /// How long the process count may sit still before a wait counts as stalled.
+    /// Teardown scales with workspace size, extensions and disk; a measured shutdown
+    /// of this editor took 8-11s to leave the process table after its window closed.
+    pub stall: Duration,
+    /// How long headless teardown may run before it is ended.
+    pub headless_ceiling: Duration,
+    /// How long to wait for processes to disappear once they have been ended.
+    pub force_ceiling: Duration,
+}
+
+const TIMINGS: StopTimings = StopTimings {
+    grace: Duration::from_secs(30),
+    stall: Duration::from_secs(10),
+    headless_ceiling: Duration::from_secs(30),
+    force_ceiling: Duration::from_secs(20),
+};
+
+/// What the stop policy needs from the system. A seam, so every branch of the policy
+/// can be tested without a real editor.
+pub(crate) trait KiroControl {
+    fn observe(&mut self) -> StopObservation;
+    fn request_close(&mut self) -> Result<(), ProcessError>;
+    /// `Some(false)` only when it is certain no Kiro window is on screen.
+    fn window_visible(&mut self) -> Option<bool>;
+    fn force(&mut self) -> Result<(), ProcessError>;
+}
+
+struct System;
+
+impl KiroControl for System {
+    fn observe(&mut self) -> StopObservation {
+        restore_process_observation(Instant::now() + OBSERVATION_BUDGET)
+    }
+    fn request_close(&mut self) -> Result<(), ProcessError> {
+        request_graceful_close(Instant::now() + SIGNAL_BUDGET)
+    }
+    fn window_visible(&mut self) -> Option<bool> {
+        kiro_window_visible()
+    }
+    fn force(&mut self) -> Result<(), ProcessError> {
+        force_kiro_for_restore(Instant::now() + SIGNAL_BUDGET)
+    }
+}
+
+/// Close Kiro for a restore or unbind.
+///
+/// `force_confirmed` is the user's second, specific confirmation, given only after being
+/// told Kiro would not close, that it may be ended even with a window open.
+pub fn stop_kiro_for_restore(force_confirmed: bool) -> Result<(), ProcessError> {
+    stop_with(&mut System, force_confirmed, &TIMINGS)
+}
+
+/// Close Kiro before a takeover. Never ends an editor with a window on screen; only the
+/// headless remains of one that has already closed.
+pub fn stop_kiro_for_takeover() -> Result<(), ProcessError> {
+    stop_with(&mut System, false, &TIMINGS)
 }
 
 /// One observation of the Kiro processes. `Running` carries the count so a
@@ -237,15 +337,72 @@ pub(crate) enum StopObservation {
     Unobservable,
 }
 
-/// Wait for every Kiro process to exit.
-///
-/// `stall` bounds how long the count may sit still before we give up; passing
-/// `None` waits out the whole `ceiling` regardless. That distinction matters: a
-/// count that stops falling during graceful shutdown most likely means the editor
-/// is holding a save/cancel prompt in front of the user, which is the one moment
-/// we must not treat as a stalled shutdown.
+fn stop_with(
+    control: &mut impl KiroControl,
+    force_confirmed: bool,
+    timings: &StopTimings,
+) -> Result<(), ProcessError> {
+    match control.observe() {
+        StopObservation::Stopped => return Ok(()),
+        StopObservation::Unobservable => return Err(ProcessError::UnknownState),
+        StopObservation::Running(_) => {}
+    }
+    if force_confirmed {
+        // The user has seen that Kiro would not close and chose to end it. Asking again
+        // would only bring the prompt back, and waiting would only make them wait.
+        return force_until_gone(control, timings);
+    }
+    control.request_close()?;
+    match wait_for_exit(control, None, timings.grace) {
+        Ok(()) => return Ok(()),
+        Err(ProcessError::TerminateTimeout) => {}
+        // Unable to look: with no evidence of what is on screen, nothing is forced.
+        Err(error) => return Err(error),
+    }
+    // A window still on screen is an editor still in use, most likely showing its save
+    // prompt. Ending it would discard exactly what the prompt is asking about.
+    if control.window_visible() != Some(false) {
+        return Err(ProcessError::StillOpen);
+    }
+    // Every window is gone, so what remains is teardown: extensions deactivating,
+    // terminals and language servers shutting down. Let it finish, and end it only once
+    // it has stopped making progress.
+    match wait_for_exit(control, Some(timings.stall), timings.headless_ceiling) {
+        Ok(()) => return Ok(()),
+        Err(ProcessError::TerminateTimeout) => {}
+        Err(error) => return Err(error),
+    }
+    // The user may have opened Kiro again in the meantime.
+    if control.window_visible() != Some(false) {
+        return Err(ProcessError::StillOpen);
+    }
+    force_until_gone(control, timings)
+}
+
+fn force_until_gone(
+    control: &mut impl KiroControl,
+    timings: &StopTimings,
+) -> Result<(), ProcessError> {
+    let deadline = Instant::now() + timings.force_ceiling;
+    let mut result = control.force();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match wait_for_exit(control, Some(timings.stall), remaining) {
+            Ok(()) => return Ok(()),
+            // A process born after the sweep survives it: sweep again while there is time.
+            Err(ProcessError::TerminateTimeout) if remaining > timings.stall => {
+                result = result.and(control.force());
+            }
+            // The final state, not whether each termination call succeeded, decides.
+            Err(error) => return result.and(Err(error)),
+        }
+    }
+}
+
+/// Wait for every Kiro process to exit. `stall` bounds how long the count may sit still;
+/// `None` waits out the whole `ceiling`, which is what a save prompt needs.
 fn wait_for_exit(
-    state: &mut impl FnMut(Instant) -> StopObservation,
+    control: &mut impl KiroControl,
     stall: Option<Duration>,
     ceiling: Duration,
 ) -> Result<(), ProcessError> {
@@ -253,17 +410,11 @@ fn wait_for_exit(
     let mut previous = None;
     let mut last_progress = start;
     loop {
-        // Each observation gets its own budget, so a transient enumeration failure
-        // is retried without the overall wait ever being reported as "cannot
-        // observe". Running out of time is the loop's decision, not a sample's.
-        match state(Instant::now() + OBSERVATION_BUDGET) {
+        match control.observe() {
             StopObservation::Stopped => return Ok(()),
             StopObservation::Unobservable => return Err(ProcessError::UnknownState),
             StopObservation::Running(remaining) => {
-                // Any change means the shutdown is still moving. A measured
-                // shutdown of this editor went 9 -> 11 before falling, so treating
-                // only a decrease as progress would start the stall clock while
-                // the system was plainly still working.
+                // Any change is progress. A measured shutdown went 9 -> 11 before falling.
                 if previous != Some(remaining) {
                     previous = Some(remaining);
                     last_progress = Instant::now();
@@ -274,74 +425,37 @@ fn wait_for_exit(
         if now.duration_since(start) >= ceiling
             || stall.is_some_and(|stall| now.duration_since(last_progress) >= stall)
         {
-            // Out of time is not the same as unobservable: we watched the whole
-            // way and the processes were still there.
+            // Out of time is not the same as unobservable: we watched the whole way.
             return Err(ProcessError::TerminateTimeout);
         }
         thread::sleep(Duration::from_millis(50));
     }
 }
 
-fn stop_for_restore_with(
-    mut state: impl FnMut(Instant) -> StopObservation,
-    graceful: impl FnOnce() -> Result<(), ProcessError>,
-    mut force: impl FnMut(Instant) -> Result<(), ProcessError>,
-    grace: Duration,
-    stall: Duration,
-    ceiling: Duration,
-) -> Result<(), ProcessError> {
-    // One deadline for the whole sequence. Each phase draws from it, so a slow
-    // shutdown cannot add its phases together and outlast the caller's own
-    // patience — the client gives up at 125s and would blame the network.
-    let overall = Instant::now() + ceiling;
-    match state(Instant::now() + OBSERVATION_BUDGET) {
-        StopObservation::Stopped => return Ok(()),
-        StopObservation::Unobservable => return Err(ProcessError::UnknownState),
-        StopObservation::Running(_) => {}
-    }
-    // A cancelled save prompt or failed graceful helper does not revoke consent.
-    let _ = graceful();
-    // The helper returns once WM_CLOSE has been delivered, not once Kiro is gone,
-    // so the editor needs its own window to shut down before force is justified.
-    let remaining = overall.saturating_duration_since(Instant::now());
-    if wait_for_exit(&mut state, None, grace.min(remaining)).is_ok() {
-        return Ok(());
-    }
-    // Being unable to look is not a reason to abandon a close the user has already
-    // confirmed: the force needs no observation, and every write downstream is
-    // still gated on its own verified stop. Returning here left the editor
-    // half-closed with the takeover still applied.
-    // `taskkill /F /IM` enumerates its targets once, and the editor spawns
-    // processes while shutting down, so a survivor born after the sweep would sit
-    // there until the stall expired. Re-issue against whatever is left rather
-    // than refusing a close that one more sweep would finish.
-    let mut force_result = force(overall);
-    loop {
-        let remaining = overall.saturating_duration_since(Instant::now());
-        match wait_for_exit(&mut state, Some(stall), remaining) {
-            Ok(()) => return Ok(()),
-            Err(ProcessError::TerminateTimeout) if remaining > stall => {
-                force_result = force_result.and(force(overall));
-            }
-            Err(error) => return force_result.and(Err(error)),
-        }
-    }
-}
-
 fn restore_process_observation(deadline: Instant) -> StopObservation {
     #[cfg(unix)]
-    {
+    loop {
+        // One failed `ps` is not evidence about the system; retry within the budget, as
+        // the Windows observation does.
         match restore_pids(deadline) {
-            Ok(pids) if pids.is_empty() => StopObservation::Stopped,
-            Ok(pids) => StopObservation::Running(pids.len()),
-            Err(_) => StopObservation::Unobservable,
+            Ok(pids) if pids.is_empty() => return StopObservation::Stopped,
+            Ok(pids) => return StopObservation::Running(pids.len()),
+            Err(_) if Instant::now() + Duration::from_millis(50) < deadline => {
+                thread::sleep(Duration::from_millis(50))
+            }
+            Err(_) => return StopObservation::Unobservable,
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     match crate::runtime::process_count_until("Kiro.exe", deadline) {
         Some(0) => StopObservation::Stopped,
         Some(remaining) => StopObservation::Running(remaining),
         None => StopObservation::Unobservable,
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = deadline;
+        StopObservation::Unobservable
     }
 }
 
@@ -407,23 +521,26 @@ fn restore_pids(deadline: Instant) -> Result<Vec<u32>, ProcessError> {
     )
 }
 
-#[cfg(any(windows, test))]
-fn restore_force_windows_command() -> Command {
-    let mut command = Command::new("taskkill.exe");
-    // No /T: unrelated children must not be terminated.
-    command.args(["/F", "/IM", "Kiro.exe"]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
-    command
-}
-
 fn force_kiro_for_restore(deadline: Instant) -> Result<(), ProcessError> {
     #[cfg(windows)]
     {
-        run_helper_until(&mut restore_force_windows_command(), deadline)
+        let _ = deadline;
+        // This session's Kiro only, each checked by image name through a handle that
+        // pins the process, so neither another user's editor nor a recycled PID is hit.
+        let pids = crate::windows_process::session_processes("Kiro.exe")
+            .map_err(|_| ProcessError::UnknownState)?;
+        let mut result = Ok(());
+        for pid in pids {
+            match crate::windows_process::terminate_if_named(pid, "Kiro.exe") {
+                Ok(()) => {}
+                Err(error) if error.raw_os_error() == Some(5) => {
+                    result = Err(ProcessError::Elevated)
+                }
+                // Exited between enumeration and termination; the final state decides.
+                Err(_) => {}
+            }
+        }
+        result
     }
     #[cfg(unix)]
     {
@@ -447,6 +564,7 @@ fn force_kiro_for_restore(deadline: Instant) -> Result<(), ProcessError> {
 
 /// Bound the helper itself, not just the subsequent IDE wait. Only the helper
 /// is killed on timeout; the IDE remains free to present its save/cancel dialog.
+#[cfg(any(unix, test))]
 fn run_helper_until(command: &mut Command, deadline: Instant) -> Result<(), ProcessError> {
     if Instant::now() >= deadline {
         return Err(ProcessError::TerminateTimeout);
@@ -713,262 +831,230 @@ mod launch_tests {
 #[cfg(test)]
 mod restore_tests {
     use super::*;
-    use std::cell::RefCell;
 
-    fn scenario(
-        states: &[StopObservation],
-        graceful_ok: bool,
-        force_ok: bool,
-    ) -> (Result<(), ProcessError>, Vec<&'static str>) {
-        scenario_with(
-            states,
-            graceful_ok,
-            force_ok,
-            Duration::ZERO,
-            Duration::ZERO,
-        )
+    /// Scripted system: `counts` is what each observation reports (the last one repeats),
+    /// `visible` what each window check reports (the last one repeats).
+    struct Fake {
+        counts: Vec<StopObservation>,
+        visible: Vec<Option<bool>>,
+        close_result: Result<(), ProcessError>,
+        /// After this many forces, every later observation reports Stopped.
+        stops_after_forces: Option<usize>,
+        calls: Vec<&'static str>,
+        forces: usize,
     }
 
-    fn scenario_with(
-        states: &[StopObservation],
-        graceful_ok: bool,
-        force_ok: bool,
-        grace: Duration,
-        ceiling: Duration,
-    ) -> (Result<(), ProcessError>, Vec<&'static str>) {
-        let mut states = states.iter().copied();
-        let calls = RefCell::new(Vec::new());
-        let result = stop_for_restore_with(
-            |_| {
-                calls.borrow_mut().push("state");
-                states.next().expect("unexpected state check")
-            },
-            || {
-                calls.borrow_mut().push("graceful");
-                if graceful_ok {
-                    Ok(())
-                } else {
-                    Err(ProcessError::TerminateTimeout)
-                }
-            },
-            |_| {
-                calls.borrow_mut().push("force");
-                if force_ok {
-                    Ok(())
-                } else {
-                    Err(ProcessError::TerminateTimeout)
-                }
-            },
-            grace,
-            Duration::ZERO,
-            ceiling,
-        );
-        (result, calls.into_inner())
-    }
-
-    const RUNNING: StopObservation = StopObservation::Running(1);
-
-    #[test]
-    fn stopped_and_unknown_never_signal() {
-        let (result, calls) = scenario(&[StopObservation::Stopped], true, true);
-        assert!(result.is_ok());
-        assert_eq!(calls, ["state"]);
-        let (result, calls) = scenario(&[StopObservation::Unobservable], true, true);
-        assert!(matches!(result, Err(ProcessError::UnknownState)));
-        assert_eq!(calls, ["state"]);
-    }
-
-    #[test]
-    fn graceful_exit_does_not_force() {
-        let (result, calls) = scenario(&[RUNNING, StopObservation::Stopped], true, true);
-        assert!(result.is_ok());
-        assert_eq!(calls, ["state", "graceful", "state"]);
-    }
-
-    #[test]
-    fn force_after_short_grace_requires_verified_exit() {
-        for graceful_ok in [true, false] {
-            for force_ok in [true, false] {
-                let (result, calls) = scenario(
-                    &[RUNNING, RUNNING, StopObservation::Stopped],
-                    graceful_ok,
-                    force_ok,
-                );
-                assert!(result.is_ok());
-                assert_eq!(calls, ["state", "graceful", "state", "force", "state"]);
+    impl Fake {
+        fn new(counts: &[StopObservation], visible: &[Option<bool>]) -> Self {
+            Self {
+                counts: counts.to_vec(),
+                visible: visible.to_vec(),
+                close_result: Ok(()),
+                stops_after_forces: None,
+                calls: Vec::new(),
+                forces: 0,
             }
         }
-        for last in [RUNNING, StopObservation::Unobservable] {
-            for force_ok in [true, false] {
-                assert!(scenario(&[RUNNING, RUNNING, last], false, force_ok)
-                    .0
-                    .is_err());
-            }
-        }
-        // Being unable to observe *after* the close was signalled must not abandon
-        // it. The user already confirmed the force, `taskkill` needs no
-        // observation, and every write downstream is gated on its own verified
-        // stop — aborting here left the editor half-closed with the takeover
-        // still applied. An unobservable system before anything is signalled is
-        // a different matter, and is covered above.
-        let (result, calls) = scenario(
-            &[
-                RUNNING,
-                StopObservation::Unobservable,
-                StopObservation::Stopped,
-            ],
-            false,
-            true,
-        );
-        assert!(result.is_ok(), "{result:?}");
-        assert!(calls.contains(&"force"));
     }
 
-    /// Running out of time is not the same as being unable to look. Reporting a
-    /// still-terminating editor as "cannot safely determine process state" both
-    /// tells the user the wrong thing and — because every caller treats unknown as
-    /// fatal — makes the one error that describes the real condition unreachable.
-    #[test]
-    fn exhausting_the_wait_reports_termination_timeout_not_unknown_state() {
-        // Mimics the real observer, which reports a state it never sampled once
-        // the deadline it was handed has passed.
-        let observe = |deadline: Instant| {
-            if Instant::now() >= deadline {
-                StopObservation::Unobservable
+    impl KiroControl for Fake {
+        fn observe(&mut self) -> StopObservation {
+            self.calls.push("observe");
+            if self.stops_after_forces.is_some_and(|n| self.forces >= n) {
+                return StopObservation::Stopped;
+            }
+            if self.counts.len() > 1 {
+                self.counts.remove(0)
             } else {
-                RUNNING
+                self.counts[0]
             }
-        };
-        let result = stop_for_restore_with(
-            observe,
-            || Ok(()),
-            |_| Ok(()),
-            Duration::from_millis(60),
-            Duration::from_secs(30),
-            Duration::from_millis(120),
-        );
-        assert!(
-            matches!(result, Err(ProcessError::TerminateTimeout)),
-            "expected a termination timeout, got {result:?}"
-        );
+        }
+        fn request_close(&mut self) -> Result<(), ProcessError> {
+            self.calls.push("close");
+            std::mem::replace(&mut self.close_result, Ok(()))
+        }
+        fn window_visible(&mut self) -> Option<bool> {
+            self.calls.push("visible");
+            if self.visible.len() > 1 {
+                self.visible.remove(0)
+            } else {
+                self.visible[0]
+            }
+        }
+        fn force(&mut self) -> Result<(), ProcessError> {
+            self.calls.push("force");
+            self.forces += 1;
+            Ok(())
+        }
     }
 
-    /// The graceful phase must wait out its whole window. A process count that
-    /// stops falling there most likely means the editor is holding a save/cancel
-    /// prompt in front of the user, which is the one moment not to force-kill.
-    #[test]
-    fn a_stalled_count_during_grace_does_not_shortcut_to_force() {
-        let calls = RefCell::new(Vec::new());
-        let started = Instant::now();
-        let result = stop_for_restore_with(
-            |_| {
-                calls.borrow_mut().push("state");
-                // Never exits, and never makes progress either.
-                StopObservation::Running(3)
-            },
-            || Ok(()),
-            |_| {
-                calls.borrow_mut().push("force");
-                Ok(())
-            },
-            Duration::from_millis(250),
-            Duration::from_millis(10),
-            Duration::from_millis(400),
-        );
-        assert!(result.is_err());
-        let calls = calls.into_inner();
-        let first_force = calls.iter().position(|c| *c == "force").expect("force");
-        assert!(
-            first_force > 2,
-            "forced after {first_force} observations; the grace window was skipped"
-        );
-        assert!(started.elapsed() >= Duration::from_millis(250));
-    }
+    const FAST: StopTimings = StopTimings {
+        grace: Duration::from_millis(150),
+        stall: Duration::from_millis(100),
+        headless_ceiling: Duration::from_millis(300),
+        force_ceiling: Duration::from_millis(600),
+    };
+    const RUNNING: StopObservation = StopObservation::Running(3);
 
-    /// A shutdown still making progress must not be cut short, however long it
-    /// takes: teardown scales with workspace size, extensions and disk.
     #[test]
-    fn steady_progress_keeps_the_stall_clock_from_expiring() {
-        let remaining = RefCell::new(8usize);
-        let result = stop_for_restore_with(
-            |_| {
-                let mut remaining = remaining.borrow_mut();
-                if *remaining == 0 {
-                    return StopObservation::Stopped;
-                }
-                *remaining -= 1;
-                StopObservation::Running(*remaining)
-            },
-            || Err(ProcessError::TerminateTimeout),
-            |_| Ok(()),
-            Duration::ZERO,
-            Duration::from_millis(80),
-            Duration::from_secs(30),
-        );
-        assert!(result.is_ok(), "{result:?}");
-    }
-
-    /// The measured shutdown went 9 -> 11 before it fell. A count that rises, or
-    /// holds while one process blocks the rest, is a shutdown still working — not
-    /// a stalled one — and cutting it off refuses a restore that was about to
-    /// succeed, with most of the ceiling unspent.
-    #[test]
-    fn a_rising_then_falling_count_is_progress_not_a_stall() {
-        let counts = RefCell::new(vec![9usize, 10, 11, 11, 10, 6, 2].into_iter());
-        let result = stop_for_restore_with(
-            |_| match counts.borrow_mut().next() {
-                Some(remaining) => StopObservation::Running(remaining),
-                None => StopObservation::Stopped,
-            },
-            || Err(ProcessError::TerminateTimeout),
-            |_| Ok(()),
-            Duration::ZERO,
-            Duration::from_millis(120),
-            Duration::from_secs(30),
-        );
-        assert!(result.is_ok(), "{result:?}");
-    }
-
-    /// `taskkill /F /IM` enumerates its targets once, so a helper spawned after
-    /// that sweep survives it. Refusing the whole restore rather than sweeping
-    /// again would leave the customer unable to restore at all.
-    #[test]
-    fn a_survivor_spawned_after_the_sweep_is_swept_again() {
-        let forces = RefCell::new(0usize);
-        let observations = RefCell::new(0usize);
-        let result = stop_for_restore_with(
-            |_| {
-                *observations.borrow_mut() += 1;
-                // One straggler outlives the first sweep and never moves; only a
-                // second sweep clears it.
-                if *forces.borrow() >= 2 {
-                    StopObservation::Stopped
-                } else {
-                    StopObservation::Running(1)
-                }
-            },
-            || Err(ProcessError::TerminateTimeout),
-            |_| {
-                *forces.borrow_mut() += 1;
-                Ok(())
-            },
-            Duration::ZERO,
-            Duration::from_millis(60),
-            Duration::from_millis(900),
-        );
-        assert!(result.is_ok(), "{result:?}");
-        assert!(*forces.borrow() >= 2, "the sweep was never repeated");
-        assert!(*observations.borrow() > 2);
+    fn nothing_running_or_nothing_observable_means_nothing_is_sent() {
+        let mut fake = Fake::new(&[StopObservation::Stopped], &[Some(false)]);
+        assert!(stop_with(&mut fake, false, &FAST).is_ok());
+        assert_eq!(fake.calls, ["observe"]);
+        let mut fake = Fake::new(&[StopObservation::Unobservable], &[Some(false)]);
+        assert!(matches!(
+            stop_with(&mut fake, false, &FAST),
+            Err(ProcessError::UnknownState)
+        ));
+        assert_eq!(fake.calls, ["observe"]);
     }
 
     #[test]
-    fn windows_force_is_exact_image_without_process_tree() {
-        let command = restore_force_windows_command();
-        assert_eq!(command.get_program(), "taskkill.exe");
+    fn an_editor_that_closes_itself_is_never_forced() {
+        let mut fake = Fake::new(
+            &[RUNNING, RUNNING, StopObservation::Stopped],
+            &[Some(false)],
+        );
+        assert!(stop_with(&mut fake, false, &FAST).is_ok());
+        assert!(!fake.calls.contains(&"force"));
+        assert_eq!(fake.calls.iter().filter(|c| **c == "close").count(), 1);
+    }
+
+    /// The case that used to lose work: the editor is showing its save prompt when time
+    /// runs out. A window on screen is never ended without the user saying so.
+    #[test]
+    fn a_window_still_on_screen_is_reported_not_killed() {
+        let mut fake = Fake::new(&[RUNNING], &[Some(true)]);
+        assert!(matches!(
+            stop_with(&mut fake, false, &FAST),
+            Err(ProcessError::StillOpen)
+        ));
+        assert!(!fake.calls.contains(&"force"));
         assert_eq!(
-            command.get_args().collect::<Vec<_>>(),
-            ["/F", "/IM", "Kiro.exe"]
+            fake.calls.iter().filter(|c| **c == "close").count(),
+            1,
+            "the close request must never be repeated"
         );
+    }
+
+    /// Where windows cannot be seen (macOS, Linux) there is no evidence Kiro is headless.
+    #[test]
+    fn unknown_visibility_counts_as_visible() {
+        let mut fake = Fake::new(&[RUNNING], &[None]);
+        assert!(matches!(
+            stop_with(&mut fake, false, &FAST),
+            Err(ProcessError::StillOpen)
+        ));
+        assert!(!fake.calls.contains(&"force"));
+    }
+
+    /// Unable to look after asking Kiro to close: no evidence, no force.
+    #[test]
+    fn losing_sight_of_the_processes_never_leads_to_a_kill() {
+        let mut fake = Fake::new(&[RUNNING, StopObservation::Unobservable], &[Some(false)]);
+        assert!(matches!(
+            stop_with(&mut fake, false, &FAST),
+            Err(ProcessError::UnknownState)
+        ));
+        assert!(!fake.calls.contains(&"force"));
+    }
+
+    /// Every window is gone and the remaining processes have stopped making progress:
+    /// ending that teardown loses no document.
+    #[test]
+    fn stalled_headless_teardown_is_ended() {
+        let mut fake = Fake::new(&[RUNNING], &[Some(false)]);
+        fake.stops_after_forces = Some(1);
+        assert!(stop_with(&mut fake, false, &FAST).is_ok());
+        assert_eq!(fake.forces, 1);
+    }
+
+    /// Teardown still making progress is waited for, not cut short.
+    #[test]
+    fn headless_teardown_making_progress_is_left_to_finish() {
+        let mut counts: Vec<_> = std::iter::repeat_n(RUNNING, 4).collect();
+        counts.extend([4usize, 3, 2, 1].map(StopObservation::Running));
+        counts.push(StopObservation::Stopped);
+        // Hold at 3 through the grace window, then count down after it.
+        let mut fake = Fake::new(&counts, &[Some(false)]);
+        let timings = StopTimings {
+            grace: Duration::from_millis(120),
+            ..FAST
+        };
+        assert!(stop_with(&mut fake, false, &timings).is_ok());
+        assert!(!fake.calls.contains(&"force"));
+    }
+
+    /// A window that reappears while teardown was being waited for is the user opening
+    /// Kiro again.
+    #[test]
+    fn a_reopened_window_cancels_the_force() {
+        let mut fake = Fake::new(&[RUNNING], &[Some(false), Some(true)]);
+        assert!(matches!(
+            stop_with(&mut fake, false, &FAST),
+            Err(ProcessError::StillOpen)
+        ));
+        assert!(!fake.calls.contains(&"force"));
+    }
+
+    /// With the user's explicit confirmation there is no second close request and no
+    /// second wait.
+    #[test]
+    fn a_confirmed_force_does_not_ask_again() {
+        let mut fake = Fake::new(&[RUNNING], &[Some(true)]);
+        fake.stops_after_forces = Some(1);
+        assert!(stop_with(&mut fake, true, &FAST).is_ok());
+        assert!(!fake.calls.contains(&"close"));
+        assert!(!fake.calls.contains(&"visible"));
+        assert_eq!(fake.forces, 1);
+    }
+
+    /// An elevated Kiro cannot be asked to close; say so at once instead of waiting.
+    #[test]
+    fn an_elevated_editor_is_reported_immediately() {
+        let mut fake = Fake::new(&[RUNNING], &[Some(true)]);
+        fake.close_result = Err(ProcessError::Elevated);
+        let started = Instant::now();
+        assert!(matches!(
+            stop_with(&mut fake, false, &FAST),
+            Err(ProcessError::Elevated)
+        ));
+        assert!(started.elapsed() < FAST.grace);
+    }
+
+    /// A process born after a sweep survives it; sweep again while there is time.
+    #[test]
+    fn a_survivor_of_the_first_sweep_is_swept_again() {
+        let mut fake = Fake::new(&[StopObservation::Running(1)], &[Some(false)]);
+        fake.stops_after_forces = Some(2);
+        let timings = StopTimings {
+            force_ceiling: Duration::from_millis(900),
+            ..FAST
+        };
+        assert!(stop_with(&mut fake, true, &timings).is_ok());
+        assert!(fake.forces >= 2);
+    }
+
+    /// Running out of time is not the same as being unable to look.
+    #[test]
+    fn exhausting_every_wait_reports_termination_timeout() {
+        let mut fake = Fake::new(&[RUNNING], &[Some(false)]);
+        assert!(matches!(
+            stop_with(&mut fake, true, &FAST),
+            Err(ProcessError::TerminateTimeout)
+        ));
+    }
+
+    /// The worst case must fit inside the 125s the client waits before giving up.
+    #[test]
+    fn the_whole_sequence_fits_inside_the_client_timeout() {
+        let t = &TIMINGS;
+        let worst = t.grace
+            + t.headless_ceiling
+            + t.force_ceiling
+            + SIGNAL_BUDGET
+            + Duration::from_secs(2 * 2); // two double-read visibility checks
+        assert!(worst < Duration::from_secs(110), "{worst:?}");
     }
 
     #[test]

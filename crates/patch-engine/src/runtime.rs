@@ -74,6 +74,12 @@ pub(crate) fn detect_kiro_process_state_until(deadline: std::time::Instant) -> P
 #[cfg(windows)]
 pub(crate) fn process_count_until(image_name: &str, deadline: std::time::Instant) -> Option<usize> {
     loop {
+        // Only this user's session: another session's Kiro is someone else's editor and
+        // must not block this user's takeover or restore. If sessions cannot be read,
+        // count every session — for a gate, over-counting is the safe mistake.
+        if let Ok(pids) = crate::windows_process::session_processes(image_name) {
+            return Some(pids.len());
+        }
         match crate::windows_process::enumerate() {
             Ok(entries) => {
                 return Some(

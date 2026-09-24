@@ -239,7 +239,7 @@ impl DesktopSession {
             .await
             .map_err(|e| format!("[connection:authenticate] {e}"))?;
         if close_confirmed {
-            crate::stop_kiro(std::time::Duration::from_secs(30))
+            crate::process::stop_kiro_for_takeover()
                 .map_err(|e| format!("[connection:close] {e}"))?;
         } else {
             crate::ensure_kiro_stopped().map_err(|e| format!("[connection:close] {e}"))?;

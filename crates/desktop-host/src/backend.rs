@@ -567,15 +567,18 @@ fn unbind_gateway(session_gateway: Option<&str>, body: &Value) -> Result<String,
 fn confirmed_restore_stop(
     body: &Value,
     pending: bool,
-    stop: impl FnOnce() -> Result<(), patch_engine::process::ProcessError>,
+    stop: impl FnOnce(bool) -> Result<(), patch_engine::process::ProcessError>,
 ) -> Result<(), String> {
     if body.get("close_kiro_confirmed").and_then(Value::as_bool) != Some(true) {
         return Err(
             "Explicit close_kiro_confirmed: true is required to close Kiro and restore".into(),
         );
     }
+    // Ending Kiro with a window still open needs its own, second confirmation, given only
+    // after the user has been told Kiro would not close. Parsed as strictly as the first.
+    let force = body.get("force_close_confirmed").and_then(Value::as_bool) == Some(true);
     if pending {
-        stop().map_err(|e| format!("Cannot stop Kiro for restore: {e}"))?;
+        stop(force).map_err(|e| format!("Cannot stop Kiro for restore: {e}"))?;
     }
     Ok(())
 }
@@ -732,7 +735,7 @@ mod tests {
     use super::*;
     #[test]
     fn restore_without_local_changes_never_stops_official_kiro() {
-        confirmed_restore_stop(&json!({"close_kiro_confirmed":true}), false, || {
+        confirmed_restore_stop(&json!({"close_kiro_confirmed":true}), false, |_| {
             panic!("verification-only sessions must not close Kiro")
         })
         .unwrap();
@@ -1350,13 +1353,13 @@ mod restore_confirmation_tests {
             json!({"close_kiro_confirmed":1}),
             json!({"close_kiro_confirmed":null}),
         ] {
-            assert!(confirmed_restore_stop(&body, true, || panic!(
+            assert!(confirmed_restore_stop(&body, true, |_| panic!(
                 "must not stop without consent"
             ))
             .is_err());
         }
         let called = std::cell::Cell::new(false);
-        confirmed_restore_stop(&json!({"close_kiro_confirmed":true}), true, || {
+        confirmed_restore_stop(&json!({"close_kiro_confirmed":true}), true, |_| {
             called.set(true);
             Ok(())
         })
@@ -1366,7 +1369,7 @@ mod restore_confirmation_tests {
 
     #[test]
     fn failed_stop_prevents_restore() {
-        let result = confirmed_restore_stop(&json!({"close_kiro_confirmed":true}), true, || {
+        let result = confirmed_restore_stop(&json!({"close_kiro_confirmed":true}), true, |_| {
             Err(patch_engine::process::ProcessError::UnknownState)
         })
         .map(|_| -> Result<(), String> { panic!("must not restore after failed stop") });

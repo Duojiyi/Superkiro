@@ -17,6 +17,7 @@ export const errorMessages: Record<string, string> = {
   'SK-CONNECT-002': '未能关闭 Kiro，请保存文件并手动退出后重试。',
   'SK-CONNECT-003': '连接配置应用失败，请检查文件占用与权限；有待恢复配置时请先还原。',
   'SK-CONNECT-004': 'Kiro 启动失败，请确认安装完整性及配置状态。',
+  'SK-CONNECT-005': 'Kiro 仍未关闭，可能正在询问是否保存更改。请回到 Kiro 保存并关闭后重试。',
   'SK-RESTORE-001': '本地配置还原未完成，请保留备份并重试还原。',
   'SK-LOCAL-001': '本地操作权限不足，请检查文件占用及系统权限。',
   'SK-LOCAL-002': '已有操作正在处理，请等待状态确认，不要重复操作。',

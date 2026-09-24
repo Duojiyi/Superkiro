@@ -32,6 +32,7 @@ const CODES: &[&str] = &[
     "SK-CONNECT-002",
     "SK-CONNECT-003",
     "SK-CONNECT-004",
+    "SK-CONNECT-005",
     "SK-RESTORE-001",
     "SK-BIND-004",
     "SK-LOCAL-001",
@@ -106,6 +107,11 @@ pub fn classify(raw: &str, path: &str, method: &str) -> Value {
         // reports "[connection:close] Timed out ..." (desktop.rs), restore and
         // unbind report "Cannot stop Kiro for restore: ..." (backend.rs), and
         // unbind's own precondition reports "Kiro IDE is currently running ...".
+        // Kiro would not close and still has a window on screen, most likely its save
+        // prompt. Distinct from other close failures because it is the one case where
+        // ending Kiro, with the user's explicit say-so, can help.
+        } else if lower.contains("kiro is still open") {
+            "SK-CONNECT-005"
         } else if stage == "close"
             || lower.contains("cannot stop kiro")
             || lower.contains("kiro ide is currently running")
@@ -215,6 +221,9 @@ mod tests {
                 "Cannot stop Kiro for restore: Cannot safely determine Kiro process state",
                 "SK-CONNECT-002",
             ),
+            ("Cannot stop Kiro for restore: Kiro is still open; it may be asking whether to save changes", "SK-CONNECT-005"),
+            ("[connection:close] Kiro is still open; it may be asking whether to save changes", "SK-CONNECT-005"),
+            ("Cannot stop Kiro for restore: Kiro is running as administrator and cannot be closed from here; close it yourself and retry", "SK-CONNECT-002"),
             ("timed out", "SK-NET-001"),
             ("network", "SK-NET-002"),
             ("TLS certificate", "SK-NET-003"),
