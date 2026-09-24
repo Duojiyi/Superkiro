@@ -33,6 +33,10 @@ async fn test_doctor_diagnostics() {
     };
     let agent_dir = app_dir.join("extensions/kiro.kiro-agent");
     fs::create_dir_all(agent_dir.join("dist")).unwrap();
+    if cfg!(target_os = "macos") {
+        fs::create_dir_all(install_dir.join("Contents/MacOS")).unwrap();
+        fs::write(install_dir.join("Contents/MacOS/Kiro"), "").unwrap();
+    }
     fs::write(
         app_dir.join("product.json"),
         r#"{"nameShort":"Kiro","win32MutexName":"kiro"}"#,

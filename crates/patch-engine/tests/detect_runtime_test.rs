@@ -13,8 +13,17 @@ fn test_candidate_paths_are_available_without_reading_host_installation() {
 
 #[test]
 fn test_inspect_synthetic_sandbox_installation() {
-    let sandbox_dir =
+    let sandbox_root =
         std::env::temp_dir().join(format!("kiro_test_sandbox_{}", std::process::id()));
+    // On macOS only a bundle named Kiro.app with its executable is an installation.
+    let sandbox_dir = if cfg!(target_os = "macos") {
+        let bundle = sandbox_root.join("Kiro.app");
+        fs::create_dir_all(bundle.join("Contents/MacOS")).unwrap();
+        fs::write(bundle.join("Contents/MacOS/Kiro"), "").unwrap();
+        bundle
+    } else {
+        sandbox_root.clone()
+    };
     let app_dir = if cfg!(target_os = "macos") {
         sandbox_dir.join("Contents/Resources/app")
     } else {
@@ -70,18 +79,25 @@ fn test_inspect_synthetic_sandbox_installation() {
     assert_eq!(installation.agent_version.as_deref(), Some("1.0.794"));
 
     // Cleanup
-    let _ = fs::remove_dir_all(sandbox_dir);
+    let _ = fs::remove_dir_all(sandbox_root);
 }
 
 #[test]
 fn test_invalid_installation_detection() {
-    let empty_dir = std::env::temp_dir().join(format!("kiro_empty_{}", std::process::id()));
+    let empty_root = std::env::temp_dir().join(format!("kiro_empty_{}", std::process::id()));
+    // On macOS an empty directory is first refused for its name; name it as a bundle so
+    // the missing contents are what is found wanting on every platform.
+    let empty_dir = if cfg!(target_os = "macos") {
+        empty_root.join("Kiro.app")
+    } else {
+        empty_root.clone()
+    };
     fs::create_dir_all(&empty_dir).unwrap();
 
     let res = inspect_installation_dir(&empty_dir);
     assert!(matches!(res, Err(DetectError::InvalidInstallation(_))));
 
-    let _ = fs::remove_dir_all(empty_dir);
+    let _ = fs::remove_dir_all(empty_root);
 }
 
 #[test]
