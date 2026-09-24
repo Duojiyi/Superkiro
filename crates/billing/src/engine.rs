@@ -481,7 +481,12 @@ impl PendingSettlementRecovery {
         // the current in-memory state, so an intent that could only be kept in memory
         // during the outage becomes durable here rather than being lost on restart.
         if !engine.persistence_ready() {
-            let _ = engine.probe_persistence();
+            // Logged, because the only other visible error is the original write failure:
+            // an operator could not tell a probe refusing the in-memory state from an
+            // outage that is still going on.
+            if let Err(error) = engine.probe_persistence() {
+                eprintln!("[kiro-billing] persistence probe failed: {error}");
+            }
         }
         let ids: std::collections::HashSet<_> = engine
             .pending_settlements
