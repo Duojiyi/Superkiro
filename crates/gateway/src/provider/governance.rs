@@ -39,6 +39,9 @@ pub enum GovernanceError {
     Provider(#[from] ProviderError),
 }
 
+/// The longest a key rests after repeated transient failures before it is tried again.
+pub const MAX_KEY_BACKOFF: Duration = Duration::from_secs(15 * 60);
+
 /// Internal state entry for each key in the pool, tracking SWRR current weight and cooldown.
 #[derive(Debug, Clone)]
 struct KeyEntry {
@@ -221,14 +224,20 @@ impl ProviderKeyPool {
     }
 
     /// Mark a key failure and apply cooldown (Spec §14.3).
+    ///
+    /// Failures from a fifth in a row on double the cooldown each time, up to
+    /// [`MAX_KEY_BACKOFF`], but never retire the key: a rate limit or a provider incident
+    /// passes. When a cooldown ends, the next request is the key's trial, and a success
+    /// restores it. Only an invalid key is retired, by [`Self::mark_key_unhealthy`].
     pub fn mark_key_failure(&self, key_id: &str, now_secs: u64, cooldown: Duration) {
         let mut guard = self.inner.lock().unwrap();
         if let Some(entry) = guard.keys.iter_mut().find(|e| e.key.id == key_id) {
-            entry.consecutive_failures += 1;
-            entry.key.mark_failure(now_secs, cooldown);
-            if entry.consecutive_failures >= 5 {
-                entry.key.health_state = HealthState::Unhealthy;
-            }
+            entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+            let doublings = entry.consecutive_failures.saturating_sub(4).min(10);
+            let backoff = cooldown
+                .saturating_mul(1 << doublings)
+                .min(MAX_KEY_BACKOFF.max(cooldown));
+            entry.key.mark_failure(now_secs, backoff);
         }
     }
 

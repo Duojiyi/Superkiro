@@ -391,3 +391,38 @@ fn configuration_refresh_preserves_cooldown_but_rotation_recovers() {
     pool.add_key(ProviderKey::new("a", "p", "new-secret"));
     assert!(pool.select_key(110, &[]).is_ok());
 }
+
+// A provider incident or a rate limit passes; the key must come back when it does.
+#[test]
+fn repeated_transient_failures_back_off_but_never_retire_a_key() {
+    use gateway::provider::governance::MAX_KEY_BACKOFF;
+    let provider = Provider::new("p", "P", ProviderFormat::OpenAi, "https://example.invalid");
+    let pool = ProviderKeyPool::new(provider, vec![ProviderKey::new("k", "p", "secret")]);
+    let cooldown = Duration::from_secs(60);
+    let mut now = 1_000u64;
+    let mut last_rest = 0;
+    for failure in 1..=12 {
+        let key = pool
+            .select_key(now, &[])
+            .unwrap_or_else(|error| panic!("failure {failure}: the key was retired: {error}"));
+        pool.mark_key_failure(&key.id, now, cooldown);
+        let rest = pool.list_keys()[0].cooldown_until.unwrap() - now;
+        assert!(
+            rest >= last_rest && rest <= MAX_KEY_BACKOFF.as_secs(),
+            "failure {failure}: {rest}s"
+        );
+        last_rest = rest;
+        now += rest;
+    }
+    assert_eq!(
+        last_rest,
+        MAX_KEY_BACKOFF.as_secs(),
+        "backs off to the ceiling"
+    );
+    // Once the rest is over the key is tried, and a success restores it fully.
+    let key = pool.select_key(now, &[]).unwrap();
+    pool.mark_key_success(&key.id);
+    assert_eq!(pool.list_keys()[0].health_state, HealthState::Healthy);
+    pool.mark_key_failure(&key.id, now, cooldown);
+    assert_eq!(pool.list_keys()[0].cooldown_until.unwrap() - now, 60);
+}
