@@ -589,7 +589,11 @@ fn traces_ride_along_with_the_next_commit_instead_of_saving_on_their_own() {
         attempt_chain: Vec::new(),
     });
     engine.finish_trace("inv-trace", TraceStatus::Success, None);
-    assert_eq!(engine.snapshot_sequence(), saves, "a trace costs no save of its own");
+    assert_eq!(
+        engine.snapshot_sequence(),
+        saves,
+        "a trace costs no save of its own"
+    );
 
     // The next commit carries it.
     engine
