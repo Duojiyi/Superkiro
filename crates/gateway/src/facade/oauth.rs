@@ -25,6 +25,10 @@ pub struct OAuthTokenResponse {
     pub refresh_token: String,
     pub profile_arn: String,
     pub expires_at: String,
+    /// Seconds until `expires_at`. Kiro computes its own expiry as
+    /// `now + expiresIn * 1000` and throws when the field is missing — after the
+    /// refresh token has already been rotated, which then logs the user out.
+    pub expires_in: u64,
     pub auth_method: String,
     pub provider: String,
 }
@@ -36,6 +40,10 @@ pub struct RefreshTokenResponse {
     pub refresh_token: String,
     pub profile_arn: String,
     pub expires_at: String,
+    /// Seconds until `expires_at`. Kiro computes its own expiry as
+    /// `now + expiresIn * 1000` and throws when the field is missing — after the
+    /// refresh token has already been rotated, which then logs the user out.
+    pub expires_in: u64,
 }
 
 #[derive(Deserialize)]
@@ -102,6 +110,7 @@ impl FacadeHandler for OAuthTokenHandler {
                         "arn:aws:codewhisperer:us-east-1:123456789012:profile/KIRO_BYOK_DEFAULT"
                             .to_string(),
                     expires_at: "2030-01-01T00:00:00.000Z".to_string(),
+                    expires_in: 3600,
                     auth_method: "social".to_string(),
                     provider: "Google".to_string(),
                 };
@@ -353,6 +362,7 @@ impl FacadeHandler for OAuthTokenHandler {
                 refresh_token,
                 profile_arn,
                 expires_at,
+                expires_in: ttl_secs,
                 auth_method: "social".to_string(),
                 provider: "Google".to_string(),
             };
@@ -367,6 +377,9 @@ fn refresh_auth_error(error: AuthError) -> Response {
     let (status, kind, message) = error.to_aws_error();
     error_response(status, kind, &message)
 }
+
+/// Lifetime of the access token issued by a refresh.
+const REFRESH_ACCESS_TTL_SECS: u64 = 3600;
 
 /// Handler for `POST /refreshToken`
 #[derive(Clone, Default)]
@@ -407,6 +420,7 @@ impl FacadeHandler for RefreshTokenHandler {
                         "arn:aws:codewhisperer:us-east-1:123456789012:profile/KIRO_BYOK_DEFAULT"
                             .to_string(),
                     expires_at: "2030-01-01T00:00:00.000Z".to_string(),
+                    expires_in: 3600,
                 };
                 return json_response(StatusCode::OK, &resp);
             }
@@ -446,11 +460,12 @@ impl FacadeHandler for RefreshTokenHandler {
             };
 
             let raw_rt = payload.refresh_token.unwrap_or_default();
-            let (claims, access_token, rotated_refresh_token) =
-                match auth_state.rotate_refresh_token(&raw_rt, 3600, 30 * 86400) {
-                    Ok(pair) => pair,
-                    Err(error) => return refresh_auth_error(error),
-                };
+            let (claims, access_token, rotated_refresh_token) = match auth_state
+                .rotate_refresh_token(&raw_rt, REFRESH_ACCESS_TTL_SECS, 30 * 86400)
+            {
+                Ok(pair) => pair,
+                Err(error) => return refresh_auth_error(error),
+            };
             let card_id = claims.card_id;
             let expected_version = claims.token_version;
 
@@ -480,13 +495,14 @@ impl FacadeHandler for RefreshTokenHandler {
                 "arn:aws:codewhisperer:us-east-1:123456789012:profile/{}",
                 card.group_id
             );
-            let expires_at = format_epoch_to_iso8601(now_secs + 3600);
+            let expires_at = format_epoch_to_iso8601(now_secs + REFRESH_ACCESS_TTL_SECS);
 
             let resp = RefreshTokenResponse {
                 access_token,
                 refresh_token: rotated_refresh_token,
                 profile_arn,
                 expires_at,
+                expires_in: REFRESH_ACCESS_TTL_SECS,
             };
 
             json_response(StatusCode::OK, &resp)
