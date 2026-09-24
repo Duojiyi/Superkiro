@@ -112,6 +112,13 @@ extern "system" {
         size: *mut u32,
     ) -> i32;
     fn TerminateProcess(process: *mut c_void, code: u32) -> i32;
+    fn GetProcessTimes(
+        process: *mut c_void,
+        creation: *mut u64,
+        exit: *mut u64,
+        kernel: *mut u64,
+        user: *mut u64,
+    ) -> i32;
 }
 type EnumWindowsProc = unsafe extern "system" fn(window: *mut c_void, context: isize) -> i32;
 #[link(name = "user32")]
@@ -124,27 +131,37 @@ extern "system" {
     fn PostMessageW(window: *mut c_void, message: u32, wparam: usize, lparam: isize) -> i32;
 }
 
-/// PIDs of processes named `image` in this client's own session.
+/// A process of this user, as the file-safety gate and the stop policy see it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UserProcess {
+    pub pid: u32,
+    /// In the client's own session, the only one whose windows it can ask to close.
+    pub own_session: bool,
+}
+
+/// Processes named `image` that belong to this user, in any of the user's sessions.
 ///
-/// Sessions come from `WTSEnumerateProcessesW`, which reports every process without
-/// opening it. Asking per process (`ProcessIdToSessionId`) fails with access denied for
-/// anything the client cannot open — an elevated Kiro included — and treating that as
-/// "not ours" would let the client rewrite files under a live editor. Another session's
-/// Kiro, on the other hand, belongs to someone else: it must neither block this user nor
-/// be closed or killed by them.
-pub(crate) fn session_processes(image: &str) -> io::Result<Vec<u32>> {
-    let mut own = 0u32;
-    if unsafe { ProcessIdToSessionId(std::process::id(), &mut own) } == 0 {
+/// Owners come from `WTSEnumerateProcessesW`, which reports every process without opening
+/// it. Asking per process fails with access denied for anything the client cannot open, an
+/// elevated Kiro included, and treating that as "not ours" would let the client rewrite
+/// files under a live editor; an owner that is not reported counts as this user for the
+/// same reason. The same user's Kiro in a disconnected session still writes this user's
+/// settings and token, so it counts. Another user's Kiro never touches them, so it neither
+/// blocks this user nor is closed or ended by them.
+pub(crate) fn user_processes(image: &str) -> io::Result<Vec<UserProcess>> {
+    let mut own_session = 0u32;
+    if unsafe { ProcessIdToSessionId(std::process::id(), &mut own_session) } == 0 {
         return Err(io::Error::last_os_error());
     }
+    let me = crate::windows_security::current_user_sid()?;
     let (mut info, mut count) = (std::ptr::null_mut(), 0u32);
     if unsafe { WTSEnumerateProcessesW(std::ptr::null_mut(), 0, 1, &mut info, &mut count) } == 0 {
         return Err(io::Error::last_os_error());
     }
     let entries = unsafe { std::slice::from_raw_parts(info, count as usize) };
-    let pids = entries
+    let found = entries
         .iter()
-        .filter(|entry| entry.session == own && !entry.name.is_null())
+        .filter(|entry| !entry.name.is_null())
         .filter(|entry| {
             let name = unsafe {
                 let length = (0..).take_while(|&i| *entry.name.add(i) != 0).count();
@@ -152,10 +169,47 @@ pub(crate) fn session_processes(image: &str) -> io::Result<Vec<u32>> {
             };
             name.eq_ignore_ascii_case(image)
         })
-        .map(|entry| entry.pid)
+        .filter(|entry| {
+            entry.sid.is_null()
+                || unsafe { crate::windows_security::sid_to_string(entry.sid) }
+                    .map_or(true, |sid| sid == me)
+        })
+        .map(|entry| UserProcess {
+            pid: entry.pid,
+            own_session: entry.session == own_session,
+        })
         .collect();
     unsafe { WTSFreeMemory(info.cast()) };
-    Ok(pids)
+    Ok(found)
+}
+
+/// Every process's parent, from one snapshot.
+pub(crate) fn parents() -> io::Result<std::collections::HashMap<u32, u32>> {
+    Ok(enumerate()?
+        .into_iter()
+        .map(|(pid, parent, _)| (pid, parent))
+        .collect())
+}
+
+/// When `pid` was created. With the PID it names one process for good: a PID is reused,
+/// the pair is not.
+pub(crate) fn creation_time(pid: u32) -> io::Result<u64> {
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if raw.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let handle = Handle(raw);
+    handle_creation_time(&handle)
+}
+
+fn handle_creation_time(handle: &Handle) -> io::Result<u64> {
+    let (mut created, mut exited, mut kernel, mut user) = (0u64, 0u64, 0u64, 0u64);
+    if unsafe { GetProcessTimes(handle.0, &mut created, &mut exited, &mut kernel, &mut user) } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(created)
 }
 
 /// A top-level window belonging to one of the given processes.
@@ -205,9 +259,10 @@ pub(crate) fn request_close(window: &TopLevelWindow) -> io::Result<()> {
     Ok(())
 }
 
-/// Terminate `pid` only if it is still a process named `image`. The handle pins the
-/// process object, so a PID recycled after enumeration cannot be hit instead.
-pub(crate) fn terminate_if_named(pid: u32, image: &str) -> io::Result<()> {
+/// Terminate `pid` only if it is still the process named `image` created at `created`.
+/// Both are checked through the handle that is then used to terminate, which pins the
+/// process object, so a PID recycled after it was observed cannot be hit instead.
+pub(crate) fn terminate_if_same(pid: u32, image: &str, created: u64) -> io::Result<()> {
     const PROCESS_TERMINATE: u32 = 0x0001;
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
     let raw = unsafe {
@@ -228,7 +283,7 @@ pub(crate) fn terminate_if_named(pid: u32, image: &str) -> io::Result<()> {
     }
     let path = String::from_utf16_lossy(&buffer[..size as usize]);
     let name = path.rsplit(['\\', '/']).next().unwrap_or_default();
-    if !name.eq_ignore_ascii_case(image) {
+    if !name.eq_ignore_ascii_case(image) || handle_creation_time(&handle)? != created {
         return Ok(());
     }
     if unsafe { TerminateProcess(handle.0, 1) } == 0 {
@@ -258,27 +313,38 @@ pub(crate) fn working_set_mb(pid: u32) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn sessions_include_this_process_and_exclude_nothing_it_cannot_open() {
+    fn user_processes_include_this_process_and_exclude_other_users() {
         let own = std::env::current_exe().unwrap();
         let image = own.file_name().unwrap().to_string_lossy().into_owned();
-        let pids = super::session_processes(&image).unwrap();
-        assert!(pids.contains(&std::process::id()));
-        // System (PID 4) lives in session 0, which is never this test's session.
-        assert!(!super::session_processes("System").unwrap().contains(&4));
+        let found = super::user_processes(&image).unwrap();
+        assert!(found.contains(&super::UserProcess {
+            pid: std::process::id(),
+            own_session: true
+        }));
+        // lsass runs as LocalSystem: another user's process.
+        assert!(super::user_processes("lsass.exe").unwrap().is_empty());
+        // System (PID 4) has no reported owner, which counts as this user: for the gate,
+        // over-counting is the safe mistake.
+        assert!(super::user_processes("System")
+            .unwrap()
+            .iter()
+            .any(|p| p.pid == 4 && !p.own_session));
     }
 
     #[test]
-    fn terminate_refuses_a_process_with_another_name() {
+    fn terminate_refuses_another_name_and_another_creation_time() {
         let mut child = std::process::Command::new("cmd")
             .args(["/C", "ping -n 5 127.0.0.1 >NUL"])
             .spawn()
             .unwrap();
-        super::terminate_if_named(child.id(), "Kiro.exe").unwrap();
+        let created = super::creation_time(child.id()).unwrap();
+        super::terminate_if_same(child.id(), "Kiro.exe", created).unwrap();
+        super::terminate_if_same(child.id(), "cmd.exe", created + 1).unwrap();
         assert!(
             child.try_wait().unwrap().is_none(),
-            "a non-Kiro process was killed"
+            "a process that was not the one observed was killed"
         );
-        super::terminate_if_named(child.id(), "cmd.exe").unwrap();
+        super::terminate_if_same(child.id(), "cmd.exe", created).unwrap();
         assert!(child.wait().is_ok());
     }
 

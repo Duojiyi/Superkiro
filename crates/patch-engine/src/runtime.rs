@@ -74,11 +74,12 @@ pub(crate) fn detect_kiro_process_state_until(deadline: std::time::Instant) -> P
 #[cfg(windows)]
 pub(crate) fn process_count_until(image_name: &str, deadline: std::time::Instant) -> Option<usize> {
     loop {
-        // Only this user's session: another session's Kiro is someone else's editor and
-        // must not block this user's takeover or restore. If sessions cannot be read,
-        // count every session — for a gate, over-counting is the safe mistake.
-        if let Ok(pids) = crate::windows_process::session_processes(image_name) {
-            return Some(pids.len());
+        // This user's Kiro in any of their sessions: it reads and writes this user's
+        // settings and token. Another user's Kiro never does, so it must not block this
+        // user's takeover or restore. If owners cannot be read, count every process —
+        // for a gate, over-counting is the safe mistake.
+        if let Ok(found) = crate::windows_process::user_processes(image_name) {
+            return Some(found.len());
         }
         match crate::windows_process::enumerate() {
             Ok(entries) => {
@@ -149,23 +150,40 @@ fn unix_process_state_until(
     deadline: std::time::Instant,
 ) -> ProcessState {
     match crate::process::capture_helper_until(
-        Command::new("/bin/ps").args(["-A", "-ww", "-o", "comm="]),
+        Command::new("/bin/ps").args(["-A", "-ww", "-o", "uid=,comm="]),
         deadline,
     ) {
         Ok(bytes) => match std::str::from_utf8(&bytes) {
-            Ok(text) => process_names_state(text, matches),
+            Ok(text) => process_names_state(text, own_uid(), matches),
             Err(_) => ProcessState::Unknown,
         },
         Err(_) => ProcessState::Unknown,
     }
 }
 
+/// The user this client runs as.
+#[cfg(unix)]
+pub(crate) fn own_uid() -> u32 {
+    extern "C" {
+        fn getuid() -> u32;
+    }
+    unsafe { getuid() }
+}
+
+/// `ps -o uid=,comm=` output: Running if one of `uid`'s processes matches. Another user's
+/// Kiro never reads or writes this user's settings or token, so it does not count.
 #[cfg(any(unix, test))]
-fn process_names_state(text: &str, matches: impl Fn(&str) -> bool) -> ProcessState {
+fn process_names_state(text: &str, uid: u32, matches: impl Fn(&str) -> bool) -> ProcessState {
     let mut found_name = false;
-    for name in text.lines().map(str::trim).filter(|name| !name.is_empty()) {
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let Some((owner, name)) = line.split_once(char::is_whitespace) else {
+            return ProcessState::Unknown;
+        };
+        let (Ok(owner), name) = (owner.parse::<u32>(), name.trim()) else {
+            return ProcessState::Unknown;
+        };
         found_name = true;
-        if matches(name) {
+        if owner == uid && matches(name) {
             return ProcessState::Running;
         }
     }
@@ -435,22 +453,38 @@ mod unix_detection_tests {
         assert!(is_kiro_executable("kiro", false));
         assert!(is_kiro_executable("Kiro", false));
         // ps comm contains only the executable, even when argv mentions the Kiro bundle.
+        let kiro = |n: &str| is_kiro_executable(n, true);
         assert_eq!(
-            process_names_state("/sbin/launchd\n/usr/bin/python3\n", |n| is_kiro_executable(
-                n, true
-            )),
+            process_names_state("0 /sbin/launchd\n501 /usr/bin/python3\n", 501, kiro),
             ProcessState::Stopped
         );
         assert_eq!(
-            process_names_state("/Applications/Kiro.app/Contents/MacOS/Electron\n", |n| {
-                is_kiro_executable(n, true)
-            }),
+            process_names_state(
+                "501 /Applications/My Apps/Kiro.app/Contents/MacOS/Electron\n",
+                501,
+                kiro
+            ),
             ProcessState::Running
         );
+        // Another user's Kiro (fast user switching) reads none of this user's files.
         assert_eq!(
-            process_names_state("   \n", |_| false),
-            ProcessState::Unknown
+            process_names_state(
+                "502 /Applications/Kiro.app/Contents/MacOS/Electron\n",
+                501,
+                kiro
+            ),
+            ProcessState::Stopped
         );
+        for unreadable in [
+            "   \n",
+            "kiro\n",
+            "x /Applications/Kiro.app/Contents/MacOS/Kiro\n",
+        ] {
+            assert_eq!(
+                process_names_state(unreadable, 501, |_| false),
+                ProcessState::Unknown
+            );
+        }
     }
 
     #[test]

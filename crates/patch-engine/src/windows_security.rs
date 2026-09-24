@@ -69,7 +69,8 @@ impl Drop for Local {
     }
 }
 
-fn current_user_sid() -> io::Result<String> {
+/// The SID this client runs as, in `S-1-5-...` form.
+pub(crate) fn current_user_sid() -> io::Result<String> {
     unsafe {
         let mut token = null_mut();
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
@@ -91,17 +92,25 @@ fn current_user_sid() -> io::Result<String> {
             return Err(io::Error::last_os_error());
         }
         let user = &*(buffer.as_ptr() as *const SidAndAttributes);
-        let mut text = null_mut();
-        if ConvertSidToStringSidW(user.sid, &mut text) == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let text = Local(text.cast());
-        let start = text.0 as *const u16;
-        let length = (0..).take_while(|&i| *start.add(i) != 0).count();
-        Ok(String::from_utf16_lossy(std::slice::from_raw_parts(
-            start, length,
-        )))
+        sid_to_string(user.sid)
     }
+}
+
+/// A binary SID in `S-1-5-...` form.
+///
+/// # Safety
+/// `sid` must point to a valid SID for the duration of the call.
+pub(crate) unsafe fn sid_to_string(sid: *mut c_void) -> io::Result<String> {
+    let mut text = null_mut();
+    if ConvertSidToStringSidW(sid, &mut text) == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let text = Local(text.cast());
+    let start = text.0 as *const u16;
+    let length = (0..).take_while(|&i| *start.add(i) != 0).count();
+    Ok(String::from_utf16_lossy(std::slice::from_raw_parts(
+        start, length,
+    )))
 }
 
 /// Replace the whole DACL with a single protected ACE granting the current user full

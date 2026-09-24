@@ -37,6 +37,12 @@ pub enum ProcessError {
     #[error("Kiro is running as administrator and cannot be closed from here; close it yourself and retry")]
     Elevated,
 
+    /// This user's Kiro is also open in another Windows session, where this client cannot
+    /// ask it to close. It still reads and writes the files being changed, so nothing is
+    /// closed here either: that would cost the user their editor for nothing.
+    #[error("Kiro is open in another Windows session of this user; close it there and retry")]
+    OtherSession,
+
     #[error("Invalid launch configuration: {0}")]
     InvalidConfiguration(String),
 }
@@ -190,26 +196,7 @@ fn request_graceful_close(deadline: Instant) -> Result<(), ProcessError> {
     #[cfg(windows)]
     {
         let _ = deadline;
-        let pids = crate::windows_process::session_processes("Kiro.exe")
-            .map_err(|_| ProcessError::UnknownState)?;
-        let (mut delivered, mut denied) = (false, false);
-        for window in crate::windows_process::top_level_windows(&pids) {
-            // Unowned, because an owned window is a dialog, and closing a save prompt is
-            // pressing Cancel. Enabled, because a disabled window has a modal open, and
-            // what happens to that is the dialog's business. Every editor window is
-            // asked at once: that is what quitting does.
-            if window.visible && !window.owned && window.enabled {
-                match crate::windows_process::request_close(&window) {
-                    Ok(()) => delivered = true,
-                    Err(error) if error.raw_os_error() == Some(5) => denied = true,
-                    Err(_) => {}
-                }
-            }
-        }
-        if denied && !delivered {
-            return Err(ProcessError::Elevated);
-        }
-        Ok(())
+        close_editor_windows(&own_session_kiro().map_err(|_| ProcessError::UnknownState)?)
     }
     #[cfg(target_os = "macos")]
     {
@@ -221,16 +208,55 @@ fn request_graceful_close(deadline: Instant) -> Result<(), ProcessError> {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        run_helper_until(
-            Command::new("pkill").args(["-TERM", "-x", "kiro"]),
-            deadline,
-        )
+        // The main process only. The renderers and the GPU and utility processes share
+        // its name, and a signal reaching them is a crash, not a request to close.
+        let main: Vec<String> = restore_pids(deadline)?
+            .iter()
+            .filter(|target| target.main)
+            .map(|target| target.pid.to_string())
+            .collect();
+        if main.is_empty() {
+            return Ok(());
+        }
+        run_helper_until(Command::new("/bin/kill").arg("-TERM").args(main), deadline)
     }
     #[cfg(not(any(windows, unix)))]
     {
         let _ = deadline;
         Err(ProcessError::UnknownState)
     }
+}
+
+#[cfg(windows)]
+fn close_editor_windows(pids: &[u32]) -> Result<(), ProcessError> {
+    let (mut delivered, mut denied) = (false, false);
+    for window in crate::windows_process::top_level_windows(pids) {
+        // Unowned, because an owned window is a dialog, and closing a save prompt is
+        // pressing Cancel. Enabled, because a disabled window has a modal open, and what
+        // happens to that is the dialog's business. Every editor window is asked, not one
+        // per process: all of a Kiro's windows belong to one process.
+        if window.visible && !window.owned && window.enabled {
+            match crate::windows_process::request_close(&window) {
+                Ok(()) => delivered = true,
+                Err(error) if error.raw_os_error() == Some(5) => denied = true,
+                Err(_) => {}
+            }
+        }
+    }
+    if denied && !delivered {
+        return Err(ProcessError::Elevated);
+    }
+    Ok(())
+}
+
+/// This user's Kiro in this session: the only one whose windows can be asked to close.
+#[cfg(windows)]
+fn own_session_kiro() -> std::io::Result<Vec<u32>> {
+    Ok(crate::windows_process::user_processes("Kiro.exe")?
+        .into_iter()
+        .filter(|process| process.own_session)
+        .map(|process| process.pid)
+        .collect())
 }
 
 /// Whether a Kiro window is on screen. `Some(false)` only on positive evidence that none
@@ -243,7 +269,7 @@ fn kiro_window_visible() -> Option<bool> {
     #[cfg(windows)]
     {
         let visible = || -> Option<bool> {
-            let pids = crate::windows_process::session_processes("Kiro.exe").ok()?;
+            let pids = own_session_kiro().ok()?;
             Some(
                 crate::windows_process::top_level_windows(&pids)
                     .iter()
@@ -266,7 +292,7 @@ const OBSERVATION_BUDGET: Duration = Duration::from_secs(2);
 /// Only long enough to deliver the close request.
 const SIGNAL_BUDGET: Duration = Duration::from_secs(10);
 
-/// Timings for [`stop_with`]. The worst case stays well inside the client's 125s.
+/// Timings for [`stop_with`]. The worst case stays well inside the client's 180s.
 pub(crate) struct StopTimings {
     /// How long the editor gets to close itself, save prompt included.
     pub grace: Duration,
@@ -291,26 +317,66 @@ const TIMINGS: StopTimings = StopTimings {
 /// can be tested without a real editor.
 pub(crate) trait KiroControl {
     fn observe(&mut self) -> StopObservation;
+    /// Whether this user's Kiro also runs in another session, where it cannot be asked
+    /// to close.
+    fn elsewhere(&mut self) -> bool;
+    /// Remember the processes being stopped. Only they, and processes they spawn while
+    /// shutting down, may ever be ended: a Kiro started after this is someone using it.
+    fn pin(&mut self);
     fn request_close(&mut self) -> Result<(), ProcessError>;
     /// `Some(false)` only when it is certain no Kiro window is on screen.
     fn window_visible(&mut self) -> Option<bool>;
+    /// End the pinned processes; `StillOpen`, ending nothing, if a Kiro outside them runs.
     fn force(&mut self) -> Result<(), ProcessError>;
 }
 
-struct System;
+#[derive(Default)]
+struct System {
+    /// (pid, creation time) of the processes being stopped.
+    pinned: Vec<ProcessKey>,
+}
 
 impl KiroControl for System {
     fn observe(&mut self) -> StopObservation {
         restore_process_observation(Instant::now() + OBSERVATION_BUDGET)
     }
+    fn elsewhere(&mut self) -> bool {
+        #[cfg(windows)]
+        {
+            crate::windows_process::user_processes("Kiro.exe")
+                .is_ok_and(|found| found.iter().any(|process| !process.own_session))
+        }
+        #[cfg(not(windows))]
+        false
+    }
+    fn pin(&mut self) {
+        // A process whose creation time cannot be read is left out, so it is never ended.
+        #[cfg(windows)]
+        {
+            self.pinned = own_session_kiro()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|pid| Some((pid, crate::windows_process::creation_time(pid).ok()?)))
+                .collect();
+        }
+    }
     fn request_close(&mut self) -> Result<(), ProcessError> {
-        request_graceful_close(Instant::now() + SIGNAL_BUDGET)
+        let result = request_graceful_close(Instant::now() + SIGNAL_BUDGET);
+        // A refused quit request (Automation permission denied or unanswered) says
+        // nothing about whether the user can still quit Kiro, so wait for them.
+        #[cfg(unix)]
+        {
+            let _ = result;
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        result
     }
     fn window_visible(&mut self) -> Option<bool> {
         kiro_window_visible()
     }
     fn force(&mut self) -> Result<(), ProcessError> {
-        force_kiro_for_restore(Instant::now() + SIGNAL_BUDGET)
+        force_kiro_for_restore(Instant::now() + SIGNAL_BUDGET, &self.pinned)
     }
 }
 
@@ -319,13 +385,13 @@ impl KiroControl for System {
 /// `force_confirmed` is the user's second, specific confirmation, given only after being
 /// told Kiro would not close, that it may be ended even with a window open.
 pub fn stop_kiro_for_restore(force_confirmed: bool) -> Result<(), ProcessError> {
-    stop_with(&mut System, force_confirmed, &TIMINGS)
+    stop_with(&mut System::default(), force_confirmed, &TIMINGS)
 }
 
 /// Close Kiro before a takeover. Never ends an editor with a window on screen; only the
 /// headless remains of one that has already closed.
 pub fn stop_kiro_for_takeover() -> Result<(), ProcessError> {
-    stop_with(&mut System, false, &TIMINGS)
+    stop_with(&mut System::default(), false, &TIMINGS)
 }
 
 /// One observation of the Kiro processes. `Running` carries the count so a
@@ -347,6 +413,12 @@ fn stop_with(
         StopObservation::Unobservable => return Err(ProcessError::UnknownState),
         StopObservation::Running(_) => {}
     }
+    // Decided before anything is sent: closing this session's editor achieves nothing
+    // while the other one keeps the files open.
+    if control.elsewhere() {
+        return Err(ProcessError::OtherSession);
+    }
+    control.pin();
     if force_confirmed {
         // The user has seen that Kiro would not close and chose to end it. Asking again
         // would only bring the prompt back, and waiting would only make them wait.
@@ -386,10 +458,15 @@ fn force_until_gone(
     let deadline = Instant::now() + timings.force_ceiling;
     let mut result = control.force();
     loop {
+        // A Kiro started since the stop began: the user is using it again.
+        if matches!(result, Err(ProcessError::StillOpen)) {
+            return result;
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         match wait_for_exit(control, Some(timings.stall), remaining) {
             Ok(()) => return Ok(()),
-            // A process born after the sweep survives it: sweep again while there is time.
+            // A process spawned during shutdown survives the sweep: sweep again while
+            // there is time.
             Err(ProcessError::TerminateTimeout) if remaining > timings.stall => {
                 result = result.and(control.force());
             }
@@ -483,55 +560,144 @@ fn restore_target(name: &str, macos: bool) -> bool {
     .any(|name| helper == format!("{name}.app/Contents/MacOS/{name}"))
 }
 
+/// One of this user's Kiro processes, from `ps -o pid=,ppid=,uid=,comm=`.
 #[cfg(any(unix, test))]
-fn parse_restore_pids(text: &str, macos: bool) -> Result<Vec<u32>, ProcessError> {
-    let mut pids = Vec::new();
+#[derive(Debug, PartialEq, Eq)]
+struct RestoreTarget {
+    pid: u32,
+    /// The main process: its parent is not Kiro. Renderers and helpers are its children.
+    main: bool,
+}
+
+#[cfg(any(unix, test))]
+fn next_number(rest: &mut &str) -> Result<u32, ProcessError> {
+    let (value, tail) = rest
+        .split_once(char::is_whitespace)
+        .ok_or(ProcessError::UnknownState)?;
+    *rest = tail.trim_start();
+    value.parse().map_err(|_| ProcessError::UnknownState)
+}
+
+/// This user's Kiro processes. Another user's are neither counted nor signalled: they
+/// never read or write this user's files, and signalling them fails anyway.
+#[cfg(any(unix, test))]
+fn parse_restore_pids(
+    text: &str,
+    macos: bool,
+    uid: u32,
+) -> Result<Vec<RestoreTarget>, ProcessError> {
+    let mut kiro = Vec::new();
     let mut found = false;
     for line in text.lines().map(str::trim).filter(|s| !s.is_empty()) {
-        let (pid, name) = line
-            .split_once(char::is_whitespace)
-            .ok_or(ProcessError::UnknownState)?;
-        let pid: u32 = pid.parse().map_err(|_| ProcessError::UnknownState)?;
-        if name.trim().is_empty() {
+        let mut rest = line;
+        let (pid, ppid, owner) = (
+            next_number(&mut rest)?,
+            next_number(&mut rest)?,
+            next_number(&mut rest)?,
+        );
+        if rest.is_empty() {
             return Err(ProcessError::UnknownState);
         }
         found = true;
-        if restore_target(name.trim(), macos) {
+        if restore_target(rest, macos) {
             if pid <= 1 {
                 return Err(ProcessError::UnknownState);
             }
-            pids.push(pid);
+            kiro.push((pid, ppid, owner));
         }
     }
     if !found {
         return Err(ProcessError::UnknownState);
     }
-    Ok(pids)
+    let pids: std::collections::HashSet<u32> = kiro.iter().map(|entry| entry.0).collect();
+    Ok(kiro
+        .into_iter()
+        .filter(|entry| entry.2 == uid)
+        .map(|(pid, ppid, _)| RestoreTarget {
+            pid,
+            main: !pids.contains(&ppid),
+        })
+        .collect())
 }
 
 #[cfg(unix)]
-fn restore_pids(deadline: Instant) -> Result<Vec<u32>, ProcessError> {
+fn restore_pids(deadline: Instant) -> Result<Vec<RestoreTarget>, ProcessError> {
     let bytes = capture_helper_until(
-        Command::new("/bin/ps").args(["-A", "-ww", "-o", "pid=,comm="]),
+        Command::new("/bin/ps").args(["-A", "-ww", "-o", "pid=,ppid=,uid=,comm="]),
         deadline,
     )?;
     parse_restore_pids(
         std::str::from_utf8(&bytes).map_err(|_| ProcessError::UnknownState)?,
         cfg!(target_os = "macos"),
+        crate::runtime::own_uid(),
     )
 }
 
-fn force_kiro_for_restore(deadline: Instant) -> Result<(), ProcessError> {
+/// One process for good: its PID and creation time. A PID is reused; the pair is not.
+type ProcessKey = (u32, u64);
+
+/// Split `live` processes into those descended from `pinned` — the processes asked to
+/// close, or children they spawned while shutting down — and the rest, which were started
+/// since and belong to someone using Kiro. A parent must have been created no later than
+/// its child, so a recycled PID cannot link a stranger into the lineage.
+#[cfg(any(windows, test))]
+fn split_lineage(
+    pinned: &[ProcessKey],
+    live: &[ProcessKey],
+    parents: &std::collections::HashMap<u32, u32>,
+) -> (Vec<ProcessKey>, Vec<ProcessKey>) {
+    live.iter().partition(|&&process| {
+        let mut current = process;
+        // Depth-bounded: a parent map read from a snapshot can, in principle, hold a cycle.
+        for _ in 0..64 {
+            if pinned.contains(&current) {
+                return true;
+            }
+            let Some(&parent) = parents.get(&current.0) else {
+                return false;
+            };
+            // The parent itself may have exited already; what was pinned still counts.
+            if pinned
+                .iter()
+                .any(|&(pid, created)| pid == parent && created <= current.1)
+            {
+                return true;
+            }
+            match live
+                .iter()
+                .find(|&&(pid, created)| pid == parent && created <= current.1)
+            {
+                Some(&next) => current = next,
+                None => return false,
+            }
+        }
+        false
+    })
+}
+
+fn force_kiro_for_restore(deadline: Instant, pinned: &[ProcessKey]) -> Result<(), ProcessError> {
     #[cfg(windows)]
     {
         let _ = deadline;
-        // This session's Kiro only, each checked by image name through a handle that
-        // pins the process, so neither another user's editor nor a recycled PID is hit.
-        let pids = crate::windows_process::session_processes("Kiro.exe")
-            .map_err(|_| ProcessError::UnknownState)?;
+        let parents = crate::windows_process::parents().map_err(|_| ProcessError::UnknownState)?;
+        let mut live = Vec::new();
+        for pid in own_session_kiro().map_err(|_| ProcessError::UnknownState)? {
+            match crate::windows_process::creation_time(pid) {
+                Ok(created) => live.push((pid, created)),
+                Err(error) if error.raw_os_error() == Some(5) => {
+                    return Err(ProcessError::Elevated)
+                }
+                // Exited since it was listed.
+                Err(_) => {}
+            }
+        }
+        let (lineage, started_since) = split_lineage(pinned, &live, &parents);
+        if !started_since.is_empty() {
+            return Err(ProcessError::StillOpen);
+        }
         let mut result = Ok(());
-        for pid in pids {
-            match crate::windows_process::terminate_if_named(pid, "Kiro.exe") {
+        for (pid, created) in lineage {
+            match crate::windows_process::terminate_if_same(pid, "Kiro.exe", created) {
                 Ok(()) => {}
                 Err(error) if error.raw_os_error() == Some(5) => {
                     result = Err(ProcessError::Elevated)
@@ -544,6 +710,9 @@ fn force_kiro_for_restore(deadline: Instant) -> Result<(), ProcessError> {
     }
     #[cfg(unix)]
     {
+        // Ended only with the user's explicit confirmation: windows cannot be seen here,
+        // so the stop policy never reaches this on its own.
+        let _ = pinned;
         let pids = restore_pids(deadline)?;
         if pids.is_empty() {
             return Ok(());
@@ -551,13 +720,13 @@ fn force_kiro_for_restore(deadline: Instant) -> Result<(), ProcessError> {
         run_helper_until(
             Command::new("/bin/kill")
                 .arg("-KILL")
-                .args(pids.iter().map(u32::to_string)),
+                .args(pids.iter().map(|target| target.pid.to_string())),
             deadline,
         )
     }
     #[cfg(not(any(windows, unix)))]
     {
-        let _ = deadline;
+        let _ = (deadline, pinned);
         Err(ProcessError::UnknownState)
     }
 }
@@ -721,6 +890,160 @@ mod tests {
     }
 }
 
+/// The filter that decides which of Kiro's windows are asked to close, against real
+/// windows. Asking one window per process lost the second window's work, and closing an
+/// owned save prompt is pressing Cancel on it.
+#[cfg(all(test, windows))]
+mod window_filter_tests {
+    use std::ffi::c_void;
+    use std::sync::{mpsc, Mutex};
+
+    #[repr(C)]
+    struct WndClassW {
+        style: u32,
+        wnd_proc: unsafe extern "system" fn(*mut c_void, u32, usize, isize) -> isize,
+        cls_extra: i32,
+        wnd_extra: i32,
+        instance: *mut c_void,
+        icon: *mut c_void,
+        cursor: *mut c_void,
+        background: *mut c_void,
+        menu_name: *const u16,
+        class_name: *const u16,
+    }
+    #[link(name = "user32")]
+    extern "system" {
+        fn RegisterClassW(class: *const WndClassW) -> u16;
+        #[allow(clippy::too_many_arguments)]
+        fn CreateWindowExW(
+            ex_style: u32,
+            class: *const u16,
+            title: *const u16,
+            style: u32,
+            x: i32,
+            y: i32,
+            width: i32,
+            height: i32,
+            parent: *mut c_void,
+            menu: *mut c_void,
+            instance: *mut c_void,
+            param: *mut c_void,
+        ) -> *mut c_void;
+        fn DefWindowProcW(window: *mut c_void, message: u32, wparam: usize, lparam: isize)
+            -> isize;
+        fn EnableWindow(window: *mut c_void, enable: i32) -> i32;
+        fn DestroyWindow(window: *mut c_void) -> i32;
+        fn PeekMessageW(msg: *mut u64, window: *mut c_void, min: u32, max: u32, remove: u32)
+            -> i32;
+        fn DispatchMessageW(msg: *const u64) -> isize;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetModuleHandleW(name: *const u16) -> *mut c_void;
+    }
+
+    static CLOSED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+    unsafe extern "system" fn record(
+        window: *mut c_void,
+        message: u32,
+        wparam: usize,
+        lparam: isize,
+    ) -> isize {
+        if message == 0x0010 {
+            // WM_CLOSE: note it, and stay open like an editor showing its save prompt.
+            CLOSED.lock().unwrap().push(window as usize);
+            return 0;
+        }
+        DefWindowProcW(window, message, wparam, lparam)
+    }
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain([0]).collect()
+    }
+
+    #[test]
+    fn every_editor_window_is_asked_and_no_dialog_or_hidden_window_is() {
+        const WS_POPUP: u32 = 0x8000_0000;
+        const WS_VISIBLE: u32 = 0x1000_0000;
+        const WS_EX_TOOLWINDOW: u32 = 0x80; // off the taskbar
+        let (created, windows) = mpsc::channel();
+        let (stop, stopped) = mpsc::channel::<()>();
+        let pump = std::thread::spawn(move || unsafe {
+            let class = wide("SuperkiroWindowFilterTest");
+            let instance = GetModuleHandleW(std::ptr::null());
+            let definition = WndClassW {
+                style: 0,
+                wnd_proc: record,
+                cls_extra: 0,
+                wnd_extra: 0,
+                instance,
+                icon: std::ptr::null_mut(),
+                cursor: std::ptr::null_mut(),
+                background: std::ptr::null_mut(),
+                menu_name: std::ptr::null(),
+                class_name: class.as_ptr(),
+            };
+            assert_ne!(RegisterClassW(&definition), 0);
+            // Off screen and one pixel: visible to the window manager, not to a person.
+            let make = |style: u32, owner: *mut c_void| {
+                let window = CreateWindowExW(
+                    WS_EX_TOOLWINDOW,
+                    class.as_ptr(),
+                    class.as_ptr(),
+                    WS_POPUP | style,
+                    -32000,
+                    -32000,
+                    1,
+                    1,
+                    owner,
+                    std::ptr::null_mut(),
+                    instance,
+                    std::ptr::null_mut(),
+                );
+                assert!(!window.is_null());
+                window
+            };
+            let first = make(WS_VISIBLE, std::ptr::null_mut());
+            let second = make(WS_VISIBLE, std::ptr::null_mut());
+            let dialog = make(WS_VISIBLE, first);
+            let modal_owner = make(WS_VISIBLE, std::ptr::null_mut());
+            EnableWindow(modal_owner, 0);
+            let hidden = make(0, std::ptr::null_mut());
+            let all = [first, second, dialog, modal_owner, hidden];
+            created.send(all.map(|w| w as usize)).unwrap();
+            let mut msg = [0u64; 8];
+            while stopped.try_recv().is_err() {
+                while PeekMessageW(msg.as_mut_ptr(), std::ptr::null_mut(), 0, 0, 1) != 0 {
+                    DispatchMessageW(msg.as_ptr());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            for window in all {
+                DestroyWindow(window);
+            }
+        });
+        let [first, second, ..] = windows.recv().unwrap();
+        super::close_editor_windows(&[std::process::id()]).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while CLOSED.lock().unwrap().len() < 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Anything queued for the other windows would have been dispatched by now too.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let mut closed = CLOSED.lock().unwrap().clone();
+        closed.sort();
+        let mut expected = vec![first, second];
+        expected.sort();
+        stop.send(()).unwrap();
+        pump.join().unwrap();
+        assert_eq!(
+            closed, expected,
+            "exactly the two unowned, enabled, visible windows"
+        );
+    }
+}
+
 #[cfg(test)]
 mod deadline_tests {
     use super::*;
@@ -840,6 +1163,10 @@ mod restore_tests {
         close_result: Result<(), ProcessError>,
         /// After this many forces, every later observation reports Stopped.
         stops_after_forces: Option<usize>,
+        /// This user's Kiro also runs in another session.
+        elsewhere: bool,
+        /// A Kiro outside the pinned processes is running, so force refuses.
+        relaunched: bool,
         calls: Vec<&'static str>,
         forces: usize,
     }
@@ -851,6 +1178,8 @@ mod restore_tests {
                 visible: visible.to_vec(),
                 close_result: Ok(()),
                 stops_after_forces: None,
+                elsewhere: false,
+                relaunched: false,
                 calls: Vec::new(),
                 forces: 0,
             }
@@ -869,6 +1198,13 @@ mod restore_tests {
                 self.counts[0]
             }
         }
+        fn elsewhere(&mut self) -> bool {
+            self.calls.push("elsewhere");
+            self.elsewhere
+        }
+        fn pin(&mut self) {
+            self.calls.push("pin");
+        }
         fn request_close(&mut self) -> Result<(), ProcessError> {
             self.calls.push("close");
             std::mem::replace(&mut self.close_result, Ok(()))
@@ -884,6 +1220,9 @@ mod restore_tests {
         fn force(&mut self) -> Result<(), ProcessError> {
             self.calls.push("force");
             self.forces += 1;
+            if self.relaunched {
+                return Err(ProcessError::StillOpen);
+            }
             Ok(())
         }
     }
@@ -1045,7 +1384,8 @@ mod restore_tests {
         ));
     }
 
-    /// The worst case must fit inside the 125s the client waits before giving up.
+    /// The worst case must leave room, inside the 180s the client waits for takeover,
+    /// restore and unbind, for authentication (up to 20s) and the launch check (3s).
     #[test]
     fn the_whole_sequence_fits_inside_the_client_timeout() {
         let t = &TIMINGS;
@@ -1057,20 +1397,101 @@ mod restore_tests {
         assert!(worst < Duration::from_secs(110), "{worst:?}");
     }
 
+    /// The same user's Kiro in another session keeps the files open and cannot be asked
+    /// to close from here. Say so before closing this session's editor for nothing.
     #[test]
-    fn unix_targets_exclude_arguments_and_other_electron_apps() {
+    fn a_kiro_in_another_session_is_reported_before_anything_is_sent() {
+        let mut fake = Fake::new(&[RUNNING], &[Some(false)]);
+        fake.elsewhere = true;
+        assert!(matches!(
+            stop_with(&mut fake, true, &FAST),
+            Err(ProcessError::OtherSession)
+        ));
+        assert_eq!(fake.calls, ["observe", "elsewhere"]);
+    }
+
+    /// Kiro opened again while an earlier one was being stopped is someone using it: it is
+    /// never ended, not even with the user's confirmation for the earlier one.
+    #[test]
+    fn a_kiro_started_during_the_stop_is_never_ended() {
+        for force_confirmed in [false, true] {
+            let mut fake = Fake::new(&[RUNNING], &[Some(false)]);
+            fake.relaunched = true;
+            assert!(matches!(
+                stop_with(&mut fake, force_confirmed, &FAST),
+                Err(ProcessError::StillOpen)
+            ));
+            assert_eq!(fake.forces, 1, "force must not be retried against it");
+            let pin = fake.calls.iter().position(|c| *c == "pin").unwrap();
+            let close = fake.calls.iter().position(|c| *c == "close");
+            assert!(close.is_none_or(|close| pin < close), "pinned after asking");
+        }
+    }
+
+    #[test]
+    fn lineage_is_what_was_asked_to_close_and_what_it_spawned() {
+        use std::collections::HashMap;
+        // 100 is Kiro's main process when it was asked to close; 101 its renderer.
+        let pinned = [(100, 10), (101, 11)];
+        let parents = HashMap::from([
+            (101, 100),
+            (102, 100), // spawned by the closing editor, after pinning
+            (103, 102), // and its child
+            (200, 4),   // a Kiro the user started since, from Explorer
+            (201, 200), // that Kiro's renderer
+            (104, 100), // PID 100 exited and was reused below; this child predates reuse
+            (300, 999), // parent unknown
+        ]);
+        let live = [
+            (101, 11),
+            (102, 20),
+            (103, 21),
+            (200, 30),
+            (201, 31),
+            (104, 25),
+            (300, 40),
+        ];
+        let (lineage, started_since) = split_lineage(&pinned, &live, &parents);
+        assert_eq!(lineage, [(101, 11), (102, 20), (103, 21), (104, 25)]);
+        assert_eq!(started_since, [(200, 30), (201, 31), (300, 40)]);
+        // A reused PID: 100 again, created after the pin, is a new process, not the old one.
+        let (lineage, started_since) = split_lineage(&pinned, &[(100, 50)], &HashMap::new());
+        assert!(lineage.is_empty());
+        assert_eq!(started_since, [(100, 50)]);
+        // A parent that is younger than its child cannot be its parent: the PID was reused.
+        let (lineage, _) = split_lineage(&[(100, 60)], &[(105, 55)], &HashMap::from([(105, 100)]));
+        assert!(lineage.is_empty());
+    }
+
+    #[test]
+    fn unix_targets_exclude_arguments_other_electron_apps_and_other_users() {
+        let target = |pid, main| RestoreTarget { pid, main };
         assert_eq!(
             parse_restore_pids(
-                "1 init\n20 kiro\n21 Kiro\n22 superkiro\n23 node\n24 /usr/bin/python kiro\n",
-                false
+                "1 0 0 init\n20 1 501 kiro\n21 20 501 Kiro\n22 1 501 superkiro\n23 1 501 node\n24 1 501 /usr/bin/python kiro\n25 1 502 kiro\n",
+                false,
+                501
             )
             .unwrap(),
-            [20, 21]
+            [target(20, true), target(21, false)]
         );
-        let listing = "0 kernel_task\n1 /sbin/launchd\n20 /Applications/Kiro.app/Contents/MacOS/Electron\n21 /Volumes/My Disk/Kiro.app/Contents/Frameworks/Kiro Helper (GPU).app/Contents/MacOS/Kiro Helper (GPU)\n22 /Applications/Other.app/Contents/MacOS/Electron\n23 /usr/bin/python /Applications/Kiro.app/example\n24 /Applications/Kiro.app/Contents/Frameworks/Other.app/Contents/MacOS/Other\n";
-        assert_eq!(parse_restore_pids(listing, true).unwrap(), [20, 21]);
-        for invalid in ["", "oops", "no kiro", "0 kiro", "22 "] {
-            assert!(parse_restore_pids(invalid, false).is_err());
+        let listing = "0 0 0 kernel_task\n1 0 0 /sbin/launchd\n20 1 501 /Applications/Kiro.app/Contents/MacOS/Electron\n21 20 501 /Volumes/My Disk/Kiro.app/Contents/Frameworks/Kiro Helper (GPU).app/Contents/MacOS/Kiro Helper (GPU)\n22 1 501 /Applications/Other.app/Contents/MacOS/Electron\n23 1 501 /usr/bin/python /Applications/Kiro.app/example\n24 1 501 /Applications/Kiro.app/Contents/Frameworks/Other.app/Contents/MacOS/Other\n";
+        assert_eq!(
+            parse_restore_pids(listing, true, 501).unwrap(),
+            [target(20, true), target(21, false)]
+        );
+        for invalid in [
+            "",
+            "oops",
+            "1 1 no-kiro",
+            "0 1 501 kiro",
+            "22 1 501 ",
+            "x 1 501 kiro",
+        ] {
+            assert!(
+                parse_restore_pids(invalid, false, 501).is_err(),
+                "{invalid:?}"
+            );
         }
     }
 }

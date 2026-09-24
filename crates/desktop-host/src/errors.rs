@@ -33,6 +33,7 @@ const CODES: &[&str] = &[
     "SK-CONNECT-003",
     "SK-CONNECT-004",
     "SK-CONNECT-005",
+    "SK-CONNECT-006",
     "SK-RESTORE-001",
     "SK-BIND-004",
     "SK-LOCAL-001",
@@ -110,6 +111,10 @@ pub fn classify(raw: &str, path: &str, method: &str) -> Value {
         // Kiro would not close and still has a window on screen, most likely its save
         // prompt. Distinct from other close failures because it is the one case where
         // ending Kiro, with the user's explicit say-so, can help.
+        } else if lower.contains("another windows session") {
+            // The same user's Kiro in another session: this client can neither ask it to
+            // close nor end it, so neither saving here nor forcing helps.
+            "SK-CONNECT-006"
         } else if lower.contains("kiro is still open") {
             "SK-CONNECT-005"
         } else if stage == "close"
@@ -223,6 +228,8 @@ mod tests {
             ),
             ("Cannot stop Kiro for restore: Kiro is still open; it may be asking whether to save changes", "SK-CONNECT-005"),
             ("[connection:close] Kiro is still open; it may be asking whether to save changes", "SK-CONNECT-005"),
+            ("Cannot stop Kiro for restore: Kiro is open in another Windows session of this user; close it there and retry", "SK-CONNECT-006"),
+            ("[connection:close] Kiro is open in another Windows session of this user; close it there and retry", "SK-CONNECT-006"),
             ("Cannot stop Kiro for restore: Kiro is running as administrator and cannot be closed from here; close it yourself and retry", "SK-CONNECT-002"),
             ("timed out", "SK-NET-001"),
             ("network", "SK-NET-002"),
