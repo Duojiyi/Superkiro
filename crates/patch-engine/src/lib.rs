@@ -6,6 +6,7 @@ pub mod desktop;
 pub mod detect;
 pub mod device;
 pub mod doctor;
+pub mod leftovers;
 pub mod mem_guard;
 pub mod patch;
 pub mod preferences;
@@ -31,6 +32,7 @@ pub use detect::{
 };
 pub use device::{generate_device_fingerprint, is_valid_device_fingerprint, DEVICE_ID_PREFIX};
 pub use doctor::{CheckItem, CheckLevel, Doctor, DoctorError, DoctorReport, TakeoverStatus};
+pub use leftovers::{candidate_extensions, Leftovers};
 pub use patch::{
     get_launcher_env, ExtensionPatcher, PatchError, PatchRecipe, PatchStatus, BACKUP_SUFFIX,
     PATCH_MARKER_V1, RUNTIME_ENDPOINT_NEEDLE,

@@ -97,6 +97,7 @@ fn credit_display_repair_preserves_authenticated_restore() {
             original_hash: content_hash(FIXTURE.as_bytes()),
             patched_hash: content_hash(repaired.as_bytes()),
             previous_patched_hash: Some(content_hash(previous.as_bytes())),
+            owner: None,
         })
         .unwrap();
     // Either side of an interrupted repair publication is recoverable.

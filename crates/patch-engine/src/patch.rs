@@ -141,6 +141,28 @@ struct PatchState {
     patched_hash: String,
     #[serde(default)]
     previous_patched_hash: Option<String>,
+    /// Who patched it: [`current_owner`]. An install shared by several users of the
+    /// computer can carry another user's live takeover, which is theirs to undo.
+    /// Absent in state written before owners were recorded.
+    #[serde(default)]
+    owner: Option<String>,
+}
+
+/// This user, as a patch's owner: their home directory.
+pub(crate) fn current_owner() -> Option<String> {
+    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .map(|home| home.to_string_lossy().to_lowercase())
+}
+
+/// Whose patch this is, as far as its files tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchOwnership {
+    /// No patch marker.
+    Unpatched,
+    /// Patched by this user, or before owners were recorded.
+    Ours,
+    /// Patched by another user of this computer.
+    Theirs,
 }
 
 /// Helper for inspecting and modifying `extension.js`.
@@ -166,16 +188,41 @@ impl ExtensionPatcher {
         PathBuf::from(p)
     }
 
+    /// Whether the file starts with the patch marker, reading only as many bytes. The
+    /// bundle is over 10 MB, and status is polled.
+    pub fn marker_present(&self) -> std::io::Result<bool> {
+        use std::io::Read;
+        let mut head = Vec::with_capacity(PATCH_MARKER_PREFIX.len());
+        fs::File::open(&self.extension_path)?
+            .take(PATCH_MARKER_PREFIX.len() as u64)
+            .read_to_end(&mut head)?;
+        Ok(head == PATCH_MARKER_PREFIX.as_bytes())
+    }
+
+    /// Whose patch this file carries. Unreadable state counts as ours: it is then this
+    /// user's own rollback that cannot proceed, never another user's patch undone.
+    pub fn ownership(&self) -> PatchOwnership {
+        if !self.marker_present().unwrap_or(false) {
+            return PatchOwnership::Unpatched;
+        }
+        match self.read_state().ok().and_then(|state| state.owner) {
+            Some(owner) if current_owner().as_ref() != Some(&owner) => PatchOwnership::Theirs,
+            _ => PatchOwnership::Ours,
+        }
+    }
+
+    /// Whether the rollback material a restore needs is present.
+    pub fn has_restore_material(&self) -> bool {
+        self.state_path().exists() || self.backup_path().exists()
+    }
+
     /// Determine current patch status.
     pub fn status(&self) -> PatchStatus {
         if !self.extension_path.exists() {
             return PatchStatus::NotFound;
         }
 
-        let is_marked = match fs::read_to_string(&self.extension_path) {
-            Ok(content) => content.starts_with(PATCH_MARKER_PREFIX),
-            Err(_) => false,
-        };
+        let is_marked = self.marker_present().unwrap_or(false);
 
         if is_marked {
             PatchStatus::Patched
@@ -292,6 +339,7 @@ impl ExtensionPatcher {
             original_hash: content_hash(content.as_bytes()),
             patched_hash: content_hash(full_patched.as_bytes()),
             previous_patched_hash: None,
+            owner: current_owner(),
         })?;
         let backup_path = self.backup_path();
         let mut backup = fs::OpenOptions::new()

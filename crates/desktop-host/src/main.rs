@@ -222,7 +222,7 @@ async fn native_inner(
                 .operation
                 .try_lock()
                 .map_err(|_| "Operation in progress; wait before exiting")?;
-            if backend::recovery_pending() {
+            if state.recovery_pending() {
                 return Err("Restore Kiro before exiting".into());
             }
             window.app_handle().exit(0);
@@ -364,7 +364,7 @@ fn main() {
                     if event.id.as_ref() == "exit" {
                         let host = app.state::<Arc<backend::Host>>();
                         if let Ok(_guard) = host.operation.try_lock() {
-                            if !backend::recovery_pending() {
+                            if !host.recovery_pending() {
                                 app.exit(0);
                                 return;
                             }

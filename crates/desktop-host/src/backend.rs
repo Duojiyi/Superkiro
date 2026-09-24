@@ -125,7 +125,7 @@ impl Host {
         }
     }
     pub fn set_install_path(&self, path: &Path) -> Result<Value, String> {
-        if recovery_pending() {
+        if self.recovery_pending() {
             return Err("Restore Kiro before changing installation".into());
         }
         patch_engine::inspect_installation_dir(path).map_err(|e| e.to_string())?;
@@ -339,11 +339,72 @@ fn should_auto_trim(
     windows && process_count > 0 && total_mb > 2500 && elapsed.is_none_or(|seconds| seconds >= 300)
 }
 
-pub fn recovery_pending() -> bool {
+impl Host {
+    /// Whether anything of a takeover is still on this machine: its rollback records,
+    /// or, when those are lost, what the files themselves show.
+    pub fn recovery_pending(&self) -> bool {
+        records_pending() || self.leftovers().found()
+    }
+
+    /// A takeover's traces in every install this client may have patched.
+    fn leftovers(&self) -> patch_engine::Leftovers {
+        let custom = self.install_path().ok().flatten();
+        patch_engine::Leftovers::scan(
+            &patch_engine::candidate_extensions(custom.as_deref()),
+            &patch_engine::SettingsManager::default(),
+            &leftover_token(),
+            &known_gateway_hosts(),
+        )
+    }
+
+    /// Undo a takeover whose records are lost. Nothing to do when none is found.
+    fn remove_leftovers(&self) -> Result<(), String> {
+        let found = self.leftovers();
+        if !found.found() {
+            return Ok(());
+        }
+        patch_engine::ensure_kiro_stopped()?;
+        found.remove(
+            &patch_engine::SettingsManager::default(),
+            &leftover_token(),
+            &known_gateway_hosts(),
+        )
+    }
+}
+
+/// Whether a takeover's own rollback records are still on the machine.
+fn records_pending() -> bool {
     SnapshotManager::default().has_active_snapshot()
         || DesktopSession::system()
             .map(|s| s.recovery_pending())
             .unwrap_or(true)
+}
+
+fn leftover_token() -> patch_engine::TokenStorage {
+    patch_engine::TokenStorage::at(
+        patch_engine::default_token_path()
+            .unwrap_or_else(|_| PathBuf::from("kiro-auth-token.json")),
+    )
+}
+
+/// Hosts of every gateway this client could have pointed Kiro at: the configured one
+/// and those named by any surviving record.
+fn known_gateway_hosts() -> Vec<String> {
+    let mut urls: Vec<String> = gateway(None).into_iter().collect();
+    urls.extend(DesktopSession::system().ok().and_then(|s| s.gateway()));
+    urls.extend(
+        SnapshotManager::default()
+            .load()
+            .ok()
+            .map(|snapshot| snapshot.gateway_url),
+    );
+    let mut hosts: Vec<String> = urls
+        .iter()
+        .filter_map(|url| reqwest::Url::parse(url).ok()?.host_str().map(str::to_owned))
+        .collect();
+    hosts.sort();
+    hosts.dedup();
+    hosts
 }
 fn network_error(error: reqwest::Error) -> String {
     if error.is_timeout() {
@@ -661,11 +722,12 @@ pub async fn dispatch(host: &Host, path: &str, method: &str, body: Value) -> Res
                 .ok()
                 .is_some_and(|path| patch_engine::TokenStorage::at(path).load().is_ok());
             let gateway = gateway(None)?;
+            let leftovers = host.leftovers();
             Ok(
                 json!({"process_state":patch_engine::detect_kiro_process_state().to_string(),
                 "kiro_installed":install.is_some(),"kiro_install_path":install.as_ref().map(|i| &i.install_dir),
                 "kiro_version":install.as_ref().map(|i| &i.version),"kiro_compatible":install.as_ref().is_some_and(|i| patch_engine::kiro_version_is_supported(&i.version)),"minimum_kiro_version":patch_engine::MINIMUM_SUPPORTED_KIRO_VERSION,"has_snapshot":SnapshotManager::default().has_active_snapshot(),
-                "recovery_pending":recovery_pending(),"authenticated":token_readable && session.as_ref().is_some_and(|s| s.authenticated()),"gateway_url":session.as_ref().and_then(|s| s.gateway()),"suggested_gateway_url":gateway,
+                "recovery_pending":records_pending() || leftovers.found(),"recovery_blocked":if leftovers.unrecoverable.is_empty() {Value::Null} else {json!("reinstall_kiro")},"authenticated":token_readable && session.as_ref().is_some_and(|s| s.authenticated()),"gateway_url":session.as_ref().and_then(|s| s.gateway()),"suggested_gateway_url":gateway,
                 "portal_url":format!("{gateway}/"),"platform":if cfg!(windows) {"win32"} else if cfg!(target_os="macos") {"darwin"} else {"linux"},
                 "model_service_available":null,"tray_available":true,"memory_maintenance":host.maintenance.lock().map_err(|_| "Maintenance state unavailable")?.clone(),"app_version":env!("SUPERKIRO_BUILD_VERSION")}),
             )
@@ -702,7 +764,7 @@ pub async fn dispatch(host: &Host, path: &str, method: &str, body: Value) -> Res
             .await
         }
         ("POST", "/api/activate") => {
-            if recovery_pending() {
+            if host.recovery_pending() {
                 return Err("Restore pending Kiro recovery state before activating".into());
             }
             let card = body["card_key"].as_str().unwrap_or("");
@@ -729,10 +791,12 @@ pub async fn dispatch(host: &Host, path: &str, method: &str, body: Value) -> Res
         ("POST", "/api/restore") => {
             confirmed_restore_stop(
                 &body,
-                recovery_pending(),
+                host.recovery_pending(),
                 patch_engine::process::stop_kiro_for_restore,
             )?;
             DesktopSession::system()?.restore_and_logout(&SnapshotManager::default())?;
+            // Whatever the records did not cover, or all of it when they are lost.
+            host.remove_leftovers()?;
             Ok(json!({"success":true}))
         }
         ("POST", "/api/unbind") => {
@@ -742,7 +806,7 @@ pub async fn dispatch(host: &Host, path: &str, method: &str, body: Value) -> Res
             let target = unbind_gateway(session.gateway().as_deref(), &body)?;
             confirmed_restore_stop(
                 &body,
-                recovery_pending(),
+                host.recovery_pending(),
                 patch_engine::process::stop_kiro_for_restore,
             )?;
             session

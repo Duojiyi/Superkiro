@@ -280,6 +280,75 @@ impl SettingsManager {
         }
     }
 
+    /// Whether the redirection keys still send Kiro to one of `gateway_hosts`. An
+    /// unreadable file tells nothing and counts as no.
+    pub fn names_gateway(&self, gateway_hosts: &[String]) -> bool {
+        self.read_settings().is_ok_and(|map| {
+            REDIRECTION_KEYS.iter().any(|key| {
+                map.get(*key)
+                    .is_some_and(|value| names_host(value, gateway_hosts))
+            })
+        })
+    }
+
+    /// Undo a takeover whose rollback record is lost, as far as the file itself shows.
+    /// The redirection keys go if they name one of `gateway_hosts`, which also leave the
+    /// proxy bypass list. A frozen `update.mode` is released too: without the record it
+    /// cannot be told from the user's own choice, and a Kiro that never updates again,
+    /// security fixes included, is the worse mistake. Returns whether anything changed.
+    pub fn remove_orphaned_takeover(
+        &self,
+        gateway_hosts: &[String],
+    ) -> Result<bool, SettingsError> {
+        let raw = self.read_raw()?;
+        if raw.is_empty() {
+            return Ok(false);
+        }
+        let text = SettingsText::parse(&raw)?;
+        let mut map = parse_settings_bytes(&raw)?;
+        let mut changed = false;
+        for key in REDIRECTION_KEYS {
+            if map
+                .get(key)
+                .is_some_and(|value| names_host(value, gateway_hosts))
+            {
+                text.remove(key);
+                map.remove(key);
+                changed = true;
+            }
+        }
+        if let Some(Value::Array(list)) = map.get("http.noProxy") {
+            let kept: Vec<Value> = list
+                .iter()
+                .filter(|entry| {
+                    !entry
+                        .as_str()
+                        .is_some_and(|host| gateway_hosts.iter().any(|g| g == host))
+                })
+                .cloned()
+                .collect();
+            if kept.len() != list.len() {
+                changed = true;
+                if kept.is_empty() {
+                    text.remove("http.noProxy");
+                    map.remove("http.noProxy");
+                } else {
+                    let kept = Value::Array(kept);
+                    text.set("http.noProxy", &kept);
+                    map.insert("http.noProxy".into(), kept);
+                }
+            }
+        }
+        if changed && map.get("update.mode") == Some(&json!("none")) {
+            text.remove("update.mode");
+            map.remove("update.mode");
+        }
+        if changed {
+            self.write_text(&text, &map)?;
+        }
+        Ok(changed)
+    }
+
     /// The file's bytes, or none when it does not exist.
     fn read_raw(&self) -> Result<Vec<u8>, SettingsError> {
         match fs::read(&self.settings_path) {
@@ -381,7 +450,7 @@ fn reverted_values(
     current: &Map<String, Value>,
     gateway_host: Option<&str>,
 ) -> Vec<(&'static str, Option<Value>)> {
-    let mut values: Vec<(&'static str, Option<Value>)> = ["kiroAuthConfig", "codewhisperer.config"]
+    let mut values: Vec<(&'static str, Option<Value>)> = REDIRECTION_KEYS
         .into_iter()
         .map(|key| (key, prior.prior_values.get(key).cloned()))
         .collect();
@@ -414,7 +483,20 @@ fn reverted_values(
     values
 }
 
-fn gateway_host(gateway_url: &str) -> Option<String> {
+/// The keys that point Kiro's own traffic at an endpoint.
+const REDIRECTION_KEYS: [&str; 2] = ["kiroAuthConfig", "codewhisperer.config"];
+
+/// Whether any URL inside `value` is on one of `hosts`.
+fn names_host(value: &Value, hosts: &[String]) -> bool {
+    match value {
+        Value::String(text) => gateway_host(text).is_some_and(|host| hosts.contains(&host)),
+        Value::Array(items) => items.iter().any(|item| names_host(item, hosts)),
+        Value::Object(map) => map.values().any(|item| names_host(item, hosts)),
+        _ => false,
+    }
+}
+
+pub(crate) fn gateway_host(gateway_url: &str) -> Option<String> {
     reqwest::Url::parse(gateway_url)
         .ok()
         .and_then(|url| url.host_str().map(str::to_owned))

@@ -12,6 +12,7 @@ fn recovery_validates_backups_and_every_durable_boundary() {
         original_hash: content_hash(original),
         patched_hash: content_hash(patched),
         previous_patched_hash: None,
+        owner: None,
     };
     // Persisted metadata, partial/complete backup, patch publication, restored
     // publication, backup cleanup, metadata cleanup: retries cover every boundary.
@@ -46,6 +47,7 @@ fn recovery_validates_backups_and_every_durable_boundary() {
         original_hash: state.original_hash.clone(),
         patched_hash: content_hash(b"new repair"),
         previous_patched_hash: Some(content_hash(patched)),
+        owner: None,
     };
     patcher.write_state(&staged).unwrap();
     fs::write(patcher.path(), patched).unwrap();
