@@ -62,8 +62,12 @@ pub fn get_launcher_env(gateway_url: &str) -> HashMap<String, String> {
     // 1. Redirect auth portal
     envs.insert("KIRO_AUTH_PORTAL_URL".to_string(), gw.to_string());
 
-    // 2. AWS SDK fallback endpoint
-    envs.insert("AWS_ENDPOINT_URL".to_string(), gw.to_string());
+    // No AWS_ENDPOINT_URL. AWS SDKs and CLI v2 read it as an override for every service,
+    // and every terminal, task, debug session and extension inside Kiro inherits it — so a
+    // customer's own `aws` commands, and AWS extensions, sent their signed requests,
+    // session tokens and payloads to the gateway. Kiro does not need it: its model
+    // endpoints come from `codewhisperer.config` in user settings, and its runtime
+    // endpoint from the patch below.
 
     // 3. Disable auxiliary LLM surfaces to control credit costs (Spec §2.5, P0-7)
     envs.insert(
@@ -137,6 +141,28 @@ struct PatchState {
     patched_hash: String,
     #[serde(default)]
     previous_patched_hash: Option<String>,
+    /// Who patched it: [`current_owner`]. An install shared by several users of the
+    /// computer can carry another user's live takeover, which is theirs to undo.
+    /// Absent in state written before owners were recorded.
+    #[serde(default)]
+    owner: Option<String>,
+}
+
+/// This user, as a patch's owner: their home directory.
+pub(crate) fn current_owner() -> Option<String> {
+    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .map(|home| home.to_string_lossy().to_lowercase())
+}
+
+/// Whose patch this is, as far as its files tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchOwnership {
+    /// No patch marker.
+    Unpatched,
+    /// Patched by this user, or before owners were recorded.
+    Ours,
+    /// Patched by another user of this computer.
+    Theirs,
 }
 
 /// Helper for inspecting and modifying `extension.js`.
@@ -162,16 +188,41 @@ impl ExtensionPatcher {
         PathBuf::from(p)
     }
 
+    /// Whether the file starts with the patch marker, reading only as many bytes. The
+    /// bundle is over 10 MB, and status is polled.
+    pub fn marker_present(&self) -> std::io::Result<bool> {
+        use std::io::Read;
+        let mut head = Vec::with_capacity(PATCH_MARKER_PREFIX.len());
+        fs::File::open(&self.extension_path)?
+            .take(PATCH_MARKER_PREFIX.len() as u64)
+            .read_to_end(&mut head)?;
+        Ok(head == PATCH_MARKER_PREFIX.as_bytes())
+    }
+
+    /// Whose patch this file carries. Unreadable state counts as ours: it is then this
+    /// user's own rollback that cannot proceed, never another user's patch undone.
+    pub fn ownership(&self) -> PatchOwnership {
+        if !self.marker_present().unwrap_or(false) {
+            return PatchOwnership::Unpatched;
+        }
+        match self.read_state().ok().and_then(|state| state.owner) {
+            Some(owner) if current_owner().as_ref() != Some(&owner) => PatchOwnership::Theirs,
+            _ => PatchOwnership::Ours,
+        }
+    }
+
+    /// Whether the rollback material a restore needs is present.
+    pub fn has_restore_material(&self) -> bool {
+        self.state_path().exists() || self.backup_path().exists()
+    }
+
     /// Determine current patch status.
     pub fn status(&self) -> PatchStatus {
         if !self.extension_path.exists() {
             return PatchStatus::NotFound;
         }
 
-        let is_marked = match fs::read_to_string(&self.extension_path) {
-            Ok(content) => content.starts_with(PATCH_MARKER_PREFIX),
-            Err(_) => false,
-        };
+        let is_marked = self.marker_present().unwrap_or(false);
 
         if is_marked {
             PatchStatus::Patched
@@ -288,6 +339,7 @@ impl ExtensionPatcher {
             original_hash: content_hash(content.as_bytes()),
             patched_hash: content_hash(full_patched.as_bytes()),
             previous_patched_hash: None,
+            owner: current_owner(),
         })?;
         let backup_path = self.backup_path();
         let mut backup = fs::OpenOptions::new()
@@ -346,12 +398,17 @@ impl ExtensionPatcher {
         let original_matches = |bytes: &[u8]| {
             bytes.len() as u64 == state.original_len && content_hash(bytes) == state.original_hash
         };
-        let backup = match fs::read(self.backup_path()) {
-            Ok(bytes) if original_matches(&bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && original_matches(&current) => {
-                current.clone()
+        // A live file that is the original needs nothing rolled back, whatever became of
+        // the backup: a crash while it was being written leaves it truncated, and an
+        // antivirus scan can lock it. Only a patched live file needs the backup to prove
+        // itself, and it is never replaced by anything that does not.
+        let backup = if original_matches(&current) {
+            current.clone()
+        } else {
+            match fs::read(self.backup_path()) {
+                Ok(bytes) if original_matches(&bytes) => bytes,
+                _ => return Err(PatchError::ExtensionChanged),
             }
-            _ => return Err(PatchError::ExtensionChanged),
         };
         let current_hash = content_hash(&current);
         if !original_matches(&current)
@@ -404,7 +461,40 @@ impl ExtensionPatcher {
     }
 }
 
+/// Remove what earlier writes to `path` left behind when they died between writing their
+/// temporary sibling and renaming it: `<name>.tmp.<pid>.<nanos>`, 13 MB each for Kiro's
+/// bundle, inside Kiro's own installation. Writes run one at a time under the operation
+/// lock, so any such sibling found before a write is a leftover. Best effort.
+pub(crate) fn remove_stale_temps(path: &Path) {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
+        return;
+    };
+    let prefix = format!("{name}.tmp.");
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(rest) = file_name
+            .to_str()
+            .and_then(|n| n.strip_prefix(prefix.as_str()))
+        else {
+            continue;
+        };
+        let leftover = rest.split_once('.').is_some_and(|(pid, nanos)| {
+            !pid.is_empty()
+                && !nanos.is_empty()
+                && pid.bytes().all(|b| b.is_ascii_digit())
+                && nanos.bytes().all(|b| b.is_ascii_digit())
+        });
+        if leftover && entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 fn atomic_write_file(path: &Path, content: &[u8]) -> Result<(), PatchError> {
+    remove_stale_temps(path);
     let temp_file = path.with_file_name(format!(
         "{}.tmp.{}.{}",
         path.file_name()
@@ -474,7 +564,9 @@ fn render_patch(content: &str, gateway: &str, recipe: &PatchRecipe) -> Result<St
     }
     let replacement = if recipe.replacement == PatchRecipe::default().replacement {
         format!(
-            "(process.env.KIRO_GATEWAY_URL||process.env.AWS_ENDPOINT_URL||{})",
+            // A user's own AWS_ENDPOINT_URL (LocalStack, say) must not redirect Kiro's
+            // gateway traffic, bearer token included.
+            "(process.env.KIRO_GATEWAY_URL||{})",
             serde_json::to_string(&gateway).unwrap()
         )
     } else {

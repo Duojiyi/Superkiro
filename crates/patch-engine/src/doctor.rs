@@ -5,7 +5,7 @@
 //! - Visual status enum: `Active`, `NotTakenOver`, `Offline`, `UpgradeDetected`, `TokenExpired`, `Incomplete`.
 //! - One-click auto-repair restoring healthy takeover state.
 
-use crate::detect::{detect_kiro, KiroInstallation};
+use crate::detect::detect_kiro;
 use crate::patch::{ExtensionPatcher, PatchStatus};
 use crate::settings::SettingsManager;
 use crate::token_storage::TokenStorage;
@@ -73,7 +73,6 @@ pub struct DoctorReport {
     pub patch_status: PatchStatus,
     pub is_running: bool,
     pub gateway_reachable: bool,
-    pub can_one_click_fix: bool,
 }
 
 /// Diagnostic health doctor.
@@ -325,13 +324,6 @@ impl Doctor {
             TakeoverStatus::Incomplete
         };
 
-        let can_one_click_fix = matches!(
-            overall_status,
-            TakeoverStatus::UpgradeDetected
-                | TakeoverStatus::Incomplete
-                | TakeoverStatus::NotTakenOver
-        );
-
         DoctorReport {
             overall_status,
             items,
@@ -339,36 +331,7 @@ impl Doctor {
             patch_status,
             is_running,
             gateway_reachable,
-            can_one_click_fix,
         }
-    }
-
-    /// One-click repair: merges settings and applies extension patch.
-    pub fn one_click_fix(
-        &self,
-        gateway_url: &str,
-        installation: &KiroInstallation,
-    ) -> Result<(), DoctorError> {
-        // 1. Merge settings
-        self.settings_mgr
-            .merge_byok(gateway_url)
-            .map_err(|e| DoctorError::Io(e.to_string()))?;
-
-        // 2. Patch extension if present
-        if let Some(ref ext_dir) = installation.agent_extension_dir {
-            let patcher = ExtensionPatcher::new(ext_dir.join("dist").join("extension.js"));
-            if patcher.status() != PatchStatus::Patched {
-                patcher
-                    .apply(gateway_url)
-                    .map_err(|e| DoctorError::Io(e.to_string()))?;
-            }
-        }
-
-        // 3. Purge orphan agent processes and compact working set
-        let _ = crate::mem_guard::MemoryGuard::purge_orphan_processes();
-        let _ = crate::mem_guard::MemoryGuard::trim_working_set(None);
-
-        Ok(())
     }
 }
 

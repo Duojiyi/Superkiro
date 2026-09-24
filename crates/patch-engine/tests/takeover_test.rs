@@ -79,7 +79,8 @@ fn test_settings_safe_merge_and_revert() {
         merged.get("http.noProxy")
     );
     // 3. Revert to original state
-    mgr.revert(&prior_state).expect("Revert must succeed");
+    mgr.revert(&prior_state, gateway_url)
+        .expect("Revert must succeed");
 
     assert!(!mgr.is_byok_active(None));
     let reverted = mgr.read_settings().unwrap();
@@ -107,7 +108,7 @@ fn test_settings_empty_file_creation_and_revert() {
     assert!(settings_file.exists());
     assert!(mgr.is_byok_active(None));
 
-    mgr.revert(&prior_state).unwrap();
+    mgr.revert(&prior_state, "https://gateway.test").unwrap();
     // Since file did not exist before BYOK, revert safely removes the file
     assert!(!settings_file.exists());
 
@@ -121,9 +122,11 @@ fn test_launcher_env_generation() {
         envs.get("KIRO_AUTH_PORTAL_URL").unwrap(),
         "https://api.kiro-byok.test:8080"
     );
-    assert_eq!(
-        envs.get("AWS_ENDPOINT_URL").unwrap(),
-        "https://api.kiro-byok.test:8080"
+    // AWS SDKs read this as an override for every service, and everything running inside
+    // Kiro inherits it: a customer's own AWS calls would be sent to the gateway.
+    assert!(
+        !envs.contains_key("AWS_ENDPOINT_URL"),
+        "Kiro must not be launched with a global AWS endpoint override"
     );
     assert_eq!(envs.get("KIRO_DISABLE_SESSION_TITLE_LLM").unwrap(), "true");
     assert_eq!(envs.get("KIRO_DISABLE_RECAP").unwrap(), "true");
@@ -131,6 +134,70 @@ fn test_launcher_env_generation() {
         envs.get("KIRO_GATEWAY_URL").unwrap(),
         "https://api.kiro-byok.test:8080"
     );
+}
+
+#[test]
+fn a_backup_torn_by_a_crash_does_not_block_restore_while_the_original_is_live() {
+    let temp_dir = std::env::temp_dir().join(format!("kiro_test_torn_{}", std::process::id()));
+    let ext_file = temp_dir.join("extension.js");
+    fs::create_dir_all(&temp_dir).unwrap();
+    let original =
+        format!("// Synthetic bundle\nfunction e(t) {{ return \"{RUNTIME_ENDPOINT_NEEDLE}\"; }}\n");
+    fs::write(&ext_file, &original).unwrap();
+    let patcher = ExtensionPatcher::new(&ext_file);
+    patcher.apply("https://my-byok-gateway.test").unwrap();
+    // The crash window of a first apply: state written, backup cut short, and the live
+    // file still the original because the patched write never happened.
+    fs::write(&ext_file, &original).unwrap();
+    fs::write(patcher.backup_path(), &original.as_bytes()[..10]).unwrap();
+    assert!(patcher.restore().unwrap());
+    assert_eq!(fs::read_to_string(&ext_file).unwrap(), original);
+    assert!(!patcher.backup_path().exists());
+    assert_eq!(patcher.status(), PatchStatus::Official);
+    // A patched live file still needs a good backup: nothing else stands in for it.
+    patcher.apply("https://my-byok-gateway.test").unwrap();
+    fs::write(patcher.backup_path(), &original.as_bytes()[..10]).unwrap();
+    assert!(matches!(
+        patcher.restore(),
+        Err(PatchError::ExtensionChanged)
+    ));
+    assert_eq!(patcher.status(), PatchStatus::Patched);
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
+fn a_write_removes_temporary_files_left_by_an_interrupted_one() {
+    let temp_dir = std::env::temp_dir().join(format!("kiro_test_temps_{}", std::process::id()));
+    let ext_file = temp_dir.join("extension.js");
+    fs::create_dir_all(&temp_dir).unwrap();
+    fs::write(
+        &ext_file,
+        format!("function e(t) {{ return \"{RUNTIME_ENDPOINT_NEEDLE}\"; }}\n"),
+    )
+    .unwrap();
+    let leftovers = [
+        "extension.js.tmp.4242.1700000000000000000",
+        "extension.js.tmp.1.2",
+    ];
+    let unrelated = [
+        "extension.js.tmp.notes",
+        "extension.js.tmp.12",
+        "extension.jsx.tmp.1.2",
+        "other.js.tmp.1.2",
+    ];
+    for name in leftovers.iter().chain(&unrelated) {
+        fs::write(temp_dir.join(name), "x").unwrap();
+    }
+    ExtensionPatcher::new(&ext_file)
+        .apply("https://my-byok-gateway.test")
+        .unwrap();
+    for name in leftovers {
+        assert!(!temp_dir.join(name).exists(), "{name} was left behind");
+    }
+    for name in unrelated {
+        assert!(temp_dir.join(name).exists(), "{name} is not ours to delete");
+    }
+    let _ = fs::remove_dir_all(temp_dir);
 }
 
 #[test]
@@ -159,6 +226,8 @@ fn test_extension_patcher_lifecycle() {
     let patched_content = fs::read_to_string(&ext_file).unwrap();
     assert!(patched_content.starts_with(PATCH_MARKER_V1));
     assert!(patched_content.contains("process.env.KIRO_GATEWAY_URL"));
+    // A user's own AWS endpoint override must not redirect gateway traffic.
+    assert!(!patched_content.contains("AWS_ENDPOINT_URL"));
 
     // 2. Re-applying is idempotent
     patcher.apply("https://my-byok-gateway.test").unwrap();
@@ -267,7 +336,7 @@ fn test_settings_revert_preserves_newly_added_user_keys() {
     .unwrap();
 
     // Now restore official settings
-    mgr.revert(&prior_state).unwrap();
+    mgr.revert(&prior_state, "https://gateway.test").unwrap();
 
     // File should NOT have been deleted; user.customPreference should be preserved!
     assert!(settings_file.exists());
@@ -404,20 +473,31 @@ fn test_single_instance_lock_reentrancy_and_collision() {
     let lock1 = patch_engine::SingleInstanceLock::acquire(Some(&lock_file)).unwrap();
     assert!(lock_file.exists());
 
+    // Any other handle — which is what a second instance holds — is refused.
+    let rival = || {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_file)
+            .unwrap()
+            .try_lock()
+    };
+    assert!(matches!(rival(), Err(fs::TryLockError::WouldBlock)));
+
     // Same-process acquisition is intentionally reentrant.
     let lock2 = patch_engine::SingleInstanceLock::acquire(Some(&lock_file)).unwrap();
     drop(lock2);
-    assert!(lock_file.exists());
+    assert!(matches!(rival(), Err(fs::TryLockError::WouldBlock)));
 
-    // Drop first lock -> file deleted cleanly
+    // Dropping the last guard frees the lock. The file stays: unlinking a lock
+    // file lets a new owner lock a fresh inode while an old one still holds it.
     drop(lock1);
-    assert!(!lock_file.exists());
-
-    // Subsequent lock acquisition succeeds
-    let lock3 = patch_engine::SingleInstanceLock::acquire(Some(&lock_file)).unwrap();
     assert!(lock_file.exists());
+    rival().expect("lock is free after the last guard drops");
+
+    let lock3 = patch_engine::SingleInstanceLock::acquire(Some(&lock_file)).unwrap();
+    assert!(matches!(rival(), Err(fs::TryLockError::WouldBlock)));
     drop(lock3);
-    assert!(!lock_file.exists());
 
     let _ = fs::remove_dir_all(temp_dir);
 }

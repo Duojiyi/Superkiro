@@ -171,10 +171,6 @@ async fn main() {
             let res = MemoryGuard::trim_working_set(None);
             println!("{}", serde_json::to_string(&res).unwrap_or_default());
         }
-        "purge-orphans" => {
-            let res = MemoryGuard::purge_orphan_processes();
-            println!("{}", serde_json::to_string(&res).unwrap_or_default());
-        }
         "sample-memory" => {
             let res = MemoryGuard::sample_memory();
             if let Some(error) = &res.error {
@@ -184,7 +180,9 @@ async fn main() {
             println!("{}", serde_json::to_string(&res).unwrap_or_default());
         }
         _ => {
-            eprintln!("Usage: patch-cli <status|activate|restore|doctor|trim-memory|purge-orphans|sample-memory>");
+            eprintln!(
+                "Usage: patch-cli <status|activate|restore|doctor|trim-memory|sample-memory>"
+            );
             std::process::exit(2);
         }
     }

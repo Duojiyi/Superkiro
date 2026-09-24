@@ -59,13 +59,6 @@ pub struct TrimResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OrphanPurgeResult {
-    pub purged_count: usize,
-    pub purged_pids: Vec<u32>,
-    pub reclaimed_memory_mb: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheCleanResult {
     pub cleaned_files_count: usize,
     pub freed_bytes: u64,
@@ -234,30 +227,6 @@ impl MemoryGuard {
         }
     }
 
-    /// Identify and terminate abandoned AI agent subprocesses whose parent IDE has died.
-    pub fn purge_orphan_processes() -> OrphanPurgeResult {
-        let snapshot = Self::sample_memory();
-        let mut purged_pids = Vec::new();
-        let mut reclaimed_mb = 0;
-
-        for p in snapshot.processes {
-            if p.is_orphan
-                && (p.category == ProcessCategory::AgentSubprocess
-                    || p.category == ProcessCategory::LanguageServer)
-                && Self::terminate_process_by_pid(p.pid)
-            {
-                purged_pids.push(p.pid);
-                reclaimed_mb += p.memory_mb;
-            }
-        }
-
-        OrphanPurgeResult {
-            purged_count: purged_pids.len(),
-            purged_pids,
-            reclaimed_memory_mb: reclaimed_mb,
-        }
-    }
-
     /// Clean IDE temporary cache directories (Cache, CachedData, Code Cache, logs).
     pub fn clean_cache_folders(
         custom_data_dir: Option<&Path>,
@@ -415,42 +384,6 @@ impl MemoryGuard {
             let success = EmptyWorkingSet(handle) != 0;
             CloseHandle(handle);
             success
-        }
-    }
-
-    fn terminate_process_by_pid(pid: u32) -> bool {
-        #[cfg(target_os = "windows")]
-        {
-            #[link(name = "kernel32")]
-            extern "system" {
-                fn OpenProcess(
-                    dwDesiredAccess: u32,
-                    bInheritHandle: i32,
-                    dwProcessId: u32,
-                ) -> *mut std::ffi::c_void;
-                fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
-                fn TerminateProcess(hProcess: *mut std::ffi::c_void, uExitCode: u32) -> i32;
-            }
-            const PROCESS_TERMINATE: u32 = 0x0001;
-
-            unsafe {
-                let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
-                if handle.is_null() {
-                    return false;
-                }
-                let success = TerminateProcess(handle, 1) != 0;
-                CloseHandle(handle);
-                success
-            }
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            Command::new("kill")
-                .args(["-9", &pid.to_string()])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
         }
     }
 

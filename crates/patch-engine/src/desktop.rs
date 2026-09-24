@@ -219,6 +219,9 @@ impl DesktopSession {
         snapshots
             .validate_takeover(&settings, Some(&patcher), gateway)
             .map_err(|e| format!("[connection:preflight] {e}"))?;
+        if !settings.profiles_in_use().is_empty() {
+            return Err("[connection:preflight] Kiro has windows on a profile other than Default; takeover configures only the Default profile".into());
+        }
         let mut launch = crate::process::prepare_kiro_launch(installation, gateway, &[])
             .map_err(|e| format!("[connection:launch-prepare] {e}"))?;
         let device = if self.path.exists() {
@@ -239,7 +242,7 @@ impl DesktopSession {
             .await
             .map_err(|e| format!("[connection:authenticate] {e}"))?;
         if close_confirmed {
-            crate::stop_kiro(std::time::Duration::from_secs(30))
+            crate::process::stop_kiro_for_takeover()
                 .map_err(|e| format!("[connection:close] {e}"))?;
         } else {
             crate::ensure_kiro_stopped().map_err(|e| format!("[connection:close] {e}"))?;
@@ -247,7 +250,7 @@ impl DesktopSession {
         self.activate_locked(&snapshots, &settings, &patcher, gateway, card, Some(token))
             .await
             .map_err(|e| format!("[connection:apply] {e}"))?;
-        launch.spawn().map_err(|e| format!("[connection:launch] Takeover completed, but Kiro launch failed: {e}. Recovery backup retained; do not assume IDE is ready."))?;
+        crate::process::spawn_and_confirm(&mut launch).map_err(|e| format!("[connection:launch] Takeover completed, but Kiro launch failed: {e}. Recovery backup retained; do not assume IDE is ready."))?;
         Ok(())
     }
 
@@ -289,7 +292,7 @@ impl DesktopSession {
                 &session.gateway,
             )
             .map_err(|e| e.to_string())?;
-        launch.spawn().map_err(|e| e.to_string())?;
+        crate::process::spawn_and_confirm(&mut launch).map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -310,8 +313,15 @@ impl DesktopSession {
             let session = self.load()?;
             match session.previous_token {
                 Some(PreviousToken::Raw(bytes)) => {
-                    crate::token_storage::private_atomic_write(self.storage.path(), &bytes)
-                        .map_err(|e| e.to_string())?
+                    // Back exactly as it was, permissions included (Windows): the cache
+                    // directory's inherited ACL, not the owner-only one used while ours.
+                    #[cfg(windows)]
+                    let written =
+                        crate::token_storage::inherited_atomic_write(self.storage.path(), &bytes);
+                    #[cfg(not(windows))]
+                    let written =
+                        crate::token_storage::private_atomic_write(self.storage.path(), &bytes);
+                    written.map_err(|e| e.to_string())?
                 }
                 Some(PreviousToken::Legacy(token)) => {
                     self.storage.save(&token).map_err(|e| e.to_string())?
@@ -611,7 +621,7 @@ mod tests {
                     assert_eq!(body["refreshToken"], "refresh-secret");
                     Json(
                         json!({"accessToken":"renewed-access", "refreshToken":"renewed-refresh",
-                    "profileArn":"profile", "expiresAt":"2099-01-01T00:00:00Z"}),
+                    "profileArn":"arn:aws:codewhisperer:us-east-1:123456789012:profile/test", "expiresAt":"2099-01-01T00:00:00Z"}),
                     )
                 }),
             )
@@ -786,7 +796,7 @@ mod tests {
                 (
                     axum::http::StatusCode::OK,
                     Json(json!({
-                        "accessToken":card, "refreshToken":"refresh", "profileArn":"profile",
+                        "accessToken":card, "refreshToken":"refresh", "profileArn":"arn:aws:codewhisperer:us-east-1:123456789012:profile/test",
                         "expiresAt":"2099-01-01T00:00:00Z"
                     })),
                 )
@@ -865,7 +875,7 @@ mod persistent_ca_tests {
         fs::create_dir_all(&root).unwrap();
         let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         let port_file = root.join("port");
-        let server = Child(
+        let mut server = Child(
             std::process::Command::new("node")
                 .arg(fixtures.join("local-https.cjs"))
                 .arg(&port_file)
@@ -874,8 +884,15 @@ mod persistent_ca_tests {
                 .spawn()
                 .unwrap(),
         );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // The fixture generates two RSA-2048 keys with openssl before it binds, which
+        // exceeded 10s on a loaded Windows CI runner. This only guards against a hang.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while !port_file.exists() {
+            // A fixture that could not start (openssl missing, say) says so at once rather
+            // than after the whole deadline; its stderr is inherited above.
+            if let Some(status) = server.0.try_wait().unwrap() {
+                panic!("local TLS fixture exited before listening ({status}); see its stderr");
+            }
             assert!(
                 std::time::Instant::now() < deadline,
                 "local TLS fixture did not start"

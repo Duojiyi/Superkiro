@@ -21,6 +21,25 @@ pub fn is_tracked_operation(method: &str, path: &str) -> bool {
         )
 }
 
+/// Copy what an earlier release kept in roaming AppData into the machine-local directory,
+/// once: the install path a customer picked, and the record of the last operation. The
+/// roaming copies stay, so rolling back to that release loses nothing. Best effort.
+pub fn adopt_roaming_state(roaming: &Path, local: &Path) {
+    if roaming == local {
+        return;
+    }
+    for name in ["preferences.json", "last-operation.json"] {
+        let (from, to) = (roaming.join(name), local.join(name));
+        if from.is_file() && !to.exists() {
+            let _ = std::fs::create_dir_all(local);
+            let temporary = to.with_extension("adopt");
+            if std::fs::copy(&from, &temporary).is_ok() {
+                let _ = std::fs::rename(&temporary, &to);
+            }
+        }
+    }
+}
+
 pub struct Host {
     pub operation: tokio::sync::Mutex<()>,
     /// Raised for the whole of a user mutation. Maintenance reads it instead of
@@ -64,6 +83,10 @@ impl Host {
             .next()
             .filter(|path| is_tracked_operation("POST", path));
         *state = json!({"id":state["id"].as_u64().unwrap_or(0) + 1,"state":"running","path":path,"error":null});
+        // Written before the operation runs: if the host dies part-way, the next start must
+        // know something was left unfinished instead of reporting the previous result. A
+        // failed write does not stop the operation.
+        save_operation(&self.preferences, &mut state);
         Ok(())
     }
     pub fn finish_operation(&self, result: &Result<Value, Value>) {
@@ -87,11 +110,7 @@ impl Host {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs());
-            let file = self.preferences.with_file_name("last-operation.json");
-            let temporary = file.with_extension("tmp");
-            let saved = std::fs::write(&temporary, state.to_string())
-                .and_then(|()| std::fs::rename(&temporary, &file));
-            state["diagnostic_saved"] = json!(saved.is_ok());
+            save_operation(&self.preferences, &mut state);
         }
     }
     fn install_path(&self) -> Result<Option<PathBuf>, String> {
@@ -106,7 +125,7 @@ impl Host {
         }
     }
     pub fn set_install_path(&self, path: &Path) -> Result<Value, String> {
-        if recovery_pending() {
+        if self.recovery_pending() {
             return Err("Restore Kiro before changing installation".into());
         }
         patch_engine::inspect_installation_dir(path).map_err(|e| e.to_string())?;
@@ -121,6 +140,15 @@ impl Host {
         Ok(json!({"success":true,"path":path}))
     }
 }
+/// Replace `last-operation.json` beside `preferences` with `state`, noting whether it worked.
+fn save_operation(preferences: &Path, state: &mut Value) {
+    let file = preferences.with_file_name("last-operation.json");
+    let temporary = file.with_extension("tmp");
+    let saved = std::fs::write(&temporary, state.to_string())
+        .and_then(|()| std::fs::rename(&temporary, &file));
+    state["diagnostic_saved"] = json!(saved.is_ok());
+}
+
 fn load_operation(config: &Path) -> Value {
     let idle = json!({"id":0,"state":"idle","path":null,"error":null});
     let Ok(bytes) = std::fs::read(config.join("last-operation.json")) else {
@@ -129,10 +157,41 @@ fn load_operation(config: &Path) -> Value {
     let Ok(saved) = serde_json::from_slice::<Value>(&bytes) else {
         return idle;
     };
+    let path = saved["path"]
+        .as_str()
+        .filter(|path| is_tracked_operation("POST", path));
+    if saved["state"] == "running" {
+        // The host stopped part-way through, so what the operation changed is unknown. An
+        // unbind or a takeover may already have reached the service, and running it again
+        // must not look safe.
+        let mut error = crate::errors::classify(
+            "Operation was interrupted before it finished",
+            path.unwrap_or(""),
+            "POST",
+        );
+        error["outcome"] = json!(if matches!(path, Some("/api/unbind" | "/api/activate")) {
+            "unknown"
+        } else {
+            "failed"
+        });
+        let mut interrupted = json!({
+            "id": saved["id"].as_u64().unwrap_or(0),
+            "state": "failed",
+            "path": path,
+            "error": "Operation failed; inspect status before recovery",
+            "stage": error["stage"],
+            "code": error["code"],
+            "support_error": error,
+            "finished_at": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+        });
+        // Saved once, so the feedback ID the customer quotes stays the same across restarts.
+        save_operation(&config.join("preferences.json"), &mut interrupted);
+        return interrupted;
+    }
     if !matches!(saved["state"].as_str(), Some("failed" | "succeeded")) {
         return idle;
     }
-    let mut clean = json!({"id":saved["id"].as_u64().unwrap_or(0), "state":saved["state"], "path":null, "error":null});
+    let mut clean = json!({"id":saved["id"].as_u64().unwrap_or(0), "state":saved["state"], "path":path, "error":null});
     clean["finished_at"] = json!(saved["finished_at"].as_u64());
     if saved["state"] == "failed" {
         clean["error"] = json!("Operation failed; inspect status before recovery");
@@ -280,11 +339,72 @@ fn should_auto_trim(
     windows && process_count > 0 && total_mb > 2500 && elapsed.is_none_or(|seconds| seconds >= 300)
 }
 
-pub fn recovery_pending() -> bool {
+impl Host {
+    /// Whether anything of a takeover is still on this machine: its rollback records,
+    /// or, when those are lost, what the files themselves show.
+    pub fn recovery_pending(&self) -> bool {
+        records_pending() || self.leftovers().found()
+    }
+
+    /// A takeover's traces in every install this client may have patched.
+    fn leftovers(&self) -> patch_engine::Leftovers {
+        let custom = self.install_path().ok().flatten();
+        patch_engine::Leftovers::scan(
+            &patch_engine::candidate_extensions(custom.as_deref()),
+            &patch_engine::SettingsManager::default(),
+            &leftover_token(),
+            &known_gateway_hosts(),
+        )
+    }
+
+    /// Undo a takeover whose records are lost. Nothing to do when none is found.
+    fn remove_leftovers(&self) -> Result<(), String> {
+        let found = self.leftovers();
+        if !found.found() {
+            return Ok(());
+        }
+        patch_engine::ensure_kiro_stopped()?;
+        found.remove(
+            &patch_engine::SettingsManager::default(),
+            &leftover_token(),
+            &known_gateway_hosts(),
+        )
+    }
+}
+
+/// Whether a takeover's own rollback records are still on the machine.
+fn records_pending() -> bool {
     SnapshotManager::default().has_active_snapshot()
         || DesktopSession::system()
             .map(|s| s.recovery_pending())
             .unwrap_or(true)
+}
+
+fn leftover_token() -> patch_engine::TokenStorage {
+    patch_engine::TokenStorage::at(
+        patch_engine::default_token_path()
+            .unwrap_or_else(|_| PathBuf::from("kiro-auth-token.json")),
+    )
+}
+
+/// Hosts of every gateway this client could have pointed Kiro at: the configured one
+/// and those named by any surviving record.
+fn known_gateway_hosts() -> Vec<String> {
+    let mut urls: Vec<String> = gateway(None).into_iter().collect();
+    urls.extend(DesktopSession::system().ok().and_then(|s| s.gateway()));
+    urls.extend(
+        SnapshotManager::default()
+            .load()
+            .ok()
+            .map(|snapshot| snapshot.gateway_url),
+    );
+    let mut hosts: Vec<String> = urls
+        .iter()
+        .filter_map(|url| reqwest::Url::parse(url).ok()?.host_str().map(str::to_owned))
+        .collect();
+    hosts.sort();
+    hosts.dedup();
+    hosts
 }
 fn network_error(error: reqwest::Error) -> String {
     if error.is_timeout() {
@@ -567,15 +687,18 @@ fn unbind_gateway(session_gateway: Option<&str>, body: &Value) -> Result<String,
 fn confirmed_restore_stop(
     body: &Value,
     pending: bool,
-    stop: impl FnOnce() -> Result<(), patch_engine::process::ProcessError>,
+    stop: impl FnOnce(bool) -> Result<(), patch_engine::process::ProcessError>,
 ) -> Result<(), String> {
     if body.get("close_kiro_confirmed").and_then(Value::as_bool) != Some(true) {
         return Err(
             "Explicit close_kiro_confirmed: true is required to close Kiro and restore".into(),
         );
     }
+    // Ending Kiro with a window still open needs its own, second confirmation, given only
+    // after the user has been told Kiro would not close. Parsed as strictly as the first.
+    let force = body.get("force_close_confirmed").and_then(Value::as_bool) == Some(true);
     if pending {
-        stop().map_err(|e| format!("Cannot stop Kiro for restore: {e}"))?;
+        stop(force).map_err(|e| format!("Cannot stop Kiro for restore: {e}"))?;
     }
     Ok(())
 }
@@ -599,11 +722,12 @@ pub async fn dispatch(host: &Host, path: &str, method: &str, body: Value) -> Res
                 .ok()
                 .is_some_and(|path| patch_engine::TokenStorage::at(path).load().is_ok());
             let gateway = gateway(None)?;
+            let leftovers = host.leftovers();
             Ok(
                 json!({"process_state":patch_engine::detect_kiro_process_state().to_string(),
                 "kiro_installed":install.is_some(),"kiro_install_path":install.as_ref().map(|i| &i.install_dir),
                 "kiro_version":install.as_ref().map(|i| &i.version),"kiro_compatible":install.as_ref().is_some_and(|i| patch_engine::kiro_version_is_supported(&i.version)),"minimum_kiro_version":patch_engine::MINIMUM_SUPPORTED_KIRO_VERSION,"has_snapshot":SnapshotManager::default().has_active_snapshot(),
-                "recovery_pending":recovery_pending(),"authenticated":token_readable && session.as_ref().is_some_and(|s| s.authenticated()),"gateway_url":session.as_ref().and_then(|s| s.gateway()),"suggested_gateway_url":gateway,
+                "recovery_pending":records_pending() || leftovers.found(),"recovery_blocked":if leftovers.unrecoverable.is_empty() {Value::Null} else {json!("reinstall_kiro")},"authenticated":token_readable && session.as_ref().is_some_and(|s| s.authenticated()),"gateway_url":session.as_ref().and_then(|s| s.gateway()),"suggested_gateway_url":gateway,
                 "portal_url":format!("{gateway}/"),"platform":if cfg!(windows) {"win32"} else if cfg!(target_os="macos") {"darwin"} else {"linux"},
                 "model_service_available":null,"tray_available":true,"memory_maintenance":host.maintenance.lock().map_err(|_| "Maintenance state unavailable")?.clone(),"app_version":env!("SUPERKIRO_BUILD_VERSION")}),
             )
@@ -621,7 +745,7 @@ pub async fn dispatch(host: &Host, path: &str, method: &str, body: Value) -> Res
                 .diagnose(&gateway(query.as_deref())?, custom.as_deref())
                 .await;
             Ok(
-                json!({"overall_status":report.overall_status,"items":report.items.iter().map(|item| json!({"name":item.name,"level":item.level})).collect::<Vec<_>>(),"kiro_version":report.kiro_version,"is_running":report.is_running,"gateway_reachable":report.gateway_reachable,"can_one_click_fix":report.can_one_click_fix}),
+                json!({"overall_status":report.overall_status,"items":report.items.iter().map(|item| json!({"name":item.name,"level":item.level})).collect::<Vec<_>>(),"kiro_version":report.kiro_version,"is_running":report.is_running,"gateway_reachable":report.gateway_reachable}),
             )
         }
         ("GET", "/api/memory/sample") => {
@@ -640,7 +764,7 @@ pub async fn dispatch(host: &Host, path: &str, method: &str, body: Value) -> Res
             .await
         }
         ("POST", "/api/activate") => {
-            if recovery_pending() {
+            if host.recovery_pending() {
                 return Err("Restore pending Kiro recovery state before activating".into());
             }
             let card = body["card_key"].as_str().unwrap_or("");
@@ -667,10 +791,12 @@ pub async fn dispatch(host: &Host, path: &str, method: &str, body: Value) -> Res
         ("POST", "/api/restore") => {
             confirmed_restore_stop(
                 &body,
-                recovery_pending(),
+                host.recovery_pending(),
                 patch_engine::process::stop_kiro_for_restore,
             )?;
             DesktopSession::system()?.restore_and_logout(&SnapshotManager::default())?;
+            // Whatever the records did not cover, or all of it when they are lost.
+            host.remove_leftovers()?;
             Ok(json!({"success":true}))
         }
         ("POST", "/api/unbind") => {
@@ -680,7 +806,7 @@ pub async fn dispatch(host: &Host, path: &str, method: &str, body: Value) -> Res
             let target = unbind_gateway(session.gateway().as_deref(), &body)?;
             confirmed_restore_stop(
                 &body,
-                recovery_pending(),
+                host.recovery_pending(),
                 patch_engine::process::stop_kiro_for_restore,
             )?;
             session
@@ -732,7 +858,7 @@ mod tests {
     use super::*;
     #[test]
     fn restore_without_local_changes_never_stops_official_kiro() {
-        confirmed_restore_stop(&json!({"close_kiro_confirmed":true}), false, || {
+        confirmed_restore_stop(&json!({"close_kiro_confirmed":true}), false, |_| {
             panic!("verification-only sessions must not close Kiro")
         })
         .unwrap();
@@ -946,7 +1072,7 @@ mod operation_tests {
         assert!(host.operation.try_lock().is_err());
         drop(guard);
         drop(host);
-        std::fs::remove_dir(root).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -1021,7 +1147,7 @@ mod operation_tests {
         }
         drop(host);
         std::fs::remove_file(root.join("last-operation.json")).unwrap();
-        std::fs::remove_dir(root).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
     /// A failed restore leaves exactly one piece of evidence: the support payload
     /// in the operation record. A working-set trim shares nothing with it, so it
@@ -1137,7 +1263,77 @@ mod operation_tests {
         assert!(clean["support_error"].is_null());
         assert!(clean["http_status"].is_null());
         std::fs::remove_file(root.join("last-operation.json")).unwrap();
-        std::fs::remove_dir(root).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn an_operation_the_host_did_not_finish_is_reported_after_restart() {
+        for (path, outcome) in [
+            ("/api/unbind", "unknown"),
+            ("/api/activate", "unknown"),
+            ("/api/restore", "failed"),
+        ] {
+            let root = std::env::temp_dir().join(format!(
+                "host-interrupted-{}-{}",
+                std::process::id(),
+                path.rsplit('/').next().unwrap()
+            ));
+            let host = Host::new(root.clone()).unwrap();
+            host.begin_operation(path).unwrap();
+            // The host dies here: no finish_operation.
+            drop(host);
+            let host = Host::new(root.clone()).unwrap();
+            let state = host.operation_status().unwrap();
+            assert_eq!(state["state"], "failed", "{path}");
+            assert_eq!(state["id"], 1);
+            assert_eq!(state["path"], path);
+            assert_eq!(state["support_error"]["outcome"], outcome, "{path}");
+            let feedback = state["support_error"]["feedback_id"].clone();
+            assert!(feedback.is_string());
+            drop(host);
+            let again = Host::new(root.clone()).unwrap().operation_status().unwrap();
+            assert_eq!(
+                again["support_error"]["feedback_id"], feedback,
+                "the feedback ID must not change across restarts"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+    #[test]
+    fn roaming_state_is_adopted_once_and_never_overwrites_local() {
+        let root = std::env::temp_dir().join(format!("host-adopt-{}", std::process::id()));
+        let (roaming, local) = (root.join("roaming"), root.join("local"));
+        std::fs::create_dir_all(&roaming).unwrap();
+        std::fs::write(
+            roaming.join("preferences.json"),
+            r#"{"install_path":"D:/Kiro"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            roaming.join("last-operation.json"),
+            r#"{"id":3,"state":"succeeded"}"#,
+        )
+        .unwrap();
+        adopt_roaming_state(&roaming, &local);
+        assert_eq!(
+            std::fs::read_to_string(local.join("preferences.json")).unwrap(),
+            r#"{"install_path":"D:/Kiro"}"#
+        );
+        assert!(
+            roaming.join("preferences.json").exists(),
+            "kept for a rollback"
+        );
+        std::fs::write(
+            local.join("preferences.json"),
+            r#"{"install_path":"E:/Kiro"}"#,
+        )
+        .unwrap();
+        adopt_roaming_state(&roaming, &local);
+        assert_eq!(
+            std::fs::read_to_string(local.join("preferences.json")).unwrap(),
+            r#"{"install_path":"E:/Kiro"}"#,
+            "local state is never overwritten"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
     #[test]
     fn usage_rows_are_bounded_without_changing_totals() {
@@ -1350,13 +1546,13 @@ mod restore_confirmation_tests {
             json!({"close_kiro_confirmed":1}),
             json!({"close_kiro_confirmed":null}),
         ] {
-            assert!(confirmed_restore_stop(&body, true, || panic!(
+            assert!(confirmed_restore_stop(&body, true, |_| panic!(
                 "must not stop without consent"
             ))
             .is_err());
         }
         let called = std::cell::Cell::new(false);
-        confirmed_restore_stop(&json!({"close_kiro_confirmed":true}), true, || {
+        confirmed_restore_stop(&json!({"close_kiro_confirmed":true}), true, |_| {
             called.set(true);
             Ok(())
         })
@@ -1366,7 +1562,7 @@ mod restore_confirmation_tests {
 
     #[test]
     fn failed_stop_prevents_restore() {
-        let result = confirmed_restore_stop(&json!({"close_kiro_confirmed":true}), true, || {
+        let result = confirmed_restore_stop(&json!({"close_kiro_confirmed":true}), true, |_| {
             Err(patch_engine::process::ProcessError::UnknownState)
         })
         .map(|_| -> Result<(), String> { panic!("must not restore after failed stop") });
@@ -1394,7 +1590,7 @@ mod restore_confirmation_tests {
             }
         }
         drop(host);
-        std::fs::remove_dir(root).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 

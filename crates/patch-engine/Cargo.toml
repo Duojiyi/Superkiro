@@ -9,6 +9,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 ring = "0.17"
+# Surgical settings.json edits that keep comments and formatting.
+jsonc-parser = { version = "0.33", default-features = false, features = ["cst"] }
 reqwest = { workspace = true }
 tokio = { workspace = true }
 

@@ -49,7 +49,7 @@ Phase 3 核心目标：为最终开发者用户交付安全、轻量、高可用
    - 验证：精准识别到宿主真实安装的 Kiro v1.0.437 与 kiroAgent v1.0.794，正确提取 `product.json` 与插件版本号，无假阴性。
 2. **官方版本静默升级覆盖自愈 (Silent Upgrade Detection & Auto-Heal)**：
    - 模拟 Kiro 官方安装程序覆盖了被补丁过的 `extension.js`；
-   - 验证：Doctor 立即识别为 `TakeoverStatus::UpgradeDetected`，并激活 `can_one_click_fix=true`；调用 `one_click_fix()` 后自动对齐恢复补丁标记，测试 100% 通过。
+   - 验证：Doctor 立即识别为 `TakeoverStatus::UpgradeDetected`，并激活 `can_one_click_fix=true`；调用 `one_click_fix()` 后自动对齐恢复补丁标记，测试 100% 通过。（2026-09-24：`one_click_fix()` 已删除，理由见 P3-7.md。）
 3. **用户复杂配置文件合并与回滚 (Settings Integrity Under Complex Customizations)**：
    - 注入包含大量用户自定义插件、按键绑定、字号以及用户原本的 `update.mode="manual"`；
    - 验证：合并时仅精准触碰托管的 5 个键；调用 `restore_official()` 回滚后，用户的自定义配置完整保留，`update.mode` 精确复原为 `"manual"`，零误伤零残留。

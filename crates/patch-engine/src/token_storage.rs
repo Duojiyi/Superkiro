@@ -195,21 +195,9 @@ fn restrict_private(path: &Path, directory: bool) -> std::io::Result<()> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         // Replace the entire DACL: icacls /inheritance:r /grant:r leaves
         // unrelated explicit ACEs intact on some Windows temp directories.
-        let status = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command",
-                "$ErrorActionPreference='Stop'; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User; if ($env:PRIVATE_DIRECTORY -eq 'true') {$acl=New-Object System.Security.AccessControl.DirectorySecurity; $rule=New-Object System.Security.AccessControl.FileSystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow')} else {$acl=New-Object System.Security.AccessControl.FileSecurity; $rule=New-Object System.Security.AccessControl.FileSystemAccessRule($sid,'FullControl','Allow')}; $acl.SetAccessRuleProtection($true,$false); $acl.AddAccessRule($rule); if ($env:PRIVATE_DIRECTORY -eq 'true') {[System.IO.Directory]::SetAccessControl($env:PRIVATE_PATH,$acl)} else {[System.IO.File]::SetAccessControl($env:PRIVATE_PATH,$acl)}"])
-            .env("PRIVATE_PATH", path)
-            .env("PRIVATE_DIRECTORY", directory.to_string())
-            .creation_flags(0x08000000)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()?;
-        if !status.success() {
-            return Err(std::io::Error::other("Cannot restrict private file ACL"));
-        }
+        crate::windows_security::restrict_to_current_user(path, directory)?;
     }
     Ok(())
 }
@@ -275,6 +263,39 @@ pub(crate) fn private_atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result
         let _ = fs::remove_file(&temp);
     }
     let _ = fs::remove_dir(&staging);
+    result
+}
+
+/// Write `bytes` to `path` the way the file's own owner would: through a sibling that takes
+/// the directory's inherited permissions, then a rename. Used to put back a file exactly as
+/// it was, which for Kiro's token means readable by the user, SYSTEM and Administrators;
+/// written privately it came back readable by the user alone.
+#[cfg(windows)]
+pub(crate) fn inherited_atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temp = path.with_extension(format!(
+        "restore.{}.{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        crate::snapshot::atomic_replace(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
     result
 }
 

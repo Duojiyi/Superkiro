@@ -6,6 +6,7 @@ pub mod desktop;
 pub mod detect;
 pub mod device;
 pub mod doctor;
+pub mod leftovers;
 pub mod mem_guard;
 pub mod patch;
 pub mod preferences;
@@ -17,8 +18,8 @@ pub mod token_storage;
 pub mod white_label;
 
 pub use mem_guard::{
-    CacheCleanResult, MemGuardConfig, MemoryGuard, MemorySnapshot, OrphanPurgeResult,
-    ProcessCategory, ProcessMemoryInfo, TrimResult,
+    CacheCleanResult, MemGuardConfig, MemoryGuard, MemorySnapshot, ProcessCategory,
+    ProcessMemoryInfo, TrimResult,
 };
 
 pub use auth::{AuthClient, AuthClientError, ClientLoginRequest, ClientRefreshRequest};
@@ -31,6 +32,7 @@ pub use detect::{
 };
 pub use device::{generate_device_fingerprint, is_valid_device_fingerprint, DEVICE_ID_PREFIX};
 pub use doctor::{CheckItem, CheckLevel, Doctor, DoctorError, DoctorReport, TakeoverStatus};
+pub use leftovers::{candidate_extensions, Leftovers};
 pub use patch::{
     get_launcher_env, ExtensionPatcher, PatchError, PatchRecipe, PatchStatus, BACKUP_SUFFIX,
     PATCH_MARKER_V1, RUNTIME_ENDPOINT_NEEDLE,
@@ -73,3 +75,5 @@ mod http;
 
 #[cfg(windows)]
 mod windows_process;
+#[cfg(windows)]
+mod windows_security;

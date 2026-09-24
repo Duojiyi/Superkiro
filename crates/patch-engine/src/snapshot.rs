@@ -232,7 +232,9 @@ impl SnapshotManager {
         let ext_path = if let Some(p) = patcher {
             if let Err(e) = p.apply(gateway_url) {
                 // Keep the recovery record if rollback itself fails.
-                if settings_mgr.revert(&prior_settings).is_ok() && !p.backup_path().exists() {
+                if settings_mgr.revert(&prior_settings, gateway_url).is_ok()
+                    && !p.backup_path().exists()
+                {
                     let _ = fs::remove_file(&self.snapshot_path);
                 }
                 return Err(SnapshotError::Patch(e));
@@ -318,7 +320,7 @@ impl SnapshotManager {
         }
 
         let settings_mgr = SettingsManager::at(&snapshot.settings_path);
-        settings_mgr.revert(&snapshot.settings_state)?;
+        settings_mgr.revert(&snapshot.settings_state, &snapshot.gateway_url)?;
 
         // The takeover is over either way: the settings are reverted and the patch
         // is either rolled back or provably gone along with its material. Keeping

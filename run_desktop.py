@@ -373,15 +373,6 @@ class SecureBridgeHandler(BaseHTTPRequestHandler):
             self.send_json(200 if code == 0 else 500, data)
             return
 
-        if path == "/api/memory/purge_orphans":
-            code, out = run_patch_cli(["purge-orphans"])
-            try:
-                data = json.loads(out)
-            except Exception:
-                data = {"raw": out}
-            self.send_json(200 if code == 0 else 500, data)
-            return
-
         self.send_json(404, {"error": "API not found"})
 
 def heartbeat_watchdog(server: ThreadingHTTPServer):

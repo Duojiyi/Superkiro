@@ -2,7 +2,7 @@ import { invoke, isTauri } from '@tauri-apps/api/core';
 import { ClientError, toClientError } from './errors';
 export interface Authorization { virtualPlanName?: string; remainingPoints?: number; totalPoints?: number; validUntil?: number; isExpired?: boolean; status?: string }
 export const MINIMUM_KIRO_VERSION = '1.1.14';
-export interface Status { kiro_compatible?: boolean; minimum_kiro_version?: typeof MINIMUM_KIRO_VERSION; gateway_url?: string; authenticated?: boolean; has_snapshot?: boolean; recovery_pending?: boolean; kiro_installed?: boolean; kiro_version?: string; kiro_install_path?: string; process_state?: string; model_service_available?: boolean | null; portal_url?: string; platform?: string; app_version?: string; authorization?: Authorization; tray_available?: boolean; memory_maintenance?: Maintenance }
+export interface Status { kiro_compatible?: boolean; minimum_kiro_version?: typeof MINIMUM_KIRO_VERSION; gateway_url?: string; authenticated?: boolean; has_snapshot?: boolean; recovery_pending?: boolean; recovery_blocked?: 'reinstall_kiro' | null; kiro_installed?: boolean; kiro_version?: string; kiro_install_path?: string; process_state?: string; model_service_available?: boolean | null; portal_url?: string; platform?: string; app_version?: string; authorization?: Authorization; tray_available?: boolean; memory_maintenance?: Maintenance }
 export interface Usage { usage?: { availableCredits?:number|null; usageBreakdownList?: {dimensionType: string; currentUsageWithPrecision: number; usageLimitWithPrecision: number}[]; virtualPlanName?: string; validUntil?: number; isExpired?: boolean }; settledUsage?: {windowStart?: string|number; windowEnd?: string|number; timezone?: string; totalTokens?: number; todayPoints?: number; todayTokens?: number; referencePrice?: number; daily?: {date: string; points?: number; tokens?: number; usd?: number}[]; models?: {name: string; tokens?: number; points?: number}[]} }
 export interface Memory { total_memory_mb?: number; total_process_count?: number; ide_memory_mb?: number; agent_memory_mb?: number; success_count?: number; failed_count?: number }
 export const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0;
@@ -54,11 +54,13 @@ export function safeError(error: unknown) {
   if (/preview/i.test(text)) return '当前为浏览器预览，未连接 Tauri 宿主。没有执行本机操作。';
   return '请求未完成，请检查本地服务、卡密及网络后重试。';
 }
+// Takeover, restore and unbind may wait for Kiro to close, save prompt included, before they write.
+const LONG_MUTATIONS = ['/api/activate', '/api/restore', '/api/unbind'];
 export async function api<T>(path: string, method = 'GET', body: object = {}): Promise<T> {
   if (!isTauri()) throw toClientError({code:'SK-PREVIEW-001'});
   let timer:ReturnType<typeof setTimeout>|undefined;
   try {
-    const result = await Promise.race([invoke<T & {success?: boolean; error?: unknown}>('api', {path, method, body}),new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(toClientError({code:'SK-NET-001',outcome:method==='GET'?'failed':'unknown'})),path==='/api/heartbeat'?5000:method==='GET'?15000:125000);})]);
+    const result = await Promise.race([invoke<T & {success?: boolean; error?: unknown}>('api', {path, method, body}),new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(toClientError({code:'SK-NET-001',outcome:method==='GET'?'failed':'unknown'})),path==='/api/heartbeat'?5000:method==='GET'?15000:LONG_MUTATIONS.includes(path)?180000:125000);})]);
     if (result?.success === false) throw result.error;
     return result;
   } catch (error) { throw toClientError(error); }
