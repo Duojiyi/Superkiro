@@ -1357,15 +1357,18 @@ mod restore_tests {
     /// Teardown still making progress is waited for, not cut short.
     #[test]
     fn headless_teardown_making_progress_is_left_to_finish() {
-        // Poll every 50ms. This gives 9 observations across 400ms, each reporting progress.
+        // Two polls go to the grace wait (one at once, one after its first 50ms sleep).
+        // The teardown then reports a change on every poll until it stops.
         let mut counts: Vec<_> = std::iter::repeat_n(RUNNING, 4).collect();
         counts.extend([4usize, 3, 2, 1].map(StopObservation::Running));
         counts.push(StopObservation::Stopped);
         let mut fake = Fake::new(&counts, &[Some(false)]);
-        // Make the grace short so the test finishes before the counts run out; stall is
-        // the real guard.
+        // Only the observations may decide this, never how late a loaded runner wakes
+        // from each 50ms sleep: the ceilings are far beyond the few polls it takes.
         let timings = StopTimings {
             grace: Duration::from_millis(50),
+            stall: Duration::from_secs(5),
+            headless_ceiling: Duration::from_secs(30),
             ..FAST
         };
         assert!(stop_with(&mut fake, false, &timings).is_ok());
