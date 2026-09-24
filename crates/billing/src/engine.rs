@@ -2360,10 +2360,10 @@ impl BillingEngine {
         // Consumption is a liability, not a new authorization. Debit the full
         // bill even beyond balance/quota; subsequent reservations are blocked.
         let previous_debt = card.outstanding_debt();
-        card.credit_used = card
-            .credit_used
-            .checked_add(entry.credits_charged)
-            .ok_or_else(|| BillingError::InvalidState("settlement credit_used overflow".into()))?;
+        // Saturate rather than fail: failing here is permanent (recovery never reprices),
+        // and only a balance an older release already saturated can get this close to
+        // the limit. Ledger reconciliation saturates the same way, so the two still agree.
+        card.credit_used = card.credit_used.saturating_add(entry.credits_charged);
         card.credit_reserved = card
             .credit_reserved
             .saturating_sub(reservation.reserved_micro_credits);
