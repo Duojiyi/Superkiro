@@ -78,6 +78,10 @@ jobs:
           key: desktop-macos-${{ matrix.target }}
       - run: npm --prefix apps/desktop-ui ci
       - run: npm --prefix apps/desktop-ui test
+      # The macOS stop, gate and install paths differ from Windows and had never been
+      # tested anywhere before a release.
+      - name: Rust tests (engine and host)
+        run: cargo test --locked -p patch-engine -p desktop-host
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
