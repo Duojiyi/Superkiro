@@ -350,12 +350,17 @@ impl ExtensionPatcher {
         let original_matches = |bytes: &[u8]| {
             bytes.len() as u64 == state.original_len && content_hash(bytes) == state.original_hash
         };
-        let backup = match fs::read(self.backup_path()) {
-            Ok(bytes) if original_matches(&bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && original_matches(&current) => {
-                current.clone()
+        // A live file that is the original needs nothing rolled back, whatever became of
+        // the backup: a crash while it was being written leaves it truncated, and an
+        // antivirus scan can lock it. Only a patched live file needs the backup to prove
+        // itself, and it is never replaced by anything that does not.
+        let backup = if original_matches(&current) {
+            current.clone()
+        } else {
+            match fs::read(self.backup_path()) {
+                Ok(bytes) if original_matches(&bytes) => bytes,
+                _ => return Err(PatchError::ExtensionChanged),
             }
-            _ => return Err(PatchError::ExtensionChanged),
         };
         let current_hash = content_hash(&current);
         if !original_matches(&current)
@@ -408,7 +413,40 @@ impl ExtensionPatcher {
     }
 }
 
+/// Remove what earlier writes to `path` left behind when they died between writing their
+/// temporary sibling and renaming it: `<name>.tmp.<pid>.<nanos>`, 13 MB each for Kiro's
+/// bundle, inside Kiro's own installation. Writes run one at a time under the operation
+/// lock, so any such sibling found before a write is a leftover. Best effort.
+pub(crate) fn remove_stale_temps(path: &Path) {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
+        return;
+    };
+    let prefix = format!("{name}.tmp.");
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(rest) = file_name
+            .to_str()
+            .and_then(|n| n.strip_prefix(prefix.as_str()))
+        else {
+            continue;
+        };
+        let leftover = rest.split_once('.').is_some_and(|(pid, nanos)| {
+            !pid.is_empty()
+                && !nanos.is_empty()
+                && pid.bytes().all(|b| b.is_ascii_digit())
+                && nanos.bytes().all(|b| b.is_ascii_digit())
+        });
+        if leftover && entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 fn atomic_write_file(path: &Path, content: &[u8]) -> Result<(), PatchError> {
+    remove_stale_temps(path);
     let temp_file = path.with_file_name(format!(
         "{}.tmp.{}.{}",
         path.file_name()

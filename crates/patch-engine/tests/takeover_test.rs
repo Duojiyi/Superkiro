@@ -136,6 +136,70 @@ fn test_launcher_env_generation() {
 }
 
 #[test]
+fn a_backup_torn_by_a_crash_does_not_block_restore_while_the_original_is_live() {
+    let temp_dir = std::env::temp_dir().join(format!("kiro_test_torn_{}", std::process::id()));
+    let ext_file = temp_dir.join("extension.js");
+    fs::create_dir_all(&temp_dir).unwrap();
+    let original =
+        format!("// Synthetic bundle\nfunction e(t) {{ return \"{RUNTIME_ENDPOINT_NEEDLE}\"; }}\n");
+    fs::write(&ext_file, &original).unwrap();
+    let patcher = ExtensionPatcher::new(&ext_file);
+    patcher.apply("https://my-byok-gateway.test").unwrap();
+    // The crash window of a first apply: state written, backup cut short, and the live
+    // file still the original because the patched write never happened.
+    fs::write(&ext_file, &original).unwrap();
+    fs::write(patcher.backup_path(), &original.as_bytes()[..10]).unwrap();
+    assert!(patcher.restore().unwrap());
+    assert_eq!(fs::read_to_string(&ext_file).unwrap(), original);
+    assert!(!patcher.backup_path().exists());
+    assert_eq!(patcher.status(), PatchStatus::Official);
+    // A patched live file still needs a good backup: nothing else stands in for it.
+    patcher.apply("https://my-byok-gateway.test").unwrap();
+    fs::write(patcher.backup_path(), &original.as_bytes()[..10]).unwrap();
+    assert!(matches!(
+        patcher.restore(),
+        Err(PatchError::ExtensionChanged)
+    ));
+    assert_eq!(patcher.status(), PatchStatus::Patched);
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
+fn a_write_removes_temporary_files_left_by_an_interrupted_one() {
+    let temp_dir = std::env::temp_dir().join(format!("kiro_test_temps_{}", std::process::id()));
+    let ext_file = temp_dir.join("extension.js");
+    fs::create_dir_all(&temp_dir).unwrap();
+    fs::write(
+        &ext_file,
+        format!("function e(t) {{ return \"{RUNTIME_ENDPOINT_NEEDLE}\"; }}\n"),
+    )
+    .unwrap();
+    let leftovers = [
+        "extension.js.tmp.4242.1700000000000000000",
+        "extension.js.tmp.1.2",
+    ];
+    let unrelated = [
+        "extension.js.tmp.notes",
+        "extension.js.tmp.12",
+        "extension.jsx.tmp.1.2",
+        "other.js.tmp.1.2",
+    ];
+    for name in leftovers.iter().chain(&unrelated) {
+        fs::write(temp_dir.join(name), "x").unwrap();
+    }
+    ExtensionPatcher::new(&ext_file)
+        .apply("https://my-byok-gateway.test")
+        .unwrap();
+    for name in leftovers {
+        assert!(!temp_dir.join(name).exists(), "{name} was left behind");
+    }
+    for name in unrelated {
+        assert!(temp_dir.join(name).exists(), "{name} is not ours to delete");
+    }
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
 fn test_extension_patcher_lifecycle() {
     let temp_dir = std::env::temp_dir().join(format!("kiro_test_patch_{}", std::process::id()));
     let ext_file = temp_dir.join("extension.js");

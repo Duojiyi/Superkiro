@@ -312,6 +312,7 @@ impl SettingsManager {
         if let Some(parent) = self.settings_path.parent() {
             fs::create_dir_all(parent)?;
         }
+        crate::patch::remove_stale_temps(&self.settings_path);
 
         let temp_file = self.settings_path.with_file_name(format!(
             "{}.tmp.{}.{}",
