@@ -170,6 +170,8 @@ pub struct BillingEngine {
     /// overwrite the shared temporary file or publish an older snapshot last.
     persistence_lock: Arc<Mutex<()>>,
     snapshot_sequence: Arc<AtomicU64>,
+    /// Size of the last saved snapshot file, as written.
+    snapshot_bytes: Arc<AtomicU64>,
     last_snapshot_checksum: Arc<RwLock<Option<String>>>,
     last_persistence_error: Arc<RwLock<Option<String>>>,
     /// Serializes cross-table mutations with snapshot reads so a published file
@@ -212,6 +214,14 @@ impl Drop for ReservationLease {
 
 const SNAPSHOT_VERSION: u32 = 2;
 const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
+
+/// Saved state sizes that call for the operator: archive the ledger soon, and now. At
+/// the ceiling every commit fails, so every reservation is refused.
+pub const STATE_WARNING_BYTES: u64 = MAX_SNAPSHOT_BYTES as u64 / 8;
+pub const STATE_URGENT_BYTES: u64 = MAX_SNAPSHOT_BYTES as u64 / 4;
+
+/// Format tag of a ledger archive encrypted with the master KEK.
+const ENCRYPTED_ARCHIVE_FORMAT: &str = "kiro-ledger-archive-aead-v1";
 /// Request traces are rewritten with the whole state on every mutation; a hundred
 /// thousand of them made traces the largest thing in it.
 const MAX_RETAINED_TRACES: usize = 10_000;
@@ -581,6 +591,7 @@ impl BillingEngine {
             master_kek: Arc::new(RwLock::new(master_kek)),
             persistence_lock: Arc::new(Mutex::new(())),
             snapshot_sequence: Arc::new(AtomicU64::new(0)),
+            snapshot_bytes: Arc::new(AtomicU64::new(0)),
             last_snapshot_checksum: Arc::new(RwLock::new(None)),
             last_persistence_error: Arc::new(RwLock::new(None)),
             state_lock: Arc::new(RwLock::new(())),
@@ -1088,7 +1099,41 @@ impl BillingEngine {
             .store(snapshot.sequence, Ordering::Release);
         *self.last_snapshot_checksum.write().unwrap() = Some(published_checksum);
         *self.last_persistence_error.write().unwrap() = None;
+        self.note_snapshot_size(file_content.len() as u64);
         Ok(())
+    }
+
+    /// Record the saved size, and tell the operator once each time it crosses a level.
+    fn note_snapshot_size(&self, bytes: u64) {
+        let previous = self.snapshot_bytes.swap(bytes, Ordering::AcqRel);
+        for (level, urgency) in [(STATE_URGENT_BYTES, "now"), (STATE_WARNING_BYTES, "soon")] {
+            if bytes >= level && previous < level {
+                eprintln!(
+                    "[kiro-billing] saved state is {bytes} bytes of a {MAX_SNAPSHOT_BYTES}-byte \
+                     ceiling; archive old ledger entries {urgency} \
+                     (POST /api/v1/admin/ledger/archive)"
+                );
+                break;
+            }
+        }
+    }
+
+    /// Where ledger archives go: beside the saved state. `None` without persistence.
+    pub fn ledger_archive_dir(&self) -> Option<std::path::PathBuf> {
+        let path = self.persistence_path.read().unwrap().clone()?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        Some(parent.join("ledger_archives"))
+    }
+
+    /// Size of the last saved snapshot file, and the ceiling past which saves fail.
+    pub fn state_size(&self) -> (u64, u64) {
+        (
+            self.snapshot_bytes.load(Ordering::Acquire),
+            MAX_SNAPSHOT_BYTES as u64,
+        )
     }
 
     pub(crate) fn commit_candidate_snapshot<R, F>(
@@ -4331,9 +4376,27 @@ impl BillingEngine {
         };
         let payload_json = serde_json::to_string_pretty(&payload)
             .map_err(|e| BillingError::InvalidState(format!("Failed to serialize archive: {e}")))?;
-        let checksum = sha256_hex(payload_json.as_bytes());
+        // The archive holds the same ledger the encrypted state does, so it is encrypted
+        // with the same key rather than left beside it in plain text.
+        let content = match self.master_kek.read().unwrap().as_ref() {
+            Some(kek) => {
+                let ciphertext = kek.encrypt(&payload_json).map_err(|e| {
+                    BillingError::InvalidState(format!("Failed to encrypt archive: {e}"))
+                })?;
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "format": ENCRYPTED_ARCHIVE_FORMAT,
+                    "archiveId": payload.archive_id,
+                    "ciphertext": ciphertext,
+                }))
+                .map_err(|e| {
+                    BillingError::InvalidState(format!("Failed to serialize archive: {e}"))
+                })?
+            }
+            None => payload_json,
+        };
+        let checksum = sha256_hex(content.as_bytes());
 
-        write_atomic_bytes(&archive_path, payload_json.as_bytes())
+        write_atomic_bytes(&archive_path, content.as_bytes())
             .map_err(|e| BillingError::Persistence(format!("Failed to write archive file: {e}")))?;
 
         let receipt = ArchivedLedgerReceipt {
@@ -4510,6 +4573,15 @@ pub fn verify_ledger_archive(
     archive_path: &std::path::Path,
     expected_checksum: &str,
 ) -> Result<ArchivedLedgerPayload, BillingError> {
+    verify_ledger_archive_with(archive_path, expected_checksum, None)
+}
+
+/// [`verify_ledger_archive`] for an archive that may be encrypted with `kek`.
+pub fn verify_ledger_archive_with(
+    archive_path: &std::path::Path,
+    expected_checksum: &str,
+    kek: Option<&crate::crypto::MasterKek>,
+) -> Result<ArchivedLedgerPayload, BillingError> {
     let bytes = std::fs::read(archive_path)
         .map_err(|e| BillingError::Persistence(format!("Failed to read archive file: {e}")))?;
     let actual_checksum = sha256_hex(&bytes);
@@ -4519,7 +4591,23 @@ pub fn verify_ledger_archive(
             expected_checksum, actual_checksum
         )));
     }
-    let payload: ArchivedLedgerPayload = serde_json::from_slice(&bytes)
+    let invalid = |e: String| BillingError::InvalidState(format!("Invalid ledger archive: {e}"));
+    let document: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| invalid(e.to_string()))?;
+    let plaintext;
+    let payload_bytes: &[u8] = if document["format"] == ENCRYPTED_ARCHIVE_FORMAT {
+        let kek = kek.ok_or_else(|| invalid("encrypted, and no master KEK was given".into()))?;
+        let ciphertext = document["ciphertext"]
+            .as_str()
+            .ok_or_else(|| invalid("no ciphertext".into()))?;
+        plaintext = kek
+            .decrypt(ciphertext)
+            .map_err(|e| invalid(e.to_string()))?;
+        plaintext.as_bytes()
+    } else {
+        &bytes
+    };
+    let payload: ArchivedLedgerPayload = serde_json::from_slice(payload_bytes)
         .map_err(|e| BillingError::InvalidState(format!("Invalid ledger archive payload: {e}")))?;
     if payload.entries_count != payload.entries.len() {
         return Err(BillingError::InvalidState(format!(

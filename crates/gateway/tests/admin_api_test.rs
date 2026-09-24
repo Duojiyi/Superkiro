@@ -1029,3 +1029,100 @@ async fn admin_cards_pagination_is_sorted_and_revision_detects_insertions() {
     assert_eq!(full_page["count"], 3);
     assert_eq!(full_page["revision"], second_page["revision"]);
 }
+
+#[tokio::test]
+async fn the_operator_can_archive_the_ledger_to_shrink_the_saved_state() {
+    let dir = std::env::temp_dir().join(format!(
+        "kiro-admin-archive-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (billing, app) = setup_admin_app();
+    billing.set_persistence_path(dir.join("billing_state.json"));
+    billing.set_master_kek(billing::crypto::MasterKek::from_bytes([3; 32]));
+    let mut card = Card::new("card-archive", "group-admin", 100_000_000);
+    card.status = CardStatus::Active;
+    billing.upsert_card(card);
+    let params = billing::reservation::ReservationEstimateParams::new(100, 100);
+    billing
+        .reserve("card-archive", "inv-archive", &params, 1_000, 60)
+        .unwrap();
+    billing
+        .settle(
+            "inv-archive",
+            &billing::ledger::UsageTokens {
+                uncached_input_tokens: 100,
+                output_tokens: 100,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+            },
+            "model",
+            "provider",
+            "target",
+            1_005,
+        )
+        .unwrap();
+    let used = billing.get_card("card-archive").unwrap().credit_used;
+
+    let post = |body: serde_json::Value, key: Option<&str>| {
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/admin/ledger/archive")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(key) = key {
+            req = req.header("x-admin-key", key);
+        }
+        req.body(Body::from(body.to_string())).unwrap()
+    };
+    let status = |req: Request<Body>| {
+        let app = app.clone();
+        async move { tower::ServiceExt::oneshot(app, req).await.unwrap().status() }
+    };
+    assert_eq!(
+        status(post(json!({"beforeTsSecs": 2_000}), None)).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        status(post(
+            json!({"beforeTsSecs": u64::MAX}),
+            Some(TEST_ADMIN_KEY)
+        ))
+        .await,
+        StatusCode::BAD_REQUEST
+    );
+
+    let resp = tower::ServiceExt::oneshot(
+        app.clone(),
+        post(json!({"beforeTsSecs": 2_000}), Some(TEST_ADMIN_KEY)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(result["receipt"]["drained_entries_count"], 1);
+    assert!(result["stateBytesAfter"].as_u64().unwrap() > 0);
+
+    // The balance is unchanged, and the archive is not readable without the key.
+    assert_eq!(billing.get_card("card-archive").unwrap().credit_used, used);
+    let file = dir
+        .join("ledger_archives")
+        .join(result["receipt"]["archive_file"].as_str().unwrap());
+    let content = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        !content.contains("card-archive"),
+        "the archive is in plain text"
+    );
+    let checksum = result["receipt"]["sha256_checksum"].as_str().unwrap();
+    assert!(billing::verify_ledger_archive(&file, checksum).is_err());
+    let kek = billing::crypto::MasterKek::from_bytes([3; 32]);
+    let payload = billing::verify_ledger_archive_with(&file, checksum, Some(&kek)).unwrap();
+    assert_eq!(payload.entries[0].card_id, "card-archive");
+    let _ = std::fs::remove_dir_all(dir);
+}

@@ -459,3 +459,30 @@ fn topup_write_failure_preserves_code_until_durable_retry() {
         .starts_with(std::env::temp_dir().canonicalize().unwrap()));
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn the_saved_state_size_is_reported_against_its_ceiling() {
+    let dir = std::env::temp_dir().join(format!(
+        "kiro-state-size-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("billing_state.json");
+    let engine = BillingEngine::new();
+    assert_eq!(engine.state_size().0, 0, "nothing saved yet");
+    engine.set_persistence_path(&path);
+    engine.upsert_card(billing::Card::new("card-size", "group", 1));
+
+    let (bytes, ceiling) = engine.state_size();
+    assert_eq!(bytes, std::fs::metadata(&path).unwrap().len());
+    assert_eq!(ceiling, 256 * 1024 * 1024);
+    const {
+        assert!(billing::engine::STATE_WARNING_BYTES < billing::engine::STATE_URGENT_BYTES);
+    }
+    assert!(billing::engine::STATE_URGENT_BYTES < ceiling);
+    let _ = std::fs::remove_dir_all(dir);
+}

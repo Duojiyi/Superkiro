@@ -305,6 +305,10 @@ impl FacadeRegistry {
                 billing: billing.clone(),
                 auth: auth.clone(),
             })
+            .register(admin::AdminArchiveLedgerHandler {
+                billing: billing.clone(),
+                auth: auth.clone(),
+            })
             .register(admin::AdminBatchCardsHandler {
                 billing: billing.clone(),
                 auth: auth.clone(),
