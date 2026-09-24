@@ -32,7 +32,8 @@ fn retryable(error: &ProviderError) -> bool {
         ProviderError::Network(_)
         | ProviderError::Timeout
         | ProviderError::StreamDisconnected
-        | ProviderError::Watchdog(_) => true,
+        | ProviderError::Watchdog(_)
+        | ProviderError::EmptyCompletion => true,
         _ => false,
     }
 }
@@ -56,11 +57,30 @@ pub async fn start_stream(
             let upstream = provider.chat_stream(client, config, request).await?;
             let mut upstream = Box::pin(WatchdogStream::new(upstream, WatchdogConfig::default()));
             let mut prefix = Vec::new();
+            let (mut stop_reason, mut metered) = (None, false);
             while let Some(event) = upstream.next().await {
                 let event = event?;
                 let output = matches!(event, ProviderStreamEvent::Delta(_));
+                if let ProviderStreamEvent::StopReason(reason) = &event {
+                    stop_reason = Some(reason.clone());
+                }
+                metered |= matches!(event, ProviderStreamEvent::Usage(_));
                 if matches!(event, ProviderStreamEvent::Done) {
-                    return Err(ProviderError::StreamDisconnected);
+                    // An empty response whose stop reason explains it — the output limit,
+                    // a content filter — is final: retrying it tripled the vendor bill and
+                    // put a shared key into cooldown for every tenant. An ordinary stop with
+                    // nothing in it is also what a failing relay sends, so it is retried,
+                    // but the key answered and is not cooled down for it.
+                    return match stop_reason.as_deref() {
+                        Some(reason)
+                            if metered && crate::stream::is_explicit_empty_stop(reason) =>
+                        {
+                            prefix.push(Ok(event));
+                            Ok(Box::pin(stream::iter(prefix)) as BoxStream<'static, _>)
+                        }
+                        Some(_) if metered => Err(ProviderError::EmptyCompletion),
+                        _ => Err(ProviderError::StreamDisconnected),
+                    };
                 }
                 prefix.push(Ok(event));
                 if output {
@@ -92,6 +112,7 @@ pub async fn start_stream(
                             ProviderError::Service => "upstream_service".into(),
                             ProviderError::Parse(_) => "protocol".into(),
                             ProviderError::Timeout | ProviderError::Watchdog(_) => "timeout".into(),
+                            ProviderError::EmptyCompletion => "empty".into(),
                             _ => "transport".into(),
                         }),
                         latency_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
@@ -107,6 +128,7 @@ pub async fn start_stream(
                     ProviderError::Parse(_) => "protocol".into(),
                     ProviderError::Service => "service".into(),
                     ProviderError::Timeout | ProviderError::Watchdog(_) => "timeout".into(),
+                    ProviderError::EmptyCompletion => "empty".into(),
                     _ => "transport".into(),
                 };
                 let can_retry = attempt + 1 < attempts && retryable(&error);

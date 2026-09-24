@@ -211,3 +211,56 @@ async fn post_rotation_checks_use_the_same_non_enumerating_error() {
         );
     }
 }
+
+/// Kiro computes its token expiry as `now + expiresIn * 1000`. Without the field that throws,
+/// after the gateway has already rotated the refresh token, and Kiro logs the user out.
+#[tokio::test]
+async fn refresh_response_carries_the_expiry_kiro_reads() {
+    let (_, auth, handler) = setup();
+    let (status, result) = refresh(
+        &handler,
+        json!({"refreshToken": token(&auth, &active_card())}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        result["expiresIn"], 3600,
+        "Kiro cannot complete a refresh without it"
+    );
+    assert!(
+        result["expiresAt"].is_string(),
+        "the desktop client reads expiresAt"
+    );
+}
+
+/// A refresh whose write failed consumed nothing. Kiro and the desktop app log out on 401 and
+/// retry a 503, and the same token must work once storage is back.
+#[tokio::test]
+async fn storage_failure_on_refresh_is_retryable_not_a_logout() {
+    let (engine, auth, handler) = setup();
+    let dir = std::env::temp_dir().join(format!(
+        "refresh-storage-fault-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    engine.set_persistence_path(dir.join("state.json"));
+    let refresh_token = token(&auth, &active_card());
+
+    engine.inject_persistence_fault(true);
+    let (status, result) = refresh(&handler, json!({"refreshToken": refresh_token})).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(result["__type"], "ServiceUnavailableException");
+
+    engine.inject_persistence_fault(false);
+    let (status, _) = refresh(&handler, json!({"refreshToken": refresh_token})).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the failed attempt must not consume the token"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

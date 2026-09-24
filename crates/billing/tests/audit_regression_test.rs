@@ -348,3 +348,128 @@ fn archived_facts_preserve_quota_reconciliation_replay_and_recovery() {
     fs::write(&invalid, serde_json::to_vec(&corrupt).unwrap()).unwrap();
     assert!(BillingEngine::new().load_from_file(&invalid).is_err());
 }
+
+/// A settlement that prices to zero must complete. It used to be refused after its
+/// intent was already durable, and the refusal was permanent: recovery retried it
+/// forever without repricing, the card could never reserve again, it could not be
+/// voided, and publishing any pricing change was refused for the whole deployment
+/// ("Requests are still settling"). The state validated on load, so a restart kept it.
+///
+/// All-zero usage is what an OpenAI-compatible upstream reports when it sends a usage
+/// frame of zeros; zero-priced configuration reaches the same place with real usage.
+#[test]
+fn a_zero_charge_settlement_completes_instead_of_wedging_the_card() {
+    let engine = engine_with_card(1_000_000_000);
+    engine
+        .reserve(
+            "card",
+            "zero-charge",
+            &ReservationEstimateParams::new(1_000, 1_000),
+            100,
+            600,
+        )
+        .unwrap();
+    assert!(engine.get_card("card").unwrap().credit_reserved > 0);
+
+    let entry = engine
+        .settle("zero-charge", &UsageTokens::default(), "m", "p", "m", 101)
+        .expect("a zero charge must settle");
+    assert_eq!(entry.credits_charged, 0);
+
+    assert!(
+        engine.list_pending_settlements().is_empty(),
+        "no intent may be left behind"
+    );
+    let card = engine.get_card("card").unwrap();
+    assert_eq!(card.credit_reserved, 0, "the hold must be returned");
+    assert_eq!(card.credit_used, 0);
+    // The card keeps working.
+    engine
+        .reserve(
+            "card",
+            "after-zero-charge",
+            &ReservationEstimateParams::new(1_000, 1_000),
+            102,
+            600,
+        )
+        .expect("the card must be able to reserve again");
+}
+
+/// Token counts come from the upstream. A buggy OpenAI-compatible relay reporting an
+/// absurd count used to price to a saturated `i64::MAX` charge, which could then never
+/// be added to a card that had any usage: the same permanent wedge as a zero charge,
+/// reached through "settlement credit_used overflow".
+#[test]
+fn an_absurd_upstream_token_count_settles_as_a_bounded_charge() {
+    let engine = engine_with_card(1_000_000_000);
+    engine
+        .reserve(
+            "card",
+            "normal",
+            &ReservationEstimateParams::new(1_000, 1_000),
+            100,
+            600,
+        )
+        .unwrap();
+    engine
+        .settle("normal", &usage(1_000), "m", "p", "m", 101)
+        .unwrap();
+    let used_before = engine.get_card("card").unwrap().credit_used;
+    assert!(used_before > 0);
+
+    engine
+        .reserve(
+            "card",
+            "absurd",
+            &ReservationEstimateParams::new(1_000, 1_000),
+            102,
+            600,
+        )
+        .unwrap();
+    let absurd = UsageTokens {
+        uncached_input_tokens: u64::MAX,
+        output_tokens: u64::MAX,
+        cache_creation_tokens: u64::MAX,
+        cache_read_tokens: u64::MAX,
+    };
+    let entry = engine
+        .settle("absurd", &absurd, "m", "p", "m", 103)
+        .expect("an absurd count must settle, not wedge");
+    assert!(entry.credits_charged > 0 && entry.credits_charged < i64::MAX / 1_000);
+    assert!(engine.list_pending_settlements().is_empty());
+    let card = engine.get_card("card").unwrap();
+    assert_eq!(card.credit_used, used_before + entry.credits_charged);
+    assert_eq!(card.credit_reserved, 0);
+}
+
+/// One failed write marks persistence unready, and every reservation is refused until
+/// something commits successfully. Nothing did: reservations are the refused path, and
+/// the janitor commits only when it reclaims a hold. So a storage hiccup of a second
+/// turned into an outage lasting until an unrelated request or timeout came along. The
+/// recovery task, which already runs on a timer, now probes.
+#[test]
+fn the_recovery_task_restores_service_once_storage_is_back() {
+    let path = state_path("persistence-probe");
+    let engine = engine_with_card(1_000_000_000);
+    engine.save_to_file(&path).unwrap();
+    let params = ReservationEstimateParams::new(1_000, 1_000);
+
+    engine.inject_persistence_fault(true);
+    assert!(engine
+        .reserve("card", "during-outage", &params, 100, 600)
+        .is_err());
+    assert!(!engine.persistence_ready());
+
+    // Storage comes back. Nothing else happens on this deployment.
+    engine.inject_persistence_fault(false);
+    let mut recovery = engine::PendingSettlementRecovery::default();
+    recovery.tick(&engine, 101);
+
+    assert!(
+        engine.persistence_ready(),
+        "a single tick must restore readiness"
+    );
+    engine
+        .reserve("card", "after-outage", &params, 102, 600)
+        .expect("reservations must resume once storage is back");
+}

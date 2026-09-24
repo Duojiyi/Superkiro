@@ -67,6 +67,12 @@ pub enum ProviderError {
 
     #[error("Upstream watchdog triggered: {0}")]
     Watchdog(#[from] crate::watchdog::WatchdogError),
+
+    /// The upstream ended normally with nothing in it and no reason (such as the output
+    /// limit or a content filter) that makes an empty answer final. A failing relay sends the
+    /// same thing. The key did answer, so this is retried without cooling the key down.
+    #[error("Upstream completed without producing any output")]
+    EmptyCompletion,
 }
 
 /// Bound and normalize vendor error bodies before they enter logs or error

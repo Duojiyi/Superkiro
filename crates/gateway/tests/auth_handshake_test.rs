@@ -81,6 +81,10 @@ async fn test_first_login_activates_card_and_binds_device() {
     assert_eq!(token_resp.auth_method, "social");
     assert_eq!(token_resp.provider, "Google");
     assert!(token_resp.profile_arn.contains("grp-pro"));
+    assert_eq!(
+        token_resp.expires_in, 3600,
+        "Kiro computes its expiry from expiresIn"
+    );
     assert!(
         !token_resp.refresh_token.is_empty(),
         "refresh_token must be present"

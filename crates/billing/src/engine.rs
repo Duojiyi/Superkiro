@@ -194,6 +194,13 @@ impl Drop for ReservationLease {
 
 const SNAPSHOT_VERSION: u32 = 2;
 const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
+/// Request traces are rewritten with the whole state on every mutation; a hundred
+/// thousand of them made traces the largest thing in it.
+const MAX_RETAINED_TRACES: usize = 10_000;
+/// Ceiling for one settlement: ten million credits. Far above any real request, and
+/// low enough that `credit_used` cannot overflow — a card in debt cannot reserve
+/// again, so only its in-flight requests can ever add to it.
+const MAX_SETTLEMENT_MICRO_CREDITS: i64 = 10_000_000 * crate::MICRO_CREDITS_PER_CREDIT;
 
 /// Authenticated encrypted snapshot envelope for billing state persistence (Spec §7, P1-03).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -469,6 +476,18 @@ impl PendingSettlementRecovery {
         engine: &BillingEngine,
         now_secs: u64,
     ) -> Vec<(String, Result<LedgerEntry, BillingError>)> {
+        // One failed write refuses every reservation until something commits, and the
+        // refused path is the one that would. Probe instead of waiting. The probe writes
+        // the current in-memory state, so an intent that could only be kept in memory
+        // during the outage becomes durable here rather than being lost on restart.
+        if !engine.persistence_ready() {
+            // Logged, because the only other visible error is the original write failure:
+            // an operator could not tell a probe refusing the in-memory state from an
+            // outage that is still going on.
+            if let Err(error) = engine.probe_persistence() {
+                eprintln!("[kiro-billing] persistence probe failed: {error}");
+            }
+        }
         let ids: std::collections::HashSet<_> = engine
             .pending_settlements
             .read()
@@ -780,6 +799,18 @@ impl BillingEngine {
         }
     }
 
+    /// Try to restore persistence after a failed write by committing the current state
+    /// — but only a state the loader would accept. Writing whatever is in memory would
+    /// turn an in-memory fault into a service that cannot start.
+    pub fn probe_persistence(&self) -> Result<(), BillingError> {
+        if self.persistence_path.read().unwrap().is_none() {
+            return Ok(());
+        }
+        validate_snapshot(&self.export_snapshot())
+            .map_err(|error| BillingError::Persistence(error.to_string()))?;
+        self.sync_to_disk_checked()
+    }
+
     /// Persist the current state and propagate failures to the caller.
     ///
     /// Financial and identity mutations use this method so an I/O failure is
@@ -942,7 +973,9 @@ impl BillingEngine {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let json = serde_json::to_string_pretty(snapshot)
+        // Compact: every mutation rewrites the whole state, so indentation was paid for on
+        // each request, and it counted toward the size ceiling. Both forms load everywhere.
+        let json = serde_json::to_string(snapshot)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         if !snapshot.issuance_orders.is_empty() && self.master_kek.read().unwrap().is_none() {
@@ -2039,6 +2072,10 @@ impl BillingEngine {
         target_model: &str,
         now_secs: u64,
     ) -> Result<LedgerEntry, BillingError> {
+        // Clamp rather than refuse. A refusal here happens before the intent is durable,
+        // and a request whose settlement is refused is refunded once the janitor
+        // reclaims the hold — so every new refusal would be a free request.
+        let tokens = &tokens.clamped();
         let _state_guard = self.state_lock.write().unwrap();
         let existing = self
             .pending_settlements
@@ -2047,7 +2084,7 @@ impl BillingEngine {
             .get(invocation_id)
             .cloned();
         if let Some(pending) = existing {
-            if pending.tokens != *tokens
+            if pending.tokens.clamped() != *tokens
                 || pending.entry.exposed_model != exposed_model
                 || pending.entry.provider_id != provider_id
                 || pending.entry.target_model != target_model
@@ -2187,6 +2224,7 @@ impl BillingEngine {
                 "calculated settlement charge is negative".to_string(),
             ));
         }
+        let charge = charge.min(MAX_SETTLEMENT_MICRO_CREDITS);
 
         let entry = LedgerEntry {
             id: format!("led-{}", invocation_id),
@@ -2301,7 +2339,10 @@ impl BillingEngine {
                 "pending reservation is not Held".into(),
             ));
         }
-        let entry = pending.entry.clone();
+        let mut entry = pending.entry.clone();
+        // An intent stored by an older release may carry a saturated charge that could
+        // never be added to `credit_used`; clamping it is what lets it complete.
+        entry.credits_charged = entry.credits_charged.min(MAX_SETTLEMENT_MICRO_CREDITS);
         if entry.invocation_id.as_deref() != Some(invocation_id)
             || entry.card_id != reservation.card_id
             || entry.kind != LedgerKind::Usage
@@ -2312,9 +2353,11 @@ impl BillingEngine {
                 "invalid pending settlement identity or amount".into(),
             ));
         }
-        if entry.credits_charged == 0 && reservation.reserved_micro_credits > 0 {
-            return Err(BillingError::MissingUsage);
-        }
+        // A zero charge is a valid outcome — zero prices are valid configuration — and
+        // is recorded like any other. This used to be refused here, after the intent was
+        // durable. Recovery retries without repricing, so the refusal was permanent: the
+        // card could never reserve again, could not be voided, and pricing publication
+        // was refused deployment-wide. Completion may now fail only on persistence.
         let card = candidate
             .cards
             .get_mut(&entry.card_id)
@@ -2322,10 +2365,10 @@ impl BillingEngine {
         // Consumption is a liability, not a new authorization. Debit the full
         // bill even beyond balance/quota; subsequent reservations are blocked.
         let previous_debt = card.outstanding_debt();
-        card.credit_used = card
-            .credit_used
-            .checked_add(entry.credits_charged)
-            .ok_or_else(|| BillingError::InvalidState("settlement credit_used overflow".into()))?;
+        // Saturate rather than fail: failing here is permanent (recovery never reprices),
+        // and only a balance an older release already saturated can get this close to
+        // the limit. Ledger reconciliation saturates the same way, so the two still agree.
+        card.credit_used = card.credit_used.saturating_add(entry.credits_charged);
         card.credit_reserved = card
             .credit_reserved
             .saturating_sub(reservation.reserved_micro_credits);
@@ -2367,8 +2410,10 @@ impl BillingEngine {
             provider_cost_micro_cny: entry.provider_cost_micro_cny,
             attempt_chain,
         });
-        if candidate.traces.len() > 100_000 {
-            candidate.traces.drain(..candidate.traces.len() - 100_000);
+        if candidate.traces.len() > MAX_RETAINED_TRACES {
+            candidate
+                .traces
+                .drain(..candidate.traces.len() - MAX_RETAINED_TRACES);
         }
         self.commit_candidate_snapshot(&candidate, || {
             *self.cards.write().unwrap() = candidate.cards.clone();
@@ -3938,8 +3983,8 @@ impl BillingEngine {
             let _state_guard = self.state_lock.write().unwrap();
             let mut traces = self.traces.write().unwrap();
             traces.push(trace);
-            if traces.len() > 100_000 {
-                let overflow = traces.len() - 100_000;
+            if traces.len() > MAX_RETAINED_TRACES {
+                let overflow = traces.len() - MAX_RETAINED_TRACES;
                 traces.drain(..overflow);
             }
         }

@@ -263,6 +263,8 @@ pub fn is_cooldown_error(err: &ProviderError) -> bool {
         ProviderError::Parse(_) | ProviderError::Serialization(_) => false,
         ProviderError::Service => false,
         ProviderError::Watchdog(_) => true,
+        // The key answered; an empty answer says nothing about the key.
+        ProviderError::EmptyCompletion => false,
     }
 }
 
@@ -352,6 +354,10 @@ pub async fn execute_stream_with_failover(
                 failure_records.push((key_id.clone(), err_msg));
 
                 let failed_at = crate::now_secs().max(now_secs);
+                if matches!(e, ProviderError::EmptyCompletion) {
+                    // Worth another key, but not a reason to cool this one down.
+                    continue;
+                }
                 if is_cooldown_error(&e) {
                     if let ProviderError::Http(status, _) = e {
                         if status.as_u16() == 401 {

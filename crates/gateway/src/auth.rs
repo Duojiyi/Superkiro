@@ -16,7 +16,7 @@ use axum::{
     response::Response,
 };
 use billing::card::CardStatus;
-use billing::engine::BillingEngine;
+use billing::engine::{BillingEngine, BillingError};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
@@ -54,6 +54,11 @@ pub enum AuthError {
 
     #[error("Token tenant does not match the live card tenant")]
     TenantMismatch,
+
+    /// The credential may be fine but could not be checked or recorded (storage is down).
+    /// Clients retry a 503; a 401 would log them out.
+    #[error("Authentication temporarily unavailable: {0}")]
+    Unavailable(String),
 }
 
 impl AuthError {
@@ -87,6 +92,11 @@ impl AuthError {
                 StatusCode::UNAUTHORIZED,
                 "AccessDeniedException",
                 "Invalid authentication credentials".to_string(),
+            ),
+            Self::Unavailable(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ServiceUnavailableException",
+                "The service is temporarily unavailable; retry shortly".to_string(),
             ),
         }
     }
@@ -397,7 +407,12 @@ impl AuthState {
             if let Some(billing) = &self.billing {
                 billing
                     .consume_refresh_token(&refresh.jti, refresh.exp, now)
-                    .map_err(|e| AuthError::InvalidSignature(e.to_string()))?;
+                    .map_err(|e| match e {
+                        // A failed write consumed nothing, so the same token works once
+                        // storage is back.
+                        BillingError::Persistence(message) => AuthError::Unavailable(message),
+                        other => AuthError::InvalidSignature(other.to_string()),
+                    })?;
             } else {
                 let mut used = self.used_refresh_tokens.write().map_err(|_| {
                     AuthError::InvalidSignature("refresh store poisoned".to_string())

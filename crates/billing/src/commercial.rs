@@ -67,6 +67,12 @@ fn text(s: &str, max: usize) -> bool {
 fn positive(n: f64) -> bool {
     n.is_finite() && n > 0.0 && n <= 1000.0
 }
+/// Version margin x group margin x model credit multiplier, as met by one request. Each is
+/// bounded on its own, but together they reached 10^9, which saturates the reservation and
+/// takes the model offline.
+const MAX_COMBINED_MULTIPLIER: f64 = 100.0;
+/// The charge divides by the face value, so a mistyped one does the same.
+const MIN_CREDIT_FACE_VALUE_CNY: f64 = 0.0001;
 fn invalid(s: &str) -> BillingError {
     BillingError::InvalidState(s.into())
 }
@@ -105,9 +111,12 @@ impl BillingEngine {
             return Err(invalid("Requests are still settling; publish when idle"));
         }
         if let Some(mut settings) = u.settings {
-            if !positive(settings.credit_face_value_cny) || !positive(settings.usd_cny_rate) {
+            if !positive(settings.credit_face_value_cny)
+                || settings.credit_face_value_cny < MIN_CREDIT_FACE_VALUE_CNY
+                || !positive(settings.usd_cny_rate)
+            {
                 return Err(invalid(
-                    "Face value and exchange rate must be finite, positive, and at most 1000",
+                    "Face value must be 0.0001-1000 and the exchange rate positive and at most 1000",
                 ));
             }
             settings.rate_updated_at_secs = now;
@@ -217,7 +226,9 @@ impl BillingEngine {
                 || prices
                     .iter()
                     .any(|p| !p.is_finite() || *p < 0.0 || *p > 1_000_000.0)
-                || fixed.iter().any(|p| *p < 0 || *p > 1_000_000_000_000_000)
+                // A million credits per million tokens (or per call). The old ceiling of
+                // 10^18 priced a single request past what a balance can hold.
+                || fixed.iter().any(|p| *p < 0 || *p > 1_000_000_000_000)
                 || !c.rate_cards.contains_key(&v.rate_card_id)
                 || v.effective_from_secs < now
             {
@@ -247,6 +258,37 @@ impl BillingEngine {
                     .map(|x| x.id),
             });
             c.rate_card_versions.push(v);
+        }
+        // Superseded versions never price a request again (publication waits for idle), and
+        // they are immutable, so counting them would block every later publication.
+        let live_margin = c
+            .rate_card_versions
+            .iter()
+            .filter(|v| {
+                v.effective_from_secs > now
+                    || !c.rate_card_versions.iter().any(|w| {
+                        w.rate_card_id == v.rate_card_id
+                            && w.model == v.model
+                            && w.effective_from_secs > v.effective_from_secs
+                            && w.effective_from_secs <= now
+                    })
+            })
+            .map(|v| v.margin_multiplier)
+            .fold(1.0, f64::max);
+        let group_margin = c
+            .groups
+            .values()
+            .map(|g| g.margin_multiplier)
+            .fold(1.0, f64::max);
+        let model_multiplier = c
+            .model_maps
+            .iter()
+            .map(|m| m.credit_multiplier)
+            .fold(1.0, f64::max);
+        if live_margin * group_margin * model_multiplier > MAX_COMBINED_MULTIPLIER {
+            return Err(invalid(
+                "Margins and model multipliers combine to more than 100x",
+            ));
         }
         let revision = view(&c).revision;
         c.commercial_audit_logs.push(CommercialAudit {
@@ -317,6 +359,25 @@ mod tests {
         assert!(e.publish_commercial_config(update(&e), 100).is_err());
         assert_eq!(e.commercial_config().revision, before);
         assert!(e.commercial_config().audit.is_empty());
+    }
+    #[test]
+    fn stacked_multipliers_and_face_value_are_bounded() {
+        let e = BillingEngine::new();
+        let before = e.commercial_config().revision;
+        let mut u = update(&e);
+        // Within its own bound of 1000, but 150x once combined.
+        u.groups[0].margin_multiplier = 150.0;
+        assert!(e.publish_commercial_config(u, 100).is_err());
+        let mut u = update(&e);
+        u.settings = Some(BillingSettings {
+            credit_face_value_cny: 0.00001,
+            ..e.export_snapshot().settings
+        });
+        assert!(e.publish_commercial_config(u, 100).is_err());
+        assert_eq!(e.commercial_config().revision, before);
+        let mut u = update(&e);
+        u.groups[0].margin_multiplier = 100.0;
+        assert!(e.publish_commercial_config(u, 100).is_ok());
     }
     #[test]
     fn model_aliases_and_provider_isolation_are_enforced() {
