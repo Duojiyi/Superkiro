@@ -154,7 +154,7 @@ async fn test_upstream_vision_transcription_mock() {
 
     assert!(desc.contains("绿色提交按钮"));
 
-    let formatted = format_fallback_description(1, "png", 120, false, Some(&desc));
+    let formatted = format_fallback_description(1, "png", 120, Some((64, 32)), Some(&desc));
     assert!(formatted.contains("[视觉降级/Vision Fallback - 图片转文字 #1]"));
     assert!(formatted.contains("绿色提交按钮"));
 }

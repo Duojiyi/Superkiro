@@ -42,10 +42,10 @@ pub use card_platform::{
     PullCardsResponse, RedeemAction, RedeemCallbackRequest, RedeemCallbackResponse,
 };
 pub use engine::{
-    read_snapshot_anchor, verify_ledger_archive, ArchivedCardSummary, ArchivedLedgerPayload,
-    ArchivedLedgerReceipt, ArchivedLedgerSummary, BillingEngine, BillingError, BillingSnapshot,
-    CardReconciliation, IssuanceOrder, PendingSettlement, SnapshotAnchor,
-    SnapshotVerificationReport, UnpaidCharge,
+    read_snapshot_anchor, verify_ledger_archive, verify_ledger_archive_with, ArchivedCardSummary,
+    ArchivedLedgerPayload, ArchivedLedgerReceipt, ArchivedLedgerSummary, BillingEngine,
+    BillingError, BillingSnapshot, CardReconciliation, IssuanceOrder, PendingSettlement,
+    SnapshotAnchor, SnapshotVerificationReport, UnpaidCharge,
 };
 pub use generator::{export_csv, export_json, generate_batch, generate_card, GeneratedCard};
 pub use group::{FallbackTarget, Group, ModelMap, ProviderBindingMode};

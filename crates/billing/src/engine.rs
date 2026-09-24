@@ -125,6 +125,24 @@ use crate::observability::{
 };
 
 /// In-memory billing engine for concurrency-safe reservations and settlements.
+/// What a refresh did to the card's refresh family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshRotation {
+    /// The family advanced to this version, durably.
+    Rotated(u64),
+    /// A retry of the refresh that just happened: nothing changed; this is the version.
+    Reissued(u64),
+}
+
+impl RefreshRotation {
+    /// The version the new refresh token must carry.
+    pub fn version(self) -> u64 {
+        match self {
+            Self::Rotated(version) | Self::Reissued(version) => version,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BillingEngine {
     cards: Arc<RwLock<HashMap<String, Card>>>,
@@ -152,6 +170,8 @@ pub struct BillingEngine {
     /// overwrite the shared temporary file or publish an older snapshot last.
     persistence_lock: Arc<Mutex<()>>,
     snapshot_sequence: Arc<AtomicU64>,
+    /// Size of the last saved snapshot file, as written.
+    snapshot_bytes: Arc<AtomicU64>,
     last_snapshot_checksum: Arc<RwLock<Option<String>>>,
     last_persistence_error: Arc<RwLock<Option<String>>>,
     /// Serializes cross-table mutations with snapshot reads so a published file
@@ -194,6 +214,14 @@ impl Drop for ReservationLease {
 
 const SNAPSHOT_VERSION: u32 = 2;
 const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
+
+/// Saved state sizes that call for the operator: archive the ledger soon, and now. At
+/// the ceiling every commit fails, so every reservation is refused.
+pub const STATE_WARNING_BYTES: u64 = MAX_SNAPSHOT_BYTES as u64 / 8;
+pub const STATE_URGENT_BYTES: u64 = MAX_SNAPSHOT_BYTES as u64 / 4;
+
+/// Format tag of a ledger archive encrypted with the master KEK.
+const ENCRYPTED_ARCHIVE_FORMAT: &str = "kiro-ledger-archive-aead-v1";
 /// Request traces are rewritten with the whole state on every mutation; a hundred
 /// thousand of them made traces the largest thing in it.
 const MAX_RETAINED_TRACES: usize = 10_000;
@@ -563,6 +591,7 @@ impl BillingEngine {
             master_kek: Arc::new(RwLock::new(master_kek)),
             persistence_lock: Arc::new(Mutex::new(())),
             snapshot_sequence: Arc::new(AtomicU64::new(0)),
+            snapshot_bytes: Arc::new(AtomicU64::new(0)),
             last_snapshot_checksum: Arc::new(RwLock::new(None)),
             last_persistence_error: Arc::new(RwLock::new(None)),
             state_lock: Arc::new(RwLock::new(())),
@@ -1070,7 +1099,41 @@ impl BillingEngine {
             .store(snapshot.sequence, Ordering::Release);
         *self.last_snapshot_checksum.write().unwrap() = Some(published_checksum);
         *self.last_persistence_error.write().unwrap() = None;
+        self.note_snapshot_size(file_content.len() as u64);
         Ok(())
+    }
+
+    /// Record the saved size, and tell the operator once each time it crosses a level.
+    fn note_snapshot_size(&self, bytes: u64) {
+        let previous = self.snapshot_bytes.swap(bytes, Ordering::AcqRel);
+        for (level, urgency) in [(STATE_URGENT_BYTES, "now"), (STATE_WARNING_BYTES, "soon")] {
+            if bytes >= level && previous < level {
+                eprintln!(
+                    "[kiro-billing] saved state is {bytes} bytes of a {MAX_SNAPSHOT_BYTES}-byte \
+                     ceiling; archive old ledger entries {urgency} \
+                     (POST /api/v1/admin/ledger/archive)"
+                );
+                break;
+            }
+        }
+    }
+
+    /// Where ledger archives go: beside the saved state. `None` without persistence.
+    pub fn ledger_archive_dir(&self) -> Option<std::path::PathBuf> {
+        let path = self.persistence_path.read().unwrap().clone()?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        Some(parent.join("ledger_archives"))
+    }
+
+    /// Size of the last saved snapshot file, and the ceiling past which saves fail.
+    pub fn state_size(&self) -> (u64, u64) {
+        (
+            self.snapshot_bytes.load(Ordering::Acquire),
+            MAX_SNAPSHOT_BYTES as u64,
+        )
     }
 
     pub(crate) fn commit_candidate_snapshot<R, F>(
@@ -1590,6 +1653,10 @@ impl BillingEngine {
         if let Some(device) = device_fp.filter(|d| !d.trim().is_empty()) {
             bind_device_locked(card, device.trim())?;
         }
+        // A sign-in starts a new refresh family: every refresh token issued before it,
+        // including one copied off the device, stops working.
+        card.refresh_version = card.refresh_version.saturating_add(1).max(1);
+        card.refresh_rotated_at = None;
         let updated_card = card.clone();
 
         self.commit_candidate_snapshot(&candidate, || {
@@ -2887,46 +2954,85 @@ impl BillingEngine {
 
     /// Rotate only the refresh-token family for a card. Access JWTs remain
     /// valid until their normal expiry or an explicit card revocation.
-    pub fn rotate_refresh_version(&self, card_id: &str) -> Result<u64, BillingError> {
-        let current = self
-            .get_card(card_id)
-            .ok_or_else(|| BillingError::CardNotFound(card_id.to_string()))?
-            .refresh_version;
-        self.rotate_refresh_version_if(card_id, current)
-    }
-
-    pub fn rotate_refresh_version_if(
+    /// Rotate a card's refresh-token family, keeping O(1) state per card.
+    ///
+    /// Only a token carrying the card's current `refresh_version` rotates it, so replaying
+    /// any older token fails without a record of each one used: the consumed-token set this
+    /// replaces grew by an entry per refresh, for 30 days, and one card chaining refreshes
+    /// could fill the state until billing stopped. The set is still read, so a token issued
+    /// before this release and already used stays refused; nothing is added to it, and it
+    /// drains as those tokens expire.
+    ///
+    /// A token exactly one version behind, presented within `grace_secs` of that rotation,
+    /// is the same refresh retried — a response lost on the way back, a second Kiro window,
+    /// or the desktop client refreshing alongside Kiro — and gets the current version again
+    /// with no change, instead of a 401 that signs the customer out.
+    pub fn rotate_refresh(
         &self,
         card_id: &str,
-        expected_version: u64,
-    ) -> Result<u64, BillingError> {
+        presented_version: u64,
+        jti: &str,
+        expires: u64,
+        now: u64,
+        grace_secs: u64,
+    ) -> Result<RefreshRotation, BillingError> {
         let _state_guard = self.state_lock.write().unwrap();
-        let sequence = self
-            .snapshot_sequence
-            .load(Ordering::Acquire)
-            .saturating_add(1);
-        let previous_checksum = self.last_snapshot_checksum.read().unwrap().clone();
-        let mut candidate = self.export_snapshot_locked(sequence, previous_checksum);
-
+        if expires <= now || jti.is_empty() || jti.len() > 256 {
+            return Err(BillingError::InvalidState(
+                "expired or empty refresh token".into(),
+            ));
+        }
+        let used = || BillingError::InvalidState("refresh token already used".into());
+        if self
+            .consumed_refresh_tokens
+            .read()
+            .unwrap()
+            .get(jti)
+            .is_some_and(|exp| *exp > now)
+        {
+            return Err(used());
+        }
+        let current = self
+            .cards
+            .read()
+            .unwrap()
+            .get(card_id)
+            .map(|card| (card.refresh_version, card.refresh_rotated_at))
+            .ok_or_else(|| BillingError::CardNotFound(card_id.to_string()))?;
+        match current {
+            (version, _) if presented_version == version => {}
+            (version, Some(rotated))
+                if presented_version.saturating_add(1) == version
+                    && now.saturating_sub(rotated) < grace_secs =>
+            {
+                return Ok(RefreshRotation::Reissued(version));
+            }
+            _ => return Err(used()),
+        }
+        let mut candidate = self.export_snapshot_locked(
+            self.snapshot_sequence
+                .load(Ordering::Acquire)
+                .saturating_add(1),
+            self.last_snapshot_checksum.read().unwrap().clone(),
+        );
+        candidate
+            .consumed_refresh_tokens
+            .retain(|_, exp| *exp > now);
         let card = candidate
             .cards
             .get_mut(card_id)
             .ok_or_else(|| BillingError::CardNotFound(card_id.to_string()))?;
-        if card.refresh_version != expected_version {
-            return Err(BillingError::InvalidState(
-                "refresh token has already been rotated".to_string(),
-            ));
-        }
         card.refresh_version = card.refresh_version.saturating_add(1).max(1);
-        let version = card.refresh_version;
-        let updated_card = card.clone();
-
+        card.refresh_rotated_at = Some(now);
+        let (version, updated) = (card.refresh_version, card.clone());
         self.commit_candidate_snapshot(&candidate, || {
             self.cards
                 .write()
                 .unwrap()
-                .insert(card_id.to_string(), updated_card);
-            version
+                .insert(card_id.to_string(), updated);
+            *self.consumed_refresh_tokens.write().unwrap() =
+                candidate.consumed_refresh_tokens.clone();
+            RefreshRotation::Rotated(version)
         })
     }
 
@@ -3285,13 +3391,24 @@ impl BillingEngine {
     // Top-up & Renewal Operations (Spec §14.9)
     // ==========================================
 
-    /// Register a top-up code in the billing engine.
-    pub fn upsert_topup_code(&self, code: TopupCode) {
-        {
-            let mut topups = self.topup_codes.write().unwrap();
-            topups.insert(code.id.clone(), code);
-        }
-        self.sync_to_disk();
+    /// Register a top-up code, durably: it exists only once the snapshot holding it is
+    /// saved. Under the state lock, so a concurrent commit cannot publish a snapshot taken
+    /// before the insert and drop the code again.
+    pub fn upsert_topup_code(&self, code: TopupCode) -> Result<(), BillingError> {
+        let _state_guard = self.state_lock.write().unwrap();
+        let sequence = self
+            .snapshot_sequence
+            .load(Ordering::Acquire)
+            .saturating_add(1);
+        let previous_checksum = self.last_snapshot_checksum.read().unwrap().clone();
+        let mut candidate = self.export_snapshot_locked(sequence, previous_checksum);
+        candidate.topup_codes.insert(code.id.clone(), code.clone());
+        self.commit_candidate_snapshot(&candidate, || {
+            self.topup_codes
+                .write()
+                .unwrap()
+                .insert(code.id.clone(), code);
+        })
     }
 
     /// Look up top-up code by ID.
@@ -3978,17 +4095,18 @@ impl BillingEngine {
     // =========================================================================
 
     /// Record a structured request execution trace (Spec §5, §14.4).
+    /// Traces are observability data. They ride along with the next commit, which saves
+    /// the whole state and follows in the same request (its reservation's release or
+    /// settlement), instead of each costing a full save of its own. A crash before that
+    /// commit loses only the trace, and with it the attempt count it holds.
     pub fn record_trace(&self, trace: RequestTrace) {
-        {
-            let _state_guard = self.state_lock.write().unwrap();
-            let mut traces = self.traces.write().unwrap();
-            traces.push(trace);
-            if traces.len() > MAX_RETAINED_TRACES {
-                let overflow = traces.len() - MAX_RETAINED_TRACES;
-                traces.drain(..overflow);
-            }
+        let _state_guard = self.state_lock.write().unwrap();
+        let mut traces = self.traces.write().unwrap();
+        traces.push(trace);
+        if traces.len() > MAX_RETAINED_TRACES {
+            let overflow = traces.len() - MAX_RETAINED_TRACES;
+            traces.drain(..overflow);
         }
-        self.sync_to_disk();
     }
 
     pub fn invocation_attempts(&self, invocation_id: &str) -> usize {
@@ -4001,23 +4119,19 @@ impl BillingEngine {
             .sum()
     }
 
-    /// Final delivery outcome is distinct from whether partial output was billed.
+    /// Final delivery outcome is distinct from whether partial output was billed. Like
+    /// [`Self::record_trace`], it is saved with the next commit rather than on its own.
     pub fn finish_trace(&self, invocation_id: &str, status: TraceStatus, error: Option<&str>) {
+        let _guard = self.state_lock.write().unwrap();
+        let mut traces = self.traces.write().unwrap();
+        if let Some(trace) = traces
+            .iter_mut()
+            .rev()
+            .find(|t| t.invocation_id == invocation_id)
         {
-            let _guard = self.state_lock.write().unwrap();
-            let mut traces = self.traces.write().unwrap();
-            if let Some(trace) = traces
-                .iter_mut()
-                .rev()
-                .find(|t| t.invocation_id == invocation_id)
-            {
-                trace.status = status;
-                trace.error_class = error.map(str::to_owned);
-            } else {
-                return;
-            }
+            trace.status = status;
+            trace.error_class = error.map(str::to_owned);
         }
-        self.sync_to_disk();
     }
 
     /// List recorded request execution traces.
@@ -4262,9 +4376,27 @@ impl BillingEngine {
         };
         let payload_json = serde_json::to_string_pretty(&payload)
             .map_err(|e| BillingError::InvalidState(format!("Failed to serialize archive: {e}")))?;
-        let checksum = sha256_hex(payload_json.as_bytes());
+        // The archive holds the same ledger the encrypted state does, so it is encrypted
+        // with the same key rather than left beside it in plain text.
+        let content = match self.master_kek.read().unwrap().as_ref() {
+            Some(kek) => {
+                let ciphertext = kek.encrypt(&payload_json).map_err(|e| {
+                    BillingError::InvalidState(format!("Failed to encrypt archive: {e}"))
+                })?;
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "format": ENCRYPTED_ARCHIVE_FORMAT,
+                    "archiveId": payload.archive_id,
+                    "ciphertext": ciphertext,
+                }))
+                .map_err(|e| {
+                    BillingError::InvalidState(format!("Failed to serialize archive: {e}"))
+                })?
+            }
+            None => payload_json,
+        };
+        let checksum = sha256_hex(content.as_bytes());
 
-        write_atomic_bytes(&archive_path, payload_json.as_bytes())
+        write_atomic_bytes(&archive_path, content.as_bytes())
             .map_err(|e| BillingError::Persistence(format!("Failed to write archive file: {e}")))?;
 
         let receipt = ArchivedLedgerReceipt {
@@ -4441,6 +4573,15 @@ pub fn verify_ledger_archive(
     archive_path: &std::path::Path,
     expected_checksum: &str,
 ) -> Result<ArchivedLedgerPayload, BillingError> {
+    verify_ledger_archive_with(archive_path, expected_checksum, None)
+}
+
+/// [`verify_ledger_archive`] for an archive that may be encrypted with `kek`.
+pub fn verify_ledger_archive_with(
+    archive_path: &std::path::Path,
+    expected_checksum: &str,
+    kek: Option<&crate::crypto::MasterKek>,
+) -> Result<ArchivedLedgerPayload, BillingError> {
     let bytes = std::fs::read(archive_path)
         .map_err(|e| BillingError::Persistence(format!("Failed to read archive file: {e}")))?;
     let actual_checksum = sha256_hex(&bytes);
@@ -4450,7 +4591,23 @@ pub fn verify_ledger_archive(
             expected_checksum, actual_checksum
         )));
     }
-    let payload: ArchivedLedgerPayload = serde_json::from_slice(&bytes)
+    let invalid = |e: String| BillingError::InvalidState(format!("Invalid ledger archive: {e}"));
+    let document: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| invalid(e.to_string()))?;
+    let plaintext;
+    let payload_bytes: &[u8] = if document["format"] == ENCRYPTED_ARCHIVE_FORMAT {
+        let kek = kek.ok_or_else(|| invalid("encrypted, and no master KEK was given".into()))?;
+        let ciphertext = document["ciphertext"]
+            .as_str()
+            .ok_or_else(|| invalid("no ciphertext".into()))?;
+        plaintext = kek
+            .decrypt(ciphertext)
+            .map_err(|e| invalid(e.to_string()))?;
+        plaintext.as_bytes()
+    } else {
+        &bytes
+    };
+    let payload: ArchivedLedgerPayload = serde_json::from_slice(payload_bytes)
         .map_err(|e| BillingError::InvalidState(format!("Invalid ledger archive payload: {e}")))?;
     if payload.entries_count != payload.entries.len() {
         return Err(BillingError::InvalidState(format!(

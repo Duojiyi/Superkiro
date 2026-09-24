@@ -797,6 +797,88 @@ impl FacadeHandler for AdminPruneTracesHandler {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AdminArchiveLedgerRequest {
+    /// Ledger entries older than this move out of the saved state into an archive file.
+    pub before_ts_secs: u64,
+}
+
+/// The way to shrink the saved state before it reaches its ceiling: moves old ledger
+/// entries into an archive file beside it (encrypted with the master KEK when one is
+/// configured), keeping per-card totals so balances and quotas are unchanged.
+pub struct AdminArchiveLedgerHandler {
+    pub billing: BillingEngine,
+    pub auth: Arc<AdminAuthState>,
+}
+
+impl FacadeHandler for AdminArchiveLedgerHandler {
+    fn method(&self) -> Method {
+        Method::POST
+    }
+    fn path(&self) -> &'static str {
+        "/api/v1/admin/ledger/archive"
+    }
+    fn handle<'a>(&'a self, req: Request<Body>) -> BoxFuture<'a, Response> {
+        Box::pin(async move {
+            if !self.auth.verify(req.headers()) {
+                return unauthorized_response();
+            }
+            let body: AdminArchiveLedgerRequest =
+                match axum::body::to_bytes(req.into_body(), 64 * 1024)
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|bytes| {
+                        serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+                    }) {
+                    Ok(body) => body,
+                    Err(error) => {
+                        return error_response(
+                            StatusCode::BAD_REQUEST,
+                            "SerializationException",
+                            &error,
+                        )
+                    }
+                };
+            if body.before_ts_secs > now_secs() {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "ValidationException",
+                    "beforeTsSecs must not be in the future",
+                );
+            }
+            let Some(dir) = self.billing.ledger_archive_dir() else {
+                return error_response(
+                    StatusCode::CONFLICT,
+                    "InvalidStateException",
+                    "Billing state is not persisted, so there is nothing to archive",
+                );
+            };
+            let (before_bytes, ceiling) = self.billing.state_size();
+            match self.billing.archive_ledger(body.before_ts_secs, &dir) {
+                Ok(receipt) => json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({
+                        "success": true,
+                        "receipt": receipt,
+                        "stateBytesBefore": before_bytes,
+                        "stateBytesAfter": self.billing.state_size().0,
+                        "stateCeilingBytes": ceiling,
+                    }),
+                ),
+                Err(billing::BillingError::InvalidAdjustment(message)) => {
+                    error_response(StatusCode::BAD_REQUEST, "ValidationException", &message)
+                }
+                Err(error) => error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "PersistenceException",
+                    &error.to_string(),
+                ),
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AdminBatchCardsRequest {
     #[serde(alias = "credit_total")]
     pub credit_total: Option<i64>,
@@ -980,11 +1062,16 @@ impl FacadeHandler for AdminStatsHandler {
 
             let remaining_credits = total_credits.saturating_sub(used_credits);
             let micro = billing::MICRO_CREDITS_PER_CREDIT as f64;
+            let (state_bytes, state_ceiling_bytes) = self.billing.state_size();
 
             json_response(
                 StatusCode::OK,
                 &serde_json::json!({
                     "success": true,
+                    // Saves fail at the ceiling; archive the ledger well before it.
+                    "stateBytes": state_bytes,
+                    "stateWarningBytes": billing::engine::STATE_WARNING_BYTES,
+                    "stateCeilingBytes": state_ceiling_bytes,
                     "totalCards": total_cards,
                     "activeCards": active_cards,
                     "unactivatedCards": unactivated_cards,

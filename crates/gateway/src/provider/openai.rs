@@ -229,7 +229,7 @@ impl ModelProvider for OpenAiProvider {
         let total_tokens = usage
             .get("total_tokens")
             .and_then(|t| t.as_u64())
-            .unwrap_or(prompt_tokens + completion_tokens);
+            .unwrap_or(prompt_tokens.saturating_add(completion_tokens));
 
         let cached_tokens = usage
             .get("prompt_tokens_details")

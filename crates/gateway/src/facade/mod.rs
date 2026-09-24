@@ -17,7 +17,6 @@ use std::sync::Arc;
 
 pub mod admin;
 pub mod admin_login;
-pub mod card_platform;
 pub mod client;
 pub mod commercial;
 pub mod completions;
@@ -193,33 +192,6 @@ impl FacadeRegistry {
         self
     }
 
-    /// Register card dispensing platform endpoints (Spec §14.1, P4-5).
-    pub fn register_card_platform_facades(
-        &mut self,
-        billing: billing::BillingEngine,
-        platform: billing::CardPlatformManager,
-        template: billing::CardTemplate,
-        api_key: Option<String>,
-    ) -> &mut Self {
-        self.register(card_platform::CardInventoryHandler {
-            billing: billing.clone(),
-            platform: platform.clone(),
-            api_key: api_key.clone(),
-        })
-        .register(card_platform::CardPullHandler {
-            billing: billing.clone(),
-            platform: platform.clone(),
-            default_template: template,
-            api_key: api_key.clone(),
-        })
-        .register(card_platform::CardRedeemHandler {
-            billing,
-            platform,
-            api_key,
-        });
-        self
-    }
-
     /// Register Administrator REST API endpoints (Spec §7, P0-01, P0-02, P1-02).
     pub fn register_admin_facades(
         &mut self,
@@ -330,6 +302,10 @@ impl FacadeRegistry {
                 json: false,
             })
             .register(admin::AdminPruneTracesHandler {
+                billing: billing.clone(),
+                auth: auth.clone(),
+            })
+            .register(admin::AdminArchiveLedgerHandler {
                 billing: billing.clone(),
                 auth: auth.clone(),
             })
@@ -453,7 +429,6 @@ impl FacadeRegistry {
                 || path == "/client/brand"
                 || path == "/portal"
                 || path.starts_with("/api/v1/portal/")
-                || path.starts_with("/api/v1/cards/")
             {
                 public_routes.insert((path, h.method()), h);
             } else if path == "/metrics" || path.starts_with("/api/v1/admin/") {

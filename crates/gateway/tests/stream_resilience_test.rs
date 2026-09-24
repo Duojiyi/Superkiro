@@ -1070,3 +1070,177 @@ async fn send_backpressure_deadline_drops_upstream_settles_once_and_releases_per
     // observed the worker's terminal cleanup.
     drop(stream);
 }
+
+/// A reserved invocation, its settler, and a stream guard over `upstream` with the given
+/// absolute deadline.
+fn guarded_stream(
+    billing: &BillingEngine,
+    card_id: &str,
+    inv_id: &str,
+    upstream: mpsc::Receiver<Result<ProviderStreamEvent, ProviderError>>,
+    deadline: Duration,
+) -> gateway::stream::FrameStream {
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let params = ReservationEstimateParams::new(1000, 2000);
+    billing
+        .reserve(card_id, inv_id, &params, now_secs, 300)
+        .unwrap();
+    let settler = BillingSettler::new(
+        billing.clone(),
+        inv_id.to_string(),
+        "claude-3-5-sonnet".to_string(),
+        "provider-1".to_string(),
+        "claude-3-5-sonnet".to_string(),
+    )
+    .with_estimated_input(1000);
+    let config = StreamGuardConfig {
+        keepalive_interval: Duration::from_secs(60),
+        model_id: "claude-3-5-sonnet".to_string(),
+        context_window: None,
+    };
+    create_stream_guard_with_send_deadline(
+        ReceiverStream::new(upstream),
+        config,
+        None,
+        None,
+        Some(settler),
+        deadline,
+    )
+}
+
+fn exception_message(frames: &[(String, Vec<u8>)]) -> Option<String> {
+    let (_, payload) = frames
+        .iter()
+        .find(|(name, _)| name.ends_with("Exception"))?;
+    let body: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    body["message"].as_str().map(str::to_string)
+}
+
+// Cut off by the deadline, a response must still end with a reason. The deadline used to
+// break the loop silently, and every terminal frame after it was refused as late.
+#[tokio::test]
+async fn a_response_cut_off_by_the_deadline_ends_with_an_exception() {
+    let (billing, card_id) = create_test_billing();
+    let (upstream_tx, upstream_rx) = mpsc::channel(8);
+    upstream_tx
+        .send(Ok(ProviderStreamEvent::Delta(ProviderDelta::Text(
+            "partial".into(),
+        ))))
+        .await
+        .unwrap();
+    // The upstream stays open and silent past the deadline.
+    let stream = guarded_stream(
+        &billing,
+        &card_id,
+        "inv-deadline-terminal",
+        upstream_rx,
+        Duration::from_millis(100),
+    );
+    let frames = collect_and_decode_frames(stream).await;
+
+    let message = exception_message(&frames).expect("the stream ends with an exception");
+    assert!(message.contains("time limit"), "{message}");
+    assert_eq!(frames.last().unwrap().0, "InternalServerException");
+    assert!(frames
+        .iter()
+        .any(|(_, payload)| String::from_utf8_lossy(payload).contains("截断")));
+    // What was streamed is billed.
+    assert_eq!(
+        billing.list_ledger_entries_for_card(&card_id, None).len(),
+        1
+    );
+    drop(upstream_tx);
+}
+
+// Tool arguments are buffered until the call completes. Past the limit the response ends
+// with an exception and is billed, instead of buffering without bound or forwarding a
+// truncated, malformed tool call.
+#[tokio::test]
+async fn an_oversized_tool_call_ends_the_response_and_is_billed() {
+    for (inv_id, chunks) in [
+        (
+            "inv-tool-bytes",
+            (0..9)
+                .map(|_| (0usize, "x".repeat(1024 * 1024)))
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "inv-tool-count",
+            (0..129).map(|index| (index, "{}".to_string())).collect(),
+        ),
+    ] {
+        let (billing, card_id) = create_test_billing();
+        let (upstream_tx, upstream_rx) = mpsc::channel(256);
+        for (index, arguments) in chunks {
+            upstream_tx
+                .send(Ok(ProviderStreamEvent::Delta(
+                    ProviderDelta::ToolCallChunk {
+                        index,
+                        id: Some(format!("call-{index}")),
+                        name: Some("fsWrite".into()),
+                        arguments,
+                    },
+                )))
+                .await
+                .unwrap();
+        }
+        upstream_tx
+            .send(Ok(ProviderStreamEvent::Done))
+            .await
+            .unwrap();
+        let stream = guarded_stream(
+            &billing,
+            &card_id,
+            inv_id,
+            upstream_rx,
+            Duration::from_secs(30),
+        );
+        let frames = collect_and_decode_frames(stream).await;
+
+        assert!(
+            !frames.iter().any(|(name, _)| name == "toolUseEvent"),
+            "{inv_id}: no tool call is forwarded"
+        );
+        let message = exception_message(&frames).expect("the stream ends with an exception");
+        assert!(
+            message.to_lowercase().contains("tool call"),
+            "{inv_id}: {message}"
+        );
+        assert_eq!(
+            billing.list_ledger_entries_for_card(&card_id, None).len(),
+            1,
+            "{inv_id}: billed for what was produced"
+        );
+    }
+}
+
+// A completed response whose settlement fails still tells the client, and does not also
+// claim a normal end.
+#[tokio::test]
+async fn a_failed_settlement_is_reported_instead_of_a_normal_end() {
+    let (billing, card_id) = create_test_billing();
+    let (upstream_tx, upstream_rx) = mpsc::channel(8);
+    for event in [
+        ProviderStreamEvent::Delta(ProviderDelta::Text("answer".into())),
+        ProviderStreamEvent::Done,
+    ] {
+        upstream_tx.send(Ok(event)).await.unwrap();
+    }
+    let stream = guarded_stream(
+        &billing,
+        &card_id,
+        "inv-settlement-fault",
+        upstream_rx,
+        Duration::from_secs(30),
+    );
+    billing.inject_persistence_fault(true);
+    let frames = collect_and_decode_frames(stream).await;
+    billing.inject_persistence_fault(false);
+
+    let message = exception_message(&frames).expect("the stream ends with an exception");
+    assert!(message.contains("settlement"), "{message}");
+    assert_eq!(frames.last().unwrap().0, "InternalServerException");
+}

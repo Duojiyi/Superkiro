@@ -129,6 +129,7 @@ fn test_audit_b_ultra_long_tool_name_shortening_and_restoration() {
         target_model: "test-model".to_string(),
         supports_vision: true,
         image_transcriptions: Vec::new(),
+        prepared_images: Default::default(),
     };
     let mut state = StreamTranslationState::new("test-model");
 
@@ -520,4 +521,15 @@ fn test_t05_image_pre_decode_validation() {
     assert_eq!(w, 1);
     assert_eq!(h, 1);
     assert!(!bytes.is_empty());
+}
+
+#[test]
+fn openai_usage_without_a_total_saturates() {
+    let usage = OpenAiProvider
+        .extract_usage(&serde_json::json!({"usage": {
+            "prompt_tokens": u64::MAX,
+            "completion_tokens": u64::MAX,
+        }}))
+        .expect("usage");
+    assert_eq!(usage.total_tokens, u64::MAX);
 }

@@ -507,3 +507,109 @@ fn retry_history_survives_single_settlement_and_final_delivery_error() {
     assert_eq!(traces[0].status, TraceStatus::Error);
     assert!(traces[0].credits_charged > 0);
 }
+
+#[test]
+fn reports_saturate_instead_of_wrapping_on_extreme_entries() {
+    use billing::ledger::{LedgerEntry, LedgerKind};
+    use billing::observability::{compute_margin_dashboard, compute_model_cost_rankings};
+    let entry = |id: &str| LedgerEntry {
+        id: id.into(),
+        card_id: "card".into(),
+        kind: LedgerKind::Usage,
+        invocation_id: None,
+        exposed_model: "model".into(),
+        provider_id: "provider".into(),
+        target_model: "target".into(),
+        input_tokens: u64::MAX,
+        output_tokens: u64::MAX,
+        cache_creation_tokens: 0,
+        cache_read_tokens: 0,
+        credits_charged: i64::MAX,
+        provider_cost_micro_cny: i64::MAX,
+        rate_card_version: None,
+        ts_secs: 1,
+        operator_id: None,
+        reason: None,
+    };
+    let entries = [entry("a"), entry("b")];
+    let settings = BillingSettings {
+        credit_face_value_cny: 0.01,
+        usd_cny_rate: 7.25,
+        rate_updated_at_secs: 1,
+    };
+
+    let margin = compute_margin_dashboard(&entries, &settings);
+    assert_eq!(margin.total_credits_charged, i64::MAX);
+    assert_eq!(margin.provider_cost_micro_cny, i64::MAX);
+    assert!(
+        margin.gross_profit_micro_cny <= 0,
+        "a loss, not a wrapped profit"
+    );
+
+    let rankings = compute_model_cost_rankings(&entries, &settings);
+    assert_eq!(rankings.len(), 1);
+    assert_eq!(rankings[0].total_tokens, u64::MAX);
+    assert_eq!(rankings[0].provider_cost_micro_cny, i64::MAX);
+}
+
+#[test]
+fn traces_ride_along_with_the_next_commit_instead_of_saving_on_their_own() {
+    let dir = std::env::temp_dir().join(format!(
+        "kiro-trace-commits-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("billing_state.json");
+    let engine = BillingEngine::new();
+    engine.set_persistence_path(&path);
+    let mut card = Card::new("card-trace", "group", 100_000_000);
+    card.status = CardStatus::Active;
+    engine.upsert_card(card);
+
+    let saves = engine.snapshot_sequence();
+    engine.record_trace(RequestTrace {
+        id: "trace-1".into(),
+        card_id: "card-trace".into(),
+        ts: 1000,
+        invocation_id: "inv-trace".into(),
+        exposed_model: "model".into(),
+        status: TraceStatus::InProgress,
+        ttft_ms: None,
+        tokens_per_second: None,
+        error_class: None,
+        provider_id: None,
+        input_tokens: 0,
+        output_tokens: 0,
+        credits_charged: 0,
+        provider_cost_micro_cny: 0,
+        attempt_chain: Vec::new(),
+    });
+    engine.finish_trace("inv-trace", TraceStatus::Success, None);
+    assert_eq!(
+        engine.snapshot_sequence(),
+        saves,
+        "a trace costs no save of its own"
+    );
+
+    // The next commit carries it.
+    engine
+        .reserve(
+            "card-trace",
+            "inv-next",
+            &ReservationEstimateParams::new(10, 10),
+            1000,
+            60,
+        )
+        .unwrap();
+    let restored = BillingEngine::new();
+    restored.load_from_file(&path).unwrap();
+    let traces = restored.list_traces(None, 10);
+    assert!(traces
+        .iter()
+        .any(|t| t.invocation_id == "inv-trace" && t.status == TraceStatus::Success));
+    let _ = std::fs::remove_dir_all(dir);
+}

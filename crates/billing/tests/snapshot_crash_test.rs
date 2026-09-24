@@ -299,7 +299,7 @@ fn topup_duration_rejection_preserves_card_code_and_ledger_across_restart() {
         engine.upsert_card(card);
         let topup = generate_topup_code(500, 7 * 86_400, 100).unwrap();
         let topup_id = topup.topup.id.clone();
-        engine.upsert_topup_code(topup.topup);
+        engine.upsert_topup_code(topup.topup).unwrap();
         engine.save_to_file(&path).unwrap();
         let before = engine.export_snapshot();
         let persisted = fs::read(&path).unwrap();
@@ -383,7 +383,7 @@ fn topup_credit_only_preserves_unactivated_and_perpetual_validity() {
         }
         engine.upsert_card(card.clone());
         let topup = billing::generate_topup_code(500, 0, 100).unwrap();
-        engine.upsert_topup_code(topup.topup);
+        engine.upsert_topup_code(topup.topup).unwrap();
         engine
             .redeem_topup("card", &topup.raw_code, 101, "test")
             .unwrap();
@@ -412,7 +412,7 @@ fn topup_write_failure_preserves_code_until_durable_retry() {
     engine.upsert_card(card);
     let topup = generate_topup_code(500, 7 * 86_400, 100).unwrap();
     let topup_id = topup.topup.id.clone();
-    engine.upsert_topup_code(topup.topup);
+    engine.upsert_topup_code(topup.topup).unwrap();
     engine.save_to_file(&path).unwrap();
     let before = engine.export_snapshot();
     let persisted = fs::read(&path).unwrap();
@@ -458,4 +458,31 @@ fn topup_write_failure_preserves_code_until_durable_retry() {
         .unwrap()
         .starts_with(std::env::temp_dir().canonicalize().unwrap()));
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn the_saved_state_size_is_reported_against_its_ceiling() {
+    let dir = std::env::temp_dir().join(format!(
+        "kiro-state-size-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("billing_state.json");
+    let engine = BillingEngine::new();
+    assert_eq!(engine.state_size().0, 0, "nothing saved yet");
+    engine.set_persistence_path(&path);
+    engine.upsert_card(billing::Card::new("card-size", "group", 1));
+
+    let (bytes, ceiling) = engine.state_size();
+    assert_eq!(bytes, std::fs::metadata(&path).unwrap().len());
+    assert_eq!(ceiling, 256 * 1024 * 1024);
+    const {
+        assert!(billing::engine::STATE_WARNING_BYTES < billing::engine::STATE_URGENT_BYTES);
+    }
+    assert!(billing::engine::STATE_URGENT_BYTES < ceiling);
+    let _ = std::fs::remove_dir_all(dir);
 }

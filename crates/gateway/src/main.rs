@@ -1,5 +1,5 @@
 use billing::engine::BillingEngine;
-use billing::{CardPlatformManager, CardTemplate};
+use billing::CardTemplate;
 use gateway::auth::AuthState;
 use gateway::facade::client::{ClientBeaconHandler, ClientBrandHandler, ClientNegotiateHandler};
 use gateway::facade::conversation::GenerateAssistantResponseHandler;
@@ -229,18 +229,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     registry.register(oauth_handler);
     registry.register(refresh_handler);
 
-    // 5. 注册 Web 自助门户与受密钥保护的发卡对接口
-    let template = CardTemplate::tier("standard-monthly", "group-pro-plus").expect("built-in tier");
-    let card_platform = CardPlatformManager::default();
-    let card_platform_key = required_secret("CARD_PLATFORM_KEY")?;
-
+    // 5. 注册 Web 自助门户。发卡平台接口 (/api/v1/cards/*) 已移除：没有接入方，
+    // 却是一组只凭一个共享密钥就能拉取卡密和充值的公开接口。
     registry.register_portal_facades(billing.clone(), Some(store.clone()));
-    registry.register_card_platform_facades(
-        billing.clone(),
-        card_platform,
-        template,
-        Some(card_platform_key),
-    );
 
     // 5.1 注册管理端 REST 接口 (P0-01, P0-02, P1-02)
     let admin_key = required_secret("ADMIN_KEY").or_else(|_| required_secret("ADMIN_SECRET"))?;
@@ -400,7 +391,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "[√] Client Negotiate Endpoint: http://{}/client/negotiate",
         addr
     );
-    println!("[√] Card Platform API: http://{}/api/v1/cards/pull", addr);
     println!("[√] Global body limit: 10 MB, request timeout: 300s");
 
     let listener = tokio::net::TcpListener::bind(addr)

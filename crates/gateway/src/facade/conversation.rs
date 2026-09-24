@@ -22,7 +22,9 @@ use crate::provider::ProviderRuntimeRegistry;
 use crate::provider::{ModelProvider, ProviderConfig};
 use crate::security::{ContentGuardrailConfig, GuardrailError};
 use crate::stream::{create_stream_guard, BillingSettler, StreamGuardConfig};
-use crate::translate::to_provider::{translate_kiro_to_chat_request, TranslationContext};
+use crate::translate::to_provider::{
+    prepare_images, translate_kiro_to_chat_request, TranslationContext,
+};
 use crate::watchdog::{WatchdogConfig, WatchdogStream};
 use axum::{
     body::Body,
@@ -33,13 +35,15 @@ use billing::engine::BillingEngine;
 use billing::reservation::ReservationEstimateParams;
 use kiro_wire::encoder::{encode_assistant_response, encode_event};
 use kiro_wire::requests::conversation::GenerateAssistantResponseRequest;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const INTENT_CLASSIFIER_SIGN_A: &str = "You are an intent classifier for a language model";
 const INTENT_CLASSIFIER_SIGN_B: &str = "(chat, do, spec)";
+
+/// How long one request may spend shrinking its images before those left over reach the
+/// model as notes for this turn. The request holds a credit reservation meanwhile.
+const IMAGE_PREPARE_BUDGET: Duration = Duration::from_secs(10);
 
 /// Handler for `POST /generateAssistantResponse`
 #[derive(Clone)]
@@ -376,8 +380,28 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                             .map(|config| config.model.as_str())
                             .unwrap_or("default-model")
                     });
+                let input_limit = input_limit_for_model(
+                    requested_model_for_reservation,
+                    claims.as_ref(),
+                    &self.billing,
+                );
+                // The group's system prompt prefix is added after translation, but it is
+                // sent, so the hold includes it.
+                let prefix_tokens = claims
+                    .as_ref()
+                    .and_then(|claims| self.billing.get_group(&claims.group_id))
+                    .and_then(|group| group.system_prompt_prefix)
+                    .map_or(0, |prefix| {
+                        crate::usage_estimate::tokens_from_units(
+                            crate::usage_estimate::token_units(&prefix),
+                        )
+                    });
                 let estimated_input_tokens = request_for_reservation
-                    .map(estimate_input_tokens)
+                    .map(|request| {
+                        estimate_input_tokens(request)
+                            .saturating_add(prefix_tokens)
+                            .clamp(1, input_limit)
+                    })
                     .unwrap_or(2_000);
                 reserved_estimated_input = estimated_input_tokens;
                 reserved_max_output = max_output_tokens_for_model(
@@ -676,38 +700,46 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                         if let (Some(ref v_url), Some(ref v_key)) =
                             (&v_cfg.fallback_provider_url, &v_cfg.fallback_api_key)
                         {
-                            let mut transcriptions = Vec::new();
                             let current_input = &kiro_req
                                 .conversation_state
                                 .current_message
                                 .user_input_message;
+                            // One slot per image, so a failed transcription leaves its
+                            // own image undescribed instead of shifting the rest.
+                            let mut transcriptions = Vec::with_capacity(current_input.images.len());
                             for img in &current_input.images {
+                                let format =
+                                    crate::translate::images::sniff_format(&img.source.bytes)
+                                        .unwrap_or(img.format.as_str());
                                 let cache_key = vision_cache_key(
                                     &v_cfg.fallback_model,
-                                    &img.format,
+                                    format,
                                     &img.source.bytes,
                                     &current_input.content,
                                 );
-                                if let Some(cached) = self.vision_cache.get(&cache_key) {
-                                    transcriptions.push(cached);
-                                } else if let Ok(desc) =
-                                    crate::translate::vision::transcribe_image_with_provider(
-                                        &self.client,
-                                        v_url,
-                                        v_key,
-                                        &v_cfg.fallback_model,
-                                        &img.format,
-                                        &img.source.bytes,
-                                        Some(&current_input.content),
-                                        v_cfg.max_tokens,
-                                    )
-                                    .await
-                                {
-                                    self.vision_cache.set(cache_key, desc.clone());
-                                    transcriptions.push(desc);
-                                }
+                                let transcription = match self.vision_cache.get(&cache_key) {
+                                    Some(cached) => Some(cached),
+                                    None => {
+                                        crate::translate::vision::transcribe_image_with_provider(
+                                            &self.client,
+                                            v_url,
+                                            v_key,
+                                            &v_cfg.fallback_model,
+                                            format,
+                                            &img.source.bytes,
+                                            Some(&current_input.content),
+                                            v_cfg.max_tokens,
+                                        )
+                                        .await
+                                        .ok()
+                                        .inspect(|desc| {
+                                            self.vision_cache.set(cache_key, desc.clone())
+                                        })
+                                    }
+                                };
+                                transcriptions.push(transcription);
                             }
-                            if !transcriptions.is_empty() {
+                            if transcriptions.iter().any(Option::is_some) {
                                 ctx = ctx.with_image_transcriptions(transcriptions);
                             }
                         }
@@ -719,6 +751,15 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
             // to_provider::format_user_content. P4-2 §35 requires an unreachable vision
             // service to degrade rather than block the conversation trunk.
 
+            if ctx.supports_vision && (historical_images || current_images) {
+                let prepared = prepare_images(
+                    &kiro_req,
+                    self.content_guardrail.max_images_per_request,
+                    IMAGE_PREPARE_BUDGET,
+                )
+                .await;
+                ctx = ctx.with_prepared_images(prepared);
+            }
             let mut chat_req = translate_kiro_to_chat_request(&kiro_req, &mut ctx);
             // The wire protocol currently has no client-controlled max_tokens
             // field.  Keep the provider request bounded by the exposed model
@@ -757,6 +798,17 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                     }
                 }
             }
+
+            // Billed when the upstream reports no input usage: what is actually sent — the
+            // group prefix, translated tool schemas, transcriptions in place of images —
+            // rather than the Kiro request the hold was estimated from.
+            let translated_input_estimate = serde_json::to_value(&chat_req)
+                .map(|value| crate::usage_estimate::estimate_json_tokens(&value))
+                .unwrap_or(reserved_estimated_input)
+                .clamp(
+                    1,
+                    input_limit_for_model(&target_model, claims.as_ref(), &self.billing),
+                );
 
             // 9. Initiate upstream streaming (with multi-key pool failover & model fallback chain, Spec §14.3, §14.6)
             let card_group = claims
@@ -988,7 +1040,7 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                     .cloned(),
             )
             .with_permit(capacity_permit)
-            .with_estimated_input(reserved_estimated_input)
+            .with_estimated_input(translated_input_estimate)
             .with_reservation_lease(reservation_lease);
 
             let watchdog_stream = WatchdogStream::new(upstream_stream, WatchdogConfig::default());
@@ -1045,8 +1097,29 @@ fn estimate_input_tokens(request: &GenerateAssistantResponseRequest) -> u64 {
     // Provider usage still settles the final charge whenever it is reported.
     serde_json::to_value(request)
         .map(|value| crate::usage_estimate::estimate_json_tokens(&value))
-        .unwrap_or(200_000)
-        .clamp(1, 200_000)
+        .unwrap_or(u64::MAX)
+}
+
+/// The most input tokens `model` accepts: its group's configured limit when the model
+/// is mapped, otherwise its known context window. Estimates are clamped to it; a fixed
+/// clamp would under-hold a model with a larger window.
+fn input_limit_for_model(model: &str, claims: Option<&AuthClaims>, billing: &BillingEngine) -> u64 {
+    claims
+        .and_then(|claims| billing.get_group(&claims.group_id))
+        .and_then(|group| {
+            billing
+                .list_models_for_group(&group.id, false)
+                .into_iter()
+                .find(|mapped| mapped.matches_model(model))
+        })
+        .map(|mapped| {
+            super::models::TokenLimits::configured(mapped.context_window, mapped.max_output)
+                .max_input_tokens
+        })
+        .unwrap_or_else(|| {
+            u64::from(billing::context::ModelContextLibrary::resolve(model).context_window)
+        })
+        .max(1)
 }
 
 fn validate_conversation_request(
@@ -1091,13 +1164,21 @@ fn validate_conversation_request(
     guardrail.validate_payload(prompt_chars, &image_sizes)
 }
 
+/// Transcriptions are shared by every card, so the key must name the image and its
+/// context exactly: SHA-256 over each length-prefixed part, not a 64-bit hash.
 fn vision_cache_key(model: &str, format: &str, bytes: &str, context: &str) -> String {
-    let mut hasher = DefaultHasher::new();
-    model.hash(&mut hasher);
-    format.hash(&mut hasher);
-    bytes.hash(&mut hasher);
-    context.hash(&mut hasher);
-    format!("{}:{}:{:016x}", model, format, hasher.finish())
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+    for part in [model, format, bytes, context] {
+        digest.update(&(part.len() as u64).to_le_bytes());
+        digest.update(part.as_bytes());
+    }
+    let hash: String = digest
+        .finish()
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("{model}:{format}:{hash}")
 }
 
 fn max_output_tokens_for_model(
@@ -1166,5 +1247,21 @@ mod capability_tests {
             max_output_tokens_for_model("gemini-unknown", None, &billing),
             4096
         );
+    }
+}
+
+#[cfg(test)]
+mod vision_cache_key_tests {
+    use super::vision_cache_key;
+
+    #[test]
+    fn key_is_a_full_digest_of_unambiguous_parts() {
+        let key = vision_cache_key("model", "png", "ab", "c");
+        let digest = key.rsplit(':').next().unwrap();
+        assert_eq!(digest.len(), 64, "SHA-256, not a 64-bit hash: {key}");
+        assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(key, vision_cache_key("model", "png", "ab", "c"));
+        assert_ne!(key, vision_cache_key("model", "png", "a", "bc"));
+        assert_ne!(key, vision_cache_key("model", "png", "ab", "d"));
     }
 }

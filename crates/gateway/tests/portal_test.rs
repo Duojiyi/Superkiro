@@ -201,7 +201,7 @@ async fn test_portal_topup_recharge_flow() {
     let topup_gen =
         billing::generate_topup_code(50_000 * billing::MICRO_CREDITS_PER_CREDIT, 86400 * 30, now)
             .unwrap();
-    billing.upsert_topup_code(topup_gen.topup);
+    billing.upsert_topup_code(topup_gen.topup).unwrap();
     let raw_topup = topup_gen.raw_code;
 
     let mut registry = FacadeRegistry::new();

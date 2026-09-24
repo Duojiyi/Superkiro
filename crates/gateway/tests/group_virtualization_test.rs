@@ -406,3 +406,73 @@ async fn test_audit_b_provider_binding_mode_isolation_shared_vs_dedicated() {
     .await;
     assert_eq!(status_dedicated, StatusCode::OK);
 }
+
+// With no usage from the upstream, input is billed from an estimate. It must be of what
+// was actually sent, the group's system prompt prefix included, not of the Kiro request.
+#[tokio::test]
+async fn unreported_input_is_billed_on_the_translated_request() {
+    let mock_server = MockServer::start().await;
+    let sse_body = [
+        r#"data: {"id":"1","choices":[{"delta":{"content":"ok"}}]}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n");
+    Mock::given(wm_method("POST"))
+        .and(wm_path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+        .mount(&mock_server)
+        .await;
+
+    let (billing, auth) = setup_environment();
+    // About 4,000 tokens of prefix; the Kiro request itself is a few dozen.
+    let prefix = "policy ".repeat(2_300);
+    billing.upsert_group(Group::enterprise(
+        "group-long-prefix",
+        "Prefixed",
+        "PREFIXED",
+        Some(prefix),
+    ));
+    billing.upsert_card(create_activated_card(
+        "card-long-prefix",
+        "group-long-prefix",
+    ));
+    let token = auth.issue_token_for_card("card-long-prefix", 3600).unwrap();
+    let handler = GenerateAssistantResponseHandler::new(
+        reqwest::Client::new(),
+        Arc::new(OpenAiProvider),
+        ProviderConfig::new(
+            mock_server.uri(),
+            "sk-test-key",
+            "gpt-4o",
+            Duration::from_secs(5),
+        )
+        .with_group("group-long-prefix"),
+        billing.clone(),
+        IdempotencyManager::default(),
+    );
+    let mut registry = FacadeRegistry::new();
+    registry.register(handler);
+    let app = registry.into_router_with_auth(auth);
+    let body = serde_json::json!({"conversationState": {
+        "conversationId": "conv-long-prefix",
+        "currentMessage": {"userInputMessage": {"content": "Write a function"}}
+    }});
+    let (status, _) = send_req(
+        app,
+        Method::POST,
+        "/generateAssistantResponse",
+        &token,
+        Body::from(serde_json::to_vec(&body).unwrap()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let entries = billing.list_ledger_entries_for_card("card-long-prefix", None);
+    assert_eq!(entries.len(), 1);
+    assert!(
+        entries[0].input_tokens >= 4_000,
+        "billed {} input tokens for a ~4,000-token prompt",
+        entries[0].input_tokens
+    );
+}

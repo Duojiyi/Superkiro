@@ -88,6 +88,10 @@ pub struct Card {
     /// `token_version` (which is used for card-wide emergency revocation).
     #[serde(default = "default_refresh_version")]
     pub refresh_version: u64,
+    /// When `refresh_version` last advanced through a refresh. A token one version behind
+    /// is accepted again shortly after, as a retry of that same refresh.
+    #[serde(default)]
+    pub refresh_rotated_at: Option<u64>,
     pub note: Option<String>,
     pub created_at: u64,
 }
@@ -122,6 +126,7 @@ impl Card {
             monthly_credit_limit: None,
             token_version: 1,
             refresh_version: 1,
+            refresh_rotated_at: None,
             note: None,
             created_at: 0,
         }
@@ -162,6 +167,7 @@ impl Card {
             monthly_credit_limit: template.monthly_credit_limit,
             token_version: 1,
             refresh_version: 1,
+            refresh_rotated_at: None,
             note,
             created_at,
         }
