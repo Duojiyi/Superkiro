@@ -21,7 +21,8 @@ pub struct TranslationContext {
     pub tool_registry: ToolRegistry,
     pub target_model: String,
     pub supports_vision: bool,
-    pub image_transcriptions: Vec<String>,
+    /// One slot per image of the current message; `None` where transcription failed.
+    pub image_transcriptions: Vec<Option<String>>,
     /// How each image reaches a vision model, from [`prepare_images`]. An image it does
     /// not cover is judged from its header alone and omitted if it would need shrinking.
     pub prepared_images: PreparedImages,
@@ -43,7 +44,7 @@ impl TranslationContext {
         self
     }
 
-    pub fn with_image_transcriptions(mut self, transcriptions: Vec<String>) -> Self {
+    pub fn with_image_transcriptions(mut self, transcriptions: Vec<Option<String>>) -> Self {
         self.image_transcriptions = transcriptions;
         self
     }
@@ -227,7 +228,7 @@ fn format_user_content(
         let mut text = content.to_string();
         for (idx, img) in images.iter().enumerate() {
             let transcription = if turn == Turn::Current {
-                ctx.image_transcriptions.get(idx).map(|s| s.as_str())
+                ctx.image_transcriptions.get(idx).and_then(|s| s.as_deref())
             } else {
                 None
             };

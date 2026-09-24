@@ -98,6 +98,16 @@ pub fn detect_image_format_from_bytes(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
+/// The format base64 image data carries, from its first bytes alone.
+pub fn sniff_format(base64_data: &str) -> Option<&'static str> {
+    let head: String = base64_data
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .take(16)
+        .collect();
+    detect_image_format_from_bytes(&BASE64.decode(head).ok()?)
+}
+
 /// Normalize declared format string (e.g. "jpg" -> "jpeg").
 fn normalize_format(fmt: &str) -> &str {
     let lower = fmt.trim();
@@ -436,6 +446,24 @@ mod tests {
                 Inspection::Ready(PreparedImage::Omitted(Omission::Unreadable))
             ));
         }
+    }
+
+    #[test]
+    fn sniffing_reads_the_format_from_the_first_bytes() {
+        let encoded = BASE64.encode(png(4, 4));
+        assert_eq!(sniff_format(&encoded), Some("png"));
+        let wrapped = format!(
+            " {}
+{}",
+            &encoded[..10],
+            &encoded[10..]
+        );
+        assert_eq!(sniff_format(&wrapped), Some("png"));
+        assert_eq!(
+            sniff_format(&BASE64.encode(b"GIF89a and more bytes")),
+            Some("gif")
+        );
+        assert_eq!(sniff_format("not base64 at all!"), None);
     }
 
     #[test]
