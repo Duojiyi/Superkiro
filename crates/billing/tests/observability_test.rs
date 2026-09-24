@@ -507,3 +507,47 @@ fn retry_history_survives_single_settlement_and_final_delivery_error() {
     assert_eq!(traces[0].status, TraceStatus::Error);
     assert!(traces[0].credits_charged > 0);
 }
+
+#[test]
+fn reports_saturate_instead_of_wrapping_on_extreme_entries() {
+    use billing::ledger::{LedgerEntry, LedgerKind};
+    use billing::observability::{compute_margin_dashboard, compute_model_cost_rankings};
+    let entry = |id: &str| LedgerEntry {
+        id: id.into(),
+        card_id: "card".into(),
+        kind: LedgerKind::Usage,
+        invocation_id: None,
+        exposed_model: "model".into(),
+        provider_id: "provider".into(),
+        target_model: "target".into(),
+        input_tokens: u64::MAX,
+        output_tokens: u64::MAX,
+        cache_creation_tokens: 0,
+        cache_read_tokens: 0,
+        credits_charged: i64::MAX,
+        provider_cost_micro_cny: i64::MAX,
+        rate_card_version: None,
+        ts_secs: 1,
+        operator_id: None,
+        reason: None,
+    };
+    let entries = [entry("a"), entry("b")];
+    let settings = BillingSettings {
+        credit_face_value_cny: 0.01,
+        usd_cny_rate: 7.25,
+        rate_updated_at_secs: 1,
+    };
+
+    let margin = compute_margin_dashboard(&entries, &settings);
+    assert_eq!(margin.total_credits_charged, i64::MAX);
+    assert_eq!(margin.provider_cost_micro_cny, i64::MAX);
+    assert!(
+        margin.gross_profit_micro_cny <= 0,
+        "a loss, not a wrapped profit"
+    );
+
+    let rankings = compute_model_cost_rankings(&entries, &settings);
+    assert_eq!(rankings.len(), 1);
+    assert_eq!(rankings[0].total_tokens, u64::MAX);
+    assert_eq!(rankings[0].provider_cost_micro_cny, i64::MAX);
+}

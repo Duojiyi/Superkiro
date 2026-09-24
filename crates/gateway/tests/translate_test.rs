@@ -522,3 +522,14 @@ fn test_t05_image_pre_decode_validation() {
     assert_eq!(h, 1);
     assert!(!bytes.is_empty());
 }
+
+#[test]
+fn openai_usage_without_a_total_saturates() {
+    let usage = OpenAiProvider
+        .extract_usage(&serde_json::json!({"usage": {
+            "prompt_tokens": u64::MAX,
+            "completion_tokens": u64::MAX,
+        }}))
+        .expect("usage");
+    assert_eq!(usage.total_tokens, u64::MAX);
+}

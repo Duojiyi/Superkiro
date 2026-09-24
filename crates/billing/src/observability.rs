@@ -185,9 +185,12 @@ pub fn compute_margin_dashboard(
 
     for entry in entries {
         if entry.kind == crate::ledger::LedgerKind::Usage {
+            // Saturating: release builds wrap on overflow, and one stored entry can
+            // carry an extreme cost from before settlement was bounded.
             total_requests += 1;
-            total_credits_charged += entry.credits_charged;
-            provider_cost_micro_cny += entry.provider_cost_micro_cny;
+            total_credits_charged = total_credits_charged.saturating_add(entry.credits_charged);
+            provider_cost_micro_cny =
+                provider_cost_micro_cny.saturating_add(entry.provider_cost_micro_cny);
         }
     }
 
@@ -197,7 +200,7 @@ pub fn compute_margin_dashboard(
     //                   = credits_charged * credit_face_value_cny
     let revenue_micro_cny =
         (total_credits_charged as f64 * settings.credit_face_value_cny).round() as i64;
-    let gross_profit_micro_cny = revenue_micro_cny - provider_cost_micro_cny;
+    let gross_profit_micro_cny = revenue_micro_cny.saturating_sub(provider_cost_micro_cny);
 
     let gross_margin_percentage = if revenue_micro_cny > 0 {
         ((gross_profit_micro_cny as f64) / (revenue_micro_cny as f64)) * 100.0
@@ -236,9 +239,13 @@ pub fn compute_model_cost_rankings(
         if entry.kind == crate::ledger::LedgerKind::Usage {
             let agg = map.entry(entry.exposed_model.clone()).or_default();
             agg.requests += 1;
-            agg.total_tokens += entry.input_tokens + entry.output_tokens;
-            agg.cost_micro_cny += entry.provider_cost_micro_cny;
-            agg.credits += entry.credits_charged;
+            agg.total_tokens = agg
+                .total_tokens
+                .saturating_add(entry.input_tokens.saturating_add(entry.output_tokens));
+            agg.cost_micro_cny = agg
+                .cost_micro_cny
+                .saturating_add(entry.provider_cost_micro_cny);
+            agg.credits = agg.credits.saturating_add(entry.credits_charged);
         }
     }
 
@@ -246,7 +253,7 @@ pub fn compute_model_cost_rankings(
         .into_iter()
         .map(|(model_id, agg)| {
             let revenue = (agg.credits as f64 * settings.credit_face_value_cny).round() as i64;
-            let profit = revenue - agg.cost_micro_cny;
+            let profit = revenue.saturating_sub(agg.cost_micro_cny);
             let margin = if revenue > 0 {
                 ((profit as f64) / (revenue as f64)) * 100.0
             } else {
@@ -293,7 +300,7 @@ pub fn compute_provider_health(
                 TraceStatus::ClientAborted | TraceStatus::InProgress => {}
             }
             if let Some(ttft) = trace.ttft_ms {
-                ttft_sum += ttft as u64;
+                ttft_sum = ttft_sum.saturating_add(ttft as u64);
                 ttft_count += 1;
             }
             if let Some(tps) = trace.tokens_per_second {
