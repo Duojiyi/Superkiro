@@ -192,20 +192,19 @@ async fn an_end_marker_without_a_usage_report_is_still_a_failed_relay() {
     assert!(outcome.body.contains("InternalServerException") || !outcome.status.is_success());
 }
 
-/// An empty turn ending with an ordinary stop gives the user nothing and looks exactly
-/// like a failed relay, so it stays an unbilled error the client can retry. What changes
-/// is the cost of reaching that answer: one upstream call, and the shared key keeps
-/// serving everyone else.
+/// An empty turn ending with an ordinary stop gives the user nothing, and a failing relay
+/// sends exactly the same thing, so it is retried and never billed. The key answered every
+/// time, so it is not put into cooldown and keeps serving everyone else.
 #[tokio::test]
-async fn an_empty_ordinary_stop_fails_once_without_harming_the_key() {
+async fn an_empty_ordinary_stop_is_retried_without_harming_the_key() {
     let outcome = run(&[
         json!({"id": "1", "choices": [{"delta": {}, "finish_reason": "stop"}]}),
         json!({"id": "1", "choices": [], "usage": {"prompt_tokens": 50, "completion_tokens": 0, "total_tokens": 50}}),
     ])
     .await;
     assert_eq!(
-        outcome.upstream_calls, 1,
-        "the upstream answered; asking again only costs more"
+        outcome.upstream_calls, 3,
+        "an empty ordinary stop is retried like a failed relay"
     );
     for key in outcome.pool.list_keys() {
         assert!(

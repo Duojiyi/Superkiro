@@ -456,6 +456,13 @@ fn empty_turn_notice(stop_reason: Option<&str>) -> Option<&'static str> {
     }
 }
 
+/// Whether a provider stop reason makes an empty response final: it was reported in full,
+/// so it is billed and explained rather than retried. `retry.rs` and the stream agree on
+/// this through here.
+pub(crate) fn is_explicit_empty_stop(raw_reason: &str) -> bool {
+    empty_turn_notice(Some(&StreamTranslationState::map_stop_reason(raw_reason))).is_some()
+}
+
 fn resolve_settlement_tokens(
     usage: &crate::provider::TokenUsage,
     has_input_usage: bool,
@@ -528,5 +535,8 @@ pub(crate) fn safe_provider_error(error: &ProviderError) -> String {
         ProviderError::Service => "upstream reported a service error".to_string(),
         ProviderError::Serialization(_) => "upstream request serialization error".to_string(),
         ProviderError::Watchdog(_) => "upstream watchdog timeout".to_string(),
+        ProviderError::EmptyCompletion => {
+            "upstream completed without producing any output".to_string()
+        }
     }
 }
