@@ -219,6 +219,9 @@ impl DesktopSession {
         snapshots
             .validate_takeover(&settings, Some(&patcher), gateway)
             .map_err(|e| format!("[connection:preflight] {e}"))?;
+        if !settings.profiles_in_use().is_empty() {
+            return Err("[connection:preflight] Kiro has windows on a profile other than Default; takeover configures only the Default profile".into());
+        }
         let mut launch = crate::process::prepare_kiro_launch(installation, gateway, &[])
             .map_err(|e| format!("[connection:launch-prepare] {e}"))?;
         let device = if self.path.exists() {

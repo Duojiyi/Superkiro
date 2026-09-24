@@ -280,6 +280,39 @@ impl SettingsManager {
         }
     }
 
+    /// Profiles other than Default that a Kiro window or workspace is set to use.
+    ///
+    /// A profile reads its own `profiles/<id>/settings.json`, which takeover does not
+    /// write. A window on one would get the gateway's token with the official
+    /// endpoints, so takeover is refused while any is in use. Read from Kiro's
+    /// `globalStorage/storage.json`; an unreadable file reports none.
+    pub fn profiles_in_use(&self) -> Vec<String> {
+        let Some(storage) = self
+            .settings_path
+            .parent()
+            .map(|user| user.join("globalStorage").join("storage.json"))
+        else {
+            return Vec::new();
+        };
+        let Some(state) = fs::read(storage)
+            .ok()
+            .and_then(|raw| parse_settings_bytes(&raw).ok())
+        else {
+            return Vec::new();
+        };
+        let mut profiles: Vec<String> = ["workspaces", "emptyWindows"]
+            .iter()
+            .filter_map(|kind| state.get("profileAssociations")?.get(*kind)?.as_object())
+            .flat_map(|associations| associations.values())
+            .filter_map(Value::as_str)
+            .filter(|profile| *profile != DEFAULT_PROFILE)
+            .map(str::to_owned)
+            .collect();
+        profiles.sort();
+        profiles.dedup();
+        profiles
+    }
+
     /// Whether the redirection keys still send Kiro to one of `gateway_hosts`. An
     /// unreadable file tells nothing and counts as no.
     pub fn names_gateway(&self, gateway_hosts: &[String]) -> bool {
@@ -482,6 +515,9 @@ fn reverted_values(
     }
     values
 }
+
+/// How Kiro names the Default profile in its window associations.
+const DEFAULT_PROFILE: &str = "__default__profile__";
 
 /// The keys that point Kiro's own traffic at an endpoint.
 const REDIRECTION_KEYS: [&str; 2] = ["kiroAuthConfig", "codewhisperer.config"];

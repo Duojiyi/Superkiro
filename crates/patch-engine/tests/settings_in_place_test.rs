@@ -232,3 +232,29 @@ fn a_takeover_of_no_file_rolls_back_to_no_file() {
     assert!(!manager.path().exists());
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn windows_on_a_profile_other_than_default_are_reported() {
+    let (dir, manager) = settings_file("profiles", b"{}");
+    let storage = dir.join("globalStorage").join("storage.json");
+    fs::create_dir_all(storage.parent().unwrap()).unwrap();
+    assert!(
+        manager.profiles_in_use().is_empty(),
+        "no storage, nothing known"
+    );
+
+    fs::write(
+        &storage,
+        r#"{"profileAssociations": {"workspaces": {"file:///d%3A/a": "__default__profile__"}, "emptyWindows": {"1": "__default__profile__"}}}"#,
+    )
+    .unwrap();
+    assert!(manager.profiles_in_use().is_empty());
+
+    fs::write(
+        &storage,
+        r#"{"userDataProfiles": [{"location": "-7a1b", "name": "Work"}], "profileAssociations": {"workspaces": {"file:///d%3A/a": "-7a1b", "file:///d%3A/b": "__default__profile__"}, "emptyWindows": {"1": "-7a1b"}}}"#,
+    )
+    .unwrap();
+    assert_eq!(manager.profiles_in_use(), vec!["-7a1b".to_string()]);
+    fs::remove_dir_all(dir).unwrap();
+}
