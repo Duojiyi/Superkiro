@@ -64,6 +64,10 @@ impl Host {
             .next()
             .filter(|path| is_tracked_operation("POST", path));
         *state = json!({"id":state["id"].as_u64().unwrap_or(0) + 1,"state":"running","path":path,"error":null});
+        // Written before the operation runs: if the host dies part-way, the next start must
+        // know something was left unfinished instead of reporting the previous result. A
+        // failed write does not stop the operation.
+        save_operation(&self.preferences, &mut state);
         Ok(())
     }
     pub fn finish_operation(&self, result: &Result<Value, Value>) {
@@ -87,11 +91,7 @@ impl Host {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs());
-            let file = self.preferences.with_file_name("last-operation.json");
-            let temporary = file.with_extension("tmp");
-            let saved = std::fs::write(&temporary, state.to_string())
-                .and_then(|()| std::fs::rename(&temporary, &file));
-            state["diagnostic_saved"] = json!(saved.is_ok());
+            save_operation(&self.preferences, &mut state);
         }
     }
     fn install_path(&self) -> Result<Option<PathBuf>, String> {
@@ -121,6 +121,15 @@ impl Host {
         Ok(json!({"success":true,"path":path}))
     }
 }
+/// Replace `last-operation.json` beside `preferences` with `state`, noting whether it worked.
+fn save_operation(preferences: &Path, state: &mut Value) {
+    let file = preferences.with_file_name("last-operation.json");
+    let temporary = file.with_extension("tmp");
+    let saved = std::fs::write(&temporary, state.to_string())
+        .and_then(|()| std::fs::rename(&temporary, &file));
+    state["diagnostic_saved"] = json!(saved.is_ok());
+}
+
 fn load_operation(config: &Path) -> Value {
     let idle = json!({"id":0,"state":"idle","path":null,"error":null});
     let Ok(bytes) = std::fs::read(config.join("last-operation.json")) else {
@@ -129,10 +138,41 @@ fn load_operation(config: &Path) -> Value {
     let Ok(saved) = serde_json::from_slice::<Value>(&bytes) else {
         return idle;
     };
+    let path = saved["path"]
+        .as_str()
+        .filter(|path| is_tracked_operation("POST", path));
+    if saved["state"] == "running" {
+        // The host stopped part-way through, so what the operation changed is unknown. An
+        // unbind or a takeover may already have reached the service, and running it again
+        // must not look safe.
+        let mut error = crate::errors::classify(
+            "Operation was interrupted before it finished",
+            path.unwrap_or(""),
+            "POST",
+        );
+        error["outcome"] = json!(if matches!(path, Some("/api/unbind" | "/api/activate")) {
+            "unknown"
+        } else {
+            "failed"
+        });
+        let mut interrupted = json!({
+            "id": saved["id"].as_u64().unwrap_or(0),
+            "state": "failed",
+            "path": path,
+            "error": "Operation failed; inspect status before recovery",
+            "stage": error["stage"],
+            "code": error["code"],
+            "support_error": error,
+            "finished_at": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+        });
+        // Saved once, so the feedback ID the customer quotes stays the same across restarts.
+        save_operation(&config.join("preferences.json"), &mut interrupted);
+        return interrupted;
+    }
     if !matches!(saved["state"].as_str(), Some("failed" | "succeeded")) {
         return idle;
     }
-    let mut clean = json!({"id":saved["id"].as_u64().unwrap_or(0), "state":saved["state"], "path":null, "error":null});
+    let mut clean = json!({"id":saved["id"].as_u64().unwrap_or(0), "state":saved["state"], "path":path, "error":null});
     clean["finished_at"] = json!(saved["finished_at"].as_u64());
     if saved["state"] == "failed" {
         clean["error"] = json!("Operation failed; inspect status before recovery");
@@ -1141,6 +1181,39 @@ mod operation_tests {
         assert!(clean["http_status"].is_null());
         std::fs::remove_file(root.join("last-operation.json")).unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn an_operation_the_host_did_not_finish_is_reported_after_restart() {
+        for (path, outcome) in [
+            ("/api/unbind", "unknown"),
+            ("/api/activate", "unknown"),
+            ("/api/restore", "failed"),
+        ] {
+            let root = std::env::temp_dir().join(format!(
+                "host-interrupted-{}-{}",
+                std::process::id(),
+                path.rsplit('/').next().unwrap()
+            ));
+            let host = Host::new(root.clone()).unwrap();
+            host.begin_operation(path).unwrap();
+            // The host dies here: no finish_operation.
+            drop(host);
+            let host = Host::new(root.clone()).unwrap();
+            let state = host.operation_status().unwrap();
+            assert_eq!(state["state"], "failed", "{path}");
+            assert_eq!(state["id"], 1);
+            assert_eq!(state["path"], path);
+            assert_eq!(state["support_error"]["outcome"], outcome, "{path}");
+            let feedback = state["support_error"]["feedback_id"].clone();
+            assert!(feedback.is_string());
+            drop(host);
+            let again = Host::new(root.clone()).unwrap().operation_status().unwrap();
+            assert_eq!(
+                again["support_error"]["feedback_id"], feedback,
+                "the feedback ID must not change across restarts"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
     #[test]
     fn usage_rows_are_bounded_without_changing_totals() {
