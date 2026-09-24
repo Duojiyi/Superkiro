@@ -664,7 +664,7 @@ pub async fn dispatch(host: &Host, path: &str, method: &str, body: Value) -> Res
                 .diagnose(&gateway(query.as_deref())?, custom.as_deref())
                 .await;
             Ok(
-                json!({"overall_status":report.overall_status,"items":report.items.iter().map(|item| json!({"name":item.name,"level":item.level})).collect::<Vec<_>>(),"kiro_version":report.kiro_version,"is_running":report.is_running,"gateway_reachable":report.gateway_reachable,"can_one_click_fix":report.can_one_click_fix}),
+                json!({"overall_status":report.overall_status,"items":report.items.iter().map(|item| json!({"name":item.name,"level":item.level})).collect::<Vec<_>>(),"kiro_version":report.kiro_version,"is_running":report.is_running,"gateway_reachable":report.gateway_reachable}),
             )
         }
         ("GET", "/api/memory/sample") => {

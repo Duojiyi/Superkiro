@@ -17,8 +17,8 @@ pub mod token_storage;
 pub mod white_label;
 
 pub use mem_guard::{
-    CacheCleanResult, MemGuardConfig, MemoryGuard, MemorySnapshot, OrphanPurgeResult,
-    ProcessCategory, ProcessMemoryInfo, TrimResult,
+    CacheCleanResult, MemGuardConfig, MemoryGuard, MemorySnapshot, ProcessCategory,
+    ProcessMemoryInfo, TrimResult,
 };
 
 pub use auth::{AuthClient, AuthClientError, ClientLoginRequest, ClientRefreshRequest};
