@@ -380,8 +380,28 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                             .map(|config| config.model.as_str())
                             .unwrap_or("default-model")
                     });
+                let input_limit = input_limit_for_model(
+                    requested_model_for_reservation,
+                    claims.as_ref(),
+                    &self.billing,
+                );
+                // The group's system prompt prefix is added after translation, but it is
+                // sent, so the hold includes it.
+                let prefix_tokens = claims
+                    .as_ref()
+                    .and_then(|claims| self.billing.get_group(&claims.group_id))
+                    .and_then(|group| group.system_prompt_prefix)
+                    .map_or(0, |prefix| {
+                        crate::usage_estimate::tokens_from_units(
+                            crate::usage_estimate::token_units(&prefix),
+                        )
+                    });
                 let estimated_input_tokens = request_for_reservation
-                    .map(estimate_input_tokens)
+                    .map(|request| {
+                        estimate_input_tokens(request)
+                            .saturating_add(prefix_tokens)
+                            .clamp(1, input_limit)
+                    })
                     .unwrap_or(2_000);
                 reserved_estimated_input = estimated_input_tokens;
                 reserved_max_output = max_output_tokens_for_model(
@@ -779,6 +799,17 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                 }
             }
 
+            // Billed when the upstream reports no input usage: what is actually sent — the
+            // group prefix, translated tool schemas, transcriptions in place of images —
+            // rather than the Kiro request the hold was estimated from.
+            let translated_input_estimate = serde_json::to_value(&chat_req)
+                .map(|value| crate::usage_estimate::estimate_json_tokens(&value))
+                .unwrap_or(reserved_estimated_input)
+                .clamp(
+                    1,
+                    input_limit_for_model(&target_model, claims.as_ref(), &self.billing),
+                );
+
             // 9. Initiate upstream streaming (with multi-key pool failover & model fallback chain, Spec §14.3, §14.6)
             let card_group = claims
                 .as_ref()
@@ -1009,7 +1040,7 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                     .cloned(),
             )
             .with_permit(capacity_permit)
-            .with_estimated_input(reserved_estimated_input)
+            .with_estimated_input(translated_input_estimate)
             .with_reservation_lease(reservation_lease);
 
             let watchdog_stream = WatchdogStream::new(upstream_stream, WatchdogConfig::default());
@@ -1066,8 +1097,29 @@ fn estimate_input_tokens(request: &GenerateAssistantResponseRequest) -> u64 {
     // Provider usage still settles the final charge whenever it is reported.
     serde_json::to_value(request)
         .map(|value| crate::usage_estimate::estimate_json_tokens(&value))
-        .unwrap_or(200_000)
-        .clamp(1, 200_000)
+        .unwrap_or(u64::MAX)
+}
+
+/// The most input tokens `model` accepts: its group's configured limit when the model
+/// is mapped, otherwise its known context window. Estimates are clamped to it; a fixed
+/// clamp would under-hold a model with a larger window.
+fn input_limit_for_model(model: &str, claims: Option<&AuthClaims>, billing: &BillingEngine) -> u64 {
+    claims
+        .and_then(|claims| billing.get_group(&claims.group_id))
+        .and_then(|group| {
+            billing
+                .list_models_for_group(&group.id, false)
+                .into_iter()
+                .find(|mapped| mapped.matches_model(model))
+        })
+        .map(|mapped| {
+            super::models::TokenLimits::configured(mapped.context_window, mapped.max_output)
+                .max_input_tokens
+        })
+        .unwrap_or_else(|| {
+            u64::from(billing::context::ModelContextLibrary::resolve(model).context_window)
+        })
+        .max(1)
 }
 
 fn validate_conversation_request(

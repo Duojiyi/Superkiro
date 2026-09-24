@@ -445,6 +445,17 @@ pub fn create_stream_guard_with_send_deadline(
                     metrics.mark_error();
                 }
             }
+            // The only way to tune the estimator: what it said, against what was billed.
+            if has_input_usage {
+                eprintln!(
+                    "usage_calibration model={} estimated_input={} uncached_input={} cache_read={} cache_write={}",
+                    settler.target_model,
+                    settler.estimated_input_tokens,
+                    usage.uncached_prompt_tokens,
+                    usage.cache_read_input_tokens.unwrap_or(0),
+                    usage.cache_creation_input_tokens.unwrap_or(0),
+                );
+            }
             if let Some(tokens) = resolve_settlement_tokens(
                 &usage,
                 has_input_usage,
