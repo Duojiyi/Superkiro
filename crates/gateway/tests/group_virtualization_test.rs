@@ -433,13 +433,21 @@ async fn unreported_input_is_billed_on_the_translated_request() {
         "PREFIXED",
         Some(prefix),
     ));
-    billing.upsert_card(create_activated_card("card-long-prefix", "group-long-prefix"));
+    billing.upsert_card(create_activated_card(
+        "card-long-prefix",
+        "group-long-prefix",
+    ));
     let token = auth.issue_token_for_card("card-long-prefix", 3600).unwrap();
     let handler = GenerateAssistantResponseHandler::new(
         reqwest::Client::new(),
         Arc::new(OpenAiProvider),
-        ProviderConfig::new(mock_server.uri(), "sk-test-key", "gpt-4o", Duration::from_secs(5))
-            .with_group("group-long-prefix"),
+        ProviderConfig::new(
+            mock_server.uri(),
+            "sk-test-key",
+            "gpt-4o",
+            Duration::from_secs(5),
+        )
+        .with_group("group-long-prefix"),
         billing.clone(),
         IdempotencyManager::default(),
     );
