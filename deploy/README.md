@@ -20,7 +20,6 @@
                          ├── Kiro IDE 冒充路由 (虚拟模型/用量/订阅)
                          ├── 双向流式二进制转译 (OpenAI/Anthropic <-> Kiro Wire)
                          ├── Web 自助激活与充值门户 (/portal)
-                         ├── 自动化发卡平台对接口 (/api/v1/cards/*)
                          ├── 客户端版本协商与信标心跳 (/client/*)
                          └── 本地状态持久化挂载卷 (/app/data)
 ```
@@ -53,7 +52,8 @@ DOMAIN=kiro.yourdomain.com
 
 # 2. 网关内部鉴权密钥 (至少 32 字符随机字符串)
 AUTH_SECRET=a_very_secure_random_string_32_characters_long!
-# 发卡平台对接密钥 (保护 /api/v1/cards/* 接口)
+# 已停用的发卡平台接口 (/api/v1/cards/*) 的旧密钥。当前网关不再读取；
+# docker-compose 仍要求设置，以便回滚到旧版本时照常启动。
 CARD_PLATFORM_KEY=secret-card-platform-token-here
 
 # 3. 上游大模型服务商 API (支持 openai / anthropic 兼容接口)
@@ -107,11 +107,8 @@ curl -X POST https://kiro.yourdomain.com/client/negotiate \
   -H "Content-Type: application/json" \
   -d '{}'
 
-# 验证发卡平台拉码接口 (带授权密钥)
-curl -X POST https://kiro.yourdomain.com/api/v1/cards/pull \
-  -H "Content-Type: application/json" \
-  -H "X-Card-Platform-Key: secret-card-platform-token-here" \
-  -d '{"order_id": "order-001", "count": 1}'
+# 发卡平台接口已移除，应返回 404
+curl -i -X POST https://kiro.yourdomain.com/api/v1/cards/pull
 ```
 
 ### 4.4 访问 Web 门户
