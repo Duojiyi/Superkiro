@@ -39,6 +39,13 @@ describe('structured client errors', () => {
     const result = expect(api('/api/status', String(method))).rejects.toMatchObject({code:'SK-NET-001', outcome});
     await vi.advanceTimersByTimeAsync(Number(delay)); await result;
   });
+  it('gives takeover, restore and unbind the time a save prompt needs', async () => {
+    vi.useFakeTimers(); invoke.mockReturnValue(new Promise(() => {}));
+    let settled = false; const result = api('/api/restore', 'POST').catch(e => { settled = true; return e; });
+    await vi.advanceTimersByTimeAsync(125000); expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(55000); expect(await result).toMatchObject({code:'SK-NET-001', outcome:'unknown'});
+    vi.useRealTimers();
+  });
   it('handles structured unsuccessful responses and native credential errors', async () => {
     invoke.mockResolvedValue({success:false,error:{code:'SK-BIND-002',retry_after_seconds:30,feedback_id:'HOST-12345678'}});
     await expect(api('/api/verify-card','POST')).rejects.toMatchObject({code:'SK-BIND-002',retry_after_seconds:30,feedback_id:'HOST-12345678'});

@@ -54,11 +54,13 @@ export function safeError(error: unknown) {
   if (/preview/i.test(text)) return '当前为浏览器预览，未连接 Tauri 宿主。没有执行本机操作。';
   return '请求未完成，请检查本地服务、卡密及网络后重试。';
 }
+// Takeover, restore and unbind may wait for Kiro to close, save prompt included, before they write.
+const LONG_MUTATIONS = ['/api/activate', '/api/restore', '/api/unbind'];
 export async function api<T>(path: string, method = 'GET', body: object = {}): Promise<T> {
   if (!isTauri()) throw toClientError({code:'SK-PREVIEW-001'});
   let timer:ReturnType<typeof setTimeout>|undefined;
   try {
-    const result = await Promise.race([invoke<T & {success?: boolean; error?: unknown}>('api', {path, method, body}),new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(toClientError({code:'SK-NET-001',outcome:method==='GET'?'failed':'unknown'})),path==='/api/heartbeat'?5000:method==='GET'?15000:125000);})]);
+    const result = await Promise.race([invoke<T & {success?: boolean; error?: unknown}>('api', {path, method, body}),new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(toClientError({code:'SK-NET-001',outcome:method==='GET'?'failed':'unknown'})),path==='/api/heartbeat'?5000:method==='GET'?15000:LONG_MUTATIONS.includes(path)?180000:125000);})]);
     if (result?.success === false) throw result.error;
     return result;
   } catch (error) { throw toClientError(error); }

@@ -238,7 +238,7 @@ describe('audit timeout recovery',()=>{
   setup(true);HTMLDialogElement.prototype.showModal=function(){this.open=true;};
   const original=invoke.getMockImplementation()!;let operationCalls=0;
   invoke.mockImplementation((command,payload)=>{
-   if(payload.path==='/api/operation')return Promise.resolve(++operationCalls===1?{id:4,state:'idle'}:{id:5,state,support_error:{...supportError('SK-RESTORE-001'),feedback_id:'host-final-456'}});
+   if(payload.path==='/api/operation')return Promise.resolve(++operationCalls<=2?{id:4,state:'idle'}:{id:5,state,support_error:{...supportError('SK-RESTORE-001'),feedback_id:'host-final-456'}});
    if(payload.path==='/api/activate')return Promise.reject(supportError('SK-NET-001','unknown'));
    return original(command,payload);
   });
@@ -254,7 +254,7 @@ describe('audit timeout recovery',()=>{
   setup(true);HTMLDialogElement.prototype.showModal=function(){this.open=true;};
   const original=invoke.getMockImplementation()!;let operationCalls=0;
   invoke.mockImplementation((c,p)=>{
-   if(p.path==='/api/operation')return Promise.resolve(++operationCalls===1?{id:4,state:'idle'}:{id:5,state:'failed',support_error:{...supportError('SK-NET-001','unknown'),feedback_id:'remote-final-456'}});
+   if(p.path==='/api/operation')return Promise.resolve(++operationCalls<=2?{id:4,state:'idle'}:{id:5,state:'failed',support_error:{...supportError('SK-NET-001','unknown'),feedback_id:'remote-final-456'}});
    if(p.path==='/api/activate')return Promise.reject(supportError('SK-NET-001','unknown'));
    if(p.path==='/api/restore')return restoreOutcome==='succeeded'?Promise.resolve({success:true}):Promise.reject({...supportError('SK-NET-001','unknown'),feedback_id:'restore-feedback-789'});
    return original(c,p);
@@ -291,7 +291,7 @@ describe('audit timeout recovery',()=>{
   setup(true);HTMLDialogElement.prototype.showModal=function(){this.open=true;};
   const original=invoke.getMockImplementation()!;let operationCalls=0;
   invoke.mockImplementation((c,p)=>{
-   if(p.path==='/api/operation'){operationCalls++;return Promise.resolve({id:operationCalls===1||kind==='preflight'?8:9,state:operationCalls===1?(kind==='preflight'?'running':'idle'):kind==='race-running'&&operationCalls===2?'running':'succeeded'});}
+   if(p.path==='/api/operation'){operationCalls++;return Promise.resolve({id:operationCalls<=2||kind==='preflight'?8:9,state:operationCalls<=2?(kind==='preflight'?'running':'idle'):kind==='race-running'&&operationCalls===3?'running':'succeeded'});}
    if(p.path==='/api/activate')return Promise.reject(supportError('SK-LOCAL-002'));
    return original(c,p);
   });
@@ -310,7 +310,8 @@ describe('audit timeout recovery',()=>{
   expect((screen.getByRole('button',{name:'启用连接'}) as HTMLButtonElement).disabled).toBe(false);
   expect(screen.getByRole('region',{name:'错误反馈'}).textContent).toContain('SK-LOCAL-002');
   expect(screen.queryByText(/宿主操作已结束/)).toBeNull();
-  expect(invoke.mock.calls.filter(([,p])=>p.path==='/api/operation')).toHaveLength(2);
+  // The startup read, the mutation baseline, and the contention check.
+  expect(invoke.mock.calls.filter(([,p])=>p.path==='/api/operation')).toHaveLength(3);
  });
  it('keeps partial unbind protection after dismissal and navigation until local restore clears the session',async()=>{
   setup(true);const original=invoke.getMockImplementation()!;
@@ -430,7 +431,7 @@ describe('persisted operation failure diagnostics',()=>{
   setup(false,true);render(<App/>);await screen.findByRole('heading',{name:'本机配置待恢复'});
   expect(screen.getByRole('button',{name:'还原 Kiro 配置'})).toBeTruthy();
   expect(screen.queryByRole('button',{name:/诊断|报告/})).toBeNull();
-  expect(invoke.mock.calls.some(([,p])=>p.path?.startsWith('/api/doctor')||p.path==='/api/operation')).toBe(false);
+  expect(invoke.mock.calls.some(([,p])=>p.path?.startsWith('/api/doctor'))).toBe(false);
  });
 });
 
@@ -478,7 +479,7 @@ describe('confirmed balance session boundaries',()=>{
  it('restores with consent, retains balance, and permits reconnect without another login',async()=>{
   setup(true);render(<App/>);await login();await connect();
   fireEvent.click(screen.getByRole('button',{name:'还原 Kiro 配置'}));
-  expect(document.querySelector('dialog[aria-labelledby=confirm-title]')?.textContent).toContain('未保存内容可能丢失');
+  expect(document.querySelector('dialog[aria-labelledby=confirm-title]')?.textContent).toContain('不会被强制结束');
   fireEvent.submit(document.querySelector('dialog form')!);
   await screen.findByText('Kiro 配置已还原，当前卡密与积分信息已保留。');
   expect(screen.queryByRole('heading',{name:'卡密登录'})).toBeNull();
@@ -962,5 +963,55 @@ describe('structured error feedback',()=>{
    expect(invoke.mock.calls.some(([c,p])=>c==='native'&&p.method==='exit')).toBe(false);
    expect(screen.queryByRole('heading',{name:'恢复未完成'})).toBeNull();
   }finally{normalize.mockRestore();}
+ });
+});
+
+describe('a Kiro that will not close',()=>{
+ // The first request for `path` fails as `code`; after a later success the machine reads as restored.
+ function kiroStaysOpenOnce(path:string,code='SK-CONNECT-005'){const original=invoke.getMockImplementation()!;let refused=false,done=false;invoke.mockImplementation(async(c,p)=>{if(p.path===path){if(!refused){refused=true;throw supportError(code);}done=true;return {success:true};}const result=await original(c,p);return p.path==='/api/status'&&done?{...result,authenticated:false,has_snapshot:false,recovery_pending:false}:result;});}
+ const guidance=()=>document.querySelector('.page-restore-failed .subtitle')?.textContent??'';
+ async function openAccount(action:string){fireEvent.click(screen.getByRole('button',{name:/设置/}));fireEvent.change(screen.getByLabelText('设置分组'),{target:{value:'account'}});fireEvent.click(screen.getByRole('button',{name:action}));}
+ it('forces only after a second consent, replaying the unbind with the card already given',async()=>{
+  setup(true);render(<App/>);await login();await connect();kiroStaysOpenOnce('/api/unbind');
+  await openAccount('解除设备绑定');
+  fireEvent.change(screen.getByLabelText('当前卡密'),{target:{value:'secret-card'}});fireEvent.submit(document.querySelector('dialog form')!);
+  await screen.findByRole('heading',{name:'恢复未完成'});
+  expect(guidance()).toContain('文件 > 退出');
+  expect(invoke.mock.calls.find(([,p])=>p.path==='/api/unbind')?.[1].body.force_close_confirmed).toBeUndefined();
+  fireEvent.click(screen.getByRole('button',{name:'强制关闭 Kiro 并继续'}));
+  expect(screen.getByRole('dialog').textContent).toContain('未保存的内容将丢失');
+  expect(screen.queryByLabelText('当前卡密')).toBeNull();
+  fireEvent.submit(document.querySelector('dialog form')!);
+  await screen.findByLabelText('输入你的卡密');
+  const unbinds=invoke.mock.calls.filter(([,p])=>p.path==='/api/unbind');
+  expect(unbinds).toHaveLength(2);
+  expect(unbinds[1][1].body).toMatchObject({card_key:'secret-card',close_kiro_confirmed:true,force_close_confirmed:true});
+  expect(invoke.mock.calls.some(([,p])=>p.path==='/api/restore')).toBe(false);
+ });
+ it('retries the intent that failed, not a plain restore',async()=>{
+  setup(true);render(<App/>);await login();await connect();kiroStaysOpenOnce('/api/restore');
+  await openAccount('切换卡密');fireEvent.submit(document.querySelector('dialog form')!);
+  await screen.findByRole('heading',{name:'恢复未完成'});
+  fireEvent.click(screen.getByRole('button',{name:'重新恢复'}));
+  await screen.findByLabelText('输入你的卡密');
+  const restores=invoke.mock.calls.filter(([,p])=>p.path==='/api/restore');
+  expect(restores).toHaveLength(2);
+  expect(restores.every(([,p])=>p.body.force_close_confirmed===undefined)).toBe(true);
+  expect(invoke.mock.calls.some(([,p])=>p.method==='clear_remembered_card')).toBe(true);
+ });
+ it('a Kiro open in another session gets its own guidance and no force',async()=>{
+  setup(true);render(<App/>);await login();await connect();kiroStaysOpenOnce('/api/restore','SK-CONNECT-006');
+  fireEvent.click(screen.getByRole('button',{name:'还原 Kiro 配置'}));fireEvent.submit(document.querySelector('dialog form')!);
+  await screen.findByRole('heading',{name:'恢复未完成'});
+  expect(guidance()).toContain('另一个 Windows 会话');
+  expect(screen.queryByRole('button',{name:'强制关闭 Kiro 并继续'})).toBeNull();
+ });
+ it.each([['unknown',true],['failed',false]] as const)('an operation left %s before a restart locks to local restore: %s',async(outcome,locked)=>{
+  setup(true);const original=invoke.getMockImplementation()!;
+  invoke.mockImplementation((c,p)=>p.path==='/api/operation'?Promise.resolve({id:7,state:'failed',support_error:supportError('SK-NET-001',outcome)}):original(c,p));
+  render(<App/>);await screen.findByLabelText('输入你的卡密');
+  if(locked)await screen.findByText(/上次操作的结果未确认/);
+  await waitFor(()=>expect(invoke.mock.calls.some(([,p])=>p.path==='/api/operation')).toBe(true));
+  expect(!!screen.queryByRole('button',{name:'仅还原本机配置'})).toBe(locked);
  });
 });
