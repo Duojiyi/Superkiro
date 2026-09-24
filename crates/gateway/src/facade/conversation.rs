@@ -165,20 +165,25 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
             let (parts, body) = req.into_parts();
 
             // 1. Extract amz-sdk-invocation-id header (Spec §4.7)
-            let invocation_id = parts
-                .headers
-                .get("amz-sdk-invocation-id")
-                .and_then(|h| h.to_str().ok())
-                .map(ToString::to_string)
-                .unwrap_or_else(|| {
-                    format!(
-                        "inv-{}",
-                        SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_nanos()
-                    )
-                });
+            let invocation_id = match parts.headers.get("amz-sdk-invocation-id") {
+                None => format!(
+                    "inv-{}",
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                ),
+                Some(value) => match value.to_str().ok().filter(|id| valid_invocation_id(id)) {
+                    Some(id) => id.to_string(),
+                    None => {
+                        return error_response(
+                            StatusCode::BAD_REQUEST,
+                            "InvalidRequestException",
+                            "amz-sdk-invocation-id must be 1 to 128 letters, digits, '.', '_', ':' or '-'",
+                        )
+                    }
+                },
+            };
 
             // Extract claims if present
             let claims = parts.extensions.get::<AuthClaims>().cloned();
@@ -1080,6 +1085,16 @@ pub fn render_system_prompt_template(
         .replace("{{group_name}}", &group.name)
         .replace("{{plan_name}}", &group.virtual_plan_name)
         .replace("{{virtual_plan_name}}", &group.virtual_plan_name)
+}
+
+/// The client's invocation id keys idempotency, the credit hold and the request traces,
+/// and is copied into the saved billing state. SDKs send a UUID. Anything else is
+/// refused before it is used: an unbounded id would be stored in every snapshot.
+fn valid_invocation_id(id: &str) -> bool {
+    (1..=128).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
 }
 
 fn valid_model_id(model: &str) -> bool {

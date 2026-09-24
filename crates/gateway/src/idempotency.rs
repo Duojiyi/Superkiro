@@ -76,16 +76,47 @@ struct IdempotencyStore {
     completed: HashMap<String, CompletedInvocation>,
     failed: HashMap<String, Instant>,
     ttl: Duration,
+    /// Expiry is swept at most once a second, not on every request.
+    last_sweep: Option<Instant>,
 }
 
 impl IdempotencyStore {
     fn clean_expired(&mut self, now: Instant) {
+        if self
+            .last_sweep
+            .is_some_and(|last| now.duration_since(last) < Duration::from_secs(1))
+        {
+            return;
+        }
+        self.last_sweep = Some(now);
         self.completed
             .retain(|_, v| now.duration_since(v.completed_at) < self.ttl);
         self.failed
             .retain(|_, timestamp| now.duration_since(*timestamp) < self.ttl);
     }
+
+    /// Keep the finished invocations remembered for replay protection within a bound,
+    /// forgetting the oldest first. In-progress ones are bounded by request concurrency.
+    fn make_room(&mut self) {
+        if self.completed.len() + self.failed.len() < MAX_REMEMBERED {
+            return;
+        }
+        let mut finished: Vec<(Instant, String)> = self
+            .completed
+            .iter()
+            .map(|(id, record)| (record.completed_at, id.clone()))
+            .chain(self.failed.iter().map(|(id, at)| (*at, id.clone())))
+            .collect();
+        finished.sort_unstable();
+        for (_, id) in finished.into_iter().take(MAX_REMEMBERED / 10) {
+            self.completed.remove(&id);
+            self.failed.remove(&id);
+        }
+    }
 }
+
+/// Finished invocations remembered at most, across completed and failed.
+const MAX_REMEMBERED: usize = 50_000;
 
 /// In-memory idempotency deduplication manager.
 #[derive(Debug, Clone)]
@@ -108,6 +139,7 @@ impl IdempotencyManager {
                 completed: HashMap::new(),
                 failed: HashMap::new(),
                 ttl,
+                last_sweep: None,
             })),
         }
     }
@@ -122,18 +154,29 @@ impl IdempotencyManager {
         let mut store = self.inner.lock().unwrap();
         let now = Instant::now();
         store.clean_expired(now);
+        store.make_room();
 
         if store.in_progress.contains_key(invocation_id) {
             return Err(IdempotencyError::InProgress(invocation_id.to_string()));
         }
 
-        if store.completed.contains_key(invocation_id) {
+        // Expiry is swept lazily, so an entry still present may already have expired.
+        let ttl = store.ttl;
+        if store
+            .completed
+            .get(invocation_id)
+            .is_some_and(|record| now.duration_since(record.completed_at) < ttl)
+        {
             return Err(IdempotencyError::AlreadyCompleted(
                 invocation_id.to_string(),
             ));
         }
 
-        if store.failed.contains_key(invocation_id) {
+        if store
+            .failed
+            .get(invocation_id)
+            .is_some_and(|at| now.duration_since(*at) < ttl)
+        {
             return Err(IdempotencyError::AlreadyFailed(invocation_id.to_string()));
         }
 
@@ -155,8 +198,14 @@ impl IdempotencyManager {
     /// Check whether an invocation was completed and is still cached.
     pub fn get_completed(&self, invocation_id: &str) -> Option<CompletedInvocation> {
         let mut store = self.inner.lock().unwrap();
-        store.clean_expired(Instant::now());
-        store.completed.get(invocation_id).cloned()
+        let now = Instant::now();
+        store.clean_expired(now);
+        let ttl = store.ttl;
+        store
+            .completed
+            .get(invocation_id)
+            .filter(|record| now.duration_since(record.completed_at) < ttl)
+            .cloned()
     }
 
     pub(crate) fn commit(&self, invocation_id: &str, record: CompletedInvocation) {
@@ -176,6 +225,25 @@ impl IdempotencyManager {
         store
             .failed
             .insert(invocation_id.to_string(), Instant::now());
+    }
+}
+
+#[cfg(test)]
+mod bound_tests {
+    use super::*;
+
+    #[test]
+    fn finished_invocations_are_remembered_within_a_bound() {
+        let manager = IdempotencyManager::new(Duration::from_secs(600));
+        for n in 0..(MAX_REMEMBERED + 100) {
+            manager.try_acquire(&format!("id-{n}")).unwrap().fail();
+        }
+        let store = manager.inner.lock().unwrap();
+        assert!(store.completed.len() + store.failed.len() <= MAX_REMEMBERED);
+        // The newest are the ones kept.
+        assert!(store
+            .failed
+            .contains_key(&format!("id-{}", MAX_REMEMBERED + 99)));
     }
 }
 
