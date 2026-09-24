@@ -223,7 +223,7 @@ async fn test_card_platform_redeem_topup() {
         1700000000,
     )
     .unwrap();
-    billing.upsert_topup_code(topup_gen.topup);
+    billing.upsert_topup_code(topup_gen.topup).unwrap();
     let raw_topup_code = topup_gen.raw_code;
 
     let handler = CardRedeemHandler {

@@ -299,7 +299,7 @@ fn topup_duration_rejection_preserves_card_code_and_ledger_across_restart() {
         engine.upsert_card(card);
         let topup = generate_topup_code(500, 7 * 86_400, 100).unwrap();
         let topup_id = topup.topup.id.clone();
-        engine.upsert_topup_code(topup.topup);
+        engine.upsert_topup_code(topup.topup).unwrap();
         engine.save_to_file(&path).unwrap();
         let before = engine.export_snapshot();
         let persisted = fs::read(&path).unwrap();
@@ -383,7 +383,7 @@ fn topup_credit_only_preserves_unactivated_and_perpetual_validity() {
         }
         engine.upsert_card(card.clone());
         let topup = billing::generate_topup_code(500, 0, 100).unwrap();
-        engine.upsert_topup_code(topup.topup);
+        engine.upsert_topup_code(topup.topup).unwrap();
         engine
             .redeem_topup("card", &topup.raw_code, 101, "test")
             .unwrap();
@@ -412,7 +412,7 @@ fn topup_write_failure_preserves_code_until_durable_retry() {
     engine.upsert_card(card);
     let topup = generate_topup_code(500, 7 * 86_400, 100).unwrap();
     let topup_id = topup.topup.id.clone();
-    engine.upsert_topup_code(topup.topup);
+    engine.upsert_topup_code(topup.topup).unwrap();
     engine.save_to_file(&path).unwrap();
     let before = engine.export_snapshot();
     let persisted = fs::read(&path).unwrap();

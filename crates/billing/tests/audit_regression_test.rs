@@ -133,7 +133,7 @@ fn full_consumption_debt_survives_restart_and_topup_pays_it() {
         )
         .is_err());
     let topup = generate_topup_code(50, 0, 102).unwrap();
-    recovered.upsert_topup_code(topup.topup);
+    recovered.upsert_topup_code(topup.topup).unwrap();
     recovered
         .redeem_topup("card", &topup.raw_code, 102, "test")
         .unwrap();
@@ -272,7 +272,7 @@ fn archived_facts_preserve_quota_reconciliation_replay_and_recovery() {
         .adjust_balance("card", -5, "op", "correction", 101)
         .unwrap();
     let topup = generate_topup_code(10, 0, 101).unwrap();
-    engine.upsert_topup_code(topup.topup);
+    engine.upsert_topup_code(topup.topup).unwrap();
     engine
         .redeem_topup("card", &topup.raw_code, 101, "op")
         .unwrap();

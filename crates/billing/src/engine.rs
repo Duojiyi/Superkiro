@@ -3346,13 +3346,24 @@ impl BillingEngine {
     // Top-up & Renewal Operations (Spec §14.9)
     // ==========================================
 
-    /// Register a top-up code in the billing engine.
-    pub fn upsert_topup_code(&self, code: TopupCode) {
-        {
-            let mut topups = self.topup_codes.write().unwrap();
-            topups.insert(code.id.clone(), code);
-        }
-        self.sync_to_disk();
+    /// Register a top-up code, durably: it exists only once the snapshot holding it is
+    /// saved. Under the state lock, so a concurrent commit cannot publish a snapshot taken
+    /// before the insert and drop the code again.
+    pub fn upsert_topup_code(&self, code: TopupCode) -> Result<(), BillingError> {
+        let _state_guard = self.state_lock.write().unwrap();
+        let sequence = self
+            .snapshot_sequence
+            .load(Ordering::Acquire)
+            .saturating_add(1);
+        let previous_checksum = self.last_snapshot_checksum.read().unwrap().clone();
+        let mut candidate = self.export_snapshot_locked(sequence, previous_checksum);
+        candidate.topup_codes.insert(code.id.clone(), code.clone());
+        self.commit_candidate_snapshot(&candidate, || {
+            self.topup_codes
+                .write()
+                .unwrap()
+                .insert(code.id.clone(), code);
+        })
     }
 
     /// Look up top-up code by ID.

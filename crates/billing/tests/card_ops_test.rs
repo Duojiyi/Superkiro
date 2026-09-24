@@ -204,7 +204,7 @@ fn test_topup_generation_export_and_redemption() {
     // Generate single top-up code: +20M credits, +3600s validity
     let generated = generate_topup_code(20_000_000, 3_600, 5_000).unwrap();
     assert!(generated.raw_code.starts_with("topup-"));
-    engine.upsert_topup_code(generated.topup.clone());
+    engine.upsert_topup_code(generated.topup.clone()).unwrap();
 
     // Redeem top-up code
     let ledger_entry = engine
@@ -240,7 +240,7 @@ fn test_topup_reactivates_expired_card() {
     engine.upsert_card(card);
 
     let generated = generate_topup_code(15_000_000, 7_200, 8_000).unwrap();
-    engine.upsert_topup_code(generated.topup.clone());
+    engine.upsert_topup_code(generated.topup.clone()).unwrap();
 
     // Redeem when current time is 10_000 (past old valid_until of 5_000)
     let _ = engine
@@ -264,4 +264,35 @@ fn test_topup_batch_and_csv_json_export() {
     let json = export_topup_json(&batch).unwrap();
     assert!(json.contains("topup-"));
     assert!(json.contains("50000000"));
+}
+
+#[test]
+fn a_topup_code_that_could_not_be_saved_does_not_exist() {
+    let dir = std::env::temp_dir().join(format!(
+        "kiro-topup-durable-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let engine = BillingEngine::new();
+    engine.set_persistence_path(dir.join("billing_state.json"));
+    let generated = generate_topup_code(20_000_000, 3_600, 5_000).unwrap();
+
+    engine.inject_persistence_fault(true);
+    assert!(matches!(
+        engine.upsert_topup_code(generated.topup.clone()),
+        Err(BillingError::Persistence(_))
+    ));
+    engine.inject_persistence_fault(false);
+    assert!(
+        engine.get_topup_code(&generated.topup.id).is_none(),
+        "a code that is not on disk must not be redeemable"
+    );
+
+    engine.upsert_topup_code(generated.topup.clone()).unwrap();
+    assert!(engine.get_topup_code(&generated.topup.id).is_some());
+    let _ = std::fs::remove_dir_all(dir);
 }

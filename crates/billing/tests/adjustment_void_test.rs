@@ -195,7 +195,7 @@ fn test_ledger_reconciliation_mathematical_consistency() {
         used_at: None,
         created_at: NOW_SECS,
     };
-    engine.upsert_topup_code(topup);
+    engine.upsert_topup_code(topup).unwrap();
     engine
         .redeem_topup(
             "card-reconcile",
@@ -793,13 +793,15 @@ fn test_void_persists_audit_and_retry_is_noop() {
             .unwrap(),
         voided
     );
-    restored.upsert_topup_code(TopupCode::new(
-        "void-topup",
-        billing::card::hash_card_code("unused-topup"),
-        100,
-        100,
-        NOW_SECS,
-    ));
+    restored
+        .upsert_topup_code(TopupCode::new(
+            "void-topup",
+            billing::card::hash_card_code("unused-topup"),
+            100,
+            100,
+            NOW_SECS,
+        ))
+        .unwrap();
     assert!(restored
         .redeem_topup("void-retry", "unused-topup", NOW_SECS, "admin")
         .is_err());
