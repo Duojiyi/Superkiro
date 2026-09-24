@@ -227,6 +227,7 @@ pub fn create_stream_guard_with_send_deadline(
         let mut tool_buffers: BTreeMap<usize, ToolBuffer> = BTreeMap::new();
         let mut usage = crate::provider::TokenUsage::default();
         let mut has_input_usage = false;
+        let mut saw_usage_frame = false;
         let mut output_units = 0u64;
         let mut saw_output = false;
         let mut completed = false;
@@ -283,6 +284,7 @@ pub fn create_stream_guard_with_send_deadline(
                             }
                         }
                         Some(Ok(ProviderStreamEvent::Usage(next))) => {
+                            saw_usage_frame = true;
                             // Output-only Anthropic message_delta must not erase prompt/cache observations.
                             // A present-but-zero cache field is not a report of input usage: the
                             // OpenAI adapter fills it from `cached_tokens`, which is usually 0.
@@ -308,6 +310,19 @@ pub fn create_stream_guard_with_send_deadline(
                             stop_reason = Some(StreamTranslationState::map_stop_reason(&reason));
                         }
                         Some(Ok(ProviderStreamEvent::Done)) => {
+                            // An empty turn with an explicit reason — the output limit, or a
+                            // content filter — was reported in full, so it ends like any other,
+                            // bills its usage, and says why it is empty. An empty turn ending
+                            // with an ordinary stop looks exactly like a failed relay and gives
+                            // the user nothing, so it stays an unbilled, retryable error below.
+                            if !saw_output && saw_usage_frame {
+                                if let Some(notice) = empty_turn_notice(stop_reason.as_deref()) {
+                                    let frame = kiro_wire::encoder::encode_assistant_response(notice, Some(&config.model_id));
+                                    if !send_frame(&tx, Bytes::from(frame), send_deadline).await { break 'stream; }
+                                    completed = true;
+                                    break;
+                                }
+                            }
                             // A terminal marker alone does not constitute a response. Do not
                             // charge input-only usage or cache this invocation as successful.
                             if !saw_output {
@@ -426,6 +441,19 @@ pub fn create_stream_guard_with_send_deadline(
         // With no billable work, dropping the guard releases the invocation for retry.
     });
     FrameStream { inner: rx }
+}
+
+/// What to show when a turn ends with no visible output, so it is not simply blank.
+/// Stop reasons arrive in each provider's own vocabulary; only the output limit is
+/// normalised before this point.
+fn empty_turn_notice(stop_reason: Option<&str>) -> Option<&'static str> {
+    match stop_reason? {
+        "max_tokens" => Some("（模型在给出可见回答前已达到输出上限。请重试，或缩短本次请求。）"),
+        "content_filter" | "refusal" => {
+            Some("（上游模型未返回内容：本次请求被其内容安全策略拦截。）")
+        }
+        _ => None,
+    }
 }
 
 fn resolve_settlement_tokens(
