@@ -28,7 +28,8 @@ fn active_card() -> Card {
 fn setup() -> (Arc<BillingEngine>, AuthState, RefreshTokenHandler) {
     let engine = Arc::new(BillingEngine::new());
     engine.upsert_card(active_card());
-    let auth = AuthState::with_billing(SECRET, (*engine).clone());
+    // No retry window: these tests pin down that a replaced token is refused.
+    let auth = AuthState::with_billing(SECRET, (*engine).clone()).with_refresh_grace(0);
     let handler = RefreshTokenHandler::new(engine.clone(), auth.clone());
     (engine, auth, handler)
 }
@@ -263,4 +264,131 @@ async fn storage_failure_on_refresh_is_retryable_not_a_logout() {
         "the failed attempt must not consume the token"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A refresh whose response was lost, or that a second window or the desktop app repeats,
+/// presents the token it replaced. Within the retry window that is the same refresh, not
+/// a replay, and it must not sign the customer out.
+#[tokio::test]
+async fn a_refresh_retried_within_the_grace_window_is_not_a_logout() {
+    let engine = Arc::new(BillingEngine::new());
+    engine.upsert_card(active_card());
+    let auth = AuthState::with_billing(SECRET, (*engine).clone());
+    let handler = RefreshTokenHandler::new(engine.clone(), auth.clone());
+    let signed_in = token(&auth, &active_card());
+    let (status, _lost) = refresh(&handler, json!({"refreshToken": signed_in})).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, retried) = refresh(&handler, json!({"refreshToken": signed_in})).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a retried refresh signed the customer out"
+    );
+    let (status, _) = refresh(&handler, json!({"refreshToken": retried["refreshToken"]})).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the retry's token must carry the family on"
+    );
+    // Two rotations behind is no retry.
+    let (status, _) = refresh(&handler, json!({"refreshToken": signed_in})).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// One card chaining refreshes neither grows the state nor gets past its budget, and is
+/// told to retry rather than signed out.
+#[tokio::test]
+async fn one_card_chaining_refreshes_is_throttled_and_leaves_state_flat() {
+    let (engine, auth, handler) = setup();
+    let size =
+        |engine: &BillingEngine| serde_json::to_vec(&engine.export_snapshot()).unwrap().len();
+    let (status, first) = refresh(
+        &handler,
+        json!({"refreshToken": token(&auth, &active_card())}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let mut raw = first["refreshToken"].as_str().unwrap().to_string();
+    let after_one = size(&engine);
+    for _ in 1..gateway::auth::CARD_TOKEN_BUDGET {
+        let (status, next) = refresh(&handler, json!({"refreshToken": raw})).await;
+        assert_eq!(status, StatusCode::OK);
+        raw = next["refreshToken"].as_str().unwrap().to_string();
+    }
+    assert!(
+        size(&engine) <= after_one + 16,
+        "the state grew with each refresh"
+    );
+    assert!(engine.export_snapshot().consumed_refresh_tokens.is_empty());
+    let request = Request::builder()
+        .method("POST")
+        .uri("/refreshToken")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"refreshToken": raw}).to_string()))
+        .unwrap();
+    let response = handler.handle(request).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let wait: u64 = response.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=3600).contains(&wait), "{wait}");
+    let body: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["__type"], "ThrottlingException");
+}
+
+/// Kiro retries a refused refresh every minute; those refusals must not use up the budget.
+#[tokio::test]
+async fn refused_refreshes_do_not_use_the_budget() {
+    let (_, auth, handler) = setup();
+    let signed_in = token(&auth, &active_card());
+    let (_, current) = refresh(&handler, json!({"refreshToken": signed_in})).await;
+    for _ in 0..gateway::auth::CARD_TOKEN_BUDGET + 5 {
+        assert_eq!(
+            refresh(&handler, json!({"refreshToken": signed_in}))
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let (status, _) = refresh(&handler, json!({"refreshToken": current["refreshToken"]})).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// A sign-in starts a new refresh family, so a token copied off the device before it stops
+/// working at once.
+#[tokio::test]
+async fn a_new_sign_in_retires_older_refresh_tokens() {
+    let (engine, auth, handler) = setup();
+    let before = token(&auth, &engine.get_card(CARD).unwrap());
+    engine
+        .activate_card_with_device(
+            CARD,
+            1,
+            86_400,
+            Some("dev_0123456789abcdef0123456789abcdef"),
+        )
+        .unwrap();
+    let current = engine.get_card(CARD).unwrap();
+    assert_eq!(current.refresh_version, 2);
+    assert_eq!(
+        refresh(&handler, json!({"refreshToken": before})).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let (status, _) = refresh(&handler, json!({"refreshToken": token(&auth, &current)})).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn the_refresh_endpoint_limits_each_source() {
+    let (_, _, handler) = setup();
+    for _ in 0..60 {
+        let (status, _) = refresh(&handler, json!({"refreshToken": "not-a-jwt"})).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    let (status, body) = refresh(&handler, json!({"refreshToken": "not-a-jwt"})).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body["__type"], "ThrottlingException");
 }

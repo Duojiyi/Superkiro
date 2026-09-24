@@ -7,7 +7,7 @@
 
 use super::{error_response, json_response, BoxFuture, FacadeHandler, Response};
 use crate::auth::{AuthError, AuthState};
-use crate::security::BruteForceProtector;
+use crate::security::{BruteForceProtector, IpRateLimiter};
 use axum::{
     body::Body,
     http::{Method, Request, StatusCode},
@@ -269,6 +269,11 @@ impl FacadeHandler for OAuthTokenHandler {
                 }
             };
 
+            // Budgeted with refreshes, and refused before the activation commit.
+            if let Some(wait) = auth_state.token_budget_retry_after(&card.id, now_secs) {
+                return throttled_response(wait);
+            }
+
             let updated_card = match engine.activate_card_with_device(
                 &card.id,
                 now_secs,
@@ -350,6 +355,7 @@ impl FacadeHandler for OAuthTokenHandler {
                     );
                 }
             };
+            auth_state.record_token_issued(&updated_card.id, now_secs);
 
             let profile_arn = format!(
                 "arn:aws:codewhisperer:us-east-1:123456789012:profile/{}",
@@ -374,8 +380,26 @@ impl FacadeHandler for OAuthTokenHandler {
 
 // Reuse the access-token contract: fixed messages, no card existence/status details.
 fn refresh_auth_error(error: AuthError) -> Response {
+    if let AuthError::Throttled(wait) = error {
+        return throttled_response(wait);
+    }
     let (status, kind, message) = error.to_aws_error();
     error_response(status, kind, &message)
+}
+
+/// A 429 with `Retry-After`: Kiro and the desktop app retry it and keep the customer signed
+/// in, where a 401 or 403 would sign them out.
+fn throttled_response(wait_secs: u64) -> Response {
+    let mut response = error_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        "ThrottlingException",
+        "Too many sign-ins or refreshes; retry later",
+    );
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from(wait_secs),
+    );
+    response
 }
 
 /// Lifetime of the access token issued by a refresh.
@@ -386,6 +410,9 @@ const REFRESH_ACCESS_TTL_SECS: u64 = 3600;
 pub struct RefreshTokenHandler {
     engine: Option<Arc<BillingEngine>>,
     auth_state: Option<AuthState>,
+    /// Per source. A real device refreshes about once an hour, but many can share one
+    /// address behind a NAT.
+    limiter: IpRateLimiter,
 }
 
 impl RefreshTokenHandler {
@@ -397,6 +424,7 @@ impl RefreshTokenHandler {
         Self {
             engine: Some(engine),
             auth_state: Some(auth_state),
+            limiter: IpRateLimiter::new(60, 60),
         }
     }
 }
@@ -436,7 +464,15 @@ impl FacadeHandler for RefreshTokenHandler {
                 }
             };
 
-            let body = req.into_body();
+            let (parts, body) = req.into_parts();
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let caller_ip = crate::security::client_ip_parts(&parts.extensions, &parts.headers);
+            if let Err(wait) = self.limiter.check_rate_limit(&caller_ip, now) {
+                return throttled_response(wait);
+            }
             let body_bytes = match axum::body::to_bytes(body, 64 * 1024).await {
                 Ok(b) => b,
                 Err(e) => {

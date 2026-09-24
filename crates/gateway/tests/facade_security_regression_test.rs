@@ -37,7 +37,8 @@ fn setup() -> (BillingEngine, AuthState, Router) {
             .activate_card_with_device(id, gateway::now_secs(), 86400, Some("device"))
             .unwrap();
     }
-    let auth = AuthState::with_billing("facade-security-local-test-signing-key", billing.clone());
+    let auth = AuthState::with_billing("facade-security-local-test-signing-key", billing.clone())
+        .with_refresh_grace(0);
     let mut registry = FacadeRegistry::new();
     registry.register_portal_facades(billing.clone(), None);
     registry.register(OAuthTokenHandler::new(
@@ -270,8 +271,12 @@ async fn caller_cannot_select_another_card_or_use_user_token_as_admin() {
 
 #[tokio::test]
 async fn refresh_rotation_rejects_replay_and_preserves_card_identity() {
-    let (_, auth, app) = setup();
-    let refresh = auth.issue_refresh_token("a", "group", 1, 1, 3600).unwrap();
+    let (billing, auth, app) = setup();
+    // Issued for the family the setup's sign-in started.
+    let card = billing.get_card("a").unwrap();
+    let refresh = auth
+        .issue_refresh_token("a", "group", card.token_version, card.refresh_version, 3600)
+        .unwrap();
     let payload = json!({"refreshToken":refresh,"cardId":"b","groupId":"other"});
     let (status, result) = request(&app, "POST", "/refreshToken", payload.clone(), None).await;
     assert_eq!(status, StatusCode::OK);

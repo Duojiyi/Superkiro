@@ -48,14 +48,16 @@ fn engine() -> BillingEngine {
 }
 
 #[test]
-fn rotation_survives_auth_and_engine_restart_without_revoking_sibling() {
+fn rotation_survives_auth_and_engine_restart_and_retires_older_tokens() {
     let b = engine();
     let file = file("refresh");
     b.set_persistence_path(&file);
-    let auth = AuthState::with_billing("local-test-signing-secret", b.clone());
+    let auth =
+        AuthState::with_billing("local-test-signing-secret", b.clone()).with_refresh_grace(0);
     let old = auth
         .issue_refresh_token("card", "group", 1, 1, 3600)
         .unwrap();
+    // Another token of the same family, as an earlier sign-in on the same device leaves.
     let sibling = auth
         .issue_refresh_token("card", "group", 1, 1, 3600)
         .unwrap();
@@ -66,10 +68,13 @@ fn rotation_survives_auth_and_engine_restart_without_revoking_sibling() {
     let recovered = BillingEngine::new();
     recovered.load_from_file(&file).unwrap();
     recovered.set_persistence_path(&file);
-    let restored = AuthState::with_billing("local-test-signing-secret", recovered.clone());
+    let restored = AuthState::with_billing("local-test-signing-secret", recovered.clone())
+        .with_refresh_grace(0);
     assert!(restored.rotate_refresh_token(&old, 300, 3600).is_err());
     assert!(restored.verify_token(&access).is_ok());
-    assert!(restored.rotate_refresh_token(&sibling, 300, 3600).is_ok());
+    // A card binds one device and has one refresh family: the rotation retired every
+    // older token, which is what keeps the refresh state O(1) per card.
+    assert!(restored.rotate_refresh_token(&sibling, 300, 3600).is_err());
     assert!(restored.rotate_refresh_token(&next, 300, 3600).is_ok());
     assert_eq!(recovered.get_card("card").unwrap().token_version, 1);
     // Fresh AuthState instances within the same second must not reuse JTIs.

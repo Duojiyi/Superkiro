@@ -20,8 +20,8 @@ use billing::engine::{BillingEngine, BillingError};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -59,6 +59,11 @@ pub enum AuthError {
     /// Clients retry a 503; a 401 would log them out.
     #[error("Authentication temporarily unavailable: {0}")]
     Unavailable(String),
+
+    /// Too many sign-ins or refreshes for one card; retry after this many seconds. A 429,
+    /// because Kiro and the desktop app retry it, where a 401 or 403 would sign them out.
+    #[error("Too many sign-ins or refreshes for this card; retry in {0}s")]
+    Throttled(u64),
 }
 
 impl AuthError {
@@ -97,6 +102,11 @@ impl AuthError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "ServiceUnavailableException",
                 "The service is temporarily unavailable; retry shortly".to_string(),
+            ),
+            Self::Throttled(_) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "ThrottlingException",
+                "Too many sign-ins or refreshes for this card; retry later".to_string(),
             ),
         }
     }
@@ -161,6 +171,15 @@ pub struct CardRecord {
     pub is_active: bool,
 }
 
+/// Sign-ins and refreshes one card may complete per rolling window. A real device refreshes
+/// about once per access-token lifetime (an hour), so this leaves ample room; it bounds how
+/// much work a single card can make the service commit.
+pub const CARD_TOKEN_BUDGET: usize = 20;
+const CARD_TOKEN_WINDOW_SECS: u64 = 3600;
+/// How long after a refresh the token it replaced is still taken as a retry of that refresh.
+/// Kiro retries a failed refresh within seconds and polls every 60s.
+pub const REFRESH_REUSE_GRACE_SECS: u64 = 120;
+
 /// Shared authentication state.
 #[derive(Clone)]
 pub struct AuthState {
@@ -169,6 +188,11 @@ pub struct AuthState {
     billing: Option<BillingEngine>,
     used_refresh_tokens: Arc<RwLock<HashMap<String, u64>>>,
     refresh_versions: Arc<RwLock<HashMap<String, u64>>>,
+    /// When each card last completed a sign-in or refresh, within the budget window. Only
+    /// successes count: Kiro retries a refused refresh every minute, and counting those
+    /// would keep an exhausted card locked out for good.
+    token_issues: Arc<Mutex<HashMap<String, VecDeque<u64>>>>,
+    refresh_grace_secs: u64,
     /// `new()` is retained for legacy/unit-test stores. Production state is
     /// connected through `with_billing()` and requires issuer/audience claims.
     require_claim_context: bool,
@@ -183,6 +207,8 @@ impl AuthState {
             billing: None,
             used_refresh_tokens: Arc::new(RwLock::new(HashMap::new())),
             refresh_versions: Arc::new(RwLock::new(HashMap::new())),
+            token_issues: Arc::new(Mutex::new(HashMap::new())),
+            refresh_grace_secs: REFRESH_REUSE_GRACE_SECS,
             require_claim_context: false,
         }
     }
@@ -195,7 +221,50 @@ impl AuthState {
             billing: Some(billing),
             used_refresh_tokens: Arc::new(RwLock::new(HashMap::new())),
             refresh_versions: Arc::new(RwLock::new(HashMap::new())),
+            token_issues: Arc::new(Mutex::new(HashMap::new())),
+            refresh_grace_secs: REFRESH_REUSE_GRACE_SECS,
             require_claim_context: true,
+        }
+    }
+
+    /// Change how long a replaced refresh token is still accepted as a retry.
+    pub fn with_refresh_grace(mut self, secs: u64) -> Self {
+        self.refresh_grace_secs = secs;
+        self
+    }
+
+    /// `Some(seconds to wait)` when `card_id` has used up its sign-ins and refreshes.
+    pub fn token_budget_retry_after(&self, card_id: &str, now: u64) -> Option<u64> {
+        let mut issues = self.token_issues.lock().unwrap_or_else(|e| e.into_inner());
+        let window = issues.get_mut(card_id)?;
+        while window
+            .front()
+            .is_some_and(|at| now.saturating_sub(*at) >= CARD_TOKEN_WINDOW_SECS)
+        {
+            window.pop_front();
+        }
+        (window.len() >= CARD_TOKEN_BUDGET).then(|| {
+            let oldest = window.front().copied().unwrap_or(now);
+            CARD_TOKEN_WINDOW_SECS
+                .saturating_sub(now.saturating_sub(oldest))
+                .max(1)
+        })
+    }
+
+    /// Count a completed sign-in or refresh against `card_id`'s budget.
+    pub fn record_token_issued(&self, card_id: &str, now: u64) {
+        let mut issues = self.token_issues.lock().unwrap_or_else(|e| e.into_inner());
+        // Cards with nothing left in the window are forgotten, so the map stays bounded by
+        // the cards active in the last hour.
+        issues.retain(|_, window| {
+            window
+                .back()
+                .is_some_and(|at| now.saturating_sub(*at) < CARD_TOKEN_WINDOW_SECS)
+        });
+        let window = issues.entry(card_id.to_string()).or_default();
+        window.push_back(now);
+        while window.len() > CARD_TOKEN_BUDGET {
+            window.pop_front();
         }
     }
 
@@ -392,27 +461,39 @@ impl AuthState {
                 "refresh token tenant mismatch".to_string(),
             ));
         }
-        // Refresh tokens are rotated per token JTI below. Do not compare or
-        // increment a card-wide version here: that would invalidate another
-        // device's still-valid refresh token. token_version remains the card-wide
-        // emergency revocation mechanism.
+        // The refresh family rotates through `refresh_version`, which is separate from
+        // token_version: token_version remains the card-wide emergency revocation, and
+        // rotating it would end the access sessions too.
+        let mut new_refresh_version = refresh.refresh_version;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
             if refresh.exp <= now {
                 return Err(AuthError::Expired);
             }
+            // Refused before anything is committed, and never as a 401.
+            if let Some(wait) = self.token_budget_retry_after(&refresh.card_id, now) {
+                return Err(AuthError::Throttled(wait));
+            }
             if let Some(billing) = &self.billing {
-                billing
-                    .consume_refresh_token(&refresh.jti, refresh.exp, now)
+                new_refresh_version = billing
+                    .rotate_refresh(
+                        &refresh.card_id,
+                        refresh.refresh_version,
+                        &refresh.jti,
+                        refresh.exp,
+                        now,
+                        self.refresh_grace_secs,
+                    )
                     .map_err(|e| match e {
                         // A failed write consumed nothing, so the same token works once
                         // storage is back.
                         BillingError::Persistence(message) => AuthError::Unavailable(message),
                         other => AuthError::InvalidSignature(other.to_string()),
-                    })?;
+                    })?
+                    .version();
             } else {
                 let mut used = self.used_refresh_tokens.write().map_err(|_| {
                     AuthError::InvalidSignature("refresh store poisoned".to_string())
@@ -427,7 +508,6 @@ impl AuthState {
             }
         }
         let new_claims = claims;
-        let new_refresh_version = refresh.refresh_version;
         let access = self.issue_token(
             &new_claims.card_id,
             &new_claims.group_id,
@@ -441,6 +521,7 @@ impl AuthState {
             new_refresh_version,
             refresh_ttl_secs,
         )?;
+        self.record_token_issued(&new_claims.card_id, now);
         Ok((new_claims, access, rotated))
     }
 

@@ -125,6 +125,24 @@ use crate::observability::{
 };
 
 /// In-memory billing engine for concurrency-safe reservations and settlements.
+/// What a refresh did to the card's refresh family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshRotation {
+    /// The family advanced to this version, durably.
+    Rotated(u64),
+    /// A retry of the refresh that just happened: nothing changed; this is the version.
+    Reissued(u64),
+}
+
+impl RefreshRotation {
+    /// The version the new refresh token must carry.
+    pub fn version(self) -> u64 {
+        match self {
+            Self::Rotated(version) | Self::Reissued(version) => version,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BillingEngine {
     cards: Arc<RwLock<HashMap<String, Card>>>,
@@ -1590,6 +1608,10 @@ impl BillingEngine {
         if let Some(device) = device_fp.filter(|d| !d.trim().is_empty()) {
             bind_device_locked(card, device.trim())?;
         }
+        // A sign-in starts a new refresh family: every refresh token issued before it,
+        // including one copied off the device, stops working.
+        card.refresh_version = card.refresh_version.saturating_add(1).max(1);
+        card.refresh_rotated_at = None;
         let updated_card = card.clone();
 
         self.commit_candidate_snapshot(&candidate, || {
@@ -2887,46 +2909,85 @@ impl BillingEngine {
 
     /// Rotate only the refresh-token family for a card. Access JWTs remain
     /// valid until their normal expiry or an explicit card revocation.
-    pub fn rotate_refresh_version(&self, card_id: &str) -> Result<u64, BillingError> {
-        let current = self
-            .get_card(card_id)
-            .ok_or_else(|| BillingError::CardNotFound(card_id.to_string()))?
-            .refresh_version;
-        self.rotate_refresh_version_if(card_id, current)
-    }
-
-    pub fn rotate_refresh_version_if(
+    /// Rotate a card's refresh-token family, keeping O(1) state per card.
+    ///
+    /// Only a token carrying the card's current `refresh_version` rotates it, so replaying
+    /// any older token fails without a record of each one used: the consumed-token set this
+    /// replaces grew by an entry per refresh, for 30 days, and one card chaining refreshes
+    /// could fill the state until billing stopped. The set is still read, so a token issued
+    /// before this release and already used stays refused; nothing is added to it, and it
+    /// drains as those tokens expire.
+    ///
+    /// A token exactly one version behind, presented within `grace_secs` of that rotation,
+    /// is the same refresh retried — a response lost on the way back, a second Kiro window,
+    /// or the desktop client refreshing alongside Kiro — and gets the current version again
+    /// with no change, instead of a 401 that signs the customer out.
+    pub fn rotate_refresh(
         &self,
         card_id: &str,
-        expected_version: u64,
-    ) -> Result<u64, BillingError> {
+        presented_version: u64,
+        jti: &str,
+        expires: u64,
+        now: u64,
+        grace_secs: u64,
+    ) -> Result<RefreshRotation, BillingError> {
         let _state_guard = self.state_lock.write().unwrap();
-        let sequence = self
-            .snapshot_sequence
-            .load(Ordering::Acquire)
-            .saturating_add(1);
-        let previous_checksum = self.last_snapshot_checksum.read().unwrap().clone();
-        let mut candidate = self.export_snapshot_locked(sequence, previous_checksum);
-
+        if expires <= now || jti.is_empty() || jti.len() > 256 {
+            return Err(BillingError::InvalidState(
+                "expired or empty refresh token".into(),
+            ));
+        }
+        let used = || BillingError::InvalidState("refresh token already used".into());
+        if self
+            .consumed_refresh_tokens
+            .read()
+            .unwrap()
+            .get(jti)
+            .is_some_and(|exp| *exp > now)
+        {
+            return Err(used());
+        }
+        let current = self
+            .cards
+            .read()
+            .unwrap()
+            .get(card_id)
+            .map(|card| (card.refresh_version, card.refresh_rotated_at))
+            .ok_or_else(|| BillingError::CardNotFound(card_id.to_string()))?;
+        match current {
+            (version, _) if presented_version == version => {}
+            (version, Some(rotated))
+                if presented_version.saturating_add(1) == version
+                    && now.saturating_sub(rotated) < grace_secs =>
+            {
+                return Ok(RefreshRotation::Reissued(version));
+            }
+            _ => return Err(used()),
+        }
+        let mut candidate = self.export_snapshot_locked(
+            self.snapshot_sequence
+                .load(Ordering::Acquire)
+                .saturating_add(1),
+            self.last_snapshot_checksum.read().unwrap().clone(),
+        );
+        candidate
+            .consumed_refresh_tokens
+            .retain(|_, exp| *exp > now);
         let card = candidate
             .cards
             .get_mut(card_id)
             .ok_or_else(|| BillingError::CardNotFound(card_id.to_string()))?;
-        if card.refresh_version != expected_version {
-            return Err(BillingError::InvalidState(
-                "refresh token has already been rotated".to_string(),
-            ));
-        }
         card.refresh_version = card.refresh_version.saturating_add(1).max(1);
-        let version = card.refresh_version;
-        let updated_card = card.clone();
-
+        card.refresh_rotated_at = Some(now);
+        let (version, updated) = (card.refresh_version, card.clone());
         self.commit_candidate_snapshot(&candidate, || {
             self.cards
                 .write()
                 .unwrap()
-                .insert(card_id.to_string(), updated_card);
-            version
+                .insert(card_id.to_string(), updated);
+            *self.consumed_refresh_tokens.write().unwrap() =
+                candidate.consumed_refresh_tokens.clone();
+            RefreshRotation::Rotated(version)
         })
     }
 
