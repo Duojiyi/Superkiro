@@ -38,4 +38,5 @@ const server = https.createServer({key:fs.readFileSync(key),cert:fs.readFileSync
     res.setHeader('content-type','application/json');res.end(JSON.stringify(result));
   });
 });
-server.listen(0,'127.0.0.1',()=>fs.writeFileSync(process.argv[2],String(server.address().port)));
+// Published by rename, so the test never reads a port file that exists but is still empty.
+server.listen(0,'127.0.0.1',()=>{fs.writeFileSync(process.argv[2]+'.next',String(server.address().port));fs.renameSync(process.argv[2]+'.next',process.argv[2]);});

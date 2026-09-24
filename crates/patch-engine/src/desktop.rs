@@ -865,7 +865,7 @@ mod persistent_ca_tests {
         fs::create_dir_all(&root).unwrap();
         let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         let port_file = root.join("port");
-        let server = Child(
+        let mut server = Child(
             std::process::Command::new("node")
                 .arg(fixtures.join("local-https.cjs"))
                 .arg(&port_file)
@@ -878,6 +878,11 @@ mod persistent_ca_tests {
         // exceeded 10s on a loaded Windows CI runner. This only guards against a hang.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while !port_file.exists() {
+            // A fixture that could not start (openssl missing, say) says so at once rather
+            // than after the whole deadline; its stderr is inherited above.
+            if let Some(status) = server.0.try_wait().unwrap() {
+                panic!("local TLS fixture exited before listening ({status}); see its stderr");
+            }
             assert!(
                 std::time::Instant::now() < deadline,
                 "local TLS fixture did not start"
