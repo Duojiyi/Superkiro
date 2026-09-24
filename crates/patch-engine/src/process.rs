@@ -63,6 +63,9 @@ pub fn prepare_kiro_launch(
         .stderr(Stdio::null());
     #[cfg(windows)]
     prevent_stdio_inheritance()?;
+    for key in inherited_editor_variables(std::env::vars_os().map(|(key, _)| key)) {
+        cmd.env_remove(key);
+    }
     cmd.envs(get_launcher_env(&gateway));
     if let Some(path) = std::env::var_os("KIRO_GATEWAY_CA_CERT") {
         let path = std::fs::canonicalize(path)?;
@@ -73,6 +76,58 @@ pub fn prepare_kiro_launch(
     }
     cmd.args(additional_args);
     Ok(cmd)
+}
+
+/// Variables that make sense only inside the editor or Electron host that set them.
+///
+/// The client can itself be started from an editor's terminal. Inherited, these turn
+/// Kiro into something else: `ELECTRON_RUN_AS_NODE` makes Kiro.exe run as plain Node and
+/// exit at once, and `VSCODE_*` carries another editor's IPC hook, portable-mode flag and
+/// profile paths. VS Code strips the same prefixes before launching its own children.
+pub(crate) fn inherited_editor_variables(
+    keys: impl Iterator<Item = std::ffi::OsString>,
+) -> Vec<std::ffi::OsString> {
+    keys.filter(|key| {
+        let key = key.to_string_lossy().to_ascii_uppercase();
+        key.starts_with("ELECTRON_") || key.starts_with("VSCODE_")
+    })
+    .collect()
+}
+
+/// How long a freshly launched Kiro must stay up before it counts as launched.
+const LAUNCH_SURVIVAL: Duration = Duration::from_secs(3);
+
+/// Spawn Kiro and confirm it is still running a moment later.
+///
+/// A launch used to be reported as done as soon as the process was created. A Kiro that
+/// exits immediately — a broken installation, or one started as plain Node — then looked
+/// like a success, and the customer was told to go and use an editor that was not there.
+pub fn spawn_and_confirm(cmd: &mut Command) -> Result<(), ProcessError> {
+    spawn_and_confirm_within(cmd, LAUNCH_SURVIVAL, || {
+        crate::runtime::detect_kiro_process_state() == ProcessState::Running
+    })
+}
+
+fn spawn_and_confirm_within(
+    cmd: &mut Command,
+    survival: Duration,
+    kiro_running: impl Fn() -> bool,
+) -> Result<(), ProcessError> {
+    let mut child = cmd.spawn()?;
+    let deadline = Instant::now() + survival;
+    while Instant::now() < deadline {
+        match child.try_wait()? {
+            None => thread::sleep(Duration::from_millis(50)),
+            // A second instance hands its arguments to the running one and exits cleanly.
+            Some(status) if status.success() && kiro_running() => return Ok(()),
+            Some(status) => {
+                return Err(ProcessError::InvalidConfiguration(format!(
+                    "Kiro exited immediately after launch ({status})"
+                )))
+            }
+        }
+    }
+    Ok(())
 }
 
 // Windows may inherit other inheritable handles even when the child's standard
@@ -583,6 +638,75 @@ mod deadline_tests {
             run_helper_until(&mut cancelled, Instant::now() + Duration::from_secs(3)),
             Err(ProcessError::TerminateTimeout)
         ));
+    }
+}
+
+#[cfg(test)]
+mod launch_tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    #[test]
+    fn editor_host_variables_are_not_passed_to_kiro() {
+        let parent = [
+            "ELECTRON_RUN_AS_NODE",
+            "electron_no_attach_console",
+            "VSCODE_IPC_HOOK_CLI",
+            "VSCODE_PORTABLE",
+            "PATH",
+            "AWS_PROFILE",
+            "KIRO_HOME",
+        ]
+        .map(OsString::from);
+        let removed: Vec<_> = inherited_editor_variables(parent.into_iter())
+            .into_iter()
+            .map(|key| key.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            removed,
+            [
+                "ELECTRON_RUN_AS_NODE",
+                "electron_no_attach_console",
+                "VSCODE_IPC_HOOK_CLI",
+                "VSCODE_PORTABLE"
+            ]
+        );
+    }
+
+    fn exits_with(code: i32) -> Command {
+        if cfg!(windows) {
+            let mut command = Command::new("cmd");
+            command.args(["/C", &format!("exit {code}")]);
+            command
+        } else {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", &format!("exit {code}")]);
+            command
+        }
+    }
+
+    fn keeps_running() -> Command {
+        if cfg!(windows) {
+            let mut command = Command::new("cmd");
+            command.args(["/C", "ping -n 3 127.0.0.1 >NUL"]);
+            command
+        } else {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "sleep 2"]);
+            command
+        }
+    }
+
+    /// A Kiro that dies on start used to be reported as launched, so the customer was told
+    /// to use an editor that was not there.
+    #[test]
+    fn a_kiro_that_exits_at_once_is_not_a_successful_launch() {
+        let survival = Duration::from_millis(800);
+        assert!(spawn_and_confirm_within(&mut exits_with(1), survival, || true).is_err());
+        // Exiting cleanly is only a hand-off if another Kiro is there to receive it.
+        assert!(spawn_and_confirm_within(&mut exits_with(0), survival, || false).is_err());
+        assert!(spawn_and_confirm_within(&mut exits_with(0), survival, || true).is_ok());
+        assert!(spawn_and_confirm_within(&mut keeps_running(), survival, || false).is_ok());
     }
 }
 

@@ -121,9 +121,11 @@ fn test_launcher_env_generation() {
         envs.get("KIRO_AUTH_PORTAL_URL").unwrap(),
         "https://api.kiro-byok.test:8080"
     );
-    assert_eq!(
-        envs.get("AWS_ENDPOINT_URL").unwrap(),
-        "https://api.kiro-byok.test:8080"
+    // AWS SDKs read this as an override for every service, and everything running inside
+    // Kiro inherits it: a customer's own AWS calls would be sent to the gateway.
+    assert!(
+        !envs.contains_key("AWS_ENDPOINT_URL"),
+        "Kiro must not be launched with a global AWS endpoint override"
     );
     assert_eq!(envs.get("KIRO_DISABLE_SESSION_TITLE_LLM").unwrap(), "true");
     assert_eq!(envs.get("KIRO_DISABLE_RECAP").unwrap(), "true");
@@ -159,6 +161,8 @@ fn test_extension_patcher_lifecycle() {
     let patched_content = fs::read_to_string(&ext_file).unwrap();
     assert!(patched_content.starts_with(PATCH_MARKER_V1));
     assert!(patched_content.contains("process.env.KIRO_GATEWAY_URL"));
+    // A user's own AWS endpoint override must not redirect gateway traffic.
+    assert!(!patched_content.contains("AWS_ENDPOINT_URL"));
 
     // 2. Re-applying is idempotent
     patcher.apply("https://my-byok-gateway.test").unwrap();

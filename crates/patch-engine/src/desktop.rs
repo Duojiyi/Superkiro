@@ -247,7 +247,7 @@ impl DesktopSession {
         self.activate_locked(&snapshots, &settings, &patcher, gateway, card, Some(token))
             .await
             .map_err(|e| format!("[connection:apply] {e}"))?;
-        launch.spawn().map_err(|e| format!("[connection:launch] Takeover completed, but Kiro launch failed: {e}. Recovery backup retained; do not assume IDE is ready."))?;
+        crate::process::spawn_and_confirm(&mut launch).map_err(|e| format!("[connection:launch] Takeover completed, but Kiro launch failed: {e}. Recovery backup retained; do not assume IDE is ready."))?;
         Ok(())
     }
 
@@ -289,7 +289,7 @@ impl DesktopSession {
                 &session.gateway,
             )
             .map_err(|e| e.to_string())?;
-        launch.spawn().map_err(|e| e.to_string())?;
+        crate::process::spawn_and_confirm(&mut launch).map_err(|e| e.to_string())?;
         Ok(())
     }
 
