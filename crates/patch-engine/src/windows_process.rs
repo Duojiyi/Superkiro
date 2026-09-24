@@ -126,6 +126,10 @@ extern "system" {
     fn EnumWindows(callback: EnumWindowsProc, context: isize) -> i32;
     fn GetWindowThreadProcessId(window: *mut c_void, pid: *mut u32) -> u32;
     fn IsWindowVisible(window: *mut c_void) -> i32;
+    /// A window whose thread has not pumped messages for about five seconds. Windows then
+    /// hides it and paints a DWM-owned "ghost" in its place, so `IsWindowVisible` reports
+    /// false for a window the user can still see and whose buffers are still unsaved.
+    fn IsHungAppWindow(window: *mut c_void) -> i32;
     fn IsWindowEnabled(window: *mut c_void) -> i32;
     fn GetWindow(window: *mut c_void, command: u32) -> *mut c_void;
     fn PostMessageW(window: *mut c_void, message: u32, wparam: usize, lparam: isize) -> i32;
@@ -235,7 +239,9 @@ pub(crate) fn top_level_windows(pids: &[u32]) -> Vec<TopLevelWindow> {
         if context.pids.contains(&pid) {
             context.found.push(TopLevelWindow {
                 handle: window,
-                visible: IsWindowVisible(window) != 0,
+                // A hung window counts as on screen: the user sees its ghost, and its
+                // unsaved work is exactly what must not be discarded.
+                visible: IsWindowVisible(window) != 0 || IsHungAppWindow(window) != 0,
                 owned: !GetWindow(window, 4 /* GW_OWNER */).is_null(),
                 enabled: IsWindowEnabled(window) != 0,
             });
