@@ -266,6 +266,39 @@ pub(crate) fn private_atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result
     result
 }
 
+/// Write `bytes` to `path` the way the file's own owner would: through a sibling that takes
+/// the directory's inherited permissions, then a rename. Used to put back a file exactly as
+/// it was, which for Kiro's token means readable by the user, SYSTEM and Administrators;
+/// written privately it came back readable by the user alone.
+#[cfg(windows)]
+pub(crate) fn inherited_atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temp = path.with_extension(format!(
+        "restore.{}.{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        crate::snapshot::atomic_replace(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
 /// Simple RFC 3339 / ISO 8601 date-time parser to Unix timestamp (seconds).
 ///
 /// Avoids extra datetime dependencies by extracting year, month, day, hour, min, sec.

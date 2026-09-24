@@ -162,3 +162,35 @@ fn private_writes_do_not_need_powershell() {
     assert_private(&path, false);
     fs::remove_dir_all(&root).unwrap();
 }
+
+/// A token put back on restore takes the permissions Kiro's own write gives it, inherited
+/// from its directory, not the owner-only ACL used while the file held the gateway's token.
+#[cfg(windows)]
+#[test]
+fn a_restored_file_inherits_its_directory_permissions_again() {
+    use std::os::windows::process::CommandExt;
+    let dir = std::env::temp_dir().join(format!("audit-inherit-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let token = dir.join("kiro-auth-token.json");
+    private_atomic_write(&token, b"{\"gateway\":true}").unwrap();
+    assert_private(&token, false);
+    inherited_atomic_write(&token, b"{\"official\":true}").unwrap();
+    assert_eq!(fs::read(&token).unwrap(), b"{\"official\":true}");
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command",
+            "$ErrorActionPreference='Stop'; $a=[System.IO.File]::GetAccessControl($env:AUDIT_PATH); if ($a.AreAccessRulesProtected) {throw 'protected ACL'}; if (@($a.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier]) | Where-Object { -not $_.IsInherited }).Count -ne 0) {throw 'explicit ACE left'}"])
+        .env("AUDIT_PATH", &token)
+        .creation_flags(0x08000000)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fs::read_dir(&dir).unwrap().count() == 1,
+        "no temporary file left behind"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}

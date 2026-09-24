@@ -310,8 +310,15 @@ impl DesktopSession {
             let session = self.load()?;
             match session.previous_token {
                 Some(PreviousToken::Raw(bytes)) => {
-                    crate::token_storage::private_atomic_write(self.storage.path(), &bytes)
-                        .map_err(|e| e.to_string())?
+                    // Back exactly as it was, permissions included (Windows): the cache
+                    // directory's inherited ACL, not the owner-only one used while ours.
+                    #[cfg(windows)]
+                    let written =
+                        crate::token_storage::inherited_atomic_write(self.storage.path(), &bytes);
+                    #[cfg(not(windows))]
+                    let written =
+                        crate::token_storage::private_atomic_write(self.storage.path(), &bytes);
+                    written.map_err(|e| e.to_string())?
                 }
                 Some(PreviousToken::Legacy(token)) => {
                     self.storage.save(&token).map_err(|e| e.to_string())?
