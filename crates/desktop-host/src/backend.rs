@@ -21,6 +21,25 @@ pub fn is_tracked_operation(method: &str, path: &str) -> bool {
         )
 }
 
+/// Copy what an earlier release kept in roaming AppData into the machine-local directory,
+/// once: the install path a customer picked, and the record of the last operation. The
+/// roaming copies stay, so rolling back to that release loses nothing. Best effort.
+pub fn adopt_roaming_state(roaming: &Path, local: &Path) {
+    if roaming == local {
+        return;
+    }
+    for name in ["preferences.json", "last-operation.json"] {
+        let (from, to) = (roaming.join(name), local.join(name));
+        if from.is_file() && !to.exists() {
+            let _ = std::fs::create_dir_all(local);
+            let temporary = to.with_extension("adopt");
+            if std::fs::copy(&from, &temporary).is_ok() {
+                let _ = std::fs::rename(&temporary, &to);
+            }
+        }
+    }
+}
+
 pub struct Host {
     pub operation: tokio::sync::Mutex<()>,
     /// Raised for the whole of a user mutation. Maintenance reads it instead of
@@ -1214,6 +1233,43 @@ mod operation_tests {
             );
             let _ = std::fs::remove_dir_all(&root);
         }
+    }
+    #[test]
+    fn roaming_state_is_adopted_once_and_never_overwrites_local() {
+        let root = std::env::temp_dir().join(format!("host-adopt-{}", std::process::id()));
+        let (roaming, local) = (root.join("roaming"), root.join("local"));
+        std::fs::create_dir_all(&roaming).unwrap();
+        std::fs::write(
+            roaming.join("preferences.json"),
+            r#"{"install_path":"D:/Kiro"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            roaming.join("last-operation.json"),
+            r#"{"id":3,"state":"succeeded"}"#,
+        )
+        .unwrap();
+        adopt_roaming_state(&roaming, &local);
+        assert_eq!(
+            std::fs::read_to_string(local.join("preferences.json")).unwrap(),
+            r#"{"install_path":"D:/Kiro"}"#
+        );
+        assert!(
+            roaming.join("preferences.json").exists(),
+            "kept for a rollback"
+        );
+        std::fs::write(
+            local.join("preferences.json"),
+            r#"{"install_path":"E:/Kiro"}"#,
+        )
+        .unwrap();
+        adopt_roaming_state(&roaming, &local);
+        assert_eq!(
+            std::fs::read_to_string(local.join("preferences.json")).unwrap(),
+            r#"{"install_path":"E:/Kiro"}"#,
+            "local state is never overwritten"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
     #[test]
     fn usage_rows_are_bounded_without_changing_totals() {

@@ -317,7 +317,33 @@ fn main() {
                 window.set_background_color(Some(tauri::window::Color(0, 0, 0, 0)))?;
             }
             let config = app.path().app_config_dir()?;
-            let host = Arc::new(backend::Host::new(config.clone())?);
+            // The lock, the install path and the operation record describe this machine,
+            // not the user: in roaming AppData, a profile redirected to a share made the
+            // lock refuse the client on a second PC.
+            let local = app.path().app_local_data_dir()?;
+            backend::adopt_roaming_state(&config, &local);
+            let host = match backend::Host::new(local) {
+                Ok(host) => Arc::new(host),
+                Err(error) => {
+                    // Setup failing leaves no window, so without this the client simply
+                    // never appears. The single-instance hand-off covers only this
+                    // Windows session; one open in another session ends up here.
+                    let running = error
+                        .downcast_ref::<patch_engine::SingleInstanceError>()
+                        .is_some_and(|e| matches!(e, patch_engine::SingleInstanceError::AlreadyRunning(_)));
+                    let message = if running {
+                        "Superkiro 已经在运行，可能是在你的另一个 Windows 会话中。请先关闭那个 Superkiro，再重新打开。".to_string()
+                    } else {
+                        format!("Superkiro 无法启动：{error}")
+                    };
+                    rfd::MessageDialog::new()
+                        .set_level(rfd::MessageLevel::Warning)
+                        .set_title("Superkiro")
+                        .set_description(message)
+                        .show();
+                    return Err(error);
+                }
+            };
             app.manage(WindowPreferences::load(config));
             app.manage(Arc::clone(&host));
             let show = MenuItem::with_id(app, "show", "显示 Superkiro", true, None::<&str>)?;
