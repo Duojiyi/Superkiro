@@ -109,16 +109,20 @@ pub fn format_fallback_description(
     index: usize,
     format: &str,
     byte_len: usize,
-    was_resized: bool,
+    dimensions: Option<(u32, u32)>,
     vision_transcription: Option<&str>,
 ) -> String {
     let detail = match vision_transcription {
         Some(desc) => format!("- 视觉模型转写结果:\n{}", desc.trim()),
         None => "- 图像内容转录: [用户附加了图片。当前目标模型为纯文本模型，网关已自动执行视觉降级保护，将图像转为文本上下文]".to_string(),
     };
+    let size = match dimensions {
+        Some((width, height)) => format!("尺寸: {width}x{height}"),
+        None => "无法读取".to_string(),
+    };
 
     format!(
-        "[视觉降级/Vision Fallback - 图片转文字 #{index}]\n- 图片格式: {format} (体积: {byte_len} 字节, 尺寸已压缩: {was_resized})\n{detail}"
+        "[视觉降级/Vision Fallback - 图片转文字 #{index}]\n- 图片格式: {format} (体积: {byte_len} 字节, {size})\n{detail}"
     )
 }
 

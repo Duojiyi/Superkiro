@@ -129,6 +129,7 @@ fn test_audit_b_ultra_long_tool_name_shortening_and_restoration() {
         target_model: "test-model".to_string(),
         supports_vision: true,
         image_transcriptions: Vec::new(),
+        prepared_images: Default::default(),
     };
     let mut state = StreamTranslationState::new("test-model");
 

@@ -22,7 +22,9 @@ use crate::provider::ProviderRuntimeRegistry;
 use crate::provider::{ModelProvider, ProviderConfig};
 use crate::security::{ContentGuardrailConfig, GuardrailError};
 use crate::stream::{create_stream_guard, BillingSettler, StreamGuardConfig};
-use crate::translate::to_provider::{translate_kiro_to_chat_request, TranslationContext};
+use crate::translate::to_provider::{
+    prepare_images, translate_kiro_to_chat_request, TranslationContext,
+};
 use crate::watchdog::{WatchdogConfig, WatchdogStream};
 use axum::{
     body::Body,
@@ -40,6 +42,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const INTENT_CLASSIFIER_SIGN_A: &str = "You are an intent classifier for a language model";
 const INTENT_CLASSIFIER_SIGN_B: &str = "(chat, do, spec)";
+
+/// How long one request may spend shrinking its images before those left over reach the
+/// model as notes for this turn. The request holds a credit reservation meanwhile.
+const IMAGE_PREPARE_BUDGET: Duration = Duration::from_secs(10);
 
 /// Handler for `POST /generateAssistantResponse`
 #[derive(Clone)]
@@ -719,6 +725,15 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
             // to_provider::format_user_content. P4-2 §35 requires an unreachable vision
             // service to degrade rather than block the conversation trunk.
 
+            if ctx.supports_vision && (historical_images || current_images) {
+                let prepared = prepare_images(
+                    &kiro_req,
+                    self.content_guardrail.max_images_per_request,
+                    IMAGE_PREPARE_BUDGET,
+                )
+                .await;
+                ctx = ctx.with_prepared_images(prepared);
+            }
             let mut chat_req = translate_kiro_to_chat_request(&kiro_req, &mut ctx);
             // The wire protocol currently has no client-controlled max_tokens
             // field.  Keep the provider request bounded by the exposed model
