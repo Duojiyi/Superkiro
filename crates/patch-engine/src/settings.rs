@@ -98,6 +98,16 @@ impl Default for SettingsManager {
     }
 }
 
+/// The only region takeover redirects. Kiro picks its endpoints by the region in the
+/// token's profile ARN and falls back to the real service for any region without an
+/// override, so a token for another region would send the gateway's bearer to real Kiro.
+pub(crate) const REDIRECTED_REGION: &str = "us-east-1";
+
+/// Whether a profile ARN (`arn:aws:codewhisperer:<region>:...`) is in the redirected region.
+pub(crate) fn in_redirected_region(profile_arn: &str) -> bool {
+    profile_arn.split(':').nth(3) == Some(REDIRECTED_REGION)
+}
+
 impl SettingsManager {
     pub fn at(path: impl Into<PathBuf>) -> Self {
         Self {
@@ -148,6 +158,7 @@ impl SettingsManager {
     /// Preserves all other user settings (theme, font, other extensions).
     /// Returns `PriorSettingsState` to enable 100% reversible rollback.
     pub fn merge_byok(&self, gateway_url: &str) -> Result<PriorSettingsState, SettingsError> {
+        let region = REDIRECTED_REGION;
         let prior = self.capture_prior_state()?;
         let mut map = self.read_settings()?;
 
@@ -166,9 +177,9 @@ impl SettingsManager {
         map.insert(
             "codewhisperer.config".to_string(),
             json!({
-                "krsEndpoints": [{ "region": "us-east-1", "endpoint": gw }],
-                "cpsEndpoints": [{ "region": "us-east-1", "endpoint": gw }],
-                "endpoints": [{ "region": "us-east-1", "endpoint": gw }]
+                "krsEndpoints": [{ "region": region, "endpoint": gw }],
+                "cpsEndpoints": [{ "region": region, "endpoint": gw }],
+                "endpoints": [{ "region": region, "endpoint": gw }]
             }),
         );
 

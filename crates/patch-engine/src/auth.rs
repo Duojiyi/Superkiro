@@ -286,6 +286,11 @@ impl AuthClient {
                 "Missing or invalid token fields".into(),
             ));
         }
+        if !crate::settings::in_redirected_region(&token.profile_arn) {
+            return Err(AuthClientError::InvalidResponse(
+                "The service issued a profile outside the redirected region".into(),
+            ));
+        }
         Ok(token)
     }
 
@@ -328,6 +333,13 @@ impl AuthClient {
         }
         if let Some(new_profile) = refresh_resp.profile_arn {
             if !new_profile.is_empty() {
+                // Saved, a profile outside the redirected region would send the gateway's
+                // bearer to real Kiro on the next request.
+                if !crate::settings::in_redirected_region(&new_profile) {
+                    return Err(AuthClientError::InvalidResponse(
+                        "The service issued a profile outside the redirected region".into(),
+                    ));
+                }
                 current_token.profile_arn = new_profile;
             }
         }
@@ -437,6 +449,67 @@ mod initialization_tests {
 mod client_contract_tests {
     use super::*;
     use axum::{routing::post, Json, Router};
+
+    /// Kiro picks endpoints by the profile's region and falls back to the real service for
+    /// a region without an override: such a token would carry the gateway's bearer there.
+    #[tokio::test]
+    async fn a_profile_outside_the_redirected_region_is_refused() {
+        const FOREIGN: &str = "arn:aws:codewhisperer:eu-central-1:123456789012:profile/X";
+        const HOME: &str = "arn:aws:codewhisperer:us-east-1:123456789012:profile/X";
+        assert!(crate::settings::in_redirected_region(HOME));
+        for other in [FOREIGN, "", "arn:aws:codewhisperer", "us-east-1"] {
+            assert!(!crate::settings::in_redirected_region(other), "{other}");
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let token = |access: &str| {
+            serde_json::json!({"accessToken": access, "refreshToken": "r2",
+            "profileArn": FOREIGN, "expiresAt": "2030-01-01T00:00:00Z",
+            "authMethod": "social", "provider": "Google"})
+        };
+        let (login, refreshed) = (token("a1"), token("a2"));
+        let app = Router::new()
+            .route("/oauth/token", post(move || async move { Json(login) }))
+            .route(
+                "/refreshToken",
+                post(move || async move { Json(refreshed) }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = std::env::temp_dir().join(format!("region-check-{}", std::process::id()));
+        let storage = TokenStorage::at(dir.join("kiro-auth-token.json"));
+        let client = AuthClient::new(storage.clone());
+
+        let error = client
+            .authenticate(&base, "card", Some("device"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AuthClientError::InvalidResponse(_)),
+            "{error}"
+        );
+
+        let current = KiroAuthToken {
+            access_token: "a0".into(),
+            refresh_token: "r0".into(),
+            profile_arn: HOME.into(),
+            expires_at: "2030-01-01T00:00:00Z".into(),
+            auth_method: "social".into(),
+            provider: "Google".into(),
+        };
+        storage.save(&current).unwrap();
+        let error = client.refresh(&base).await.unwrap_err();
+        assert!(
+            matches!(error, AuthClientError::InvalidResponse(_)),
+            "{error}"
+        );
+        assert_eq!(
+            storage.load().unwrap(),
+            current,
+            "the refused token must not be saved"
+        );
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[tokio::test]
     async fn rebind_policy_uses_bounded_body_retry_without_echoing_details() {
         for (category, retry, expected, seconds) in [

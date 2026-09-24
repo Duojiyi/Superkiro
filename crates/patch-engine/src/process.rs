@@ -98,14 +98,25 @@ pub fn prepare_kiro_launch(
 ///
 /// The client can itself be started from an editor's terminal. Inherited, these turn
 /// Kiro into something else: `ELECTRON_RUN_AS_NODE` makes Kiro.exe run as plain Node and
-/// exit at once, and `VSCODE_*` carries another editor's IPC hook, portable-mode flag and
-/// profile paths. VS Code strips the same prefixes before launching its own children.
+/// exit at once, and `VSCODE_*` carries another editor's IPC hook, portable-mode data
+/// directory and code-cache paths. VS Code strips the same prefixes for its own children.
+///
+/// Kept: settings a customer sets themselves and Kiro honours. `VSCODE_APPDATA` and
+/// `VSCODE_EXTENSIONS` relocate Kiro's user data (hot-exit backups included) and its
+/// extensions; stripped, a Kiro started by the client opened another profile, and unsaved
+/// work appeared lost. `ELECTRON_OZONE_PLATFORM_HINT` picks X11 or Wayland on Linux.
 pub(crate) fn inherited_editor_variables(
     keys: impl Iterator<Item = std::ffi::OsString>,
 ) -> Vec<std::ffi::OsString> {
+    const USER_SETTINGS: [&str; 3] = [
+        "VSCODE_APPDATA",
+        "VSCODE_EXTENSIONS",
+        "ELECTRON_OZONE_PLATFORM_HINT",
+    ];
     keys.filter(|key| {
         let key = key.to_string_lossy().to_ascii_uppercase();
-        key.starts_with("ELECTRON_") || key.starts_with("VSCODE_")
+        (key.starts_with("ELECTRON_") || key.starts_with("VSCODE_"))
+            && !USER_SETTINGS.contains(&key.as_str())
     })
     .collect()
 }
@@ -1097,6 +1108,10 @@ mod launch_tests {
             "PATH",
             "AWS_PROFILE",
             "KIRO_HOME",
+            // The customer's own settings, which Kiro honours.
+            "VSCODE_APPDATA",
+            "vscode_extensions",
+            "ELECTRON_OZONE_PLATFORM_HINT",
         ]
         .map(OsString::from);
         let removed: Vec<_> = inherited_editor_variables(parent.into_iter())
@@ -1111,6 +1126,37 @@ mod launch_tests {
                 "VSCODE_IPC_HOOK_CLI",
                 "VSCODE_PORTABLE"
             ]
+        );
+    }
+
+    /// The launch command itself drops them, not only the filter that names them.
+    #[test]
+    fn the_launch_command_removes_inherited_editor_variables() {
+        std::env::set_var("VSCODE_PID", "4242");
+        std::env::set_var("VSCODE_APPDATA", "D:\\KiroData");
+        let executable = std::env::current_exe().unwrap();
+        let installation = crate::detect::KiroInstallation {
+            install_dir: executable.parent().unwrap().to_path_buf(),
+            executable_path: executable.clone(),
+            product_json_path: executable.clone(),
+            version: "1.1.14".into(),
+            vscode_version: None,
+            commit: None,
+            quality: None,
+            win32_mutex_name: "kiro".into(),
+            agent_extension_dir: None,
+            agent_version: None,
+            is_user_level: true,
+        };
+        let command = prepare_kiro_launch(&installation, "https://gateway.example", &[]).unwrap();
+        let envs: Vec<_> = command.get_envs().collect();
+        assert!(
+            envs.contains(&(std::ffi::OsStr::new("VSCODE_PID"), None)),
+            "an inherited editor variable reached Kiro"
+        );
+        assert!(
+            !envs.iter().any(|(key, _)| *key == "VSCODE_APPDATA"),
+            "the customer's own VSCODE_APPDATA was touched"
         );
     }
 
