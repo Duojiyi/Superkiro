@@ -147,6 +147,15 @@ impl StreamGuardConfig {
 
 const DEFAULT_SEND_DEADLINE: Duration = Duration::from_secs(600);
 
+/// How long a terminal frame may wait for the client, deadline or not. Without it Kiro
+/// sees a response that simply stops, with no reason and no end.
+const TERMINAL_FRAME_GRACE: Duration = Duration::from_secs(3);
+
+/// Tool-call arguments one response may accumulate, across all its calls, and how many
+/// calls it may open. A file-writing call legitimately carries hundreds of kilobytes.
+const MAX_TOOL_ARGUMENT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_TOOL_CALLS: usize = 128;
+
 async fn send_frame(
     tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
     frame: Bytes,
@@ -161,6 +170,52 @@ async fn send_frame(
         tokio::time::timeout_at(deadline, tx.send(Ok(frame))).await,
         Ok(Ok(()))
     )
+}
+
+/// Send a frame that ends the response, allowing [`TERMINAL_FRAME_GRACE`] even past
+/// the request deadline.
+async fn send_terminal_frame(
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    frame: Vec<u8>,
+) -> bool {
+    matches!(
+        tokio::time::timeout(TERMINAL_FRAME_GRACE, tx.send(Ok(Bytes::from(frame)))).await,
+        Ok(Ok(()))
+    )
+}
+
+/// Why a response ended before completing, as the client is told at its end.
+struct Failure {
+    /// Shown in the conversation, where Kiro renders it.
+    note: Option<String>,
+    /// The exception that ends the stream.
+    error: String,
+}
+
+impl Failure {
+    fn new(note: Option<String>, error: impl Into<String>) -> Self {
+        Self {
+            note,
+            error: error.into(),
+        }
+    }
+
+    fn deadline() -> Self {
+        Self::new(
+            Some(
+                "\n\n**响应超过时间上限，已被截断。**可以让模型从这里继续，或缩短本次请求。\n"
+                    .into(),
+            ),
+            "Response exceeded the time limit and was cut off",
+        )
+    }
+
+    fn oversized_tool_call(error: &str) -> Self {
+        Self::new(
+            Some("\n\n**模型生成的工具调用超出网关上限，本次响应已中止。**\n".into()),
+            error,
+        )
+    }
 }
 
 #[derive(Default)]
@@ -225,6 +280,8 @@ pub fn create_stream_guard_with_send_deadline(
         interval.tick().await;
         let mut upstream = Box::pin(upstream_stream);
         let mut tool_buffers: BTreeMap<usize, ToolBuffer> = BTreeMap::new();
+        let mut tool_argument_bytes = 0usize;
+        let mut failure: Option<Failure> = None;
         let mut usage = crate::provider::TokenUsage::default();
         let mut has_input_usage = false;
         let mut saw_usage_frame = false;
@@ -270,6 +327,22 @@ pub fn create_stream_guard_with_send_deadline(
                                         || name.as_ref().is_some_and(|value| !value.is_empty());
                                     output_units = output_units.saturating_add(crate::usage_estimate::token_units(&arguments))
                                         .saturating_add(name.as_ref().map_or(0, |n| crate::usage_estimate::token_units(n)));
+                                    // Truncated arguments would reach Kiro as a malformed tool
+                                    // call, so a response over the limits ends instead, billed
+                                    // for what it produced.
+                                    if !tool_buffers.contains_key(&index) && tool_buffers.len() >= MAX_TOOL_CALLS {
+                                        failure = Some(Failure::oversized_tool_call(
+                                            "Response opened more tool calls than the gateway accepts",
+                                        ));
+                                        break 'stream;
+                                    }
+                                    tool_argument_bytes = tool_argument_bytes.saturating_add(arguments.len());
+                                    if tool_argument_bytes > MAX_TOOL_ARGUMENT_BYTES {
+                                        failure = Some(Failure::oversized_tool_call(
+                                            "Tool call arguments exceeded the gateway limit",
+                                        ));
+                                        break 'stream;
+                                    }
                                     let buf = tool_buffers.entry(index).or_default();
                                     if let Some(id) = id { buf.id = id; }
                                     if let Some(name) = name {
@@ -327,11 +400,7 @@ pub fn create_stream_guard_with_send_deadline(
                             // charge input-only usage or cache this invocation as successful.
                             if !saw_output {
                                 rejected_empty = true;
-                                let frame = kiro_wire::encoder::encode_exception(
-                                    "InternalServerException",
-                                    "Upstream completed without producing any output",
-                                );
-                                let _ = send_frame(&tx, Bytes::from(frame), send_deadline).await;
+                                failure = Some(Failure::new(None, "Upstream completed without producing any output"));
                                 break;
                             }
                             for (_, buf) in std::mem::take(&mut tool_buffers) {
@@ -353,12 +422,7 @@ pub fn create_stream_guard_with_send_deadline(
                                 _ => "Upstream stream ended before completion".to_string(),
                             };
                             let friendly = format!("\n\n**上游模型服务异常**：{error}\n");
-                            let frame = kiro_wire::encoder::encode_assistant_response(&friendly, Some(&config.model_id));
-                            if !send_frame(&tx, Bytes::from(frame), send_deadline).await {
-                                break 'stream;
-                            }
-                            let frame = kiro_wire::encoder::encode_exception("InternalServerException", &error);
-                            let _ = send_frame(&tx, Bytes::from(frame), send_deadline).await;
+                            failure = Some(Failure::new(Some(friendly), error));
                             break;
                         }
                     }
@@ -368,6 +432,11 @@ pub fn create_stream_guard_with_send_deadline(
         // One finalization path for Done, EOF, provider errors, cancellation and failed sends.
         // Dropping this receiver cancels the provider pump even while it waits for bytes.
         drop(upstream);
+        // Every other way out that leaves the client connected is the deadline: it fired,
+        // or a send was refused because it had passed.
+        if !completed && failure.is_none() && !tx.is_closed() {
+            failure = Some(Failure::deadline());
+        }
         let mut settlement_ok = true;
         let mut billable_attempt = false;
         if let Some(mut settler) = billing_settler.take() {
@@ -388,11 +457,6 @@ pub fn create_stream_guard_with_send_deadline(
                 billable_attempt = true;
                 if let Err(error) = settler.settle(&tokens) {
                     settlement_ok = false;
-                    let frame = kiro_wire::encoder::encode_exception(
-                        "InternalServerException",
-                        "Billing settlement failed; request retained for reconciliation",
-                    );
-                    let _ = send_frame(&tx, Bytes::from(frame), send_deadline).await;
                     eprintln!("[kiro-gateway] settlement failed: {error}");
                 }
             }
@@ -417,28 +481,55 @@ pub fn create_stream_guard_with_send_deadline(
                 },
             );
         }
-        if completed && settlement_ok && !tx.is_closed() {
-            let frame = kiro_wire::encoder::encode_metadata(
-                None,
-                Some(stop_reason.as_deref().unwrap_or("end_turn")),
-            );
-            if send_frame(&tx, Bytes::from(frame), send_deadline).await {
-                if let Some(guard) = idempotency_guard.take() {
-                    guard.commit(CompletedInvocation {
-                        completed_at: Instant::now(),
-                        model_id: config.model_id.clone(),
-                        total_input_tokens: usage.prompt_tokens.min(u32::MAX as u64) as u32,
-                        total_output_tokens: usage.completion_tokens.min(u32::MAX as u64) as u32,
-                    });
+        if completed && settlement_ok {
+            if !tx.is_closed() {
+                let frame = kiro_wire::encoder::encode_metadata(
+                    None,
+                    Some(stop_reason.as_deref().unwrap_or("end_turn")),
+                );
+                if send_terminal_frame(&tx, frame).await {
+                    if let Some(guard) = idempotency_guard.take() {
+                        guard.commit(CompletedInvocation {
+                            completed_at: Instant::now(),
+                            model_id: config.model_id.clone(),
+                            total_input_tokens: usage.prompt_tokens.min(u32::MAX as u64) as u32,
+                            total_output_tokens: usage.completion_tokens.min(u32::MAX as u64)
+                                as u32,
+                        });
+                    }
                 }
             }
+            if billable_attempt {
+                if let Some(guard) = idempotency_guard.take() {
+                    guard.fail();
+                }
+            }
+            return;
         }
-        if billable_attempt {
-            if let Some(guard) = idempotency_guard.take() {
-                guard.fail();
+        // Record the outcome before telling a client that may be slow to read: billable
+        // work is never replayed, and anything else is released for an immediate retry.
+        match idempotency_guard.take() {
+            Some(guard) if billable_attempt => guard.fail(),
+            released => drop(released),
+        }
+        let failure = match failure {
+            Some(failure) => failure,
+            None if !settlement_ok => Failure::new(
+                None,
+                "Billing settlement failed; request retained for reconciliation",
+            ),
+            // The client left; there is no one to tell.
+            None => return,
+        };
+        if let Some(note) = failure.note {
+            let frame =
+                kiro_wire::encoder::encode_assistant_response(&note, Some(&config.model_id));
+            if !send_terminal_frame(&tx, frame).await {
+                return;
             }
         }
-        // With no billable work, dropping the guard releases the invocation for retry.
+        let frame = kiro_wire::encoder::encode_exception("InternalServerException", &failure.error);
+        let _ = send_terminal_frame(&tx, frame).await;
     });
     FrameStream { inner: rx }
 }
