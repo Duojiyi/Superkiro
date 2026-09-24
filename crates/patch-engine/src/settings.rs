@@ -5,7 +5,10 @@
 //! - Disables Tab Autocomplete (`kiroAgent.enableTabAutocomplete: false`) to prevent credit bleed.
 //! - Freezes auto-updates (`update.mode: "none"`) to prevent silent patch breakage.
 //! - Provides 100% clean rollback with zero leftover configuration residue.
+//! - Edits the file in place: comments, key order, indentation, line endings and a
+//!   byte-order mark survive both takeover and rollback.
 
+use jsonc_parser::cst::{CstInputValue, CstObject, CstObjectProp, CstRootNode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::env;
@@ -160,118 +163,92 @@ impl SettingsManager {
     pub fn merge_byok(&self, gateway_url: &str) -> Result<PriorSettingsState, SettingsError> {
         let region = REDIRECTED_REGION;
         let prior = self.capture_prior_state()?;
-        let mut map = self.read_settings()?;
+        let raw = self.read_raw()?;
+        let text = SettingsText::parse(&raw)?;
+        let mut map = parse_settings_bytes(&raw)?;
 
         let gw = gateway_url.trim_end_matches('/');
-
-        // 1. kiroAuthConfig
-        map.insert(
-            "kiroAuthConfig".to_string(),
-            json!({
-                "portalUrl": gw,
-                "endpoint": gw
-            }),
-        );
-
-        // 2. codewhisperer.config (KRS + CPS + general endpoints)
-        map.insert(
-            "codewhisperer.config".to_string(),
-            json!({
-                "krsEndpoints": [{ "region": region, "endpoint": gw }],
-                "cpsEndpoints": [{ "region": region, "endpoint": gw }],
-                "endpoints": [{ "region": region, "endpoint": gw }]
-            }),
-        );
-
-        // 3. Tab Autocomplete: disable to save user tokens (Spec §2.5)
-        map.insert("kiroAgent.enableTabAutocomplete".to_string(), json!(false));
-
-        // 4. Update mode: none (freeze auto-updates to prevent silent patch breakage)
-        map.insert("update.mode".to_string(), json!("none"));
-
-        // 5. Telemetry: off
-        map.insert("telemetry.telemetryLevel".to_string(), json!("off"));
+        let mut values = vec![
+            ("kiroAuthConfig", json!({ "portalUrl": gw, "endpoint": gw })),
+            // KRS + CPS + general endpoints
+            (
+                "codewhisperer.config",
+                json!({
+                    "krsEndpoints": [{ "region": region, "endpoint": gw }],
+                    "cpsEndpoints": [{ "region": region, "endpoint": gw }],
+                    "endpoints": [{ "region": region, "endpoint": gw }]
+                }),
+            ),
+        ];
+        values.extend(our_preferences());
 
         // Kiro's core proxy agent drops IP identity on TLS tunnels. Bypass only
         // this gateway; keep the user's other proxy exceptions and TLS checks.
-        let host = reqwest::Url::parse(gw)
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_owned));
-        if let Some(host) = host {
+        if let Some(host) = gateway_host(gw) {
             let mut bypass = match map.get("http.noProxy") {
                 Some(Value::Array(values)) => values.clone(),
                 None => Vec::new(),
-                _ => {
-                    return Err(SettingsError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "http.noProxy must be an array",
-                    )))
-                }
+                _ => return Err(invalid_data("http.noProxy must be an array")),
             };
             if !bypass.iter().any(|value| value.as_str() == Some(&host)) {
                 bypass.push(json!(host));
             }
-            map.insert("http.noProxy".into(), Value::Array(bypass));
+            values.push(("http.noProxy", Value::Array(bypass)));
         }
-        self.atomic_write(&map)?;
 
-        Ok(PriorSettingsState { ..prior })
+        for (key, value) in values {
+            text.set(key, &value);
+            map.insert(key.to_string(), value);
+        }
+        self.write_text(&text, &map)?;
+        Ok(prior)
     }
 
     /// Revert BYOK settings back to original state using `PriorSettingsState`.
     ///
-    /// If the settings file did not exist before BYOK, deletes the file.
-    /// Otherwise restores prior values of managed keys or removes them if they didn't exist.
-    pub fn revert(&self, prior: &PriorSettingsState) -> Result<(), SettingsError> {
-        let mut map = self.read_settings()?;
+    /// `gateway_url` is the gateway the takeover pointed Kiro at. What each managed key
+    /// returns to is decided by [`reverted_values`]. When the result is exactly the file
+    /// as it was, its original bytes are restored; otherwise only the managed keys are
+    /// edited in place, so anything the user changed meanwhile is kept, comments
+    /// included. A file that did not exist before and would be left empty is deleted.
+    pub fn revert(
+        &self,
+        prior: &PriorSettingsState,
+        gateway_url: &str,
+    ) -> Result<(), SettingsError> {
+        let raw = self.read_raw()?;
+        let text = SettingsText::parse(&raw)?;
+        let mut map = parse_settings_bytes(&raw)?;
+        let host = gateway_host(gateway_url.trim_end_matches('/'));
+        for (key, value) in reverted_values(prior, &map, host.as_deref()) {
+            match value {
+                Some(value) => {
+                    text.set(key, &value);
+                    map.insert(key.to_string(), value);
+                }
+                None => {
+                    text.remove(key);
+                    map.remove(key);
+                }
+            }
+        }
 
         if !prior.had_settings_file {
-            // Spec §9, T08: If the user subsequently added their own custom settings
-            // while BYOK was active, do NOT delete the entire file. Remove only BYOK managed keys.
-            for &key in MANAGED_KEYS {
-                if key == "http.noProxy" && !prior.proxy_bypass_managed {
-                    continue;
-                }
-                map.remove(key);
-            }
+            // Spec §9, T08: settings the user added while BYOK was active keep the file.
             if map.is_empty() {
                 if self.settings_path.exists() {
                     fs::remove_file(&self.settings_path)?;
                 }
-            } else {
-                self.atomic_write(&map)?;
-            }
-            return Ok(());
-        }
-
-        // If no unrelated setting changed, restore the original bytes. This
-        // preserves JSONC comments, whitespace, ordering, and line endings.
-        // If the user changed/added an unrelated key, merge only managed keys
-        // so that their live edit is retained.
-        if let Some(raw) = prior.prior_raw.as_deref() {
-            let original_map = parse_settings_bytes(raw)?;
-            if non_managed_values(&map) == non_managed_values(&original_map)
-                && (prior.proxy_bypass_managed
-                    || map.get("http.noProxy") == original_map.get("http.noProxy"))
-            {
-                self.atomic_write_bytes(raw)?;
                 return Ok(());
             }
+            return self.write_text(&text, &map);
         }
-
-        for &key in MANAGED_KEYS {
-            if key == "http.noProxy" && !prior.proxy_bypass_managed {
-                continue;
-            }
-            if let Some(orig) = prior.prior_values.get(key) {
-                map.insert(key.to_string(), orig.clone());
-            } else {
-                map.remove(key);
+        if let Some(original) = prior.prior_raw.as_deref() {
+            if parse_settings_bytes(original).is_ok_and(|original_map| original_map == map) {
+                return self.atomic_write_bytes(original);
             }
         }
-
-        self.atomic_write(&map)?;
-        Ok(())
+        self.write_text(&text, &map)
     }
 
     /// Check if BYOK redirection keys are currently active in `settings.json`.
@@ -303,9 +280,30 @@ impl SettingsManager {
         }
     }
 
-    fn atomic_write(&self, map: &Map<String, Value>) -> Result<(), SettingsError> {
-        let json_str = serde_json::to_string_pretty(map)?;
-        self.atomic_write_bytes(json_str.as_bytes())
+    /// The file's bytes, or none when it does not exist.
+    fn read_raw(&self) -> Result<Vec<u8>, SettingsError> {
+        match fs::read(&self.settings_path) {
+            Ok(raw) => Ok(raw),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Write an edited file, but only if it reads back as exactly `expected`. The
+    /// editor and the reader are different parsers, and a file they disagree on is
+    /// refused rather than written.
+    fn write_text(
+        &self,
+        text: &SettingsText,
+        expected: &Map<String, Value>,
+    ) -> Result<(), SettingsError> {
+        let bytes = text.to_bytes();
+        if &parse_settings_bytes(&bytes)? != expected {
+            return Err(invalid_data(
+                "settings.json could not be edited in place without changing other settings",
+            ));
+        }
+        self.atomic_write_bytes(&bytes)
     }
 
     fn atomic_write_bytes(&self, bytes: &[u8]) -> Result<(), SettingsError> {
@@ -346,6 +344,8 @@ fn parse_settings_bytes(raw: &[u8]) -> Result<Map<String, Value>, SettingsError>
     let content = std::str::from_utf8(raw).map_err(|error| {
         serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     })?;
+    // Editors such as Notepad save UTF-8 with a byte-order mark; Kiro reads through it.
+    let content = content.strip_prefix(BOM).unwrap_or(content);
     if content.trim().is_empty() {
         return Ok(Map::new());
     }
@@ -358,11 +358,177 @@ fn parse_settings_bytes(raw: &[u8]) -> Result<Map<String, Value>, SettingsError>
     }
 }
 
-fn non_managed_values(map: &Map<String, Value>) -> Map<String, Value> {
-    map.iter()
-        .filter(|(key, _)| !MANAGED_KEYS.contains(&key.as_str()))
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect()
+/// Preferences takeover sets, with the values it sets them to.
+fn our_preferences() -> [(&'static str, Value); 3] {
+    [
+        // Tab Autocomplete off, to save the user's credits (Spec §2.5).
+        ("kiroAgent.enableTabAutocomplete", json!(false)),
+        // Auto-update frozen, so an update cannot silently replace the patch.
+        ("update.mode", json!("none")),
+        ("telemetry.telemetryLevel", json!("off")),
+    ]
+}
+
+/// What each managed key becomes on rollback; `None` removes it.
+///
+/// The redirection keys always return to their prior values: anything left naming the
+/// gateway would keep sending the customer's own traffic to it. A preference takeover
+/// set returns to its prior value only while it still holds ours; a different value
+/// is the user's own choice, made while taken over, and stays. From the proxy bypass
+/// list only the gateway's host is removed, and only if takeover added it.
+fn reverted_values(
+    prior: &PriorSettingsState,
+    current: &Map<String, Value>,
+    gateway_host: Option<&str>,
+) -> Vec<(&'static str, Option<Value>)> {
+    let mut values: Vec<(&'static str, Option<Value>)> = ["kiroAuthConfig", "codewhisperer.config"]
+        .into_iter()
+        .map(|key| (key, prior.prior_values.get(key).cloned()))
+        .collect();
+    for (key, ours) in our_preferences() {
+        let value = if current.get(key) == Some(&ours) {
+            prior.prior_values.get(key).cloned()
+        } else {
+            current.get(key).cloned()
+        };
+        values.push((key, value));
+    }
+    if prior.proxy_bypass_managed {
+        let prior_list = prior.prior_values.get("http.noProxy");
+        let value = match (current.get("http.noProxy"), gateway_host) {
+            (Some(Value::Array(list)), Some(host)) => {
+                let added_by_us = !prior_list
+                    .and_then(Value::as_array)
+                    .is_some_and(|list| list.iter().any(|entry| entry.as_str() == Some(host)));
+                let mut list = list.clone();
+                if added_by_us {
+                    list.retain(|entry| entry.as_str() != Some(host));
+                }
+                (!list.is_empty() || prior_list.is_some()).then_some(Value::Array(list))
+            }
+            // Nothing to reason from: return the list as it was.
+            _ => prior_list.cloned(),
+        };
+        values.push(("http.noProxy", value));
+    }
+    values
+}
+
+fn gateway_host(gateway_url: &str) -> Option<String> {
+    reqwest::Url::parse(gateway_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+}
+
+fn invalid_data(message: &str) -> SettingsError {
+    SettingsError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        message.to_string(),
+    ))
+}
+
+const BOM: &str = "\u{feff}";
+
+/// What Kiro's settings reader accepts: comments and trailing commas, nothing looser.
+/// Parsing more loosely could edit a file Kiro itself rejects into one it reads.
+fn kiro_parse_options() -> jsonc_parser::ParseOptions {
+    jsonc_parser::ParseOptions {
+        allow_comments: true,
+        allow_trailing_commas: true,
+        allow_loose_object_property_names: false,
+        allow_missing_commas: false,
+        allow_single_quoted_strings: false,
+        allow_hexadecimal_numbers: false,
+        allow_unary_plus_numbers: false,
+    }
+}
+
+/// A settings file edited in place. Only the members named change; every other byte
+/// (comments, order, indentation, line endings, a byte-order mark) stays as it was.
+struct SettingsText {
+    bom: bool,
+    root: CstRootNode,
+    object: CstObject,
+}
+
+impl SettingsText {
+    /// Refuses a file whose root is not an object, rather than replacing it.
+    fn parse(raw: &[u8]) -> Result<Self, SettingsError> {
+        parse_settings_bytes(raw)?;
+        let text =
+            std::str::from_utf8(raw).map_err(|_| invalid_data("settings.json is not UTF-8"))?;
+        let (bom, body) = match text.strip_prefix(BOM) {
+            Some(body) => (true, body),
+            None => (false, text),
+        };
+        let body = if body.trim().is_empty() { "{}" } else { body };
+        let root = CstRootNode::parse(body, &kiro_parse_options())
+            .map_err(|error| invalid_data(&format!("settings.json: {error}")))?;
+        let object = root
+            .object_value()
+            .ok_or_else(|| invalid_data("settings.json must contain an object"))?;
+        Ok(Self { bom, root, object })
+    }
+
+    /// Every top-level member named `key`. Kiro reads the last of duplicates.
+    fn named(&self, key: &str) -> Vec<CstObjectProp> {
+        self.object
+            .properties()
+            .into_iter()
+            .filter(|prop| {
+                prop.name()
+                    .and_then(|name| name.decoded_value().ok())
+                    .is_some_and(|name| name == key)
+            })
+            .collect()
+    }
+
+    /// Leave exactly one `key`, holding `value`: the last occurrence keeps its place,
+    /// earlier duplicates go, and a missing key is added at the end.
+    fn set(&self, key: &str, value: &Value) {
+        let mut props = self.named(key);
+        match props.pop() {
+            Some(last) => {
+                for earlier in props {
+                    earlier.remove();
+                }
+                last.set_value(cst_value(value));
+            }
+            None => {
+                self.object.append(key, cst_value(value));
+            }
+        }
+    }
+
+    fn remove(&self, key: &str) {
+        for prop in self.named(key) {
+            prop.remove();
+        }
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut out = String::new();
+        if self.bom {
+            out.push_str(BOM);
+        }
+        out.push_str(&self.root.to_string());
+        out.into_bytes()
+    }
+}
+
+fn cst_value(value: &Value) -> CstInputValue {
+    match value {
+        Value::Null => CstInputValue::Null,
+        Value::Bool(value) => CstInputValue::Bool(*value),
+        Value::Number(value) => CstInputValue::Number(value.to_string()),
+        Value::String(value) => CstInputValue::String(value.clone()),
+        Value::Array(items) => CstInputValue::Array(items.iter().map(cst_value).collect()),
+        Value::Object(map) => CstInputValue::Object(
+            map.iter()
+                .map(|(key, value)| (key.clone(), cst_value(value)))
+                .collect(),
+        ),
+    }
 }
 
 fn atomic_replace(temp: &Path, target: &Path) -> std::io::Result<()> {
@@ -491,7 +657,7 @@ mod shape_tests {
                     prior_raw: had_settings_file.then(|| b"{}".to_vec()),
                     ..Default::default()
                 };
-                assert!(manager.revert(&prior).is_err());
+                assert!(manager.revert(&prior, "https://fixture.invalid").is_err());
                 assert_eq!(fs::read(manager.path()).unwrap(), bytes);
             }
         }

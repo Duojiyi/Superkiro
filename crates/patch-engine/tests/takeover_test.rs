@@ -79,7 +79,8 @@ fn test_settings_safe_merge_and_revert() {
         merged.get("http.noProxy")
     );
     // 3. Revert to original state
-    mgr.revert(&prior_state).expect("Revert must succeed");
+    mgr.revert(&prior_state, gateway_url)
+        .expect("Revert must succeed");
 
     assert!(!mgr.is_byok_active(None));
     let reverted = mgr.read_settings().unwrap();
@@ -107,7 +108,7 @@ fn test_settings_empty_file_creation_and_revert() {
     assert!(settings_file.exists());
     assert!(mgr.is_byok_active(None));
 
-    mgr.revert(&prior_state).unwrap();
+    mgr.revert(&prior_state, "https://gateway.test").unwrap();
     // Since file did not exist before BYOK, revert safely removes the file
     assert!(!settings_file.exists());
 
@@ -335,7 +336,7 @@ fn test_settings_revert_preserves_newly_added_user_keys() {
     .unwrap();
 
     // Now restore official settings
-    mgr.revert(&prior_state).unwrap();
+    mgr.revert(&prior_state, "https://gateway.test").unwrap();
 
     // File should NOT have been deleted; user.customPreference should be preserved!
     assert!(settings_file.exists());
