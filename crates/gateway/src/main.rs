@@ -168,8 +168,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         match billing.load_from_file(&state_file) {
+            // The release tooling checks this line: the sequence must be the one it left.
             Ok(_) => println!(
-                "[√] Successfully restored billing state from {:?}",
+                "[√] Restored billing state at sequence {} from {:?}",
+                billing.snapshot_sequence(),
                 state_file
             ),
             Err(e) => {

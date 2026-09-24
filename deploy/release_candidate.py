@@ -5,6 +5,8 @@ from contextlib import contextmanager
 from pathlib import Path
 import re
 import shlex
+import shutil
+import subprocess
 import sys
 import tarfile
 import time
@@ -17,6 +19,21 @@ from test_deployed_server import ROOT, connect
 
 BASE = '/opt/kiro-byok'
 SOURCE_PATHS = ['Cargo.toml', 'Cargo.lock', 'crates', 'apps/admin-ui/dist', 'apps/portal-ui', 'deploy/Dockerfile']
+# What the shipped sources are built from; all of it must be exactly the release commit.
+COMMITTED_INPUTS = ['Cargo.toml', 'Cargo.lock', 'crates', 'apps/portal-ui', 'deploy/Dockerfile',
+                    'apps/admin-ui/src', 'apps/admin-ui/index.html', 'apps/admin-ui/package.json',
+                    'apps/admin-ui/package-lock.json', 'apps/admin-ui/vite.config.ts',
+                    'apps/admin-ui/tsconfig.json', 'apps/admin-ui/tailwind.config.js',
+                    'apps/admin-ui/postcss.config.js']
+LEDGER_ANCHOR = BASE + '/data/billing_state.json.anchor'
+# Releases, with their data and configuration copies, kept after a deploy.
+KEEP_RELEASES = 5
+FREE_SPACE_MARGIN = 1 << 30
+RELEASE_NAME = re.compile(r'\d{8}T\d{6}Z')
+
+
+class PreconditionFailed(RuntimeError):
+    """Refused before anything changed: the lock is released and the reason kept."""
 
 
 def run(ssh, command, timeout=300):
@@ -49,11 +66,130 @@ def deployment_lock(ssh):
     run(ssh, f'mkdir -m 700 {lock}')
     try:
         yield
-    except Exception:
+    except PreconditionFailed:
+        # Nothing was changed, so nothing needs review: release the lock, keep the reason.
+        run(ssh, f'rmdir {lock}')
+        raise
+    except Exception as error:
         # A timed-out SSH command may still be running. Never unlock on uncertainty.
-        raise RuntimeError('Deployment failed; lock retained at /opt/kiro-byok/deployment.lock for operator review') from None
+        # The reason is our own message or an exception type; remote output is never in it.
+        raise RuntimeError(f'Deployment failed ({type(error).__name__}: {error}); lock retained at '
+                           '/opt/kiro-byok/deployment.lock for operator review') from None
     else:
         run(ssh, f'rmdir {lock}')
+
+
+def git(*args, root=ROOT):
+    return subprocess.run(['git', '-C', str(root), *args], capture_output=True, text=True,
+                          check=True).stdout.strip()
+
+
+def ci_conclusions(commit, root=ROOT):
+    """Every CI check run on `commit`, as its conclusion, or 'pending' while it runs."""
+    try:
+        origin = git('remote', 'get-url', 'origin', root=root)
+        repo = re.search(r'github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$', origin).group(1)
+        out = subprocess.run(
+            [shutil.which('gh') or 'gh', 'api', '--paginate', f'repos/{repo}/commits/{commit}/check-runs',
+             '-q', '.check_runs[] | .status + " " + (.conclusion // "")'],
+            capture_output=True, text=True, check=True).stdout
+    except (OSError, AttributeError, subprocess.CalledProcessError):
+        raise PreconditionFailed('Cannot read CI results for the release commit') from None
+    runs = [line.split() for line in out.splitlines() if line.strip()]
+    return [fields[1] if fields[0] == 'completed' and len(fields) > 1 else 'pending' for fields in runs]
+
+
+def verified_commit(allow_untested=False, root=ROOT):
+    """The commit a release is built from.
+
+    CI is the only place the full test suite runs, so a release is built only from a commit
+    CI passed: on origin/main, with every committed input exactly that commit, nothing
+    edited or added on this disk. `allow_untested` skips the CI result only, for an
+    emergency, and the report still records the commit.
+    """
+    try:
+        commit = git('rev-parse', 'HEAD', root=root)
+        dirty = git('status', '--porcelain', '--untracked-files=all', '--', *COMMITTED_INPUTS, root=root)
+        git('fetch', '--quiet', 'origin', 'main', root=root)
+        on_main = subprocess.run(['git', '-C', str(root), 'merge-base', '--is-ancestor', commit, 'origin/main'],
+                                 capture_output=True).returncode == 0
+    except (OSError, subprocess.CalledProcessError):
+        raise PreconditionFailed('Cannot read the release source from git') from None
+    if dirty:
+        raise PreconditionFailed('Release inputs have uncommitted or untracked changes')
+    if not on_main:
+        raise PreconditionFailed('Release commit is not on origin/main')
+    if not allow_untested:
+        conclusions = ci_conclusions(commit, root)
+        if not conclusions or any(c not in ('success', 'skipped', 'neutral') for c in conclusions):
+            raise PreconditionFailed('CI has not passed for the release commit')
+    return commit
+
+
+def build_admin_ui(root=ROOT):
+    """Build the admin bundle from the release commit's own sources and lockfile."""
+    npm = shutil.which('npm')
+    if npm is None:
+        raise PreconditionFailed('npm is required to build the admin UI')
+    for args in (['ci', '--no-audit', '--no-fund'], ['run', 'build']):
+        if subprocess.run([npm, *args], cwd=root / 'apps' / 'admin-ui', capture_output=True).returncode:
+            raise PreconditionFailed('Admin UI build failed')
+
+
+def ledger_sequence(ssh):
+    """The saved ledger's sequence, from its anchor; None for a machine with no ledger."""
+    text = run(ssh, f"if test -f {LEDGER_ANCHOR}; then grep -o '\"sequence\": *[0-9]*' {LEDGER_ANCHOR} "
+                    "| grep -o '[0-9]*$' | head -n 1; fi")
+    return int(text) if text.isdigit() else None
+
+
+def verify_ledger_loaded(ssh, sequence):
+    """The new gateway must say it restored exactly the ledger it was given. A missing or
+    empty data directory otherwise starts a healthy gateway that knows no card."""
+    if sequence is None:
+        return
+    restored = run(ssh, "docker logs kiro-gateway 2>&1 | grep -o 'Restored billing state at sequence [0-9]*' "
+                        "| tail -n 1")
+    if restored != f'Restored billing state at sequence {sequence}':
+        raise RuntimeError('New gateway did not load the ledger it was given')
+
+
+def check_free_space(ssh):
+    """Room for the data copy, before anything is stopped."""
+    free, used = (int(value) for value in run(
+        ssh, f"df --output=avail -B1 {BASE} | tail -n 1\ndu -sb {BASE}/data | cut -f1").split())
+    if free < 2 * used + FREE_SPACE_MARGIN:
+        raise PreconditionFailed('Not enough free space for the data backup; nothing was stopped')
+
+
+def pull_tree(ssh, remote, local):
+    """Copy a remote directory here, checking every file's SHA-256 against the server's."""
+    local = Path(local)
+    listing = run(ssh, f"cd {shlex.quote(remote)}\nfind . -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum")
+    with ssh.open_sftp() as sftp:
+        for line in listing.splitlines():
+            digest, relative = line.split('  ', 1)
+            relative = relative[2:] if relative.startswith('./') else relative
+            if relative.startswith('/') or '..' in Path(relative).parts:
+                raise RuntimeError('Unexpected backup path')
+            target = local / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            sftp.get(f'{remote}/{relative}', str(target))
+            if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+                raise RuntimeError('Backup copy does not match the server')
+    return str(local)
+
+
+def prune_releases(ssh, protect):
+    """Keep the newest KEEP_RELEASES releases, their data and configuration copies and
+    images, and every release in `protect`. Remove the rest. Only timestamp-named entries
+    are ever touched."""
+    names = sorted(name for name in run(ssh, f'ls -1 {BASE}/releases').split() if RELEASE_NAME.fullmatch(name))
+    doomed = [name for name in names[:-KEEP_RELEASES] if f'{BASE}/releases/{name}' not in protect]
+    for name in doomed:
+        run(ssh, f'rm -rf -- {BASE}/releases/{name} {BASE}/backups/release-{name} {BASE}/config-backups/release-{name}\n'
+                 f'docker image rm kiro-byok:{name} >/dev/null 2>&1 || true')
+    return doomed
 
 
 def release_path(value):
@@ -103,11 +239,18 @@ def portal_caddy_config(content):
 
 def save_report(ssh, report):
     content = json.dumps(report, indent=2).encode()
-    path = ROOT / 'deployment-candidate-results.json'
-    temporary = path.with_suffix('.next')
-    temporary.write_bytes(content)
-    temporary.replace(path)
     write_remote(ssh, f"{BASE}/releases/{report['release']}/release-state.json", content)
+    # The server's copy is the record. This local one is a convenience, and a scanner or
+    # editor holding the file must never fail a production step.
+    path = ROOT / 'deployment-candidate-results.json'
+    for _ in range(5):
+        try:
+            temporary = path.with_suffix('.next')
+            temporary.write_bytes(content)
+            temporary.replace(path)
+            return
+        except OSError:
+            time.sleep(0.5)
 
 
 def admin_readiness(admin, api, browser_login=True):
@@ -172,39 +315,45 @@ def promote(ssh, report, extra_readiness=None):
     dest = release_path(f'{BASE}/releases/{release}')
     old = release_path(report['previous_release'])
     backup = f'{BASE}/backups/release-{release}'
+    # Secrets are backed up apart from the ledger, so no backup directory holds both the
+    # ciphertext and its key.
+    configuration = f'{BASE}/config-backups/release-{release}'
     compose = f'docker compose -p deploy -f {dest}/deploy/docker-compose.ip.yml'
     previous = f'docker compose -p deploy -f {old}/deploy/docker-compose.ip.yml'
     if run(ssh, f'cat {dest}/build.exit') != '0':
-        raise RuntimeError('Candidate build did not succeed')
+        raise PreconditionFailed('Candidate build did not succeed')
     if run(ssh, f'readlink -f {BASE}/current') != old:
-        raise RuntimeError('Current release changed; restage candidate')
+        raise PreconditionFailed('Current release changed; restage candidate')
     if configuration_digest(ssh, old) != report['configuration_sha256']:
-        raise RuntimeError('Production configuration changed; restage candidate')
+        raise PreconditionFailed('Production configuration changed; restage candidate')
     if tree_digest(ssh, dest, SOURCE_PATHS + ['deploy/docker-compose.ip.yml', 'deploy/Caddyfile.ip']) != report['candidate_sha256']:
-        raise RuntimeError('Staged candidate changed; restage candidate')
+        raise PreconditionFailed('Staged candidate changed; restage candidate')
     if report.get('browser_auth_migration'):
         from deploy.migrate_browser_auth import verify_staged
         verify_staged(ssh, report)
     image_id = run(ssh, f'cat {dest}/build.image-id')
     if not re.fullmatch(r'sha256:[a-f0-9]{64}', image_id):
-        raise RuntimeError('Missing build image identity')
+        raise PreconditionFailed('Missing build image identity')
     if run(ssh, f"docker image inspect kiro-byok:{release} --format '{{{{.Id}}}}'") != image_id:
-        raise RuntimeError('Candidate image tag changed')
+        raise PreconditionFailed('Candidate image tag changed')
     config = json.loads(run(ssh, compose + ' config --format json'))
     if config['services']['gateway']['image'] != f'kiro-byok:{release}':
-        raise RuntimeError('Compose gateway image differs from candidate')
+        raise PreconditionFailed('Compose gateway image differs from candidate')
     previous_id = report['previous_image_id']
     if run(ssh, "docker inspect kiro-gateway --format '{{.Image}}'") != previous_id:
-        raise RuntimeError('Previous gateway identity is unavailable')
+        raise PreconditionFailed('Previous gateway identity is unavailable')
     old_config = json.loads(run(ssh, previous + ' config --format json'))
     old_tag = shlex.quote(old_config['services']['gateway']['image'])
     if run(ssh, f"docker image inspect {old_tag} --format '{{{{.Id}}}}'") != previous_id:
-        raise RuntimeError('Rollback image tag changed')
+        raise PreconditionFailed('Rollback image tag changed')
     report['image_id'] = image_id
-    run(ssh, f'mkdir -m 700 {backup}\ncp -a {old}/deploy {backup}/deploy\ncp -a /etc/kiro-byok {backup}/configuration\n'
-        f'diff -qr {old}/deploy {backup}/deploy\ndiff -qr /etc/kiro-byok {backup}/configuration')
+    check_free_space(ssh)
+    run(ssh, f'mkdir -m 700 {backup}\ncp -a {old}/deploy {backup}/deploy\n'
+        f'mkdir -p -m 700 {BASE}/config-backups\ncp -a /etc/kiro-byok {configuration}\n'
+        f'diff -qr {old}/deploy {backup}/deploy\ndiff -qr /etc/kiro-byok {configuration}')
     report['status'] = 'stopping'
     save_report(ssh, report)
+    clean_stop = False
     try:
         stop_services(ssh)
         exit_code = run(ssh, "docker inspect kiro-gateway --format '{{.State.ExitCode}}'")
@@ -214,7 +363,10 @@ def promote(ssh, report, extra_readiness=None):
         if exit_code not in ('0', '143') or oom_killed != 'false':
             raise RuntimeError('Gateway stop was abnormal; data needs review')
         report['previous_exit_code'] = int(exit_code)
+        clean_stop = True
         run(ssh, f'cp -a {BASE}/data {backup}/data\ndiff -qr {BASE}/data {backup}/data\ntouch {backup}/data.complete')
+        # Read once the old gateway has flushed and stopped: what the new one must load.
+        report['ledger_sequence'] = ledger_sequence(ssh)
         report['status'] = 'backed_up'
         save_report(ssh, report)
         if report.get('browser_auth_migration'):
@@ -223,6 +375,7 @@ def promote(ssh, report, extra_readiness=None):
             apply_staged(ssh, report)
         run(ssh, compose + ' up -d --no-deps --pull never gateway')
         wait_gateway(ssh, image_id)
+        verify_ledger_loaded(ssh, report['ledger_sequence'])
         switch_current(ssh, dest, release)
         # Persist before invoking Caddy: the command may succeed remotely and time out locally.
         report['status'] = 'exposing'
@@ -246,7 +399,7 @@ def promote(ssh, report, extra_readiness=None):
                     f'cp -a {backup}/data {restore}\ndiff -qr {backup}/data {restore}\n'
                     f'test ! -e {backup}/failed-candidate-data\nmv {BASE}/data {backup}/failed-candidate-data\nmv {restore} {BASE}/data')
                 if report.get('browser_auth_migration'):
-                    run(ssh, f'cp -a {backup}/configuration/gateway.env /etc/kiro-byok/gateway.env\ncp -a {backup}/configuration/caddy.env /etc/kiro-byok/caddy.env')
+                    run(ssh, f'cp -a {configuration}/gateway.env /etc/kiro-byok/gateway.env\ncp -a {configuration}/caddy.env /etc/kiro-byok/caddy.env')
                 switch_current(ssh, old, release)
                 run(ssh, previous + ' up -d --no-deps --pull never --force-recreate gateway')
                 wait_gateway(ssh, previous_id)
@@ -254,9 +407,28 @@ def promote(ssh, report, extra_readiness=None):
                 old_browser_login = str(old_config['services']['gateway'].get('environment', {}).get('ADMIN_BROWSER_LOGIN', '')).lower() == 'true'
                 external_readiness(browser_login=old_browser_login)
                 report['status'] = 'rolled_back'
+            elif phase == 'exposing':
+                # The new gateway is healthy and current. If ingress never came back up
+                # (the save or the Caddy start itself failed), bring it up rather than
+                # leave the site down. A running Caddy means readiness failed: leave the
+                # live release to the operator, as below.
+                if run(ssh, "docker inspect kiro-caddy --format '{{.State.Running}}'") != 'true':
+                    run(ssh, compose + ' up -d --no-deps --pull never caddy')
+                    external_readiness()
+            elif phase == 'stopping' and clean_stop:
+                # The old gateway stopped cleanly and nothing was changed: only the copy
+                # failed (no space, an I/O error, a dropped command). Bring the previous
+                # release back rather than leave the site down.
+                run(ssh, f'test ! -e {backup}/data.complete\nrm -rf -- {backup}/data')
+                run(ssh, previous + ' up -d --no-deps --pull never gateway')
+                wait_gateway(ssh, previous_id)
+                run(ssh, previous + ' up -d --no-deps --pull never caddy')
+                old_browser_login = str(old_config['services']['gateway'].get('environment', {}).get('ADMIN_BROWSER_LOGIN', '')).lower() == 'true'
+                external_readiness(browser_login=old_browser_login)
+                report['status'] = 'restarted_previous'
             elif phase == 'stopping':
-                # Already on the way down and no data backup exists yet, so leaving
-                # them stopped is consistent with how far we got.
+                # The stop itself was abnormal: the data may need review, so leave the
+                # services down for an operator.
                 stop_services(ssh)
             # Every other phase leaves production running. At 'staging' nothing has
             # touched it yet, so the previous release is still serving normally. At
@@ -278,12 +450,14 @@ def promote(ssh, report, extra_readiness=None):
 
 def main(credentials=None, ssh=None):
     credentials = json.load(sys.stdin) if credentials is None else credentials
+    commit = verified_commit(allow_untested=credentials.get('allow_untested', False))
+    build_admin_ui()
     owns_connection = ssh is None
     if owns_connection:
         ssh = pinned_connection(credentials)
     release = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     dest = f'{BASE}/releases/{release}'
-    report = {'release': release, 'image': f'kiro-byok:{release}',
+    report = {'release': release, 'image': f'kiro-byok:{release}', 'commit': commit,
               'backup': f'{BASE}/backups/release-{release}', 'status': 'staging'}
     try:
         with deployment_lock(ssh):
@@ -319,7 +493,8 @@ def main(credentials=None, ssh=None):
             run(ssh, f"echo '{digest}  {dest}/source.tar.gz' | sha256sum -c -\ntar -xzf {dest}/source.tar.gz -C {dest}")
             report['candidate_sha256'] = tree_digest(ssh, dest, SOURCE_PATHS + ['deploy/docker-compose.ip.yml', 'deploy/Caddyfile.ip'])
             script = (f'set -eu\numask 077\ncd {dest}\n'
-                      f'if docker build --iidfile build.image-id -t {report["image"]} -f deploy/Dockerfile . > build.log 2>&1; '
+                      f'if docker build --iidfile build.image-id --label org.opencontainers.image.revision={commit} '
+                      f'-t {report["image"]} -f deploy/Dockerfile . > build.log 2>&1; '
                       'then code=0; else code=$?; fi\nprintf "%s" "$code" > build.exit.next\nmv build.exit.next build.exit\nexit "$code"\n')
             write_remote(ssh, dest + '/build-resume.sh', script.encode())
             save_report(ssh, report)
@@ -328,9 +503,27 @@ def main(credentials=None, ssh=None):
             else:
                 run(ssh, f'sh {dest}/build-resume.sh', timeout=3600)
                 promote(ssh, report)
+                keep_off_host(ssh, report, credentials)
     finally:
         if owns_connection:
             ssh.close()
+
+
+def keep_off_host(ssh, report, credentials):
+    """After a deploy: copy the release-time ledger backup here, off the production disk,
+    and prune old releases. The release is live either way; failures are reported, not
+    raised. The copy holds the encrypted ledger only; the KEK stays on the server."""
+    local = Path(credentials.get('backup_dir') or Path.home() / 'kiro-byok-backups') / report['release']
+    try:
+        report['off_host_backup'] = pull_tree(ssh, report['backup'] + '/data', local / 'data')
+    except Exception as error:
+        report['off_host_backup'] = f'failed ({type(error).__name__}: {error})'
+    try:
+        report['pruned_releases'] = prune_releases(
+            ssh, {f"{BASE}/releases/{report['release']}", report['previous_release']})
+    except Exception as error:
+        report['pruned_releases'] = f'failed ({type(error).__name__}: {error})'
+    save_report(ssh, report)
 
 
 if __name__ == '__main__':
