@@ -4050,17 +4050,18 @@ impl BillingEngine {
     // =========================================================================
 
     /// Record a structured request execution trace (Spec §5, §14.4).
+    /// Traces are observability data. They ride along with the next commit, which saves
+    /// the whole state and follows in the same request (its reservation's release or
+    /// settlement), instead of each costing a full save of its own. A crash before that
+    /// commit loses only the trace, and with it the attempt count it holds.
     pub fn record_trace(&self, trace: RequestTrace) {
-        {
-            let _state_guard = self.state_lock.write().unwrap();
-            let mut traces = self.traces.write().unwrap();
-            traces.push(trace);
-            if traces.len() > MAX_RETAINED_TRACES {
-                let overflow = traces.len() - MAX_RETAINED_TRACES;
-                traces.drain(..overflow);
-            }
+        let _state_guard = self.state_lock.write().unwrap();
+        let mut traces = self.traces.write().unwrap();
+        traces.push(trace);
+        if traces.len() > MAX_RETAINED_TRACES {
+            let overflow = traces.len() - MAX_RETAINED_TRACES;
+            traces.drain(..overflow);
         }
-        self.sync_to_disk();
     }
 
     pub fn invocation_attempts(&self, invocation_id: &str) -> usize {
@@ -4073,23 +4074,19 @@ impl BillingEngine {
             .sum()
     }
 
-    /// Final delivery outcome is distinct from whether partial output was billed.
+    /// Final delivery outcome is distinct from whether partial output was billed. Like
+    /// [`Self::record_trace`], it is saved with the next commit rather than on its own.
     pub fn finish_trace(&self, invocation_id: &str, status: TraceStatus, error: Option<&str>) {
+        let _guard = self.state_lock.write().unwrap();
+        let mut traces = self.traces.write().unwrap();
+        if let Some(trace) = traces
+            .iter_mut()
+            .rev()
+            .find(|t| t.invocation_id == invocation_id)
         {
-            let _guard = self.state_lock.write().unwrap();
-            let mut traces = self.traces.write().unwrap();
-            if let Some(trace) = traces
-                .iter_mut()
-                .rev()
-                .find(|t| t.invocation_id == invocation_id)
-            {
-                trace.status = status;
-                trace.error_class = error.map(str::to_owned);
-            } else {
-                return;
-            }
+            trace.status = status;
+            trace.error_class = error.map(str::to_owned);
         }
-        self.sync_to_disk();
     }
 
     /// List recorded request execution traces.

@@ -551,3 +551,61 @@ fn reports_saturate_instead_of_wrapping_on_extreme_entries() {
     assert_eq!(rankings[0].total_tokens, u64::MAX);
     assert_eq!(rankings[0].provider_cost_micro_cny, i64::MAX);
 }
+
+#[test]
+fn traces_ride_along_with_the_next_commit_instead_of_saving_on_their_own() {
+    let dir = std::env::temp_dir().join(format!(
+        "kiro-trace-commits-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("billing_state.json");
+    let engine = BillingEngine::new();
+    engine.set_persistence_path(&path);
+    let mut card = Card::new("card-trace", "group", 100_000_000);
+    card.status = CardStatus::Active;
+    engine.upsert_card(card);
+
+    let saves = engine.snapshot_sequence();
+    engine.record_trace(RequestTrace {
+        id: "trace-1".into(),
+        card_id: "card-trace".into(),
+        ts: 1000,
+        invocation_id: "inv-trace".into(),
+        exposed_model: "model".into(),
+        status: TraceStatus::InProgress,
+        ttft_ms: None,
+        tokens_per_second: None,
+        error_class: None,
+        provider_id: None,
+        input_tokens: 0,
+        output_tokens: 0,
+        credits_charged: 0,
+        provider_cost_micro_cny: 0,
+        attempt_chain: Vec::new(),
+    });
+    engine.finish_trace("inv-trace", TraceStatus::Success, None);
+    assert_eq!(engine.snapshot_sequence(), saves, "a trace costs no save of its own");
+
+    // The next commit carries it.
+    engine
+        .reserve(
+            "card-trace",
+            "inv-next",
+            &ReservationEstimateParams::new(10, 10),
+            1000,
+            60,
+        )
+        .unwrap();
+    let restored = BillingEngine::new();
+    restored.load_from_file(&path).unwrap();
+    let traces = restored.list_traces(None, 10);
+    assert!(traces
+        .iter()
+        .any(|t| t.invocation_id == "inv-trace" && t.status == TraceStatus::Success));
+    let _ = std::fs::remove_dir_all(dir);
+}
