@@ -178,6 +178,14 @@ impl SettingsManager {
     /// touches the token, so a file it cannot edit is refused while nothing has changed.
     pub fn plan_merge(&self, gateway_url: &str) -> Result<Vec<u8>, SettingsError> {
         let region = REDIRECTED_REGION;
+        // Written by rename, a file with other names would keep the takeover under one
+        // name only, and the rollback could not bring them together again.
+        let target = crate::token_storage::link_target(&self.settings_path)?;
+        if target.exists() && hard_links(&target)? > 1 {
+            return Err(invalid_data(
+                "settings.json has more than one hard link, which a takeover would separate; remove the extra links and try again",
+            ));
+        }
         let raw = self.read_raw()?;
         let text = SettingsText::parse(&raw, Reading::Kiro)?;
         let mut map = parse_settings_bytes(&raw)?;
@@ -452,14 +460,16 @@ impl SettingsManager {
     }
 
     fn atomic_write_bytes(&self, bytes: &[u8]) -> Result<(), SettingsError> {
-        if let Some(parent) = self.settings_path.parent() {
+        // A linked settings.json (dotfiles) is written where it lives, and stays linked.
+        let target = crate::token_storage::link_target(&self.settings_path)?;
+        if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
-        crate::patch::remove_stale_temps(&self.settings_path);
+        crate::patch::remove_stale_temps(&target);
 
-        let temp_file = self.settings_path.with_file_name(format!(
+        let temp_file = target.with_file_name(format!(
             "{}.tmp.{}.{}",
-            self.settings_path
+            target
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("settings.json"),
@@ -476,7 +486,7 @@ impl SettingsManager {
             file.sync_all()?;
         }
 
-        if let Err(e) = atomic_replace(&temp_file, &self.settings_path) {
+        if let Err(e) = atomic_replace(&temp_file, &target) {
             let _ = fs::remove_file(&temp_file);
             return Err(SettingsError::Io(e));
         }
@@ -843,6 +853,38 @@ fn cst_value(value: &Value) -> CstInputValue {
                 .map(|(key, value)| (key.clone(), cst_value(value)))
                 .collect(),
         ),
+    }
+}
+
+/// How many names the file at `path` has.
+fn hard_links(path: &Path) -> std::io::Result<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(fs::metadata(path)?.nlink())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        #[link(name = "kernel32")]
+        extern "system" {
+            // BY_HANDLE_FILE_INFORMATION: thirteen DWORDs, the link count the eleventh.
+            fn GetFileInformationByHandle(
+                file: *mut std::ffi::c_void,
+                information: *mut [u32; 13],
+            ) -> i32;
+        }
+        let file = File::open(path)?;
+        let mut information = [0u32; 13];
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(u64::from(information[10]))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Ok(1)
     }
 }
 

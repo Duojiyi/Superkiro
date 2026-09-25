@@ -838,6 +838,57 @@ mod tests {
         }
     }
 
+    /// A token file that is a symbolic link stays one, through the takeover's token and
+    /// the restore of the customer's own: both are written to the file it points to.
+    #[test]
+    fn a_linked_token_file_stays_linked_through_takeover_and_restore() {
+        let root = std::env::temp_dir().join(format!("linked-token-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let target = root.join("elsewhere").join("kiro-auth-token.json");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, b"official-token").unwrap();
+        let link = root.join("cache").join("kiro-auth-token.json");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&target, &link);
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&target, &link);
+        if let Err(error) = linked {
+            eprintln!("skipped: symbolic links cannot be created here ({error})");
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        let storage = TokenStorage::at(&link);
+        let desktop = DesktopSession::new(storage.clone(), root.join("session.json"));
+        desktop
+            .save(&Session {
+                gateway: "https://fixture.invalid".into(),
+                device: "fixture".into(),
+                previous_token: Some(PreviousToken::Raw(b"official-token".to_vec())),
+                authenticated: true,
+                ca_path: None,
+            })
+            .unwrap();
+
+        let token = KiroAuthToken::new("gateway", "refresh", "profile", "2099-01-01T00:00:00Z");
+        storage.save(&token).unwrap();
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(storage.load().unwrap(), token);
+        desktop.restore_token().unwrap();
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&target).unwrap(), b"official-token");
+        for side in [link.parent().unwrap(), target.parent().unwrap()] {
+            assert_eq!(fs::read_dir(side).unwrap().count(), 1, "{side:?}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn recovery_pending_does_not_require_authenticated_or_readable_session() {
         let root =

@@ -312,6 +312,80 @@ fn a_syntax_error_no_reading_gets_past_is_located_and_nothing_is_written() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+/// A symbolic link at `link` to `target`.
+fn symlink(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link)
+    }
+}
+
+/// A settings.json linked into a dotfiles repository stays linked: the takeover and its
+/// rollback edit the file it points to. Replaced by rename, the link became a detached
+/// copy, and every later change missed the repository.
+#[test]
+fn a_linked_settings_file_stays_linked_through_takeover_and_rollback() {
+    let original = "{\n  \"editor.fontSize\": 15\n}\n";
+    let (dir, _) = settings_file("linked", b"");
+    let target = dir.join("dotfiles").join("settings.json");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, original).unwrap();
+    let link = dir.join("User").join("settings.json");
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    if let Err(error) = symlink(&target, &link) {
+        eprintln!("skipped: symbolic links cannot be created here ({error})");
+        fs::remove_dir_all(dir).unwrap();
+        return;
+    }
+    let manager = SettingsManager::at(&link);
+
+    let prior = manager.merge_byok(GATEWAY).unwrap();
+    assert!(fs::symlink_metadata(&link)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert!(fs::read_to_string(&target)
+        .unwrap()
+        .contains("kiroAuthConfig"));
+    manager.revert(&prior, GATEWAY).unwrap();
+    assert!(fs::symlink_metadata(&link)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(fs::read_to_string(&target).unwrap(), original);
+    for side in [link.parent().unwrap(), target.parent().unwrap()] {
+        assert_eq!(fs::read_dir(side).unwrap().count(), 1, "{side:?}");
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// A settings.json with a second name (a hard link) is refused: replaced by rename, only
+/// one name would carry the takeover, and the rollback could not join them again.
+#[test]
+fn a_settings_file_with_another_hard_link_is_refused_and_left_alone() {
+    let original = "{\n  \"editor.fontSize\": 15\n}\n";
+    let (dir, manager) = settings_file("hard-link", original.as_bytes());
+    let other = dir.join("settings-elsewhere.json");
+    fs::hard_link(manager.path(), &other).unwrap();
+
+    let error = manager.merge_byok(GATEWAY).unwrap_err();
+    assert!(
+        error.to_string().contains("more than one hard link"),
+        "{error}"
+    );
+    assert!(manager.plan_merge(GATEWAY).is_err());
+    assert_eq!(text(&manager), original);
+    assert_eq!(fs::read_to_string(&other).unwrap(), original);
+
+    fs::remove_file(&other).unwrap();
+    manager.merge_byok(GATEWAY).unwrap();
+    fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn a_takeover_of_no_file_rolls_back_to_no_file() {
     let dir = std::env::temp_dir().join(format!("settings-in-place-none-{}", std::process::id()));
