@@ -76,17 +76,57 @@ pub fn client_ip_parts(extensions: &Extensions, headers: &HeaderMap) -> String {
                 return real_ip.to_string();
             }
         }
+        if headers.contains_key("x-forwarded-for") || headers.contains_key("x-real-ip") {
+            warn_untrusted_forwarder(peer_ip);
+        }
         return peer_ip.to_string();
     }
     "unknown".to_string()
 }
 
+/// A proxy whose forwarded address is ignored makes every client behind it one client:
+/// they share each per-address rate limit and lockout, so one customer's traffic or failed
+/// attempts shut out all the others. Say so once, loudly, instead of degrading in silence.
+fn warn_untrusted_forwarder(peer: IpAddr) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "[!] Forwarded client address from {peer} ignored: it is not in TRUSTED_PROXY_CIDRS \
+             (or TRUSTED_PROXY_HEADERS is off). Every client behind that proxy now shares one \
+             rate limit and lockout."
+        );
+    }
+}
+
 pub fn validate_trusted_proxy_config() -> Result<(), String> {
-    if proxy_headers_enabled() && trusted_proxy_networks().is_empty() {
+    if !proxy_headers_enabled() {
+        return Ok(());
+    }
+    let configured = std::env::var("TRUSTED_PROXY_CIDRS").unwrap_or_default();
+    let entries: Vec<&str> = configured
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    validate_trusted_networks(&entries)
+}
+
+/// Every configured entry must parse, and none may cover every address: a silently
+/// dropped typo stops trusting the real proxy, and a catch-all trusts forged headers.
+fn validate_trusted_networks(entries: &[&str]) -> Result<(), String> {
+    if entries.is_empty() {
         return Err(
             "TRUSTED_PROXY_HEADERS=true requires TRUSTED_PROXY_CIDRS; refusing to trust forged forwarding headers"
                 .to_string(),
         );
+    }
+    for entry in entries {
+        let problem = match parse_network(entry) {
+            None => "is not an address or CIDR",
+            Some((_, 0)) => "trusts every address; name the proxy network",
+            Some(_) => continue,
+        };
+        return Err(format!("TRUSTED_PROXY_CIDRS entry {entry:?} {problem}"));
     }
     Ok(())
 }
@@ -101,20 +141,19 @@ fn trusted_proxy_networks() -> Vec<(IpAddr, u8)> {
     std::env::var("TRUSTED_PROXY_CIDRS")
         .unwrap_or_default()
         .split(',')
-        .filter_map(|entry| {
-            let mut parts = entry.trim().splitn(2, '/');
-            let ip = parts.next()?.parse().ok()?;
-            let prefix = parts
-                .next()
-                .and_then(|value| value.parse::<u8>().ok())
-                .unwrap_or(match ip {
-                    IpAddr::V4(_) => 32,
-                    IpAddr::V6(_) => 128,
-                });
-            let max = if ip.is_ipv4() { 32 } else { 128 };
-            (prefix <= max).then_some((ip, prefix))
-        })
+        .filter_map(|entry| parse_network(entry.trim()))
         .collect()
+}
+
+fn parse_network(entry: &str) -> Option<(IpAddr, u8)> {
+    let mut parts = entry.splitn(2, '/');
+    let ip: IpAddr = parts.next()?.parse().ok()?;
+    let max = if ip.is_ipv4() { 32 } else { 128 };
+    let prefix = match parts.next() {
+        None => max,
+        Some(value) => value.parse::<u8>().ok()?,
+    };
+    (prefix <= max).then_some((ip, prefix))
 }
 
 fn is_trusted_proxy(ip: IpAddr) -> bool {
@@ -599,6 +638,37 @@ impl PortalChallengeManager {
         }
         nonces.insert(claims.nonce, claims.exp);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod trusted_network_tests {
+    use super::*;
+
+    #[test]
+    fn a_typo_or_a_catch_all_in_the_trusted_networks_refuses_to_start() {
+        for good in [&["172.30.82.0/24"][..], &["10.0.0.1", "fd00::/8"]] {
+            assert!(validate_trusted_networks(good).is_ok(), "{good:?}");
+        }
+        for bad in [
+            &[][..],
+            &["172.30.82.0/33"],
+            &["172.30.82.0/abc"],
+            &["caddy"],
+            &["172.30.82.0/24", "0.0.0.0/0"],
+            &["::/0"],
+        ] {
+            assert!(validate_trusted_networks(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_bad_prefix_is_not_read_as_a_single_host() {
+        assert_eq!(parse_network("10.0.0.0/abc"), None);
+        assert_eq!(
+            parse_network("10.0.0.7"),
+            Some(("10.0.0.7".parse().unwrap(), 32))
+        );
     }
 }
 

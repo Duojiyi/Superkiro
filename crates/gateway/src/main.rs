@@ -236,7 +236,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     registry.register_portal_facades(billing.clone(), Some(store.clone()));
 
     // 5.1 注册管理端 REST 接口 (P0-01, P0-02, P1-02)
-    let admin_key = required_secret("ADMIN_KEY").or_else(|_| required_secret("ADMIN_SECRET"))?;
+    // ADMIN_SECRET is the older name. When neither works, the ADMIN_KEY reason is the one to fix.
+    let admin_key = required_secret("ADMIN_KEY")
+        .or_else(|primary| required_secret("ADMIN_SECRET").map_err(|_| primary))?;
     if admin_key == auth_secret {
         return Err("ADMIN_KEY must be different from AUTH_SECRET".into());
     }
@@ -438,16 +440,34 @@ fn get_secret_from_env_or_file(name: &str) -> Result<Option<String>, Box<dyn std
     Ok(None)
 }
 
+/// Example values from the shipped env template and README. They pass the length check,
+/// and a gateway started with one signs card and admin tokens that anyone can forge.
+const EXAMPLE_SECRETS: &[&str] = &[
+    "generate-a-secure-random-string-at-least-32-chars-long!",
+    "generate-a-different-admin-secret-at-least-32-chars!",
+    "a_very_secure_random_string_32_characters_long!",
+];
+
 fn required_secret(name: &str) -> Result<String, Box<dyn std::error::Error>> {
     let value = get_secret_from_env_or_file(name)?.ok_or_else(|| {
         format!(
             "{name} (or {name}_FILE) must be set; refusing to start without production credentials"
         )
     })?;
-    if value.len() < 32 {
-        return Err(format!("{name} must be at least 32 characters").into());
-    }
+    usable_secret(name, &value)?;
     Ok(value)
+}
+
+fn usable_secret(name: &str, value: &str) -> Result<(), String> {
+    if value.len() < 32 {
+        return Err(format!("{name} must be at least 32 characters"));
+    }
+    if EXAMPLE_SECRETS.contains(&value.trim()) {
+        return Err(format!(
+            "{name} is the documented example value; generate a random secret"
+        ));
+    }
+    Ok(())
 }
 
 fn env_flag(name: &str, default: bool) -> bool {
@@ -500,4 +520,18 @@ async fn shutdown_signal() {
         "
 [*] Graceful shutdown signal received, draining server connections..."
     );
+}
+
+#[cfg(test)]
+mod secret_tests {
+    use super::*;
+
+    #[test]
+    fn a_documented_example_secret_refuses_to_start() {
+        for example in EXAMPLE_SECRETS {
+            assert!(usable_secret("AUTH_SECRET", example).is_err(), "{example}");
+        }
+        assert!(usable_secret("AUTH_SECRET", "too-short").is_err());
+        assert!(usable_secret("AUTH_SECRET", &"k7".repeat(20)).is_ok());
+    }
 }
