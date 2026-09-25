@@ -133,7 +133,7 @@ async fn keepalives_continue_while_a_tool_call_is_generated() {
             let _ = tx
                 .send(Ok(ProviderStreamEvent::Delta(
                     ProviderDelta::ToolCallChunk {
-                        index: 0,
+                        index: Some(0),
                         id: first.then(|| "call-write".to_string()),
                         name: first.then(|| "fsWrite".to_string()),
                         arguments: if first { "{\"text\":\"" } else { "line " }.to_string(),
@@ -145,7 +145,7 @@ async fn keepalives_continue_while_a_tool_call_is_generated() {
         let _ = tx
             .send(Ok(ProviderStreamEvent::Delta(
                 ProviderDelta::ToolCallChunk {
-                    index: 0,
+                    index: Some(0),
                     id: None,
                     name: None,
                     arguments: "\"}".to_string(),
@@ -182,6 +182,98 @@ async fn keepalives_continue_while_a_tool_call_is_generated() {
     );
 }
 
+/// The tool calls Kiro receives when an OpenAI-compatible upstream streams `lines`,
+/// as (toolUseId, name, input).
+async fn tool_calls_from_openai(lines: &[&str]) -> Vec<(String, String, String)> {
+    use gateway::provider::ModelProvider;
+    let mut events = Vec::new();
+    for line in lines {
+        let parsed = gateway::provider::openai::OpenAiProvider
+            .parse_stream_line(line)
+            .unwrap();
+        events.extend(parsed.into_iter().map(Ok::<_, ProviderError>));
+    }
+    let stream = create_stream_guard(
+        futures_util::stream::iter(events),
+        StreamGuardConfig::default(),
+        None,
+        None,
+        None,
+    );
+    collect_and_decode_frames(stream)
+        .await
+        .into_iter()
+        .filter(|(name, _)| name == "toolUseEvent")
+        .map(|(_, payload)| {
+            let event: ToolUseEvent = decode_single_event(&payload);
+            (event.tool_use_id, event.name, event.input)
+        })
+        .collect()
+}
+
+fn call(id: &str, name: &str, input: &str) -> (String, String, String) {
+    (id.to_string(), name.to_string(), input.to_string())
+}
+
+// Some OpenAI-compatible upstreams stream parallel tool calls without an `index`, each
+// call opened by its id. They are separate calls, not one call with joined arguments.
+#[tokio::test]
+async fn parallel_tool_calls_without_an_index_stay_separate() {
+    let calls = tool_calls_from_openai(&[
+        r#"data: {"choices":[{"delta":{"tool_calls":[{"id":"call-a","type":"function","function":{"name":"readFile","arguments":"{\"path\":"}}]}}]}"#,
+        r#"data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"\"a.py\"}"}}]}}]}"#,
+        r#"data: {"choices":[{"delta":{"tool_calls":[{"id":"call-b","type":"function","function":{"name":"readFile","arguments":"{\"path\":\"b.py\"}"}}]}}]}"#,
+        r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        "data: [DONE]",
+    ])
+    .await;
+    assert_eq!(
+        calls,
+        vec![
+            call("call-a", "readFile", r#"{"path":"a.py"}"#),
+            call("call-b", "readFile", r#"{"path":"b.py"}"#),
+        ]
+    );
+
+    // With an index, the index decides, however the fragments interleave.
+    let calls = tool_calls_from_openai(&[
+        r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-a","function":{"name":"readFile","arguments":""}}]}}]}"#,
+        r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call-b","function":{"name":"listDir","arguments":""}}]}}]}"#,
+        r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"dir\":\"src\"}"}}]}}]}"#,
+        r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":\"a.py\"}"}}]}}]}"#,
+        "data: [DONE]",
+    ])
+    .await;
+    assert_eq!(
+        calls,
+        vec![
+            call("call-a", "readFile", r#"{"path":"a.py"}"#),
+            call("call-b", "listDir", r#"{"dir":"src"}"#),
+        ]
+    );
+}
+
+// An empty id or name on a continuation fragment is not a new identity: the call keeps
+// the one it opened with instead of being blanked and silently dropped.
+#[tokio::test]
+async fn an_empty_id_or_name_on_a_continuation_keeps_the_call() {
+    for index in [r#""index":0,"#, ""] {
+        let calls = tool_calls_from_openai(&[
+            &format!(r#"data: {{"choices":[{{"delta":{{"tool_calls":[{{{index}"id":"call-1","type":"function","function":{{"name":"readFile","arguments":""}}}}]}}}}]}}"#),
+            &format!(r#"data: {{"choices":[{{"delta":{{"tool_calls":[{{{index}"id":"","function":{{"name":"","arguments":"{{\"path\":"}}}}]}}}}]}}"#),
+            &format!(r#"data: {{"choices":[{{"delta":{{"tool_calls":[{{{index}"id":"","function":{{"name":"","arguments":"\"a.py\"}}"}}}}]}}}}]}}"#),
+            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "data: [DONE]",
+        ])
+        .await;
+        assert_eq!(
+            calls,
+            vec![call("call-1", "readFile", r#"{"path":"a.py"}"#)],
+            "with {index:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_stream_guard_normal_flow_with_tool_use_and_usage() {
     let (tx, rx) = mpsc::channel(16);
@@ -208,7 +300,7 @@ async fn test_stream_guard_normal_flow_with_tool_use_and_usage() {
         let _ = tx
             .send(Ok(ProviderStreamEvent::Delta(
                 ProviderDelta::ToolCallChunk {
-                    index: 0,
+                    index: Some(0),
                     id: Some("call_abc123".to_string()),
                     name: Some(safe_tool_name),
                     arguments: "{\"arg\":42}".to_string(),

@@ -62,7 +62,7 @@ impl ModelProvider for Scripted {
             } else {
                 events.push(Ok(ProviderStreamEvent::Delta(
                     ProviderDelta::ToolCallChunk {
-                        index: 0,
+                        index: Some(0),
                         id: Some("tool-id".into()),
                         name: Some("test".into()),
                         arguments: "{}".into(),

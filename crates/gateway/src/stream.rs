@@ -13,7 +13,7 @@ use billing::engine::{BillingEngine, BillingError};
 use billing::ledger::UsageTokens;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// RAII settler for credit reservations (Spec §6.1, §6.3, §6.7).
@@ -225,6 +225,35 @@ struct ToolBuffer {
     arguments: String,
 }
 
+/// Tool calls being assembled, in the order they opened.
+#[derive(Default)]
+struct ToolCalls {
+    calls: Vec<ToolBuffer>,
+    by_index: HashMap<usize, usize>,
+    by_id: HashMap<String, usize>,
+}
+
+impl ToolCalls {
+    /// The call a fragment belongs to: by its index when it has one, otherwise by its id,
+    /// otherwise the latest call. `None` when it opens a new call.
+    fn find(&self, index: Option<usize>, id: Option<&str>) -> Option<usize> {
+        match (index, id) {
+            (Some(index), _) => self.by_index.get(&index).copied(),
+            (None, Some(id)) => self.by_id.get(id).copied(),
+            (None, None) => self.calls.len().checked_sub(1),
+        }
+    }
+
+    fn open(&mut self, index: Option<usize>) -> usize {
+        self.calls.push(ToolBuffer::default());
+        let position = self.calls.len() - 1;
+        if let Some(index) = index {
+            self.by_index.insert(index, position);
+        }
+        position
+    }
+}
+
 /// Simple Stream wrapper around tokio mpsc::Receiver for binary frame chunks.
 pub struct FrameStream {
     inner: tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>,
@@ -282,7 +311,7 @@ pub fn create_stream_guard_with_send_deadline(
         tokio::pin!(deadline_sleep);
         interval.tick().await;
         let mut upstream = Box::pin(upstream_stream);
-        let mut tool_buffers: BTreeMap<usize, ToolBuffer> = BTreeMap::new();
+        let mut tool_calls = ToolCalls::default();
         let mut tool_argument_bytes = 0usize;
         let mut failure: Option<Failure> = None;
         let mut usage = crate::provider::TokenUsage::default();
@@ -324,15 +353,18 @@ pub fn create_stream_guard_with_send_deadline(
                                     Some(kiro_wire::encoder::encode_reasoning(Some(&text), None, None))
                                 }
                                 ProviderDelta::ToolCallChunk { index, id, name, arguments } => {
-                                    saw_output |= !arguments.is_empty()
-                                        || id.as_ref().is_some_and(|value| !value.is_empty())
-                                        || name.as_ref().is_some_and(|value| !value.is_empty());
+                                    // An empty id or name on a continuation names nothing; it
+                                    // must not blank the call it continues.
+                                    let id = id.filter(|value| !value.is_empty());
+                                    let name = name.filter(|value| !value.is_empty());
+                                    saw_output |= !arguments.is_empty() || id.is_some() || name.is_some();
                                     output_units = output_units.saturating_add(crate::usage_estimate::token_units(&arguments))
                                         .saturating_add(name.as_ref().map_or(0, |n| crate::usage_estimate::token_units(n)));
                                     // Truncated arguments would reach Kiro as a malformed tool
                                     // call, so a response over the limits ends instead, billed
                                     // for what it produced.
-                                    if !tool_buffers.contains_key(&index) && tool_buffers.len() >= MAX_TOOL_CALLS {
+                                    let position = tool_calls.find(index, id.as_deref());
+                                    if position.is_none() && tool_calls.calls.len() >= MAX_TOOL_CALLS {
                                         failure = Some(Failure::oversized_tool_call(
                                             "Response opened more tool calls than the gateway accepts",
                                         ));
@@ -345,8 +377,12 @@ pub fn create_stream_guard_with_send_deadline(
                                         ));
                                         break 'stream;
                                     }
-                                    let buf = tool_buffers.entry(index).or_default();
-                                    if let Some(id) = id { buf.id = id; }
+                                    let position = position.unwrap_or_else(|| tool_calls.open(index));
+                                    if let Some(id) = id {
+                                        tool_calls.by_id.entry(id.clone()).or_insert(position);
+                                        tool_calls.calls[position].id = id;
+                                    }
+                                    let buf = &mut tool_calls.calls[position];
                                     if let Some(name) = name {
                                         buf.name = tool_registry.as_ref().map_or_else(|| name.clone(), |r| r.restore(&name));
                                     }
@@ -407,7 +443,7 @@ pub fn create_stream_guard_with_send_deadline(
                                 failure = Some(Failure::new(None, "Upstream completed without producing any output"));
                                 break;
                             }
-                            for (_, buf) in std::mem::take(&mut tool_buffers) {
+                            for buf in std::mem::take(&mut tool_calls.calls) {
                                 if !buf.name.is_empty() || !buf.id.is_empty() {
                                     let frame = kiro_wire::encoder::encode_tool_use(&buf.name, &buf.id, &buf.arguments, true);
                                     if !send_frame(&tx, Bytes::from(frame), send_deadline).await { break 'stream; }

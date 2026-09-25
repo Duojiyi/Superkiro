@@ -287,7 +287,10 @@ impl ModelProvider for AnthropicProvider {
                 }
             }
             "content_block_start" => {
-                let index = val.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                let index = val
+                    .get("index")
+                    .and_then(|i| i.as_u64())
+                    .map(|i| i as usize);
                 if let Some(block) = val.get("content_block") {
                     let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
                     if block_type == "tool_use" {
@@ -309,7 +312,10 @@ impl ModelProvider for AnthropicProvider {
                 }
             }
             "content_block_delta" => {
-                let index = val.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                let index = val
+                    .get("index")
+                    .and_then(|i| i.as_u64())
+                    .map(|i| i as usize);
                 if let Some(delta) = val.get("delta") {
                     let delta_type = delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
                     match delta_type {

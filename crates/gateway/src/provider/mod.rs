@@ -191,8 +191,11 @@ pub struct ChatRequest {
 pub enum ProviderDelta {
     Text(String),
     Reasoning(String),
+    /// A fragment of a tool call. `index` is the call's position when the upstream says
+    /// it; without one, a fragment with an id opens or continues that call, and one with
+    /// neither continues the latest call.
     ToolCallChunk {
-        index: usize,
+        index: Option<usize>,
         id: Option<String>,
         name: Option<String>,
         arguments: String,

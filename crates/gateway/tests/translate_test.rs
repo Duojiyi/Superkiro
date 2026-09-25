@@ -134,7 +134,7 @@ fn test_audit_b_ultra_long_tool_name_shortening_and_restoration() {
     let mut state = StreamTranslationState::new("test-model");
 
     let chunk_event = ProviderStreamEvent::Delta(ProviderDelta::ToolCallChunk {
-        index: 0,
+        index: Some(0),
         id: Some("call_abc".to_string()),
         name: Some(shortened),
         arguments: "{\"cmd\": \"ls\"}".to_string(),
