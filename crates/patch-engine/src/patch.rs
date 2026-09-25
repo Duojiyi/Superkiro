@@ -708,27 +708,84 @@ fn render_patch_for(
     // Match the whole literal, never its contents. This includes the runtime
     // template literal whose ${t} must disappear along with its backticks: every
     // occurrence of the needle has to be one, or the patch would miss a use.
-    let needles = content.matches(recipe.needle.as_str()).count();
-    let mut body = content.to_string();
+    let mut body = String::with_capacity(content.len());
+    let mut copied = 0;
     let mut replaced = 0;
-    for quote in ['"', '\'', '`'] {
-        let literal = format!("{quote}{}{quote}", recipe.needle);
-        // Anyone else keeps the literal as Kiro wrote it.
-        let replacement = match &is_owner {
-            Some(is_owner) => format!("({is_owner}?{replacement}:{literal})"),
-            None => replacement.clone(),
+    for found in needle_occurrences(content, &recipe.needle) {
+        let quote = content[..found.start].chars().next_back();
+        let whole =
+            quote.filter(|q| matches!(q, '"' | '\'' | '`') && content[found.end..].starts_with(*q));
+        let Some(quote) = whole else {
+            if found.exact {
+                return Err(PatchError::NeedleNotFound);
+            }
+            // Another variable's form outside a whole literal was never patched before;
+            // left as it is, it cannot refuse a bundle earlier versions accepted.
+            continue;
         };
-        replaced += body.matches(&literal).count();
-        body = body.replace(&literal, &replacement);
+        let (start, end) = (found.start - quote.len_utf8(), found.end + quote.len_utf8());
+        body.push_str(&content[copied..start]);
+        match &is_owner {
+            // Anyone else keeps the literal as Kiro wrote it.
+            Some(is_owner) => body.push_str(&format!(
+                "({is_owner}?{replacement}:{})",
+                &content[start..end]
+            )),
+            None => body.push_str(&replacement),
+        }
+        copied = end;
+        replaced += 1;
     }
-    if replaced == 0 || replaced != needles {
+    if replaced == 0 {
         return Err(PatchError::NeedleNotFound);
     }
+    body.push_str(&content[copied..]);
     Ok(format!(
         "{}\n{}",
         recipe.marker,
         repair_credit_display(&repair_proxy_tls(&body))
     ))
+}
+
+/// One place the needle occurs, as a byte range of the bundle.
+struct NeedleOccurrence {
+    start: usize,
+    end: usize,
+    /// Written exactly as the needle, `${t}` and all.
+    exact: bool,
+}
+
+/// Where `needle` occurs in `content`. Its `${t}` stands for any identifier: Kiro names
+/// the region variable differently from one use to the next, and 1.1.70 builds its
+/// activity publisher's endpoint as `https://runtime.${n}.kiro.dev`.
+fn needle_occurrences(content: &str, needle: &str) -> Vec<NeedleOccurrence> {
+    let Some((head, tail)) = needle.split_once("${t}") else {
+        return content
+            .match_indices(needle)
+            .map(|(start, found)| NeedleOccurrence {
+                start,
+                end: start + found.len(),
+                exact: true,
+            })
+            .collect();
+    };
+    let (head, tail) = (format!("{head}${{"), format!("}}{tail}"));
+    content
+        .match_indices(&head)
+        .filter_map(|(start, _)| {
+            let rest = &content[start + head.len()..];
+            let name = rest
+                .bytes()
+                .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$'))
+                .count();
+            (name > 0 && !rest.as_bytes()[0].is_ascii_digit() && rest[name..].starts_with(&tail))
+                .then(|| NeedleOccurrence {
+                    start,
+                    end: start + head.len() + name + tail.len(),
+                    exact: &rest[..name] == "t",
+                })
+        })
+        .collect()
 }
 
 // Only the runtime belonging to this extension may validate a real installation.
@@ -903,11 +960,14 @@ fn atomic_replace(temp: &Path, target: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Kiro 1.1.14 bundles https-proxy-agent with an IP tunnel identity bug:
+/// Kiro bundles https-proxy-agent and socks-proxy-agent with an IP tunnel identity bug:
 /// removing host while SNI is unset makes Node verify "localhost" instead.
 /// Preserve host for normal certificate verification; do not override TLS checks.
+/// Both open the tunnelled connection as `X.connect({...omit(normalise(r),"host","path",
+/// "port"),socket:s})`; the helpers' minified names change with every Kiro build.
 fn repair_proxy_tls(content: &str) -> String {
-    content
+    const OMITTED: &str = ",\"host\",\"path\",\"port\"),socket:";
+    let content = content
         .replace(
             "M5o(N5o(r),\"host\",\"path\",\"port\")",
             "M5o(N5o(r),\"path\",\"port\")",
@@ -915,7 +975,39 @@ fn repair_proxy_tls(content: &str) -> String {
         .replace(
             "qyl($yl(r),\"host\",\"path\",\"port\")",
             "qyl($yl(r),\"path\",\"port\")",
-        )
+        );
+    let mut repaired = String::with_capacity(content.len());
+    let mut copied = 0;
+    for (at, _) in content.match_indices(OMITTED) {
+        if tunnel_options_before(&content[..at]) {
+            repaired.push_str(&content[copied..at]);
+            repaired.push_str(",\"path\",\"port\"),socket:");
+            copied = at + OMITTED.len();
+        }
+    }
+    repaired.push_str(&content[copied..]);
+    repaired
+}
+
+/// Whether `before` ends in `.connect({...omit(normalise(r)`, whatever the names.
+fn tunnel_options_before(before: &str) -> bool {
+    /// `text` without the identifier it ends in; None when it ends in none.
+    fn identifier(text: &str) -> Option<&str> {
+        let name = text
+            .bytes()
+            .rev()
+            .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$'))
+            .count();
+        (name > 0).then(|| &text[..text.len() - name])
+    }
+    before
+        .strip_suffix(')')
+        .and_then(identifier)
+        .and_then(|text| text.strip_suffix('('))
+        .and_then(identifier)
+        .and_then(|text| text.strip_suffix('('))
+        .and_then(identifier)
+        .is_some_and(|text| text.ends_with(".connect({..."))
 }
 
 // Kiro 1.1.14's getItemContent interpolates full-precision usage into the
@@ -951,6 +1043,118 @@ mod proxy_tls_tests {
             render_patch(&bundle, "https://160.202.47.98", &PatchRecipe::default()).unwrap();
         assert!(rendered.contains(expected));
         assert!(!rendered.contains(original));
+    }
+
+    /// Kiro 1.1.70: new names in both proxy agents, the same shape.
+    #[test]
+    fn proxy_tls_repair_follows_renamed_helpers() {
+        for (original, expected) in [
+            (
+                "r.secureEndpoint?(wLe(\"Upgrading\"),CVo.connect({...TVo(IVo(r),\"host\",\"path\",\"port\"),socket:s})):s",
+                "r.secureEndpoint?(wLe(\"Upgrading\"),CVo.connect({...TVo(IVo(r),\"path\",\"port\"),socket:s})):s",
+            ),
+            (
+                "let m=RPl.connect({...MPl(OPl(r),\"host\",\"path\",\"port\"),socket:h});",
+                "let m=RPl.connect({...MPl(OPl(r),\"path\",\"port\"),socket:h});",
+            ),
+            (
+                "a.connect({...$b($c(e),\"host\",\"path\",\"port\"),socket:x})",
+                "a.connect({...$b($c(e),\"path\",\"port\"),socket:x})",
+            ),
+        ] {
+            assert_eq!(repair_proxy_tls(original), expected);
+            assert_eq!(repair_proxy_tls(expected), expected);
+        }
+        // The same keys anywhere else are not a tunnel's TLS options.
+        for untouched in [
+            "pick(opts,\"host\",\"path\",\"port\"),socket:s",
+            "x={...TVo(IVo(r),\"host\",\"path\",\"port\"),socket:s}",
+            "CVo.connect({...TVo(IVo(r,1),\"host\",\"path\",\"port\"),socket:s})",
+        ] {
+            assert_eq!(repair_proxy_tls(untouched), untouched);
+        }
+    }
+}
+
+#[cfg(test)]
+mod runtime_endpoint_tests {
+    use super::*;
+
+    /// Kiro 1.1.70 builds its activity publisher's endpoint from a variable named `n`.
+    #[test]
+    fn every_region_variable_is_redirected() {
+        let source = "a=c(t=>`https://runtime.${t}.kiro.dev`,\"ji\");\
+            let n=this.region,s=this.endpoint||(n?`https://runtime.${n}.kiro.dev`:void 0);\
+            b=`https://runtime.${$r_1}.kiro.dev`;";
+        let rendered =
+            render_patch_for(source, "https://gw.test", &PatchRecipe::default(), None).unwrap();
+        assert!(!rendered.contains("https://runtime."), "{rendered}");
+        assert_eq!(rendered.matches("\"https://gw.test\"").count(), 3);
+        assert!(rendered.contains(
+            "s=this.endpoint||(n?(process.env.KIRO_GATEWAY_URL||\"https://gw.test\"):void 0)"
+        ));
+    }
+
+    /// Anyone but the owner keeps each literal as Kiro wrote it, its own variable included.
+    #[test]
+    fn the_fallback_keeps_each_literal_verbatim() {
+        let source =
+            "s=n?`https://runtime.${n}.kiro.dev`:void 0;e=`https://runtime.${t}.kiro.dev`;";
+        let rendered = render_patch_for(
+            source,
+            "https://gw.test",
+            &PatchRecipe::default(),
+            Some("/home/taker"),
+        )
+        .unwrap();
+        assert!(
+            rendered.contains(":`https://runtime.${n}.kiro.dev`)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(":`https://runtime.${t}.kiro.dev`)"),
+            "{rendered}"
+        );
+    }
+
+    /// Forms earlier versions never patched still do not refuse a bundle: another
+    /// variable outside a whole literal, or no identifier at all.
+    #[test]
+    fn unfamiliar_forms_neither_match_nor_refuse() {
+        let source = "a=`https://runtime.${t}.kiro.dev`;\
+            b=`https://runtime.${n}.kiro.dev/x`;\
+            c=`https://runtime.${r.id}.kiro.dev`;\
+            d=`https://runtime.${1}.kiro.dev`;";
+        let rendered = render_patch(source, "https://gw.test", &PatchRecipe::default()).unwrap();
+        assert!(rendered.contains("b=`https://runtime.${n}.kiro.dev/x`"));
+        assert!(rendered.contains("c=`https://runtime.${r.id}.kiro.dev`"));
+        assert!(rendered.contains("d=`https://runtime.${1}.kiro.dev`"));
+        assert!(!rendered.contains("a=`"));
+    }
+
+    /// A bundle from an installed Kiro, rendered and parsed as the takeover would:
+    /// KIRO_BUNDLE=<copy of extension.js> cargo test -p patch-engine installed -- --ignored
+    #[test]
+    #[ignore]
+    fn installed_bundle_renders_and_parses() {
+        let path = std::env::var("KIRO_BUNDLE").expect("set KIRO_BUNDLE");
+        let content = fs::read_to_string(path).unwrap();
+        let rendered = render_patch_for(
+            &content,
+            "https://kiro.rent",
+            &PatchRecipe::default(),
+            Some("c:\\users\\taker"),
+        )
+        .unwrap();
+        // Every runtime literal is owner-gated; no tunnel drops its host any more.
+        let literals = needle_occurrences(&content, RUNTIME_ENDPOINT_NEEDLE).len();
+        assert_eq!(
+            rendered.matches("(process.env.KIRO_GATEWAY_URL||").count(),
+            literals
+        );
+        assert!(!rendered.contains(",\"host\",\"path\",\"port\"),socket:"));
+        check_javascript(Command::new("node"), &rendered).unwrap();
+        eprintln!("{literals} runtime literals redirected");
     }
 }
 
