@@ -186,6 +186,28 @@ class PortalBrowserTests(unittest.TestCase):
             expect(self.page.locator('#release-status')).to_contain_text('暂无可用发布')
             self.assert_disabled('windows-x64')
 
+    def test_03b_unusable_card_offers_no_unbind_and_another_card_can_follow(self):
+        self.goto('/device')
+        # The customer site never advertises the administrator console.
+        self.assertEqual(self.page.locator('a[href="/admin/"]').count(), 0)
+        for status, label in (('voided', '已删除（作废）'), ('banned', '已禁用')):
+            self.query['status'] = status
+            self.verify()
+            expect(self.page.locator('#account-details')).to_contain_text(label)
+            expect(self.page.locator('#masked-card')).to_contain_text(CARD[-4:])
+            self.assertTrue(self.page.locator('#request-unbind').is_disabled())
+            expect(self.page.locator('#device-message')).to_contain_text('不提供解绑')
+            self.page.locator('#reset-card').click()
+        self.query['status'] = 'active'
+        self.verify()
+        self.assertFalse(self.page.locator('#request-unbind').is_disabled())
+        self.page.locator('#request-unbind').click()
+        self.page.locator('#confirm-unbind').click()
+        expect(self.page.locator('#recovery')).to_be_visible()
+        self.page.locator('#another-card').click()
+        expect(self.page.locator('#verify-form')).to_be_visible()
+        expect(self.page.locator('#masked-card')).to_have_text('')
+
     def test_04_query_failures_and_untrusted_text(self):
         self.goto('/device')
         # A lockout's own wait is shown; with none given, the page must not invent one.
@@ -368,7 +390,8 @@ class PortalBrowserTests(unittest.TestCase):
     def test_14_restore_documentation_matches_desktop(self):
         self.goto('/docs/restore')
         section = self.page.locator('[data-doc="restore"]')
-        for text in ['还原 Kiro 配置', '自动关闭 Kiro', '未保存内容可能丢失', '不会退出登录或解除设备绑定', '启用连接']:
+        # The client asks Kiro to close and forces it only on a second, explicit consent.
+        for text in ['还原 Kiro 配置', '请求 Kiro 关闭', '不会被强制结束', '不会退出登录或解除设备绑定', '启用连接']:
             expect(section).to_contain_text(text)
         self.goto('/docs/downloads')
         expect(self.page.locator('[data-doc="downloads"]')).to_contain_text('单文件客户端')
@@ -399,7 +422,7 @@ class PortalBrowserTests(unittest.TestCase):
         expect(section).not_to_contain_text('可立即在新客户端绑定')
 
     def test_17_unbind_success_does_not_promise_valid_authorization(self):
-        for status in ['frozen', 'expired', 'banned', 'active']:
+        for status in ['frozen', 'expired', 'active']:
             with self.subTest(status=status):
                 self.query.update(status=status, isExpired=status == 'expired', remainingPoints=0)
                 self.goto('/device')
