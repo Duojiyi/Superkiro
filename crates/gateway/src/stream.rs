@@ -629,14 +629,17 @@ pub(crate) fn resolve_settlement_tokens(
     } else {
         0
     };
-    // An exact report wins, except a report of zero after text was streamed: that is
-    // an upstream that sent a usage frame of zeros, and trusting it bills visible
-    // output as free.
-    let output = if usage.output_tokens_final && !(saw_output && usage.completion_tokens == 0) {
-        usage.completion_tokens
-    } else {
-        usage.completion_tokens.max(streamed)
-    };
+    // An exact report wins, unless it is below half of what was streamed. The estimate
+    // is within that of a real tokenizer (it overcounts CJK and deep indentation at
+    // most about twofold), so such a report is wrong: an upstream that sent a usage
+    // frame of zeros, or an Anthropic-format relay whose final count of 0 left its
+    // opening count of 1, which billed thousands of streamed words as one token.
+    let output =
+        if usage.output_tokens_final && usage.completion_tokens.saturating_mul(2) >= streamed {
+            usage.completion_tokens
+        } else {
+            usage.completion_tokens.max(streamed)
+        };
     Some(UsageTokens {
         uncached_input_tokens: if has_input_usage {
             usage.uncached_prompt_tokens
