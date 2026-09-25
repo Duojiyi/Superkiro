@@ -1514,6 +1514,44 @@ impl BillingEngine {
         })
     }
 
+    /// Give a card a new secret code and change nothing else: its balance, usage, devices
+    /// and history stay, so the saved state still reconciles with the ledger. Sessions
+    /// signed in with the old code end, and its recovery copy, which holds the old code, is
+    /// dropped.
+    pub fn set_card_code_hash(&self, card_id: &str, code_hash: &str) -> Result<Card, BillingError> {
+        let _state_guard = self.state_lock.write().unwrap();
+        let mut candidate = self.export_snapshot_locked(
+            self.snapshot_sequence
+                .load(Ordering::Acquire)
+                .saturating_add(1),
+            self.last_snapshot_checksum.read().unwrap().clone(),
+        );
+        if candidate
+            .cards
+            .values()
+            .any(|card| card.id != card_id && card.code_hash == code_hash)
+        {
+            return Err(BillingError::InvalidState(
+                "another card already uses this code".into(),
+            ));
+        }
+        let card = candidate
+            .cards
+            .get_mut(card_id)
+            .ok_or_else(|| BillingError::CardNotFound(card_id.to_string()))?;
+        card.code_hash = code_hash.to_string();
+        card.code_encrypted = None;
+        card.token_version = card.token_version.saturating_add(1);
+        let updated = card.clone();
+        self.commit_candidate_snapshot(&candidate, || {
+            self.cards
+                .write()
+                .unwrap()
+                .insert(card_id.to_string(), updated.clone());
+            updated
+        })
+    }
+
     /// Issue recoverable cards atomically; missing KEK never falls back to plaintext.
     pub fn issue_cards(
         &self,
