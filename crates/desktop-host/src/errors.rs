@@ -377,6 +377,15 @@ mod tests {
         assert_eq!(reinstall["code"], "SK-RESTORE-002");
         assert_eq!(reinstall["outcome"], "failed");
         assert_eq!(validated(&reinstall), Some(reinstall.clone()));
+        // The same guidance when a restore finds the patch's backup gone.
+        assert_eq!(
+            classify(
+                "Kiro's extension is still modified and its backup is gone or no longer matches; reinstall Kiro to replace it, then restore again",
+                "/api/restore",
+                "POST",
+            )["code"],
+            "SK-RESTORE-002"
+        );
         // A settings.json the customer has to fix first says where, and nothing else.
         let syntax = classify(
             "Settings error: settings.json has a syntax error at line 12, column 5; fix that line and retry",

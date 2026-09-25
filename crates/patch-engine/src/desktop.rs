@@ -591,6 +591,82 @@ mod tests {
         fs::remove_dir(root).unwrap();
     }
 
+    /// A patched bundle whose backup is gone leaves the whole takeover in place: rolling
+    /// the settings and the token back under the live patch would send the customer's
+    /// own token to the gateway through its runtime endpoint. Restore says to reinstall
+    /// Kiro, and once that has replaced the bundle the same restore completes.
+    #[test]
+    fn a_patch_without_its_backup_waits_for_a_reinstall_then_restores_everything() {
+        let official = format!(
+            "const endpoint = \"{}\";",
+            crate::patch::RUNTIME_ENDPOINT_NEEDLE
+        );
+        for (index, reinstalled) in [official.clone(), format!("/* 2.0 */ {official}")]
+            .into_iter()
+            .enumerate()
+        {
+            let root = std::env::temp_dir()
+                .join(format!("reinstall-restore-{}-{index}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).unwrap();
+            let original_settings = "{\n  \"editor.fontSize\": 14\n}\n";
+            let settings = SettingsManager::at(root.join("settings.json"));
+            fs::write(settings.path(), original_settings).unwrap();
+            let extension = root.join("extension.js");
+            fs::write(&extension, &official).unwrap();
+            let patcher = ExtensionPatcher::new(&extension);
+            let storage = TokenStorage::at(root.join("kiro-auth-token.json"));
+            let desktop = DesktopSession::new(storage.clone(), root.join("session.json"));
+            let snapshots = SnapshotManager::at(root.join("snapshot.json"));
+            let gateway = "https://gw.reinstall.test";
+            desktop
+                .save(&Session {
+                    gateway: gateway.into(),
+                    device: "fixture".into(),
+                    previous_token: Some(PreviousToken::Raw(b"official-token".to_vec())),
+                    authenticated: true,
+                    ca_path: None,
+                })
+                .unwrap();
+            fs::write(storage.path(), b"gateway-token").unwrap();
+            snapshots
+                .takeover(&settings, Some(&patcher), gateway)
+                .unwrap();
+            fs::remove_file(patcher.backup_path()).unwrap();
+            let taken_settings = fs::read(settings.path()).unwrap();
+
+            let error = desktop.restore_and_logout(&snapshots).unwrap_err();
+            assert!(error.contains("reinstall Kiro"), "{error}");
+            assert_eq!(fs::read(settings.path()).unwrap(), taken_settings);
+            assert_eq!(fs::read(storage.path()).unwrap(), b"gateway-token");
+            assert_eq!(patcher.status(), crate::PatchStatus::Patched);
+            assert!(snapshots.has_active_snapshot() && desktop.recovery_pending());
+            let hosts = ["gw.reinstall.test".to_string()];
+            let scan = || {
+                crate::Leftovers::scan(
+                    std::slice::from_ref(&extension),
+                    &settings,
+                    &storage,
+                    &hosts,
+                )
+            };
+            assert_eq!(scan().unrecoverable, vec![extension.clone()]);
+
+            // Reinstalling Kiro puts an official bundle back, of this version or a newer one.
+            fs::write(&extension, &reinstalled).unwrap();
+            desktop.restore_and_logout(&snapshots).unwrap();
+            assert_eq!(
+                fs::read_to_string(settings.path()).unwrap(),
+                original_settings
+            );
+            assert_eq!(fs::read(storage.path()).unwrap(), b"official-token");
+            assert_eq!(fs::read_to_string(&extension).unwrap(), reinstalled);
+            assert!(!snapshots.has_active_snapshot() && !desktop.recovery_pending());
+            assert!(!scan().found());
+            fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
     #[test]
     fn recovery_pending_does_not_require_authenticated_or_readable_session() {
         let root =

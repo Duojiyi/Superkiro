@@ -140,6 +140,29 @@ fn a_patch_whose_backup_is_gone_needs_a_reinstall_but_the_rest_is_still_undone()
     assert_eq!(patcher.status(), PatchStatus::Patched);
 }
 
+/// A backup deleted or replaced on its own (a cleaner, a virus scanner) is as lost as
+/// no material at all: the state that remains authenticates nothing it could restore.
+#[test]
+fn a_patch_whose_backup_alone_is_gone_or_wrong_is_unrecoverable() {
+    for damage in ["deleted", "replaced"] {
+        let machine = Machine::taken_over(damage);
+        let patcher = ExtensionPatcher::new(&machine.extension);
+        if damage == "deleted" {
+            fs::remove_file(patcher.backup_path()).unwrap();
+        } else {
+            fs::write(patcher.backup_path(), "// some other bundle").unwrap();
+        }
+        assert!(machine.extension.with_extension("js.kpatch-state").exists());
+        let found = machine.scan();
+        assert!(found.patches.is_empty(), "{damage}");
+        assert_eq!(
+            found.unrecoverable,
+            vec![machine.extension.clone()],
+            "{damage}"
+        );
+    }
+}
+
 #[test]
 fn another_users_patch_on_a_shared_install_is_left_alone() {
     let machine = Machine::taken_over("shared");

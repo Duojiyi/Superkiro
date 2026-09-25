@@ -43,6 +43,9 @@ pub enum SnapshotError {
 
     #[error("No active takeover snapshot found on system")]
     NoActiveSnapshot,
+
+    #[error("Kiro's extension is still modified and its backup is gone or no longer matches; reinstall Kiro to replace it, then restore again")]
+    ReinstallRequired,
 }
 
 /// Metadata recorded during takeover to ensure precision rollback.
@@ -320,6 +323,15 @@ impl SnapshotManager {
                         "Kiro replaced extension.js before it could be rolled back;                          the stale patch backup has been discarded"
                             .to_string(),
                     );
+                }
+                // The patch is live and what would roll it back is gone or no longer
+                // matches, so only reinstalling Kiro replaces the file. Until then the
+                // settings and the token stay as they are: rolled back under a live
+                // patch, the customer's own token would go to the gateway through the
+                // patched runtime endpoint. Once Kiro is reinstalled, this same restore
+                // completes.
+                Err(PatchError::ExtensionChanged) if patcher.restore_material_is_lost() => {
+                    return Err(SnapshotError::ReinstallRequired)
                 }
                 // The patch is live. Abort before mutating anything.
                 Err(error) => return Err(SnapshotError::Patch(error)),

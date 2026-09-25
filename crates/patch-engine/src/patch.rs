@@ -211,9 +211,40 @@ impl ExtensionPatcher {
         }
     }
 
-    /// Whether the rollback material a restore needs is present.
-    pub fn has_restore_material(&self) -> bool {
-        self.state_path().exists() || self.backup_path().exists()
+    /// Positive proof that this patch can never be rolled back from its own material:
+    /// the file carries the marker, and what a rollback needs (the state that
+    /// authenticates it, and the backup of the original) is gone or reads as something
+    /// else, or the live file is not what the patch wrote. Only replacing the file, by
+    /// reinstalling or updating Kiro, undoes it then.
+    ///
+    /// A read that fails proves nothing: a virus scan can lock the backup for a moment,
+    /// and telling the customer to reinstall Kiro over that would be wrong.
+    pub fn restore_material_is_lost(&self) -> bool {
+        let gone = |error: std::io::Error| error.kind() == std::io::ErrorKind::NotFound;
+        if !self.marker_present().unwrap_or(false) {
+            return false;
+        }
+        let state: PatchState = match fs::read(self.state_path()) {
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(state) => state,
+                Err(_) => return true,
+            },
+            Err(error) => return gone(error),
+        };
+        let Ok(current) = fs::read(&self.extension_path) else {
+            return false;
+        };
+        let current = content_hash(&current);
+        if current != state.patched_hash && state.previous_patched_hash.as_ref() != Some(&current) {
+            return true;
+        }
+        match fs::read(self.backup_path()) {
+            Ok(backup) => {
+                backup.len() as u64 != state.original_len
+                    || content_hash(&backup) != state.original_hash
+            }
+            Err(error) => gone(error),
+        }
     }
 
     /// Determine current patch status.
