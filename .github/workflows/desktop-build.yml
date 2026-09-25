@@ -18,20 +18,22 @@ jobs:
   package:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '22'
           cache: npm
           cache-dependency-path: apps/desktop-ui/package-lock.json
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.13'
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: x86_64-pc-windows-msvc
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: npm --prefix apps/desktop-ui ci
       - run: npm --prefix apps/desktop-ui run build
       - run: npm --prefix apps/desktop-ui test
@@ -41,7 +43,7 @@ jobs:
       - run: python scripts/build_desktop.py
       - name: Record source and artifact mapping (not signing or acceptance)
         run: python -B deploy/artifact_provenance.py --artifact dist/Superkiro.exe --version "ci-${{ github.run_id }}.${{ github.run_attempt }}" --platform windows --arch x64
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: Superkiro-Windows-x64-unsigned
           path: |
@@ -64,16 +66,18 @@ jobs:
             arch: x64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '22'
           cache: npm
           cache-dependency-path: apps/desktop-ui/package-lock.json
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: desktop-macos-${{ matrix.target }}
       - run: npm --prefix apps/desktop-ui ci
@@ -84,12 +88,13 @@ jobs:
       # tested anywhere before a release.
       - name: Rust tests (engine and host)
         run: cargo test --locked --no-fail-fast -p patch-engine -p desktop-host
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.13'
+      # The Tauri CLI and its native binary come from the UI lockfile, integrity-checked.
       - name: Build app (no Developer ID signing or notarization)
         working-directory: crates/desktop-host
-        run: npx --yes --package @tauri-apps/cli@2.8.4 tauri build --target ${{ matrix.target }} --bundles app --ci -- --locked
+        run: ../../apps/desktop-ui/node_modules/.bin/tauri build --target ${{ matrix.target }} --bundles app --ci -- --locked
       - name: Archive app preserving permissions and symlinks
         shell: bash
         run: |
@@ -98,7 +103,7 @@ jobs:
           tar -czf "dist/Superkiro-macOS-${{ matrix.arch }}-unsigned.app.tar.gz" -C "target/${{ matrix.target }}/release/bundle/macos" Superkiro.app
       - name: Record source and artifact mapping (not signing or acceptance)
         run: python -B deploy/artifact_provenance.py --artifact dist/Superkiro-macOS-${{ matrix.arch }}-unsigned.app.tar.gz --version "ci-${{ github.run_id }}.${{ github.run_attempt }}" --platform macos --arch ${{ matrix.arch }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: Superkiro-macOS-${{ matrix.arch }}-unsigned
           path: |
