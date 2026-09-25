@@ -153,7 +153,7 @@ const TERMINAL_FRAME_GRACE: Duration = Duration::from_secs(3);
 
 /// Tool-call arguments one response may accumulate, across all its calls, and how many
 /// calls it may open. A file-writing call legitimately carries hundreds of kilobytes.
-const MAX_TOOL_ARGUMENT_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_TOOL_ARGUMENT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TOOL_CALLS: usize = 128;
 
 async fn send_frame(

@@ -376,3 +376,65 @@ fn upstream_in_band_errors_are_not_silently_ignored() {
         }
     }
 }
+
+/// Events parsed from an Anthropic stream delivered as `chunks` of bytes.
+async fn anthropic_events(chunks: Vec<String>) -> Vec<Result<ProviderStreamEvent, ProviderError>> {
+    let bytes = futures_util::stream::iter(
+        chunks
+            .into_iter()
+            .map(|chunk| Ok::<_, reqwest::Error>(bytes::Bytes::from(chunk))),
+    );
+    gateway::provider::process_byte_stream(bytes, |line| AnthropicProvider.parse_stream_line(line))
+        .collect()
+        .await
+}
+
+/// A tool call's whole input in one `input_json_delta` event, streamed in 64 KB chunks.
+fn one_event_tool_call(input_bytes: usize) -> Vec<String> {
+    let partial = serde_json::to_string(&format!(
+        "{{\"path\":\"big.txt\",\"text\":\"{}\"}}",
+        "x".repeat(input_bytes)
+    ))
+    .unwrap();
+    let body = [
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tu_big","name":"fsWrite","input":{}}}"#.to_string(),
+        format!(r#"data: {{"type":"content_block_delta","index":0,"delta":{{"type":"input_json_delta","partial_json":{partial}}}}}"#),
+        r#"data: {"type":"message_stop"}"#.to_string(),
+        String::new(),
+    ]
+    .join("\n\n");
+    body.as_bytes()
+        .chunks(64 * 1024)
+        .map(|chunk| String::from_utf8(chunk.to_vec()).unwrap())
+        .collect()
+}
+
+// Some providers send a tool call's whole input in a single event. One carrying a large
+// file is a healthy response, up to what the stream accepts for tool calls at all.
+#[tokio::test]
+async fn a_large_single_event_does_not_abort_the_stream() {
+    let events = anthropic_events(one_event_tool_call(3 * 1024 * 1024)).await;
+    assert!(
+        events.iter().all(Result::is_ok),
+        "{:?}",
+        events.iter().find(|event| event.is_err())
+    );
+    let arguments: usize = events
+        .iter()
+        .filter_map(|event| match event {
+            Ok(ProviderStreamEvent::Delta(ProviderDelta::ToolCallChunk { arguments, .. })) => {
+                Some(arguments.len())
+            }
+            _ => None,
+        })
+        .sum();
+    assert!(arguments > 3 * 1024 * 1024);
+    assert!(matches!(events.last(), Some(Ok(ProviderStreamEvent::Done))));
+
+    // The ceiling stays: an event beyond it ends the stream with an error.
+    let events = anthropic_events(one_event_tool_call(40 * 1024 * 1024)).await;
+    assert!(matches!(
+        events.last(),
+        Some(Err(ProviderError::Parse(message))) if message.contains("exceeded limit")
+    ));
+}

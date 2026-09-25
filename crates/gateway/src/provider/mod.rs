@@ -322,8 +322,11 @@ pub fn process_byte_stream<F>(
 where
     F: FnMut(&str) -> Result<Vec<ProviderStreamEvent>, ProviderError> + Send + 'static,
 {
-    const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
-    const MAX_SSE_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+    // One event may be as large as the tool-call arguments a response may carry: some
+    // providers send a tool call's whole input, a file being written, in a single event.
+    // The bound still holds a misbehaving upstream to a fixed amount of memory.
+    const MAX_SSE_LINE_BYTES: usize = crate::stream::MAX_TOOL_ARGUMENT_BYTES;
+    const MAX_SSE_BUFFER_BYTES: usize = 2 * MAX_SSE_LINE_BYTES;
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
     tokio::spawn(async move {
