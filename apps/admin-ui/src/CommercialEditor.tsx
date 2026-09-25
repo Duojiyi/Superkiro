@@ -109,10 +109,13 @@ export default function CommercialEditor({ kind,onDirtyChange,onBusyChange }: {k
   // An unpublished draft survives a session end, restored only onto the configuration it
   // was made from; the draft holds no secret.
   const draftKey = `admin-commercial-draft:v1:${kind}`;
-  const apply = (next: CommercialConfig): 'restored' | 'stale' | 'none' => {
+  // `keepSaved` is false for a reload the operator asked for after discarding their edits:
+  // the kept draft is dropped then, never brought back.
+  const apply = (next: CommercialConfig, keepSaved: boolean): 'restored' | 'stale' | 'none' => {
     const value = JSON.stringify(kind === 'groups' ? {groups: next.groups} : {models: next.models, rate_cards: next.rate_cards, versions: []}, null, 2);
     let saved: {base?: unknown; draft?: unknown; reason?: unknown} = {};
-    try {saved = JSON.parse(sessionStorage.getItem(draftKey) || '{}') ?? {};} catch {/* nothing to restore */}
+    if (keepSaved) {try {saved = JSON.parse(sessionStorage.getItem(draftKey) || '{}') ?? {};} catch {/* nothing to restore */}}
+    else {try {sessionStorage.removeItem(draftKey);} catch {/* nothing kept */}}
     const restore = saved.base === value && typeof saved.draft === 'string' && typeof saved.reason === 'string';
     setConfig(next); setSelected(String(next[kind][0]?.id ?? '')); setPriceDraft(null); setPriceInputs({}); setReason(restore ? String(saved.reason) : ''); setLoadedDraft(value); setDraft(restore ? String(saved.draft) : value); setNeedsReview(false);
     return restore ? 'restored' : typeof saved.draft === 'string' ? 'stale' : 'none';
@@ -124,14 +127,14 @@ export default function CommercialEditor({ kind,onDirtyChange,onBusyChange }: {k
       else sessionStorage.removeItem(draftKey);
     } catch {/* A draft that cannot be kept is only lost at a session end. */}
   }, [draft, loadedDraft, reason, draftKey]);
-  const load = async () => {
+  const load = async (keepSaved = true) => {
     if (pending.current) return;
     pending.current = true; setBusy(true); setMessage('正在读取配置…');
     try {
       const result = await adminApi.getCommercialConfig();
       if (result.success !== true || !result.config?.revision) throw new Error('服务器未确认配置读取成功');
       if (alive.current) {
-        const draftState = apply(result.config);
+        const draftState = apply(result.config, keepSaved);
         setMessage(draftState === 'restored' ? '已恢复会话到期前未发布的草稿，请核对后发布。' : draftState === 'stale' ? '配置已在别处更新，之前未发布的草稿基于旧配置，未恢复；请在当前配置上重新编辑。' : '当前配置已加载。历史价格只读；调整价格请创建新版本。');
       }
     } catch (error) {
@@ -177,7 +180,7 @@ export default function CommercialEditor({ kind,onDirtyChange,onBusyChange }: {k
       if (result.success !== true) throw new AdminApiError('服务器未确认发布成功', 400);
       if (!result.config?.revision) throw new Error('服务器未返回可核对的配置版本');
       try {sessionStorage.removeItem(draftKey);} catch {/* published; nothing left to keep */}
-      if (alive.current) {apply(result.config); setMessage('发布成功，配置与审计记录已保存。');}
+      if (alive.current) {apply(result.config, false); setMessage('发布成功，配置与审计记录已保存。');}
     } catch (error) {
       if (alive.current) {
         const mustReview = submitted && !(error instanceof AdminApiError && [400, 401, 403, 413, 422].includes(error.status));
@@ -233,7 +236,7 @@ export default function CommercialEditor({ kind,onDirtyChange,onBusyChange }: {k
     <p role="status" className="text-[#A87029] text-sm">{message}</p>
     {config && draftError && <p role="alert">{draftError} 原输入已保留，修正后才能加入价格或发布。</p>}
     <p className="muted">{dirty ? `有未发布的编辑 · 已加入 ${Array.isArray(parsedDraft.versions) ? parsedDraft.versions.length : 0} 个价格版本` : '当前没有未发布的编辑'}{needsReview ? ' · 请重新读取后核对，当前禁止发布' : ''}</p>
-    <button disabled={busy} onClick={() => { if (!dirty || window.confirm('重新读取将丢弃未发布的编辑，继续吗？')) void load(); }} className="px-4 py-2 bg-[#EFF1EF] rounded">重新读取配置</button>
+    <button disabled={busy} onClick={() => { if (!dirty || window.confirm('重新读取将丢弃未发布的编辑，继续吗？')) void load(false); }} className="px-4 py-2 bg-[#EFF1EF] rounded">重新读取配置</button>
     <details><summary>高级配置 JSON · 新增条目与价格版本</summary><label className="block">配置 JSON<textarea aria-label="配置 JSON" value={draft} disabled={busy} onChange={e => setDraft(e.target.value)} spellCheck={false} className="block w-full h-96 bg-white font-mono text-sm p-3 border border-[#E5E8E5] rounded" /></label></details>
     <label className="block">变更原因<input aria-label="变更原因" value={reason} maxLength={500} disabled={busy} onChange={e=>setReason(e.target.value)} className="block w-full bg-white p-3 border border-[#E5E8E5] rounded" /></label>
     <p className="muted">变更原因用于审计，最多 500 字节（中文通常占 3 字节）。重新读取成功后会丢弃本页草稿，请先保留需要的内容。</p>

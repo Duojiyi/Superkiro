@@ -15,6 +15,11 @@ type Tab = 'overview' | 'cards' | 'groups' | 'providers' | 'models' | 'traces' |
 
 type AuthState = 'checking' | 'authenticated' | 'unauthenticated';
 
+/** Drops the unpublished announcement and configuration drafts this tab keeps. */
+function discardDrafts() {
+  try {for (const key of Object.keys(sessionStorage)) if (key.startsWith('admin-commercial-draft:') || key === 'admin-announcement-draft:v1') sessionStorage.removeItem(key);} catch {/* nothing kept */}
+}
+
 function ListEmptyState({loading, failed, empty, onRetry}: {loading: boolean; failed?: boolean; empty: string; onRetry: () => void}) {
   return <div className="list-empty" role="status"><p>{loading ? '正在读取，请稍候…' : failed ? '读取失败，暂时无法确认是否有记录。' : empty}</p>{failed && !loading && <button onClick={onRetry}>重新读取数据</button>}</div>;
 }
@@ -48,6 +53,10 @@ export default function App() {
     };
     adminApi.onExpiring = () => {if (current) setExpiring(true);};
     adminApi.onSessionChanged = () => {
+      // The session was replaced underneath this tab, without a login here: nothing the
+      // previous session was composing carries over. Only a session that expired and was
+      // re-established by logging in again in this tab keeps its drafts.
+      discardDrafts();
       if (current) setWorkspaceVersion(version => version + 1);
     };
     adminApi.checkAuth().then(() => {
@@ -90,6 +99,9 @@ export default function App() {
     if (pending.current) return;
     const version = ++attempt.current;
     pending.current = true; setBusy(true); setPassword('');setTotpCode(''); setError('');
+    // An explicit logout ends the work, so unpublished drafts go with it; only a session
+    // that expired keeps them for the next login in this tab.
+    discardDrafts();
     // logout clears the API session synchronously, before awaiting the server.
     const revocation = adminApi.logout(all);
     setAuthState('unauthenticated');

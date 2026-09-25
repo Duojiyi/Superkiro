@@ -19,13 +19,8 @@ import sys
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--release-version", default="",
-                        help="one to four dot-separated numbers, e.g. 2026.09.25")
-    args = parser.parse_args()
-    if args.release_version and not re.fullmatch(r"[0-9]{1,9}(\.[0-9]{1,9}){0,3}", args.release_version):
+def main(release_version=""):
+    if release_version and not re.fullmatch(r"[0-9]{1,9}(\.[0-9]{1,9}){0,3}", release_version):
         raise SystemExit("Release version must be one to four dot-separated numbers, e.g. 2026.09.25")
     if sys.platform != "win32":
         raise SystemExit("This portable EXE build targets Windows; run it on Windows with MSVC.")
@@ -40,7 +35,7 @@ def main():
     target = "x86_64-pc-windows-msvc"
     env = os.environ.copy()
     env["CARGO_BUILD_JOBS"] = "2"
-    env["SUPERKIRO_RELEASE_VERSION"] = args.release_version
+    env["SUPERKIRO_RELEASE_VERSION"] = release_version
     env["RUSTFLAGS"] = (env.get("RUSTFLAGS", "") + " -C target-feature=+crt-static").strip()
     subprocess.run(["cargo", "build", "--locked", "--release", "--target", target,
                     "-p", "desktop-host", "--bin", "Superkiro"], cwd=ROOT, env=env, check=True)
@@ -54,4 +49,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--release-version", default="",
+                        help="one to four dot-separated numbers, e.g. 2026.09.25")
+    main(parser.parse_args().release_version)

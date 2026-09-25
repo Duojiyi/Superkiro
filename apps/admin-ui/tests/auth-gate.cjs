@@ -145,7 +145,10 @@ const server=http.createServer(async(req,res)=>{
     await page.getByRole('heading',{name:'运营概览',level:2,exact:true}).waitFor();
     await page.getByRole('navigation').getByRole('button',{name:'模型与定价',exact:true}).click();
     await page.getByText('高级配置 JSON · 新增条目与价格版本',{exact:true}).click();
-    assert(!(await page.getByRole('textbox',{name:'配置 JSON',exact:true}).inputValue()).includes('old-sensitive-draft'));
+    // An unpublished draft (no secrets) survives the expired session in this tab and is
+    // restored after the next login onto the configuration it was made from, never before.
+    await page.getByText('已恢复会话到期前未发布的草稿，请核对后发布。',{exact:true}).waitFor();
+    assert((await page.getByRole('textbox',{name:'配置 JSON',exact:true}).inputValue()).includes('old-sensitive-draft'));
     // Focus revalidation must hide the old workspace and reject revoked cookies.
     fixture.expire();await page.evaluate(()=>window.dispatchEvent(new Event('focus')));
     await page.getByRole('heading',{name:'管理员登录',exact:true}).waitFor();assert.equal(await page.locator('.workspace,textarea').count(),0);
