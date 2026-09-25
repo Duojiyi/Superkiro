@@ -274,15 +274,18 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
             }
 
             // 4. Local Intent Classifier Interception (Optimization)
-            let body_str = String::from_utf8_lossy(&body_bytes);
-            if self.intercept_intent
-                && body_str.contains(INTENT_CLASSIFIER_SIGN_A)
-                && body_str.contains(INTENT_CLASSIFIER_SIGN_B)
-            {
-                let is_spec = body_str.contains("create a spec")
-                    || body_str.contains("specification")
-                    || body_str.contains("需求文档")
-                    || body_str.contains("规范");
+            let classified_message = self
+                .intercept_intent
+                .then(|| intent_classifier_message(&body_bytes))
+                .flatten();
+            if let Some(message) = classified_message {
+                // The instructions themselves describe spec requests; only the user's
+                // message says whether this is one.
+                let message = message.to_lowercase();
+                let is_spec = message.contains("create a spec")
+                    || message.contains("specification")
+                    || message.contains("需求文档")
+                    || message.contains("规范");
                 let probs = if is_spec {
                     serde_json::json!({ "chat": 0, "do": 0.1, "spec": 0.9 })
                 } else {
@@ -701,53 +704,21 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
 
             if !ctx.supports_vision {
                 if let Some(ref v_cfg) = self.vision_config {
-                    if v_cfg.enabled {
-                        if let (Some(ref v_url), Some(ref v_key)) =
-                            (&v_cfg.fallback_provider_url, &v_cfg.fallback_api_key)
-                        {
-                            let current_input = &kiro_req
-                                .conversation_state
-                                .current_message
-                                .user_input_message;
-                            // One slot per image, so a failed transcription leaves its
-                            // own image undescribed instead of shifting the rest.
-                            let mut transcriptions = Vec::with_capacity(current_input.images.len());
-                            for img in &current_input.images {
-                                let format =
-                                    crate::translate::images::sniff_format(&img.source.bytes)
-                                        .unwrap_or(img.format.as_str());
-                                let cache_key = vision_cache_key(
-                                    &v_cfg.fallback_model,
-                                    format,
-                                    &img.source.bytes,
-                                    &current_input.content,
-                                );
-                                let transcription = match self.vision_cache.get(&cache_key) {
-                                    Some(cached) => Some(cached),
-                                    None => {
-                                        crate::translate::vision::transcribe_image_with_provider(
-                                            &self.client,
-                                            v_url,
-                                            v_key,
-                                            &v_cfg.fallback_model,
-                                            format,
-                                            &img.source.bytes,
-                                            Some(&current_input.content),
-                                            v_cfg.max_tokens,
-                                        )
-                                        .await
-                                        .ok()
-                                        .inspect(|desc| {
-                                            self.vision_cache.set(cache_key, desc.clone())
-                                        })
-                                    }
-                                };
-                                transcriptions.push(transcription);
-                            }
-                            if transcriptions.iter().any(Option::is_some) {
-                                ctx = ctx.with_image_transcriptions(transcriptions);
-                            }
-                        }
+                    let current_input = &kiro_req
+                        .conversation_state
+                        .current_message
+                        .user_input_message;
+                    let transcriptions = crate::translate::vision::transcribe_images(
+                        &self.client,
+                        v_cfg,
+                        &self.vision_cache,
+                        &current_input.images,
+                        &current_input.content,
+                        crate::translate::vision::TRANSCRIPTION_BUDGET,
+                    )
+                    .await;
+                    if transcriptions.iter().any(Option::is_some) {
+                        ctx = ctx.with_image_transcriptions(transcriptions);
                     }
                 }
             }
@@ -1027,7 +998,9 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
             });
             let guard_config = StreamGuardConfig {
                 keepalive_interval: Duration::from_secs(20),
-                model_id: actual_target_model.clone(),
+                // The model the customer asked for. The target, a fallback included, is
+                // internal routing and stays in the server-side traces.
+                model_id: requested_model.to_string(),
                 context_window: Some(context_window),
             };
 
@@ -1085,6 +1058,41 @@ pub fn render_system_prompt_template(
         .replace("{{group_name}}", &group.name)
         .replace("{{plan_name}}", &group.virtual_plan_name)
         .replace("{{virtual_plan_name}}", &group.virtual_plan_name)
+}
+
+/// The user's message, when `body` is Kiro's intent-classifier call: the classifier
+/// instructions lead the request, as its system prompt or its first message, and no tools
+/// are offered. The same words anywhere else (a pasted log, a file a tool read, a later
+/// message) are the user's own content, and that turn goes to the model.
+fn intent_classifier_message(body: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(body);
+    if !text.contains(INTENT_CLASSIFIER_SIGN_A) || !text.contains(INTENT_CLASSIFIER_SIGN_B) {
+        return None;
+    }
+    let request: GenerateAssistantResponseRequest = serde_json::from_slice(body).ok()?;
+    let state = &request.conversation_state;
+    let current = &state.current_message.user_input_message;
+    if current
+        .user_input_message_context
+        .as_ref()
+        .is_some_and(|context| !context.tools.is_empty())
+    {
+        return None;
+    }
+    let instructions = request
+        .system_prompt
+        .as_deref()
+        .filter(|prompt| !prompt.trim().is_empty())
+        .or_else(|| match state.history.first()? {
+            kiro_wire::requests::conversation::Message::User(user) => {
+                Some(user.user_input_message.content.as_str())
+            }
+            kiro_wire::requests::conversation::Message::Assistant(_) => None,
+        })?
+        .trim_start();
+    (instructions.starts_with(INTENT_CLASSIFIER_SIGN_A)
+        && instructions.contains(INTENT_CLASSIFIER_SIGN_B))
+    .then(|| current.content.clone())
 }
 
 /// The client's invocation id keys idempotency, the credit hold and the request traces,
@@ -1156,15 +1164,32 @@ fn validate_conversation_request(
         });
     }
 
-    // Validate the complete serialized conversation, including tool schemas,
-    // tool results, tool calls and metadata, rather than only visible text.
-    let prompt_chars = serde_json::to_string(request)
-        .map(|json| json.chars().count())
-        .unwrap_or(usize::MAX);
     let current = &request
         .conversation_state
         .current_message
         .user_input_message;
+    // Validate the complete serialized conversation, including tool schemas,
+    // tool results, tool calls and metadata, rather than only visible text. Image
+    // payloads are left out: Kiro resends every earlier image on every turn, and an
+    // image is bounded by the image limits and reaches the model as an image or a
+    // note, never as text.
+    let image_chars: usize = request
+        .conversation_state
+        .history
+        .iter()
+        .filter_map(|message| match message {
+            kiro_wire::requests::conversation::Message::User(user) => {
+                Some(&user.user_input_message.images)
+            }
+            kiro_wire::requests::conversation::Message::Assistant(_) => None,
+        })
+        .chain([&current.images])
+        .flatten()
+        .map(|image| image.source.bytes.chars().count())
+        .sum();
+    let prompt_chars = serde_json::to_string(request)
+        .map(|json| json.chars().count().saturating_sub(image_chars))
+        .unwrap_or(usize::MAX);
     let mut image_sizes = Vec::with_capacity(current.images.len());
     for image in &current.images {
         let decoded = base64::Engine::decode(
@@ -1177,23 +1202,6 @@ fn validate_conversation_request(
         image_sizes.push(decoded.len());
     }
     guardrail.validate_payload(prompt_chars, &image_sizes)
-}
-
-/// Transcriptions are shared by every card, so the key must name the image and its
-/// context exactly: SHA-256 over each length-prefixed part, not a 64-bit hash.
-fn vision_cache_key(model: &str, format: &str, bytes: &str, context: &str) -> String {
-    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
-    for part in [model, format, bytes, context] {
-        digest.update(&(part.len() as u64).to_le_bytes());
-        digest.update(part.as_bytes());
-    }
-    let hash: String = digest
-        .finish()
-        .as_ref()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    format!("{model}:{format}:{hash}")
 }
 
 fn max_output_tokens_for_model(
@@ -1262,21 +1270,5 @@ mod capability_tests {
             max_output_tokens_for_model("gemini-unknown", None, &billing),
             4096
         );
-    }
-}
-
-#[cfg(test)]
-mod vision_cache_key_tests {
-    use super::vision_cache_key;
-
-    #[test]
-    fn key_is_a_full_digest_of_unambiguous_parts() {
-        let key = vision_cache_key("model", "png", "ab", "c");
-        let digest = key.rsplit(':').next().unwrap();
-        assert_eq!(digest.len(), 64, "SHA-256, not a 64-bit hash: {key}");
-        assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
-        assert_eq!(key, vision_cache_key("model", "png", "ab", "c"));
-        assert_ne!(key, vision_cache_key("model", "png", "a", "bc"));
-        assert_ne!(key, vision_cache_key("model", "png", "ab", "d"));
     }
 }

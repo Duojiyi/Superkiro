@@ -35,6 +35,23 @@ fn image() -> Value {
     json!({"format": "png", "source": {"bytes": PNG}})
 }
 
+/// A PNG of random pixels, which PNG cannot compress: as large as a detailed screenshot.
+fn noise_png(width: u32, height: u32) -> String {
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let pixels = image::RgbImage::from_fn(width, height, |_, _| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let [r, g, b, ..] = state.to_le_bytes();
+        image::Rgb([r, g, b])
+    });
+    let mut out = Vec::new();
+    pixels
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .unwrap();
+    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, out)
+}
+
 struct Harness {
     app: axum::Router,
     token: String,
@@ -244,6 +261,75 @@ async fn declared_vision_capable_sends_the_image_upstream() {
         "image was not forwarded: {sent}"
     );
     assert_eq!(h.vision_calls().await, 0, "no transcription should occur");
+}
+
+/// A screenshot is routinely larger than the size an image is forwarded at. It is shrunk
+/// to fit instead of the turn being refused.
+#[tokio::test]
+async fn a_large_screenshot_is_shrunk_instead_of_refused() {
+    let h = harness(true, false).await;
+    let screenshot = noise_png(600, 400);
+    assert!(screenshot.len() / 4 * 3 > 400 * 1024);
+    let (status, body) = h
+        .send(current_only(vec![
+            json!({"format": "png", "source": {"bytes": screenshot}}),
+        ]))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let sent = serde_json::to_string(&h.upstream_body().await).unwrap();
+    assert!(
+        sent.contains("data:image/jpeg;base64,"),
+        "the image is forwarded shrunk"
+    );
+    assert!(!sent.contains(&screenshot[..200]), "and not as it was sent");
+}
+
+/// Kiro resends every earlier image on every turn. Their base64 is not prompt text: a
+/// few screenshots must not push a conversation over the prompt length limit for good.
+#[tokio::test]
+async fn earlier_screenshots_do_not_count_toward_the_prompt_length() {
+    let h = harness(true, false).await;
+    let mut history = Vec::new();
+    for turn in 0..4 {
+        let screenshot = noise_png(360, 360);
+        assert!(
+            screenshot.len() / 4 * 3 <= 400 * 1024,
+            "each fits on its own"
+        );
+        history.push(json!({"userInputMessage": {
+            "content": format!("screenshot {turn}"),
+            "images": [{"format": "png", "source": {"bytes": screenshot}}]
+        }}));
+        history.push(json!({"assistantResponseMessage": {"content": "seen"}}));
+    }
+    let payload = json!({"conversationState": {
+        "conversationId": "conv-vision",
+        "history": history,
+        "currentMessage": {"userInputMessage": {"content": "and now?", "modelId": EXPOSED}}
+    }});
+    assert!(payload.to_string().len() > 2_000_000);
+    let (status, body) = h.send(payload).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        serde_json::to_string(&h.upstream_body().await)
+            .unwrap()
+            .matches("data:image/png;base64,")
+            .count(),
+        4
+    );
+
+    // Text still counts.
+    let (status, body) = h
+        .send(json!({"conversationState": {
+            "conversationId": "conv-vision",
+            "currentMessage": {"userInputMessage": {
+                "content": "x".repeat(2_000_001),
+                "modelId": EXPOSED
+            }}
+        }}))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("Prompt content too long"), "{body}");
 }
 
 /// A configured degradation path must actually run. Before the capability sources

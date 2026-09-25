@@ -185,8 +185,9 @@ impl ModelProvider for OpenAiProvider {
                     // Tool calls
                     if let Some(tool_calls) = delta.get("tool_calls").and_then(|tc| tc.as_array()) {
                         for tc in tool_calls {
-                            let idx =
-                                tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                            // Some compatible upstreams omit the index; the call's id then
+                            // tells parallel calls apart.
+                            let idx = tc.get("index").and_then(|i| i.as_u64()).map(|i| i as usize);
                             let id = tc
                                 .get("id")
                                 .and_then(|i| i.as_str())

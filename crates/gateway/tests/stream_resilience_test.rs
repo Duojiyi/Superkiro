@@ -845,7 +845,7 @@ async fn empty_completed_stream_releases_credits_and_allows_retry() {
         )))];
         events.push(Ok(ProviderStreamEvent::Delta(
             ProviderDelta::ToolCallChunk {
-                index: 0,
+                index: Some(0),
                 id: None,
                 name: None,
                 arguments: String::new(),
@@ -918,7 +918,7 @@ async fn completed_tool_invocation_settles_once_and_replay_is_rejected() {
 
     let events = vec![
         Ok(ProviderStreamEvent::Delta(ProviderDelta::ToolCallChunk {
-            index: 0,
+            index: Some(0),
             id: Some("call-tool-1".to_string()),
             name: Some("read_file".to_string()),
             arguments: r#"{"path":"README.md"}"#.to_string(),
@@ -1178,7 +1178,7 @@ async fn an_oversized_tool_call_ends_the_response_and_is_billed() {
             upstream_tx
                 .send(Ok(ProviderStreamEvent::Delta(
                     ProviderDelta::ToolCallChunk {
-                        index,
+                        index: Some(index),
                         id: Some(format!("call-{index}")),
                         name: Some("fsWrite".into()),
                         arguments,

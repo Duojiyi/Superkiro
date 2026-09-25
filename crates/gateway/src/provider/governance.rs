@@ -277,6 +277,80 @@ pub fn is_cooldown_error(err: &ProviderError) -> bool {
     }
 }
 
+fn provider_adapter(provider: &Provider) -> Box<dyn ModelProvider> {
+    match provider.format {
+        ProviderFormat::OpenAi => Box::new(OpenAiProvider),
+        ProviderFormat::Anthropic => Box::new(AnthropicProvider),
+    }
+}
+
+/// Whether a failed attempt leaves another key or target worth trying for this request.
+/// Anything else is a problem with the request itself, which every key would share.
+fn worth_another_attempt(error: &ProviderError) -> bool {
+    matches!(error, ProviderError::EmptyCompletion) || is_cooldown_error(error)
+}
+
+/// Start the stream with one key of `pool`, making up to `retries` attempts with it, and
+/// record the outcome on the key.
+#[allow(clippy::too_many_arguments)]
+async fn attempt_with_key(
+    pool: &ProviderKeyPool,
+    provider: &Provider,
+    key: &ProviderKey,
+    client: &reqwest::Client,
+    model: &str,
+    chat_req: &ChatRequest,
+    default_cooldown: Duration,
+    retries: usize,
+    now_secs: u64,
+) -> Result<BoxStream<'static, Result<ProviderStreamEvent, ProviderError>>, ProviderError> {
+    let config = ProviderConfig::new(
+        &provider.base_url,
+        &key.api_key,
+        model,
+        Duration::from_secs(600),
+    );
+
+    let req_to_use;
+    let req_ref = if chat_req.model == model {
+        chat_req
+    } else {
+        req_to_use = {
+            let mut r = chat_req.clone();
+            r.model = model.to_string();
+            r
+        };
+        &req_to_use
+    };
+
+    let result = super::retry::ATTEMPT_KEY
+        .scope(
+            (provider.id.clone(), key.id.clone()),
+            super::retry::start_stream(
+                provider_adapter(provider).as_ref(),
+                client,
+                &config,
+                req_ref,
+                retries,
+            ),
+        )
+        .await;
+    match &result {
+        Ok(_) => pool.mark_key_success(&key.id),
+        // Worth another key, but not a reason to cool this one down.
+        Err(ProviderError::EmptyCompletion) => {}
+        Err(ProviderError::Http(status, _)) if status.as_u16() == 401 => {
+            pool.mark_key_unhealthy(&key.id)
+        }
+        Err(error) if is_cooldown_error(error) => {
+            pool.mark_key_failure(&key.id, crate::now_secs().max(now_secs), default_cooldown)
+        }
+        // A problem with the request says nothing about the key.
+        Err(_) => {}
+    }
+    result
+}
+
 /// Execute a streaming chat request with automatic multi-key failover and cooldown (Spec §14.3).
 pub async fn execute_stream_with_failover(
     pool: &ProviderKeyPool,
@@ -294,11 +368,6 @@ pub async fn execute_stream_with_failover(
     GovernanceError,
 > {
     let provider = pool.provider();
-    let provider_impl: Box<dyn ModelProvider> = match provider.format {
-        ProviderFormat::OpenAi => Box::new(OpenAiProvider),
-        ProviderFormat::Anthropic => Box::new(AnthropicProvider),
-    };
-
     let mut attempted_keys = Vec::new();
     let mut failure_records = Vec::new();
 
@@ -314,75 +383,32 @@ pub async fn execute_stream_with_failover(
             Err(GovernanceError::AllCandidatesExhausted) => break,
             Err(e) => return Err(e),
         };
+        attempted_keys.push(key.id.clone());
 
-        let key_id = key.id.clone();
-        attempted_keys.push(key_id.clone());
-
-        let config = ProviderConfig::new(
-            &provider.base_url,
-            &key.api_key,
-            model,
-            Duration::from_secs(600),
-        );
-
-        let req_to_use;
-        let req_ref = if chat_req.model == model {
-            chat_req
+        // A lone key gets the retries a pool would spend on its other keys.
+        let retries = if pool.list_keys().len() == 1 {
+            max_attempts.min(3)
         } else {
-            req_to_use = {
-                let mut r = chat_req.clone();
-                r.model = model.to_string();
-                r
-            };
-            &req_to_use
+            1
         };
-
-        match super::retry::ATTEMPT_KEY
-            .scope(
-                (provider.id.clone(), key_id.clone()),
-                super::retry::start_stream(
-                    provider_impl.as_ref(),
-                    client,
-                    &config,
-                    req_ref,
-                    if pool.list_keys().len() == 1 {
-                        max_attempts.min(3)
-                    } else {
-                        1
-                    },
-                ),
-            )
-            .await
+        match attempt_with_key(
+            pool,
+            &provider,
+            &key,
+            client,
+            model,
+            chat_req,
+            default_cooldown,
+            retries,
+            now_secs,
+        )
+        .await
         {
-            Ok(stream) => {
-                pool.mark_key_success(&key_id);
-                return Ok((key, stream));
+            Ok(stream) => return Ok((key, stream)),
+            Err(e) if worth_another_attempt(&e) => {
+                failure_records.push((key.id.clone(), e.to_string()));
             }
-            Err(e) => {
-                let err_msg = e.to_string();
-                failure_records.push((key_id.clone(), err_msg));
-
-                let failed_at = crate::now_secs().max(now_secs);
-                if matches!(e, ProviderError::EmptyCompletion) {
-                    // Worth another key, but not a reason to cool this one down.
-                    continue;
-                }
-                if is_cooldown_error(&e) {
-                    if let ProviderError::Http(status, _) = e {
-                        if status.as_u16() == 401 {
-                            pool.mark_key_unhealthy(&key_id);
-                        } else {
-                            pool.mark_key_failure(&key_id, failed_at, default_cooldown);
-                        }
-                    } else {
-                        pool.mark_key_failure(&key_id, failed_at, default_cooldown);
-                    }
-                    // Failover continues to next key
-                } else {
-                    // Non-retryable client error
-                    return Err(GovernanceError::NonRetryable(e));
-                }
-            }
+            Err(e) => return Err(GovernanceError::NonRetryable(e)),
         }
     }
 
@@ -418,62 +444,157 @@ impl std::fmt::Debug for ModelFallbackResult {
 /// Iterates through candidate model targets `(ProviderKeyPool, target_model)` in priority order:
 /// If the primary target fails (all keys in cooldown or unrecoverable error), automatically falls back
 /// to the next candidate model in the chain.
+///
+/// `max_attempts` bounds the upstream requests actually sent, across the whole chain. A
+/// chain tries one key of each target in order, then untried keys again from the top
+/// while attempts remain; a target with no key to try right now is passed over without
+/// spending one, so the whole chain is always considered.
 pub async fn execute_stream_with_model_fallback(
     candidates: &[(ProviderKeyPool, String)],
     client: &reqwest::Client,
     chat_req: &ChatRequest,
     default_cooldown: Duration,
-    max_key_attempts_per_candidate: usize,
+    max_attempts: usize,
     now_secs: u64,
 ) -> Result<ModelFallbackResult, GovernanceError> {
-    if candidates.is_empty() {
-        return Err(GovernanceError::AllCandidatesExhausted);
-    }
-
-    let mut last_err = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
-    for (idx, (pool, target_model)) in candidates
-        .iter()
-        .take(max_key_attempts_per_candidate.clamp(1, 3))
-        .enumerate()
-    {
-        match tokio::time::timeout_at(
-            deadline,
-            execute_stream_with_failover(
-                pool,
+    let (pool, target_model) = match candidates {
+        [] => return Err(GovernanceError::AllCandidatesExhausted),
+        [only] => only,
+        chain => {
+            return execute_chain(
+                chain,
                 client,
-                target_model,
                 chat_req,
                 default_cooldown,
-                if candidates.len() > 1 {
-                    1
-                } else {
-                    max_key_attempts_per_candidate
-                },
+                max_attempts,
                 now_secs,
-            ),
-        )
-        .await
-        .unwrap_or(Err(GovernanceError::NonRetryable(ProviderError::Timeout)))
-        {
-            Ok((key, stream)) => {
-                return Ok(ModelFallbackResult {
-                    provider: pool.provider(),
-                    key,
-                    target_model: target_model.clone(),
-                    stream,
-                    candidate_index: idx,
-                    was_fallback: idx > 0,
-                });
-            }
-            Err(e @ GovernanceError::NonRetryable(_)) => return Err(e),
-            Err(e) => {
-                last_err = Some(e);
+                deadline,
+            )
+            .await
+        }
+    };
+    // A single target spends every attempt on its own keys.
+    let (key, stream) = tokio::time::timeout_at(
+        deadline,
+        execute_stream_with_failover(
+            pool,
+            client,
+            target_model,
+            chat_req,
+            default_cooldown,
+            max_attempts,
+            now_secs,
+        ),
+    )
+    .await
+    .unwrap_or(Err(GovernanceError::NonRetryable(ProviderError::Timeout)))?;
+    Ok(ModelFallbackResult {
+        provider: pool.provider(),
+        key,
+        target_model: target_model.clone(),
+        stream,
+        candidate_index: 0,
+        was_fallback: false,
+    })
+}
+
+async fn execute_chain(
+    chain: &[(ProviderKeyPool, String)],
+    client: &reqwest::Client,
+    chat_req: &ChatRequest,
+    default_cooldown: Duration,
+    max_attempts: usize,
+    now_secs: u64,
+    deadline: tokio::time::Instant,
+) -> Result<ModelFallbackResult, GovernanceError> {
+    let mut attempts_left = max_attempts.clamp(1, 3);
+    let mut tried: Vec<Vec<String>> = vec![Vec::new(); chain.len()];
+    let mut failures = Vec::new();
+    // Why the last target could not serve, if not a failed attempt, as each target was
+    // first considered. Later passes only spend attempts left on untried keys.
+    let mut unavailable = None;
+    let mut first_pass = true;
+    while attempts_left > 0 {
+        let mut attempted = false;
+        for (idx, (pool, target_model)) in chain.iter().enumerate() {
+            while attempts_left > 0 {
+                let key = match pool.select_key_for_model(
+                    crate::now_secs().max(now_secs),
+                    &tried[idx],
+                    Some(target_model),
+                ) {
+                    Ok(key) => key,
+                    Err(e) => {
+                        if first_pass && tried[idx].is_empty() {
+                            unavailable = Some(e);
+                        }
+                        break;
+                    }
+                };
+                tried[idx].push(key.id.clone());
+                attempts_left -= 1;
+                attempted = true;
+                let provider = pool.provider();
+                let outcome = tokio::time::timeout_at(
+                    deadline,
+                    attempt_with_key(
+                        pool,
+                        &provider,
+                        &key,
+                        client,
+                        target_model,
+                        chat_req,
+                        default_cooldown,
+                        1,
+                        now_secs,
+                    ),
+                )
+                .await
+                .unwrap_or(Err(ProviderError::Timeout));
+                match outcome {
+                    Ok(stream) => {
+                        return Ok(ModelFallbackResult {
+                            provider,
+                            key,
+                            target_model: target_model.clone(),
+                            stream,
+                            candidate_index: idx,
+                            was_fallback: idx > 0,
+                        })
+                    }
+                    Err(e)
+                        if worth_another_attempt(&e) && tokio::time::Instant::now() < deadline =>
+                    {
+                        let own_key_problem = matches!(
+                            &e,
+                            ProviderError::Http(status, _) if matches!(status.as_u16(), 401 | 429)
+                        );
+                        failures.push((key.id.clone(), e.to_string()));
+                        if first_pass {
+                            unavailable = None;
+                        }
+                        // A rate-limited or invalid key says nothing about its target's
+                        // other keys, which keep the model asked for. Anything else may
+                        // be the provider failing, so the next target goes first.
+                        if !own_key_problem {
+                            break;
+                        }
+                    }
+                    Err(e) => return Err(GovernanceError::NonRetryable(e)),
+                }
             }
         }
+        first_pass = false;
+        if !attempted {
+            break;
+        }
     }
-
-    Err(last_err.unwrap_or(GovernanceError::AllCandidatesExhausted))
+    Err(match unavailable {
+        Some(e) => e,
+        None if !failures.is_empty() => GovernanceError::AllCandidatesFailed { attempts: failures },
+        None => GovernanceError::AllCandidatesExhausted,
+    })
 }
 
 /// Latency and throughput benchmark probe results (Spec §14.3).

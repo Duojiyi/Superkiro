@@ -52,6 +52,103 @@ fn stream() -> String {
     .concat()
 }
 
+/// Posts `images` to a text-only model with vision fallback through `upstream`, which
+/// serves both the model and the transcriptions, and returns the model's prompt.
+async fn post_images(upstream: &MockServer, images: &[String]) -> String {
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(stream()),
+        )
+        .mount(upstream)
+        .await;
+    let billing = BillingEngine::new();
+    let mut card = Card::new("card", "group", 100_000_000);
+    card.activate(gateway::now_secs(), 86_400).unwrap();
+    billing.upsert_card(card);
+    let mut handler = GenerateAssistantResponseHandler::new(
+        reqwest::Client::new(),
+        Arc::new(AnthropicProvider),
+        ProviderConfig {
+            base_url: upstream.uri(),
+            api_key: "key".into(),
+            model: "deepseek-chat".into(),
+            timeout: Duration::from_secs(5),
+            group_id: None,
+        },
+        billing,
+        IdempotencyManager::default(),
+    );
+    handler.vision_config = Some(VisionFallbackConfig {
+        enabled: true,
+        fallback_provider_url: Some(upstream.uri()),
+        fallback_api_key: Some("vision-key".into()),
+        ..Default::default()
+    });
+    let mut registry = FacadeRegistry::default();
+    registry.register(handler);
+    let images: Vec<Value> = images
+        .iter()
+        .map(|bytes| json!({"format": "png", "source": {"bytes": bytes}}))
+        .collect();
+    let body = json!({"conversationState": {
+        "conversationId": "conversation",
+        "currentMessage": {"userInputMessage": {"content": "compare these", "images": images}},
+    }});
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri("/generateAssistantResponse")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("amz-sdk-invocation-id", "invocation")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    request.extensions_mut().insert(AuthClaims {
+        card_id: "card".into(),
+        group_id: "group".into(),
+        token_version: 1,
+        exp: 9_999_999_999,
+        iat: 1_000_000_000,
+    });
+    let response = registry.into_router().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.into_body().collect().await.unwrap();
+    let requests = upstream.received_requests().await.unwrap();
+    let prompt = requests
+        .iter()
+        .find(|request| request.url.path() == "/v1/messages")
+        .expect("the model is called");
+    String::from_utf8_lossy(&prompt.body).to_string()
+}
+
+// Transcriptions run before the first byte is streamed, while the request holds a credit
+// reservation and a concurrency slot. They run together, not one after another.
+#[tokio::test]
+async fn images_are_transcribed_together() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"choices": [{"message": {"content": "A DESCRIPTION"}}]}))
+                .set_delay(Duration::from_millis(1_500)),
+        )
+        .mount(&upstream)
+        .await;
+    let images = [png(3, 3), png(4, 4), png(5, 5)];
+
+    let started = std::time::Instant::now();
+    let prompt = post_images(&upstream, &images).await;
+    let elapsed = started.elapsed();
+
+    assert_eq!(prompt.matches("A DESCRIPTION").count(), 3, "{prompt}");
+    assert!(
+        elapsed < Duration::from_millis(3_500),
+        "three transcriptions took {elapsed:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_failed_transcription_does_not_caption_another_image() {
     let upstream = MockServer::start().await;

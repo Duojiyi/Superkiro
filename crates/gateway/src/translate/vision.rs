@@ -5,6 +5,8 @@
 //! inputs and converts them into structured text transcriptions, preventing
 //! upstream 400 Bad Request errors and preserving conversation context.
 
+use futures_util::StreamExt;
+use kiro_wire::requests::conversation::KiroImage;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -13,6 +15,15 @@ use std::time::Duration;
 /// Bound on a transcription sub-request. It runs inline before any byte is
 /// streamed, holding a credit reservation and a concurrency slot.
 const VISION_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long one request may spend transcribing the images of its current message, all of
+/// them together; an image not described by then reaches the model as its placeholder.
+/// With image preparation and the upstream start, this keeps the time before the first
+/// byte well inside the gateway's response timeout.
+pub const TRANSCRIPTION_BUDGET: Duration = VISION_REQUEST_TIMEOUT;
+
+/// Transcriptions one request runs at a time.
+const TRANSCRIPTION_CONCURRENCY: usize = 4;
 
 /// Returns whether a model identifier natively supports vision/image input.
 pub fn model_supports_vision(model_id: &str) -> bool {
@@ -126,6 +137,89 @@ pub fn format_fallback_description(
     )
 }
 
+/// Transcriptions are shared by every card, so the key must name the image and its
+/// context exactly: SHA-256 over each length-prefixed part, not a 64-bit hash.
+fn transcription_cache_key(model: &str, format: &str, bytes: &str, context: &str) -> String {
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+    for part in [model, format, bytes, context] {
+        digest.update(&(part.len() as u64).to_le_bytes());
+        digest.update(part.as_bytes());
+    }
+    let hash: String = digest
+        .finish()
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("{model}:{format}:{hash}")
+}
+
+/// Describe each image of the current message for a text-only model, several at a time
+/// and all within `budget`. One slot per image, so a failed or late transcription leaves
+/// its own image undescribed instead of shifting the rest. All `None` when no vision
+/// provider is configured.
+pub async fn transcribe_images(
+    client: &reqwest::Client,
+    config: &VisionFallbackConfig,
+    cache: &VisionFallbackCache,
+    images: &[KiroImage],
+    context: &str,
+    budget: Duration,
+) -> Vec<Option<String>> {
+    let (true, Some(base_url), Some(api_key)) = (
+        config.enabled,
+        config.fallback_provider_url.as_deref(),
+        config.fallback_api_key.as_deref(),
+    ) else {
+        return vec![None; images.len()];
+    };
+    let deadline = tokio::time::Instant::now() + budget;
+    let pending: Vec<_> = images
+        .iter()
+        .map(|image| {
+            let format =
+                super::images::sniff_format(&image.source.bytes).unwrap_or(image.format.as_str());
+            let key = transcription_cache_key(
+                &config.fallback_model,
+                format,
+                &image.source.bytes,
+                context,
+            );
+            let request = transcribe_image_with_provider(
+                client,
+                base_url,
+                api_key,
+                &config.fallback_model,
+                format,
+                &image.source.bytes,
+                Some(context),
+                config.max_tokens,
+            );
+            cached_transcription(cache, key, tokio::time::timeout_at(deadline, request))
+        })
+        .collect();
+    futures_util::stream::iter(pending)
+        .buffered(TRANSCRIPTION_CONCURRENCY)
+        .collect()
+        .await
+}
+
+/// A cached transcription, or the outcome of `request`, remembered when it succeeds.
+async fn cached_transcription(
+    cache: &VisionFallbackCache,
+    key: String,
+    request: impl std::future::Future<
+        Output = Result<Result<String, String>, tokio::time::error::Elapsed>,
+    >,
+) -> Option<String> {
+    if let Some(cached) = cache.get(&key) {
+        return Some(cached);
+    }
+    let description = request.await.ok()?.ok()?;
+    cache.set(key, description.clone());
+    Some(description)
+}
+
 /// Call an upstream vision provider (e.g. OpenAI/Claude compatible endpoint) to transcribe an image into text.
 #[allow(clippy::too_many_arguments)]
 pub async fn transcribe_image_with_provider(
@@ -187,4 +281,60 @@ pub async fn transcribe_image_with_provider(
         .ok_or_else(|| "Missing choices[0].message.content in vision response".to_string())?;
 
     Ok(content.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_key_is_a_full_digest_of_unambiguous_parts() {
+        let key = transcription_cache_key("model", "png", "ab", "c");
+        let digest = key.rsplit(':').next().unwrap();
+        assert_eq!(digest.len(), 64, "SHA-256, not a 64-bit hash: {key}");
+        assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(key, transcription_cache_key("model", "png", "ab", "c"));
+        assert_ne!(key, transcription_cache_key("model", "png", "a", "bc"));
+        assert_ne!(key, transcription_cache_key("model", "png", "ab", "d"));
+    }
+
+    // However many images a turn carries and however slowly the vision provider answers,
+    // transcription ends at its budget and the images left over keep their placeholder.
+    #[tokio::test]
+    async fn transcription_ends_at_its_budget() {
+        // A local listener that accepts connections and never answers.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = VisionFallbackConfig {
+            enabled: true,
+            fallback_provider_url: Some(format!("http://{}", silent.local_addr().unwrap())),
+            fallback_api_key: Some("vision-key".into()),
+            ..Default::default()
+        };
+        let images: Vec<KiroImage> = (0..8)
+            .map(|n| KiroImage {
+                format: "png".into(),
+                source: kiro_wire::requests::conversation::KiroImageSource {
+                    bytes: format!("image-{n}"),
+                },
+            })
+            .collect();
+
+        let started = std::time::Instant::now();
+        let transcriptions = transcribe_images(
+            &reqwest::Client::new(),
+            &config,
+            &VisionFallbackCache::default(),
+            &images,
+            "what is this",
+            Duration::from_millis(300),
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(transcriptions, vec![None; images.len()]);
+        drop(silent);
+    }
 }
