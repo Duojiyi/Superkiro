@@ -7,6 +7,10 @@ import requests
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from test_deployed_server import ROOT, HOST, PROXY, connect
 
+# Every check below is an assert; optimized Python would skip them all and still pass.
+if not __debug__:
+    raise SystemExit('Run without -O: these checks are assertions')
+
 config = json.load(sys.stdin)
 release = json.loads((ROOT / 'deployment-candidate-results.json').read_text())
 assert release['status'] == 'deployed'

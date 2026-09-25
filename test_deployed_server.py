@@ -61,6 +61,8 @@ def connect(password, use_proxy=True):
 
 
 def main():
+    if not __debug__:
+        raise SystemExit('Run without -O: these checks are assertions')
     config = json.load(sys.stdin) if '--stdin-config' in sys.argv else {'password': getpass.getpass('SSH password: ')}
     ssh = connect(config['password'])
     results = []

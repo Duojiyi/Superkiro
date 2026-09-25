@@ -5,6 +5,10 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright,expect
 from deploy.domain_acceptance import ROOT,BASE,connection
 
+# Every check below is an assert; optimized Python would skip them all and still pass.
+if not __debug__:
+    raise SystemExit('Run without -O: these checks are assertions')
+
 def run(ssh):
     _,s,_,req=connection(ssh);card=None;results=[]
     out=ROOT/'.acceptance/domain-browser';out.mkdir(exist_ok=True)

@@ -60,12 +60,16 @@ def request(base, path, payload=None, headers=None):
 def decode_frames(data):
     payloads = []
     while data:
-        assert len(data) >= 16, 'Truncated eventstream frame'
+        if len(data) < 16:
+            raise ValueError('Truncated eventstream frame')
         total, headers_length, prelude_crc = struct.unpack('!III', data[:12])
-        assert 16 <= total <= len(data), 'Invalid frame length'
+        if not 16 <= total <= len(data):
+            raise ValueError('Invalid frame length')
         frame, data = data[:total], data[total:]
-        assert zlib.crc32(frame[:8]) == prelude_crc, 'Invalid prelude CRC'
-        assert zlib.crc32(frame[:-4]) == struct.unpack('!I', frame[-4:])[0], 'Invalid message CRC'
+        if zlib.crc32(frame[:8]) != prelude_crc:
+            raise ValueError('Invalid prelude CRC')
+        if zlib.crc32(frame[:-4]) != struct.unpack('!I', frame[-4:])[0]:
+            raise ValueError('Invalid message CRC')
         payloads.append(json.loads(frame[12 + headers_length:-4]))
     return payloads
 
@@ -81,6 +85,8 @@ def stop(proc):
 
 
 def main():
+    if not __debug__:
+        raise SystemExit('Run without -O: these checks are assertions')
     subprocess.run(['cargo', 'build', '--locked', '-p', 'gateway', '--bin', 'gateway'], cwd=ROOT, check=True)
     exe = ROOT / 'target' / 'debug' / ('gateway.exe' if os.name == 'nt' else 'gateway')
     upstream = ThreadingHTTPServer(('127.0.0.1', 0), Upstream)
