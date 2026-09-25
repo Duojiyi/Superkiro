@@ -147,16 +147,21 @@ export function App() {
     const titles:Record<Intent,string>={activate:'启用连接？',restore:'还原 Kiro 配置？',switch:'切换卡密？',exit:'退出 Superkiro？',unbind:'解除设备绑定？',trim:'整理工作集？'};
     setModal({action,title:titles[action],label:action==='activate'?'启用连接':action==='trim'?'整理工作集':action==='exit'?'还原并退出':'确认并继续',detail:action==='trim'?'仅请求系统整理实际 Kiro 进程工作集，不终止正在编辑的进程。':action==='activate'?'将备份原始配置并配置连接，可能需要重启 Kiro。请先保存文件。配置完成不代表模型对话已验证。':status.has_snapshot===false&&status.recovery_pending===false?(action==='unbind'?'将解除此卡密在当前设备的云端绑定；不会关闭 Kiro 或修改官方配置。':'当前没有待还原的本机配置；不会关闭 Kiro 或修改官方配置。'):'确认后将请求 Kiro 关闭。Kiro 询问是否保存时，请在 Kiro 中处理；Kiro 未关闭时不会被强制结束。仅还原 Superkiro 修改的配置，失败保留备份。'});
   }
-  useEffect(()=>{let disposed=false;let unlisten:(()=>void)|undefined;void listen('desktop-exit-request',()=>ask('exit')).then(stop=>{if(disposed)stop();else unlisten=stop;}).catch(()=>{});return()=>{disposed=true;unlisten?.();};},[busy,uncertain,remoteUncertain,remoteUnbound,page]);
+  // Registered once and dispatched to the latest ask: a listener that captured an early
+  // render described the exit with a stale status (say, a restore when nothing is configured).
+  const askLatest=useRef(ask);askLatest.current=ask;
+  useEffect(()=>{let disposed=false;let unlisten:(()=>void)|undefined;void listen('desktop-exit-request',()=>askLatest.current('exit')).then(stop=>{if(disposed)stop();else unlisten=stop;}).catch(()=>{});return()=>{disposed=true;unlisten?.();};},[]);
   async function execute(action:Intent,unbindCard:string,force=false){setModal(null);if(remoteUnbound&&['activate','unbind'].includes(action)){ask(action);return;}if(uncertain&&!(remoteUncertain&&action==='restore')){ask(action);return;}await perform(async()=>{setRetry(null);
     invalidateMemory();
     if(action==='trim'){if(status.kiro_installed!==true||status.process_state!=='Running')throw new Error('no process');let result:Memory;try{result=await api<Memory>('/api/memory/trim','POST');}catch(e){if(refusedBeforeStart(e)){busyNotice();return;}throw e;}await sampleMemory(true);setNotice(finite(result.success_count)&&result.success_count>0?`工作集整理：${result.success_count} 成功，${number(result.failed_count)} 失败。`:'未确认任何 Kiro 进程完成整理，没有可报告的优化结果。');return;}
     if(action==='activate'){setPage('connecting');try{await mutate('/api/activate',{gateway_url:verified!.gateway,card_key:verified!.card,close_kiro_confirmed:true});verificationOnly.current=false;await refresh();setPage('overview');setNotice('连接配置已应用，请在 Kiro 中验证真实模型对话。');void loadUsage();}catch(e){try{await refresh();}catch{if(mutationSent.current){mutation.current=true;setUncertain(true);}}setPage('overview');if(refusedBeforeStart(e)){busyNotice();return;}if(configured(sessionStatus.current)){verificationOnly.current=false;void loadUsage();}captureError(e);return;}return;}
     // The force flag is sent only after a second confirmation that names the unsaved-work loss.
     const closeFlags={close_kiro_confirmed:true,...(force?{force_close_confirmed:true}:{})};
+    const hadLocal=status.has_snapshot===true||status.recovery_pending===true;
     try{if(!(action==='exit'&&status.authenticated===false&&status.has_snapshot===false&&status.recovery_pending!==true))await mutate(action==='unbind'?'/api/unbind':'/api/restore',action==='unbind'?{card_key:unbindCard,gateway_url:verified?.gateway||sessionGateway.current||gateway(gatewayInput),...closeFlags}:closeFlags);
       const restoredStatus=await refresh();if(restoredStatus.recovery_pending===true||restoredStatus.has_snapshot===true)throw new Error('restore pending');
-      let completionNotice=action==='unbind'?'设备绑定已解除，Kiro 配置已还原。':'Kiro 配置已还原。';
+      // Say what happened: after a verification-only login there was nothing local to restore.
+      let completionNotice=action==='unbind'?(hadLocal?'设备绑定已解除，Kiro 配置已还原。':'设备绑定已解除。'):hadLocal?'Kiro 配置已还原。':action==='switch'?'请输入新的卡密。':'没有需要还原的本机配置。';
       if(action==='switch'||action==='unbind'){try{if(await native('clear_remembered_card')!==true)throw new Error();setRemember(false);}catch(e){captureError(e,false);setRemember(true);completionNotice='配置已还原，但系统保存的卡密未能清除，请在登录页取消记住卡密后重试。';}}
       setMemoryDetails(null);setSamples([]);setMemoryState('empty');
       if(action==='restore'&&auth&&!remoteUnbound){
