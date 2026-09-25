@@ -332,7 +332,7 @@ impl ExtensionPatcher {
             .map_err(|e| PatchError::Io(self.extension_path.clone(), e.to_string()))?;
         let patched = if content.starts_with(PATCH_MARKER_PREFIX) {
             self.verify_patched_content()?;
-            let repaired = repair_credit_display(&repair_proxy_tls(&content));
+            let repaired = self.updated_patch(&content, gateway_url, &PatchRecipe::default());
             if repaired != content {
                 validate_javascript(&self.extension_path, &repaired)?;
             }
@@ -423,7 +423,7 @@ impl ExtensionPatcher {
 
         if self.status() == PatchStatus::Patched {
             self.verify_patched_content()?;
-            let repaired = repair_credit_display(&repair_proxy_tls(&content));
+            let repaired = self.updated_patch(&content, gateway_url, recipe);
             if repaired != content {
                 check(&repaired)?;
                 let mut state = self.read_state()?;
@@ -466,6 +466,31 @@ impl ExtensionPatcher {
 
     fn state_path(&self) -> PathBuf {
         self.extension_path.with_extension("js.kpatch-state")
+    }
+
+    /// The already-patched bundle as the current rules would patch it, rendered afresh
+    /// from the verified original in the backup; None when the backup cannot vouch for
+    /// itself, and only the incremental repairs apply then. A patch written by an earlier
+    /// client (one that missed Kiro 1.1.70's `${n}` runtime endpoint, say) is so brought up
+    /// to date the next time it is applied, instead of keeping the old rules for good.
+    fn rerendered(&self, content: &str, gateway_url: &str, recipe: &PatchRecipe) -> Option<String> {
+        let state = self.read_state().ok()?;
+        let backup = fs::read(self.backup_path()).ok()?;
+        if backup.len() as u64 != state.original_len || content_hash(&backup) != state.original_hash
+        {
+            return None;
+        }
+        let original = String::from_utf8(backup).ok()?;
+        let owner = state.owner.or_else(current_owner);
+        let fresh = render_patch_for(&original, gateway_url, recipe, owner.as_deref()).ok()?;
+        (fresh != content).then_some(fresh)
+    }
+
+    /// What an already-patched bundle should become: rendered afresh from its original when
+    /// that is possible, else the incremental repairs; equal to `content` when current.
+    fn updated_patch(&self, content: &str, gateway_url: &str, recipe: &PatchRecipe) -> String {
+        self.rerendered(content, gateway_url, recipe)
+            .unwrap_or_else(|| repair_credit_display(&repair_proxy_tls(content)))
     }
 
     fn read_state(&self) -> Result<PatchState, PatchError> {
@@ -724,6 +749,10 @@ fn render_patch_for(
             continue;
         };
         let (start, end) = (found.start - quote.len_utf8(), found.end + quote.len_utf8());
+        // Two literals cannot share a quote; text that looks so is not JavaScript we know.
+        if start < copied {
+            return Err(PatchError::NeedleNotFound);
+        }
         body.push_str(&content[copied..start]);
         match &is_owner {
             // Anyone else keeps the literal as Kiro wrote it.
@@ -1073,6 +1102,100 @@ mod proxy_tls_tests {
         ] {
             assert_eq!(repair_proxy_tls(untouched), untouched);
         }
+    }
+}
+
+#[cfg(test)]
+mod rerender_tests {
+    use super::*;
+
+    const GATEWAY: &str = "https://gw.test";
+    const ORIGINAL: &str =
+        "module.exports=[(t)=>`https://runtime.${t}.kiro.dev`,(n)=>`https://runtime.${n}.kiro.dev`];";
+
+    /// A bundle as an earlier client patched it: the `${t}` endpoint redirected, the `${n}`
+    /// one Kiro 1.1.70 added left on the official runtime.
+    fn older_patch() -> String {
+        format!(
+            "{PATCH_MARKER_V1}\n{}",
+            ORIGINAL.replacen(
+                "`https://runtime.${t}.kiro.dev`",
+                "(process.env.KIRO_GATEWAY_URL||\"https://gw.test\")",
+                1
+            )
+        )
+    }
+
+    fn installed(name: &str, live: &str, backup: &[u8]) -> (PathBuf, ExtensionPatcher) {
+        let dir =
+            std::env::temp_dir().join(format!("patch-rerender-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let patcher = ExtensionPatcher::new(dir.join("extension.js"));
+        fs::write(patcher.path(), live).unwrap();
+        fs::write(patcher.backup_path(), backup).unwrap();
+        patcher
+            .write_state(&PatchState {
+                original_len: ORIGINAL.len() as u64,
+                original_hash: content_hash(ORIGINAL.as_bytes()),
+                patched_hash: content_hash(live.as_bytes()),
+                previous_patched_hash: None,
+                owner: None,
+            })
+            .unwrap();
+        (dir, patcher)
+    }
+
+    #[test]
+    fn an_older_patch_is_rerendered_from_its_original() {
+        let older = older_patch();
+        let (dir, patcher) = installed("current", &older, ORIGINAL.as_bytes());
+        let fresh = render_patch(ORIGINAL, GATEWAY, &PatchRecipe::default()).unwrap();
+        assert_eq!(
+            patcher.updated_patch(&older, GATEWAY, &PatchRecipe::default()),
+            fresh
+        );
+        // The takeover's own check passes it, naming the bundle read and what it becomes.
+        let prepared = patcher.prepare(GATEWAY).unwrap();
+        assert_eq!(prepared.source, content_hash(older.as_bytes()));
+        assert_eq!(prepared.patched, content_hash(fresh.as_bytes()));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_current_patch_is_left_as_it_is() {
+        let fresh = render_patch(ORIGINAL, GATEWAY, &PatchRecipe::default()).unwrap();
+        let (dir, patcher) = installed("fresh", &fresh, ORIGINAL.as_bytes());
+        assert_eq!(
+            patcher.updated_patch(&fresh, GATEWAY, &PatchRecipe::default()),
+            fresh
+        );
+        let prepared = patcher.prepare(GATEWAY).unwrap();
+        assert_eq!(prepared.source, prepared.patched);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A backup that no longer matches the recorded original cannot vouch for a re-render:
+    /// only the incremental repairs apply, as before.
+    #[test]
+    fn an_unverifiable_backup_falls_back_to_the_repairs() {
+        let older = older_patch();
+        let (dir, patcher) = installed("tampered", &older, b"not the original");
+        assert_eq!(
+            patcher.updated_patch(&older, GATEWAY, &PatchRecipe::default()),
+            older
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Text where two literals would share a quote is refused, not a panic.
+    #[test]
+    fn literals_sharing_a_quote_are_refused() {
+        let source = "a=`https://runtime.${t}.kiro.dev`https://runtime.${t}.kiro.dev`;";
+        assert_eq!(
+            render_patch(source, GATEWAY, &PatchRecipe::default()),
+            Err(PatchError::NeedleNotFound)
+        );
     }
 }
 
