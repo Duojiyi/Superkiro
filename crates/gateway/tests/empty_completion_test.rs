@@ -24,6 +24,8 @@ use std::time::Duration;
 use wiremock::matchers::{method as wm_method, path as wm_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+mod support;
+
 const GROUP: &str = "group-empty";
 const CARD: &str = "card-empty";
 const MODEL: &str = "claude-sonnet-4-6";
@@ -53,6 +55,7 @@ async fn run(frames: &[Value]) -> Outcome {
         .await;
 
     let billing = BillingEngine::default();
+    billing.upsert_rate_card_version(support::wildcard_price("default"));
     let auth = AuthState::with_billing(
         "test-secret-key-empty-completion-contract-32",
         billing.clone(),

@@ -89,6 +89,9 @@ pub enum BillingError {
     #[error("Provider returned no billable usage for a reserved invocation")]
     MissingUsage,
 
+    #[error("No price is published for model '{0}'")]
+    ModelNotPriced(String),
+
     #[error("Invalid billing state: {0}")]
     InvalidState(String),
 
@@ -1974,19 +1977,20 @@ impl BillingEngine {
             let models: Vec<&str> = std::iter::once(model.as_str())
                 .chain(model_map.map(|m| m.target_model.as_str()))
                 .collect();
-            let resolved_rcv = self.resolve_price(rate_card_id, &models, now_secs);
-            if let Some(rcv) = resolved_rcv {
-                let amt = rcv.calculate_reserve_amount(
-                    params.estimated_input_tokens,
-                    params.max_output_tokens,
-                    group_margin,
-                    model_multiplier,
-                    &settings,
-                );
-                (amt, Some(rcv.id))
-            } else {
-                (params.calculate_reserve_amount(), None)
-            }
+            // A named model is never billed at the built-in default rates: without a
+            // published price it is refused here, before any work. It used to reserve and
+            // settle at 15 and 60 credits per million tokens, its margins dropped.
+            let rcv = self
+                .resolve_price(rate_card_id, &models, now_secs)
+                .ok_or_else(|| BillingError::ModelNotPriced(model.clone()))?;
+            let amt = rcv.calculate_reserve_amount(
+                params.estimated_input_tokens,
+                params.max_output_tokens,
+                group_margin,
+                model_multiplier,
+                &settings,
+            );
+            (amt, Some(rcv.id))
         } else {
             (params.calculate_reserve_amount(), None)
         };

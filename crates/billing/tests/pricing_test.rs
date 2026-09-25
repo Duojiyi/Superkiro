@@ -2,7 +2,7 @@
 //! Rate-card versioning, tiered cache token billing, cost-side ledger, and 3 pricing modes (Spec §5, §6.4, §6.5, §14.10).
 
 use billing::card::Card;
-use billing::engine::BillingEngine;
+use billing::engine::{BillingEngine, BillingError};
 use billing::group::{Group, ModelMap};
 use billing::ledger::{LedgerKind, UsageTokens};
 use billing::rate_card::{BillingSettings, Currency, PricingMode, RateCard, RateCardVersion};
@@ -1039,4 +1039,50 @@ fn a_wildcard_price_never_shadows_the_mapped_targets_price() {
         engine.display_price("group-target", "other", now),
         Some(MICRO_CREDITS_PER_CREDIT)
     );
+}
+
+/// A request is never billed at the built-in default rates. A model with no published
+/// price, exact or wildcard, used to reserve and settle at 15 and 60 credits per million
+/// tokens with the group margin and the model multiplier dropped: here a third of what
+/// the priced model in the same group costs. It is refused before any work instead.
+#[test]
+fn a_model_without_a_published_price_is_refused_before_any_work() {
+    let engine = BillingEngine::new();
+    let now = 1_000;
+    let mut group = Group::pro_plus("group-priced", "Priced");
+    group.margin_multiplier = 3.0;
+    engine.upsert_group(group);
+    engine.upsert_rate_card_version(output_price("v-priced", "default", "priced", 60));
+    let mut card = Card::new(
+        "card-priced",
+        "group-priced",
+        1_000 * MICRO_CREDITS_PER_CREDIT,
+    );
+    card.activate(now, 86_400).unwrap();
+    engine.upsert_card(card);
+
+    let params = ReservationEstimateParams::new(1_000, 1_000);
+    assert_eq!(
+        engine.reserve(
+            "card-priced",
+            "inv-unpriced",
+            &params.clone().with_model("unpriced"),
+            now,
+            300
+        ),
+        Err(BillingError::ModelNotPriced("unpriced".to_string()))
+    );
+    assert_eq!(engine.get_card("card-priced").unwrap().credit_reserved, 0);
+    assert!(engine.export_snapshot().reservations.is_empty());
+
+    let reservation = engine
+        .reserve(
+            "card-priced",
+            "inv-priced",
+            &params.with_model("priced"),
+            now,
+            300,
+        )
+        .unwrap();
+    assert_eq!(reservation.rate_card_version.as_deref(), Some("v-priced"));
 }

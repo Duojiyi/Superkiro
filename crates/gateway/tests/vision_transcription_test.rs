@@ -22,6 +22,8 @@ use wiremock::{
     Mock, MockServer, ResponseTemplate,
 };
 
+mod support;
+
 fn png(width: u32, height: u32) -> String {
     let image = image::RgbImage::from_pixel(width, height, image::Rgb([90, 90, 90]));
     let mut out = Vec::new();
@@ -65,6 +67,7 @@ async fn post_images(upstream: &MockServer, images: &[String]) -> String {
         .mount(upstream)
         .await;
     let billing = BillingEngine::new();
+    billing.upsert_rate_card_version(support::wildcard_price("default"));
     let mut card = Card::new("card", "group", 100_000_000);
     card.activate(gateway::now_secs(), 86_400).unwrap();
     billing.upsert_card(card);
@@ -179,6 +182,7 @@ async fn a_failed_transcription_does_not_caption_another_image() {
         .await;
 
     let billing = BillingEngine::new();
+    billing.upsert_rate_card_version(support::wildcard_price("default"));
     let mut card = Card::new("card", "group", 100_000_000);
     card.activate(gateway::now_secs(), 86_400).unwrap();
     billing.upsert_card(card);

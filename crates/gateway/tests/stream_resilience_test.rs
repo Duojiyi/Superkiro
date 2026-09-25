@@ -18,6 +18,8 @@ use kiro_wire::decoder::EventStreamDecoder;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
+mod support;
+
 fn create_test_billing() -> (BillingEngine, String) {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let temp_dir = std::env::temp_dir().join(format!(
@@ -36,6 +38,7 @@ fn create_test_billing() -> (BillingEngine, String) {
     let billing = BillingEngine::new();
     billing.set_persistence_path(&state_file);
     billing.set_master_kek(kek);
+    billing.upsert_rate_card_version(support::wildcard_price("default"));
 
     let mut card = Card::new("card-t06-test", "group-default", 10_000_000);
     let now_secs = SystemTime::now()

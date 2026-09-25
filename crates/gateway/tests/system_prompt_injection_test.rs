@@ -19,8 +19,13 @@ use std::time::Duration;
 use wiremock::matchers::{method as wm_method, path as wm_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+mod support;
+
 fn setup_auth() -> (BillingEngine, AuthState) {
     let billing = BillingEngine::default();
+    for rate_card in ["default", "enterprise"] {
+        billing.upsert_rate_card_version(support::wildcard_price(rate_card));
+    }
     let auth = AuthState::with_billing(
         "test-secret-key-system-prompt-p4-7-audit-ok-minimum-32-chars",
         billing.clone(),

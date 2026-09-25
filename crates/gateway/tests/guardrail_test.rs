@@ -13,6 +13,8 @@ use gateway::facade::FacadeRegistry;
 use gateway::guardrail::{CapacityError, CapacityGuardrail};
 use tower::ServiceExt;
 
+mod support;
+
 #[test]
 fn test_capacity_guardrail_fast_fail_and_raii_release() {
     let guardrail = CapacityGuardrail::new(2, 3);
@@ -118,6 +120,7 @@ async fn test_gateway_card_concurrency_quota_rejection() {
         .as_secs();
 
     let billing = BillingEngine::new();
+    billing.upsert_rate_card_version(support::wildcard_price("default"));
     let mut card = Card::new(
         "card-concurrency-gw",
         "group-default",
@@ -199,6 +202,7 @@ async fn test_gateway_daily_and_monthly_quota_rejection() {
         .as_secs();
 
     let billing = BillingEngine::new();
+    billing.upsert_rate_card_version(support::wildcard_price("default"));
     let mut card = Card::new(
         "card-period-gw",
         "group-default",

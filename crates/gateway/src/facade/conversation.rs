@@ -357,6 +357,11 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
             };
 
             // 5. Credit Reservation (Spec §6.2)
+            let fallback_model = self
+                .provider_config
+                .as_ref()
+                .map(|c| c.model.as_str())
+                .unwrap_or("claude-3-5-sonnet-20241022");
             let mut has_reservation = false;
             let reservation_lease = self.billing.protect_reservation(&invocation_key);
             let mut reserved_estimated_input = 2_000u64;
@@ -372,22 +377,21 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                     .as_secs();
 
                 let request_for_reservation = parsed_request.as_ref();
-                let requested_model_for_reservation = request_for_reservation
-                    .and_then(|request| {
-                        request
-                            .conversation_state
-                            .current_message
-                            .user_input_message
-                            .model_id
-                            .as_deref()
-                    })
-                    .filter(|model| !model.trim().is_empty())
-                    .unwrap_or_else(|| {
-                        self.provider_config
-                            .as_ref()
-                            .map(|config| config.model.as_str())
-                            .unwrap_or("default-model")
-                    });
+                // Held and billed as the model the request is sent to.
+                let requested_model_for_reservation = request_for_reservation.map_or_else(
+                    || fallback_model.to_string(),
+                    |request| {
+                        requested_model_id(request, claims.as_ref(), &self.billing, fallback_model)
+                    },
+                );
+                let requested_model_for_reservation = requested_model_for_reservation.as_str();
+                if !valid_model_id(requested_model_for_reservation) {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidRequestException",
+                        "modelId is invalid",
+                    );
+                }
                 let input_limit = input_limit_for_model(
                     requested_model_for_reservation,
                     claims.as_ref(),
@@ -478,6 +482,13 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                                 // paths and the snapshot size, and the caller cannot act
                                 // on either.
                                 "Billing persistence is temporarily unavailable",
+                            );
+                        }
+                        billing::engine::BillingError::ModelNotPriced(_) => {
+                            return error_response(
+                                StatusCode::BAD_REQUEST,
+                                "ValidationException",
+                                "This model has no published price; choose another model or ask your administrator to publish one",
                             );
                         }
                         _ => {
@@ -577,18 +588,9 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                 }
             }
 
-            let fallback_model = self
-                .provider_config
-                .as_ref()
-                .map(|c| c.model.as_str())
-                .unwrap_or("claude-3-5-sonnet-20241022");
-            let requested_model = kiro_req
-                .conversation_state
-                .current_message
-                .user_input_message
-                .model_id
-                .as_deref()
-                .unwrap_or(fallback_model);
+            let requested_model =
+                requested_model_id(&kiro_req, claims.as_ref(), &self.billing, fallback_model);
+            let requested_model = requested_model.as_str();
             if !valid_model_id(requested_model) {
                 if has_reservation {
                     let _ = self.billing.release(&invocation_key);
@@ -643,7 +645,9 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                 }
             }
 
-            if !mapped_model && self.provider.is_some() && requested_model != fallback_model {
+            // An unmapped request is sent to the fallback model, so that is the only model it
+            // may name: it is held and billed as the model it names.
+            if !mapped_model && requested_model != fallback_model {
                 if has_reservation {
                     let _ = self.billing.release(&invocation_key);
                 }
@@ -1103,6 +1107,40 @@ fn valid_invocation_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
+}
+
+/// The model a request is for: the one it names, or, when it names none, its group's
+/// default — the first model its model list shows — or, in a group that maps no models,
+/// the fallback model every unmapped request is sent to. A request that named no model
+/// was priced as "default-model" and sent to the fallback model, so it was billed at the
+/// built-in default rates whatever its group's models cost.
+fn requested_model_id(
+    request: &GenerateAssistantResponseRequest,
+    claims: Option<&AuthClaims>,
+    billing: &BillingEngine,
+    fallback_model: &str,
+) -> String {
+    if let Some(model) = request
+        .conversation_state
+        .current_message
+        .user_input_message
+        .model_id
+        .as_deref()
+    {
+        return model.to_string();
+    }
+    claims
+        .and_then(|claims| billing.get_group(&claims.group_id))
+        .and_then(|group| {
+            billing
+                .list_models_for_group(&group.id, true)
+                .into_iter()
+                .next()
+        })
+        .map_or_else(
+            || fallback_model.to_string(),
+            |model| model.exposed_model_id,
+        )
 }
 
 fn valid_model_id(model: &str) -> bool {

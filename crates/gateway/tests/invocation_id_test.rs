@@ -15,8 +15,11 @@ use serde_json::json;
 use std::{sync::Arc, time::Duration};
 use tower::ServiceExt;
 
+mod support;
+
 async fn send(invocation_id: &str) -> (StatusCode, BillingEngine) {
     let billing = BillingEngine::new();
+    billing.upsert_rate_card_version(support::wildcard_price("default"));
     let mut card = Card::new("card", "group", 100_000_000);
     card.activate(gateway::now_secs(), 86_400).unwrap();
     billing.upsert_card(card);

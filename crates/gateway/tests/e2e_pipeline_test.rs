@@ -26,6 +26,8 @@ use tower::ServiceExt;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+mod support;
+
 fn create_auth_claims(card_id: &str) -> AuthClaims {
     AuthClaims {
         card_id: card_id.to_string(),
@@ -72,6 +74,7 @@ async fn test_e2e_conversation_pipeline_with_provider_and_billing_settlement() {
 
     // 2. Setup Billing Engine with a test card
     let billing = BillingEngine::new();
+    billing.upsert_rate_card_version(support::wildcard_price("default"));
     let initial_credits = 100_000_000i64; // 100 credits
     let mut card = Card::new("card-e2e-001", "group-default", initial_credits);
     let now_secs = std::time::SystemTime::now()
@@ -384,6 +387,7 @@ async fn classifier_words_inside_an_ordinary_turn_reach_the_model() {
         .await;
 
     let billing = BillingEngine::new();
+    billing.upsert_rate_card_version(support::wildcard_price("default"));
     let mut card = Card::new("card-intent-001", "group-default", 100_000_000);
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -477,6 +481,7 @@ async fn classifier_words_inside_an_ordinary_turn_reach_the_model() {
 #[tokio::test]
 async fn test_e2e_insufficient_credit_rejection() {
     let billing = BillingEngine::new();
+    billing.upsert_rate_card_version(support::wildcard_price("default"));
     // Card with zero balance
     let mut card = Card::new("card-broke-001", "group-default", 0);
     let now_secs = std::time::SystemTime::now()

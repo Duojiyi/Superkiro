@@ -19,6 +19,8 @@ use tower::ServiceExt;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+mod support;
+
 fn create_auth_claims(card_id: &str) -> AuthClaims {
     AuthClaims {
         card_id: card_id.to_string(),
@@ -80,6 +82,7 @@ async fn test_provider_import_to_real_request_and_lifecycle_loop() {
     let kek = MasterKek::from_bytes(kek_bytes);
 
     let billing = BillingEngine::new();
+    billing.upsert_rate_card_version(support::wildcard_price("default"));
     billing.set_persistence_path(&state_file);
     billing.set_master_kek(kek.clone());
 
