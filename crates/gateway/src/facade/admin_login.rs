@@ -490,7 +490,8 @@ pub async fn handle(
         return no_store(json_response(
             StatusCode::OK,
             &serde_json::json!({
-                "success": true, "authenticated": true, "role": "admin", "csrfToken": csrf_token(req.headers()),
+                // The one operator account: the console names who acts without a new sign-in.
+                "success": true, "authenticated": true, "role": "admin", "username": "admin", "csrfToken": csrf_token(req.headers()),
                 "expiresAt": expires_at, "expiresIn": expires_at.saturating_sub(now_secs()),
                 "twoFactorEnabled": browser.totp.is_some(), "totpRequired": browser.totp.is_some()
             }),
@@ -721,6 +722,7 @@ mod tests {
                 serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap())
                     .unwrap();
             assert_eq!(body["expiresAt"], session.expires_at);
+            assert_eq!(body["username"], "admin");
             let ttl = body["expiresIn"].as_u64().unwrap();
             assert!(ttl <= 60);
             if attempt == 1 {
