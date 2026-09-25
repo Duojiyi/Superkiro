@@ -1147,6 +1147,8 @@ impl FacadeHandler for AdminStatsHandler {
                     "totalPoints": (total_credits as f64) / micro,
                     "usedPoints": (used_credits as f64) / micro,
                     "remainingPoints": (remaining_credits as f64) / micro,
+                    // Real totals for the overview, not a sample of the latest traces.
+                    "activity": self.billing.activity(now_secs()),
                 }),
             )
         })

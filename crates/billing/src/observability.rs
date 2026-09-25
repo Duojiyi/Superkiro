@@ -17,6 +17,46 @@ pub enum TraceStatus {
     InProgress,
 }
 
+/// What happened over one period: requests by outcome from the traces, and what was
+/// billed for them from the ledger.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityWindow {
+    pub requests: u64,
+    pub succeeded: u64,
+    pub failed: u64,
+    pub client_aborted: u64,
+    pub credits_charged: i64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub provider_cost_micro_cny: i64,
+    /// Cards billed at least once in the period.
+    pub active_cards: u64,
+}
+
+/// Requests in one clock hour.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityHour {
+    pub start_secs: u64,
+    pub requests: u64,
+    pub failed: u64,
+}
+
+/// The last 24 hours and 7 days, and the last 24 clock hours one by one.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Activity {
+    #[serde(rename = "last24h")]
+    pub last_24h: ActivityWindow,
+    #[serde(rename = "last7d")]
+    pub last_7d: ActivityWindow,
+    /// Oldest first; the last is the current, unfinished hour.
+    pub hourly: Vec<ActivityHour>,
+    /// The oldest trace kept: request counts reach back no further than this.
+    pub traces_cover_from_secs: Option<u64>,
+}
+
 /// Single failover or execution attempt record within a request trace (Spec §5, §14.4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttemptRecord {

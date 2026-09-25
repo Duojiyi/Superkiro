@@ -4343,6 +4343,75 @@ impl BillingEngine {
         }
     }
 
+    /// Requests and billing over the last 24 hours and 7 days, and hour by hour over the
+    /// last day, read in place: request outcomes from the traces, charges from the ledger.
+    pub fn activity(&self, now: u64) -> crate::observability::Activity {
+        use crate::observability::{Activity, ActivityHour, ActivityWindow};
+        const HOUR: u64 = 3600;
+        let day_start = now.saturating_sub(24 * HOUR);
+        let week_start = now.saturating_sub(7 * 24 * HOUR);
+        let first_hour = (now / HOUR).saturating_sub(23) * HOUR;
+        let mut activity = Activity {
+            hourly: (0..24)
+                .map(|i| ActivityHour {
+                    start_secs: first_hour + i * HOUR,
+                    ..ActivityHour::default()
+                })
+                .collect(),
+            ..Activity::default()
+        };
+        let count = |window: &mut ActivityWindow, status: TraceStatus| {
+            match status {
+                TraceStatus::Success => window.succeeded += 1,
+                TraceStatus::Error => window.failed += 1,
+                TraceStatus::ClientAborted => window.client_aborted += 1,
+                TraceStatus::InProgress => return,
+            }
+            window.requests += 1;
+        };
+        {
+            let traces = self.traces.read().unwrap();
+            activity.traces_cover_from_secs = traces.iter().map(|trace| trace.ts).min();
+            for trace in traces.iter().filter(|trace| trace.ts <= now) {
+                if trace.ts > week_start {
+                    count(&mut activity.last_7d, trace.status);
+                }
+                if trace.ts > day_start {
+                    count(&mut activity.last_24h, trace.status);
+                }
+                if trace.ts >= first_hour && trace.status != TraceStatus::InProgress {
+                    let hour = &mut activity.hourly[((trace.ts - first_hour) / HOUR) as usize];
+                    hour.requests += 1;
+                    hour.failed += u64::from(trace.status == TraceStatus::Error);
+                }
+            }
+        }
+        let ledger = self.ledger.read().unwrap();
+        for (window, start) in [
+            (&mut activity.last_24h, day_start),
+            (&mut activity.last_7d, week_start),
+        ] {
+            let mut cards = std::collections::HashSet::new();
+            for entry in ledger.iter().filter(|entry| {
+                entry.kind == crate::ledger::LedgerKind::Usage
+                    && entry.ts_secs > start
+                    && entry.ts_secs <= now
+            }) {
+                window.credits_charged =
+                    window.credits_charged.saturating_add(entry.credits_charged);
+                // Already the whole prompt: uncached, cache reads and cache writes.
+                window.input_tokens = window.input_tokens.saturating_add(entry.input_tokens);
+                window.output_tokens = window.output_tokens.saturating_add(entry.output_tokens);
+                window.provider_cost_micro_cny = window
+                    .provider_cost_micro_cny
+                    .saturating_add(entry.provider_cost_micro_cny);
+                cards.insert(entry.card_id.as_str());
+            }
+            window.active_cards = cards.len() as u64;
+        }
+        activity
+    }
+
     /// List recorded request execution traces.
     pub fn list_traces(&self, card_id: Option<&str>, limit: usize) -> Vec<RequestTrace> {
         let traces = self.traces.read().unwrap();

@@ -697,3 +697,95 @@ fn traces_ride_along_with_the_next_commit_instead_of_saving_on_their_own() {
         .any(|t| t.invocation_id == "inv-trace" && t.status == TraceStatus::Success));
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn activity_counts_real_totals_by_period_and_hour() {
+    let engine = BillingEngine::new();
+    let mut card = Card::new("card-activity", "group", 100_000_000);
+    card.status = CardStatus::Active;
+    engine.upsert_card(card);
+    // Fifty minutes into an hour, so each moment falls in a known hourly bucket.
+    let now = 240 * 3600 + 3000;
+    let tokens = UsageTokens {
+        uncached_input_tokens: 1000,
+        output_tokens: 500,
+        cache_creation_tokens: 0,
+        cache_read_tokens: 200,
+    };
+    for (invocation, at) in [
+        ("inv-hour-ago", now - 3600),
+        ("inv-two-days", now - 2 * 86400),
+        ("inv-eight-days", now - 8 * 86400),
+    ] {
+        engine
+            .reserve(
+                "card-activity",
+                invocation,
+                &ReservationEstimateParams::new(1000, 500),
+                at - 5,
+                60,
+            )
+            .unwrap();
+        engine
+            .settle(
+                invocation,
+                &tokens,
+                "claude-opus-5",
+                "provider",
+                "target",
+                at,
+            )
+            .unwrap();
+    }
+    let trace = |invocation: &str, ts: u64, status: TraceStatus| RequestTrace {
+        id: format!("trace-{invocation}"),
+        card_id: "card-activity".into(),
+        ts,
+        invocation_id: invocation.into(),
+        exposed_model: "claude-opus-5".into(),
+        status,
+        ttft_ms: None,
+        tokens_per_second: None,
+        error_class: None,
+        provider_id: None,
+        input_tokens: 0,
+        output_tokens: 0,
+        credits_charged: 0,
+        provider_cost_micro_cny: 0,
+        attempt_chain: Vec::new(),
+    };
+    engine.record_trace(trace("inv-failed", now - 1800, TraceStatus::Error));
+    engine.record_trace(trace("inv-left", now - 60, TraceStatus::ClientAborted));
+    engine.record_trace(trace("inv-running", now - 10, TraceStatus::InProgress));
+
+    let activity = engine.activity(now);
+    let day = &activity.last_24h;
+    assert_eq!(
+        (day.requests, day.succeeded, day.failed, day.client_aborted),
+        (3, 1, 1, 1)
+    );
+    assert_eq!(day.input_tokens, 1200);
+    assert_eq!(day.output_tokens, 500);
+    assert_eq!(day.active_cards, 1);
+    assert!(day.credits_charged > 0);
+    let week = &activity.last_7d;
+    assert_eq!((week.requests, week.succeeded), (4, 2));
+    assert_eq!(week.credits_charged, 2 * day.credits_charged);
+    assert_eq!(activity.hourly.len(), 24);
+    assert_eq!(activity.hourly[23].start_secs, 240 * 3600);
+    assert_eq!(
+        (activity.hourly[23].requests, activity.hourly[23].failed),
+        (2, 1)
+    );
+    assert_eq!(
+        (activity.hourly[22].requests, activity.hourly[22].failed),
+        (1, 0)
+    );
+    assert_eq!(activity.hourly.iter().map(|h| h.requests).sum::<u64>(), 3);
+    assert_eq!(activity.traces_cover_from_secs, Some(now - 8 * 86400));
+    // As the stats endpoint sends it.
+    let json = serde_json::to_value(&activity).unwrap();
+    assert_eq!(json["last24h"]["clientAborted"], 1);
+    assert_eq!(json["hourly"][23]["startSecs"], 240 * 3600);
+    assert_eq!(json["tracesCoverFromSecs"], now - 8 * 86400);
+}
