@@ -140,6 +140,8 @@ fn abandoned_lease_is_reclaimed_and_live_ownership_is_not_restored() {
         660,
     )
     .unwrap();
+    // The hold is saved with the next write, and a restart drops it.
+    b.sync_to_disk_checked().unwrap();
     let recovered = BillingEngine::new();
     recovered.load_from_file(&file).unwrap();
     assert_eq!(recovered.get_card("card").unwrap().credit_reserved, 0);

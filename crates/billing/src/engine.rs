@@ -218,6 +218,12 @@ impl Drop for ReservationLease {
 }
 
 const SNAPSHOT_VERSION: u32 = 2;
+/// How long the record of a settled or released invocation is kept. It is what refuses a
+/// replay of a settled invocation id once the gateway's in-memory guard (ten minutes) has
+/// forgotten it or the process restarted, and a client retries within minutes. Past a day
+/// a reuse is a new request, served and billed as one. Kept for good, settled records
+/// grew the saved state by every request ever served.
+const TERMINAL_RESERVATION_RETENTION_SECS: u64 = 24 * 60 * 60;
 const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
 
 /// Saved state sizes that call for the operator: archive the ledger soon, and now. At
@@ -386,59 +392,86 @@ impl ArchivedLedgerSummary {
 }
 
 impl BillingSnapshot {
-    fn usage_since(&self, card_id: &str, since: u64) -> i64 {
-        self.ledger
-            .iter()
-            .filter(|e| e.card_id == card_id && e.kind == LedgerKind::Usage && e.ts_secs >= since)
-            .fold(
-                self.archived_ledger_summary.usage_since(card_id, since),
-                |sum, e| sum.saturating_add(e.credits_charged),
-            )
-    }
-
     fn check_quota(&self, card: &Card, additional: i64, now_secs: u64) -> Result<(), BillingError> {
-        if self
-            .pending_settlements
-            .values()
-            .any(|p| p.entry.card_id == card.id)
-        {
-            return Err(BillingError::InvalidState(
-                "card has a pending settlement".into(),
-            ));
-        }
-        // A hold remains exposure in the current window until settled/released;
-        // settlement usage is attributed to completion time.
-        let held = self
-            .reservations
-            .values()
-            .filter(|r| r.card_id == card.id && r.state == ReservationState::Held)
-            .fold(0i64, |sum, r| sum.saturating_add(r.reserved_micro_credits));
-        if let Some(limit) = card.daily_credit_limit {
-            let current = self
-                .usage_since(&card.id, now_secs / 86_400 * 86_400)
-                .saturating_add(held);
-            if additional > limit.saturating_sub(current) {
-                return Err(BillingError::DailyLimitExceeded {
-                    limit,
-                    current,
-                    needed: additional,
-                });
-            }
-        }
-        if let Some(limit) = card.monthly_credit_limit {
-            let current = self
-                .usage_since(&card.id, now_secs.saturating_sub(30 * 86_400))
-                .saturating_add(held);
-            if additional > limit.saturating_sub(current) {
-                return Err(BillingError::MonthlyLimitExceeded {
-                    limit,
-                    current,
-                    needed: additional,
-                });
-            }
-        }
-        Ok(())
+        check_quota(
+            card,
+            additional,
+            now_secs,
+            &self.reservations,
+            &self.pending_settlements,
+            &self.ledger,
+            &self.archived_ledger_summary,
+        )
     }
+}
+
+fn usage_since(
+    ledger: &[LedgerEntry],
+    archived: &ArchivedLedgerSummary,
+    card_id: &str,
+    since: u64,
+) -> i64 {
+    ledger
+        .iter()
+        .filter(|e| e.card_id == card_id && e.kind == LedgerKind::Usage && e.ts_secs >= since)
+        .fold(archived.usage_since(card_id, since), |sum, e| {
+            sum.saturating_add(e.credits_charged)
+        })
+}
+
+/// The card's fair-use limits, checked for `additional` more credit held, over the tables
+/// given: a transaction's candidate state or, under the state lock, the live tables.
+fn check_quota(
+    card: &Card,
+    additional: i64,
+    now_secs: u64,
+    reservations: &HashMap<String, CreditReservation>,
+    pending_settlements: &HashMap<String, PendingSettlement>,
+    ledger: &[LedgerEntry],
+    archived: &ArchivedLedgerSummary,
+) -> Result<(), BillingError> {
+    if pending_settlements
+        .values()
+        .any(|p| p.entry.card_id == card.id)
+    {
+        return Err(BillingError::InvalidState(
+            "card has a pending settlement".into(),
+        ));
+    }
+    // A hold remains exposure in the current window until settled/released;
+    // settlement usage is attributed to completion time.
+    let held = reservations
+        .values()
+        .filter(|r| r.card_id == card.id && r.state == ReservationState::Held)
+        .fold(0i64, |sum, r| sum.saturating_add(r.reserved_micro_credits));
+    if let Some(limit) = card.daily_credit_limit {
+        let current = usage_since(ledger, archived, &card.id, now_secs / 86_400 * 86_400)
+            .saturating_add(held);
+        if additional > limit.saturating_sub(current) {
+            return Err(BillingError::DailyLimitExceeded {
+                limit,
+                current,
+                needed: additional,
+            });
+        }
+    }
+    if let Some(limit) = card.monthly_credit_limit {
+        let current = usage_since(
+            ledger,
+            archived,
+            &card.id,
+            now_secs.saturating_sub(30 * 86_400),
+        )
+        .saturating_add(held);
+        if additional > limit.saturating_sub(current) {
+            return Err(BillingError::MonthlyLimitExceeded {
+                limit,
+                current,
+                needed: additional,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Immutable audit receipt for an archived batch of settled ledger entries (Spec §14.6, T03).
@@ -731,9 +764,19 @@ impl BillingEngine {
             card.credit_reserved = 0;
         }
         let mut reservations = snapshot.reservations;
-        // Migrate legacy snapshots once, not on every model request.
+        // Migrate legacy snapshots once, not on every model request. Only an invocation
+        // inside the retention window needs a record: an older one is pruned, and
+        // recreating it at every start would grow the state back.
+        let horizon = snapshot
+            .ledger
+            .iter()
+            .filter(|entry| entry.kind == LedgerKind::Usage)
+            .map(|entry| entry.ts_secs)
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(TERMINAL_RESERVATION_RETENTION_SECS);
         for entry in &snapshot.ledger {
-            if entry.kind == LedgerKind::Usage {
+            if entry.kind == LedgerKind::Usage && entry.ts_secs >= horizon {
                 if let Some(id) = &entry.invocation_id {
                     reservations.entry(id.clone()).or_insert_with(|| {
                         let mut reservation = CreditReservation::new(
@@ -1933,49 +1976,50 @@ impl BillingEngine {
             ));
         }
 
+        // A hold is not a money movement, and a restart drops every hold without a
+        // settlement, so it is taken in place and not written: writing it bought nothing
+        // and cost a copy and a write of the whole state per request. The next write, this
+        // request's settlement among them, saves it with everything else.
         let _state_guard = self.state_lock.write().unwrap();
-        let sequence = self
-            .snapshot_sequence
-            .load(Ordering::Acquire)
-            .saturating_add(1);
-        let previous_checksum = self.last_snapshot_checksum.read().unwrap().clone();
-        let mut candidate = self.export_snapshot_locked(sequence, previous_checksum);
+        let mut reservations = self.reservations.write().unwrap();
+        let pending_settlements = self.pending_settlements.read().unwrap();
 
         // 1. Check duplicate invocation ID. A released reservation represents
         // zero consumed work and may be retried with the same client ID; held,
         // settled and pending records remain immutable for billing safety.
-        if let Some(existing) = candidate.reservations.get(invocation_id) {
-            if existing.state == ReservationState::Released
-                && !candidate.pending_settlements.contains_key(invocation_id)
+        if let Some(existing) = reservations.get(invocation_id) {
+            if existing.state != ReservationState::Released
+                || pending_settlements.contains_key(invocation_id)
             {
-                candidate.reservations.remove(invocation_id);
-            } else {
                 return Err(BillingError::DuplicateInvocation(invocation_id.to_string()));
             }
         }
 
         // 2. Fetch card
-        let mut card = candidate
+        let mut card = self
             .cards
+            .read()
+            .unwrap()
             .get(card_id)
             .cloned()
             .ok_or_else(|| BillingError::CardNotFound(card_id.to_string()))?;
 
         // 3. Resolve rate card version if model is specified
         let (reserve_amount, resolved_version, pricing) = if let Some(ref model) = params.model {
-            let group = candidate.groups.get(&card.group_id);
+            let groups = self.groups.read().unwrap();
+            let group = groups.get(&card.group_id);
             let rate_card_id = group.map(|g| g.rate_card_id.as_str()).unwrap_or("default");
             let group_margin = group.map(|g| g.margin_multiplier).unwrap_or(1.0);
 
-            let model_map = candidate
-                .model_maps
+            let model_maps = self.model_maps.read().unwrap();
+            let model_map = model_maps
                 .iter()
                 .find(|m| m.group_id == card.group_id && m.matches_model(model));
             let model_multiplier = model_map
                 .map(|m| m.credit_multiplier)
                 .unwrap_or(params.credit_multiplier);
 
-            let settings = candidate.settings.clone();
+            let settings = self.settings.read().unwrap().clone();
             let models: Vec<&str> = std::iter::once(model.as_str())
                 .chain(model_map.map(|m| m.target_model.as_str()))
                 .collect();
@@ -2009,8 +2053,7 @@ impl BillingEngine {
         }
 
         // 3a. Check card concurrency quota (Spec §14.9 Fair-Use)
-        let active_concurrency = candidate
-            .reservations
+        let active_concurrency = reservations
             .values()
             .filter(|r| r.card_id == card_id && r.state == ReservationState::Held)
             .count() as u32;
@@ -2022,7 +2065,15 @@ impl BillingEngine {
             });
         }
 
-        candidate.check_quota(&card, reserve_amount, now_secs)?;
+        check_quota(
+            &card,
+            reserve_amount,
+            now_secs,
+            &reservations,
+            &pending_settlements,
+            &self.ledger.read().unwrap(),
+            &self.archived_ledger_summary.read().unwrap(),
+        )?;
         if card.outstanding_debt() > 0 {
             return Err(BillingError::Card(CardError::InsufficientCredit {
                 available: 0,
@@ -2048,27 +2099,12 @@ impl BillingEngine {
         reservation.rate_card_version = resolved_version;
         reservation.pricing = pricing;
 
-        candidate
-            .reservations
-            .insert(invocation_id.to_string(), reservation.clone());
-
-        candidate.cards.insert(card_id.to_string(), card.clone());
-        let updated_card = card.clone();
-        let reservation_clone = reservation.clone();
-        let inv_id_clone = invocation_id.to_string();
-        let card_id_clone = card_id.to_string();
-
-        self.commit_candidate_snapshot(&candidate, || {
-            self.cards
-                .write()
-                .unwrap()
-                .insert(card_id_clone, updated_card);
-            self.reservations
-                .write()
-                .unwrap()
-                .insert(inv_id_clone, reservation_clone);
-            reservation
-        })
+        reservations.insert(invocation_id.to_string(), reservation.clone());
+        self.cards
+            .write()
+            .unwrap()
+            .insert(card_id.to_string(), card);
+        Ok(reservation)
     }
 
     /// Authorize a larger upper bound BEFORE consuming more provider work.
@@ -2329,14 +2365,26 @@ impl BillingEngine {
         candidate
             .pending_settlements
             .insert(invocation_id.to_string(), pending.clone());
-        // Retain in memory even when storage is wholly unavailable. A successful
-        // write makes this intent durable before any debit is attempted.
-        let commit = self.commit_candidate_snapshot(&candidate, || {
-            self.pending_settlements
-                .write()
-                .unwrap()
-                .insert(invocation_id.to_string(), pending.clone());
-        });
+        #[cfg(test)]
+        if *self.fail_after_pending.read().unwrap() {
+            // What an older release left when the second of its two writes failed: the
+            // intent saved, its debit not.
+            self.commit_candidate_snapshot(&candidate, || {
+                self.pending_settlements
+                    .write()
+                    .unwrap()
+                    .insert(invocation_id.to_string(), pending.clone());
+            })?;
+            self.inject_persistence_fault(true);
+            return self.complete_pending_settlement_locked(invocation_id, &pending);
+        }
+        // The priced intent and its debit are saved in one write; it took two, the intent
+        // first. Either way nothing is saved when the first write fails, and then the
+        // intent is kept in memory, never released or reclaimed, for the recovery task to
+        // save and complete once storage is back.
+        let completed = Self::apply_pending_settlement(&mut candidate, invocation_id, &pending);
+        let commit =
+            self.commit_candidate_snapshot(&candidate, || self.publish_settlement(&candidate));
         if let Err(error) = commit {
             self.pending_settlements
                 .write()
@@ -2344,11 +2392,8 @@ impl BillingEngine {
                 .insert(invocation_id.to_string(), pending);
             return Err(error);
         }
-        #[cfg(test)]
-        if *self.fail_after_pending.read().unwrap() {
-            self.inject_persistence_fault(true);
-        }
-        self.complete_pending_settlement_locked(invocation_id, &pending)
+        // An intent that fails its checks is saved undebited, and recovery retries it.
+        completed
     }
 
     pub fn list_pending_settlements(&self) -> Vec<PendingSettlement> {
@@ -2404,6 +2449,21 @@ impl BillingEngine {
             sequence,
             self.last_snapshot_checksum.read().unwrap().clone(),
         );
+        let entry = Self::apply_pending_settlement(&mut candidate, invocation_id, pending)?;
+        self.commit_candidate_snapshot(&candidate, || {
+            self.publish_settlement(&candidate);
+            entry
+        })
+    }
+
+    /// Debit a priced settlement in `candidate`: the hold returned, the card charged, the
+    /// ledger entry and the trace recorded. Every check comes before any change, so on an
+    /// error `candidate` is as it was.
+    fn apply_pending_settlement(
+        candidate: &mut BillingSnapshot,
+        invocation_id: &str,
+        pending: &PendingSettlement,
+    ) -> Result<LedgerEntry, BillingError> {
         let reservation = candidate
             .reservations
             .get_mut(invocation_id)
@@ -2489,15 +2549,17 @@ impl BillingEngine {
                 .traces
                 .drain(..candidate.traces.len() - MAX_RETAINED_TRACES);
         }
-        self.commit_candidate_snapshot(&candidate, || {
-            *self.cards.write().unwrap() = candidate.cards.clone();
-            *self.reservations.write().unwrap() = candidate.reservations.clone();
-            *self.ledger.write().unwrap() = candidate.ledger.clone();
-            *self.unpaid_ledger.write().unwrap() = candidate.unpaid_ledger.clone();
-            *self.pending_settlements.write().unwrap() = candidate.pending_settlements.clone();
-            *self.traces.write().unwrap() = candidate.traces.clone();
-            entry
-        })
+        Ok(entry)
+    }
+
+    /// Publish what a saved settlement changed.
+    fn publish_settlement(&self, candidate: &BillingSnapshot) {
+        *self.cards.write().unwrap() = candidate.cards.clone();
+        *self.reservations.write().unwrap() = candidate.reservations.clone();
+        *self.ledger.write().unwrap() = candidate.ledger.clone();
+        *self.unpaid_ledger.write().unwrap() = candidate.unpaid_ledger.clone();
+        *self.pending_settlements.write().unwrap() = candidate.pending_settlements.clone();
+        *self.traces.write().unwrap() = candidate.traces.clone();
     }
 
     /// Step 3: Cancellation / Abort refund (Spec §6.3).
@@ -2516,45 +2578,23 @@ impl BillingEngine {
                 "consumed reservation is pending settlement, not refundable".into(),
             ));
         }
-        let sequence = self
-            .snapshot_sequence
-            .load(Ordering::Acquire)
-            .saturating_add(1);
-        let previous_checksum = self.last_snapshot_checksum.read().unwrap().clone();
-        let mut candidate = self.export_snapshot_locked(sequence, previous_checksum);
-
-        let (card_id, reserved_micro_credits) = {
-            let reservation = match candidate.reservations.get_mut(invocation_id) {
-                Some(r) => r,
-                None => return Ok(()), // Already gone or no reservation
-            };
-
-            if reservation.state != ReservationState::Held {
-                return Ok(());
-            }
-
-            reservation.state = ReservationState::Released;
-            (
-                reservation.card_id.clone(),
-                reservation.reserved_micro_credits,
-            )
+        // Returning a hold moves no money, so like taking one it is done in place and not
+        // written.
+        let mut reservations = self.reservations.write().unwrap();
+        let reservation = match reservations.get_mut(invocation_id) {
+            Some(r) => r,
+            None => return Ok(()), // Already gone or no reservation
         };
-
-        if let Some(card) = candidate.cards.get_mut(&card_id) {
-            card.credit_reserved = card.credit_reserved.saturating_sub(reserved_micro_credits);
+        if reservation.state != ReservationState::Held {
+            return Ok(());
         }
-
-        let updated_card = candidate.cards.get(&card_id).cloned();
-        let inv_id = invocation_id.to_string();
-
-        self.commit_candidate_snapshot(&candidate, || {
-            if let Some(card) = updated_card {
-                self.cards.write().unwrap().insert(card_id, card);
-            }
-            if let Some(r) = self.reservations.write().unwrap().get_mut(&inv_id) {
-                r.state = ReservationState::Released;
-            }
-        })
+        reservation.state = ReservationState::Released;
+        if let Some(card) = self.cards.write().unwrap().get_mut(&reservation.card_id) {
+            card.credit_reserved = card
+                .credit_reserved
+                .saturating_sub(reservation.reserved_micro_credits);
+        }
+        Ok(())
     }
 
     /// Janitor service: Reclaim expired orphan reservations (Spec §6.2).
@@ -2572,7 +2612,6 @@ impl BillingEngine {
         let mut reclaimed_count = 0;
         let mut affected_cards = HashMap::new();
         let mut released_reservations = Vec::new();
-        const TERMINAL_RESERVATION_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 
         for res in candidate.reservations.values_mut() {
             if res.is_expired(now_secs)
@@ -2602,9 +2641,7 @@ impl BillingEngine {
             .reservations
             .values()
             .filter(|res| {
-                // ponytail: retain settled IDs for replay safety, including after ledger archival.
-                // Compact tombstones only when snapshot size warrants a schema migration.
-                res.state == ReservationState::Released
+                res.state != ReservationState::Held
                     && res.created_at_secs < prune_before
                     && !candidate
                         .pending_settlements
@@ -4148,8 +4185,8 @@ impl BillingEngine {
 
     /// Record a structured request execution trace (Spec §5, §14.4).
     /// Traces are observability data. They ride along with the next commit, which saves
-    /// the whole state and follows in the same request (its reservation's release or
-    /// settlement), instead of each costing a full save of its own. A crash before that
+    /// the whole state (the request's own settlement, or any later write when it is
+    /// released), instead of each costing a full save of its own. A crash before that
     /// commit loses only the trace, and with it the attempt count it holds.
     pub fn record_trace(&self, trace: RequestTrace) {
         let _state_guard = self.state_lock.write().unwrap();
@@ -5243,17 +5280,20 @@ mod durability_regressions {
         assert_eq!(restarted.ledger_entries().len(), 1);
         assert!(restarted.last_snapshot_mirror_error().is_some());
         *restarted.injected_mirror_fault.write().unwrap() = false;
-        restarted.run_janitor(700000);
+        // The janitor never returns a settled hold: within the retention window the record
+        // stays settled, and past it only the record goes.
+        restarted.run_janitor(3_600);
         assert_eq!(
             restarted.export_snapshot().reservations["use"].state,
             ReservationState::Settled
         );
+        restarted.run_janitor(700000);
+        assert!(!restarted.export_snapshot().reservations.contains_key("use"));
+        assert_eq!(restarted.get_card("card").unwrap().credit_used, 180);
+        assert_eq!(restarted.get_card("card").unwrap().credit_reserved, 0);
         let disk = BillingEngine::new();
         disk.load_from_file(&path).unwrap();
-        assert_eq!(
-            disk.export_snapshot().reservations["use"].state,
-            ReservationState::Settled
-        );
+        assert_eq!(disk.get_card("card").unwrap().credit_used, 180);
         disk.retry_pending_settlement("use").unwrap();
         assert_eq!(disk.ledger_entries().len(), 1);
     }

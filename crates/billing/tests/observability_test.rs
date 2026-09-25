@@ -669,7 +669,7 @@ fn traces_ride_along_with_the_next_commit_instead_of_saving_on_their_own() {
         "a trace costs no save of its own"
     );
 
-    // The next commit carries it.
+    // The next commit carries it: here the next request's settlement.
     engine
         .reserve(
             "card-trace",
@@ -677,6 +677,16 @@ fn traces_ride_along_with_the_next_commit_instead_of_saving_on_their_own() {
             &ReservationEstimateParams::new(10, 10),
             1000,
             60,
+        )
+        .unwrap();
+    engine
+        .settle(
+            "inv-next",
+            &billing::ledger::UsageTokens::default(),
+            "model",
+            "provider",
+            "model",
+            1001,
         )
         .unwrap();
     let restored = BillingEngine::new();

@@ -176,13 +176,18 @@ fn janitor_prunes_terminal_memory_but_preserves_live_holds() {
         )
         .unwrap();
     let guard = engine.protect_reservation("live");
+    // Within a day every record is kept.
+    assert_eq!(engine.run_janitor(3_600), 0);
+    assert_eq!(engine.export_snapshot().reservations.len(), 3);
+    // Past it, settled and released records go; a live hold stays.
     assert_eq!(engine.run_janitor(700000), 0);
     let snapshot = engine.export_snapshot();
     assert!(!snapshot.reservations.contains_key("released"));
-    assert!(snapshot.reservations.contains_key("settled"));
+    assert!(!snapshot.reservations.contains_key("settled"));
     assert!(snapshot.reservations.contains_key("live"));
     assert_eq!(engine.run_janitor(700000), 0);
     drop(guard);
     assert_eq!(engine.run_janitor(700000), 1);
-    assert_eq!(engine.export_snapshot().reservations.len(), 1);
+    assert!(engine.export_snapshot().reservations.is_empty());
+    assert_eq!(engine.ledger_entries().len(), 1);
 }
