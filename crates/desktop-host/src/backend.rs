@@ -5,6 +5,20 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+/// Reads, which never take the operation lock. The UI polls some of them in the
+/// background; refused by an operation in progress, a read was reported as an
+/// operation whose outcome is unknown, and holding the lock it refused the user's
+/// restore. The balance read still takes the session lock, which a change waits for.
+pub fn reads_only(method: &str, path: &str) -> bool {
+    matches!(
+        (method, path.split('?').next()),
+        (
+            "GET",
+            Some("/api/usage" | "/api/memory/sample" | "/api/doctor")
+        ) | ("POST", Some("/api/verify-card"))
+    )
+}
+
 /// Whether a request is a configuration mutation worth a recoverable record.
 ///
 /// This is the single source of truth: the record holds exactly one operation, so
@@ -447,7 +461,10 @@ fn gateway(value: Option<&str>) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 pub fn external_allowed(url: &str) -> Result<bool, String> {
-    Ok(url == "https://kiro.dev/downloads/" || url == format!("{}/", gateway(None)?))
+    let gateway = gateway(None)?;
+    Ok(url == "https://kiro.dev/downloads/"
+        || url == format!("{gateway}/")
+        || url == format!("{gateway}/#downloads"))
 }
 pub fn validate_card(card: &str) -> Result<(), String> {
     if card.trim().is_empty() || card.chars().count() > 256 {
@@ -457,6 +474,22 @@ pub fn validate_card(card: &str) -> Result<(), String> {
     }
 }
 fn validate_authorization(value: &Value, now: f64) -> Result<(), String> {
+    // A card the gateway knows but that cannot be used says why, so the customer is
+    // told to renew or to ask about the card instead of being sent to support.
+    if value["success"] == true {
+        if matches!(
+            value["status"].as_str(),
+            Some("frozen" | "banned" | "voided")
+        ) {
+            return Err("[auth:access-denied] Card is frozen, banned or voided".into());
+        }
+        if value["status"] == "expired"
+            || value["isExpired"] == true
+            || value["validUntil"].as_f64().is_some_and(|n| n <= now)
+        {
+            return Err("[auth:expired] Card has expired".into());
+        }
+    }
     let number = |key: &str| {
         value[key]
             .as_f64()
@@ -516,10 +549,24 @@ async fn verify_card(gateway: &str, card: &str) -> Result<Value, String> {
         .await
         .map_err(network_error)?;
     if !response.status().is_success() {
-        return Err(format!(
-            "Card verification HTTP {}",
-            response.status().as_u16()
-        ));
+        let status = response.status().as_u16();
+        // The portal answers an unknown card with one deliberately vague 400.
+        if status == 400 {
+            return Err("[auth:invalid-card] Card verification HTTP 400".into());
+        }
+        if status == 429 {
+            let retry = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .map(|seconds| format!(" [retry-after:{seconds}]"))
+                .unwrap_or_default();
+            return Err(format!(
+                "[auth:throttled]{retry} Card verification HTTP 429"
+            ));
+        }
+        return Err(format!("Card verification HTTP {status}"));
     }
     let mut response = response;
     let mut bytes = Vec::new();
@@ -897,13 +944,33 @@ mod tests {
     fn rejects_expired_or_incomplete_authorization() {
         let mut value = json!({"success":true,"status":"active","isExpired":false,"remainingPoints":1,"totalPoints":2,"maxDevices":1,"boundDevices":[],"validUntil":200});
         assert!(validate_authorization(&value, 100.0).is_ok());
-        assert!(validate_authorization(&value, 201.0).is_err());
+        assert!(validate_authorization(&value, 201.0)
+            .unwrap_err()
+            .starts_with("[auth:expired]"));
+        for status in ["frozen", "banned", "voided"] {
+            let mut unusable = value.clone();
+            unusable["status"] = json!(status);
+            assert!(validate_authorization(&unusable, 100.0)
+                .unwrap_err()
+                .starts_with("[auth:access-denied]"));
+        }
+        let mut expired = value.clone();
+        expired["status"] = json!("expired");
+        expired["isExpired"] = json!(true);
+        assert!(validate_authorization(&expired, 100.0)
+            .unwrap_err()
+            .starts_with("[auth:expired]"));
         value["remainingPoints"] = json!("1");
         assert!(validate_authorization(&value, 100.0).is_err());
     }
     #[test]
     fn external_urls_are_allowlisted() {
         assert!(external_allowed("https://kiro.dev/downloads/").unwrap());
+        // Every URL the desktop UI opens.
+        let gateway = gateway(None).unwrap();
+        assert!(external_allowed(&format!("{gateway}/")).unwrap());
+        assert!(external_allowed(&format!("{gateway}/#downloads")).unwrap());
+        assert!(!external_allowed(&format!("{gateway}/#other")).unwrap());
         assert!(!external_allowed("file:///C:/Windows").unwrap());
         assert!(!external_allowed("https://evil.example").unwrap());
     }
@@ -1620,6 +1687,35 @@ mod client_contract_tests {
             "https://a.example?secret=1",
         ] {
             assert!(unbind_gateway(None, &json!({"gateway_url":supplied})).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod read_route_tests {
+    use super::*;
+
+    #[test]
+    fn only_routes_that_change_nothing_skip_the_operation_lock() {
+        for (method, path) in [
+            ("GET", "/api/usage"),
+            ("GET", "/api/memory/sample"),
+            ("GET", "/api/doctor?gateway_url=https%3A%2F%2Fkiro.rent"),
+            ("POST", "/api/verify-card"),
+        ] {
+            assert!(reads_only(method, path), "{method} {path}");
+            assert!(!is_tracked_operation(method, path));
+        }
+        for (method, path) in [
+            ("POST", "/api/activate"),
+            ("POST", "/api/restore"),
+            ("POST", "/api/unbind"),
+            ("POST", "/api/launch"),
+            ("POST", "/api/memory/trim"),
+            ("GET", "/api/verify-card"),
+            ("POST", "/api/usage"),
+        ] {
+            assert!(!reads_only(method, path), "{method} {path}");
         }
     }
 }

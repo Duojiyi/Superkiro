@@ -36,6 +36,7 @@ const CODES: &[&str] = &[
     "SK-CONNECT-006",
     "SK-CONNECT-007",
     "SK-RESTORE-001",
+    "SK-RESTORE-002",
     "SK-BIND-004",
     "SK-LOCAL-001",
     "SK-LOCAL-002",
@@ -67,6 +68,10 @@ pub fn classify(raw: &str, path: &str, method: &str) -> Value {
             "SK-BIND-004"
         } else if lower.contains("operation in progress") {
             "SK-LOCAL-002"
+        } else if lower.contains("reinstall kiro") {
+            // Kiro's bundle is still modified and nothing is left to restore it from:
+            // retrying cannot help, reinstalling Kiro replaces the file.
+            "SK-RESTORE-002"
         } else if lower.contains("kiro") && lower.contains("is unsupported; upgrade to") {
             "SK-KIRO-001"
         } else if let Some(code) = match auth {
@@ -283,6 +288,13 @@ mod tests {
         assert!(classify("[retry-after:86401]", "", "GET")["retry_after_seconds"].is_null());
     }
     #[test]
+    fn every_code_has_a_desktop_message() {
+        let messages = include_str!("../../../apps/desktop-ui/src/errors.ts");
+        for code in CODES {
+            assert!(messages.contains(&format!("'{code}':")), "{code}");
+        }
+    }
+    #[test]
     fn classification_boundaries() {
         assert_eq!(
             classify("[connection:launch-prepare] failed", "", "POST")["code"],
@@ -296,6 +308,34 @@ mod tests {
             classify("Card authorization invalid or expired", "", "GET")["code"],
             "SK-UNKNOWN-001"
         );
+        // Card verification says why a card cannot be used.
+        for (raw, code) in [
+            (
+                "[auth:invalid-card] Card verification HTTP 400",
+                "SK-AUTH-001",
+            ),
+            ("[auth:expired] Card has expired", "SK-AUTH-002"),
+            (
+                "[auth:access-denied] Card is frozen, banned or voided",
+                "SK-AUTH-003",
+            ),
+            (
+                "[auth:throttled] [retry-after:30] Card verification HTTP 429",
+                "SK-AUTH-004",
+            ),
+        ] {
+            let value = classify(raw, "/api/verify-card", "POST");
+            assert_eq!(value["code"], code, "{raw}");
+            assert_eq!(value["outcome"], "failed", "{raw}");
+        }
+        let reinstall = classify(
+            "Kiro's extension is still modified and its backup is gone; reinstall Kiro to replace it",
+            "/api/restore",
+            "POST",
+        );
+        assert_eq!(reinstall["code"], "SK-RESTORE-002");
+        assert_eq!(reinstall["outcome"], "failed");
+        assert_eq!(validated(&reinstall), Some(reinstall.clone()));
         assert_eq!(
             classify("credential network timeout", "", "POST")["code"],
             "SK-NET-001"

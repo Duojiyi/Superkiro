@@ -365,6 +365,25 @@ impl OperationLock {
         file.try_lock().map_err(std::io::Error::from)?;
         Ok(Self(file))
     }
+
+    /// `acquire`, waiting up to `wait` while another owner holds the lock.
+    pub(crate) fn acquire_within(
+        path: PathBuf,
+        wait: std::time::Duration,
+    ) -> std::io::Result<Self> {
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            match Self::acquire(path.clone()) {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                result => return result,
+            }
+        }
+    }
 }
 
 pub(crate) fn atomic_replace(temp: &Path, target: &Path) -> std::io::Result<()> {
@@ -400,6 +419,29 @@ pub(crate) fn atomic_replace(temp: &Path, target: &Path) -> std::io::Result<()> 
 #[cfg(test)]
 mod os_lock_tests {
     use super::*;
+
+    #[test]
+    fn a_waiting_owner_gets_a_released_lock_and_gives_up_after_its_wait() {
+        use std::time::{Duration, Instant};
+        let path = std::env::temp_dir().join(format!("os-lock-wait-{}", std::process::id()));
+        let held = OperationLock::acquire(path.clone()).unwrap();
+        let started = Instant::now();
+        let refused = OperationLock::acquire_within(path.clone(), Duration::from_millis(200));
+        assert_eq!(
+            refused.err().map(|error| error.kind()),
+            Some(std::io::ErrorKind::WouldBlock)
+        );
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(held);
+        });
+        let acquired = OperationLock::acquire_within(path.clone(), Duration::from_secs(10));
+        release.join().unwrap();
+        assert!(acquired.is_ok());
+        drop(acquired);
+        fs::remove_file(path).unwrap();
+    }
     #[cfg(unix)]
     #[test]
     fn dropping_owner_unlocks_even_with_a_duplicated_descriptor() {

@@ -3,7 +3,13 @@ use crate::{
     AuthClient, ExtensionPatcher, KiroAuthToken, SettingsManager, SnapshotManager, TokenStorage,
 };
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, time::Duration};
+
+/// How long a change waits for the session lock. A balance read holds it for at most
+/// a token refresh (15 s) and the usage request (20 s).
+const SESSION_LOCK_WAIT: Duration = Duration::from_secs(45);
+const SESSION_BUSY: &str =
+    "Another desktop operation holds the session lock; wait for completion before retrying";
 
 #[derive(Serialize, Deserialize)]
 struct Session {
@@ -60,8 +66,20 @@ impl DesktopSession {
             .map(Some)
             .map_err(|e| e.to_string())
     }
+    /// The session lock, for a change. A balance read holds it across its gateway round
+    /// trip, so a refreshed token cannot land after a restore put the official one back;
+    /// a change waits for that read to finish instead of failing because of it.
     fn lock(&self) -> Result<crate::snapshot::OperationLock, String> {
-        crate::snapshot::OperationLock::acquire(self.path.with_extension("session-lock")).map_err(|_| "Another desktop operation holds the session lock; wait for completion before retrying".into())
+        crate::snapshot::OperationLock::acquire_within(
+            self.path.with_extension("session-lock"),
+            SESSION_LOCK_WAIT,
+        )
+        .map_err(|_| SESSION_BUSY.into())
+    }
+    /// The session lock, for a read: it never waits behind a change.
+    fn lock_now(&self) -> Result<crate::snapshot::OperationLock, String> {
+        crate::snapshot::OperationLock::acquire(self.path.with_extension("session-lock"))
+            .map_err(|_| SESSION_BUSY.into())
     }
     pub fn gateway(&self) -> Option<String> {
         self.load().ok().map(|s| s.gateway)
@@ -76,7 +94,7 @@ impl DesktopSession {
     }
     /// Fetch account usage without exposing credentials to the webview.
     pub async fn usage(&self) -> Result<serde_json::Value, String> {
-        let _lock = self.lock()?;
+        let _lock = self.lock_now()?;
         let mut session = self.load()?;
         if !session.authenticated {
             return Err("Not authenticated".into());
@@ -394,6 +412,32 @@ mod tests {
     use super::*;
     use axum::{routing::post, Json, Router};
     use serde_json::{json, Value};
+
+    #[test]
+    fn a_change_waits_for_a_balance_read_and_a_read_never_waits() {
+        let root = std::env::temp_dir().join(format!("session-lock-wait-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let desktop = DesktopSession::new(
+            TokenStorage::at(root.join("token.json")),
+            root.join("session.json"),
+        );
+        let read = desktop.lock_now().unwrap();
+        assert_eq!(desktop.lock_now().err(), Some(SESSION_BUSY.to_string()));
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(read);
+        });
+        let started = std::time::Instant::now();
+        let change = desktop.lock().unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(250));
+        release.join().unwrap();
+        // A read during a change is refused at once rather than queued behind it.
+        let started = std::time::Instant::now();
+        assert_eq!(desktop.lock_now().err(), Some(SESSION_BUSY.to_string()));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(change);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[tokio::test]
     async fn successful_unbind_invalidates_session_even_when_local_restore_fails() {

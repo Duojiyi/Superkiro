@@ -21,6 +21,7 @@ export const errorMessages: Record<string, string> = {
   'SK-CONNECT-006': 'Kiro 在你的另一个 Windows 会话中仍在运行，这里无法关闭它。请到那个会话中关闭 Kiro 后重试。',
   'SK-CONNECT-007': 'Kiro 中有窗口在使用 Default 以外的配置文件（Profile）。接入只配置 Default 配置文件，请先在 Kiro 中把这些窗口切换到 Default 配置文件，然后重试。',
   'SK-RESTORE-001': '本地配置还原未完成，请保留备份并重试还原。',
+  'SK-RESTORE-002': 'Kiro 的扩展文件仍是修改后的版本，且用于还原它的备份已丢失，重试无法还原。请从官网重新安装 Kiro（会替换该文件），再重新还原。',
   'SK-LOCAL-001': '本地操作权限不足，请检查文件占用及系统权限。',
   'SK-LOCAL-002': '已有操作正在处理，请等待状态确认，不要重复操作。',
   'SK-LOCAL-003': '系统安全存储操作失败，请检查系统凭据服务。',

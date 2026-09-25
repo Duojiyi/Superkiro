@@ -38,6 +38,20 @@ async fn api(
             .await
             .map_err(|e| errors::classify(&e, &path, &method));
     }
+    if backend::reads_only(&method, &path) {
+        let (worker_path, worker_method) = (path.clone(), method.clone());
+        return tauri::async_runtime::spawn_blocking(move || {
+            tauri::async_runtime::block_on(backend::dispatch(
+                &host,
+                &worker_path,
+                &worker_method,
+                body,
+            ))
+        })
+        .await
+        .unwrap_or_else(|_| Err("Desktop engine failed unexpectedly".into()))
+        .map_err(|e| errors::classify(&e, &path, &method));
+    }
     tauri::async_runtime::spawn(async move {
         // The detached task retains its lock despite a webview timeout.
         let tracked = backend::is_tracked_operation(&method, &path);
