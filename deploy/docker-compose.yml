@@ -14,9 +14,11 @@ services:
       dockerfile: deploy/Dockerfile
     container_name: kiro-gateway
     restart: unless-stopped
+    stop_grace_period: 90s
     init: true
     security_opt:
       - no-new-privileges:true
+    cap_drop: ["ALL"]
     mem_limit: 1g
     cpus: "1.0"
     pids_limit: 256
@@ -31,7 +33,6 @@ services:
       - HOST=0.0.0.0
       - PORT=19820
       - AUTH_SECRET=${AUTH_SECRET:?AUTH_SECRET must be set}
-      - CARD_PLATFORM_KEY=${CARD_PLATFORM_KEY:?CARD_PLATFORM_KEY must be set}
       - ADMIN_KEY=${ADMIN_KEY:?ADMIN_KEY must be set}
       - ADMIN_BROWSER_LOGIN=${ADMIN_BROWSER_LOGIN:?ADMIN_BROWSER_LOGIN must be true}
       - ADMIN_ORIGIN=${ADMIN_ORIGIN:?ADMIN_ORIGIN must be an exact HTTPS origin}
@@ -49,7 +50,7 @@ services:
       - "19820"
 
   caddy:
-    image: caddy:2-alpine
+    image: caddy:2-alpine@sha256:de23def33b17fb5d1290b0f6c2add1d70780e52341896c00a4c8a2a2fe9d355e
     container_name: kiro-caddy
     restart: unless-stopped
     init: true

@@ -3,6 +3,7 @@ services:
     image: kiro-byok:local
     container_name: kiro-gateway
     restart: unless-stopped
+    stop_grace_period: 90s
     init: true
     security_opt: ["no-new-privileges:true"]
     cap_drop: ["ALL"]

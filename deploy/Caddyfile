@@ -47,14 +47,26 @@
         Referrer-Policy "strict-origin-when-cross-origin"
         Strict-Transport-Security "max-age=31536000; includeSubDomains"
         X-Frame-Options "DENY"
-        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'"
         Permissions-Policy "camera=(), microphone=(), geolocation=()"
     }
+    # Only the portal page carries an inline script. The admin console shows card codes
+    # and provider keys, so it runs with no inline script allowed at all.
+    @admin_console path /admin /admin/*
+    header @admin_console Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+    @not_admin_console not path /admin /admin/*
+    header @not_admin_console Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
 
     # 访问日志输出
     log {
         output stdout
-        format console
+        # Request headers carry credentials on this service (x-admin-key, x-csrf-token) and
+        # Caddy redacts only Cookie/Authorization by default: drop the whole map.
+        format filter {
+            wrap json
+            fields {
+                request>headers delete
+            }
+        }
     }
 }
 
