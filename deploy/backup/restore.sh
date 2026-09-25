@@ -11,6 +11,28 @@ fi
 RAW_INPUT="$1"
 command -v python3 >/dev/null 2>&1 || { echo "Error: python3 is required" >&2; exit 1; }
 
+# Promote copies and moves data/ while the gateway is stopped, the very state this script
+# requires: hold the deployment lock for the whole run, so neither can start mid-way.
+DEPLOYMENT_LOCK="${DEPLOYMENT_LOCK:-/opt/kiro-byok/deployment.lock}"
+if ! mkdir -- "${DEPLOYMENT_LOCK}" 2>/dev/null; then
+  echo "Error: ${DEPLOYMENT_LOCK} exists: a deployment, backup or restore is running or awaits review" >&2
+  exit 1
+fi
+# A restore whose rollback did not complete keeps the lock for operator review.
+KEEP_LOCK=false
+STAGE_DIR=""
+on_exit() {
+  if [[ -n "${STAGE_DIR}" ]]; then
+    rm -rf -- "${STAGE_DIR}"
+  fi
+  if [[ "${KEEP_LOCK}" == true ]]; then
+    echo "Deployment lock retained at ${DEPLOYMENT_LOCK} for operator review" >&2
+  else
+    rmdir -- "${DEPLOYMENT_LOCK}" 2>/dev/null || true
+  fi
+}
+trap on_exit EXIT
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 DATA_DIR="${DATA_DIR:-${SCRIPT_DIR}/../../data}"
 TARGET_FILE="${DATA_FILE:-${DATA_DIR}/billing_state.json}"
@@ -110,10 +132,6 @@ CHECKSUM_BASENAME="$(basename -- "${CHECKSUM_FILE}")"
 # Step 3: Temporary sandbox pre-verification with real engine (T07)
 # Verifies decryption, checksum, anchor matching, and ledger invariants before touching live data
 STAGE_DIR="$(mktemp -d 2>/dev/null || mktemp -d -t kiro_stage)"
-cleanup_stage() {
-  rm -rf -- "${STAGE_DIR}"
-}
-trap cleanup_stage EXIT
 
 cp -- "${BACKUP_FILE}" "${STAGE_DIR}/billing_state.json"
 cp -- "${ANCHOR_FILE}" "${STAGE_DIR}/billing_state.json.anchor"
@@ -136,7 +154,22 @@ chmod 600 "${STAGE_DIR}"/*
 # The Rust gateway verifier is mandatory. Structural JSON parsing is not a
 # substitute for AEAD, generation and ledger invariant checks.
 VERIFY_SUCCESS=false
-if command -v kiro-gateway >/dev/null 2>&1; then
+# Production has no gateway binary on the host; it runs only inside its image. Verify with
+# the stopped gateway's own image, offline and read-only, given only the ledger key.
+VERIFY_IMAGE="${VERIFY_IMAGE:-$(docker inspect --type container --format '{{.Image}}' -- "${GATEWAY_CONTAINER}" 2>/dev/null || true)}"
+GATEWAY_ENV_FILE="${GATEWAY_ENV_FILE:-/etc/kiro-byok/gateway.env}"
+if [[ -n "${VERIFY_IMAGE}" && -r "${GATEWAY_ENV_FILE}" ]] && grep -q '^KIRO_MASTER_KEK=' "${GATEWAY_ENV_FILE}"; then
+  KIRO_MASTER_KEK="$(grep '^KIRO_MASTER_KEK=' "${GATEWAY_ENV_FILE}" | tail -n 1 | cut -d= -f2-)"
+  # Compose accepts a quoted value; the verifier needs the bare key.
+  case "${KIRO_MASTER_KEK}" in
+    \"*\"|\'*\') KIRO_MASTER_KEK="${KIRO_MASTER_KEK:1:${#KIRO_MASTER_KEK}-2}" ;;
+  esac
+  export KIRO_MASTER_KEK
+  docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+    --user "$(id -u):$(id -g)" -e KIRO_MASTER_KEK -v "${STAGE_DIR}:/stage:ro" \
+    --entrypoint /app/gateway "${VERIFY_IMAGE}" verify-snapshot /stage/billing_state.json && VERIFY_SUCCESS=true
+  unset KIRO_MASTER_KEK
+elif command -v kiro-gateway >/dev/null 2>&1; then
   kiro-gateway verify-snapshot "${STAGE_DIR}/billing_state.json" && VERIFY_SUCCESS=true
 elif [[ -x "${SCRIPT_DIR}/../../target/release/gateway" ]]; then
   "${SCRIPT_DIR}/../../target/release/gateway" verify-snapshot "${STAGE_DIR}/billing_state.json" && VERIFY_SUCCESS=true
@@ -270,6 +303,7 @@ emergency_rollback() {
   fi
   rm -f -- "${TEMP_FILE}" "${TEMP_ANCHOR}" "${TEMP_GENERATION}" || failed=true
   if [[ "${failed}" == true ]]; then
+    KEEP_LOCK=true
     echo "Error: rollback incomplete; preserve data and rollback directory for manual recovery." >&2
   else
     echo "Live state successfully restored to its pre-restore state." >&2

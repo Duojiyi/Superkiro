@@ -1,4 +1,5 @@
 """Stage and promote pinned candidates; never print remote output or credentials."""
+import difflib
 import hashlib
 import json
 from contextlib import contextmanager
@@ -18,13 +19,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from test_deployed_server import ROOT, connect
 
 BASE = '/opt/kiro-byok'
-SOURCE_PATHS = ['Cargo.toml', 'Cargo.lock', 'crates', 'apps/admin-ui/dist', 'apps/portal-ui', 'deploy/Dockerfile']
-# What the shipped sources are built from; all of it must be exactly the release commit.
-COMMITTED_INPUTS = ['Cargo.toml', 'Cargo.lock', 'crates', 'apps/portal-ui', 'deploy/Dockerfile',
+SOURCE_PATHS = ['Cargo.toml', 'Cargo.lock', 'crates', 'apps/admin-ui/dist', 'apps/portal-ui', 'deploy/Dockerfile',
+                'deploy/backup']
+# The production compose and Caddy configuration, deployed from the repository.
+CONFIG_FILES = ['docker-compose.ip.yml', 'Caddyfile.ip']
+# What a release is built and configured from; all of it must be exactly the release commit.
+COMMITTED_INPUTS = ['Cargo.toml', 'Cargo.lock', 'crates', 'apps/portal-ui', 'deploy/Dockerfile', 'deploy/backup',
                     'apps/admin-ui/src', 'apps/admin-ui/index.html', 'apps/admin-ui/package.json',
                     'apps/admin-ui/package-lock.json', 'apps/admin-ui/vite.config.ts',
                     'apps/admin-ui/tsconfig.json', 'apps/admin-ui/tailwind.config.js',
-                    'apps/admin-ui/postcss.config.js']
+                    'apps/admin-ui/postcss.config.js'] + [f'deploy/{name}' for name in CONFIG_FILES]
+GATEWAY_IMAGE_LINE = re.compile(r'(?m)^    image: (kiro-byok:[^\s]+)$')
+# Installed from each release so repository fixes reach the nightly backup.
+BACKUP_TOOLS = ['server-backup.py', 'verify-bundle.py', 'backup.sh', 'restore.sh']
+BACKUP_UNITS = ['superkiro-backup.service', 'superkiro-backup.timer']
 LEDGER_ANCHOR = BASE + '/data/billing_state.json.anchor'
 # Releases, with their data and configuration copies, kept after a deploy.
 KEEP_RELEASES = 5
@@ -219,22 +227,72 @@ def write_remote(ssh, path, content):
         sftp.posix_rename(path + '.next', path)
 
 
-def portal_caddy_config(content):
-    """Preserve live routing/secrets; add only the embedded-font CSP permission."""
-    text = content.decode('utf-8')
-    pattern = r'Content-Security-Policy "([^"\n]+)"'
-    matches = list(re.finditer(pattern, text))
+def with_gateway_image(compose, image):
+    """The compose text with its single gateway image line pointing at `image`."""
+    matches = GATEWAY_IMAGE_LINE.findall(compose)
     if len(matches) != 1:
-        raise RuntimeError('Expected exactly one production CSP header')
-    match = matches[0]
-    policy = match.group(1)
-    fonts = [part.strip() for part in policy.split(';') if part.strip().startswith('font-src')]
-    if fonts:
-        if fonts != ["font-src 'self' data:"]:
-            raise RuntimeError('Custom font policy requires explicit review')
-        return content
-    policy = policy.rstrip('; ') + "; font-src 'self' data:"
-    return (text[:match.start(1)] + policy + text[match.end(1):]).encode('utf-8')
+        raise PreconditionFailed('Unexpected gateway image configuration')
+    return compose.replace('    image: ' + matches[0], '    image: ' + image, 1)
+
+
+def repository_configuration(image, root=ROOT):
+    """The production compose and Caddy files as the repository defines them."""
+    text = {name: (root / 'deploy' / name).read_text(encoding='utf-8').replace('\r\n', '\n')
+            for name in CONFIG_FILES}
+    text['docker-compose.ip.yml'] = with_gateway_image(text['docker-compose.ip.yml'], image)
+    return {name: value.encode('utf-8') for name, value in text.items()}
+
+
+def configuration_drift(live, repository):
+    """What deploying the repository configuration changes on the server, as a unified diff."""
+    return ''.join(line for name in CONFIG_FILES for line in difflib.unified_diff(
+        live[name].decode('utf-8').splitlines(keepends=True),
+        repository[name].decode('utf-8').splitlines(keepends=True),
+        f'live/{name}', f'repository/{name}'))
+
+
+def accept_configuration(drift, release, credentials, root=ROOT):
+    """A release deploys the repository's configuration. A difference from what is live is
+    deployed only once reviewed: the diff is written locally, never printed, and must be
+    acknowledged by its digest. Returns that digest, or None when nothing differs."""
+    if not drift:
+        return None
+    digest = hashlib.sha256(drift.encode('utf-8')).hexdigest()
+    if credentials.get('accept_configuration') == digest:
+        return digest
+    path = root / '.acceptance' / f'configuration-drift-{release}.diff'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(drift, encoding='utf-8')
+    raise PreconditionFailed(f'Live configuration differs from the repository; review {path} and set '
+                             f'accept_configuration to {digest} to deploy the repository version')
+
+
+def validate_caddyfile(ssh, release, compose):
+    """The staged Caddyfile must load in the Caddy image it will run in, offline, with the
+    production environment, before anything is promoted."""
+    images = re.findall(r'(?m)^    image: (caddy:\S+)$', compose.decode('utf-8'))
+    if len(images) != 1:
+        raise PreconditionFailed('Unexpected Caddy image configuration')
+    try:
+        run(ssh, f'docker run --rm --pull never --network none --env-file /etc/kiro-byok/caddy.env '
+                 f'-v {release}/deploy/Caddyfile.ip:/etc/caddy/Caddyfile:ro {shlex.quote(images[0])} '
+                 'caddy validate --config /etc/caddy/Caddyfile >/dev/null')
+    except RuntimeError:
+        raise PreconditionFailed('The staged Caddyfile does not load in the production Caddy image') from None
+
+
+def install_backup_tooling(ssh, release):
+    """Install the release's backup scripts and systemd units, and enable the nightly backup
+    once its credentials exist. Returns what was done."""
+    source = f'{release}/deploy/backup'
+    tools = ' '.join(f'{source}/{name}' for name in BACKUP_TOOLS)
+    units = ' '.join(f'{source}/{name}' for name in BACKUP_UNITS)
+    run(ssh, f'mkdir -p -m 700 {BASE}/deploy/backup\ninstall -m 700 {tools} {BASE}/deploy/backup/\n'
+             f'install -m 644 {units} /etc/systemd/system/\nsystemctl daemon-reload')
+    if run(ssh, 'if test -f /etc/kiro-byok/admin-access.json; then echo yes; fi') != 'yes':
+        return 'installed; nightly backup not enabled: /etc/kiro-byok/admin-access.json is missing'
+    run(ssh, 'systemctl enable --now superkiro-backup.timer')
+    return 'installed; nightly backup enabled'
 
 
 def save_report(ssh, report):
@@ -461,18 +519,25 @@ def main(credentials=None, ssh=None):
               'backup': f'{BASE}/backups/release-{release}', 'status': 'staging'}
     try:
         with deployment_lock(ssh):
+            # A staged build runs on after its staging released the lock; two at once would
+            # compete with the live gateway for the host.
+            if run(ssh, "if pgrep -f 'build-resume[.]sh' >/dev/null; then echo running; fi") == 'running':
+                raise PreconditionFailed('A candidate build is still running on the server')
             old = release_path(run(ssh, f'readlink -f {BASE}/current'))
             report['previous_release'] = old
             report['configuration_sha256'] = configuration_digest(ssh, old)
             report['previous_image_id'] = run(ssh, "docker inspect kiro-gateway --format '{{.Image}}'")
             with ssh.open_sftp() as sftp:
-                compose = sftp.open(old + '/deploy/docker-compose.ip.yml').read().decode()
-                matches = re.findall(r'(?m)^    image: (kiro-byok:[^\s]+)$', compose)
+                live_compose = sftp.open(old + '/deploy/docker-compose.ip.yml').read().decode()
+                matches = GATEWAY_IMAGE_LINE.findall(live_compose)
                 if len(matches) != 1:
-                    raise RuntimeError('Unexpected gateway image configuration')
+                    raise PreconditionFailed('Unexpected gateway image configuration')
                 report['previous_image'] = matches[0]
-                compose = compose.replace('    image: ' + matches[0], '    image: ' + report['image'], 1)
-                caddy = portal_caddy_config(sftp.open(old + '/deploy/Caddyfile.ip').read())
+                live = {'docker-compose.ip.yml': with_gateway_image(live_compose, report['image']).encode(),
+                        'Caddyfile.ip': sftp.open(old + '/deploy/Caddyfile.ip').read()}
+                configuration = repository_configuration(report['image'])
+                report['configuration_drift_sha256'] = accept_configuration(
+                    configuration_drift(live, configuration), release, credentials)
                 archive = ROOT / '.acceptance' / f'release-{release}.tar.gz'
                 archive.parent.mkdir(parents=True, exist_ok=True)
                 for relative in SOURCE_PATHS + ['apps/admin-ui/dist/index.html', 'apps/portal-ui/index.html']:
@@ -488,8 +553,9 @@ def main(credentials=None, ssh=None):
                 report['archive_sha256'] = digest
                 run(ssh, f'mkdir {dest}\nmkdir {dest}/deploy')
                 sftp.put(str(archive), dest + '/source.tar.gz')
-            write_remote(ssh, dest + '/deploy/docker-compose.ip.yml', compose.encode())
-            write_remote(ssh, dest + '/deploy/Caddyfile.ip', caddy)
+            for name in CONFIG_FILES:
+                write_remote(ssh, f'{dest}/deploy/{name}', configuration[name])
+            validate_caddyfile(ssh, dest, configuration['docker-compose.ip.yml'])
             run(ssh, f"echo '{digest}  {dest}/source.tar.gz' | sha256sum -c -\ntar -xzf {dest}/source.tar.gz -C {dest}")
             report['candidate_sha256'] = tree_digest(ssh, dest, SOURCE_PATHS + ['deploy/docker-compose.ip.yml', 'deploy/Caddyfile.ip'])
             script = (f'set -eu\numask 077\ncd {dest}\n'
@@ -523,6 +589,10 @@ def keep_off_host(ssh, report, credentials):
             ssh, {f"{BASE}/releases/{report['release']}", report['previous_release']})
     except Exception as error:
         report['pruned_releases'] = f'failed ({type(error).__name__}: {error})'
+    try:
+        report['backup_tooling'] = install_backup_tooling(ssh, f"{BASE}/releases/{report['release']}")
+    except Exception as error:
+        report['backup_tooling'] = f'failed ({type(error).__name__}: {error})'
     save_report(ssh, report)
 
 

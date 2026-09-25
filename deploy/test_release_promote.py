@@ -237,6 +237,97 @@ class PromoteFailureBehaviour(unittest.TestCase):
                 rc.promote(None, dict(bad))
 
 
+class ConfigurationFromRepository(unittest.TestCase):
+    """A release deploys the repository's compose and Caddy files, never the live ones."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        (self.root / 'deploy').mkdir()
+        (self.root / 'deploy' / 'docker-compose.ip.yml').write_bytes(
+            b'services:\r\n  gateway:\r\n    image: kiro-byok:local\r\n  caddy:\r\n    image: caddy:2\r\n')
+        (self.root / 'deploy' / 'Caddyfile.ip').write_bytes(b'kiro.rent {\n    respond ok\n}\n')
+
+    def repository(self):
+        return rc.repository_configuration('kiro-byok:20260101T000000Z', root=self.root)
+
+    def test_the_repository_files_are_deployed_with_the_candidate_image(self):
+        configuration = self.repository()
+        self.assertEqual(configuration['docker-compose.ip.yml'],
+                         b'services:\n  gateway:\n    image: kiro-byok:20260101T000000Z\n  caddy:\n    image: caddy:2\n')
+        self.assertEqual(configuration['Caddyfile.ip'], b'kiro.rent {\n    respond ok\n}\n')
+
+    def test_a_compose_file_without_exactly_one_gateway_image_is_refused(self):
+        for compose in ('services: {}\n', '    image: kiro-byok:a\n    image: kiro-byok:b\n'):
+            with self.assertRaises(rc.PreconditionFailed):
+                rc.with_gateway_image(compose, 'kiro-byok:new')
+
+    def test_identical_configuration_deploys_without_review(self):
+        configuration = self.repository()
+        drift = rc.configuration_drift(dict(configuration), configuration)
+        self.assertEqual(drift, '')
+        self.assertIsNone(rc.accept_configuration(drift, RELEASE, {}, root=self.root))
+
+    def test_a_difference_is_written_for_review_and_deployed_only_once_acknowledged(self):
+        configuration = self.repository()
+        live = dict(configuration, **{'Caddyfile.ip': b'kiro.rent {\n    respond live\n}\n'})
+        drift = rc.configuration_drift(live, configuration)
+        self.assertIn('-    respond live', drift)
+        self.assertIn('+    respond ok', drift)
+        self.assertNotIn('docker-compose', drift)
+        digest = hashlib.sha256(drift.encode()).hexdigest()
+        for credentials in ({}, {'accept_configuration': '0' * 64}):
+            with self.assertRaises(rc.PreconditionFailed) as refused:
+                rc.accept_configuration(drift, RELEASE, credentials, root=self.root)
+            self.assertIn(digest, str(refused.exception))
+            # The diff is for the operator's eyes only: it is never in the message.
+            self.assertNotIn('respond', str(refused.exception))
+        review = self.root / '.acceptance' / f'configuration-drift-{RELEASE}.diff'
+        self.assertEqual(review.read_text(encoding='utf-8'), drift)
+        self.assertEqual(rc.accept_configuration(drift, RELEASE, {'accept_configuration': digest}, root=self.root),
+                         digest)
+
+    def test_a_caddyfile_that_does_not_load_stops_the_release_before_promotion(self):
+        compose = b'  caddy:\n    image: caddy:2-alpine@sha256:' + b'c' * 64 + b'\n'
+        with patch.object(rc, 'run', side_effect=RuntimeError('Remote operation failed (exit 1)')) as run:
+            with self.assertRaises(rc.PreconditionFailed):
+                rc.validate_caddyfile(None, DEST, compose)
+        command = run.call_args.args[1]
+        self.assertIn('--network none', command)
+        self.assertIn('caddy validate', command)
+        self.assertIn('caddy:2-alpine@sha256:' + 'c' * 64, command)
+
+
+class BackupTooling(unittest.TestCase):
+    def test_each_release_installs_its_backup_tools_and_enables_the_timer_with_credentials(self):
+        for credentials, enabled in (('yes', True), ('', False)):
+            commands = []
+
+            def run(_ssh, command):
+                commands.append(command)
+                return credentials if 'admin-access.json' in command else ''
+
+            with patch.object(rc, 'run', side_effect=run):
+                outcome = rc.install_backup_tooling(None, DEST)
+            joined = '\n'.join(commands)
+            for name in rc.BACKUP_TOOLS:
+                self.assertIn(f'{DEST}/deploy/backup/{name}', joined)
+            self.assertIn('/etc/systemd/system/', joined)
+            self.assertIn('systemctl daemon-reload', joined)
+            self.assertEqual('enable --now superkiro-backup.timer' in joined, enabled)
+            self.assertIn('enabled' if enabled else 'not enabled', outcome)
+
+    def test_a_backup_tooling_failure_is_reported_not_raised(self):
+        report = {'release': RELEASE, 'backup': f'/opt/kiro-byok/backups/release-{RELEASE}', 'previous_release': OLD}
+        with patch.object(rc, 'pull_tree', return_value='copied'), \
+                patch.object(rc, 'prune_releases', return_value=[]), \
+                patch.object(rc, 'install_backup_tooling', side_effect=RuntimeError('no systemd')), \
+                patch.object(rc, 'save_report'):
+            rc.keep_off_host(None, report, {'backup_dir': self.id()})
+        self.assertEqual(report['backup_tooling'], 'failed (RuntimeError: no systemd)')
+
+
 class Retention(unittest.TestCase):
     def test_old_releases_go_and_the_newest_and_protected_ones_stay(self):
         names = [f'2026010{day}T000000Z' for day in range(1, 9)] + ['hand-made', 'lost+found']

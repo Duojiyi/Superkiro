@@ -4,18 +4,19 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from deploy.release_candidate import ROOT, deployment_lock, pinned_connection, promote
+from deploy.release_candidate import ROOT, deployment_lock, keep_off_host, pinned_connection, promote
 
 
-def main(ssh=None):
+def main(credentials=None, ssh=None):
+    credentials = json.load(sys.stdin) if credentials is None else credentials
     owns_connection = ssh is None
     if owns_connection:
-        ssh = pinned_connection(json.load(sys.stdin))
+        ssh = pinned_connection(credentials)
     try:
         with deployment_lock(ssh):
             report = json.loads((ROOT / 'deployment-candidate-results.json').read_text(encoding='utf-8'))
-            from deploy.release_announcements import verify_public_release
-            promote(ssh, report, extra_readiness=verify_public_release if 'web_sha256' in report else None)
+            promote(ssh, report)
+            keep_off_host(ssh, report, credentials)
     finally:
         if owns_connection:
             ssh.close()

@@ -47,7 +47,8 @@ class ColdBackupSafetyTests(unittest.TestCase):
         self.env.update(PATH=str(self.bin) + os.pathsep + os.environ["PATH"],
                         DATA_DIR=self.data.as_posix(), BACKUP_DIR=self.backups.as_posix(),
                         RETENTION_DAYS="7", TEST_BIN=bash_path(self.bin), DOCKER_LOG=self.log.as_posix(),
-                        FAKE_STATE="exited", FAKE_DOCKER_EXIT="0", FAKE_CURL_EXIT="7")
+                        FAKE_STATE="exited", FAKE_DOCKER_EXIT="0", FAKE_CURL_EXIT="7",
+                        DEPLOYMENT_LOCK=(self.root / "deployment.lock").as_posix())
         self.content = b'{"snapshot":"isolated test fixture"}'
         (self.data / "billing_state.json").write_bytes(self.content)
         (self.data / "billing_state.json.anchor").write_text(json.dumps({
@@ -114,6 +115,10 @@ class ColdBackupSafetyTests(unittest.TestCase):
         dirname = isolated / "dirname"
         dirname.write_text('shift; echo "${1%/*}"\n', encoding="utf-8")
         dirname.chmod(0o755)
+        # The deployment lock is taken before anything else, and released on refusal.
+        for tool in ("mkdir", "rmdir"):
+            (isolated / tool).write_text(f'exec /usr/bin/{tool} "$@"\n', encoding="utf-8")
+            (isolated / tool).chmod(0o755)
         result = subprocess.run([str(BASH), "--noprofile", "--norc", "-c",
                                  'export PATH="$TEST_BIN"; script=$1; shift; source "$script"',
                                  "cold-backup-safety", SCRIPT.as_posix()],
@@ -122,6 +127,7 @@ class ColdBackupSafetyTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("docker is required", result.stderr)
         self.assertEqual(list(self.backups.iterdir()), [])
+        self.assertFalse((self.root / "deployment.lock").exists())
 
     def test_responding_endpoint_vetoes_stopped_container(self):
         result = self.assert_refused(FAKE_CURL_EXIT="0")

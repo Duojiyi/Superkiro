@@ -33,8 +33,11 @@ class ColdBackupTests(unittest.TestCase):
             target.chmod(0o755)
         self.env = {key: value for key, value in os.environ.items()
                     if key not in {"DATA_FILE", "ANCHOR_FILE", "GATEWAY_CONTAINER", "GATEWAY_UID", "GATEWAY_GID"}}
+        self.lock = self.root / "deployment.lock"
         self.env = dict(self.env, PATH=str(self.bin) + os.pathsep + os.environ["PATH"],
-                        DATA_DIR=self.data.as_posix(), BACKUP_DIR=(self.root / "backups").as_posix())
+                        DATA_DIR=self.data.as_posix(), BACKUP_DIR=(self.root / "backups").as_posix(),
+                        DEPLOYMENT_LOCK=self.lock.as_posix(),
+                        GATEWAY_ENV_FILE=(self.root / "gateway.env").as_posix())
         self.content = b'{"authoritative":"fixture"}'
         self.generation = "billing_state.json.gen_fixture"
         (self.data / self.generation).write_bytes(self.content)
@@ -248,6 +251,70 @@ exec /usr/bin/rm "$@"''')
                 result = self.restore(MOCK_STATE=state, GATEWAY_CONTAINER="custom-gateway")
                 self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("-- custom-gateway", self.log.read_text())
+
+    def test_a_held_deployment_lock_refuses_backup_and_restore_and_stays(self):
+        self.restore_fixture()
+        self.lock.mkdir()
+        for result in (self.run_script("backup.sh"), self.restore()):
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("deployment.lock", result.stderr)
+        self.assertTrue(self.lock.is_dir())
+        self.assertFalse(list((self.root / "backups").glob("*.manifest.json")))
+        self.assertEqual(list(self.target.iterdir()), [])
+
+    def test_the_lock_is_held_while_running_and_released_after(self):
+        self.restore_fixture()
+        self.old_state()
+        self.mock("kiro-gateway", 'test -d "$DEPLOYMENT_LOCK" || exit 9')
+        for result in (self.run_script("backup.sh"), self.restore()):
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(self.lock.exists())
+
+    def test_an_incomplete_rollback_keeps_the_lock_for_review(self):
+        self.restore_fixture()
+        self.old_state()
+        result = self.restore(FAIL_PUBLISH="1", FAIL_AFTER_MOVE="1", FAIL_ROLLBACK="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("rollback incomplete", result.stderr)
+        self.assertTrue(self.lock.is_dir())
+
+    def test_restore_verifies_with_the_stopped_gateways_image_and_key(self):
+        self.restore_fixture()
+        self.old_state()
+        # Nothing else may vouch for the snapshot.
+        self.mock("kiro-gateway", "exit 1")
+        self.mock("docker", r'''if [[ "$1" == inspect && "$*" == *"{{.Image}}"* ]]; then echo sha256:gatewayimage; exit 0; fi
+if [[ "$1" == inspect ]]; then echo exited; exit 0; fi
+printf '%s\n' "$@" > "$DOCKER_ARGS"
+printf '%s' "${KIRO_MASTER_KEK:-}" > "$DOCKER_KEK"
+[[ "$*" == *"verify-snapshot /stage/billing_state.json"* ]]''')
+        (self.root / "gateway.env").write_text(
+            "AUTH_SECRET=unrelated\nKIRO_MASTER_KEK='" + "ab" * 32 + "'\n", encoding="utf-8", newline="\n")
+        args, kek = self.root / "docker.args", self.root / "docker.kek"
+        result = self.restore(DOCKER_ARGS=args.as_posix(), DOCKER_KEK=kek.as_posix())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = args.read_text(encoding="utf-8").splitlines()
+        for expected in ("run", "--rm", "--read-only", "--entrypoint", "sha256:gatewayimage"):
+            self.assertIn(expected, argv)
+        self.assertEqual(argv[argv.index("--network") + 1], "none")
+        # The key reaches the verifier through its environment, never its arguments.
+        self.assertEqual(kek.read_text(encoding="utf-8"), "ab" * 32)
+        self.assertFalse(any("ab" * 32 in arg for arg in argv))
+        self.assertFalse(any("unrelated" in arg for arg in argv))
+
+    def test_a_failed_image_verification_touches_nothing(self):
+        self.restore_fixture()
+        expected = self.old_state()
+        self.mock("kiro-gateway", "exit 0")
+        self.mock("docker", r'''if [[ "$1" == inspect && "$*" == *"{{.Image}}"* ]]; then echo sha256:gatewayimage; exit 0; fi
+if [[ "$1" == inspect ]]; then echo exited; exit 0; fi
+exit 1''')
+        (self.root / "gateway.env").write_text("KIRO_MASTER_KEK=" + "cd" * 32 + "\n", encoding="utf-8", newline="\n")
+        result = self.restore()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("verification failed", result.stderr)
+        self.assert_live_files(expected)
+        self.assertFalse(self.lock.exists())
 
     @unittest.skipIf(os.name == "nt", "POSIX restore ownership requires Linux")
     def test_restore_uses_configured_runtime_identity(self):

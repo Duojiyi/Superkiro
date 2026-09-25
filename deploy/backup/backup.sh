@@ -21,6 +21,15 @@ if [[ $# -gt 0 ]]; then
   exit 1
 fi
 
+# Promote copies and moves data/ while the gateway is stopped, the very state this script
+# requires: hold the deployment lock for the whole run, so neither can start mid-way.
+DEPLOYMENT_LOCK="${DEPLOYMENT_LOCK:-/opt/kiro-byok/deployment.lock}"
+if ! mkdir -- "${DEPLOYMENT_LOCK}" 2>/dev/null; then
+  echo "Error: ${DEPLOYMENT_LOCK} exists: a deployment, backup or restore is running or awaits review" >&2
+  exit 1
+fi
+trap 'rmdir -- "${DEPLOYMENT_LOCK}" 2>/dev/null || true' EXIT
+
 # Step 1: Require positive evidence that the deployment container is stopped.
 # Both shipped Compose files use container_name: kiro-gateway. Inspect that
 # runtime identity directly: Compose config/env/project errors must not look
@@ -78,6 +87,7 @@ GENERATION_TMP=""
 
 cleanup() {
   rm -f -- "${TMP_FILE}" "${TMP_ANCHOR}" "${TMP_CHECKSUM}" "${TMP_MANIFEST}" ${GENERATION_TMP:+"${GENERATION_TMP}"}
+  rmdir -- "${DEPLOYMENT_LOCK}" 2>/dev/null || true
 }
 trap cleanup EXIT
 
