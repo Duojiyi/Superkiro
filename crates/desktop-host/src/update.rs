@@ -388,7 +388,8 @@ fn record_failure(state: &mut Value, sha256: &str) {
 }
 
 fn clear_failures(state: &mut Value, sha256: &str) {
-    if let Some(failures) = state["failures"].as_object_mut() {
+    // Through get_mut: indexing a missing key would write a null into the state.
+    if let Some(failures) = state.get_mut("failures").and_then(Value::as_object_mut) {
         failures.remove(sha256);
     }
 }
@@ -682,9 +683,16 @@ fn stage(
         |e: std::io::Error| format!("[update:replace] Cannot write beside the client: {e}");
     #[cfg(not(target_os = "macos"))]
     let (staged, executable) = {
-        let staged = beside(current, &format!("{}.exe", release.version));
-        let _ = remove_path(&staged);
-        retry(|| fs::rename(verified, &staged)).map_err(replace)?;
+        // In a hidden folder under the client's own file name, so the trial shows in Task
+        // Manager as the client does, and moves out to take its place.
+        let work = beside(current, &format!("{}.new", release.version));
+        let _ = remove_path(&work);
+        fs::create_dir(&work).map_err(replace)?;
+        let staged = work.join(current.file_name().unwrap_or_default());
+        if let Err(error) = retry(|| fs::rename(verified, &staged)) {
+            let _ = fs::remove_dir_all(&work);
+            return Err(replace(error));
+        }
         (staged.clone(), staged)
     };
     #[cfg(target_os = "macos")]
@@ -723,15 +731,11 @@ fn stage(
 
 /// What removing a staged version removes: the file, or on macOS the folder it came in.
 fn staged_root(pending: &Pending) -> PathBuf {
-    if cfg!(target_os = "macos") {
-        pending
-            .staged
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| pending.staged.clone())
-    } else {
-        pending.staged.clone()
-    }
+    pending
+        .staged
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| pending.staged.clone())
 }
 
 /// Starts a trial of the staged version and waits until it signals it is up.
@@ -962,9 +966,7 @@ fn move_into_place(pending: &Pending) -> bool {
         return false;
     }
     let _ = remove_path(&aside);
-    if cfg!(target_os = "macos") {
-        let _ = fs::remove_dir_all(staged_root(pending));
-    }
+    let _ = fs::remove_dir_all(staged_root(pending));
     true
 }
 
@@ -1488,7 +1490,16 @@ mod tests {
         assert_eq!(fs::read(&pending.staged).unwrap(), b"new");
         assert_eq!(pending.executable, pending.staged);
         assert_eq!(pending.version, OTHER);
+        // The trial runs under the client's own file name, so it looks like the client.
+        assert_eq!(pending.staged.file_name(), pending.current.file_name());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn clearing_failures_writes_nothing_when_there_are_none() {
+        let mut value = json!({});
+        clear_failures(&mut value, "abc");
+        assert_eq!(value, json!({}));
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1574,7 +1585,7 @@ mod tests {
             "other.txt",
             ".Superkiro.exe.12.log",
             ".Superkiro.exe.0123456789abcdef.part",
-            ".Superkiro.exe.2026.09.26.exe",
+            ".Superkiro.exe.2026.09.26.new",
         ];
         for name in keep {
             fs::write(dir.join(name), b"keep").unwrap();
@@ -1582,12 +1593,12 @@ mod tests {
         for name in [
             ".Superkiro.exe.12.old",
             ".Superkiro.exe.34.new",
-            ".Superkiro.exe.2026.09.24.exe",
+            ".Superkiro.exe.2026.09.24.new",
         ] {
             fs::write(dir.join(name), b"gone").unwrap();
         }
         fs::create_dir(dir.join(".Superkiro.exe.56.old")).unwrap();
-        let pending_staged = dir.join(".Superkiro.exe.2026.09.26.exe");
+        let pending_staged = dir.join(".Superkiro.exe.2026.09.26.new");
         // Three days on, the kept part file is a superseded download; judged a week later.
         let later = SystemTime::now() + PART_LIFETIME / 2;
         remove_leftovers_of(&client, std::slice::from_ref(&pending_staged), later);
