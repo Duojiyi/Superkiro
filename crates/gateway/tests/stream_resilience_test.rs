@@ -1326,3 +1326,84 @@ async fn an_output_count_far_below_what_was_streamed_is_not_trusted() {
 fn json_line(value: serde_json::Value) -> String {
     format!("data: {value}")
 }
+
+// --------------------------------------------------------------------------
+// A streamed response's trace carries its time to first output and its speed
+// --------------------------------------------------------------------------
+#[tokio::test]
+async fn a_streamed_response_records_its_time_to_first_output() {
+    let (billing, card_id) = create_test_billing();
+    let inv_id = "inv-first-output";
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let params = ReservationEstimateParams {
+        estimated_input_tokens: 1000,
+        max_output_tokens: 2000,
+        input_rate_per_m: 15_000_000,
+        output_rate_per_m: 60_000_000,
+        credit_multiplier: 1.0,
+        margin_multiplier: 1.0,
+        model: Some("claude-3-5-sonnet".to_string()),
+    };
+    billing
+        .reserve(&card_id, inv_id, &params, now_secs, 300)
+        .unwrap();
+    let received_at = std::time::Instant::now();
+
+    let (tx, rx) = mpsc::channel(16);
+    tokio::spawn(async move {
+        // The model thinks before it answers; then the answer streams for a while.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let _ = tx
+            .send(Ok(ProviderStreamEvent::Delta(ProviderDelta::Text(
+                "The answer begins".to_string(),
+            ))))
+            .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = tx
+            .send(Ok(ProviderStreamEvent::Usage(TokenUsage {
+                uncached_prompt_tokens: 1000,
+                prompt_tokens: 1000,
+                completion_tokens: 40,
+                total_tokens: 1040,
+                output_tokens_final: true,
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
+            })))
+            .await;
+        let _ = tx.send(Ok(ProviderStreamEvent::Done)).await;
+    });
+
+    let config = StreamGuardConfig {
+        keepalive_interval: Duration::from_secs(60),
+        model_id: "claude-3-5-sonnet".to_string(),
+        context_window: None,
+    };
+    let settler = BillingSettler::new(
+        billing.clone(),
+        inv_id.to_string(),
+        "claude-3-5-sonnet".to_string(),
+        "provider-1".to_string(),
+        "claude-3-5-sonnet".to_string(),
+    )
+    .with_started_at(received_at)
+    .with_estimated_input(1000);
+    let stream = create_stream_guard(ReceiverStream::new(rx), config, None, None, Some(settler));
+    collect_and_decode_frames(stream).await;
+
+    let trace = billing
+        .list_traces(Some(&card_id), 10)
+        .into_iter()
+        .find(|trace| trace.invocation_id == inv_id)
+        .expect("the response has a trace");
+    let ttft = trace.ttft_ms.expect("time to first output is recorded");
+    assert!(
+        (150..5_000).contains(&ttft),
+        "measured from the request: {ttft} ms"
+    );
+    // 40 tokens over the 100 ms after the first output: a speed, and a plausible one.
+    let speed = trace.tokens_per_second.expect("output speed is recorded");
+    assert!(speed > 0.0 && speed < 4_000.0, "{speed} tokens/s");
+}

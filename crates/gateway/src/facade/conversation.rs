@@ -162,6 +162,8 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
 
     fn handle<'a>(&'a self, req: Request<Body>) -> BoxFuture<'a, Response> {
         Box::pin(async move {
+            // What a response's time to first output is measured from.
+            let received_at = std::time::Instant::now();
             let (parts, body) = req.into_parts();
 
             // 1. Extract amz-sdk-invocation-id header (Spec §4.7)
@@ -1057,6 +1059,7 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                     .cloned(),
             )
             .with_permit(capacity_permit)
+            .with_started_at(received_at)
             .with_estimated_input(translated_input_estimate)
             .with_reservation_lease(reservation_lease);
 

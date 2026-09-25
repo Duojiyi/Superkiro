@@ -34,6 +34,7 @@ pub struct BillingSettler {
     settlement_attempted: bool,
     reservation_lease: Option<billing::engine::ReservationLease>,
     metrics: Option<crate::ops::metrics::RequestMetrics>,
+    started_at: std::time::Instant,
 }
 
 impl BillingSettler {
@@ -56,7 +57,14 @@ impl BillingSettler {
             settlement_attempted: false,
             reservation_lease: None,
             metrics: None,
+            started_at: std::time::Instant::now(),
         }
+    }
+
+    /// When the request arrived, so its time to first output counts all the customer waited.
+    pub fn with_started_at(mut self, started_at: std::time::Instant) -> Self {
+        self.started_at = started_at;
+        self
     }
 
     pub fn with_reservation_lease(mut self, lease: billing::engine::ReservationLease) -> Self {
@@ -342,6 +350,7 @@ pub fn create_stream_guard_with_send_deadline(
         let mut saw_usage_frame = false;
         let mut output_units = 0u64;
         let mut saw_output = false;
+        let mut first_output_at: Option<std::time::Instant> = None;
         let mut completed = false;
         let mut rejected_empty = false;
         let context_window = config
@@ -417,6 +426,9 @@ pub fn create_stream_guard_with_send_deadline(
                                     None
                                 }
                             };
+                            if saw_output && first_output_at.is_none() {
+                                first_output_at = Some(std::time::Instant::now());
+                            }
                             if let Some(frame) = frame {
                                 if !send_frame(&tx, Bytes::from(frame), send_deadline).await { break; }
                                 interval.reset();
@@ -519,15 +531,15 @@ pub fn create_stream_guard_with_send_deadline(
                     usage.cache_creation_input_tokens.unwrap_or(0),
                 );
             }
-            if let Some(tokens) = resolve_settlement_tokens(
+            let resolved = resolve_settlement_tokens(
                 &usage,
                 has_input_usage,
                 output_units,
                 saw_output,
                 settler.estimated_input_tokens,
-            )
-            .filter(|_| !rejected_empty)
-            {
+            );
+            let output_tokens = resolved.as_ref().map_or(0, |tokens| tokens.output_tokens);
+            if let Some(tokens) = resolved.filter(|_| !rejected_empty) {
                 billable_attempt = true;
                 if let Err(error) = settler.settle(&tokens) {
                     settlement_ok = false;
@@ -554,6 +566,11 @@ pub fn create_stream_guard_with_send_deadline(
                     None
                 },
             );
+            let (ttft_ms, tokens_per_second) =
+                stream_timing(settler.started_at, first_output_at, output_tokens);
+            settler
+                .billing
+                .note_trace_timing(&settler.invocation_id, ttft_ms, tokens_per_second);
         }
         if completed && settlement_ok {
             if !tx.is_closed() {
@@ -639,6 +656,21 @@ pub(crate) fn reports_input(usage: &crate::provider::TokenUsage) -> bool {
         || usage
             .cache_creation_input_tokens
             .is_some_and(|tokens| tokens > 0)
+}
+
+/// Time to first output since the request arrived, and output speed after it.
+fn stream_timing(
+    started_at: std::time::Instant,
+    first_output_at: Option<std::time::Instant>,
+    output_tokens: u64,
+) -> (Option<u32>, Option<f64>) {
+    let Some(first) = first_output_at else {
+        return (None, None);
+    };
+    let ttft = first.saturating_duration_since(started_at).as_millis();
+    let generating = first.elapsed().as_secs_f64();
+    let speed = (output_tokens > 0 && generating > 0.0).then(|| output_tokens as f64 / generating);
+    (Some(ttft.min(u32::MAX as u128) as u32), speed)
 }
 
 pub(crate) fn resolve_settlement_tokens(

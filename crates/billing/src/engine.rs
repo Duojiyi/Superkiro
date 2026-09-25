@@ -4323,6 +4323,26 @@ impl BillingEngine {
         }
     }
 
+    /// Notes how a streamed response was timed on its trace: the time from the request to
+    /// its first output, and its output speed after that. Observability, like the trace.
+    pub fn note_trace_timing(
+        &self,
+        invocation_id: &str,
+        ttft_ms: Option<u32>,
+        tokens_per_second: Option<f64>,
+    ) {
+        let _guard = self.state_lock.write().unwrap();
+        let mut traces = self.traces.write().unwrap();
+        if let Some(trace) = traces
+            .iter_mut()
+            .rev()
+            .find(|t| t.invocation_id == invocation_id)
+        {
+            trace.ttft_ms = ttft_ms;
+            trace.tokens_per_second = tokens_per_second;
+        }
+    }
+
     /// List recorded request execution traces.
     pub fn list_traces(&self, card_id: Option<&str>, limit: usize) -> Vec<RequestTrace> {
         let traces = self.traces.read().unwrap();
