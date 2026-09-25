@@ -663,6 +663,20 @@ pub fn validate_gateway_url(url: &str) -> Result<String, PatchError> {
 }
 
 fn render_patch(content: &str, gateway: &str, recipe: &PatchRecipe) -> Result<String, PatchError> {
+    render_patch_for(content, gateway, recipe, current_owner().as_deref())
+}
+
+/// The patched bundle, redirecting only `owner`, the user taking over, as
+/// [`current_owner`] names them. An installation can be shared by every user of the
+/// computer (`/Applications/Kiro.app`, say) while a takeover is one user's: anyone
+/// else's Kiro keeps its official runtime endpoint, and their own token with it. With
+/// no owner known, the redirect applies to everyone, as it always did.
+fn render_patch_for(
+    content: &str,
+    gateway: &str,
+    recipe: &PatchRecipe,
+    owner: Option<&str>,
+) -> Result<String, PatchError> {
     let gateway = validate_gateway_url(gateway)?;
     if !recipe.marker.starts_with("/* @patched-kiro-byok ")
         || !recipe.marker.ends_with(" */")
@@ -682,16 +696,32 @@ fn render_patch(content: &str, gateway: &str, recipe: &PatchRecipe) -> Result<St
         let url = validate_gateway_url(&recipe.replacement.replace("{}", &gateway))?;
         serde_json::to_string(&url).unwrap()
     };
+    // Whether the bundle runs as the owner: their home directory, read and compared the
+    // way `current_owner` reads it.
+    let is_owner = owner.map(|owner| {
+        format!(
+            "String(process.env.{}||\"\").toLowerCase()==={}",
+            if cfg!(windows) { "USERPROFILE" } else { "HOME" },
+            serde_json::to_string(owner).unwrap()
+        )
+    });
     // Match the whole literal, never its contents. This includes the runtime
-    // template literal whose ${t} must disappear along with its backticks.
+    // template literal whose ${t} must disappear along with its backticks: every
+    // occurrence of the needle has to be one, or the patch would miss a use.
+    let needles = content.matches(recipe.needle.as_str()).count();
     let mut body = content.to_string();
     let mut replaced = 0;
     for quote in ['"', '\'', '`'] {
         let literal = format!("{quote}{}{quote}", recipe.needle);
+        // Anyone else keeps the literal as Kiro wrote it.
+        let replacement = match &is_owner {
+            Some(is_owner) => format!("({is_owner}?{replacement}:{literal})"),
+            None => replacement.clone(),
+        };
         replaced += body.matches(&literal).count();
         body = body.replace(&literal, &replacement);
     }
-    if replaced == 0 || body.contains(&recipe.needle) {
+    if replaced == 0 || replaced != needles {
         return Err(PatchError::NeedleNotFound);
     }
     Ok(format!(
@@ -921,6 +951,80 @@ mod proxy_tls_tests {
             render_patch(&bundle, "https://160.202.47.98", &PatchRecipe::default()).unwrap();
         assert!(rendered.contains(expected));
         assert!(!rendered.contains(original));
+    }
+}
+
+#[cfg(test)]
+mod shared_install_tests {
+    use super::*;
+
+    /// An installation every user of the computer shares carries one user's takeover.
+    /// Only that user's Kiro is redirected; anyone else's keeps Kiro's official runtime
+    /// endpoint, so their own token never reaches the gateway.
+    #[test]
+    fn only_the_user_who_took_over_is_redirected() {
+        let dir = std::env::temp_dir().join(format!("shared-install-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let bundle = dir.join("bundle.js");
+        let (home, owner, other) = if cfg!(windows) {
+            ("USERPROFILE", "C:\\Users\\Taker", "C:\\Users\\Someone")
+        } else {
+            ("HOME", "/Users/taker", "/Users/someone")
+        };
+        let source = format!("module.exports = (t) => `{RUNTIME_ENDPOINT_NEEDLE}`;");
+        let rendered = render_patch_for(
+            &source,
+            "https://gw.shared.test",
+            &PatchRecipe::default(),
+            Some(&owner.to_lowercase()),
+        )
+        .unwrap();
+        fs::write(&bundle, rendered).unwrap();
+        let endpoint = |user: &str, launched_with: Option<&str>| {
+            let mut node = Command::new("node");
+            node.args([
+                "-e",
+                "process.stdout.write(require(process.argv[1])('us-east-1'))",
+            ])
+            .arg(&bundle)
+            .env(home, user)
+            .env_remove("KIRO_GATEWAY_URL");
+            if let Some(gateway) = launched_with {
+                node.env("KIRO_GATEWAY_URL", gateway);
+            }
+            let output = node.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8(output.stdout).unwrap()
+        };
+        let official = "https://runtime.us-east-1.kiro.dev";
+        assert_eq!(endpoint(owner, None), "https://gw.shared.test");
+        assert_eq!(
+            endpoint(&owner.to_uppercase(), None),
+            "https://gw.shared.test"
+        );
+        assert_eq!(
+            endpoint(owner, Some("https://gw.launch.test")),
+            "https://gw.launch.test"
+        );
+        assert_eq!(endpoint(other, None), official);
+        assert_eq!(endpoint(other, Some("https://gw.launch.test")), official);
+        assert_eq!(endpoint("", None), official);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Every use of the endpoint is a whole literal, or the patch is refused as before.
+    #[test]
+    fn a_needle_outside_a_whole_literal_still_refuses_the_patch() {
+        let source = format!("a = `{RUNTIME_ENDPOINT_NEEDLE}`; b = `{RUNTIME_ENDPOINT_NEEDLE}/x`;");
+        assert_eq!(
+            render_patch_for(
+                &source,
+                "https://gw.test",
+                &PatchRecipe::default(),
+                Some("/home/taker")
+            ),
+            Err(PatchError::NeedleNotFound)
+        );
     }
 }
 

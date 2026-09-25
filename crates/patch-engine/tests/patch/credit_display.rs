@@ -62,7 +62,12 @@ fn unknown_credit_formatter_does_not_block_endpoint_injection() {
     assert_eq!(repair_credit_display(&unknown), unknown);
     let rendered =
         render_patch(&unknown, "https://gateway.invalid", &PatchRecipe::default()).unwrap();
-    assert!(!rendered.contains(RUNTIME_ENDPOINT_NEEDLE));
+    // Injected: the endpoint literal is left only as what other users of the computer
+    // keep, behind the check for the user who took over.
+    assert!(rendered.contains(&format!(
+        "?(process.env.KIRO_GATEWAY_URL||\"https://gateway.invalid\"):`{RUNTIME_ENDPOINT_NEEDLE}`)"
+    )));
+    assert_eq!(rendered.matches(RUNTIME_ENDPOINT_NEEDLE).count(), 1);
     assert!(rendered.contains("https://gateway.invalid"));
     assert!(rendered.contains("${d}: ${s} / ${u}"));
     assert!(!rendered.contains("creditDisplay"));
