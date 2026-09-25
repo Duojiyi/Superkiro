@@ -364,6 +364,11 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                 .unwrap_or("claude-3-5-sonnet-20241022");
             let mut has_reservation = false;
             let reservation_lease = self.billing.protect_reservation(&invocation_key);
+            let mut hold = HoldRelease {
+                billing: self.billing.clone(),
+                invocation_id: invocation_key.clone(),
+                armed: false,
+            };
             let mut reserved_estimated_input = 2_000u64;
             let mut reserved_max_output = 4_096u32;
             if claims.is_some() || real_provider {
@@ -501,6 +506,7 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                     }
                 }
                 has_reservation = true;
+                hold.armed = true;
             }
 
             // 6. If no real provider is configured, return fallback stub frame
@@ -1008,6 +1014,8 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                 context_window: Some(context_window),
             };
 
+            // The stream's settler bills or returns the hold from here on.
+            hold.armed = false;
             let settler = BillingSettler::new(
                 self.billing.clone(),
                 invocation_key.clone(),
@@ -1041,6 +1049,25 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
             )
                 .into_response()
         })
+    }
+}
+
+/// Returns a request's hold when the request ends before its stream's settler takes over:
+/// refused on the way, or dropped at an await because the client went away (Kiro's stop,
+/// a disconnect, the request timeout) while the upstream was being started. That left the
+/// hold for the janitor, eleven minutes later: two such stops locked a two-request card
+/// out, and the retry of either was refused as a duplicate.
+struct HoldRelease {
+    billing: BillingEngine,
+    invocation_id: String,
+    armed: bool,
+}
+
+impl Drop for HoldRelease {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.billing.release(&self.invocation_id);
+        }
     }
 }
 
