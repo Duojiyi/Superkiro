@@ -53,6 +53,29 @@ fn rate_limit_response(retry_after: u64) -> Response {
     response
 }
 
+/// How the portal shows a bound device. Anyone holding the card code can query the card,
+/// so the portal must never hand out the id that signs a machine in as that device: it
+/// shows enough of the end for the customer to recognise their machine and pick it.
+const MASKED_DEVICE_PREFIX: &str = "****";
+
+fn masked_device(device: &str) -> String {
+    let chars: Vec<char> = device.chars().collect();
+    let shown = (chars.len() / 3).min(6);
+    let tail: String = chars[chars.len() - shown..].iter().collect();
+    format!("{MASKED_DEVICE_PREFIX}{tail}")
+}
+
+/// The binding refusals a card holder can act on. Anything else is internal detail.
+fn device_refusal(error: &BillingError) -> Option<String> {
+    matches!(
+        error,
+        BillingError::DeviceAlreadyBound
+            | BillingError::RebindLimitExceeded { .. }
+            | BillingError::RebindCooldown { .. }
+    )
+    .then(|| error.to_string())
+}
+
 /// Unified error for portal endpoints — intentionally vague to avoid enumeration (P1-01).
 fn portal_deny_response() -> Response {
     (
@@ -254,7 +277,11 @@ impl FacadeHandler for PortalQueryHandler {
                 activated_at: card.activated_at,
                 valid_until: card.valid_until,
                 is_expired,
-                bound_devices: card.bound_devices.clone(),
+                bound_devices: card
+                    .bound_devices
+                    .iter()
+                    .map(|d| masked_device(d))
+                    .collect(),
                 max_devices: 1,
                 rebind_count: card.rebind_count,
                 max_rebinds: card.max_rebinds,
@@ -341,8 +368,8 @@ impl FacadeHandler for PortalActivateHandler {
                 _ => return portal_deny_response(),
             };
 
-            if let Err(error) = card.check_device_policy() {
-                return portal_deny_response_with_error(error.to_string());
+            if card.check_device_policy().is_err() {
+                return portal_deny_response();
             }
 
             let device = req_data
@@ -356,11 +383,15 @@ impl FacadeHandler for PortalActivateHandler {
                     .activate_card_with_device(&card.id, now, validity_secs, device)
                 {
                     Ok(card) => card,
-                    Err(error) => return portal_deny_response_with_error(error.to_string()),
+                    Err(error) => {
+                        return device_refusal(&error)
+                            .map_or_else(portal_deny_response, portal_deny_response_with_error)
+                    }
                 }
             } else if let Some(device) = device {
                 if let Err(error) = self.billing.bind_device(&card.id, device, now) {
-                    return portal_deny_response_with_error(error.to_string());
+                    return device_refusal(&error)
+                        .map_or_else(portal_deny_response, portal_deny_response_with_error);
                 }
                 self.billing.get_card(&card.id).unwrap_or(card)
             } else {
@@ -522,7 +553,24 @@ impl FacadeHandler for PortalUnbindHandler {
                 }
             };
 
-            if let Err(e) = self.billing.unbind_device(&card.id, &req_data.device) {
+            // The portal names a device by the masked form its query showed; the desktop
+            // client, which knows its own id, names it in full.
+            let device = if req_data.device.starts_with(MASKED_DEVICE_PREFIX) {
+                let mut named = card
+                    .bound_devices
+                    .iter()
+                    .filter(|bound| masked_device(bound) == req_data.device);
+                match (named.next(), named.next()) {
+                    (Some(bound), None) => bound.clone(),
+                    _ => {
+                        let _ = self.protector.record_failure(&ip, now);
+                        return portal_deny_response();
+                    }
+                }
+            } else {
+                req_data.device.clone()
+            };
+            if let Err(e) = self.billing.unbind_device(&card.id, &device) {
                 let _ = self.protector.record_failure(&ip, now);
                 // Only allowlisted policy details leave the server; never expose billing IDs.
                 let detail = match e {
@@ -560,7 +608,11 @@ impl FacadeHandler for PortalUnbindHandler {
             let resp = PortalUnbindResponse {
                 success: true,
                 card_id: updated_card.id,
-                remaining_devices: updated_card.bound_devices,
+                remaining_devices: updated_card
+                    .bound_devices
+                    .iter()
+                    .map(|d| masked_device(d))
+                    .collect(),
             };
 
             json_response(StatusCode::OK, &resp)
@@ -669,7 +721,11 @@ impl FacadeHandler for PortalTopupHandler {
                             [(header::CONTENT_TYPE, "application/json")],
                             axum::Json(serde_json::json!({
                                 "success": false,
-                                "error": format!("Topup failed: {}", e),
+                                "error": if e == BillingError::InvalidOrRedeemedTopupCode {
+                                    e.to_string()
+                                } else {
+                                    "Topup failed".to_string()
+                                },
                             })),
                         )
                             .into_response();

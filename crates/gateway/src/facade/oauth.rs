@@ -307,10 +307,12 @@ impl FacadeHandler for OAuthTokenHandler {
                         );
                     }
                     other => {
+                        // Internal detail stays in the log; the card holder gets the outcome.
+                        eprintln!("[!] Device binding failed: {other}");
                         return error_response(
                             StatusCode::BAD_REQUEST,
                             "DeviceBindingException",
-                            &format!("Device binding failed: {:?}", other),
+                            "Device binding failed",
                         );
                     }
                 },

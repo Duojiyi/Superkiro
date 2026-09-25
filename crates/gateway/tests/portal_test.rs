@@ -97,7 +97,8 @@ async fn test_portal_query_and_activation_flow() {
         .unwrap();
     let query_resp2: PortalQueryResponse = serde_json::from_slice(&bytes_q2).unwrap();
     assert_eq!(query_resp2.status, "active");
-    assert_eq!(query_resp2.bound_devices, vec!["portal-device-fp-101"]);
+    // A card code alone shows only enough of the device to recognise it.
+    assert_eq!(query_resp2.bound_devices, vec!["****fp-101"]);
 }
 
 #[tokio::test]
@@ -163,7 +164,7 @@ async fn test_portal_unbind_device_flow() {
         .unwrap();
     let unbind_resp: PortalUnbindResponse = serde_json::from_slice(&bytes).unwrap();
     assert!(unbind_resp.success);
-    assert_eq!(unbind_resp.remaining_devices, vec!["device-beta"]);
+    assert_eq!(unbind_resp.remaining_devices, vec!["****eta"]);
 
     // Attempting to unbind device-alpha again should fail
     let req_again = Request::builder()

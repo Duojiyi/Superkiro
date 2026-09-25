@@ -154,3 +154,45 @@ async fn portal_activate_cannot_replace_device_and_can_fill_explicitly_unbound_s
     assert_eq!(card.rebind_count, 1);
     assert_eq!(card.token_version, 2);
 }
+
+#[tokio::test]
+async fn the_card_code_alone_never_reveals_the_bound_device_yet_the_portal_can_unbind_it() {
+    let fingerprint = format!("dev_{}", "4f".repeat(30));
+    let billing = BillingEngine::new();
+    let mut card = Card::new("card", "group-pro-plus", 1_000_000_000);
+    card.code_hash = billing::card::hash_card_code(CARD_CODE);
+    card.max_rebinds = 2;
+    billing.upsert_card(card);
+    billing
+        .activate_card_with_device("card", gateway::now_secs(), 86400, Some(&fingerprint))
+        .unwrap();
+    let auth =
+        AuthState::with_billing("test-only-unbind-secret-at-least-32-bytes", billing.clone());
+    let mut registry = FacadeRegistry::new();
+    registry.register_portal_facades(billing.clone(), None);
+    let app = registry.into_router_with_auth(auth);
+
+    let (status, query) = post(&app, "/api/v1/portal/query", json!({"card": CARD_CODE})).await;
+    assert_eq!(status, StatusCode::OK);
+    let shown = query["boundDevices"][0].as_str().unwrap().to_string();
+    assert!(!shown.contains(&fingerprint[..20]), "{shown}");
+    assert!(shown.len() < 16, "{shown}");
+    assert!(
+        fingerprint.ends_with(&shown[4..]),
+        "the customer can still recognise it"
+    );
+
+    // The portal unbinds the device it was shown, and never learns the id afterwards either.
+    let (status, result) = unbind(&app, &shown).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["remainingDevices"], json!([]));
+    assert!(billing.get_card("card").unwrap().bound_devices.is_empty());
+}
+
+#[tokio::test]
+async fn a_masked_name_that_matches_no_bound_device_unbinds_nothing() {
+    let (billing, _, app) = setup(2);
+    let (status, _) = unbind(&app, "****zzzz").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(billing.get_card("card").unwrap().bound_devices, vec!["old"]);
+}
