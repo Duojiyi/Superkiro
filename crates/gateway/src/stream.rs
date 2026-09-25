@@ -398,11 +398,7 @@ pub fn create_stream_guard_with_send_deadline(
                         Some(Ok(ProviderStreamEvent::Usage(next))) => {
                             saw_usage_frame = true;
                             // Output-only Anthropic message_delta must not erase prompt/cache observations.
-                            // A present-but-zero cache field is not a report of input usage: the
-                            // OpenAI adapter fills it from `cached_tokens`, which is usually 0.
-                            has_input_usage |= next.prompt_tokens > 0 || next.uncached_prompt_tokens > 0
-                                || next.cache_read_input_tokens.is_some_and(|tokens| tokens > 0)
-                                || next.cache_creation_input_tokens.is_some_and(|tokens| tokens > 0);
+                            has_input_usage |= reports_input(&next);
                             usage.merge(&next);
                             let wire_usage = kiro_wire::events::TokenUsage {
                                 uncached_input_tokens: usage.uncached_prompt_tokens.min(i64::MAX as u64) as i64,
@@ -605,7 +601,20 @@ pub(crate) fn is_explicit_empty_stop(raw_reason: &str) -> bool {
     empty_turn_notice(Some(&StreamTranslationState::map_stop_reason(raw_reason))).is_some()
 }
 
-fn resolve_settlement_tokens(
+/// Whether a usage report counts the input. A present-but-zero cache field does not: the
+/// OpenAI adapter fills it from `cached_tokens`, which is usually 0.
+pub(crate) fn reports_input(usage: &crate::provider::TokenUsage) -> bool {
+    usage.prompt_tokens > 0
+        || usage.uncached_prompt_tokens > 0
+        || usage
+            .cache_read_input_tokens
+            .is_some_and(|tokens| tokens > 0)
+        || usage
+            .cache_creation_input_tokens
+            .is_some_and(|tokens| tokens > 0)
+}
+
+pub(crate) fn resolve_settlement_tokens(
     usage: &crate::provider::TokenUsage,
     has_input_usage: bool,
     output_units: u64,

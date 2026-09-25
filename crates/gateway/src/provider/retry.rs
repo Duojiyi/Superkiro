@@ -6,6 +6,18 @@ use futures_util::stream;
 tokio::task_local! {
     pub static ATTEMPTS: std::sync::Mutex<Vec<billing::observability::AttemptRecord>>;
     pub static ATTEMPT_KEY: (String, String);
+    /// The last attempt of a request that ended empty with a usage report.
+    pub static EMPTY_ATTEMPT: std::sync::Mutex<Option<EmptyAttempt>>;
+}
+
+/// An attempt that ended with an ordinary stop and nothing in it, after reporting usage.
+/// It is retried, but the upstream consumed its input: when no attempt of the request
+/// produces output, the request is billed what this one reported.
+#[derive(Debug, Clone)]
+pub struct EmptyAttempt {
+    pub provider_id: String,
+    pub target_model: String,
+    pub usage: TokenUsage,
 }
 
 pub(crate) fn stream_error(value: &serde_json::Value) -> ProviderError {
@@ -38,8 +50,9 @@ fn retryable(error: &ProviderError) -> bool {
     }
 }
 
-/// Prime the stream through its first delta. Failed-attempt usage is discarded,
-/// while the caller owns a single reservation across attempts. Dropping this
+/// Prime the stream through its first delta. Failed-attempt usage is discarded, except
+/// that of an empty attempt, kept in [`EMPTY_ATTEMPT`], while the caller owns a single
+/// reservation across attempts. Dropping this
 /// future drops the provider receiver and cancels the underlying HTTP pump.
 /// The first delta (including reasoning/tool fragments) permanently ends retries.
 pub async fn start_stream(
@@ -78,7 +91,25 @@ pub async fn start_stream(
                             prefix.push(Ok(event));
                             Ok(Box::pin(stream::iter(prefix)) as BoxStream<'static, _>)
                         }
-                        Some(_) if metered => Err(ProviderError::EmptyCompletion),
+                        Some(_) if metered => {
+                            let mut usage = TokenUsage::default();
+                            for event in &prefix {
+                                if let Ok(ProviderStreamEvent::Usage(next)) = event {
+                                    usage.merge(next);
+                                }
+                            }
+                            let provider_id = ATTEMPT_KEY
+                                .try_with(|(provider_id, _)| provider_id.clone())
+                                .unwrap_or_else(|_| provider.name().to_string());
+                            let _ = EMPTY_ATTEMPT.try_with(|slot| {
+                                *slot.lock().unwrap() = Some(EmptyAttempt {
+                                    provider_id,
+                                    target_model: config.model.clone(),
+                                    usage,
+                                })
+                            });
+                            Err(ProviderError::EmptyCompletion)
+                        }
                         _ => Err(ProviderError::StreamDisconnected),
                     };
                 }

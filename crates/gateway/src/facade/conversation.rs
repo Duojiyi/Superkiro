@@ -884,21 +884,24 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
             }
             let (upstream_stream, actual_provider_id, actual_target_model) =
                 if !candidates.is_empty() {
-                    let (route_result, attempts) = crate::provider::retry::ATTEMPTS
-                        .scope(std::sync::Mutex::new(Vec::new()), async {
-                            let result = execute_stream_with_model_fallback(
-                                &candidates,
-                                &self.client,
-                                &chat_req,
-                                Duration::from_secs(60),
-                                remaining_attempts,
-                                now_secs,
-                            )
-                            .await;
-                            let attempts = crate::provider::retry::ATTEMPTS
-                                .with(|records| records.lock().unwrap().clone());
-                            (result, attempts)
-                        })
+                    let ((route_result, attempts), empty_attempt) =
+                        with_empty_attempt(crate::provider::retry::ATTEMPTS.scope(
+                            std::sync::Mutex::new(Vec::new()),
+                            async {
+                                let result = execute_stream_with_model_fallback(
+                                    &candidates,
+                                    &self.client,
+                                    &chat_req,
+                                    Duration::from_secs(60),
+                                    remaining_attempts,
+                                    now_secs,
+                                )
+                                .await;
+                                let attempts = crate::provider::retry::ATTEMPTS
+                                    .with(|records| records.lock().unwrap().clone());
+                                (result, attempts)
+                            },
+                        ))
                         .await;
                     self.billing
                         .record_trace(billing::observability::RequestTrace {
@@ -937,6 +940,18 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                         });
                     match route_result {
                         Ok(res) => (res.stream, res.provider.id, res.target_model),
+                        // Whatever stopped the last attempt, an empty one consumed input.
+                        Err(_)
+                            if self.bill_empty_attempt(
+                                &invocation_key,
+                                requested_model,
+                                translated_input_estimate,
+                                empty_attempt,
+                            ) =>
+                        {
+                            idempotency_guard.fail();
+                            return empty_attempts_response();
+                        }
                         Err(GovernanceError::AllKeysInCooldown {
                             next_recovery_secs, ..
                         }) => {
@@ -973,16 +988,28 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                     }
                     let mut direct_config = provider_config.clone();
                     direct_config.model = target_model.clone();
-                    match crate::provider::retry::start_stream(
-                        provider.as_ref(),
-                        &self.client,
-                        &direct_config,
-                        &chat_req,
-                        3,
-                    )
-                    .await
-                    {
+                    let (started, empty_attempt) =
+                        with_empty_attempt(crate::provider::retry::start_stream(
+                            provider.as_ref(),
+                            &self.client,
+                            &direct_config,
+                            &chat_req,
+                            3,
+                        ))
+                        .await;
+                    match started {
                         Ok(s) => (s, provider.name().to_string(), target_model.clone()),
+                        Err(_)
+                            if self.bill_empty_attempt(
+                                &invocation_key,
+                                requested_model,
+                                translated_input_estimate,
+                                empty_attempt,
+                            ) =>
+                        {
+                            idempotency_guard.fail();
+                            return empty_attempts_response();
+                        }
                         Err(e) => {
                             // Upstream initiation failed; release reservation in full
                             let _ = self.billing.release(&invocation_key);
@@ -1050,6 +1077,80 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                 .into_response()
         })
     }
+}
+
+impl GenerateAssistantResponseHandler {
+    /// Bill what the last empty attempt reported, when no attempt of the request produced
+    /// anything: each consumed the input it reported, and the request pays for it once,
+    /// however many times it was retried. An attempt that answers is billed by its stream
+    /// instead, and an empty attempt before it is not billed as well. Whether it billed;
+    /// a failed save still keeps the charge for the recovery task.
+    fn bill_empty_attempt(
+        &self,
+        invocation_key: &str,
+        exposed_model: &str,
+        estimated_input: u64,
+        empty: Option<crate::provider::retry::EmptyAttempt>,
+    ) -> bool {
+        let Some(empty) = empty else {
+            return false;
+        };
+        let Some(tokens) = crate::stream::resolve_settlement_tokens(
+            &empty.usage,
+            crate::stream::reports_input(&empty.usage),
+            0,
+            false,
+            estimated_input,
+        ) else {
+            return false;
+        };
+        let settled = self.billing.settle(
+            invocation_key,
+            &tokens,
+            exposed_model,
+            &empty.provider_id,
+            &empty.target_model,
+            crate::now_secs(),
+        );
+        if let Err(error) = &settled {
+            eprintln!("[kiro-gateway] settlement failed: {error}");
+        }
+        self.billing.finish_trace(
+            invocation_key,
+            billing::observability::TraceStatus::Error,
+            Some(if settled.is_ok() {
+                "empty_completion"
+            } else {
+                "settlement_failed"
+            }),
+        );
+        true
+    }
+}
+
+/// Run `attempts` with an [`crate::provider::retry::EMPTY_ATTEMPT`] slot, and take what it
+/// holds at the end.
+async fn with_empty_attempt<T>(
+    attempts: impl std::future::Future<Output = T>,
+) -> (T, Option<crate::provider::retry::EmptyAttempt>) {
+    crate::provider::retry::EMPTY_ATTEMPT
+        .scope(std::sync::Mutex::new(None), async {
+            let result = attempts.await;
+            let empty =
+                crate::provider::retry::EMPTY_ATTEMPT.with(|slot| slot.lock().unwrap().take());
+            (result, empty)
+        })
+        .await
+}
+
+/// A request whose every attempt came back empty. It was billed the input consumed, so it
+/// is not retried under the same invocation id.
+fn empty_attempts_response() -> Response {
+    error_response(
+        StatusCode::BAD_GATEWAY,
+        "InternalServerException",
+        "The upstream model returned an empty response to every attempt; the input it read has been billed",
+    )
 }
 
 /// Returns a request's hold when the request ends before its stream's settler takes over:
