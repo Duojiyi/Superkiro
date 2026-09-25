@@ -85,10 +85,24 @@ describe('Announcements', () => {
   });
   it('persists exact content versions and detects edits with the same id', async () => {
     const first = render(<Announcements blocked={false} />); await flush();
-    expect(modal().open).toBe(true); expect(JSON.parse(localStorage.getItem(STORAGE)!)['one']).toContain('公开内容'); first.unmount();
+    expect(modal().open).toBe(true); expect(JSON.parse(localStorage.getItem(STORAGE)!)['one']).toBeTruthy();
+    // The read state holds a hash, never the announcement's text.
+    expect(localStorage.getItem(STORAGE)).not.toContain('公开内容'); first.unmount();
     const second = render(<Announcements blocked={false} />); await flush(); expect(modal().open).toBe(false); second.unmount();
     request.mockResolvedValue({ announcements: [{ ...item, content: '更新内容' }] });
     render(<Announcements blocked={false} />); await flush(); expect(modal().open).toBe(true);
+  });
+  it('forgets announcements that left the feed and honours read marks from earlier releases', async () => {
+    localStorage.setItem(STORAGE, JSON.stringify({ gone: 'x', one: JSON.stringify([item.title, item.content, item.level]) }));
+    const first = render(<Announcements blocked={false} />); await flush();
+    // Read under the old text-valued record: not shown again.
+    expect(modal().open).toBe(false); first.unmount();
+    request.mockResolvedValue({ announcements: [item, { ...item, id: 'two', content: '第二条' }] });
+    render(<Announcements blocked={false} />); await flush();
+    expect(modal().open).toBe(true);
+    const stored = JSON.parse(localStorage.getItem(STORAGE)!);
+    expect(Object.keys(stored).sort()).toEqual(['one', 'two']);
+    expect(localStorage.getItem(STORAGE)).not.toContain('第二条');
   });
   it('paginates full titles and multiple announcements and renders HTML as text', async () => {
     const title = '长标题'.repeat(70);

@@ -12,13 +12,26 @@ export interface Announcement {
 }
 const STORAGE = 'superkiro.announcements.read.v1';
 const INTERVAL = 5 * 60 * 1000;
-// Exact content signature: no hash collisions, and no timestamp-only versioning.
-const signature = (a: Announcement) => JSON.stringify([a.title, a.content, a.level]);
+// A 53-bit content hash: an edit under the same id reads as new, and the read state keeps
+// no announcement text. The versions of earlier releases were the text itself.
+function contentHash(text: string): string {
+  let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
+}
+const signature = (a: Announcement) => contentHash(JSON.stringify([a.title, a.content, a.level]));
 function loadRead(): Record<string, string> {
   try {
     const value: unknown = JSON.parse(localStorage.getItem(STORAGE) || '{}');
     return value && typeof value === 'object' && !Array.isArray(value)
-      ? Object.fromEntries(Object.entries(value).filter(([, v]) => typeof v === 'string')) : {};
+      ? Object.fromEntries(Object.entries(value).filter(([, v]) => typeof v === 'string')
+        .map(([id, v]) => [id, (v as string).startsWith('[') ? contentHash(v as string) : v as string])) : {};
   } catch { return {}; }
 }
 function parse(value: unknown): Announcement[] {
@@ -173,10 +186,14 @@ export function Announcements({ blocked }: { blocked: boolean }) {
   useEffect(() => {
     if (!open || status !== 'ready' || !current || measuredVersion !== version || !pages.length || page !== pages.length - 1
       || read[String(current.id)] === version) return;
-    const next = { ...loadRead(), ...read, [String(current.id)]: version };
+    // Only what the feed still carries: expired and withdrawn ones are forgotten, so the
+    // record stays small instead of growing until storage refuses every later write.
+    const live = new Set(items.map(a => String(a.id)));
+    const next = Object.fromEntries(Object.entries({ ...loadRead(), ...read, [String(current.id)]: version })
+      .filter(([id]) => live.has(id)));
     setRead(next);
     try { localStorage.setItem(STORAGE, JSON.stringify(next)); } catch { /* Storage may be disabled; keep session read state. */ }
-  }, [open, current, version, pages, page, read, status, measuredVersion]);
+  }, [open, current, version, pages, page, read, status, measuredVersion, items]);
 
   function dismiss() {
     items.forEach(a => attempted.current.add(JSON.stringify([a.id, signature(a)])));
