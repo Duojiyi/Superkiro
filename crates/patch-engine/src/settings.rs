@@ -168,8 +168,16 @@ impl SettingsManager {
     /// Preserves all other user settings (theme, font, other extensions).
     /// Returns `PriorSettingsState` to enable 100% reversible rollback.
     pub fn merge_byok(&self, gateway_url: &str) -> Result<PriorSettingsState, SettingsError> {
-        let region = REDIRECTED_REGION;
         let prior = self.capture_prior_state()?;
+        self.atomic_write_bytes(&self.plan_merge(gateway_url)?)?;
+        Ok(prior)
+    }
+
+    /// The file [`merge_byok`](Self::merge_byok) would write, built and read back in
+    /// memory; nothing is written. A takeover works this out before it closes Kiro or
+    /// touches the token, so a file it cannot edit is refused while nothing has changed.
+    pub fn plan_merge(&self, gateway_url: &str) -> Result<Vec<u8>, SettingsError> {
+        let region = REDIRECTED_REGION;
         let raw = self.read_raw()?;
         let text = SettingsText::parse(&raw, Reading::Kiro)?;
         let mut map = parse_settings_bytes(&raw)?;
@@ -207,8 +215,7 @@ impl SettingsManager {
             text.set(key, &value);
             map.insert(key.to_string(), value);
         }
-        self.write_text(&text, &map)?;
-        Ok(prior)
+        verified_bytes(&text, &map)
     }
 
     /// Revert BYOK settings back to original state using `PriorSettingsState`.
@@ -442,15 +449,6 @@ impl SettingsManager {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(error) => Err(error.into()),
         }
-    }
-
-    /// Write an edited file, but only if it reads back as exactly `expected`.
-    fn write_text(
-        &self,
-        text: &SettingsText,
-        expected: &Map<String, Value>,
-    ) -> Result<(), SettingsError> {
-        self.atomic_write_bytes(&verified_bytes(text, expected)?)
     }
 
     fn atomic_write_bytes(&self, bytes: &[u8]) -> Result<(), SettingsError> {

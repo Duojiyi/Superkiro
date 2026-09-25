@@ -165,6 +165,14 @@ pub enum PatchOwnership {
     Theirs,
 }
 
+/// A patch rendered and checked by [`ExtensionPatcher::prepare`]: the bundle it was made
+/// from, and the patched bytes that passed, by hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedPatch {
+    source: String,
+    patched: String,
+}
+
 /// Helper for inspecting and modifying `extension.js`.
 #[derive(Debug, Clone)]
 pub struct ExtensionPatcher {
@@ -312,9 +320,57 @@ impl ExtensionPatcher {
         Ok(true)
     }
 
+    /// Render the patch for `gateway_url` and have Kiro's own runtime check it, writing
+    /// nothing. The result names the bundle read and the patched bytes that passed, so
+    /// the takeover, once Kiro has been closed, can write exactly those without running
+    /// Kiro again.
+    pub fn prepare(&self, gateway_url: &str) -> Result<PreparedPatch, PatchError> {
+        if !self.extension_path.exists() {
+            return Err(PatchError::FileNotFound(self.extension_path.clone()));
+        }
+        let content = fs::read_to_string(&self.extension_path)
+            .map_err(|e| PatchError::Io(self.extension_path.clone(), e.to_string()))?;
+        let patched = if content.starts_with(PATCH_MARKER_PREFIX) {
+            self.verify_patched_content()?;
+            let repaired = repair_credit_display(&repair_proxy_tls(&content));
+            if repaired != content {
+                validate_javascript(&self.extension_path, &repaired)?;
+            }
+            repaired
+        } else {
+            if self.backup_path().exists() {
+                return Err(PatchError::ExtensionChanged);
+            }
+            let rendered = render_patch(&content, gateway_url, &PatchRecipe::default())?;
+            validate_javascript(&self.extension_path, &rendered)?;
+            rendered
+        };
+        Ok(PreparedPatch {
+            source: content_hash(content.as_bytes()),
+            patched: content_hash(patched.as_bytes()),
+        })
+    }
+
+    /// Whether extension.js is still the bundle `prepared` was made from.
+    pub fn is_as_prepared(&self, prepared: &PreparedPatch) -> Result<bool, PatchError> {
+        let content = fs::read(&self.extension_path)
+            .map_err(|e| PatchError::Io(self.extension_path.clone(), e.to_string()))?;
+        Ok(content_hash(&content) == prepared.source)
+    }
+
     /// Apply the BYOK patch to `extension.js` using default recipe.
     pub fn apply(&self, gateway_url: &str) -> Result<(), PatchError> {
-        self.apply_with_recipe(gateway_url, &PatchRecipe::default())
+        self.apply_checked(gateway_url, &PatchRecipe::default(), None)
+    }
+
+    /// [`apply`](Self::apply), taking the check `prepared` records as done for exactly
+    /// the bytes it names; anything else is checked again.
+    pub fn apply_prepared(
+        &self,
+        gateway_url: &str,
+        prepared: &PreparedPatch,
+    ) -> Result<(), PatchError> {
+        self.apply_checked(gateway_url, &PatchRecipe::default(), Some(prepared))
     }
 
     /// Apply the BYOK patch to `extension.js` using a server-distributed recipe.
@@ -325,6 +381,15 @@ impl ExtensionPatcher {
         &self,
         gateway_url: &str,
         recipe: &PatchRecipe,
+    ) -> Result<(), PatchError> {
+        self.apply_checked(gateway_url, recipe, None)
+    }
+
+    fn apply_checked(
+        &self,
+        gateway_url: &str,
+        recipe: &PatchRecipe,
+        prepared: Option<&PreparedPatch>,
     ) -> Result<(), PatchError> {
         match crate::runtime::detect_kiro_process_state() {
             crate::runtime::ProcessState::Running => return Err(PatchError::KiroRunning),
@@ -342,12 +407,25 @@ impl ExtensionPatcher {
 
         let content = fs::read_to_string(&self.extension_path)
             .map_err(|e| PatchError::Io(self.extension_path.clone(), e.to_string()))?;
+        // Kiro's runtime has already passed exactly these bytes, made from exactly this
+        // bundle, when `prepared` says so.
+        let check = |patched: &str| {
+            let passed = prepared.is_some_and(|prepared| {
+                prepared.source == content_hash(content.as_bytes())
+                    && prepared.patched == content_hash(patched.as_bytes())
+            });
+            if passed {
+                Ok(())
+            } else {
+                validate_javascript(&self.extension_path, patched)
+            }
+        };
 
         if self.status() == PatchStatus::Patched {
             self.verify_patched_content()?;
             let repaired = repair_credit_display(&repair_proxy_tls(&content));
             if repaired != content {
-                validate_javascript(&self.extension_path, &repaired)?;
+                check(&repaired)?;
                 let mut state = self.read_state()?;
                 state.previous_patched_hash = Some(content_hash(content.as_bytes()));
                 state.patched_hash = content_hash(repaired.as_bytes());
@@ -360,7 +438,7 @@ impl ExtensionPatcher {
             return Err(PatchError::ExtensionChanged);
         }
         let full_patched = render_patch(&content, gateway_url, recipe)?;
-        validate_javascript(&self.extension_path, &full_patched)?;
+        check(&full_patched)?;
 
         // No backup or live mutation until both the URL and complete JS parse pass.
         // Persist original identity before the first backup write. A failed/partial
@@ -725,7 +803,15 @@ fn verify_run_as_node(executable: &Path) -> Result<(), PatchError> {
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many bundles this thread has had Kiro's runtime check.
+    pub(crate) static JAVASCRIPT_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn validate_javascript(extension_path: &Path, content: &str) -> Result<(), PatchError> {
+    #[cfg(test)]
+    JAVASCRIPT_CHECKS.with(|checks| checks.set(checks.get() + 1));
     check_javascript(javascript_command(extension_path)?, content)
 }
 

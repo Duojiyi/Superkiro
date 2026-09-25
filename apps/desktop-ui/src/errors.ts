@@ -20,6 +20,7 @@ export const errorMessages: Record<string, string> = {
   'SK-CONNECT-005': 'Kiro 仍未关闭，可能正在询问是否保存更改。请回到 Kiro 处理提示；也可以在 Kiro 中选择「文件 > 退出」，Kiro 默认会保留未保存的内容并在下次打开时恢复。然后重试。',
   'SK-CONNECT-006': 'Kiro 在你的另一个 Windows 会话中仍在运行，这里无法关闭它。请到那个会话中关闭 Kiro 后重试。',
   'SK-CONNECT-007': 'Kiro 中有窗口在使用 Default 以外的配置文件（Profile）。接入只配置 Default 配置文件，请先在 Kiro 中把这些窗口切换到 Default 配置文件，然后重试。',
+  'SK-CONNECT-008': 'Kiro 正在更新或刚完成更新，本次未修改任何配置。请打开 Kiro 一次，等更新完成后再重试。',
   'SK-RESTORE-001': '本地配置还原未完成，请保留备份并重试还原。',
   'SK-RESTORE-002': 'Kiro 的扩展文件仍是修改后的版本，且用于还原它的备份已丢失，重试无法还原。请从官网重新安装 Kiro（会替换该文件），再重新还原。',
   'SK-RESTORE-003': 'Kiro 的 settings.json 有语法错误，无法安全修改，本次未改动任何文件。请在 Kiro 中运行「Preferences: Open User Settings (JSON)」（或用记事本打开该文件），修正出错的那一行并保存，然后重试。',

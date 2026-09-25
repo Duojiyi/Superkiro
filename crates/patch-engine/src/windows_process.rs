@@ -42,6 +42,25 @@ extern "system" {
 extern "system" {
     fn GetProcessMemoryInfo(handle: *mut c_void, counters: *mut MemoryCounters, size: u32) -> i32;
 }
+#[link(name = "kernel32")]
+extern "system" {
+    fn OpenMutexW(access: u32, inherit: i32, name: *const u16) -> *mut c_void;
+}
+
+/// Whether a process in this session holds a mutex named `name`. A named mutex lives only
+/// as long as a handle to it does, so this never reports a leftover. One this user may
+/// not open (an elevated installer's) exists all the same.
+pub(crate) fn mutex_exists(name: &str) -> bool {
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
+    let raw = unsafe { OpenMutexW(SYNCHRONIZE, 0, wide.as_ptr()) };
+    if raw.is_null() {
+        return io::Error::last_os_error().raw_os_error() == Some(ERROR_ACCESS_DENIED);
+    }
+    drop(Handle(raw));
+    true
+}
 
 struct Handle(*mut c_void);
 impl Drop for Handle {

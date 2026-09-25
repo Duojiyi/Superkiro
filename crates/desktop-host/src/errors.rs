@@ -35,6 +35,7 @@ const CODES: &[&str] = &[
     "SK-CONNECT-005",
     "SK-CONNECT-006",
     "SK-CONNECT-007",
+    "SK-CONNECT-008",
     "SK-RESTORE-001",
     "SK-RESTORE-002",
     "SK-RESTORE-003",
@@ -125,6 +126,13 @@ pub fn classify(raw: &str, path: &str, method: &str) -> Value {
         } else if lower.contains("profile other than default") {
             // Only the Default profile is configured; the user must switch windows to it.
             "SK-CONNECT-007"
+        } else if (lower.contains("kiro update is waiting to install")
+            || lower.contains("installation changed after it was checked"))
+            && !lower.contains("recovery record retained")
+        {
+            // Kiro is updating itself, or just did, under the takeover. Nothing was left
+            // changed; letting the update finish and trying again is all it takes.
+            "SK-CONNECT-008"
         } else if lower.contains("another windows session") {
             // The same user's Kiro in another session: this client can neither ask it to
             // close nor end it, so neither saving here nor forcing helps.
@@ -281,6 +289,10 @@ mod tests {
             ("Cannot stop Kiro for restore: Kiro is open in another Windows session of this user; close it there and retry", "SK-CONNECT-006"),
             ("[connection:close] Kiro is open in another Windows session of this user; close it there and retry", "SK-CONNECT-006"),
             ("[connection:preflight] Kiro has windows on a profile other than Default; takeover configures only the Default profile", "SK-CONNECT-007"),
+            ("[connection:preflight] A Kiro update is waiting to install; nothing was changed. Open Kiro once so it can finish, then try again", "SK-CONNECT-008"),
+            ("[connection:apply] Login succeeded but takeover failed: Kiro's installation changed after it was checked, likely an update installed as Kiro closed; nothing was changed. Open Kiro once, then try again; your own Kiro sign-in was put back", "SK-CONNECT-008"),
+            // Something is left for a restore, so this is not the case where nothing changed.
+            ("[connection:apply] Login succeeded but takeover failed: Kiro's installation changed after it was checked; putting your own Kiro sign-in back failed (denied); recovery record retained", "SK-CONNECT-003"),
             ("Cannot stop Kiro for restore: Kiro is running as administrator and cannot be closed from here; close it yourself and retry", "SK-CONNECT-002"),
             ("timed out", "SK-NET-001"),
             ("network", "SK-NET-002"),

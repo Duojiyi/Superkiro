@@ -1,6 +1,7 @@
 //! Desktop operations share one authenticated gateway and preserve official credentials.
 use crate::{
-    AuthClient, ExtensionPatcher, KiroAuthToken, SettingsManager, SnapshotManager, TokenStorage,
+    AuthClient, ExtensionPatcher, KiroAuthToken, SettingsManager, SnapshotError, SnapshotManager,
+    TakeoverPlan, TokenStorage,
 };
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf, time::Duration};
@@ -10,6 +11,7 @@ use std::{fs, path::PathBuf, time::Duration};
 const SESSION_LOCK_WAIT: Duration = Duration::from_secs(45);
 const SESSION_BUSY: &str =
     "Another desktop operation holds the session lock; wait for completion before retrying";
+const UPDATE_WAITING: &str = "[connection:preflight] A Kiro update is waiting to install; nothing was changed. Open Kiro once so it can finish, then try again";
 
 #[derive(Serialize, Deserialize)]
 struct Session {
@@ -149,9 +151,15 @@ impl DesktopSession {
         card: &str,
     ) -> Result<(), String> {
         let _lock = self.lock()?;
-        self.activate_locked(snapshots, settings, patcher, gateway, card, None)
+        let plan = snapshots
+            .plan_takeover(settings, Some(patcher), gateway)
+            .map_err(|e| e.to_string())?;
+        self.activate_locked(snapshots, settings, patcher, gateway, card, None, &plan)
             .await
     }
+    /// `plan` is what the takeover will write, checked before Kiro was closed; it must
+    /// still hold before the token changes.
+    #[allow(clippy::too_many_arguments)]
     async fn activate_locked(
         &self,
         snapshots: &SnapshotManager,
@@ -160,11 +168,12 @@ impl DesktopSession {
         gateway: &str,
         card: &str,
         prepared_token: Option<KiroAuthToken>,
+        plan: &TakeoverPlan,
     ) -> Result<(), String> {
         crate::ensure_kiro_stopped()?;
         let gateway = crate::patch::validate_gateway_url(gateway).map_err(|e| e.to_string())?;
         snapshots
-            .validate_takeover(settings, Some(patcher), &gateway)
+            .confirm_plan(settings, Some(patcher), &gateway, plan)
             .map_err(|e| e.to_string())?;
         let mut session = if self.path.exists() {
             let existing = self.load()?;
@@ -198,12 +207,30 @@ impl DesktopSession {
         } else {
             self.login_card(&mut session, card).await?;
         }
-        snapshots
-            .takeover(settings, Some(patcher), &gateway)
-            .map_err(|e| {
-                format!("Login succeeded but takeover failed: {e}; recovery record retained")
-            })?;
-        Ok(())
+        match snapshots.takeover_planned(settings, Some(patcher), &gateway, plan) {
+            Ok(_) => Ok(()),
+            Err(error) => Err(self.after_failed_takeover(snapshots, &error)),
+        }
+    }
+
+    /// What is left of a takeover that failed once the gateway's token was written. With
+    /// nothing else of it on the machine, the customer's own token goes back at once:
+    /// reopened, Kiro would otherwise hold one that is not theirs until they found and ran
+    /// a restore. Anything it did leave is for a restore, which puts the token back too.
+    fn after_failed_takeover(&self, snapshots: &SnapshotManager, error: &SnapshotError) -> String {
+        if snapshots.has_active_snapshot() {
+            return format!(
+                "Login succeeded but takeover failed: {error}; recovery record retained"
+            );
+        }
+        match self.restore_token() {
+            Ok(()) => format!(
+                "Login succeeded but takeover failed: {error}; your own Kiro sign-in was put back"
+            ),
+            Err(restore) => format!(
+                "Login succeeded but takeover failed: {error}; putting your own Kiro sign-in back failed ({restore}); recovery record retained"
+            ),
+        }
     }
     async fn login_card(&self, session: &mut Session, card: &str) -> Result<(), String> {
         // Always authenticate the supplied card; never silently refresh a previous card.
@@ -234,11 +261,18 @@ impl DesktopSession {
         let patcher = ExtensionPatcher::new(extension.join("dist").join("extension.js"));
         let snapshots = SnapshotManager::default();
         let settings = SettingsManager::default();
-        snapshots
-            .validate_takeover(&settings, Some(&patcher), gateway)
+        // Everything the takeover will write, checked while Kiro is still open and the
+        // customer's own token untouched.
+        let plan = snapshots
+            .plan_takeover(&settings, Some(&patcher), gateway)
             .map_err(|e| format!("[connection:preflight] {e}"))?;
         if !settings.profiles_in_use().is_empty() {
             return Err("[connection:preflight] Kiro has windows on a profile other than Default; takeover configures only the Default profile".into());
+        }
+        // Closing Kiro would let a waiting update install itself over the files the
+        // takeover is about to change.
+        if installation.update_waiting() {
+            return Err(UPDATE_WAITING.into());
         }
         let mut launch = crate::process::prepare_kiro_launch(installation, gateway, &[])
             .map_err(|e| format!("[connection:launch-prepare] {e}"))?;
@@ -265,9 +299,28 @@ impl DesktopSession {
         } else {
             crate::ensure_kiro_stopped().map_err(|e| format!("[connection:close] {e}"))?;
         }
-        self.activate_locked(&snapshots, &settings, &patcher, gateway, card, Some(token))
-            .await
-            .map_err(|e| format!("[connection:apply] {e}"))?;
+        // Closing Kiro is when a waiting update installs itself. Kiro must still be the
+        // installation checked above, or nothing is written.
+        if installation.update_waiting() {
+            return Err(UPDATE_WAITING.into());
+        }
+        if !installation.unchanged() {
+            return Err(format!(
+                "[connection:apply] {}",
+                SnapshotError::InstallationChanged
+            ));
+        }
+        self.activate_locked(
+            &snapshots,
+            &settings,
+            &patcher,
+            gateway,
+            card,
+            Some(token),
+            &plan,
+        )
+        .await
+        .map_err(|e| format!("[connection:apply] {e}"))?;
         crate::process::spawn_and_confirm(&mut launch).map_err(|e| format!("[connection:launch] Takeover completed, but Kiro launch failed: {e}. Recovery backup retained; do not assume IDE is ready."))?;
         Ok(())
     }
@@ -289,8 +342,8 @@ impl DesktopSession {
         if !snapshots.has_active_snapshot() {
             return Err("No active takeover; activate again".into());
         }
-        snapshots
-            .validate_takeover(
+        let plan = snapshots
+            .plan_takeover(
                 &SettingsManager::default(),
                 Some(&patcher),
                 &session.gateway,
@@ -304,10 +357,11 @@ impl DesktopSession {
             launch.env("NODE_EXTRA_CA_CERTS", ca);
         }
         snapshots
-            .takeover(
+            .takeover_planned(
                 &SettingsManager::default(),
                 Some(&patcher),
                 &session.gateway,
+                &plan,
             )
             .map_err(|e| e.to_string())?;
         crate::process::spawn_and_confirm(&mut launch).map_err(|e| e.to_string())?;
@@ -589,6 +643,123 @@ mod tests {
         assert_eq!(storage.load().unwrap(), legacy);
         fs::remove_file(storage.path()).unwrap();
         fs::remove_dir(root).unwrap();
+    }
+
+    /// A machine ready to be taken over: settings, an official synthetic bundle and the
+    /// customer's own token, plus a gateway whose login runs `on_login` first.
+    async fn activation_fixture(
+        name: &str,
+        settings: &str,
+        on_login: impl Fn() + Clone + Send + Sync + 'static,
+    ) -> (
+        PathBuf,
+        DesktopSession,
+        SnapshotManager,
+        SettingsManager,
+        ExtensionPatcher,
+        String,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let root = std::env::temp_dir().join(format!("activation-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let settings_mgr = SettingsManager::at(root.join("settings.json"));
+        fs::write(settings_mgr.path(), settings).unwrap();
+        let extension = root.join("extension.js");
+        fs::write(
+            &extension,
+            format!(
+                "const endpoint = \"{}\";",
+                crate::patch::RUNTIME_ENDPOINT_NEEDLE
+            ),
+        )
+        .unwrap();
+        let storage = TokenStorage::at(root.join("kiro-auth-token.json"));
+        fs::write(storage.path(), b"official-token").unwrap();
+        let app = Router::new().route(
+            "/oauth/token",
+            post(move || {
+                let on_login = on_login.clone();
+                async move {
+                    on_login();
+                    Json(json!({
+                        "accessToken":"gateway-access", "refreshToken":"gateway-refresh",
+                        "profileArn":"arn:aws:codewhisperer:us-east-1:123456789012:profile/test",
+                        "expiresAt":"2099-01-01T00:00:00Z"
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (
+            root.clone(),
+            DesktopSession::new(storage, root.join("session.json")),
+            SnapshotManager::at(root.join("snapshot.json")),
+            settings_mgr,
+            ExtensionPatcher::new(extension),
+            gateway,
+            server,
+        )
+    }
+
+    /// A settings.json the takeover cannot edit (an `http.noProxy` that is not a list,
+    /// which Kiro itself ignores) is refused before the card is used or anything is
+    /// written. Found only after login, it left the gateway's token in place of the
+    /// customer's own and a record only a restore would clear.
+    #[tokio::test]
+    async fn a_settings_file_the_takeover_cannot_edit_is_refused_before_login() {
+        let logins = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = logins.clone();
+        let original = r#"{"http.noProxy": "corp.example"}"#;
+        let (root, desktop, snapshots, settings, patcher, gateway, server) =
+            activation_fixture("preflight", original, move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+            .await;
+
+        let error = desktop
+            .activate(&snapshots, &settings, &patcher, &gateway, "card")
+            .await
+            .unwrap_err();
+        server.abort();
+        assert!(error.contains("http.noProxy"), "{error}");
+        assert_eq!(logins.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(fs::read(desktop.storage.path()).unwrap(), b"official-token");
+        assert!(!desktop.recovery_pending() && !snapshots.has_active_snapshot());
+        assert_eq!(fs::read_to_string(settings.path()).unwrap(), original);
+        assert_eq!(patcher.status(), crate::PatchStatus::Official);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A takeover that fails once the gateway's token is written, leaving nothing else
+    /// behind, puts the customer's own token back at once and says so. Here the bundle
+    /// changes during login, as when an update lands.
+    #[tokio::test]
+    async fn a_takeover_that_fails_after_login_puts_the_customers_token_back() {
+        let original = "{\n  \"editor.fontSize\": 14\n}\n";
+        let root = std::env::temp_dir().join(format!("activation-rollback-{}", std::process::id()));
+        let extension = root.join("extension.js");
+        let (root, desktop, snapshots, settings, patcher, gateway, server) =
+            activation_fixture("rollback", original, move || {
+                fs::write(&extension, "// a bundle this takeover never checked").unwrap();
+            })
+            .await;
+
+        let error = desktop
+            .activate(&snapshots, &settings, &patcher, &gateway, "card")
+            .await
+            .unwrap_err();
+        server.abort();
+        assert!(error.contains("put back"), "{error}");
+        assert_eq!(fs::read(desktop.storage.path()).unwrap(), b"official-token");
+        assert!(!desktop.recovery_pending() && !snapshots.has_active_snapshot());
+        assert_eq!(fs::read_to_string(settings.path()).unwrap(), original);
+        assert!(!patcher.backup_path().exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     /// A patched bundle whose backup is gone leaves the whole takeover in place: rolling
