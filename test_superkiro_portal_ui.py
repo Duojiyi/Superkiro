@@ -23,7 +23,9 @@ class StaticHandler(BaseHTTPRequestHandler):
             data = (UI / 'index.html').read_bytes()
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
-            policy = re.findall(r'Content-Security-Policy "([^"]+)"', (ROOT / 'deploy/Caddyfile.ip').read_text())[0]
+            # The policy production serves outside /admin, which this page runs under.
+            policy = re.findall(r'header @not_admin_console Content-Security-Policy "([^"]+)"',
+                                (ROOT / 'deploy/Caddyfile.ip').read_text())[0]
             self.send_header('Content-Security-Policy', policy)
             self.end_headers()
             self.wfile.write(data)
