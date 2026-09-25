@@ -288,6 +288,20 @@ class ConfigurationFromRepository(unittest.TestCase):
         self.assertEqual(rc.accept_configuration(drift, RELEASE, {'accept_configuration': digest}, root=self.root),
                          digest)
 
+    def test_the_accepted_digest_does_not_depend_on_the_release_name(self):
+        # The image line names each attempt's release; a change near it must still read the
+        # same from one attempt to the next, or no reviewed digest could ever be accepted.
+        def drift_for(image):
+            live = {'docker-compose.ip.yml': f'services:\n  gateway:\n    image: {image}\n    restart: always\n'.encode(),
+                    'Caddyfile.ip': b'kiro.rent {\n    respond ok\n}\n'}
+            repository = {'docker-compose.ip.yml': f'services:\n  gateway:\n    image: {image}\n    restart: always\n    stop_grace_period: 90s\n'.encode(),
+                          'Caddyfile.ip': b'kiro.rent {\n    respond ok\n}\n'}
+            return rc.configuration_drift(live, repository)
+        first, second = drift_for('kiro-byok:20260101T000000Z'), drift_for('kiro-byok:20260101T000512Z')
+        self.assertIn('+    stop_grace_period: 90s', first)
+        self.assertEqual(first, second)
+        self.assertNotIn('20260101T', first)
+
     def test_a_caddyfile_that_does_not_load_stops_the_release_before_promotion(self):
         compose = b'  caddy:\n    image: caddy:2-alpine@sha256:' + b'c' * 64 + b'\n'
         with patch.object(rc, 'run', side_effect=RuntimeError('Remote operation failed (exit 1)')) as run:

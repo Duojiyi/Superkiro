@@ -244,10 +244,16 @@ def repository_configuration(image, root=ROOT):
 
 
 def configuration_drift(live, repository):
-    """What deploying the repository configuration changes on the server, as a unified diff."""
+    """What deploying the repository configuration changes on the server, as a unified diff.
+
+    Both sides name this attempt's gateway image, which differs from one attempt to the
+    next; it is written as a placeholder, so a change near it keeps the digest an operator
+    reviewed and accepted instead of changing it every run."""
+    def text(files, name):
+        return GATEWAY_IMAGE_LINE.sub('    image: kiro-byok:<release>', files[name].decode('utf-8'))
     return ''.join(line for name in CONFIG_FILES for line in difflib.unified_diff(
-        live[name].decode('utf-8').splitlines(keepends=True),
-        repository[name].decode('utf-8').splitlines(keepends=True),
+        text(live, name).splitlines(keepends=True),
+        text(repository, name).splitlines(keepends=True),
         f'live/{name}', f'repository/{name}'))
 
 
