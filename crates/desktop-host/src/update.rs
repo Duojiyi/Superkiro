@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -57,7 +57,7 @@ const HANDOFF_MARKER: &str = "SUPERKIRO_UPDATE_MARKER";
 /// the trial's process id, to wait for before taking the single instance.
 const FALLBACK_PID: &str = "SUPERKIRO_UPDATE_FALLBACK";
 /// How long the replaced process waits for the new one to show it started.
-const START_LIMIT: Duration = Duration::from_secs(30);
+const START_LIMIT: Duration = Duration::from_secs(120);
 /// How long a new process waits for the one before it to exit.
 const PREDECESSOR_LIMIT: Duration = Duration::from_secs(60);
 /// How long a trial may take to bring its window up before it steps aside.
@@ -70,20 +70,69 @@ const DOWNLOAD_LIMIT: Duration = Duration::from_secs(30 * 60);
 const FAILURES_BEFORE_REJECT: u64 = 2;
 /// How many refused hashes are remembered; enough to outlast a few bad releases.
 const REJECTED_LIMIT: usize = 24;
+/// How long a refused release stays refused. Failures that came from the machine (a folder
+/// a sync client held, an antivirus scan) should not block a release for good.
+const REJECTION_LIFETIME: u64 = 7 * 24 * 3600;
 /// A partial download older than this belongs to a release long superseded.
 const PART_LIFETIME: Duration = Duration::from_secs(3 * 24 * 3600);
 
 /// This process is a trial of a newly installed version, not yet confirmed.
 struct Trial {
     pending: Pending,
-    /// Held until confirmation: while it is held, no other process judges this trial.
-    lock: Mutex<Option<fs::File>>,
+    /// Held until confirmation: while they are held, no other process judges this trial.
+    locks: Mutex<Vec<fs::File>>,
 }
 
 static TRIAL: OnceLock<Trial> = OnceLock::new();
 /// Where the customer's client is, once a confirmed trial has moved itself there.
 static CANONICAL: OnceLock<PathBuf> = OnceLock::new();
-static CONFIRMED: AtomicBool = AtomicBool::new(false);
+static PHASE: TrialPhase = TrialPhase::new();
+
+/// Where a trial stands. It is watched until its window sends anything; from then on it only
+/// waits for its confirmation, and never steps aside - whatever it is doing, the customer is
+/// using it. Stepping aside and confirming exclude each other.
+struct TrialPhase(AtomicU8);
+
+impl TrialPhase {
+    const WATCHING: u8 = 0;
+    const WINDOW_UP: u8 = 1;
+    const STEPPING_ASIDE: u8 = 2;
+    const CONFIRMED: u8 = 3;
+
+    const fn new() -> Self {
+        Self(AtomicU8::new(Self::WATCHING))
+    }
+
+    fn is(&self, phase: u8) -> bool {
+        self.0.load(Ordering::SeqCst) == phase
+    }
+
+    fn step(&self, from: u8, to: u8) -> bool {
+        self.0
+            .compare_exchange(from, to, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    fn window_up(&self) {
+        self.step(Self::WATCHING, Self::WINDOW_UP);
+    }
+
+    /// Whether to step aside now; from then on it cannot confirm.
+    fn step_aside(&self) -> bool {
+        self.step(Self::WATCHING, Self::STEPPING_ASIDE)
+    }
+
+    /// Stepping aside failed: it stays, able to confirm.
+    fn stay(&self) {
+        self.step(Self::STEPPING_ASIDE, Self::WINDOW_UP);
+    }
+
+    /// Whether to confirm now; only once, and never while stepping aside.
+    fn confirm(&self) -> bool {
+        self.window_up();
+        self.step(Self::WINDOW_UP, Self::CONFIRMED)
+    }
+}
 /// The installer's lock, held until this process exits once a trial has been started.
 static INSTALLER_LOCK: Mutex<Option<fs::File>> = Mutex::new(None);
 static INSTALLING: AtomicBool = AtomicBool::new(false);
@@ -299,7 +348,11 @@ pub async fn available(
         target,
         &trusted_keys(),
     )?;
-    let rejected = rejected_hashes(&read_state(state));
+    // Unreadable for now: nothing is offered that may have been refused.
+    let Some(value) = read_state(state) else {
+        return Ok(None);
+    };
+    let rejected = rejected_hashes(&value, now_secs());
     Ok(release.filter(|release| !rejected.contains(&hex(&release.sha256))))
 }
 
@@ -335,12 +388,31 @@ pub fn state_path() -> Option<PathBuf> {
     )
 }
 
-fn read_state(state: &Path) -> Value {
-    fs::read(state)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .filter(Value::is_object)
-        .unwrap_or_else(|| json!({}))
+/// The update state; None while it exists but cannot be read (a scanner holding it), so that
+/// nothing is decided on, or written over, what could not be seen. Missing, or not state at
+/// all, it reads as empty.
+fn read_state(state: &Path) -> Option<Value> {
+    match fs::read(state) {
+        Ok(bytes) => Some(
+            serde_json::from_slice::<Value>(&bytes)
+                .ok()
+                .filter(Value::is_object)
+                .unwrap_or_else(|| json!({})),
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(json!({})),
+        Err(_) => None,
+    }
+}
+
+/// The state, read again for a moment while it is briefly held.
+fn read_state_patiently(state: &Path) -> Option<Value> {
+    for _ in 0..20 {
+        if let Some(value) = read_state(state) {
+            return Some(value);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    None
 }
 
 fn write_state(state: &Path, value: &Value) -> Result<(), String> {
@@ -352,27 +424,58 @@ fn write_state(state: &Path, value: &Value) -> Result<(), String> {
     fs::rename(&temp, state).map_err(|_| "Cannot write update state".into())
 }
 
-fn rejected_hashes(state: &Value) -> Vec<String> {
-    state["rejected"]
-        .as_array()
-        .map(|list| {
-            list.iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default()
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
 }
 
-fn reject_hash(state: &mut Value, sha256: &str) {
-    let mut rejected = rejected_hashes(state);
-    rejected.retain(|hash| hash != sha256);
-    rejected.push(sha256.to_string());
-    let start = rejected.len().saturating_sub(REJECTED_LIMIT);
-    state["rejected"] = json!(rejected[start..]);
+/// Refusals still in force at `now`, oldest first, kept as hash -> when refused. A clock that
+/// ran ahead must not make one last: stamped more than its lifetime ahead it is no refusal at
+/// all, and one stamped a little ahead lasts at most a lifetime more (and is rewritten as now
+/// with the next refusal).
+fn live_rejections(state: &Value, now: u64) -> Vec<(u64, String)> {
+    let mut live: Vec<(u64, String)> = state
+        .get("rejected")
+        .and_then(Value::as_object)
+        .map(|rejected| {
+            rejected
+                .iter()
+                .filter_map(|(hash, at)| Some((at.as_u64()?, hash.clone())))
+                .filter(|(at, _)| {
+                    *at <= now.saturating_add(REJECTION_LIFETIME)
+                        && now < at.saturating_add(REJECTION_LIFETIME)
+                })
+                .map(|(at, hash)| (at.min(now), hash))
+                .collect()
+        })
+        .unwrap_or_default();
+    live.sort();
+    live
+}
+
+fn rejected_hashes(state: &Value, now: u64) -> Vec<String> {
+    live_rejections(state, now)
+        .into_iter()
+        .map(|(_, hash)| hash)
+        .collect()
+}
+
+fn reject_hash(state: &mut Value, sha256: &str, now: u64) {
+    let mut kept = live_rejections(state, now);
+    kept.retain(|(_, hash)| hash != sha256);
+    let start = kept.len().saturating_sub(REJECTED_LIMIT - 1);
+    let mut rejected = serde_json::Map::new();
+    for (at, hash) in &kept[start..] {
+        rejected.insert(hash.clone(), json!(at));
+    }
+    rejected.insert(sha256.to_string(), json!(now));
+    state["rejected"] = Value::Object(rejected);
 }
 
 /// Counts a trial of `sha256` that ended without confirming; refuses the hash at the limit.
-fn record_failure(state: &mut Value, sha256: &str) {
+fn record_failure(state: &mut Value, sha256: &str, now: u64) {
     if !state["failures"].is_object() {
         state["failures"] = json!({});
     }
@@ -381,7 +484,7 @@ fn record_failure(state: &mut Value, sha256: &str) {
         if let Some(failures) = state["failures"].as_object_mut() {
             failures.remove(sha256);
         }
-        reject_hash(state, sha256);
+        reject_hash(state, sha256, now);
     } else {
         state["failures"][sha256] = json!(count);
     }
@@ -710,7 +813,7 @@ fn stage(
             .stderr(Stdio::null())
             .status()
             .is_ok_and(|status| status.success());
-        let _ = fs::remove_file(verified);
+        // The archive stays until the trial has started, for another attempt to use.
         let bundle = work.join("Superkiro.app");
         let executable = bundle.join("Contents/MacOS/Superkiro");
         if !unpacked || !executable.is_file() {
@@ -729,48 +832,79 @@ fn stage(
     })
 }
 
-/// What removing a staged version removes: the file, or on macOS the folder it came in.
-fn staged_root(pending: &Pending) -> PathBuf {
-    pending
-        .staged
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| pending.staged.clone())
+/// The hidden folder a staged version came in, only when it is exactly one this client
+/// makes: beside the customer's client and named after it. A record in any other shape
+/// (from an earlier layout, or edited) must never lead to deleting the customer's own folder.
+fn staged_root(pending: &Pending) -> Option<PathBuf> {
+    let folder = pending.staged.parent()?;
+    let name = folder.file_name()?.to_str()?;
+    let client = pending.current.file_name()?.to_str()?;
+    let version = name
+        .strip_prefix(&format!(".{client}."))?
+        .strip_suffix(".new")?;
+    (folder.parent() == pending.current.parent()
+        && !version.is_empty()
+        && version.bytes().all(|b| b.is_ascii_digit() || b == b'.'))
+    .then(|| folder.to_path_buf())
 }
 
-/// Starts a trial of the staged version and waits until it signals it is up.
-fn start_trial(pending: &Pending, marker: &Path) -> Result<(), String> {
+fn remove_staged(pending: &Pending) {
+    if let Some(folder) = staged_root(pending) {
+        let _ = fs::remove_dir_all(folder);
+    }
+}
+
+/// Undoes staging and keeps the verified download where it was, so an attempt put off or held
+/// up downloads nothing again: on Windows the staged file is that download, moved.
+fn unstage(pending: &Pending, verified: &Path) {
+    #[cfg(not(target_os = "macos"))]
+    let _ = retry(|| fs::rename(&pending.staged, verified));
+    #[cfg(target_os = "macos")]
+    let _ = verified;
+    remove_staged(pending);
+}
+
+#[derive(Debug, PartialEq)]
+enum TrialStart {
+    Started,
+    /// It could not be run, or it ended before saying it was up: these bytes are at fault.
+    Ended,
+    /// Still starting when the limit passed: the machine held it up (a security prompt, a
+    /// scan of the new file), which says nothing about the release.
+    HeldUp,
+}
+
+/// Starts a trial of the staged version and waits until it signals it is up. The signal is
+/// the first thing a trial does, so only the machine can keep it waiting.
+fn start_trial(pending: &Pending, marker: &Path) -> TrialStart {
     let _ = fs::remove_file(marker);
-    let spawned = Command::new(&pending.executable)
+    let Ok(mut child) = Command::new(&pending.executable)
         .env(HANDOFF_PID, std::process::id().to_string())
         .env(HANDOFF_MARKER, marker)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn();
-    let started = match spawned {
-        Ok(mut child) => {
-            let deadline = Instant::now() + START_LIMIT;
-            loop {
-                if marker.exists() {
-                    break true;
-                }
-                if !matches!(child.try_wait(), Ok(None)) || Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break false;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
+        .spawn()
+    else {
+        return TrialStart::Ended;
+    };
+    let deadline = Instant::now() + START_LIMIT;
+    let outcome = loop {
+        if marker.exists() {
+            break TrialStart::Started;
         }
-        Err(_) => false,
+        if !matches!(child.try_wait(), Ok(None)) {
+            break TrialStart::Ended;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break TrialStart::HeldUp;
+        }
+        std::thread::sleep(Duration::from_millis(100));
     };
     let _ = fs::remove_file(marker);
-    if started {
-        Ok(())
-    } else {
-        Err("[update:relaunch] The updated client did not start; this version carries on".into())
-    }
+    outcome
 }
 
 /// Stops more than one install at a time, for as long as it is held.
@@ -783,6 +917,11 @@ impl Drop for InstallGuard {
 }
 
 pub fn begin_install() -> Result<InstallGuard, String> {
+    // A trial installs nothing before it has taken its place: it would stage beside a client
+    // it is not yet, and the retry that follows comes after its confirmation.
+    if TRIAL.get().is_some() && !PHASE.is(TrialPhase::CONFIRMED) {
+        return Err("Operation in progress".into());
+    }
     if INSTALLING.swap(true, Ordering::SeqCst) {
         return Err("Operation in progress".into());
     }
@@ -807,21 +946,42 @@ pub fn install(state: &Path, release: &Release, verified: &Path) -> Result<(), S
     let lock = open_lock(&lock_path(state)).map_err(|_| "Operation in progress".to_string())?;
     let (current, current_executable) = client_location()?;
     let pending = stage(verified, &current, &current_executable, release)?;
-    let mut value = read_state(state);
-    set_pending(&mut value, Some(&pending));
-    if let Err(error) = write_state(state, &value) {
-        let _ = remove_path(&staged_root(&pending));
+    // Put off while it was being staged: nothing was recorded, nothing starts, and the
+    // download stays for the next attempt.
+    if CANCELLED.load(Ordering::SeqCst) {
+        unstage(&pending, verified);
+        return Err("[update:download] The update was cancelled".into());
+    }
+    let recorded = read_state_patiently(state)
+        .ok_or_else(|| "Cannot read update state".to_string())
+        .and_then(|mut value| {
+            set_pending(&mut value, Some(&pending));
+            write_state(state, &value)
+        });
+    if let Err(error) = recorded {
+        unstage(&pending, verified);
         return Err(format!("[update:replace] {error}"));
     }
-    if let Err(error) = start_trial(&pending, &marker_path(state)) {
-        // It could not even start: these bytes are counted against, and nothing else changes.
-        let _ = remove_path(&staged_root(&pending));
-        let mut value = read_state(state);
-        set_pending(&mut value, None);
-        record_failure(&mut value, &pending.sha256);
-        let _ = write_state(state, &value);
-        return Err(error);
+    let outcome = start_trial(&pending, &marker_path(state));
+    if outcome != TrialStart::Started {
+        // Nothing else changes; bytes that ended by themselves are counted against.
+        unstage(&pending, verified);
+        if let Some(mut value) = read_state_patiently(state) {
+            set_pending(&mut value, None);
+            if outcome == TrialStart::Ended {
+                record_failure(&mut value, &pending.sha256, now_secs());
+            }
+            let _ = write_state(state, &value);
+        }
+        return Err(if outcome == TrialStart::Ended {
+            "[update:relaunch] The updated client did not start; this version carries on"
+        } else {
+            "[update:held] The updated client was held up starting; this version carries on"
+        }
+        .into());
     }
+    #[cfg(target_os = "macos")]
+    let _ = fs::remove_file(verified);
     *INSTALLER_LOCK.lock().unwrap_or_else(|e| e.into_inner()) = Some(lock);
     Ok(())
 }
@@ -842,8 +1002,8 @@ pub fn startup(state: Option<&Path>) {
     std::env::remove_var(HANDOFF_MARKER);
     std::env::remove_var(FALLBACK_PID);
     if let Some(pid) = fallback {
-        // A trial stepping aside for this client: let it end before taking its place.
-        ExitWaiter::open(pid).wait(PREDECESSOR_LIMIT);
+        // A trial stepping aside for this client: let it, and its WebView2, end first.
+        wait_for_predecessor(pid, None);
     }
     let (Some(state), Some(current)) = (state, release_version()) else {
         // Builds that never update themselves leave update state alone.
@@ -853,22 +1013,45 @@ pub fn startup(state: Option<&Path>) {
         return;
     };
     if let Some(pid) = predecessor {
-        let pending = pending_of(&read_state(state)).filter(|p| p.version == current);
+        // The trial lock first, before telling the installer we started: from that moment on
+        // the installer may exit, and no other start may take this trial for a dead one. Only
+        // a brief look by another start can be holding it.
+        let lock = acquire_lock_within(&trial_lock_path(state), Duration::from_secs(5));
+        let pending = read_state_patiently(state)
+            .and_then(|value| pending_of(&value))
+            .filter(|p| p.version == current);
+        let (Some(lock), Some(pending)) = (lock, pending) else {
+            // Not a trial this start can guard. The installer sees it end without starting,
+            // counts it, and carries on as it was.
+            std::process::exit(1);
+        };
         wait_for_predecessor(pid, marker.as_deref());
-        if let Some(pending) = pending {
-            // The installer held the lock until it exited; it is ours from now until we confirm.
-            let lock = acquire_lock_within(&lock_path(state), Duration::from_secs(30));
-            if TRIAL
-                .set(Trial {
-                    pending,
-                    lock: Mutex::new(lock),
-                })
-                .is_ok()
-            {
-                start_watchdog(state.to_path_buf());
-            }
+        // The installer's lock too, now that it has exited: a start that looks only at that
+        // lock (an earlier test build) does not take this trial for a dead one either.
+        let mut locks = vec![lock];
+        locks.extend(acquire_lock_within(
+            &lock_path(state),
+            Duration::from_secs(5),
+        ));
+        if TRIAL
+            .set(Trial {
+                pending,
+                locks: Mutex::new(locks),
+            })
+            .is_ok()
+        {
+            start_watchdog();
         }
         return;
+    }
+    // Unreadable, it may hold a trial; the wait costs nothing when none is running.
+    if read_state(state).is_none_or(|value| pending_of(&value).is_some()) {
+        // Started while a trial is coming up (a second click on the shortcut): give it the time
+        // to take its place, then the single instance hands this start to it.
+        drop(acquire_lock_within(
+            &trial_lock_path(state),
+            Duration::from_secs(30),
+        ));
     }
     judge_ended_trial(state, current);
 }
@@ -877,19 +1060,25 @@ pub fn startup(state: Option<&Path>) {
 /// it cleared; the customer's client, never touched, simply carries on. While the update
 /// lock is held a trial (or its installer) is live, and nothing is judged.
 fn judge_ended_trial(state: &Path, current: &str) {
-    if pending_of(&read_state(state)).is_none() {
+    if read_state(state).is_none_or(|value| pending_of(&value).is_none()) {
         return;
     }
-    let Ok(_lock) = open_lock(&lock_path(state)) else {
+    // Neither an installer nor a trial may be live: either lock held means one is.
+    let (Ok(_install), Ok(_trial)) = (
+        open_lock(&lock_path(state)),
+        open_lock(&trial_lock_path(state)),
+    ) else {
         return;
     };
-    let mut value = read_state(state);
+    let Some(mut value) = read_state_patiently(state) else {
+        return;
+    };
     let Some(pending) = pending_of(&value) else {
         return;
     };
     if pending.version != current {
-        record_failure(&mut value, &pending.sha256);
-        let _ = remove_path(&staged_root(&pending));
+        record_failure(&mut value, &pending.sha256, now_secs());
+        remove_staged(&pending);
     }
     // Being the pending version ourselves, the trial moved itself into place and only its
     // record was left: nothing failed.
@@ -897,77 +1086,145 @@ fn judge_ended_trial(state: &Path, current: &str) {
     let _ = write_state(state, &value);
 }
 
-/// A trial whose window is not up in time steps aside: it releases the update lock, starts
-/// the customer's own client, which judges it, and exits.
-fn start_watchdog(state: PathBuf) {
-    std::thread::spawn(move || {
+/// Called for every command from the window. Once it is up, a trial never steps aside.
+pub fn window_up() {
+    PHASE.window_up();
+}
+
+/// A trial whose window has sent nothing in time steps aside for the customer's own client.
+fn start_watchdog() {
+    std::thread::spawn(|| {
         let deadline = Instant::now() + CONFIRM_LIMIT;
         while Instant::now() < deadline {
-            if CONFIRMED.load(Ordering::SeqCst) {
+            if !PHASE.is(TrialPhase::WATCHING) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(500));
         }
-        step_aside(&state);
+        step_aside();
     });
 }
 
-fn step_aside(state: &Path) {
+/// Starts the customer's client, which waits for this trial to end and then judges it, and
+/// exits. Nothing came from the window, so no operation of the customer's can be running.
+fn step_aside() {
     let Some(trial) = TRIAL.get() else { return };
-    if CONFIRMED.swap(true, Ordering::SeqCst) {
+    if !PHASE.step_aside() {
         return;
     }
-    let _ = state;
-    drop(trial.lock.lock().unwrap_or_else(|e| e.into_inner()).take());
-    let _ = Command::new(&trial.pending.current_executable)
+    let started = Command::new(&trial.pending.current_executable)
         .env(FALLBACK_PID, std::process::id().to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn();
-    std::process::exit(0);
+        .spawn()
+        .is_ok();
+    if started {
+        // The trial lock goes with this process.
+        std::process::exit(0);
+    }
+    // Without a client to hand over to, this one stays, still able to confirm: something
+    // running beats nothing.
+    PHASE.stay();
 }
 
-/// Called by a trial once its window is up and talking to the host. It moves the customer's
-/// client aside and itself into its place; the version kept aside is removed. A no-op for
-/// anything but an unconfirmed trial.
+/// Called by a trial once its window is up and its host answers. It puts itself where the
+/// customer's client is. A no-op for anything but an unconfirmed trial, and for one that is
+/// stepping aside.
 pub fn confirm(state: &Path) {
     let Some(trial) = TRIAL.get() else { return };
-    if CONFIRMED.swap(true, Ordering::SeqCst) {
+    if !PHASE.confirm() {
         return;
     }
     let moved = move_into_place(&trial.pending);
-    let mut value = read_state(state);
-    if pending_of(&value).as_ref() == Some(&trial.pending) {
-        set_pending(&mut value, None);
-    }
     if moved {
-        clear_failures(&mut value, &trial.pending.sha256);
         let _ = CANONICAL.set(trial.pending.current.clone());
-    } else {
-        // It runs, but cannot take the client's place (the folder refused the rename): the
-        // customer's client stays the old version, and repeated tries are counted.
-        record_failure(&mut value, &trial.pending.sha256);
     }
-    let _ = write_state(state, &value);
-    drop(trial.lock.lock().unwrap_or_else(|e| e.into_inner()).take());
+    // Unreadable, the record stays: moved, the next start is this version and clears it
+    // without counting anything; not moved, it is counted then.
+    if let Some(mut value) = read_state_patiently(state) {
+        if pending_of(&value).as_ref() == Some(&trial.pending) {
+            set_pending(&mut value, None);
+        }
+        if moved {
+            clear_failures(&mut value, &trial.pending.sha256);
+        } else {
+            // It runs, but cannot take the client's place (the folder refused the rename):
+            // the customer's client stays the old version, and repeated tries are counted.
+            record_failure(&mut value, &trial.pending.sha256, now_secs());
+        }
+        let _ = write_state(state, &value);
+    }
+    drop(std::mem::take(
+        &mut *trial.locks.lock().unwrap_or_else(|e| e.into_inner()),
+    ));
 }
 
-/// Moves the customer's client aside and the staged version into its place, putting the
-/// client back if the second step fails. A running executable or bundle may be renamed.
+/// Puts the staged version where the customer's client is. In one step when it can be done
+/// in one - a rename over the idle old executable (Windows), a swap of the two bundles
+/// (macOS) - so at no moment is nothing there; in two, moving the client aside first and
+/// back again on failure, only when the old one is in use.
 fn move_into_place(pending: &Pending) -> bool {
+    // Gone (an antivirus took it): there is nothing to put in place, and the client stays.
+    if !pending.staged.exists() {
+        return false;
+    }
+    #[cfg(not(target_os = "macos"))]
+    let replaced = retry(|| fs::rename(&pending.staged, &pending.current)).is_ok();
+    #[cfg(target_os = "macos")]
+    let replaced = retry(|| swap_paths(&pending.staged, &pending.current)).is_ok()
+        // The swap left the old bundle where the staged one was.
+        && {
+            let _ = fs::remove_dir_all(&pending.staged);
+            true
+        };
+    if !replaced && !move_in_two_steps(pending) {
+        return false;
+    }
+    remove_staged(pending);
+    true
+}
+
+/// When the old client is in use (a second start still runs it): moves it aside and the
+/// staged version in, putting the old one back - by name, or else by copy - if that fails.
+fn move_in_two_steps(pending: &Pending) -> bool {
     let aside = beside(&pending.current, &format!("{}.old", std::process::id()));
     let _ = remove_path(&aside);
     if retry(|| fs::rename(&pending.current, &aside)).is_err() {
         return false;
     }
-    if retry(|| fs::rename(&pending.staged, &pending.current)).is_err() {
-        let _ = retry(|| fs::rename(&aside, &pending.current));
-        return false;
+    if retry(|| fs::rename(&pending.staged, &pending.current)).is_ok() {
+        let _ = remove_path(&aside);
+        return true;
     }
-    let _ = remove_path(&aside);
-    let _ = fs::remove_dir_all(staged_root(pending));
-    true
+    if retry(|| fs::rename(&aside, &pending.current)).is_err() && aside.is_file() {
+        let _ = fs::copy(&aside, &pending.current);
+    }
+    false
+}
+
+/// Exchanges two paths in one step (macOS `renamex_np` with `RENAME_SWAP`).
+#[cfg(target_os = "macos")]
+fn swap_paths(a: &Path, b: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    extern "C" {
+        fn renamex_np(
+            from: *const libc::c_char,
+            to: *const libc::c_char,
+            flags: libc::c_uint,
+        ) -> libc::c_int;
+    }
+    const RENAME_SWAP: libc::c_uint = 0x0000_0002;
+    let (from, to) = (
+        CString::new(a.as_os_str().as_bytes())?,
+        CString::new(b.as_os_str().as_bytes())?,
+    );
+    if unsafe { renamex_np(from.as_ptr(), to.as_ptr(), RENAME_SWAP) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 /// Waits for the process this one replaced to exit and, on Windows, for its WebView2 helper
@@ -997,8 +1254,14 @@ fn wait_for_predecessor(pid: u32, marker: Option<&Path>) {
 
 // ---- the update lock and the start marker ----
 
+/// Held by an installer until it exits: no two installs, and no judging while one starts.
 fn lock_path(state: &Path) -> PathBuf {
     state.with_file_name("update.lock")
+}
+
+/// Held by a trial from its first instant until it confirms: while held, it is alive.
+fn trial_lock_path(state: &Path) -> PathBuf {
+    state.with_file_name("update-trial.lock")
 }
 
 /// An exclusive lock on `path`, held as long as the file stays open. The operating system
@@ -1046,7 +1309,7 @@ fn marker_path(state: &Path) -> PathBuf {
 /// versions no trial needs, and partial downloads long superseded. Skipped while a trial or
 /// an install is live. Best effort; whatever is locked goes at a later start.
 pub fn remove_leftovers(state: &Path) {
-    if TRIAL.get().is_some() && !CONFIRMED.load(Ordering::SeqCst) {
+    if TRIAL.get().is_some() && !PHASE.is(TrialPhase::CONFIRMED) {
         return;
     }
     let Ok(_lock) = open_lock(&lock_path(state)) else {
@@ -1055,8 +1318,18 @@ pub fn remove_leftovers(state: &Path) {
     let Ok((current, _)) = client_location() else {
         return;
     };
-    let keep: Vec<PathBuf> = pending_of(&read_state(state))
-        .map(|pending| vec![pending.staged.clone(), staged_root(&pending)])
+    let Ok(_trial) = open_lock(&trial_lock_path(state)) else {
+        return;
+    };
+    let Some(value) = read_state(state) else {
+        return;
+    };
+    let keep: Vec<PathBuf> = pending_of(&value)
+        .map(|pending| {
+            let mut keep = vec![pending.staged.clone()];
+            keep.extend(staged_root(&pending));
+            keep
+        })
         .unwrap_or_default();
     remove_leftovers_of(&current, &keep, SystemTime::now());
 }
@@ -1444,31 +1717,101 @@ mod tests {
     }
 
     #[test]
-    fn a_trial_that_fails_twice_is_refused() {
+    fn a_trial_that_fails_twice_is_refused_for_a_while() {
+        let now = 1_000_000;
         let mut value = json!({});
-        record_failure(&mut value, "abc");
-        assert!(rejected_hashes(&value).is_empty());
+        record_failure(&mut value, "abc", now);
+        assert!(rejected_hashes(&value, now).is_empty());
         assert_eq!(value["failures"]["abc"], 1);
-        record_failure(&mut value, "abc");
-        assert_eq!(rejected_hashes(&value), vec!["abc".to_string()]);
+        record_failure(&mut value, "abc", now);
+        assert_eq!(rejected_hashes(&value, now), vec!["abc".to_string()]);
         assert!(value["failures"].get("abc").is_none());
+        // Refusals expire: a failure the machine caused does not block a release for good.
+        assert_eq!(
+            rejected_hashes(&value, now + REJECTION_LIFETIME - 1).len(),
+            1
+        );
+        assert!(rejected_hashes(&value, now + REJECTION_LIFETIME).is_empty());
         // A success in between clears the count.
-        record_failure(&mut value, "def");
+        record_failure(&mut value, "def", now);
         clear_failures(&mut value, "def");
-        record_failure(&mut value, "def");
-        assert!(!rejected_hashes(&value).contains(&"def".to_string()));
+        record_failure(&mut value, "def", now);
+        assert!(!rejected_hashes(&value, now).contains(&"def".to_string()));
+        // A refusal list in an earlier shape reads as nothing refused, not an error.
+        assert!(rejected_hashes(&json!({"rejected": ["abc"]}), now).is_empty());
     }
 
     #[test]
     fn rejected_hashes_are_bounded_newest_kept() {
         let mut value = json!({});
         for i in 0..(REJECTED_LIMIT + 5) {
-            reject_hash(&mut value, &format!("{i:064x}"));
+            reject_hash(&mut value, &format!("{i:064x}"), 1_000 + i as u64);
         }
-        let kept = rejected_hashes(&value);
+        let kept = rejected_hashes(&value, 2_000);
         assert_eq!(kept.len(), REJECTED_LIMIT);
         assert!(kept.contains(&format!("{:064x}", REJECTED_LIMIT + 4)));
         assert!(!kept.contains(&format!("{:064x}", 0)));
+    }
+
+    #[test]
+    fn a_trial_steps_aside_or_confirms_never_both() {
+        let phase = TrialPhase::new();
+        phase.window_up();
+        assert!(
+            !phase.step_aside(),
+            "a window that sent anything is never left"
+        );
+        assert!(phase.confirm());
+        assert!(!phase.confirm(), "only once");
+        let phase = TrialPhase::new();
+        assert!(phase.step_aside());
+        phase.window_up();
+        assert!(!phase.confirm(), "stepping aside, it confirms nothing");
+        phase.stay();
+        assert!(
+            phase.confirm(),
+            "one that could not step aside can still confirm"
+        );
+        let phase = TrialPhase::new();
+        phase.stay();
+        assert!(
+            phase.is(TrialPhase::WATCHING),
+            "staying is only after stepping aside"
+        );
+    }
+
+    #[test]
+    fn only_our_own_hidden_folder_is_ever_deleted() {
+        let dir = std::env::temp_dir().join("update-roots");
+        let current = dir.join("Superkiro.exe");
+        let pending = |staged: PathBuf| Pending {
+            version: OTHER.into(),
+            sha256: "abc".into(),
+            staged: staged.clone(),
+            executable: staged,
+            current: current.clone(),
+            current_executable: current.clone(),
+        };
+        let ours = dir
+            .join(".Superkiro.exe.9999.1.1.new")
+            .join("Superkiro.exe");
+        assert_eq!(
+            staged_root(&pending(ours)),
+            Some(dir.join(".Superkiro.exe.9999.1.1.new"))
+        );
+        // An earlier layout staged the file straight beside the client: its parent is the
+        // customer's own folder, which must never be taken for ours.
+        for staged in [
+            dir.join(".Superkiro.exe.9999.1.1.exe"),
+            dir.join("Desktop").join("Superkiro.exe"),
+            dir.join(".Other.exe.9999.1.1.new").join("Superkiro.exe"),
+            dir.join(".Superkiro.exe.x.new").join("Superkiro.exe"),
+            std::env::temp_dir()
+                .join(".Superkiro.exe.9999.1.1.new")
+                .join("Superkiro.exe"),
+        ] {
+            assert_eq!(staged_root(&pending(staged.clone())), None, "{staged:?}");
+        }
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1521,6 +1864,70 @@ mod tests {
 
     #[cfg(not(target_os = "macos"))]
     #[test]
+    fn an_attempt_put_off_keeps_its_download() {
+        let dir = scratch("unstage");
+        let pending = staged_beside(&dir, b"old", b"new");
+        let verified = download_part(&pending.current, &release_of(b"new", OTHER));
+        unstage(&pending, &verified);
+        // The next attempt finds the whole download and fetches nothing again.
+        assert_eq!(fs::read(&verified).unwrap(), b"new");
+        assert!(!pending.staged.exists());
+        assert!(staged_root(&pending).is_some_and(|folder| !folder.exists()));
+        assert_eq!(fs::read(&pending.current).unwrap(), b"old");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_client_in_use_is_still_replaced_and_never_lost() {
+        let dir = scratch("move-busy");
+        let pending = staged_beside(&dir, b"old", b"new");
+        // A second start still runs the old client: open without delete sharing, as a
+        // mapped image is, a rename over it fails and only moving it aside works.
+        use std::os::windows::fs::OpenOptionsExt;
+        let busy = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x4)
+            .open(&pending.current)
+            .unwrap();
+        assert!(move_into_place(&pending));
+        assert_eq!(fs::read(&pending.current).unwrap(), b"new");
+        drop(busy);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_state_is_not_an_empty_one() {
+        let dir = scratch("state-read");
+        let state = dir.join("update-state.json");
+        assert_eq!(read_state(&state), Some(json!({})));
+        fs::write(&state, b"not json").unwrap();
+        assert_eq!(read_state(&state), Some(json!({})));
+        // A folder where the file should be cannot be read, and is not taken for empty.
+        fs::remove_file(&state).unwrap();
+        fs::create_dir(&state).unwrap();
+        assert_eq!(read_state(&state), None);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_clock_that_ran_ahead_does_not_make_a_refusal_last() {
+        let now = 1_000_000;
+        let day = 24 * 3600;
+        // Stamped a year ahead: no refusal at all.
+        assert!(rejected_hashes(&json!({"rejected": {"abc": now + 365 * day}}), now).is_empty());
+        // Stamped a day ahead: in force, and over a day after its week would have ended.
+        let mut value = json!({"rejected": {"abc": now + day}});
+        assert_eq!(rejected_hashes(&value, now), vec!["abc".to_string()]);
+        assert_eq!(rejected_hashes(&value, now + REJECTION_LIFETIME).len(), 1);
+        assert!(rejected_hashes(&value, now + REJECTION_LIFETIME + day).is_empty());
+        // The next refusal rewrites it as now.
+        reject_hash(&mut value, "def", now);
+        assert_eq!(value["rejected"]["abc"], now);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
     fn a_failed_move_leaves_the_customers_client_in_place() {
         let dir = scratch("move-fail");
         let pending = staged_beside(&dir, b"old", b"new");
@@ -1541,18 +1948,20 @@ mod tests {
         set_pending(&mut value, Some(&pending));
         write_state(&state, &value).unwrap();
 
-        // A live trial holds the lock: nothing is judged.
-        let held = open_lock(&lock_path(&state)).unwrap();
-        judge_ended_trial(&state, "2026.09.22");
-        assert!(pending_of(&read_state(&state)).is_some());
-        drop(held);
+        // An installer or a live trial holds a lock: nothing is judged.
+        for lock in [lock_path(&state), trial_lock_path(&state)] {
+            let held = open_lock(&lock).unwrap();
+            judge_ended_trial(&state, "2026.09.22");
+            assert!(pending_of(&read_state(&state).unwrap()).is_some());
+            drop(held);
+        }
 
         // The trial is gone without confirming: counted, its staged copy removed, the
         // customer's client untouched.
         judge_ended_trial(&state, "2026.09.22");
-        let value = read_state(&state);
+        let value = read_state(&state).unwrap();
         assert!(pending_of(&value).is_none());
-        assert_eq!(value["failures"][&pending.sha256], 1);
+        assert_eq!(value["failures"][pending.sha256.as_str()], 1);
         assert!(!pending.staged.exists());
         assert_eq!(fs::read(&pending.current).unwrap(), b"old");
         fs::remove_dir_all(dir).unwrap();
@@ -1568,7 +1977,7 @@ mod tests {
         set_pending(&mut value, Some(&pending));
         write_state(&state, &value).unwrap();
         judge_ended_trial(&state, OTHER);
-        let value = read_state(&state);
+        let value = read_state(&state).unwrap();
         assert!(pending_of(&value).is_none());
         assert!(value["failures"].get(&pending.sha256).is_none());
         fs::remove_dir_all(dir).unwrap();

@@ -9,6 +9,8 @@ type Page = 'login'|'overview'|'settings'|'connecting'|'restore-failed';
 type Intent = 'activate'|'restore'|'switch'|'exit'|'unbind'|'trim';
 type Modal = {title: string; detail: string; label: string; action?: Intent; force?: boolean};
 const MINIMUM_KIRO_VERSION = '1.1.14';
+// A first status that failed is tried again this many times, this far apart.
+const STATUS_RETRIES = 3, STATUS_RETRY = 2000;
 const tabs = [['overview','概览','▦'],['settings','设置','☷']] as const;
 function Empty({title, children}: {title:string; children: ReactNode}) { return <div key={title} className="empty"><div className="empty-bars" aria-hidden="true"><i/><i/><i/></div><h2>{title}</h2><p>{children}</p></div>; }
 function Wave({active = false, singlePeak = false}: {active?:boolean; singlePeak?:boolean}) { return <div className={`wave ${active?'responding':''}`} aria-hidden="true">{Array.from({length:singlePeak?33:64},(_,i)=><i key={i} style={{animationDelay:`${-i*.09}s`,height:`${singlePeak?12+84*Math.exp(-(((i-16)/8)**2)):12+60*Math.exp(-(((i-18)/10)**2))+30*Math.exp(-(((i-48)/7)**2))}%`}}/>)}</div>; }
@@ -140,7 +142,14 @@ export function App() {
     setMemoryDetails(data);setSamples(v=>[...v,data.total_memory_mb!].slice(-40));setSampleTime(new Date().toLocaleTimeString('zh-CN'));setMemoryState('ready');
   }catch(e){if(current()){setMemoryDetails(null);setMemoryState('error');if(toClientError(e).code!=='SK-LOCAL-002')captureError(e);}}finally{if(current())sampling.current=false;} }
   function navigate(next:Page){if(!hasSession&&!(needsRecovery&&next==='overview')&&!['login','restore-failed'].includes(next))return;if(lock.current&&page==='connecting')return;setPage(next);if(next==='settings')void sampleMemory();}
-  useEffect(()=>{let alive=true;void refresh().then(s=>{if(alive&&recoveryPending(s)){setPage('overview');setNotice('检测到待恢复的本机配置，无需卡密即可还原。');}else if(alive&&configured(s)){setPage('overview');void loadUsage();}}).catch(e=>{if(alive)captureError(e);});void api<{id:number;state:string;support_error?:unknown}>('/api/operation').then(op=>{if(!alive||op.state!=='failed'||!op.support_error||!Number.isSafeInteger(op.id))return;const error=toClientError(op.support_error);if(error.outcome!=='unknown')return;mutation.current=true;operationBaseline.current=op.id;setUncertain(true);setRemoteUncertain(true);captureError(error,false);setNotice('上次操作的结果未确认。如需恢复，仅还原本机配置；不要重复解绑或激活。');}).catch(()=>{});void native<string|null>('get_remembered_card').then(v=>{if(alive&&(v===null||typeof v==='string'&&v.length<=256)){setStoreReady(true);if(v){setCard(v);setRemember(true);}}}).catch(()=>{});return()=>{alive=false;};},[]);
+  // After a render with the host's status has committed, a newly installed version confirms
+  // itself: one that fails to render real status never takes the customer's client's place.
+  const confirmUpdate=updater.confirm;
+  useEffect(()=>{if(status.platform)confirmUpdate();},[status,confirmUpdate]);
+  // The first status routes the page and lets a new version confirm itself, so one that
+  // fails is tried again a few times; the first failure is reported, and cleared if a retry
+  // succeeds while it is still the one shown.
+  useEffect(()=>{let alive=true,timer:number|undefined,failures=0,first:ClientError|null=null;const start=()=>void refresh().then(s=>{if(!alive)return;if(first){const shown=first;setClientError(current=>current===shown?null:current);}if(recoveryPending(s)){setPage('overview');setNotice('检测到待恢复的本机配置，无需卡密即可还原。');}else if(configured(s)){setPage('overview');void loadUsage();}}).catch(e=>{if(!alive)return;if(failures++===0){first=toClientError(e);captureError(first);}if(failures<=STATUS_RETRIES)timer=window.setTimeout(start,STATUS_RETRY);});start();void api<{id:number;state:string;support_error?:unknown}>('/api/operation').then(op=>{if(!alive||op.state!=='failed'||!op.support_error||!Number.isSafeInteger(op.id))return;const error=toClientError(op.support_error);if(error.outcome!=='unknown')return;mutation.current=true;operationBaseline.current=op.id;setUncertain(true);setRemoteUncertain(true);captureError(error,false);setNotice('上次操作的结果未确认。如需恢复，仅还原本机配置；不要重复解绑或激活。');}).catch(()=>{});void native<string|null>('get_remembered_card').then(v=>{if(alive&&(v===null||typeof v==='string'&&v.length<=256)){setStoreReady(true);if(v){setCard(v);setRemember(true);}}}).catch(()=>{});return()=>{alive=false;window.clearTimeout(timer);};},[]);
   useEffect(()=>{if(page==='overview'&&hasSession)void sampleMemory();},[page]);
   const windowMode=page==='login'?'connect':'status';
   useEffect(()=>{void native('screen',[windowMode]).catch(()=>{});},[windowMode]);

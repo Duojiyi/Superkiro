@@ -49,6 +49,7 @@ const CODES: &[&str] = &[
     "SK-UPDATE-002",
     "SK-UPDATE-003",
     "SK-UPDATE-004",
+    "SK-UPDATE-005",
 ];
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -83,6 +84,7 @@ pub fn classify(raw: &str, path: &str, method: &str) -> Value {
                 "verify" => Some("SK-UPDATE-002"),
                 "replace" => Some("SK-UPDATE-003"),
                 "relaunch" => Some("SK-UPDATE-004"),
+                "held" => Some("SK-UPDATE-005"),
                 _ => None,
             })
         {
@@ -376,6 +378,10 @@ mod tests {
             (
                 "[update:relaunch] The updated client did not start; the previous version was put back",
                 "SK-UPDATE-004",
+            ),
+            (
+                "[update:held] The updated client was held up starting; this version carries on",
+                "SK-UPDATE-005",
             ),
         ] {
             let error = classify(raw, "native", "update_install");

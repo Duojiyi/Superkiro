@@ -14,6 +14,10 @@ const NETWORK_RETRY = 3 * 1000;
 const MAX_NETWORK_RETRIES = 3;
 // A backstop so a stuck install never leaves the screen spinning forever with no way out.
 const INSTALL_LIMIT = 15 * 60 * 1000;
+// A confirmation that did not reach the host is sent again: unconfirmed, a new version is
+// counted against when it ends.
+const CONFIRM_ATTEMPTS = 3;
+const CONFIRM_RETRY = 2 * 1000;
 const version = (v: unknown): v is string => typeof v === 'string' && /^\d{1,9}(\.\d{1,9}){0,3}$/.test(v);
 
 /** Only the shapes the host sends; anything else is no update at all. */
@@ -59,9 +63,6 @@ export function useUpdater(blocked: boolean, onUpdated: (version: string) => voi
   const refresh = useCallback(async () => {
     try {
       const result = parseCheck(await native('update_check'));
-      // The host answered, so this build runs and talks to it: a new version has proven
-      // itself and takes its place (a no-op for anything else). Only once.
-      if (!confirmed.current) { confirmed.current = true; void native('update_confirm').catch(() => {}); }
       if (!result) return;
       setCheck(result);
       if (result.updated && result.current && !notified.current) {
@@ -86,6 +87,19 @@ export function useUpdater(blocked: boolean, onUpdated: (version: string) => voi
       }
     }).then(unlisten => { if (disposed) unlisten(); else stop = unlisten; }).catch(() => {});
     return () => { disposed = true; stop?.(); };
+  }, []);
+  // Called once a page showing its host's local status has rendered: this build runs, renders
+  // and its host answers, so a newly installed version has proven itself and takes its place
+  // (a no-op for anything else). It depends on nothing remote: offline, or with the update
+  // server down, a new version still confirms.
+  const confirm = useCallback(() => {
+    if (confirmed.current) return;
+    confirmed.current = true;
+    void (async () => {
+      for (let i = 0; i < CONFIRM_ATTEMPTS; i++) {
+        try { await native('update_confirm'); return; } catch { await new Promise(resolve => setTimeout(resolve, CONFIRM_RETRY)); }
+      }
+    })();
   }, []);
   const schedule = useCallback((delay: number) => {
     const at = Date.now() + delay;
@@ -135,7 +149,7 @@ export function useUpdater(blocked: boolean, onUpdated: (version: string) => voi
   const retry = useCallback(() => { networkRetries.current = 0; void install(); }, [install]);
   const available = check?.state === 'available' ? check : null;
   return {
-    check, phase, progress, error, install, retry, dismiss, start, postponed, resumed, autoRetry, mandatory,
+    check, phase, progress, error, install, retry, dismiss, start, confirm, postponed, resumed, autoRetry, mandatory,
     /** An update the customer can start from the header: an optional one, or a mandatory one
      * that was put off. */
     offer: available && phase === 'idle' && (!mandatory || postponed) ? available : null,
@@ -155,7 +169,8 @@ export function UpdateScreen({ updater, blocked, openDownloads, restore }: { upd
   const title = phase === 'restarting' ? '正在重启 Superkiro' : phase === 'installing' ? '正在更新 Superkiro' : phase === 'failed' ? '更新未完成' : '需要更新 Superkiro';
   // The download's own progress; once it reaches the full size the host is verifying and
   // installing, which reports no further progress.
-  const percent = progress && progress.total > 0 ? Math.min(100, Math.round((progress.received / progress.total) * 100)) : null;
+  // Rounded down: 100 only once every byte is in, so the pause button stays while any is due.
+  const percent = progress && progress.total > 0 ? Math.min(100, Math.floor((progress.received / progress.total) * 100)) : null;
   const downloading = phase === 'installing' && percent !== null && percent < 100;
   const finishing = phase === 'installing' && percent === 100;
   const connecting = phase === 'installing' && percent === null;
@@ -188,8 +203,10 @@ export function UpdateScreen({ updater, blocked, openDownloads, restore }: { upd
     {/* Restoring Kiro stays reachable until the client restarts; a restore simply makes the
         update wait for it. */}
     {phase !== 'restarting' && restore && <button className="full" onClick={restore}>还原 Kiro 配置</button>}
-    {/* Even a required update can be put off whenever it is not restarting, so the client is
-        never locked; a download in progress stops and later continues where it was. */}
-    {phase !== 'restarting' && <button className="text full" onClick={updater.dismiss}>{phase === 'installing' ? '暂停更新，先进入客户端' : '暂时进入客户端'}</button>}
+    {/* Even a required update can be put off while it is not installing the downloaded
+        version, so the client is never locked; a download in progress stops and later
+        continues where it was. Once downloaded, the new version starts moments later, and a
+        button that could no longer stop it is not offered. */}
+    {phase !== 'restarting' && !finishing && <button className="text full" onClick={updater.dismiss}>{phase === 'installing' ? '暂停更新，先进入客户端' : '暂时进入客户端'}</button>}
   </section>;
 }

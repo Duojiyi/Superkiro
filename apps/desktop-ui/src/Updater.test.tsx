@@ -14,6 +14,7 @@ const mandatory = { state: 'available', current: '2026.09.22', version: '2026.09
 function Harness({ blocked = false, onUpdated = () => {}, restore = null }: { blocked?: boolean; onUpdated?: (v: string) => void; restore?: (() => void) | null }) {
   const updater = useUpdater(blocked, onUpdated);
   return <div>
+    <button onClick={() => updater.confirm()}>本地状态已读取</button>
     {updater.offer && <button onClick={() => updater.start()}>{updater.postponed ? '继续更新' : `新版本 ${updater.offer.version}`} ↑</button>}
     {updater.screen ? <UpdateScreen updater={updater} blocked={blocked} openDownloads={() => call('open_external')} restore={restore}/> : <p>页面内容</p>}
   </div>;
@@ -45,14 +46,30 @@ describe('parseCheck', () => {
 });
 
 describe('useUpdater and UpdateScreen', () => {
-  it('confirms this build once the host has answered, and only once', async () => {
-    host({ state: 'current', current: '2026.09.25' });
-    render(<Harness/>); await flush();
-    expect(call.mock.calls.filter(([m]) => m === 'update_confirm')).toHaveLength(1);
-    // Confirmation follows a host answer: a host that never answers is never confirmed.
-    cleanup(); call.mockReset(); call.mockRejectedValue(new Error('host down'));
+  it('confirms this build on the local status alone, and only once', async () => {
+    // The update server is unreachable: a new version still confirms once its host answers.
+    call.mockImplementation(async (method: string) => { if (method === 'update_check') throw failure('SK-UPDATE-001'); return null; });
     render(<Harness/>); await flush();
     expect(call).not.toHaveBeenCalledWith('update_confirm');
+    fireEvent.click(screen.getByRole('button', { name: '本地状态已读取' })); await flush();
+    fireEvent.click(screen.getByRole('button', { name: '本地状态已读取' })); await flush();
+    expect(call.mock.calls.filter(([m]) => m === 'update_confirm')).toHaveLength(1);
+  });
+
+  it('a confirmation that did not reach the host is sent again', async () => {
+    vi.useFakeTimers();
+    let confirms = 0;
+    call.mockImplementation(async (method: string) => {
+      if (method === 'update_confirm' && ++confirms === 1) throw new Error('bridge busy');
+      return method === 'update_check' ? { state: 'current', current: '2026.09.25' } : null;
+    });
+    render(<Harness/>); await flush();
+    fireEvent.click(screen.getByRole('button', { name: '本地状态已读取' })); await flush();
+    expect(confirms).toBe(1);
+    await act(async () => { vi.advanceTimersByTime(2_000); }); await flush();
+    expect(confirms).toBe(2);
+    await act(async () => { vi.advanceTimersByTime(10_000); }); await flush();
+    expect(confirms).toBe(2);
   });
 
   it('a mandatory update takes the place of the page and installs by itself', async () => {
@@ -88,6 +105,16 @@ describe('useUpdater and UpdateScreen', () => {
     // Nonsense from the event channel is ignored.
     act(() => { handler({ event: 'update-progress', id: 3, payload: { received: 9, total: 1 } }); });
     expect(screen.getByText('50%')).toBeTruthy();
+    // Downloading, it can be put off; downloaded, the new version starts moments later and
+    // no button pretends it could still stop that.
+    expect(screen.getByRole('button', { name: '暂停更新，先进入客户端' })).toBeTruthy();
+    // One byte short is not done: it still reads 99% and can still be put off.
+    act(() => { handler({ event: 'update-progress', id: 4, payload: { received: 4 * 1024 * 1024 - 1, total: 4 * 1024 * 1024, resumed: false } }); });
+    expect(screen.getByText('99%')).toBeTruthy();
+    expect(screen.getByRole('button', { name: '暂停更新，先进入客户端' })).toBeTruthy();
+    act(() => { handler({ event: 'update-progress', id: 5, payload: { received: 4 * 1024 * 1024, total: 4 * 1024 * 1024, resumed: false } }); });
+    expect(screen.getByText('校验并安装')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: '暂停更新，先进入客户端' })).toBeNull();
   });
 
   it('marks a download the host says resumed from a break point', async () => {

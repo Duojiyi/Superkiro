@@ -22,6 +22,7 @@ async fn api(
     body: Value,
 ) -> Result<Value, Value> {
     local_window(&window).map_err(|e| errors::classify(&e, &path, &method))?;
+    update::window_up();
     let host = Arc::clone(state.inner());
     if method == "GET" && path.split('?').next() == Some("/api/operation") {
         return host
@@ -210,6 +211,7 @@ async fn native_inner(
     args: Vec<Value>,
 ) -> Result<Value, String> {
     local_window(&window)?;
+    update::window_up();
     let arg = args.first().and_then(Value::as_str).unwrap_or("");
     match method.as_str() {
         "minimize" => window.minimize().map_err(|e| e.to_string())?,
@@ -318,7 +320,7 @@ async fn native_inner(
         }
         "update_cancel" => update::cancel(),
         "update_confirm" => {
-            // The window is up and talking to the host: the new version has proven itself.
+            // The window is up and its host answers: the new version has proven itself.
             let state_file = state.update_state();
             tauri::async_runtime::spawn_blocking(move || update::confirm(&state_file));
         }
