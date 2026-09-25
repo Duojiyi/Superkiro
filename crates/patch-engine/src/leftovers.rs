@@ -73,6 +73,14 @@ impl Leftovers {
         token: &TokenStorage,
         gateway_hosts: &[String],
     ) -> Result<(), String> {
+        // Settings no edit can safely change (a syntax error) fail the cleanup before any
+        // file changes, rather than leaving Kiro's official bundle with the gateway's
+        // settings and token.
+        if self.settings {
+            settings
+                .plan_orphan_removal(gateway_hosts)
+                .map_err(|error| error.to_string())?;
+        }
         for path in &self.patches {
             ExtensionPatcher::new(path)
                 .restore()

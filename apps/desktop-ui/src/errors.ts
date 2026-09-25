@@ -22,6 +22,7 @@ export const errorMessages: Record<string, string> = {
   'SK-CONNECT-007': 'Kiro 中有窗口在使用 Default 以外的配置文件（Profile）。接入只配置 Default 配置文件，请先在 Kiro 中把这些窗口切换到 Default 配置文件，然后重试。',
   'SK-RESTORE-001': '本地配置还原未完成，请保留备份并重试还原。',
   'SK-RESTORE-002': 'Kiro 的扩展文件仍是修改后的版本，且用于还原它的备份已丢失，重试无法还原。请从官网重新安装 Kiro（会替换该文件），再重新还原。',
+  'SK-RESTORE-003': 'Kiro 的 settings.json 有语法错误，无法安全修改，本次未改动任何文件。请在 Kiro 中运行「Preferences: Open User Settings (JSON)」（或用记事本打开该文件），修正出错的那一行并保存，然后重试。',
   'SK-LOCAL-001': '本地操作权限不足，请检查文件占用及系统权限。',
   'SK-LOCAL-002': '已有操作正在处理，请等待状态确认，不要重复操作。',
   'SK-LOCAL-003': '系统安全存储操作失败，请检查系统凭据服务。',
@@ -32,12 +33,15 @@ const stages = ['preflight', 'launch-prepare', 'authenticate', 'close', 'apply',
 export class ClientError extends Error {
   constructor(public code: string, public feedback_id: string, public stage: string,
     public outcome: 'failed' | 'partial' | 'unknown', public retry_after_seconds: number | null,
-    public occurred_at: string) {
-    super(errorMessages[code] + (outcome === 'unknown' ? ' 操作结果未确认，请等待状态同步，不要重复修改配置。' : '') +
+    public occurred_at: string, public line: number | null = null, public column: number | null = null) {
+    super(errorMessages[code] + (line !== null && column !== null ? ` 出错位置：第 ${line} 行第 ${column} 列。` : '') +
+      (outcome === 'unknown' ? ' 操作结果未确认，请等待状态同步，不要重复修改配置。' : '') +
       (retry_after_seconds !== null ? ` 请在 ${retry_after_seconds} 秒后重试。` : ''));
     this.name = 'ClientError';
   }
 }
+// Where settings.json has to be fixed; any other value is dropped.
+const position = (value: unknown) => typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= 10_000_000 ? value : null;
 export function toClientError(error: unknown): ClientError {
   if (error instanceof ClientError) return error;
   const value = error && typeof error === 'object' ? error as Record<string, unknown> : {};
@@ -49,7 +53,8 @@ export function toClientError(error: unknown): ClientError {
   return new ClientError(code, id, typeof value.stage === 'string' && stages.includes(value.stage) ? value.stage : 'unknown',
     value.outcome === 'partial' || value.outcome === 'unknown' ? value.outcome : 'failed',
     typeof value.retry_after_seconds === 'number' && Number.isInteger(value.retry_after_seconds) && value.retry_after_seconds >= 0 && value.retry_after_seconds <= 86400 ? value.retry_after_seconds : null,
-    Number.isFinite(date.getTime()) ? date.toISOString() : new Date().toISOString());
+    Number.isFinite(date.getTime()) ? date.toISOString() : new Date().toISOString(),
+    code === 'SK-RESTORE-003' ? position(value.line) : null, code === 'SK-RESTORE-003' ? position(value.column) : null);
 }
 export function feedbackText(error: ClientError, status: Status): string {
   const version = (value: unknown) => typeof value === 'string' && /^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]{1,40})?$/.test(value) ? value : '未知';

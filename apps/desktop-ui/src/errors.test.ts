@@ -23,6 +23,16 @@ describe('structured client errors', () => {
     expect(toClientError(new Error('Bearer secret')).message).not.toContain('secret');
     expect(toClientError('secret').feedback_id).not.toBe(error.feedback_id);
   });
+  it('says where settings.json has to be fixed, and only for that error', () => {
+    const error = toClientError({code:'SK-RESTORE-003', line:12, column:5});
+    expect(error.message).toContain('settings.json');
+    expect(error.message).toContain('第 12 行第 5 列');
+    for (const [code, line] of [['SK-RESTORE-003', '12'], ['SK-RESTORE-003', 0], ['SK-RESTORE-003', 1.5], ['SK-RESTORE-001', 12]] as const) {
+      const other = toClientError({code, line, column:5});
+      expect(other.line).toBeNull();
+      expect(other.message).not.toContain('出错位置');
+    }
+  });
   it('bounds cooldown and accepts release versions', () => {
     const error = toClientError({code:'SK-BIND-002', retry_after_seconds:60});
     expect(error.message).toContain('60 秒');

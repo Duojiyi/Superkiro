@@ -1,6 +1,6 @@
 //! settings.json is edited in place: takeover and rollback change only the keys they
 //! manage, and the user's comments, formatting and later edits survive both.
-use patch_engine::SettingsManager;
+use patch_engine::{SettingsError, SettingsManager};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
@@ -218,6 +218,98 @@ fn a_file_kiro_would_not_read_is_refused_and_left_alone() {
         assert_eq!(text(&manager), original);
         fs::remove_dir_all(dir).unwrap();
     }
+}
+
+/// Kiro reads past a missing comma, so a customer can leave one while taken over and
+/// never notice. The rollback reads the file the same way, takes out only what the
+/// takeover put in, and leaves the customer's typo exactly where it is.
+#[test]
+fn a_rollback_reads_past_a_missing_comma_and_leaves_the_typo_where_it_is() {
+    let original = "{\n  // mine\n  \"editor.tabSize\": 2,\n  \"editor.fontSize\": 14,\n  \"update.mode\": \"manual\"\n}\n";
+    let (dir, manager) = settings_file("missing-comma", original.as_bytes());
+    let prior = manager.merge_byok(GATEWAY).unwrap();
+    edit(&manager, "\"editor.tabSize\": 2,", "\"editor.tabSize\": 2");
+    assert!(manager.read_settings().is_err(), "no longer strict JSONC");
+
+    manager.revert(&prior, GATEWAY).unwrap();
+    assert_eq!(
+        text(&manager),
+        original.replacen("\"editor.tabSize\": 2,", "\"editor.tabSize\": 2", 1)
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// A missing comma right next to a member the takeover added: taking that member out
+/// must not take one of the customer's commas instead, which would move their typo
+/// onto their own line.
+#[test]
+fn a_missing_comma_next_to_a_takeover_key_costs_the_customer_no_comma() {
+    // The customer adds a line at the end and leaves out the comma above it, which
+    // ends the takeover's last member.
+    let original = "{\n  \"editor.tabSize\": 2,\n  \"editor.fontSize\": 14\n}\n";
+    let (dir, manager) = settings_file("comma-after-ours", original.as_bytes());
+    let prior = manager.merge_byok(GATEWAY).unwrap();
+    let merged = text(&manager);
+    let end = merged.rfind('}').unwrap();
+    fs::write(
+        manager.path(),
+        format!(
+            "{}  \"editor.wordWrap\": \"on\"\n{}",
+            &merged[..end],
+            &merged[end..]
+        ),
+    )
+    .unwrap();
+    manager.revert(&prior, GATEWAY).unwrap();
+    assert_eq!(
+        text(&manager),
+        "{\n  \"editor.tabSize\": 2,\n  \"editor.fontSize\": 14,\n  \"editor.wordWrap\": \"on\"\n}\n"
+    );
+    fs::remove_dir_all(dir).unwrap();
+
+    // The customer deletes the comma between their last setting and the takeover's first.
+    let (dir, manager) = settings_file("comma-before-ours", original.as_bytes());
+    let prior = manager.merge_byok(GATEWAY).unwrap();
+    edit(
+        &manager,
+        "\"editor.fontSize\": 14,",
+        "\"editor.fontSize\": 14",
+    );
+    manager.revert(&prior, GATEWAY).unwrap();
+    assert_eq!(text(&manager), original);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// A syntax error even a tolerant reading stops at (here a stray closing brace) is named
+/// by line and column, and nothing is written.
+#[test]
+fn a_syntax_error_no_reading_gets_past_is_located_and_nothing_is_written() {
+    let original = "{\n  \"editor.fontSize\": 14\n}\n";
+    let (dir, manager) = settings_file("stray-brace", original.as_bytes());
+    let prior = manager.merge_byok(GATEWAY).unwrap();
+    let broken = format!("{}}}\n", text(&manager));
+    fs::write(manager.path(), &broken).unwrap();
+    let line = broken.matches('\n').count();
+
+    let error = manager.revert(&prior, GATEWAY).unwrap_err();
+    assert!(
+        matches!(error, SettingsError::Syntax { line: l, column: 1 } if l == line),
+        "{error:?}"
+    );
+    assert!(
+        error.to_string().contains(&format!(
+            "settings.json has a syntax error at line {line}, column 1"
+        )),
+        "{error}"
+    );
+    let hosts = ["gateway.test".to_string()];
+    assert!(manager.names_gateway(&hosts), "blind to a broken file");
+    assert!(matches!(
+        manager.remove_orphaned_takeover(&hosts),
+        Err(SettingsError::Syntax { .. })
+    ));
+    assert_eq!(text(&manager), broken);
+    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]

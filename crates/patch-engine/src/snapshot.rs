@@ -276,6 +276,13 @@ impl SnapshotManager {
 
         let _lock = self.operation_lock()?;
         let snapshot = self.load()?;
+        let settings_mgr = SettingsManager::at(&snapshot.settings_path);
+
+        // Settings that cannot be rolled back (a syntax error the customer made while
+        // taken over, say) must fail the restore before any file changes. Found only
+        // after the extension was rolled back, they left Kiro on its official bundle
+        // with the gateway's settings and token, and every retry failed the same way.
+        settings_mgr.plan_revert(&snapshot.settings_state, &snapshot.gateway_url)?;
 
         // Unwind in the reverse of takeover's order. `merge_byok` freezes Kiro's
         // auto-update (`update.mode: "none"`) precisely so an update cannot
@@ -319,7 +326,6 @@ impl SnapshotManager {
             }
         }
 
-        let settings_mgr = SettingsManager::at(&snapshot.settings_path);
         settings_mgr.revert(&snapshot.settings_state, &snapshot.gateway_url)?;
 
         // The takeover is over either way: the settings are reverted and the patch
