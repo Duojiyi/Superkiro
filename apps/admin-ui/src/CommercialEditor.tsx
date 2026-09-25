@@ -104,17 +104,34 @@ export default function CommercialEditor({ kind,onDirtyChange,onBusyChange }: {k
   const numericFields = ['virtual_usage_limit', 'margin_multiplier', 'context_window', 'max_output', 'credit_multiplier'];
   const fields = kind === 'groups' ? ['name', 'issuance_enabled', 'virtual_plan_name', 'virtual_usage_limit', 'rate_card_id', 'margin_multiplier'] : ['exposed_model_id', 'target_provider_id', 'target_model', 'group_id', 'context_window', 'max_output', 'credit_multiplier', 'visible', 'supports_tools', 'supports_vision', 'supports_reasoning'];
   const labels: Record<string, string> = {name: '分组名称', issuance_enabled: '允许发放新卡', virtual_plan_name: '虚拟套餐名称（非发卡套餐）', virtual_usage_limit: '虚拟用量上限（非发卡积分）', rate_card_id: '价格表 ID', margin_multiplier: '分组扣费倍率（1 = 不加倍）', exposed_model_id: '展示模型 ID', target_provider_id: '供应商 ID', target_model: '上游模型 ID', group_id: '分组 ID', context_window: '上下文长度', max_output: '最大输出', credit_multiplier: '模型扣费倍率（1 = 不加倍）', visible: '发布到用户目录', supports_tools: '工具调用', supports_vision: '视觉', supports_reasoning: '推理'};
-  const apply = (next: CommercialConfig) => {
+  // An unpublished draft survives a session end, restored only onto the configuration it
+  // was made from; the draft holds no secret.
+  const draftKey = `admin-commercial-draft:v1:${kind}`;
+  const apply = (next: CommercialConfig): 'restored' | 'stale' | 'none' => {
     const value = JSON.stringify(kind === 'groups' ? {groups: next.groups} : {models: next.models, rate_cards: next.rate_cards, versions: []}, null, 2);
-    setConfig(next); setSelected(String(next[kind][0]?.id ?? '')); setPriceDraft(null); setPriceInputs({}); setReason(''); setLoadedDraft(value); setDraft(value); setNeedsReview(false);
+    let saved: {base?: unknown; draft?: unknown; reason?: unknown} = {};
+    try {saved = JSON.parse(sessionStorage.getItem(draftKey) || '{}') ?? {};} catch {/* nothing to restore */}
+    const restore = saved.base === value && typeof saved.draft === 'string' && typeof saved.reason === 'string';
+    setConfig(next); setSelected(String(next[kind][0]?.id ?? '')); setPriceDraft(null); setPriceInputs({}); setReason(restore ? String(saved.reason) : ''); setLoadedDraft(value); setDraft(restore ? String(saved.draft) : value); setNeedsReview(false);
+    return restore ? 'restored' : typeof saved.draft === 'string' ? 'stale' : 'none';
   };
+  useEffect(() => {
+    if (!loadedDraft) return;
+    try {
+      if (draft !== loadedDraft || reason.trim()) sessionStorage.setItem(draftKey, JSON.stringify({base: loadedDraft, draft, reason}));
+      else sessionStorage.removeItem(draftKey);
+    } catch {/* A draft that cannot be kept is only lost at a session end. */}
+  }, [draft, loadedDraft, reason, draftKey]);
   const load = async () => {
     if (pending.current) return;
     pending.current = true; setBusy(true); setMessage('正在读取配置…');
     try {
       const result = await adminApi.getCommercialConfig();
       if (result.success !== true || !result.config?.revision) throw new Error('服务器未确认配置读取成功');
-      if (alive.current) {apply(result.config); setMessage('当前配置已加载。历史价格只读；调整价格请创建新版本。');}
+      if (alive.current) {
+        const draftState = apply(result.config);
+        setMessage(draftState === 'restored' ? '已恢复会话到期前未发布的草稿，请核对后发布。' : draftState === 'stale' ? '配置已在别处更新，之前未发布的草稿基于旧配置，未恢复；请在当前配置上重新编辑。' : '当前配置已加载。历史价格只读；调整价格请创建新版本。');
+      }
     } catch (error) {
       if (alive.current) {setNeedsReview(true); setMessage(`${error instanceof Error ? error.message : String(error)}。读取失败，原草稿已保留；重新读取成功前不可发布。`);}
     } finally {pending.current = false; if (alive.current) setBusy(false);}
@@ -157,6 +174,7 @@ export default function CommercialEditor({ kind,onDirtyChange,onBusyChange }: {k
       const result = await adminApi.publishCommercialConfig({...parsedDraft, expected_revision: config.revision, reason: reason.trim()});
       if (result.success !== true) throw new AdminApiError('服务器未确认发布成功', 400);
       if (!result.config?.revision) throw new Error('服务器未返回可核对的配置版本');
+      try {sessionStorage.removeItem(draftKey);} catch {/* published; nothing left to keep */}
       if (alive.current) {apply(result.config); setMessage('发布成功，配置与审计记录已保存。');}
     } catch (error) {
       if (alive.current) {

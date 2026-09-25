@@ -30,17 +30,19 @@ export default function App() {
   const [totpRequired,setTotpRequired]=useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [expiring, setExpiring] = useState(false);
   const attempt = useRef(0);
   const pending = useRef(false);
 
   useEffect(() => {
     let current = true;
     const version = ++attempt.current;
-    adminApi.onUnauthorized = () => {
+    adminApi.onUnauthorized = (reason) => {
       ++attempt.current;
-      setPassword('');setTotpCode(''); setAuthState('unauthenticated');
-      setError('');
+      setPassword('');setTotpCode(''); setAuthState('unauthenticated');setExpiring(false);
+      setError(reason === 'expired' ? '会话已到期（每次登录有效 15 分钟），请重新登录。未发布的公告和配置草稿已保留。' : '');
     };
+    adminApi.onExpiring = () => {if (current) setExpiring(true);};
     adminApi.onSessionChanged = () => {
       if (current) setWorkspaceVersion(version => version + 1);
     };
@@ -51,7 +53,7 @@ export default function App() {
         adminApi.clearSession(); setAuthState('unauthenticated');
       }
     }).finally(()=>{if(current)setTotpRequired(adminApi.totpRequired);});
-    return () => {current = false; ++attempt.current; adminApi.onUnauthorized = undefined; adminApi.onSessionChanged = undefined; adminApi.clearSession();};
+    return () => {current = false; ++attempt.current; adminApi.onUnauthorized = undefined; adminApi.onSessionChanged = undefined; adminApi.onExpiring = undefined; adminApi.clearSession();};
   }, []);
 
   useEffect(()=>{
@@ -71,7 +73,7 @@ export default function App() {
     const version = ++attempt.current;
     try {
       await adminApi.establishSession(username.trim(), password, totpCode || undefined);
-      if (version === attempt.current) {setPassword('');setTotpCode('');setRecheckError(''); setAuthState('authenticated');}
+      if (version === attempt.current) {setPassword('');setTotpCode('');setRecheckError('');setExpiring(false); setAuthState('authenticated');}
     } catch (cause) {
       if (version === attempt.current) {
         adminApi.clearSession(); setError(cause instanceof Error ? cause.message : '登录失败，请重试');
@@ -93,7 +95,7 @@ export default function App() {
   }
 
   if (authState === 'checking') return <main className="auth-page"><p role="status">正在检查会话…</p></main>;
-  if (authState === 'authenticated') return <><div ref={node=>{if(node)node.inert=rechecking||!!recheckError;}} aria-hidden={rechecking||!!recheckError||undefined}><AdminWorkspace key={workspaceVersion} onLogout={logout} operator={adminApi.authenticatedUsername} onReauthenticate={()=>{++attempt.current;adminApi.clearSession();setAuthState('unauthenticated');setError('请重新登录确认调账账户，未确认意图不会自动提交。');}} /></div>{(rechecking||recheckError)&&<div className="fixed inset-0 z-[100] bg-white/80 flex items-center justify-center" role="status" aria-live="polite">{rechecking?'正在检查会话…':<section><p>{recheckError}</p><button onClick={()=>window.dispatchEvent(new Event('focus'))}>重新验证会话</button></section>}</div>}</>;
+  if (authState === 'authenticated') return <>{expiring&&<div className="fixed inset-x-0 top-0 z-[110] bg-amber-100 text-amber-900 text-sm px-4 py-2 text-center" role="alert">会话将在约 2 分钟后到期。到期后需要重新登录；未发布的公告和配置草稿会保留，请先完成正在进行的操作。</div>}<div ref={node=>{if(node)node.inert=rechecking||!!recheckError;}} aria-hidden={rechecking||!!recheckError||undefined}><AdminWorkspace key={workspaceVersion} onLogout={logout} operator={adminApi.authenticatedUsername} onReauthenticate={()=>{++attempt.current;adminApi.clearSession();setAuthState('unauthenticated');setError('请重新登录确认调账账户，未确认意图不会自动提交。');}} /></div>{(rechecking||recheckError)&&<div className="fixed inset-0 z-[100] bg-white/80 flex items-center justify-center" role="status" aria-live="polite">{rechecking?'正在检查会话…':<section><p>{recheckError}</p><button onClick={()=>window.dispatchEvent(new Event('focus'))}>重新验证会话</button></section>}</div>}</>;
   return <main className="auth-page"><section className="auth-card" aria-labelledby="login-title">
     <p className="auth-brand">Superkiro</p><h1 id="login-title">管理员登录</h1>
     <form onSubmit={event => {event.preventDefault(); void login();}} aria-busy={busy}>
@@ -232,9 +234,17 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
   const [cardGroups, setCardGroups] = useState<Array<Record<string, unknown>>>([]);
 
   // New announcement form
-  const [noticeTitle, setNoticeTitle] = useState('');
-  const [noticeLevel, setNoticeLevel] = useState<'info' | 'warning' | 'critical'>('info');
-  const [noticeContent, setNoticeContent] = useState('');
+  const noticeDraftKey = 'admin-announcement-draft:v1';
+  const [savedNotice] = useState<Record<string, unknown>>(() => {try {const value = JSON.parse(sessionStorage.getItem(noticeDraftKey) || '{}'); return value && typeof value === 'object' ? value : {};} catch {return {};}});
+  const [noticeTitle, setNoticeTitle] = useState<string>(() => typeof savedNotice.title === 'string' ? savedNotice.title : '');
+  const [noticeLevel, setNoticeLevel] = useState<'info' | 'warning' | 'critical'>(() => savedNotice.level === 'warning' || savedNotice.level === 'critical' ? savedNotice.level : 'info');
+  const [noticeContent, setNoticeContent] = useState<string>(() => typeof savedNotice.content === 'string' ? savedNotice.content : '');
+  useEffect(() => {
+    try {
+      if (noticeTitle || noticeContent) sessionStorage.setItem(noticeDraftKey, JSON.stringify({title: noticeTitle, level: noticeLevel, content: noticeContent}));
+      else sessionStorage.removeItem(noticeDraftKey);
+    } catch {/* A draft that cannot be kept is only lost at a session end. */}
+  }, [noticeTitle, noticeLevel, noticeContent]);
   const noticeStorageKey = 'admin-pending-announcement:v1';
   const [noticeRecovery, setNoticeRecovery] = useState<'refresh' | 'review' | null>(() => {
     try {return sessionStorage.getItem(noticeStorageKey) ? 'refresh' : null;} catch {return 'refresh';}

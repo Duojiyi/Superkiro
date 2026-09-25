@@ -108,6 +108,9 @@ export interface AdminAnnouncement {
   expires_at?: number;
 }
 
+// How long before the end of a session the operator is warned.
+export const SESSION_WARNING_MS = 120_000;
+
 export class AdminApiClient {
   private baseUrl: string;
   private csrfToken = '';
@@ -115,11 +118,15 @@ export class AdminApiClient {
   authenticatedUsername: string|null = null;
   private sessionVersion = 0;
   private requests = new Set<AbortController>();
-  onUnauthorized?: () => void;
+  // 'expired': the session reached its fixed lifetime; the login page says so.
+  onUnauthorized?: (reason?: 'expired') => void;
   onSessionChanged?: () => void;
+  // Shortly before the session ends, so the operator can finish what they are doing.
+  onExpiring?: () => void;
   twoFactorEnabled: boolean | undefined;
   totpRequired = false;
   private expiryTimer?: ReturnType<typeof setTimeout>;
+  private warningTimer?: ReturnType<typeof setTimeout>;
   private expiresAt = 0;
 
   constructor(baseUrl: string = '') { this.baseUrl = baseUrl; }
@@ -136,7 +143,7 @@ export class AdminApiClient {
   }
 
   clearSession() {
-    clearTimeout(this.expiryTimer);this.expiresAt=0;
+    clearTimeout(this.expiryTimer);clearTimeout(this.warningTimer);this.expiresAt=0;
     this.authenticatedUsername=null;this.csrfToken = ''; this.sessionVersion++;
     for (const controller of this.requests) controller.abort();
     this.requests.clear();
@@ -155,7 +162,7 @@ export class AdminApiClient {
   }
 
   private async request<T>(path: string, options: RequestInit = {}, blob = false): Promise<T> {
-    if(this.expiresAt && Date.now()>=this.expiresAt){this.clearSession();this.onUnauthorized?.();}
+    if(this.expiresAt && Date.now()>=this.expiresAt){this.clearSession();this.onUnauthorized?.('expired');}
     if (path !== '/api/v1/admin/session' && !this.csrfToken) throw new Error('请先登录');
     const headers = new Headers(options.headers || {});
     if (options.method && !['GET', 'HEAD', 'OPTIONS'].includes(options.method)) headers.set('x-csrf-token', this.csrfToken);
@@ -186,9 +193,9 @@ export class AdminApiClient {
     } catch(error){if(controller.signal.aborted&&version===this.sessionVersion)throw new Error('请求超时，结果未确认；写操作请核对后重试');throw error;} finally {clearTimeout(timer);this.requests.delete(controller);}
   }
 
-  async checkAuth(): Promise<{ success: boolean; role: string; csrfToken: string; expiresAt?: number; twoFactorEnabled?: boolean; totpRequired?: boolean }> {
+  async checkAuth(): Promise<{ success: boolean; role: string; csrfToken: string; expiresAt?: number; expiresIn?: number; twoFactorEnabled?: boolean; totpRequired?: boolean }> {
     const version = this.sessionVersion;
-    const result = await this.request<{ success: boolean; role: string; csrfToken: string; expiresAt?: number; twoFactorEnabled?: boolean; totpRequired?: boolean }>('/api/v1/admin/session');
+    const result = await this.request<{ success: boolean; role: string; csrfToken: string; expiresAt?: number; expiresIn?: number; twoFactorEnabled?: boolean; totpRequired?: boolean }>('/api/v1/admin/session');
     if (version !== this.sessionVersion) throw new Error('管理会话已改变，请重新加载');
     if (result.success !== true || result.role !== 'admin' || typeof result.csrfToken !== 'string' || !result.csrfToken) {
       this.clearSession(); this.onUnauthorized?.();
@@ -200,11 +207,15 @@ export class AdminApiClient {
     if(this.csrfToken!==result.csrfToken)this.authenticatedUsername=null;
     this.csrfToken = result.csrfToken;
     this.twoFactorEnabled=result.twoFactorEnabled;this.totpRequired=result.totpRequired===true;
-    clearTimeout(this.expiryTimer);
-    if(result.expiresAt!==undefined){
-      if(!Number.isFinite(result.expiresAt)||result.expiresAt*1000<=Date.now()){this.clearSession();this.onUnauthorized?.();throw new Error('管理会话已到期');}
-      this.expiresAt=result.expiresAt*1000;
-      this.expiryTimer=setTimeout(()=>{this.clearSession();this.onUnauthorized?.();},Math.min(2147483647,this.expiresAt-Date.now()));
+    clearTimeout(this.expiryTimer);clearTimeout(this.warningTimer);
+    if(result.expiresAt!==undefined||result.expiresIn!==undefined){
+      // The server's remaining lifetime, not its clock: an operator's clock ahead of the
+      // server's by more than the lifetime otherwise ended every new session at once.
+      const remaining=typeof result.expiresIn==='number'?result.expiresIn*1000:Number(result.expiresAt)*1000-Date.now();
+      if(!Number.isFinite(remaining)||remaining<=0){this.clearSession();this.onUnauthorized?.('expired');throw new Error('管理会话已到期');}
+      this.expiresAt=Date.now()+remaining;
+      this.expiryTimer=setTimeout(()=>{this.clearSession();this.onUnauthorized?.('expired');},Math.min(2147483647,remaining));
+      if(remaining>SESSION_WARNING_MS)this.warningTimer=setTimeout(()=>this.onExpiring?.(),Math.min(2147483647,remaining-SESSION_WARNING_MS));
     }
     if (changed) this.onSessionChanged?.();
     return result;
