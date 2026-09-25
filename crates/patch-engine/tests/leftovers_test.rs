@@ -119,7 +119,7 @@ fn a_takeover_whose_records_are_lost_is_found_and_undone() {
 }
 
 #[test]
-fn a_patch_whose_backup_is_gone_needs_a_reinstall_but_the_rest_is_still_undone() {
+fn a_patch_whose_backup_is_gone_needs_a_reinstall_before_the_rest_is_undone() {
     let machine = Machine::taken_over("unrecoverable");
     let patcher = ExtensionPatcher::new(&machine.extension);
     fs::remove_file(patcher.backup_path()).unwrap();
@@ -129,15 +129,29 @@ fn a_patch_whose_backup_is_gone_needs_a_reinstall_but_the_rest_is_still_undone()
     assert!(found.patches.is_empty());
     assert_eq!(found.unrecoverable, vec![machine.extension.clone()]);
 
+    let settings_before = fs::read(machine.settings.path()).unwrap();
+    let token_before = fs::read(machine.token.path()).unwrap();
     let error = machine.remove(&found).unwrap_err();
     assert!(error.contains("reinstall Kiro"), "{error}");
-    // What sends the customer's own traffic to the gateway is gone regardless, and
-    // Kiro's updater is released so an update can replace the patched bundle.
+    // The patched bundle still sends Kiro's runtime calls to the gateway: clearing the
+    // settings and token now would let the customer's own sign-in reach it. Both stay.
+    assert_eq!(fs::read(machine.settings.path()).unwrap(), settings_before);
+    assert_eq!(fs::read(machine.token.path()).unwrap(), token_before);
+    assert_eq!(patcher.status(), PatchStatus::Patched);
+
+    // Reinstalling Kiro replaces the bundle; the same cleanup then completes.
+    fs::write(
+        &machine.extension,
+        format!("// bundle\nfunction e(t) {{ return \"{RUNTIME_ENDPOINT_NEEDLE}\"; }}\n"),
+    )
+    .unwrap();
+    let found = machine.scan();
+    assert!(found.unrecoverable.is_empty());
+    machine.remove(&found).unwrap();
     let settings = machine.settings.read_settings().unwrap();
     assert!(!settings.contains_key("kiroAuthConfig"));
-    assert!(!settings.contains_key("update.mode"));
     assert!(machine.token.load().is_err());
-    assert_eq!(patcher.status(), PatchStatus::Patched);
+    assert!(!machine.scan().found());
 }
 
 /// A backup deleted or replaced on its own (a cleaner, a virus scanner) is as lost as

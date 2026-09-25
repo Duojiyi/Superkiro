@@ -67,9 +67,11 @@ impl Leftovers {
     /// Undo what was found. Kiro must not be running.
     ///
     /// Bundles are rolled back from their own material first, then the settings and
-    /// the token are cleared. Settings are cleared even when a bundle cannot be rolled
-    /// back: they are what sends the customer's own traffic to the gateway, and
-    /// releasing Kiro's updater lets an update replace the patched bundle.
+    /// the token are cleared. While a bundle that cannot be rolled back remains, the
+    /// settings and the gateway's token stay, as a restore with records keeps them: that
+    /// bundle still sends Kiro's runtime calls to the gateway, so a fresh official sign-in
+    /// would carry the customer's own token there. Reinstalling Kiro replaces it, and the
+    /// same cleanup then completes.
     pub fn remove(
         &self,
         settings: &SettingsManager,
@@ -89,6 +91,12 @@ impl Leftovers {
                 .restore()
                 .map_err(|error| error.to_string())?;
         }
+        if !self.unrecoverable.is_empty() {
+            return Err(
+                "Kiro's extension is still modified and its backup is gone; reinstall Kiro to replace it"
+                    .into(),
+            );
+        }
         if self.settings {
             settings
                 .remove_orphaned_takeover(gateway_hosts)
@@ -96,12 +104,6 @@ impl Leftovers {
         }
         if self.token {
             token.clear().map_err(|error| error.to_string())?;
-        }
-        if !self.unrecoverable.is_empty() {
-            return Err(
-                "Kiro's extension is still modified and its backup is gone; reinstall Kiro to replace it"
-                    .into(),
-            );
         }
         Ok(())
     }
