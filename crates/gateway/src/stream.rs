@@ -147,6 +147,21 @@ impl StreamGuardConfig {
 
 const DEFAULT_SEND_DEADLINE: Duration = Duration::from_secs(600);
 
+/// Set once, when the gateway is stopping and its drain is over.
+static STOPPING: std::sync::OnceLock<tokio::sync::watch::Sender<bool>> = std::sync::OnceLock::new();
+
+fn stopping() -> &'static tokio::sync::watch::Sender<bool> {
+    STOPPING.get_or_init(|| tokio::sync::watch::channel(false).0)
+}
+
+/// End every open stream, and any that starts from now on, as a response cut off by a
+/// restart, each billed for what it streamed. The gateway calls this when it stops: it
+/// used to wait for every stream, which may run ten minutes, so it was killed with
+/// streams still running, and their holds were dropped at the next start unbilled.
+pub fn cut_open_streams() {
+    stopping().send_replace(true);
+}
+
 /// How long a terminal frame may wait for the client, deadline or not. Without it Kiro
 /// sees a response that simply stops, with no reason and no end.
 const TERMINAL_FRAME_GRACE: Duration = Duration::from_secs(3);
@@ -207,6 +222,13 @@ impl Failure {
                     .into(),
             ),
             "Response exceeded the time limit and was cut off",
+        )
+    }
+
+    fn restarting() -> Self {
+        Self::new(
+            Some("\n\n**网关正在重启，本次响应已被截断。**可以让模型从这里继续。\n".into()),
+            "The gateway is restarting; the response was cut off",
         )
     }
 
@@ -309,6 +331,7 @@ pub fn create_stream_guard_with_send_deadline(
         let mut interval = tokio::time::interval(config.keepalive_interval);
         let deadline_sleep = tokio::time::sleep_until(send_deadline);
         tokio::pin!(deadline_sleep);
+        let mut stop = stopping().subscribe();
         interval.tick().await;
         let mut upstream = Box::pin(upstream_stream);
         let mut tool_calls = ToolCalls::default();
@@ -333,6 +356,10 @@ pub fn create_stream_guard_with_send_deadline(
             tokio::select! {
                 _ = tx.closed() => break,
                 _ = &mut deadline_sleep => break,
+                _ = async { drop(stop.wait_for(|stop| *stop).await) } => {
+                    failure = Some(Failure::restarting());
+                    break;
+                }
                 _ = interval.tick() => {
                     if !send_frame(&tx, Bytes::from(kiro_wire::encoder::encode_keepalive()), send_deadline).await {
                         break;

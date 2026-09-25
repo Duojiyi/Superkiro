@@ -392,7 +392,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         listener,
         router.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(async {
+        shutdown_signal().await;
+        // A stream may run ten minutes, and the container is killed 90 seconds after it
+        // is told to stop (stop_grace_period). Streams still open after the drain are cut,
+        // so each settles what it streamed before the final save below.
+        tokio::spawn(async {
+            tokio::time::sleep(STREAM_DRAIN).await;
+            println!("[*] Drain over; cutting the streams still open");
+            gateway::stream::cut_open_streams();
+        });
+    })
     .await?;
 
     // 9. 停机持久化保证 (Durability Guarantee on Shutdown)
@@ -408,6 +418,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 const BOOTSTRAP_CARD_ID: &str = "card-dev-bootstrap";
+
+/// How long a stopping gateway lets open streams finish before cutting them, within the
+/// 90-second stop grace period of the compose files and the release tool.
+const STREAM_DRAIN: Duration = Duration::from_secs(60);
 
 /// Seed the bootstrap card for `dev_code`, once. A card already holding the code is left
 /// alone, and a new code goes to the bootstrap card already there, which keeps its balance
