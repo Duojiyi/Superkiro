@@ -47,6 +47,7 @@ for (const input of ['', '-1', 'NaN', 'Infinity', '1e3', '1.0000001', '900719925
     [() => api.updateCardStatus('card-2', 'archive', 'cleanup'), '/cards/status', {cardId:'card-2',action:'archive',reason:'cleanup'}],
     [() => api.updateCardStatus('card-2', 'unarchive', 'review'), '/cards/status', {cardId:'card-2',action:'unarchive',reason:'review'}],
     [() => api.createAnnouncement('notice', 'body', 'warning', 3600), '/announcements', {title:'notice',content:'body',level:'warning',ttlSecs:3600}],
+    [() => api.withdrawAnnouncement('ann-1'), '/announcements/withdraw', {id:'ann-1'}],
     [() => api.updateProviderStatus('provider-1', false), '/providers/status', {providerId:'provider-1',enabled:false}],
     [() => api.pruneTraces(123), '/traces/prune', {cutoffSecs:123}],
     [() => api.manageKey('save', {provider_id:'p',key_id:'k',allowed_models:[]}), '/providers/keys', {provider_id:'p',key_id:'k',allowed_models:[]}],

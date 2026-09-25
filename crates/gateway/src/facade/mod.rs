@@ -317,6 +317,10 @@ impl FacadeRegistry {
                 billing: billing.clone(),
                 auth: auth.clone(),
             })
+            .register(admin::AdminWithdrawAnnouncementHandler {
+                billing: billing.clone(),
+                auth: auth.clone(),
+            })
             .register(admin::AdminSnapshotSyncHandler { billing, auth });
         self
     }

@@ -297,6 +297,10 @@ export class AdminApiClient {
     });
   }
 
+  async withdrawAnnouncement(id: string): Promise<{ success: boolean; id: string }> {
+    return this.request('/api/v1/admin/announcements/withdraw', {method: 'POST', body: JSON.stringify({id})});
+  }
+
   async getFinancials(): Promise<AdminFinancials> {
     return this.request('/api/v1/admin/financials');
   }

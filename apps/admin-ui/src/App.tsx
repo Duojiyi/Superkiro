@@ -596,6 +596,20 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
     } finally {writing.current=false;setMutationBusy(false);}
   };
 
+  const handleWithdrawNotice = async (notice: AdminAnnouncement) => {
+    if (mutationBusy || writing.current) return;
+    if (!window.confirm(`确认撤回公告「${notice.title}」？撤回后客户端不再显示该公告（已打开的客户端在下次刷新公告时移除）。`)) return;
+    try {
+      setMutationBusy(true); setActionError(''); writing.current = true;
+      const res = await adminApi.withdrawAnnouncement(notice.id);
+      if (res.success !== true) throw new Error('服务端未确认撤回');
+      showToast(`公告「${notice.title}」已撤回`);
+      refreshData();
+    } catch (err: any) {
+      setActionError(`公告撤回结果未确认：${err.message}。请刷新公告列表核对。`);
+    } finally {writing.current = false; setMutationBusy(false);}
+  };
+
   useEffect(() => {setSelectedCardIds([]); setCardPage(0);}, [searchQuery, groupFilter, cardStatusFilter, activeTab]);
   useEffect(() => {setSelectedCardIds([]);}, [cardPage]);
   const changeCardFilter = (update: () => void) => {setSelectedCardIds([]); setCardPage(0); update();};
@@ -956,7 +970,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
               <div className="actions"><button disabled={noticeChecking} onClick={() => void refreshNoticesForReview()}>{noticeChecking ? '正在刷新公告…' : '刷新公告以核对'}</button>
                 <button disabled={noticeChecking || noticeRecovery !== 'review'} onClick={() => {if (window.confirm('确认已核对刷新后的公告列表？若已有相同公告，请勿再次发布。解除限制不会自动提交。')) {try{sessionStorage.removeItem(noticeStorageKey);setNoticeRecovery(null);setActionError('');}catch{setActionError('无法清除待核对记录，仍禁止发布。');}}}}>已核对列表，解除发布限制</button></div>
             </section>}
-            <section className="panel"><table><thead><tr><th>标题</th><th>范围</th><th>发布时间</th><th>状态</th><th>操作</th></tr></thead><tbody>{announcements.map(notice => <tr key={notice.id}><td>{notice.title}</td><td>全部用户</td><td>{new Date(notice.created_at * 1000).toLocaleString()}</td><td>{!notice.enabled ? '已停用' : notice.expires_at && notice.expires_at < Date.now()/1000 ? '已到期' : '已发布'}</td><td><details><summary>预览</summary><p>{notice.content}</p></details></td></tr>)}{!announcements.length && <tr><td colSpan={5} className="empty-state"><ListEmptyState loading={loading} failed={dataFailures.announcements} empty="尚无公告。可在下方编辑并预览，确认后发布。" onRetry={() => void refreshData()} /></td></tr>}</tbody></table></section>
+            <section className="panel"><table><thead><tr><th>标题</th><th>范围</th><th>发布时间</th><th>状态</th><th>操作</th></tr></thead><tbody>{announcements.map(notice => <tr key={notice.id}><td>{notice.title}</td><td>全部用户</td><td>{new Date(notice.created_at * 1000).toLocaleString()}</td><td>{!notice.enabled ? '已停用' : notice.expires_at && notice.expires_at < Date.now()/1000 ? '已到期' : '已发布'}</td><td><details><summary>预览</summary><p>{notice.content}</p></details>{notice.enabled && <button disabled={mutationBusy || !isAuthenticated} onClick={() => void handleWithdrawNotice(notice)}>撤回</button>}</td></tr>)}{!announcements.length && <tr><td colSpan={5} className="empty-state"><ListEmptyState loading={loading} failed={dataFailures.announcements} empty="尚无公告。可在下方编辑并预览，确认后发布。" onRetry={() => void refreshData()} /></td></tr>}</tbody></table></section>
             <div className="two-columns"><section className="panel"><h3>编辑公告</h3><div className="field-grid"><label>标题<input aria-label="公告标题" value={noticeTitle} onChange={e => setNoticeTitle(e.target.value)} /></label><label>等级<select aria-label="公告等级" value={noticeLevel} onChange={e => setNoticeLevel(e.target.value as typeof noticeLevel)}><option value="info">普通提示</option><option value="warning">预警通知</option><option value="critical">紧急通知</option></select></label><label className="full-width">正文<textarea rows={4} aria-label="正文内容" value={noticeContent} onChange={e => setNoticeContent(e.target.value)} /></label></div></section><section className="panel"><h3>用户侧预览</h3><h4>{noticeTitle || '尚未填写标题'}</h4><p className="preview-content">{noticeContent || '填写正文后在此预览。'}</p><p className="muted">全部用户 · 发布后有效期 7 天</p><div className="actions"><button className="primary" disabled={!isAuthenticated || !!noticeRecovery || !noticeTitle.trim() || !noticeContent.trim()} onClick={() => setShowNoticeModal(true)}>预览并确认发布</button></div></section></div>
             <section className="notice-panel"><h3>发布确认</h3><p>公告发布后对全部用户可见，有效期为 7 天。请确认正文、通知等级和服务状态准确。</p></section>
           </div>}

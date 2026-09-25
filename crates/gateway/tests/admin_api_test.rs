@@ -1126,3 +1126,51 @@ async fn the_operator_can_archive_the_ledger_to_shrink_the_saved_state() {
     assert_eq!(payload.entries[0].card_id, "card-archive");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test]
+async fn a_published_announcement_can_be_withdrawn_and_stops_being_shown() {
+    let (billing, app) = setup_admin_app();
+    let now = gateway::now_secs();
+    billing.add_announcement(
+        billing::Announcement::new(
+            "ann-wrong",
+            "Wrong window",
+            "Maintenance tonight",
+            billing::AnnouncementLevel::Critical,
+            now,
+        )
+        .with_expiry(now + 3600),
+    );
+    let withdraw = |id: &str| {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/admin/announcements/withdraw")
+            .header("x-admin-key", TEST_ADMIN_KEY)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({ "id": id }).to_string()))
+            .unwrap()
+    };
+    let resp = tower::ServiceExt::oneshot(app.clone(), withdraw("ann-wrong"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(billing.list_active_announcements(now).is_empty());
+    // Kept on record, not deleted.
+    assert!(billing
+        .export_snapshot()
+        .announcements
+        .iter()
+        .any(|a| a.id == "ann-wrong" && !a.enabled));
+    let resp = tower::ServiceExt::oneshot(app.clone(), withdraw("ann-missing"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let anonymous = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/admin/announcements/withdraw")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({ "id": "ann-wrong" }).to_string()))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app, anonymous).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}

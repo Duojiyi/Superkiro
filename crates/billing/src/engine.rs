@@ -4274,6 +4274,23 @@ impl BillingEngine {
         self.sync_to_disk();
     }
 
+    /// Withdraw a published announcement: it stops being shown at once and stays on
+    /// record. Returns false when no announcement has that id.
+    pub fn withdraw_announcement(&self, id: &str) -> bool {
+        let found = {
+            let _state_guard = self.state_lock.write().unwrap();
+            let mut anns = self.announcements.write().unwrap();
+            anns.iter_mut()
+                .find(|a| a.id == id)
+                .map(|a| a.enabled = false)
+                .is_some()
+        };
+        if found {
+            self.sync_to_disk();
+        }
+        found
+    }
+
     /// List active platform announcements (Spec §14.4).
     pub fn list_active_announcements(&self, now_secs: u64) -> Vec<Announcement> {
         let anns = self.announcements.read().unwrap();

@@ -1686,6 +1686,66 @@ impl FacadeHandler for AdminCreateAnnouncementHandler {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct AdminWithdrawAnnouncementRequest {
+    pub id: String,
+}
+
+/// A published announcement pops up on every customer client until it expires; a wrong
+/// one must be withdrawable instead of contradicted by a second one.
+pub struct AdminWithdrawAnnouncementHandler {
+    pub billing: BillingEngine,
+    pub auth: Arc<AdminAuthState>,
+}
+
+impl FacadeHandler for AdminWithdrawAnnouncementHandler {
+    fn method(&self) -> Method {
+        Method::POST
+    }
+
+    fn path(&self) -> &'static str {
+        "/api/v1/admin/announcements/withdraw"
+    }
+
+    fn handle<'a>(&'a self, req: Request<Body>) -> BoxFuture<'a, Response> {
+        Box::pin(async move {
+            if !self.auth.verify(req.headers()) {
+                return unauthorized_response();
+            }
+            let id = match axum::body::to_bytes(req.into_body(), 4 * 1024)
+                .await
+                .ok()
+                .and_then(|bytes| {
+                    serde_json::from_slice::<AdminWithdrawAnnouncementRequest>(&bytes).ok()
+                }) {
+                Some(request) if valid_text(&request.id, 128) => request.id,
+                _ => {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidRequestException",
+                        "announcement id is required",
+                    )
+                }
+            };
+            if !self.billing.withdraw_announcement(&id) {
+                return error_response(
+                    StatusCode::NOT_FOUND,
+                    "ResourceNotFoundException",
+                    "announcement not found",
+                );
+            }
+            eprintln!(
+                "{}",
+                serde_json::json!({"event": "admin_announcement_withdrawn", "id": id})
+            );
+            json_response(
+                StatusCode::OK,
+                &serde_json::json!({ "success": true, "id": id }),
+            )
+        })
+    }
+}
+
 // 7. Admin Snapshot Sync Handler (POST /api/v1/admin/snapshot/sync)
 pub struct AdminSnapshotSyncHandler {
     pub billing: BillingEngine,
