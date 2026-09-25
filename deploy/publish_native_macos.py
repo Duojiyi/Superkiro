@@ -51,10 +51,12 @@ def validate_archive(data, arch):
 
 
 def carries_release(data, version):
-    """Whether the app's executable was built as `version` (see publish_native_windows)."""
+    """Whether the app's executable is a release build of `version` (see
+    publish_native_windows): its marker once, and nothing only a debug build carries."""
     with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as archive:
         executable = archive.extractfile('Superkiro.app/Contents/MacOS/Superkiro').read()
-    return executable.count(update_signing.release_marker(version)) == 1
+    return (executable.count(update_signing.release_marker(version)) == 1
+            and not update_signing.debug_build(executable))
 
 
 def prepare(source, version, acceptance, arch, key, mandatory=True):

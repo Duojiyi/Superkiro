@@ -5,25 +5,30 @@
 //! signature, by one of `UPDATE_KEYS`, over its target, version, size and hash: whoever
 //! controls the server or the network can withhold an update, never substitute one.
 //!
-//! Installing swaps the new bytes into place, then starts them beside the old version kept
-//! aside. The new version proves itself: once its window is up it confirms, and only then
-//! is the old version deleted. A new version that never confirms - it crashed, its window
-//! never loaded, an antivirus quarantined it - is rolled back at the next start, and its
-//! hash is refused so the client cannot be pushed into the same broken release again.
+//! Installing never touches the client the customer starts until the new version has
+//! proven itself. The verified download is staged beside it and started from there, and
+//! the old version exits. Once the new version's window is up and talking to the host it
+//! confirms: it moves the old version aside and itself into its place. Until then the
+//! customer's own shortcut still starts the old version, whatever happens to the new one:
+//! a crash, a window that never loads, an antivirus quarantining it, or the customer
+//! starting the client again meanwhile. A trial that ends without confirming is counted,
+//! and after two such trials that release's hash is refused, so a broken release cannot
+//! restart the client again and again.
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Public halves of the offline release keys (deploy/update_signing.py). A list, so a new
 /// key can ship in a release, trusted alongside the old, before the old one is retired.
 const UPDATE_KEYS: &[&str] = &["346633520d5a0d37dbf8cc09028724118a84c7eb14181596e2a8439a699263eb"];
 
 /// Trusted only by debug builds, for local end-to-end tests (the key seeded with byte 42 in
-/// .review-scratch/update_demo.py). A release build never trusts it, so a manifest signed
-/// with it cannot update customers.
+/// .review-scratch/update_demo.py). A release build never trusts it, and the publishers
+/// refuse any binary that carries it.
 #[cfg(debug_assertions)]
 const TEST_UPDATE_KEY: &str = "197f6b23e16c8532c6abc838facd5ea789be0c76b2920334039bfa8b3d368d61";
 
@@ -40,24 +45,53 @@ fn trusted_keys() -> Vec<&'static str> {
 /// whole marker in the binary through `/OPT:REF,ICF` and dead-stripping, one copy only.
 static RELEASE_MARKER: &str = concat!("superkiro-release:", env!("SUPERKIRO_RELEASE_VERSION"), ";");
 
+/// The identifier in tauri.conf.json, which names the local data directory.
+const IDENTIFIER: &str = "app.superkiro.desktop";
 const MANIFEST_LIMIT: usize = 256 * 1024;
 const ARTIFACT_LIMIT: u64 = 512 * 1024 * 1024;
-/// Set for the new process by the one it replaces: that process's id, and where it should
-/// write the marker that tells the replaced process it has started.
+/// Set for the new version by the one it replaces: that process's id, and the marker the
+/// new version writes to say it has started.
 const HANDOFF_PID: &str = "SUPERKIRO_UPDATE_HANDOFF";
 const HANDOFF_MARKER: &str = "SUPERKIRO_UPDATE_MARKER";
+/// Set for the customer's own version when a trial that never came up steps aside for it:
+/// the trial's process id, to wait for before taking the single instance.
+const FALLBACK_PID: &str = "SUPERKIRO_UPDATE_FALLBACK";
 /// How long the replaced process waits for the new one to show it started.
 const START_LIMIT: Duration = Duration::from_secs(30);
-/// How long the new process waits for the replaced one to exit before it takes the lock.
+/// How long a new process waits for the one before it to exit.
 const PREDECESSOR_LIMIT: Duration = Duration::from_secs(60);
-/// How many rejected hashes are remembered; enough to outlast a few bad releases.
+/// How long a trial may take to bring its window up before it steps aside.
+const CONFIRM_LIMIT: Duration = Duration::from_secs(180);
+/// Bounds on the download: no answer, a stalled line, and the whole transfer.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
+const DOWNLOAD_LIMIT: Duration = Duration::from_secs(30 * 60);
+/// Trials of one release that may end without confirming before its hash is refused.
+const FAILURES_BEFORE_REJECT: u64 = 2;
+/// How many refused hashes are remembered; enough to outlast a few bad releases.
 const REJECTED_LIMIT: usize = 24;
+/// A partial download older than this belongs to a release long superseded.
+const PART_LIFETIME: Duration = Duration::from_secs(3 * 24 * 3600);
 
-static UPDATED: AtomicBool = AtomicBool::new(false);
+/// This process is a trial of a newly installed version, not yet confirmed.
+struct Trial {
+    pending: Pending,
+    /// Held until confirmation: while it is held, no other process judges this trial.
+    lock: Mutex<Option<fs::File>>,
+}
 
-/// Whether this run is a freshly updated, confirmed build.
+static TRIAL: OnceLock<Trial> = OnceLock::new();
+/// Where the customer's client is, once a confirmed trial has moved itself there.
+static CANONICAL: OnceLock<PathBuf> = OnceLock::new();
+static CONFIRMED: AtomicBool = AtomicBool::new(false);
+/// The installer's lock, held until this process exits once a trial has been started.
+static INSTALLER_LOCK: Mutex<Option<fs::File>> = Mutex::new(None);
+static INSTALLING: AtomicBool = AtomicBool::new(false);
+static CANCELLED: AtomicBool = AtomicBool::new(false);
+
+/// Whether this run is a newly installed version on its first start.
 pub fn was_updated() -> bool {
-    UPDATED.load(Ordering::Relaxed)
+    TRIAL.get().is_some()
 }
 
 /// This build's release version; None for builds that never update themselves.
@@ -113,6 +147,10 @@ pub fn signed_message(
     format!(
         "superkiro-update/1\nplatform={platform}\narch={arch}\nversion={version}\nsha256={sha256}\nsize={size}"
     )
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn hex_bytes<const N: usize>(text: &str) -> Option<[u8; N]> {
@@ -216,11 +254,15 @@ pub fn origin(gateway: Result<String, String>) -> Result<String, String> {
 }
 
 async fn manifest(client: &reqwest::Client, origin: &str) -> Result<Value, String> {
-    let mut response = client
-        .get(format!("{origin}/downloads/releases.json"))
-        .send()
-        .await
-        .map_err(|e| format!("[update:download] {}", crate::backend::network_error(e)))?;
+    let mut response = tokio::time::timeout(
+        REQUEST_TIMEOUT,
+        client
+            .get(format!("{origin}/downloads/releases.json"))
+            .send(),
+    )
+    .await
+    .map_err(|_| "[update:download] The update server did not answer".to_string())?
+    .map_err(|e| format!("[update:download] {}", crate::backend::network_error(e)))?;
     if response.status() != reqwest::StatusCode::OK {
         return Err(format!(
             "[update:download] Update manifest HTTP {}",
@@ -241,8 +283,8 @@ async fn manifest(client: &reqwest::Client, origin: &str) -> Result<Value, Strin
     serde_json::from_slice(&bytes).map_err(|_| "[update:verify] Invalid update manifest".into())
 }
 
-/// The release this client should install now, if any. A release whose bytes were rolled
-/// back before (its hash is in `state`) is skipped, so a broken forced update cannot loop.
+/// The release this client should install now, if any. A release whose trials never
+/// confirmed often enough (its hash is refused in `state`) is skipped.
 pub async fn available(
     client: &reqwest::Client,
     origin: &str,
@@ -280,140 +322,15 @@ pub async fn check(client: &reqwest::Client, origin: &str, state: &Path) -> Resu
     })
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
+// ---- persistent state: a staged trial, trials that failed, and refused hashes ----
 
-/// Where an interrupted download of `release` is kept, so it can resume rather than start
-/// over. Named by hash, so a different release never reuses the wrong bytes.
-fn download_part(state: &Path, release: &Release) -> PathBuf {
-    state.with_file_name(format!(".update-download-{}.part", hex(&release.sha256)))
-}
-
-/// What to do with a part file of `existing` bytes for a release of `size`.
-#[derive(Debug, PartialEq)]
-enum Resume {
-    /// Nothing kept; download the whole thing.
-    Fresh,
-    /// Continue after this many bytes already on disk.
-    From(u64),
-    /// The bytes are all here; only verify.
-    Complete,
-}
-
-fn resume_plan(existing: u64, size: u64) -> Resume {
-    match existing {
-        0 => Resume::Fresh,
-        n if n == size => Resume::Complete,
-        n if n < size => Resume::From(n),
-        // Longer than the signed size: it cannot be these bytes. Start over.
-        _ => Resume::Fresh,
-    }
-}
-
-/// The release's bytes, exactly as signed, resuming an interrupted download of the same
-/// bytes where it left off. `progress` hears (received, total). The verified bytes are read
-/// back from disk, so a resume across restarts is checked whole against the signed hash.
-pub async fn download(
-    client: &reqwest::Client,
-    origin: &str,
-    release: &Release,
-    state: &Path,
-    mut progress: impl FnMut(u64, u64),
-) -> Result<Vec<u8>, String> {
-    use std::io::Write;
-    let failed =
-        |e: reqwest::Error| format!("[update:download] {}", crate::backend::network_error(e));
-    let part = download_part(state, release);
-    let existing = fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
-    let mut have = match resume_plan(existing, release.size) {
-        Resume::Complete => release.size,
-        Resume::From(n) => n,
-        Resume::Fresh => {
-            let _ = fs::remove_file(&part);
-            0
-        }
-    };
-    progress(have, release.size);
-
-    if have < release.size {
-        let mut request = client.get(format!("{origin}{}", release.url));
-        if have > 0 {
-            request = request.header(reqwest::header::RANGE, format!("bytes={have}-"));
-        }
-        let mut response = request.send().await.map_err(failed)?;
-        let status = response.status();
-        // 206 continues what we have; a plain 200 ignores the range, so start the file over.
-        let mut file = if have > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT {
-            fs::OpenOptions::new()
-                .append(true)
-                .open(&part)
-                .map_err(|e| format!("[update:download] Cannot resume the download: {e}"))?
-        } else if status == reqwest::StatusCode::OK {
-            have = 0;
-            if let Some(dir) = part.parent() {
-                let _ = fs::create_dir_all(dir);
-            }
-            fs::File::create(&part)
-                .map_err(|e| format!("[update:download] Cannot write the download: {e}"))?
-        } else {
-            return Err(format!("[update:download] Update HTTP {}", status.as_u16()));
-        };
-        loop {
-            // A stalled line fails in a minute; a slow one may take as long as it needs. An
-            // interrupted one leaves the part file for the next attempt to continue.
-            let chunk = tokio::time::timeout(Duration::from_secs(60), response.chunk())
-                .await
-                .map_err(|_| "[update:download] Update download timed out".to_string())?
-                .map_err(failed)?;
-            let Some(chunk) = chunk else { break };
-            if chunk.len() as u64 > release.size - have {
-                return Err("[update:verify] The update is larger than was signed".into());
-            }
-            file.write_all(&chunk)
-                .map_err(|e| format!("[update:download] Cannot write the download: {e}"))?;
-            have += chunk.len() as u64;
-            progress(have, release.size);
-        }
-        file.sync_all()
-            .map_err(|_| "[update:download] Cannot write the download".to_string())?;
-    }
-
-    let bytes =
-        fs::read(&part).map_err(|_| "[update:download] Cannot read the download".to_string())?;
-    if bytes.len() as u64 != release.size {
-        // The part is short (the connection dropped); it stays for the next attempt.
-        return Err("[update:download] The update download was cut short".into());
-    }
-    if ring::digest::digest(&ring::digest::SHA256, &bytes).as_ref() != release.sha256 {
-        // Not the signed bytes: discard, so a corrupt resume cannot wedge every attempt.
-        let _ = fs::remove_file(&part);
-        return Err("[update:verify] The update does not match its signed hash".into());
-    }
-    let _ = fs::remove_file(&part);
-    Ok(bytes)
-}
-
-// ---- persistent state: a pending, unconfirmed boot and the hashes that failed ----
-
-/// The client's own state directory (Tauri's `app_local_data_dir`), computed without the
-/// Tauri path resolver so the rollback decision can run before the app is built. `Host`
-/// keeps its update state in the same file, so both sides agree on where it is.
+/// The update state, in the client's own local data directory: the directory Tauri's
+/// `app_local_data_dir` resolves, computed the same way so the check before the app is
+/// built and the host agree on it.
 pub fn state_path() -> Option<PathBuf> {
-    let base = if cfg!(windows) {
-        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
-    } else if cfg!(target_os = "macos") {
-        std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Library/Application Support"))
-    } else {
-        std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
-            })
-    };
     Some(
-        base?
-            .join("app.superkiro.desktop")
+        dirs::data_local_dir()?
+            .join(IDENTIFIER)
             .join("update-state.json"),
     )
 }
@@ -454,35 +371,67 @@ fn reject_hash(state: &mut Value, sha256: &str) {
     state["rejected"] = json!(rejected[start..]);
 }
 
-/// A staged version waiting to prove it runs, and how to put the old one back. Rollback and
-/// confirm act on `current` and `previous`; the new executable's own path is recorded in the
-/// state for diagnostics but not needed here.
+/// Counts a trial of `sha256` that ended without confirming; refuses the hash at the limit.
+fn record_failure(state: &mut Value, sha256: &str) {
+    if !state["failures"].is_object() {
+        state["failures"] = json!({});
+    }
+    let count = state["failures"][sha256].as_u64().unwrap_or(0) + 1;
+    if count >= FAILURES_BEFORE_REJECT {
+        if let Some(failures) = state["failures"].as_object_mut() {
+            failures.remove(sha256);
+        }
+        reject_hash(state, sha256);
+    } else {
+        state["failures"][sha256] = json!(count);
+    }
+}
+
+fn clear_failures(state: &mut Value, sha256: &str) {
+    if let Some(failures) = state["failures"].as_object_mut() {
+        failures.remove(sha256);
+    }
+}
+
+/// A staged version started as a trial: what it is, where it runs from, and where the
+/// customer's own client is.
+#[derive(Debug, Clone, PartialEq)]
 struct Pending {
-    previous: PathBuf,
-    current: PathBuf,
     version: String,
     sha256: String,
+    /// The staged executable (Windows) or app bundle (macOS).
+    staged: PathBuf,
+    /// What the trial runs: the staged executable.
+    executable: PathBuf,
+    /// The customer's client: the executable or bundle the shortcut starts.
+    current: PathBuf,
+    /// The executable to start for the customer's client.
+    current_executable: PathBuf,
 }
 
 fn pending_of(state: &Value) -> Option<Pending> {
     let p = state.get("pending")?;
+    let path = |key: &str| p[key].as_str().map(PathBuf::from);
     Some(Pending {
-        previous: PathBuf::from(p["previous"].as_str()?),
-        current: PathBuf::from(p["current"].as_str()?),
         version: p["version"].as_str()?.to_string(),
         sha256: p["sha256"].as_str()?.to_string(),
+        staged: path("staged")?,
+        executable: path("executable")?,
+        current: path("current")?,
+        current_executable: path("current_executable")?,
     })
 }
 
-fn set_pending(state: &mut Value, pending: Option<&Staged>, version: &str, sha256: &str) {
+fn set_pending(state: &mut Value, pending: Option<&Pending>) {
     match pending {
-        Some(staged) => {
+        Some(p) => {
             state["pending"] = json!({
-                "previous": staged.previous.to_string_lossy(),
-                "current": staged.current.to_string_lossy(),
-                "executable": staged.executable.to_string_lossy(),
-                "version": version,
-                "sha256": sha256,
+                "version": p.version,
+                "sha256": p.sha256,
+                "staged": p.staged.to_string_lossy(),
+                "executable": p.executable.to_string_lossy(),
+                "current": p.current.to_string_lossy(),
+                "current_executable": p.current_executable.to_string_lossy(),
             })
         }
         None => {
@@ -493,18 +442,210 @@ fn set_pending(state: &mut Value, pending: Option<&Staged>, version: &str, sha25
     }
 }
 
-// ---- staging the new bytes on disk ----
+// ---- where the customer's client is ----
 
-/// The running client, replaced on disk by a new version, and how to put it back.
-#[derive(Debug)]
-pub struct Staged {
-    /// Where the client lives: the executable (Windows) or the app bundle (macOS).
-    current: PathBuf,
-    /// The previous version, moved aside.
-    previous: PathBuf,
-    /// What to start: the new executable.
-    executable: PathBuf,
+/// The executable inside the customer's client: itself (Windows), or the bundle's binary.
+fn executable_in(current: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        current.join("Contents/MacOS/Superkiro")
+    } else {
+        current.to_path_buf()
+    }
 }
+
+/// The customer's client (the executable or app bundle their shortcut starts) and the
+/// executable to start for it. A trial runs from its staged copy, but this is still the
+/// customer's; after confirming, the trial is at that path itself.
+fn client_location() -> Result<(PathBuf, PathBuf), String> {
+    if let Some(current) = CANONICAL.get() {
+        return Ok((current.clone(), executable_in(current)));
+    }
+    if let Some(trial) = TRIAL.get() {
+        return Ok((
+            trial.pending.current.clone(),
+            trial.pending.current_executable.clone(),
+        ));
+    }
+    let executable = std::env::current_exe()
+        .map_err(|_| "[update:replace] Cannot locate the running client".to_string())?;
+    if cfg!(target_os = "macos") {
+        let bundle = executable
+            .ancestors()
+            .find(|path| path.extension().is_some_and(|ext| ext == "app"))
+            .ok_or("[update:replace] The client is not inside an app bundle")?
+            .to_path_buf();
+        Ok((bundle, executable))
+    } else {
+        Ok((executable.clone(), executable))
+    }
+}
+
+/// The customer's client: where downloads and staged versions go, beside it.
+pub fn client_path() -> Result<PathBuf, String> {
+    client_location().map(|(current, _)| current)
+}
+
+/// A hidden name beside `current` for what an update keeps there.
+fn beside(current: &Path, suffix: &str) -> PathBuf {
+    let name = current.file_name().unwrap_or_default().to_string_lossy();
+    current.with_file_name(format!(".{name}.{suffix}"))
+}
+
+// ---- the download: resuming an interrupted one, verified whole ----
+
+/// Where a download of `release` is kept, beside the client so the verified file can be
+/// staged by a rename on one volume. Named by hash, so another release's bytes are never
+/// continued; kept between attempts and restarts so an interrupted download resumes.
+fn download_part(current: &Path, release: &Release) -> PathBuf {
+    beside(current, &format!("{}.part", &hex(&release.sha256)[..16]))
+}
+
+/// What to do with a part file of `existing` bytes for a release of `size`.
+#[derive(Debug, PartialEq)]
+enum Resume {
+    Fresh,
+    From(u64),
+    Complete,
+}
+
+fn resume_plan(existing: u64, size: u64) -> Resume {
+    match existing {
+        0 => Resume::Fresh,
+        n if n == size => Resume::Complete,
+        n if n < size => Resume::From(n),
+        // Longer than the signed size: it cannot be these bytes. Start over.
+        _ => Resume::Fresh,
+    }
+}
+
+/// The first byte a `206 Partial Content` starts at, as its `Content-Range` says.
+fn content_range_start(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let value = headers.get(reqwest::header::CONTENT_RANGE)?.to_str().ok()?;
+    value
+        .strip_prefix("bytes ")?
+        .split('-')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn file_sha256(path: &Path) -> std::io::Result<[u8; 32]> {
+    use std::io::Read;
+    let mut file = fs::File::open(path)?;
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        context.update(&buffer[..read]);
+    }
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(context.finish().as_ref());
+    Ok(digest)
+}
+
+/// Downloads `release` beside the client at `current`, resuming bytes already there, and
+/// returns the file once it is exactly the signed bytes. `progress` hears (received,
+/// total, resumed). A cancel, a stall or the overall deadline stops it; what arrived stays
+/// for the next attempt.
+pub async fn download(
+    client: &reqwest::Client,
+    origin: &str,
+    release: &Release,
+    current: &Path,
+    mut progress: impl FnMut(u64, u64, bool),
+) -> Result<PathBuf, String> {
+    use std::io::Write;
+    let failed =
+        |e: reqwest::Error| format!("[update:download] {}", crate::backend::network_error(e));
+    let part = download_part(current, release);
+    let existing = fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+    let mut have = match resume_plan(existing, release.size) {
+        Resume::Complete => release.size,
+        Resume::From(n) => n,
+        Resume::Fresh => {
+            let _ = fs::remove_file(&part);
+            0
+        }
+    };
+    let resumed = have > 0;
+    progress(have, release.size, resumed);
+
+    if have < release.size {
+        let mut request = client.get(format!("{origin}{}", release.url));
+        if have > 0 {
+            request = request.header(reqwest::header::RANGE, format!("bytes={have}-"));
+        }
+        let mut response = tokio::time::timeout(REQUEST_TIMEOUT, request.send())
+            .await
+            .map_err(|_| "[update:download] The update server did not answer".to_string())?
+            .map_err(failed)?;
+        let status = response.status();
+        // A 206 continues what we have, from where the server says it starts (a proxy may
+        // answer from elsewhere); a 200 ignores the range, so the file starts over.
+        let continues = have > 0
+            && status == reqwest::StatusCode::PARTIAL_CONTENT
+            && content_range_start(response.headers()) == Some(have);
+        if !continues && status != reqwest::StatusCode::OK {
+            let _ = fs::remove_file(&part);
+            return Err(format!("[update:download] Update HTTP {}", status.as_u16()));
+        }
+        let opened = if continues {
+            fs::OpenOptions::new().append(true).open(&part)
+        } else {
+            have = 0;
+            fs::File::create(&part)
+        };
+        // Writing beside the client is the first write the update makes; a folder this user
+        // cannot write (Program Files) stops it here, the client untouched.
+        let mut file =
+            opened.map_err(|e| format!("[update:replace] Cannot write beside the client: {e}"))?;
+        let deadline = Instant::now() + DOWNLOAD_LIMIT;
+        loop {
+            if CANCELLED.load(Ordering::Relaxed) {
+                return Err("[update:download] The update was cancelled".into());
+            }
+            if Instant::now() >= deadline {
+                return Err("[update:download] The update download took too long".into());
+            }
+            // A stalled line fails in a minute; a slow one may take as long as it needs.
+            let chunk = tokio::time::timeout(READ_TIMEOUT, response.chunk())
+                .await
+                .map_err(|_| "[update:download] Update download timed out".to_string())?
+                .map_err(failed)?;
+            let Some(chunk) = chunk else { break };
+            if chunk.len() as u64 > release.size - have {
+                let _ = fs::remove_file(&part);
+                return Err("[update:verify] The update is larger than was signed".into());
+            }
+            file.write_all(&chunk)
+                .map_err(|e| format!("[update:replace] Cannot write beside the client: {e}"))?;
+            have += chunk.len() as u64;
+            progress(have, release.size, resumed);
+        }
+        file.sync_all()
+            .map_err(|e| format!("[update:replace] Cannot write beside the client: {e}"))?;
+    }
+
+    let size = fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+    if size != release.size {
+        // Short: the connection dropped. It stays for the next attempt to continue.
+        return Err("[update:download] The update download was cut short".into());
+    }
+    match file_sha256(&part) {
+        Ok(digest) if digest == release.sha256 => Ok(part),
+        _ => {
+            // Not the signed bytes: discard, so a corrupt resume cannot wedge every attempt.
+            let _ = fs::remove_file(&part);
+            Err("[update:verify] The update does not match its signed hash".into())
+        }
+    }
+}
+
+// ---- staging and starting the trial, the customer's client untouched ----
 
 fn remove_path(path: &Path) -> std::io::Result<()> {
     if path.is_dir() {
@@ -529,102 +670,31 @@ fn retry(mut action: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()>
     action()
 }
 
-/// Puts the previous version back where the client runs. Idempotent: whatever step already
-/// happened is treated as done, and success is decided by the client being in place, not by
-/// which rename ran - an antivirus that removed the new bytes must not strand the customer.
-fn restore_previous(current: &Path, previous: &Path) -> Result<(), String> {
-    if previous.exists() {
-        if current.exists() {
-            let aside = leftover_name(current, "new");
-            let _ = remove_path(&aside);
-            let _ = retry(|| fs::rename(current, &aside));
-            let _ = remove_path(&aside);
-        }
-        let _ = retry(|| fs::rename(previous, current));
-    }
-    if current.exists() {
-        Ok(())
-    } else {
-        Err("[update:relaunch] The previous version could not be put back".into())
-    }
-}
-
-/// Moves `current` aside to `previous` and `next` into its place; puts it back on failure.
-fn swap(current: &Path, next: &Path, previous: &Path) -> Result<(), String> {
-    let _ = remove_path(previous);
-    // A running executable may be renamed, though not deleted or overwritten.
-    retry(|| fs::rename(current, previous))
-        .map_err(|e| format!("[update:replace] Cannot move the running client aside: {e}"))?;
-    if let Err(error) = retry(|| fs::rename(next, current)) {
-        let _ = retry(|| fs::rename(previous, current));
-        return Err(format!(
-            "[update:replace] Cannot put the new client in place: {error}"
-        ));
-    }
-    Ok(())
-}
-
-/// The names an update leaves beside `current` for a later start to remove.
-fn leftover_name(current: &Path, suffix: &str) -> PathBuf {
-    let name = current.file_name().unwrap_or_default().to_string_lossy();
-    // Hidden, and unique to this process: an older leftover may still be locked.
-    current.with_file_name(format!(".{name}.{}.{suffix}", std::process::id()))
-}
-
-/// Replaces the running client on disk with `bytes`, a verified release.
-fn stage(bytes: &[u8]) -> Result<Staged, String> {
-    let executable = std::env::current_exe()
-        .map_err(|_| "[update:replace] Cannot locate the running client".to_string())?;
-    stage_at(&executable, bytes)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn stage_at(executable: &Path, bytes: &[u8]) -> Result<Staged, String> {
-    let next = leftover_name(executable, "new");
-    let previous = leftover_name(executable, "old");
-    // Written beside the client, so the final step is a rename on one volume. Failing here,
-    // in a folder this user may not write (Program Files), leaves the client untouched.
-    let write = || -> std::io::Result<()> {
-        use std::io::Write;
-        let mut file = fs::File::create(&next)?;
-        file.write_all(bytes)?;
-        file.sync_all()
+/// Makes the verified download at `verified` a runnable version beside the client, without
+/// touching the client itself.
+fn stage(
+    verified: &Path,
+    current: &Path,
+    current_executable: &Path,
+    release: &Release,
+) -> Result<Pending, String> {
+    let replace =
+        |e: std::io::Error| format!("[update:replace] Cannot write beside the client: {e}");
+    #[cfg(not(target_os = "macos"))]
+    let (staged, executable) = {
+        let staged = beside(current, &format!("{}.exe", release.version));
+        let _ = remove_path(&staged);
+        retry(|| fs::rename(verified, &staged)).map_err(replace)?;
+        (staged.clone(), staged)
     };
-    if let Err(error) = write() {
-        let _ = fs::remove_file(&next);
-        return Err(format!(
-            "[update:replace] Cannot write beside the client: {error}"
-        ));
-    }
-    if let Err(error) = swap(executable, &next, &previous) {
-        let _ = fs::remove_file(&next);
-        return Err(error);
-    }
-    Ok(Staged {
-        current: executable.to_path_buf(),
-        previous,
-        executable: executable.to_path_buf(),
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn stage_at(executable: &Path, bytes: &[u8]) -> Result<Staged, String> {
-    let bundle = executable
-        .ancestors()
-        .find(|path| path.extension().is_some_and(|ext| ext == "app"))
-        .ok_or("[update:replace] The client is not inside an app bundle")?
-        .to_path_buf();
-    let work = leftover_name(&bundle, "new");
-    let previous = leftover_name(&bundle, "old");
-    let unpack = || -> Result<PathBuf, String> {
-        fs::create_dir(&work)
-            .map_err(|e| format!("[update:replace] Cannot write beside the app: {e}"))?;
-        let archive = work.join("update.tar.gz");
-        fs::write(&archive, bytes)
-            .map_err(|e| format!("[update:replace] Cannot write beside the app: {e}"))?;
+    #[cfg(target_os = "macos")]
+    let (staged, executable) = {
+        let work = beside(current, &format!("{}.new", release.version));
+        let _ = remove_path(&work);
+        fs::create_dir(&work).map_err(replace)?;
         let unpacked = Command::new("/usr/bin/tar")
             .arg("-xzf")
-            .arg(&archive)
+            .arg(verified)
             .arg("-C")
             .arg(&work)
             .stdin(Stdio::null())
@@ -632,67 +702,42 @@ fn stage_at(executable: &Path, bytes: &[u8]) -> Result<Staged, String> {
             .stderr(Stdio::null())
             .status()
             .is_ok_and(|status| status.success());
-        let fresh = work.join("Superkiro.app");
-        if !unpacked || !fresh.join("Contents/MacOS/Superkiro").is_file() {
+        let _ = fs::remove_file(verified);
+        let bundle = work.join("Superkiro.app");
+        let executable = bundle.join("Contents/MacOS/Superkiro");
+        if !unpacked || !executable.is_file() {
+            let _ = fs::remove_dir_all(&work);
             return Err("[update:verify] The update archive does not hold the app".into());
         }
-        Ok(fresh)
+        (bundle, executable)
     };
-    let result = unpack().and_then(|fresh| swap(&bundle, &fresh, &previous));
-    let _ = fs::remove_dir_all(&work);
-    result?;
-    let relative = executable
-        .strip_prefix(&bundle)
-        .unwrap_or(Path::new("Contents/MacOS/Superkiro"));
-    Ok(Staged {
-        executable: bundle.join(relative),
-        current: bundle,
-        previous,
+    Ok(Pending {
+        version: release.version.clone(),
+        sha256: hex(&release.sha256),
+        staged,
+        executable,
+        current: current.to_path_buf(),
+        current_executable: current_executable.to_path_buf(),
     })
 }
 
-// ---- install, relaunch, and the trial boot ----
-
-fn marker_path(state: &Path) -> PathBuf {
-    // In the app-local state dir, not a world-writable temp; a nonce, and created fresh.
-    let nonce = format!(
-        "{}-{:x}",
-        std::process::id(),
-        Instant::now().elapsed().as_nanos()
-    );
-    state.with_file_name(format!(".update-ready-{nonce}"))
-}
-
-/// Replaces this client with `release`'s verified `bytes` and starts the new version. On
-/// success the caller exits; the new version waits for it to go, boots, and confirms. On
-/// failure nothing is left changed. Runs off the async runtime (it blocks).
-pub fn install(state: &Path, bytes: &[u8], release: &Release) -> Result<(), String> {
-    let staged = stage(bytes)?;
-    let sha256 = hex(&release.sha256);
-    let mut value = read_state(state);
-    set_pending(&mut value, Some(&staged), &release.version, &sha256);
-    if let Err(error) = write_state(state, &value) {
-        let _ = restore_previous(&staged.current, &staged.previous);
-        return Err(format!("[update:replace] {error}"));
-    }
-    let marker = marker_path(state);
-    match relaunch(&staged, &marker) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = restore_previous(&staged.current, &staged.previous);
-            let mut value = read_state(state);
-            set_pending(&mut value, None, "", "");
-            let _ = write_state(state, &value);
-            Err(error)
-        }
+/// What removing a staged version removes: the file, or on macOS the folder it came in.
+fn staged_root(pending: &Pending) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        pending
+            .staged
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| pending.staged.clone())
+    } else {
+        pending.staged.clone()
     }
 }
 
-/// Starts the new version and waits until it signals it is up. No file changes: the caller
-/// rolls the swap back if this fails.
-fn relaunch(staged: &Staged, marker: &Path) -> Result<(), String> {
+/// Starts a trial of the staged version and waits until it signals it is up.
+fn start_trial(pending: &Pending, marker: &Path) -> Result<(), String> {
     let _ = fs::remove_file(marker);
-    let spawned = Command::new(&staged.executable)
+    let spawned = Command::new(&pending.executable)
         .env(HANDOFF_PID, std::process::id().to_string())
         .env(HANDOFF_MARKER, marker)
         .stdin(Stdio::null())
@@ -720,84 +765,207 @@ fn relaunch(staged: &Staged, marker: &Path) -> Result<(), String> {
     if started {
         Ok(())
     } else {
-        Err(
-            "[update:relaunch] The updated client did not start; the previous version was put back"
-                .into(),
-        )
+        Err("[update:relaunch] The updated client did not start; this version carries on".into())
     }
 }
 
-/// What [`startup`] tells `main` to do.
-pub enum Startup {
-    /// Carry on building the app.
-    Continue,
-    /// A rollback was launched; this process must exit at once, before it takes the lock.
-    Exit,
+/// Stops more than one install at a time, for as long as it is held.
+pub struct InstallGuard;
+
+impl Drop for InstallGuard {
+    fn drop(&mut self) {
+        INSTALLING.store(false, Ordering::SeqCst);
+    }
 }
 
+pub fn begin_install() -> Result<InstallGuard, String> {
+    if INSTALLING.swap(true, Ordering::SeqCst) {
+        return Err("Operation in progress".into());
+    }
+    CANCELLED.store(false, Ordering::SeqCst);
+    Ok(InstallGuard)
+}
+
+/// Stops a download in progress; what arrived stays for the next attempt.
+pub fn cancel() {
+    CANCELLED.store(true, Ordering::SeqCst);
+}
+
+/// Installs `release` from its verified download: stages it beside the customer's client
+/// and starts it as a trial. The client the customer starts stays exactly as it was until
+/// the trial confirms. On success the caller exits. Runs off the async runtime (it blocks).
+pub fn install(state: &Path, release: &Release, verified: &Path) -> Result<(), String> {
+    if CANCELLED.load(Ordering::SeqCst) {
+        return Err("[update:download] The update was cancelled".into());
+    }
+    // Held from here until this process exits: while a trial is starting, no other start of
+    // the client judges it as one that never came up.
+    let lock = open_lock(&lock_path(state)).map_err(|_| "Operation in progress".to_string())?;
+    let (current, current_executable) = client_location()?;
+    let pending = stage(verified, &current, &current_executable, release)?;
+    let mut value = read_state(state);
+    set_pending(&mut value, Some(&pending));
+    if let Err(error) = write_state(state, &value) {
+        let _ = remove_path(&staged_root(&pending));
+        return Err(format!("[update:replace] {error}"));
+    }
+    if let Err(error) = start_trial(&pending, &marker_path(state)) {
+        // It could not even start: these bytes are counted against, and nothing else changes.
+        let _ = remove_path(&staged_root(&pending));
+        let mut value = read_state(state);
+        set_pending(&mut value, None);
+        record_failure(&mut value, &pending.sha256);
+        let _ = write_state(state, &value);
+        return Err(error);
+    }
+    *INSTALLER_LOCK.lock().unwrap_or_else(|e| e.into_inner()) = Some(lock);
+    Ok(())
+}
+
+// ---- the trial: waiting for the old version, confirming, or stepping aside ----
+
 /// Called at the very start of `main`, before the single-instance plugin or the app lock.
-/// Handles the two sides of an update: the new version's first boot (wait for the version
-/// it replaced to exit, then carry on and confirm once up), and a new version that never
-/// confirmed (roll back to the version kept aside and hand off to it).
-pub fn startup(state: Option<&Path>) -> Startup {
+/// A trial waits for the version it replaces to exit and takes the update lock; a normal
+/// start judges a trial that ended without confirming.
+pub fn startup(state: Option<&Path>) {
     let predecessor = std::env::var(HANDOFF_PID).ok().and_then(|p| p.parse().ok());
     let marker = std::env::var_os(HANDOFF_MARKER).map(PathBuf::from);
+    let fallback = std::env::var(FALLBACK_PID)
+        .ok()
+        .and_then(|p| p.parse().ok());
     // Kiro and anything else this client starts must not inherit these.
     std::env::remove_var(HANDOFF_PID);
     std::env::remove_var(HANDOFF_MARKER);
-
-    if let Some(state) = state {
-        let mut value = read_state(state);
-        if let Some(pending) = pending_of(&value) {
-            if release_version() == Some(pending.version.as_str()) {
-                if let Some(pid) = predecessor {
-                    // Our first boot. Prove ourselves: wait for the old version, then run.
-                    // The UI calls confirm() once it is up, which deletes the old version.
-                    wait_for_predecessor(pid, marker.as_deref());
-                    UPDATED.store(true, Ordering::Relaxed);
-                    return Startup::Continue;
-                }
-                // Started again without ever confirming: crashed, or the window never came
-                // up. Put the old version back, refuse these bytes, and hand off to it.
-                let _ = restore_previous(&pending.current, &pending.previous);
-                reject_hash(&mut value, &pending.sha256);
-                set_pending(&mut value, None, "", "");
-                let _ = write_state(state, &value);
-                let _ = spawn_detached(&pending.current);
-                return Startup::Exit;
-            }
-            // We are not the pending version: a rollback already completed, or a stale
-            // record. Drop it so a later, real update is not mistaken for this one.
-            set_pending(&mut value, None, "", "");
-            let _ = write_state(state, &value);
-        }
+    std::env::remove_var(FALLBACK_PID);
+    if let Some(pid) = fallback {
+        // A trial stepping aside for this client: let it end before taking its place.
+        ExitWaiter::open(pid).wait(PREDECESSOR_LIMIT);
     }
+    let (Some(state), Some(current)) = (state, release_version()) else {
+        // Builds that never update themselves leave update state alone.
+        if let Some(pid) = predecessor {
+            wait_for_predecessor(pid, marker.as_deref());
+        }
+        return;
+    };
     if let Some(pid) = predecessor {
+        let pending = pending_of(&read_state(state)).filter(|p| p.version == current);
         wait_for_predecessor(pid, marker.as_deref());
-    }
-    Startup::Continue
-}
-
-/// Confirms the update once the client is up and its window is talking to the host: the old
-/// version is proven unneeded and removed. A no-op when no boot is pending.
-pub fn confirm(state: &Path) {
-    let mut value = read_state(state);
-    if let Some(pending) = pending_of(&value) {
-        if release_version() == Some(pending.version.as_str()) {
-            let _ = remove_path(&pending.previous);
-            set_pending(&mut value, None, "", "");
-            let _ = write_state(state, &value);
+        if let Some(pending) = pending {
+            // The installer held the lock until it exited; it is ours from now until we confirm.
+            let lock = acquire_lock_within(&lock_path(state), Duration::from_secs(30));
+            if TRIAL
+                .set(Trial {
+                    pending,
+                    lock: Mutex::new(lock),
+                })
+                .is_ok()
+            {
+                start_watchdog(state.to_path_buf());
+            }
         }
+        return;
     }
+    judge_ended_trial(state, current);
 }
 
-fn spawn_detached(executable: &Path) -> std::io::Result<()> {
-    Command::new(executable)
+/// A trial that ended without confirming is counted against its bytes, and the record of
+/// it cleared; the customer's client, never touched, simply carries on. While the update
+/// lock is held a trial (or its installer) is live, and nothing is judged.
+fn judge_ended_trial(state: &Path, current: &str) {
+    if pending_of(&read_state(state)).is_none() {
+        return;
+    }
+    let Ok(_lock) = open_lock(&lock_path(state)) else {
+        return;
+    };
+    let mut value = read_state(state);
+    let Some(pending) = pending_of(&value) else {
+        return;
+    };
+    if pending.version != current {
+        record_failure(&mut value, &pending.sha256);
+        let _ = remove_path(&staged_root(&pending));
+    }
+    // Being the pending version ourselves, the trial moved itself into place and only its
+    // record was left: nothing failed.
+    set_pending(&mut value, None);
+    let _ = write_state(state, &value);
+}
+
+/// A trial whose window is not up in time steps aside: it releases the update lock, starts
+/// the customer's own client, which judges it, and exits.
+fn start_watchdog(state: PathBuf) {
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + CONFIRM_LIMIT;
+        while Instant::now() < deadline {
+            if CONFIRMED.load(Ordering::SeqCst) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        step_aside(&state);
+    });
+}
+
+fn step_aside(state: &Path) {
+    let Some(trial) = TRIAL.get() else { return };
+    if CONFIRMED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let _ = state;
+    drop(trial.lock.lock().unwrap_or_else(|e| e.into_inner()).take());
+    let _ = Command::new(&trial.pending.current_executable)
+        .env(FALLBACK_PID, std::process::id().to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
-        .map(|_| ())
+        .spawn();
+    std::process::exit(0);
+}
+
+/// Called by a trial once its window is up and talking to the host. It moves the customer's
+/// client aside and itself into its place; the version kept aside is removed. A no-op for
+/// anything but an unconfirmed trial.
+pub fn confirm(state: &Path) {
+    let Some(trial) = TRIAL.get() else { return };
+    if CONFIRMED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let moved = move_into_place(&trial.pending);
+    let mut value = read_state(state);
+    if pending_of(&value).as_ref() == Some(&trial.pending) {
+        set_pending(&mut value, None);
+    }
+    if moved {
+        clear_failures(&mut value, &trial.pending.sha256);
+        let _ = CANONICAL.set(trial.pending.current.clone());
+    } else {
+        // It runs, but cannot take the client's place (the folder refused the rename): the
+        // customer's client stays the old version, and repeated tries are counted.
+        record_failure(&mut value, &trial.pending.sha256);
+    }
+    let _ = write_state(state, &value);
+    drop(trial.lock.lock().unwrap_or_else(|e| e.into_inner()).take());
+}
+
+/// Moves the customer's client aside and the staged version into its place, putting the
+/// client back if the second step fails. A running executable or bundle may be renamed.
+fn move_into_place(pending: &Pending) -> bool {
+    let aside = beside(&pending.current, &format!("{}.old", std::process::id()));
+    let _ = remove_path(&aside);
+    if retry(|| fs::rename(&pending.current, &aside)).is_err() {
+        return false;
+    }
+    if retry(|| fs::rename(&pending.staged, &pending.current)).is_err() {
+        let _ = retry(|| fs::rename(&aside, &pending.current));
+        return false;
+    }
+    let _ = remove_path(&aside);
+    if cfg!(target_os = "macos") {
+        let _ = fs::remove_dir_all(staged_root(pending));
+    }
+    true
 }
 
 /// Waits for the process this one replaced to exit and, on Windows, for its WebView2 helper
@@ -806,7 +974,7 @@ fn wait_for_predecessor(pid: u32, marker: Option<&Path>) {
     // Opened before the predecessor may end, so a reused id cannot be waited on.
     let waiter = ExitWaiter::open(pid);
     if let Some(marker) = marker {
-        // Tells the predecessor we started; do not follow a symlink a prior run left.
+        // Tells the predecessor we started; never follows a link a prior run left.
         let _ = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -816,8 +984,6 @@ fn wait_for_predecessor(pid: u32, marker: Option<&Path>) {
     waiter.wait(PREDECESSOR_LIMIT);
     #[cfg(windows)]
     {
-        // The predecessor's WebView2 keeps the user-data folder locked for a moment after it
-        // exits; creating our window against it would fail. Give it up to ten seconds.
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline
             && patch_engine::has_child_process(pid, "msedgewebview2.exe")
@@ -827,28 +993,73 @@ fn wait_for_predecessor(pid: u32, marker: Option<&Path>) {
     }
 }
 
-/// Removes what an update left beside the client: an old version already confirmed gone, a
-/// partial copy. Skips a version still kept for a pending boot. Best effort.
-pub fn remove_leftovers(state: &Path) {
-    let Ok(executable) = std::env::current_exe() else {
-        return;
-    };
-    let current = if cfg!(target_os = "macos") {
-        match executable
-            .ancestors()
-            .find(|path| path.extension().is_some_and(|ext| ext == "app"))
-        {
-            Some(bundle) => bundle.to_path_buf(),
-            None => return,
-        }
-    } else {
-        executable
-    };
-    let keep = pending_of(&read_state(state)).map(|pending| pending.previous);
-    remove_leftovers_of(&current, keep.as_deref());
+// ---- the update lock and the start marker ----
+
+fn lock_path(state: &Path) -> PathBuf {
+    state.with_file_name("update.lock")
 }
 
-fn remove_leftovers_of(current: &Path, keep: Option<&Path>) {
+/// An exclusive lock on `path`, held as long as the file stays open. The operating system
+/// releases it when the process ends, however it ends.
+fn open_lock(path: &Path) -> std::io::Result<fs::File> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)?;
+    file.try_lock()
+        .map_err(|_| std::io::Error::other("the update lock is held"))?;
+    Ok(file)
+}
+
+fn acquire_lock_within(path: &Path, limit: Duration) -> Option<fs::File> {
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Ok(file) = open_lock(path) {
+            return Some(file);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The marker a trial writes to tell the process that started it that it is up: in the
+/// update directory, not a shared temp folder, and unique to this start.
+fn marker_path(state: &Path) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    state.with_file_name(format!(".update-ready-{}-{nanos:x}", std::process::id()))
+}
+
+// ---- what updates leave beside the client ----
+
+/// Removes what updates left beside the customer's client: versions kept aside, staged
+/// versions no trial needs, and partial downloads long superseded. Skipped while a trial or
+/// an install is live. Best effort; whatever is locked goes at a later start.
+pub fn remove_leftovers(state: &Path) {
+    if TRIAL.get().is_some() && !CONFIRMED.load(Ordering::SeqCst) {
+        return;
+    }
+    let Ok(_lock) = open_lock(&lock_path(state)) else {
+        return;
+    };
+    let Ok((current, _)) = client_location() else {
+        return;
+    };
+    let keep: Vec<PathBuf> = pending_of(&read_state(state))
+        .map(|pending| vec![pending.staged.clone(), staged_root(&pending)])
+        .unwrap_or_default();
+    remove_leftovers_of(&current, &keep, SystemTime::now());
+}
+
+fn remove_leftovers_of(current: &Path, keep: &[PathBuf], now: SystemTime) {
     let (Some(dir), Some(name)) = (current.parent(), current.file_name()) else {
         return;
     };
@@ -856,26 +1067,46 @@ fn remove_leftovers_of(current: &Path, keep: Option<&Path>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
+    let own = std::process::id().to_string();
     for entry in entries.flatten() {
-        if keep.is_some_and(|keep| keep == entry.path()) {
+        let path = entry.path();
+        if keep.contains(&path) {
             continue;
         }
         let file = entry.file_name().to_string_lossy().into_owned();
         let Some(rest) = file.strip_prefix(&prefix) else {
             continue;
         };
-        // Only our own names: ".<name>.<pid>.old" and ".<name>.<pid>.new".
-        let ours = rest.rsplit_once('.').is_some_and(|(pid, kind)| {
-            matches!(kind, "old" | "new")
-                && !pid.is_empty()
-                && pid.bytes().all(|b| b.is_ascii_digit())
-                && pid != std::process::id().to_string()
-        });
+        let Some((middle, kind)) = rest.rsplit_once('.') else {
+            continue;
+        };
+        let ours = match kind {
+            // A download, kept to resume; gone once long superseded.
+            "part" => {
+                middle.len() == 16
+                    && middle.bytes().all(|b| b.is_ascii_hexdigit())
+                    && entry
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|modified| now.duration_since(modified).ok())
+                        .is_some_and(|age| age > PART_LIFETIME)
+            }
+            // Kept aside by a process (its id), or staged (a version); never this process's.
+            "old" | "new" | "exe" => {
+                !middle.is_empty()
+                    && middle != own
+                    && middle.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+            }
+            _ => false,
+        };
         if ours {
-            let _ = remove_path(&entry.path());
+            let _ = remove_path(&path);
         }
     }
 }
+
+// ---- waiting for another process to end ----
 
 struct ExitWaiter(
     #[cfg(windows)] *mut std::ffi::c_void,
@@ -915,8 +1146,6 @@ impl ExitWaiter {
 
     #[cfg(not(windows))]
     fn wait(self, limit: Duration) {
-        // A zombie answers signal 0, so wait for the child to be reaped (reparented away
-        // from us) rather than for the pid to disappear.
         let deadline = Instant::now() + limit;
         while Instant::now() < deadline && unsafe { libc::kill(self.0 as libc::pid_t, 0) } == 0 {
             std::thread::sleep(Duration::from_millis(50));
@@ -929,8 +1158,11 @@ mod tests {
     use super::*;
 
     const TEST_SEED: [u8; 32] = [7; 32];
+    /// Never a version a release build could be: tests stay true whatever CI builds as.
+    const OTHER: &str = "9999.1.1";
 
     fn signed(entry: &mut Value, seed: &[u8; 32]) -> String {
+        use ring::signature::KeyPair;
         let pair = ring::signature::Ed25519KeyPair::from_seed_unchecked(seed).unwrap();
         let message = signed_message(
             entry["platform"].as_str().unwrap(),
@@ -940,7 +1172,6 @@ mod tests {
             entry["size"].as_u64().unwrap(),
         );
         entry["updateSignature"] = json!(hex(pair.sign(message.as_bytes()).as_ref()));
-        use ring::signature::KeyPair;
         hex(pair.public_key().as_ref())
     }
 
@@ -960,6 +1191,25 @@ mod tests {
             ("windows", "x64"),
             &[key],
         )
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("update-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn release_of(body: &[u8], version: &str) -> Release {
+        let mut sha256 = [0u8; 32];
+        sha256.copy_from_slice(ring::digest::digest(&ring::digest::SHA256, body).as_ref());
+        Release {
+            version: version.into(),
+            url: "/downloads/app".into(),
+            sha256,
+            size: body.len() as u64,
+            mandatory: true,
+        }
     }
 
     /// Signed by deploy/update_signing.py (key seeded with bytes 0..32): the tool and the
@@ -1082,11 +1332,12 @@ mod tests {
         assert!(select(&json!({}), "1", ("windows", "x64"), &[&key]).is_err());
     }
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("update-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    #[test]
+    fn the_state_lives_where_tauri_keeps_local_data() {
+        let config = include_str!("../tauri.conf.json");
+        assert!(config.contains(&format!("\"identifier\": \"{IDENTIFIER}\"")));
+        let path = state_path().unwrap();
+        assert!(path.ends_with(Path::new(IDENTIFIER).join("update-state.json")));
     }
 
     #[test]
@@ -1120,150 +1371,200 @@ mod tests {
                     .and_then(|r| r.strip_suffix('-'))
                     .and_then(|n| n.parse::<usize>().ok())
             });
-            if let Some(start) = range {
-                let tail = &body[start..];
-                let header = format!(
-                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
-                    tail.len(), start, body.len() - 1, body.len()
-                );
-                let _ = stream.write_all(header.as_bytes());
-                let _ = stream.write_all(tail);
-            } else if first {
-                first = false;
-                // Full length promised, half delivered, then the socket closes.
-                let header = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = stream.write_all(header.as_bytes());
-                let _ = stream.write_all(&body[..body.len() / 2]);
-            } else {
-                let header = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = stream.write_all(header.as_bytes());
-                let _ = stream.write_all(&body);
-            }
+            let (head, payload): (String, &[u8]) = match range {
+                Some(start) => (
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nConnection: close\r\n\r\n",
+                        body.len() - start, start, body.len() - 1, body.len()
+                    ),
+                    &body[start..],
+                ),
+                None if first => {
+                    first = false;
+                    (
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()),
+                        &body[..body.len() / 2],
+                    )
+                }
+                None => (
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()),
+                    &body[..],
+                ),
+            };
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(payload);
         }
     }
 
     #[tokio::test]
     async fn an_interrupted_download_resumes_over_http_and_verifies_whole() {
         let dir = scratch("resume-http");
-        let state = dir.join("update-state.json");
+        let client_file = dir.join("Superkiro.exe");
         let body: Vec<u8> = (0..120_000u32).map(|i| (i % 251) as u8).collect();
-        let digest = ring::digest::digest(&ring::digest::SHA256, &body);
-        let mut sha256 = [0u8; 32];
-        sha256.copy_from_slice(digest.as_ref());
-        let release = Release {
-            version: "2026.09.25".into(),
-            url: "/downloads/app".into(),
-            sha256,
-            size: body.len() as u64,
-            mandatory: true,
-        };
+        let release = release_of(&body, OTHER);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
         let served = body.clone();
         std::thread::spawn(move || serve_with_one_break(listener, served));
 
         let client = reqwest::Client::new();
-        // The first attempt is cut short; the part file keeps what arrived.
-        let first = download(&client, &origin, &release, &state, |_, _| {}).await;
+        // The first attempt is cut short; the part file beside the client keeps what arrived.
+        let first = download(&client, &origin, &release, &client_file, |_, _, _| {}).await;
         assert!(first.is_err(), "{first:?}");
-        let part = download_part(&state, &release).metadata().unwrap().len();
+        let part = download_part(&client_file, &release);
+        let kept = part.metadata().unwrap().len();
         assert!(
-            part > 0 && part < body.len() as u64,
-            "kept {part} of {}",
+            kept > 0 && kept < body.len() as u64,
+            "kept {kept} of {}",
             body.len()
         );
 
-        // The next attempt resumes above zero and returns the whole, verified download.
-        let mut started_at = u64::MAX;
-        let got = download(&client, &origin, &release, &state, |received, _| {
-            started_at = started_at.min(received);
-        })
+        // The next attempt resumes where it broke and returns the whole, verified file.
+        let mut first_event = None;
+        let verified = download(
+            &client,
+            &origin,
+            &release,
+            &client_file,
+            |received, _, resumed| {
+                first_event.get_or_insert((received, resumed));
+            },
+        )
         .await
         .unwrap();
-        assert_eq!(got, body);
         assert_eq!(
-            started_at, part,
-            "resumed from the break point, not from zero"
+            first_event,
+            Some((kept, true)),
+            "resumed from the break point"
         );
-        assert!(
-            !download_part(&state, &release).exists(),
-            "part cleaned up on success"
-        );
+        assert_eq!(fs::read(&verified).unwrap(), body);
         fs::remove_dir_all(dir).ok();
     }
 
     #[test]
-    fn a_rejected_hash_is_remembered_and_not_offered_again() {
-        let dir = scratch("rejected");
-        let state = dir.join("update-state.json");
-        let mut value = read_state(&state);
+    fn a_trial_that_fails_twice_is_refused() {
+        let mut value = json!({});
+        record_failure(&mut value, "abc");
+        assert!(rejected_hashes(&value).is_empty());
+        assert_eq!(value["failures"]["abc"], 1);
+        record_failure(&mut value, "abc");
+        assert_eq!(rejected_hashes(&value), vec!["abc".to_string()]);
+        assert!(value["failures"].get("abc").is_none());
+        // A success in between clears the count.
+        record_failure(&mut value, "def");
+        clear_failures(&mut value, "def");
+        record_failure(&mut value, "def");
+        assert!(!rejected_hashes(&value).contains(&"def".to_string()));
+    }
+
+    #[test]
+    fn rejected_hashes_are_bounded_newest_kept() {
+        let mut value = json!({});
         for i in 0..(REJECTED_LIMIT + 5) {
             reject_hash(&mut value, &format!("{i:064x}"));
         }
-        write_state(&state, &value).unwrap();
-        let kept = rejected_hashes(&read_state(&state));
+        let kept = rejected_hashes(&value);
         assert_eq!(kept.len(), REJECTED_LIMIT);
-        // The newest are kept; the oldest fall off.
         assert!(kept.contains(&format!("{:064x}", REJECTED_LIMIT + 4)));
         assert!(!kept.contains(&format!("{:064x}", 0)));
-        // Re-rejecting an existing hash moves it to newest without growing the list.
-        let last = kept.last().unwrap().clone();
-        reject_hash(&mut value, &last);
-        assert_eq!(rejected_hashes(&value).len(), REJECTED_LIMIT);
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn staging_swaps_the_executable_and_restore_puts_it_back() {
-        let dir = scratch("stage");
-        let client = dir.join("Superkiro-2026.09.22-Windows.exe");
-        fs::write(&client, b"old").unwrap();
-        let staged = stage_at(&client, b"new").unwrap();
-        assert_eq!(fs::read(&client).unwrap(), b"new");
-        assert_eq!(fs::read(&staged.previous).unwrap(), b"old");
-        assert_eq!(staged.executable, client);
-        restore_previous(&staged.current, &staged.previous).unwrap();
-        assert_eq!(fs::read(&client).unwrap(), b"old");
-        assert!(!staged.previous.exists());
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn restore_is_idempotent_and_survives_a_lost_new_file() {
-        let dir = scratch("restore");
+    fn staged_beside(dir: &Path, old: &[u8], new: &[u8]) -> Pending {
         let client = dir.join("Superkiro.exe");
-        fs::write(&client, b"old").unwrap();
-        let staged = stage_at(&client, b"new").unwrap();
-        // An antivirus removed the new bytes: restore must still put the old ones back.
-        fs::remove_file(&client).unwrap();
-        restore_previous(&staged.current, &staged.previous).unwrap();
-        assert_eq!(fs::read(&client).unwrap(), b"old");
-        // Running it again changes nothing and still reports the client in place.
-        restore_previous(&staged.current, &staged.previous).unwrap();
-        assert_eq!(fs::read(&client).unwrap(), b"old");
+        fs::write(&client, old).unwrap();
+        let release = release_of(new, OTHER);
+        let verified = download_part(&client, &release);
+        fs::write(&verified, new).unwrap();
+        stage(&verified, &client, &client, &release).unwrap()
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn staging_never_touches_the_customers_client() {
+        let dir = scratch("stage");
+        let pending = staged_beside(&dir, b"old", b"new");
+        assert_eq!(fs::read(&pending.current).unwrap(), b"old");
+        assert_eq!(fs::read(&pending.staged).unwrap(), b"new");
+        assert_eq!(pending.executable, pending.staged);
+        assert_eq!(pending.version, OTHER);
         fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(not(target_os = "macos"))]
     #[test]
-    fn a_folder_that_cannot_be_written_leaves_the_client_untouched() {
-        let dir = scratch("missing");
-        let client = dir.join("absent").join("Superkiro.exe");
-        let error = stage_at(&client, b"new").unwrap_err();
-        assert!(error.starts_with("[update:replace]"), "{error}");
+    fn confirming_moves_the_new_version_into_place() {
+        let dir = scratch("confirm");
+        let pending = staged_beside(&dir, b"old", b"new");
+        assert!(move_into_place(&pending));
+        assert_eq!(fs::read(&pending.current).unwrap(), b"new");
+        assert!(!pending.staged.exists());
+        let left: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(left.len(), 1, "{left:?}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_failed_move_leaves_the_customers_client_in_place() {
+        let dir = scratch("move-fail");
+        let pending = staged_beside(&dir, b"old", b"new");
+        // The staged copy vanished (an antivirus took it): the client must be put back.
+        fs::remove_file(&pending.staged).unwrap();
+        assert!(!move_into_place(&pending));
+        assert_eq!(fs::read(&pending.current).unwrap(), b"old");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn an_ended_trial_is_counted_and_the_client_carries_on() {
+        let dir = scratch("judge");
+        let state = dir.join("update-state.json");
+        let pending = staged_beside(&dir, b"old", b"new");
+        let mut value = json!({});
+        set_pending(&mut value, Some(&pending));
+        write_state(&state, &value).unwrap();
+
+        // A live trial holds the lock: nothing is judged.
+        let held = open_lock(&lock_path(&state)).unwrap();
+        judge_ended_trial(&state, "2026.09.22");
+        assert!(pending_of(&read_state(&state)).is_some());
+        drop(held);
+
+        // The trial is gone without confirming: counted, its staged copy removed, the
+        // customer's client untouched.
+        judge_ended_trial(&state, "2026.09.22");
+        let value = read_state(&state);
+        assert!(pending_of(&value).is_none());
+        assert_eq!(value["failures"][&pending.sha256], 1);
+        assert!(!pending.staged.exists());
+        assert_eq!(fs::read(&pending.current).unwrap(), b"old");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn the_new_version_finding_its_own_record_counts_nothing() {
+        let dir = scratch("judge-self");
+        let state = dir.join("update-state.json");
+        let pending = staged_beside(&dir, b"old", b"new");
+        let mut value = json!({});
+        set_pending(&mut value, Some(&pending));
+        write_state(&state, &value).unwrap();
+        judge_ended_trial(&state, OTHER);
+        let value = read_state(&state);
+        assert!(pending_of(&value).is_none());
+        assert!(value["failures"].get(&pending.sha256).is_none());
         fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn leftovers_are_removed_except_a_pending_previous_and_this_process() {
+    fn leftovers_are_removed_and_nothing_else() {
         let dir = scratch("leftovers");
         let client = dir.join("Superkiro.exe");
         fs::write(&client, b"client").unwrap();
@@ -1272,84 +1573,45 @@ mod tests {
             ".Superkiro.exe.x.old",
             "other.txt",
             ".Superkiro.exe.12.log",
+            ".Superkiro.exe.0123456789abcdef.part",
+            ".Superkiro.exe.2026.09.26.exe",
         ];
         for name in keep {
             fs::write(dir.join(name), b"keep").unwrap();
         }
-        let pending_previous = dir.join(".Superkiro.exe.99.old");
-        fs::write(&pending_previous, b"still-needed").unwrap();
-        fs::write(dir.join(".Superkiro.exe.12.old"), b"old").unwrap();
-        fs::write(dir.join(".Superkiro.exe.34.new"), b"partial").unwrap();
+        for name in [
+            ".Superkiro.exe.12.old",
+            ".Superkiro.exe.34.new",
+            ".Superkiro.exe.2026.09.24.exe",
+        ] {
+            fs::write(dir.join(name), b"gone").unwrap();
+        }
         fs::create_dir(dir.join(".Superkiro.exe.56.old")).unwrap();
-        remove_leftovers_of(&client, Some(&pending_previous));
+        let pending_staged = dir.join(".Superkiro.exe.2026.09.26.exe");
+        // Three days on, the kept part file is a superseded download; judged a week later.
+        let later = SystemTime::now() + PART_LIFETIME / 2;
+        remove_leftovers_of(&client, std::slice::from_ref(&pending_staged), later);
         let mut left: Vec<String> = fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         left.sort();
         let mut expected: Vec<String> = keep.iter().map(|s| s.to_string()).collect();
-        expected.extend(["Superkiro.exe".into(), ".Superkiro.exe.99.old".into()]);
+        expected.push("Superkiro.exe".into());
         expected.sort();
         assert_eq!(left, expected);
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn an_unconfirmed_restart_rolls_back_refuses_the_bytes_and_steps_aside() {
-        // The pending version equals this test binary's (none): stand in by writing state
-        // and calling the pieces startup() runs, without spawning anything.
-        let dir = scratch("rollback");
-        let state = dir.join("update-state.json");
-        let client = dir.join("Superkiro.exe");
-        fs::write(&client, b"old").unwrap();
-        let staged = stage_at(&client, b"new").unwrap();
-        let mut value = read_state(&state);
-        set_pending(&mut value, Some(&staged), "2026.09.25", "deadbeef");
-        write_state(&state, &value).unwrap();
-
-        // What the rollback branch does when a boot was never confirmed.
-        let pending = pending_of(&read_state(&state)).unwrap();
-        restore_previous(&pending.current, &pending.previous).unwrap();
-        reject_hash(&mut value, &pending.sha256);
-        set_pending(&mut value, None, "", "");
-        write_state(&state, &value).unwrap();
-
-        assert_eq!(fs::read(&client).unwrap(), b"old");
-        let reloaded = read_state(&state);
-        assert!(reloaded.get("pending").is_none());
-        assert!(rejected_hashes(&reloaded).contains(&"deadbeef".to_string()));
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn confirm_removes_the_old_version_only_for_the_matching_pending() {
-        let dir = scratch("confirm");
-        let state = dir.join("update-state.json");
-        let client = dir.join("Superkiro.exe");
-        fs::write(&client, b"new").unwrap();
-        let previous = dir.join(".Superkiro.exe.1.old");
-        fs::write(&previous, b"old").unwrap();
-        let staged = Staged {
-            current: client.clone(),
-            previous: previous.clone(),
-            executable: client.clone(),
-        };
-        let mut value = read_state(&state);
-        // A pending for another version (this test build's release_version() is None) is
-        // left alone: confirm() must not touch a boot that is not ours.
-        set_pending(&mut value, Some(&staged), "2026.09.25", "deadbeef");
-        write_state(&state, &value).unwrap();
-        confirm(&state);
-        assert!(previous.exists());
-        assert!(read_state(&state).get("pending").is_some());
+        // Once old enough, the part file goes too.
+        remove_leftovers_of(
+            &client,
+            &[pending_staged],
+            SystemTime::now() + PART_LIFETIME * 2,
+        );
+        assert!(!dir.join(".Superkiro.exe.0123456789abcdef.part").exists());
         fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn a_dev_build_has_no_release_version() {
-        // Tests are built without SUPERKIRO_RELEASE_VERSION.
         if env!("SUPERKIRO_RELEASE_VERSION").is_empty() {
             assert_eq!(release_version(), None);
         } else {

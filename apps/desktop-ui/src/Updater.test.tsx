@@ -45,10 +45,14 @@ describe('parseCheck', () => {
 });
 
 describe('useUpdater and UpdateScreen', () => {
-  it('confirms this build once its window is up', async () => {
+  it('confirms this build once the host has answered, and only once', async () => {
     host({ state: 'current', current: '2026.09.25' });
     render(<Harness/>); await flush();
-    expect(call).toHaveBeenCalledWith('update_confirm');
+    expect(call.mock.calls.filter(([m]) => m === 'update_confirm')).toHaveLength(1);
+    // Confirmation follows a host answer: a host that never answers is never confirmed.
+    cleanup(); call.mockReset(); call.mockRejectedValue(new Error('host down'));
+    render(<Harness/>); await flush();
+    expect(call).not.toHaveBeenCalledWith('update_confirm');
   });
 
   it('a mandatory update takes the place of the page and installs by itself', async () => {
@@ -74,8 +78,8 @@ describe('useUpdater and UpdateScreen', () => {
     host(mandatory);
     render(<Harness/>); await flush();
     const handler = vi.mocked(listen).mock.calls.find(([event]) => event === 'update-progress')![1];
-    act(() => { handler({ event: 'update-progress', id: 1, payload: { received: 0, total: 4 * 1024 * 1024 } }); });
-    act(() => { handler({ event: 'update-progress', id: 2, payload: { received: 2 * 1024 * 1024, total: 4 * 1024 * 1024 } }); });
+    act(() => { handler({ event: 'update-progress', id: 1, payload: { received: 0, total: 4 * 1024 * 1024, resumed: false } }); });
+    act(() => { handler({ event: 'update-progress', id: 2, payload: { received: 2 * 1024 * 1024, total: 4 * 1024 * 1024, resumed: false } }); });
     expect(screen.getByText('50%')).toBeTruthy();
     expect(screen.getByText(/已下载 2 \/ 4 MB/)).toBeTruthy();
     expect(screen.getByRole('progressbar').getAttribute('aria-valuenow')).toBe('50');
@@ -86,13 +90,39 @@ describe('useUpdater and UpdateScreen', () => {
     expect(screen.getByText('50%')).toBeTruthy();
   });
 
-  it('marks a download that resumed from a break point', async () => {
+  it('marks a download the host says resumed from a break point', async () => {
     host(mandatory);
     render(<Harness/>); await flush();
     const handler = vi.mocked(listen).mock.calls.find(([event]) => event === 'update-progress')![1];
-    // The first event carries a non-zero offset: the download resumed on disk.
-    act(() => { handler({ event: 'update-progress', id: 1, payload: { received: 1 * 1024 * 1024, total: 4 * 1024 * 1024 } }); });
+    act(() => { handler({ event: 'update-progress', id: 1, payload: { received: 1 * 1024 * 1024, total: 4 * 1024 * 1024, resumed: true } }); });
     expect(screen.getByText(/已从断点续传/)).toBeTruthy();
+    // A fresh download that happens to report progress first is not called resumed.
+    act(() => { handler({ event: 'update-progress', id: 2, payload: { received: 2 * 1024 * 1024, total: 4 * 1024 * 1024, resumed: false } }); });
+    expect(screen.queryByText(/已从断点续传/)).toBeNull();
+  });
+
+  it('a download in progress can be put off, which stops it for later', async () => {
+    host(mandatory);
+    render(<Harness/>); await flush();
+    expect(screen.getByRole('heading', { name: '正在更新 Superkiro' })).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: '暂停更新，先进入客户端' })); await flush();
+    expect(call).toHaveBeenCalledWith('update_cancel');
+    expect(screen.getByText('页面内容')).toBeTruthy();
+    expect(screen.getByRole('button', { name: '继续更新 ↑' })).toBeTruthy();
+  });
+
+  it('a retry waits from now, however long the client has been open', async () => {
+    vi.useFakeTimers();
+    let attempts = 0;
+    host({ state: 'current', current: '2026.09.22' });
+    const view = render(<Harness/>); await flush();
+    // Two days in the tray, then a required update whose install finds a takeover running.
+    await act(async () => { vi.advanceTimersByTime(2 * 24 * 3600 * 1000); }); await flush();
+    host(mandatory, async () => { attempts++; throw failure('SK-LOCAL-002'); });
+    view.rerender(<Harness key="later"/>); await flush();
+    expect(attempts).toBe(1);
+    await act(async () => { vi.advanceTimersByTime(31_000); }); await flush();
+    expect(attempts).toBe(2);
   });
 
   it('once the new version is in place, says the client is restarting', async () => {
@@ -144,6 +174,7 @@ describe('useUpdater and UpdateScreen', () => {
   it('a failed update explains itself and offers retry, download and restore', async () => {
     let fail = true;
     host(mandatory, async () => { if (fail) throw failure('SK-UPDATE-003'); return new Promise(() => {}); });
+    // SK-UPDATE-003 is a local failure: no automatic retries, the screen asks at once.
     const restore = vi.fn();
     render(<Harness restore={restore}/>); await flush();
     expect(screen.getByRole('heading', { name: '更新未完成' })).toBeTruthy();

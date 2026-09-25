@@ -34,9 +34,9 @@ const megabytes = (bytes: number) => (bytes / 1024 / 1024).toLocaleString('zh-CN
 
 /**
  * Checks for a new version at start and every half hour. A mandatory one installs by itself
- * as soon as nothing else is running; an optional one waits for the customer. A failed
- * mandatory update can be put off so the customer is never locked out of the app - it keeps
- * offering from the header instead of blocking the page.
+ * as soon as nothing else is running; an optional one waits for the customer. A mandatory
+ * update can be put off whenever it is not actually installing, so the customer is never
+ * locked out of the client; it then keeps offering from the header.
  */
 export function useUpdater(blocked: boolean, onUpdated: (version: string) => void) {
   const [check, setCheck] = useState<UpdateCheck | null>(null);
@@ -47,19 +47,21 @@ export function useUpdater(blocked: boolean, onUpdated: (version: string) => voi
   const [postponed, setPostponed] = useState(false);
   const [resumed, setResumed] = useState(false);
   const [autoRetry, setAutoRetry] = useState(false);
+  // Bumped by a timer when a scheduled retry is due, so the install effect runs again.
+  const [tick, setTick] = useState(0);
   const notified = useRef(false);
-  const sawProgress = useRef(false);
   const networkRetries = useRef(0);
   const mandatoryRef = useRef(false);
+  const attempt = useRef(0);
   const confirmed = useRef(false);
   const updatedLatest = useRef(onUpdated);
   updatedLatest.current = onUpdated;
-  // Once the window is up and talking to the host, tell it this build proved itself: the
-  // version it replaced is no longer kept for rollback.
-  useEffect(() => { if (!confirmed.current) { confirmed.current = true; void native('update_confirm').catch(() => {}); } }, []);
   const refresh = useCallback(async () => {
     try {
       const result = parseCheck(await native('update_check'));
+      // The host answered, so this build runs and talks to it: a new version has proven
+      // itself and takes its place (a no-op for anything else). Only once.
+      if (!confirmed.current) { confirmed.current = true; void native('update_confirm').catch(() => {}); }
       if (!result) return;
       setCheck(result);
       if (result.updated && result.current && !notified.current) {
@@ -75,61 +77,67 @@ export function useUpdater(blocked: boolean, onUpdated: (version: string) => voi
   }, [refresh]);
   useEffect(() => {
     let disposed = false, stop: (() => void) | undefined;
-    void listen<{ received?: unknown; total?: unknown }>('update-progress', ({ payload }) => {
+    void listen<{ received?: unknown; total?: unknown; resumed?: unknown }>('update-progress', ({ payload }) => {
       const received = Number(payload?.received), total = Number(payload?.total);
       if (Number.isSafeInteger(received) && Number.isSafeInteger(total) && total > 0 && received >= 0 && received <= total) {
-        // The first event carries where the download starts; above zero means it resumed.
-        if (!sawProgress.current) { sawProgress.current = true; if (received > 0) setResumed(true); }
+        // The host says whether it continued an interrupted download.
+        setResumed(payload?.resumed === true);
         setProgress({ received, total });
       }
     }).then(unlisten => { if (disposed) unlisten(); else stop = unlisten; }).catch(() => {});
     return () => { disposed = true; stop?.(); };
   }, []);
+  const schedule = useCallback((delay: number) => {
+    const at = Date.now() + delay;
+    setRetryAt(at);
+    setTimeout(() => setTick(t => t + 1), delay);
+  }, []);
   const install = useCallback(async () => {
-    setPhase('installing'); setError(null); setProgress(null); setPostponed(false); setResumed(false); setAutoRetry(false); sawProgress.current = false;
+    const mine = ++attempt.current;
+    setPhase('installing'); setError(null); setProgress(null); setPostponed(false); setResumed(false); setAutoRetry(false);
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
         native('update_install'),
-        new Promise((_, reject) => { timer = setTimeout(() => reject(toClientError({ code: 'SK-UPDATE-004' })), INSTALL_LIMIT); }),
+        new Promise((_, reject) => { timer = setTimeout(() => { void native('update_cancel').catch(() => {}); reject(toClientError({ code: 'SK-UPDATE-001' })); }, INSTALL_LIMIT); }),
       ]);
+      if (mine !== attempt.current) return;
       // The host starts the new version and ends this one.
       networkRetries.current = 0;
       setPhase('restarting');
     } catch (e) {
+      if (mine !== attempt.current) return;
       const failure = toClientError(e);
-      // A takeover or restore is running: fall back to the page and try again shortly.
-      if (failure.code === 'SK-LOCAL-002') { setPhase('idle'); setRetryAt(Date.now() + BUSY_RETRY); return; }
+      // A takeover, restore or another install is running: fall back and try again shortly.
+      if (failure.code === 'SK-LOCAL-002') { setPhase('idle'); schedule(BUSY_RETRY); return; }
       // A dropped line during a required update: resume automatically a few times before
       // asking. The download continues from the break point, so a retry does not start over.
-      // An optional update falls through to the failure screen, where the retry also resumes.
       if (failure.code === 'SK-UPDATE-001' && mandatoryRef.current && networkRetries.current < MAX_NETWORK_RETRIES) {
         networkRetries.current += 1;
-        setPhase('idle'); setAutoRetry(true); setRetryAt(Date.now() + NETWORK_RETRY);
+        setPhase('idle'); setAutoRetry(true); schedule(NETWORK_RETRY);
         return;
       }
       setError(failure); setPhase('failed');
     } finally { clearTimeout(timer); }
-  }, []);
+  }, [schedule]);
   const mandatory = check?.state === 'available' && check.mandatory === true;
   mandatoryRef.current = mandatory;
-  const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
-    if (retryAt <= now) return;
-    const timer = setTimeout(() => setNow(Date.now()), retryAt - now);
-    return () => clearTimeout(timer);
-  }, [retryAt, now]);
-  useEffect(() => {
-    if (mandatory && phase === 'idle' && !blocked && !postponed && retryAt <= now) void install();
-  }, [mandatory, phase, blocked, postponed, retryAt, now, install]);
-  // Put a failed mandatory update off so the app is usable; it keeps offering from the header.
-  const dismiss = useCallback(() => { setPhase('idle'); setError(null); setPostponed(true); setAutoRetry(false); }, []);
+    if (mandatory && phase === 'idle' && !blocked && !postponed && retryAt <= Date.now()) void install();
+  }, [mandatory, phase, blocked, postponed, retryAt, tick, install]);
+  // Put an update off so the client is usable; it keeps offering from the header. During a
+  // download this also stops it; what arrived stays and the next try continues from there.
+  const dismiss = useCallback(() => {
+    if (phase === 'installing') { ++attempt.current; void native('update_cancel').catch(() => {}); }
+    setPhase('idle'); setError(null); setPostponed(true); setAutoRetry(false); setProgress(null);
+  }, [phase]);
   const start = useCallback(() => { setPostponed(false); networkRetries.current = 0; void install(); }, [install]);
+  const retry = useCallback(() => { networkRetries.current = 0; void install(); }, [install]);
   const available = check?.state === 'available' ? check : null;
   return {
-    check, phase, progress, error, install, dismiss, start, postponed, resumed, autoRetry,
+    check, phase, progress, error, install, retry, dismiss, start, postponed, resumed, autoRetry, mandatory,
     /** An update the customer can start from the header: an optional one, or a mandatory one
-     * that failed and was put off. */
+     * that was put off. */
     offer: available && phase === 'idle' && (!mandatory || postponed) ? available : null,
     /** Whether the update screen takes the place of the page. */
     screen: phase !== 'idle' || (mandatory && !postponed),
@@ -174,13 +182,14 @@ export function UpdateScreen({ updater, blocked, openDownloads, restore }: { upd
         </div>}
     </div>
     {phase === 'failed' && <>
-      <button className="primary full" onClick={() => void updater.install()}>重试更新</button>
+      <button className="primary full" onClick={updater.retry}>重试更新</button>
       <button className="full" onClick={openDownloads}>从官网下载新版 ↗</button>
-      {restore && <button className="full" onClick={restore}>还原 Kiro 配置</button>}
-      {/* Even a required update can be put off after it fails, so the client stays usable. */}
-      <button className="text full" onClick={updater.dismiss}>暂时进入客户端</button>
     </>}
-    {/* While waiting to start (not mid-download), restoring Kiro must stay available. */}
-    {phase === 'idle' && restore && <button className="full" onClick={restore}>还原 Kiro 配置</button>}
+    {/* Restoring Kiro stays reachable until the client restarts; a restore simply makes the
+        update wait for it. */}
+    {phase !== 'restarting' && restore && <button className="full" onClick={restore}>还原 Kiro 配置</button>}
+    {/* Even a required update can be put off whenever it is not restarting, so the client is
+        never locked; a download in progress stops and later continues where it was. */}
+    {phase !== 'restarting' && <button className="text full" onClick={updater.dismiss}>{phase === 'installing' ? '暂停更新，先进入客户端' : '暂时进入客户端'}</button>}
   </section>;
 }

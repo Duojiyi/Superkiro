@@ -144,6 +144,10 @@ fn model_ids_read_as_names() {
         ("deepseek-chat", "DeepSeek Chat"),
         ("gpt-4o-mini", "GPT 4o Mini"),
         ("glm-5", "GLM 5"),
+        // Snapshot dates name a build, not the model.
+        ("claude-sonnet-4-20250514", "Claude Sonnet 4"),
+        ("claude-opus-4-1-20250805", "Claude Opus 4.1"),
+        ("claude-3-5-haiku-20241022", "Claude 3.5 Haiku"),
     ] {
         assert_eq!(display_name(id), name, "{id}");
     }

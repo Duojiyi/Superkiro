@@ -35,6 +35,9 @@ def prepare(source, version, acceptance, key, mandatory=True):
     if data.count(update_signing.release_marker(version)) != 1:
         raise ValueError('The executable was not built as this release '
                          '(set SUPERKIRO_RELEASE_VERSION to it when building)')
+    # A debug build trusts a test key anyone can derive and a redirecting variable.
+    if update_signing.debug_build(data):
+        raise ValueError('A debug build cannot be published; build with --release')
     digest = hashlib.sha256(data).hexdigest()
     receipt = json.loads(Path(acceptance).read_text(encoding='utf-8-sig'))
     expected = dict(version=version, sha256=digest, size=len(data), platform='windows', arch='x64')

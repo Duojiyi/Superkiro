@@ -71,6 +71,23 @@ class PublicationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'SUPERKIRO_RELEASE_VERSION'):
                 self.prepare()
 
+    def test_a_debug_build_is_refused(self):
+        for marker in update_signing.DEBUG_ONLY:
+            data = FIXTURE + marker
+            self.exe.write_bytes(data)
+            self.approval.update(sha256=hashlib.sha256(data).hexdigest(), size=len(data))
+            self.save()
+            with self.assertRaisesRegex(ValueError, 'debug build'):
+                self.prepare()
+
+    def test_the_debug_markers_are_what_the_client_compiles_only_in_debug(self):
+        source = (Path(__file__).resolve().parents[1] / 'crates' / 'desktop-host' / 'src'
+                  / 'update.rs').read_text(encoding='utf-8')
+        test_key, variable = (m.decode() for m in update_signing.DEBUG_ONLY)
+        self.assertIn(f'#[cfg(debug_assertions)]\nconst TEST_UPDATE_KEY: &str = "{test_key}";',
+                      source.replace('\r\n', '\n'))
+        self.assertIn(f'std::env::var("{variable}")', source)
+
     def test_an_older_version_than_the_published_one_is_refused(self):
         _, item = self.prepare()
         newer = dict(item, version='1.10', sha256='c' * 64)

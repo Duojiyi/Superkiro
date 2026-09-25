@@ -23,6 +23,8 @@ rfd = "0.15"
 open = "5"
 # Update signatures and hashes; already in the graph through the engine.
 ring = "0.17"
+# The same local data directory Tauri resolves, before Tauri is built (update.rs).
+dirs = "6"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

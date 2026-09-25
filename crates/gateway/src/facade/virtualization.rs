@@ -124,6 +124,10 @@ pub fn display_name(model_id: &str) -> String {
         .filter(|part| !part.is_empty())
     {
         if part.bytes().all(|b| b.is_ascii_digit()) {
+            // A snapshot date ("20250514") names a build, not the model: Kiro's list omits it.
+            if part.len() >= 6 {
+                continue;
+            }
             if let Some(last) = words.last_mut() {
                 if last.bytes().all(|b| b.is_ascii_digit() || b == b'.') && last.len() <= 4 {
                     last.push('.');
@@ -181,7 +185,10 @@ fn rate_multipliers(
             m.rate_multiplier.or_else(|| {
                 let (rate, anchor_price) = anchor?;
                 let relative = rate * (*price)? as f64 / anchor_price as f64;
-                Some((relative * 100.0).round() / 100.0)
+                // Two decimals as Kiro shows them, within the bounds a configured multiplier
+                // has; one too small to show as more than "0x" is left off instead.
+                let shown = ((relative * 100.0).round() / 100.0).min(1000.0);
+                (shown > 0.0).then_some(shown)
             })
         })
         .collect()

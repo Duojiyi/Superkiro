@@ -97,6 +97,17 @@ def release_marker(version):
     return f'superkiro-release:{version};'.encode()
 
 
+# Compiled only into debug builds (update.rs): the test key they trust and the variable that
+# points them at another update server. Neither may ever reach a customer.
+DEBUG_ONLY = (b'197f6b23e16c8532c6abc838facd5ea789be0c76b2920334039bfa8b3d368d61',
+              b'SUPERKIRO_UPDATE_URL')
+
+
+def debug_build(data):
+    """Whether `data` (an executable) is a debug build, which must never be published."""
+    return any(marker in data for marker in DEBUG_ONLY)
+
+
 def keygen(path=KEY):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
