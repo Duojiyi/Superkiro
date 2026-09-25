@@ -196,3 +196,42 @@ async fn a_masked_name_that_matches_no_bound_device_unbinds_nothing() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(billing.get_card("card").unwrap().bound_devices, vec!["old"]);
 }
+
+#[tokio::test]
+async fn cooldown_refusals_never_lock_the_card_holder_out() {
+    let (billing, _, app) = setup(3);
+    assert_eq!(unbind(&app, "old").await.0, StatusCode::OK);
+    billing
+        .activate_card_with_device("card", gateway::now_secs(), 86400, Some("new"))
+        .unwrap();
+    // Well past the five failures that start a lockout.
+    for _ in 0..7 {
+        let (status, result) = unbind(&app, "new").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{result}");
+        assert_eq!(result["code"], "rebind_cooldown");
+    }
+}
+
+#[tokio::test]
+async fn a_lockout_says_how_long_it_lasts() {
+    let (_, _, app) = setup(2);
+    for _ in 0..5 {
+        assert_eq!(unbind(&app, "****zzzz").await.0, StatusCode::BAD_REQUEST);
+    }
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/portal/unbind")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"card": CARD_CODE, "device": "old", "challengeToken": "unused"}).to_string(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let wait: u64 = response.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((600..=900).contains(&wait), "{wait}");
+}

@@ -59,6 +59,7 @@ class PortalBrowserTests(unittest.TestCase):
         self.manifest_status = 200
         self.fail_action = None
         self.fail_status = 400
+        self.fail_headers = {'Retry-After': '30'}
         self.fail_payload = {}
         self.bad_challenge = False
         self.bad_unbind = False
@@ -85,7 +86,7 @@ class PortalBrowserTests(unittest.TestCase):
         self.assertEqual(route.request.method, 'POST')
         self.assertNotIn(CARD, route.request.url)
         if action == self.fail_action:
-            route.fulfill(status=self.fail_status, headers={'Retry-After': '30'},
+            route.fulfill(status=self.fail_status, headers=self.fail_headers,
                           json={'success': False, 'error': CARD + DEVICE, **self.fail_payload})
         elif action == 'query':
             route.fulfill(json=self.query)
@@ -185,8 +186,11 @@ class PortalBrowserTests(unittest.TestCase):
 
     def test_04_query_failures_and_untrusted_text(self):
         self.goto('/device')
-        for status, text in [(400, '验证未通过'), (429, '30 秒'), (404, '尚未开放'), (503, '验证未通过')]:
-            self.fail_action, self.fail_status = 'query', status
+        # A lockout's own wait is shown; with none given, the page must not invent one.
+        for status, headers, text in [(400, {}, '验证未通过'), (429, {'Retry-After': '30'}, '30 秒'),
+                                      (429, {'Retry-After': '900'}, '15 分钟'), (429, {}, '等待时间未知'),
+                                      (404, {}, '尚未开放'), (503, {}, '验证未通过')]:
+            self.fail_action, self.fail_status, self.fail_headers = 'query', status, headers
             self.page.locator('#card').fill(CARD)
             self.page.locator('#verify').click()
             expect(self.page.locator('#device-message')).to_contain_text(text)

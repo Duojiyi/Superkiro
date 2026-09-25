@@ -76,6 +76,24 @@ fn device_refusal(error: &BillingError) -> Option<String> {
     .then(|| error.to_string())
 }
 
+/// A lockout says how long it lasts, as every 429 here does: without it the page could
+/// only guess, and told a customer locked out for 15 minutes to retry in a minute.
+fn lockout_response(remaining_secs: u64) -> Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(header::CONTENT_TYPE, "application/json")],
+        axum::Json(serde_json::json!({
+            "success": false,
+            "error": format!("Too many failed attempts. Locked out for {remaining_secs}s"),
+        })),
+    )
+        .into_response();
+    if let Ok(value) = header::HeaderValue::from_str(&remaining_secs.max(1).to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
 /// Unified error for portal endpoints — intentionally vague to avoid enumeration (P1-01).
 fn portal_deny_response() -> Response {
     (
@@ -495,15 +513,7 @@ impl FacadeHandler for PortalUnbindHandler {
             if let Err(BruteForceError::LockedOut { remaining_secs }) =
                 self.protector.check_lockout(&ip, now)
             {
-                return (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    [(header::CONTENT_TYPE, "application/json")],
-                    axum::Json(serde_json::json!({
-                        "success": false,
-                        "error": format!("Too many failed attempts. Locked out for {remaining_secs}s"),
-                    })),
-                )
-                    .into_response();
+                return lockout_response(remaining_secs);
             }
 
             let bytes = match axum::body::to_bytes(req.into_body(), 64 * 1024).await {
@@ -571,7 +581,14 @@ impl FacadeHandler for PortalUnbindHandler {
                 req_data.device.clone()
             };
             if let Err(e) = self.billing.unbind_device(&card.id, &device) {
-                let _ = self.protector.record_failure(&ip, now);
+                // A cooldown or an exhausted rebind allowance is policy, answered to someone
+                // who proved the card and the challenge: not a guess to count toward a lockout.
+                if !matches!(
+                    e,
+                    BillingError::RebindCooldown { .. } | BillingError::RebindLimitExceeded { .. }
+                ) {
+                    let _ = self.protector.record_failure(&ip, now);
+                }
                 // Only allowlisted policy details leave the server; never expose billing IDs.
                 let detail = match e {
                     BillingError::RebindCooldown { remaining_secs } => serde_json::json!({
@@ -649,15 +666,7 @@ impl FacadeHandler for PortalTopupHandler {
             if let Err(BruteForceError::LockedOut { remaining_secs }) =
                 self.protector.check_lockout(&ip, now)
             {
-                return (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    [(header::CONTENT_TYPE, "application/json")],
-                    axum::Json(serde_json::json!({
-                        "success": false,
-                        "error": format!("Too many failed attempts. Locked out for {remaining_secs}s"),
-                    })),
-                )
-                    .into_response();
+                return lockout_response(remaining_secs);
             }
 
             let bytes = match axum::body::to_bytes(req.into_body(), 64 * 1024).await {
