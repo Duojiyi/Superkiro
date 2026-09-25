@@ -24,8 +24,11 @@ ROOT = Path(__file__).resolve().parents[1]
 KEY = ROOT / '.acceptance' / 'update-signing-key.pem'
 CLIENT_KEYS = ROOT / 'crates' / 'desktop-host' / 'src' / 'update.rs'
 TARGETS = {('windows', 'x64'), ('macos', 'arm64'), ('macos', 'x64')}
-# Numeric, dotted, one to four parts: what clients compare ("2026.09.25", "2026.09.25.1").
+# Numeric, dotted, one to four parts: what clients can compare. New releases are stricter,
+# see RELEASE_VERSION.
 VERSION = re.compile(r'[0-9]{1,9}(\.[0-9]{1,9}){0,3}')
+# What a release is published as: MAJOR.MINOR.PATCH without leading zeros ("0.1.1").
+RELEASE_VERSION = re.compile(r'(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})')
 
 
 def message(item):

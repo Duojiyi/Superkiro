@@ -26,17 +26,30 @@
 > 下一次构建的客户端所信任的钥，不是**线上已安装**客户端所信任的钥。轮换必须按上面的顺序，
 > 否则线上旧客户端会静默收不到更新。
 
-## 二、构建
+## 二、版本号与构建
 
-发布版必须带版本号（客户端据此判断自身版本并比较线上发布）：
+版本号用语义化版本 `主.次.修订`（如 `0.1.1`），不带前导零：修 bug 升修订号（0.1.1 → 0.1.2），
+加功能升次版本号（0.1.x → 0.2.0），稳定后再到 1.0.0。客户端按数值逐段比较，所以 `0.1.10`
+高于 `0.1.9`。版本号**只在一处定义**：`crates/desktop-host/tauri.conf.json` 的 `version`。
+Windows 程序属性、macOS Info.plist、客户端“版本信息”、更新比较、发布清单与下载文件名都用它。
+
+> 早先的发布用过 `0.1.0-preview.*` 和 `2026.09.22` 这类编号。它们不带更新签名，没有任何客户端
+> 是经热更新装上它们的，所以语义化版本的首个发布（0.1.1）可以直接替换它们。之后发布清单
+> 一律拒绝“版本倒退”。
+
+发一个版本：
+
+1. 提交一次版本号变更：把 `tauri.conf.json` 的 `version` 改成新版本号（开发中的构建显示为
+   `<版本>-preview.<提交号>`）。
+2. 用同一个版本号构建发布版：
 
 ```sh
-python scripts/build_desktop.py --release-version 2026.09.25      # Windows 单文件
-# CI：Desktop Native Packages 工作流，手动触发时填 release_version
+python scripts/build_desktop.py --release-version 0.1.1      # Windows 单文件
+# CI：Desktop Native Packages 工作流，手动触发时 release_version 填 0.1.1
 ```
 
-版本号为一到四段数字（如 `2026.09.25`、`2026.09.25.1`），按数值逐段比较。构建会把
-`superkiro-release:<版本>;` 标记嵌入二进制；发布脚本据此拒绝“构建版本与发布版本不符”的产物，
+构建会把 `superkiro-release:<版本>;` 标记嵌入二进制；发布版构建时若版本号与 `tauri.conf.json`
+不一致，或不是 `主.次.修订`，构建直接失败。发布脚本据此拒绝“构建版本与发布版本不符”的产物，
 避免客户端每次启动都重装同一发布。不带 `--release-version` 的构建不自更新（供本地开发）。
 
 ## 三、验收后发布
@@ -45,7 +58,7 @@ python scripts/build_desktop.py --release-version 2026.09.25      # Windows 单�
 
 ```sh
 python .acceptance/ssh_secret.py | python deploy/publish_native_windows.py \
-  --version 2026.09.25 --source dist/Superkiro.exe --acceptance <收据.json>
+  --version 0.1.1 --source dist/Superkiro.exe --acceptance <收据.json>
 # macOS：publish_native_macos.py，另加 --arch arm64|x64
 ```
 

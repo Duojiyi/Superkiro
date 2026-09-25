@@ -3,7 +3,7 @@
 Requires Rust/MSVC and Node/npm on the build machine. End users need WebView2,
 not Python, Node, patch-cli, or files next to Superkiro.exe.
 
-  python scripts/build_desktop.py --release-version 2026.09.25
+  python scripts/build_desktop.py --release-version 0.1.1
 
 builds a release: the client knows its version and updates itself to later ones. Without
 it the build never updates itself. Publish it as exactly that version.
@@ -20,8 +20,8 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def main(release_version=""):
-    if release_version and not re.fullmatch(r"[0-9]{1,9}(\.[0-9]{1,9}){0,3}", release_version):
-        raise SystemExit("Release version must be one to four dot-separated numbers, e.g. 2026.09.25")
+    if release_version and not re.fullmatch(r"(0|[1-9][0-9]{0,8})(\.(0|[1-9][0-9]{0,8})){2}", release_version):
+        raise SystemExit("Release version must be MAJOR.MINOR.PATCH, e.g. 0.1.1")
     if sys.platform != "win32":
         raise SystemExit("This portable EXE build targets Windows; run it on Windows with MSVC.")
     npm = shutil.which("npm.cmd") or shutil.which("npm")
@@ -52,5 +52,5 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--release-version", default="",
-                        help="one to four dot-separated numbers, e.g. 2026.09.25")
+                        help="MAJOR.MINOR.PATCH, the version in tauri.conf.json, e.g. 0.1.1")
     main(parser.parse_args().release_version)

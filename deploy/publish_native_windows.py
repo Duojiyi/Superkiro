@@ -21,8 +21,8 @@ REMOTE = '/opt/kiro-byok/downloads/'
 
 def check_version(version):
     # Clients compare versions numerically, and each knows its own from its build.
-    if not isinstance(version, str) or not update_signing.VERSION.fullmatch(version):
-        raise ValueError('Release version must be one to four dot-separated numbers, e.g. 2026.09.25')
+    if not isinstance(version, str) or not update_signing.RELEASE_VERSION.fullmatch(version):
+        raise ValueError('Release version must be MAJOR.MINOR.PATCH, e.g. 0.1.1')
 
 
 def prepare(source, version, acceptance, key, mandatory=True):
@@ -60,7 +60,10 @@ def merge_manifest(previous, item):
         same_target = all(release.get(k) == item[k] for k in ('platform', 'arch'))
         if same_target and release.get('version') == item['version'] and release.get('sha256') != item['sha256']:
             raise ValueError('Version already published with a different digest')
-        if same_target and newer(release.get('version'), item['version']):
+        # Clients never go back from what they may have installed. An entry without an
+        # update signature predates self-update: no client installed it by updating.
+        if (same_target and 'updateSignature' in release
+                and newer(release.get('version'), item['version'])):
             raise ValueError('A newer version is already published; clients never go back')
     return {'releases': [r for r in releases if
                          (r.get('platform'), r.get('arch')) != (item['platform'], item['arch'])] + [item]}

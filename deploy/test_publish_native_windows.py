@@ -8,7 +8,7 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from publish_native_windows import prepare, merge_manifest, validate_history
+from publish_native_windows import prepare, merge_manifest, validate_history, check_version
 import update_signing
 
 FIXTURE = b'MZfixture-not-executable' + update_signing.release_marker('1.2.3')
@@ -95,6 +95,21 @@ class PublicationTests(unittest.TestCase):
             merge_manifest({'releases': [newer]}, item)
         older = dict(item, version='1.2', sha256='d' * 64)
         self.assertEqual(merge_manifest({'releases': [older]}, item)['releases'], [item])
+
+    def test_an_entry_from_before_self_update_does_not_block_a_release(self):
+        # The date-numbered releases carry no update signature: no client updated to them,
+        # so a release numbered lower still replaces them.
+        _, item = self.prepare()
+        legacy = {k: v for k, v in item.items() if k != 'updateSignature'}
+        legacy.update(version='2026.09.22', sha256='e' * 64)
+        self.assertEqual(merge_manifest({'releases': [legacy]}, item)['releases'], [item])
+
+    def test_a_release_is_numbered_major_minor_patch(self):
+        for good in ['0.1.1', '1.0.0', '10.20.300']:
+            check_version(good)
+        for bad in ['2026.09.25', '0.1', '0.1.1.1', '01.1.1', '0.1.1-rc', '', None]:
+            with self.assertRaises(ValueError):
+                check_version(bad)
 
     def test_unapproved_wrong_version_and_non_executable_fail(self):
         for key, value in [('approvedForPublication', False), ('version', '1.2.4'), ('size', 0)]:

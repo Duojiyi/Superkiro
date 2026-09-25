@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       release_version:
-        description: 'Release version the clients are built as (e.g. 2026.09.25); empty builds never update themselves'
+        description: 'Release version the clients are built as: MAJOR.MINOR.PATCH, the version in tauri.conf.json (e.g. 0.1.1); empty builds never update themselves'
         required: false
         default: ''
   push:
