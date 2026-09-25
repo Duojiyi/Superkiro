@@ -1971,13 +1971,10 @@ impl BillingEngine {
                 .unwrap_or(params.credit_multiplier);
 
             let settings = candidate.settings.clone();
-            let resolved_rcv = self
-                .resolve_rate_card_version(rate_card_id, model, now_secs)
-                .or_else(|| {
-                    model_map.and_then(|m| {
-                        self.resolve_rate_card_version(rate_card_id, &m.target_model, now_secs)
-                    })
-                });
+            let models: Vec<&str> = std::iter::once(model.as_str())
+                .chain(model_map.map(|m| m.target_model.as_str()))
+                .collect();
+            let resolved_rcv = self.resolve_price(rate_card_id, &models, now_secs);
             if let Some(rcv) = resolved_rcv {
                 let amt = rcv.calculate_reserve_amount(
                     params.estimated_input_tokens,
@@ -2216,23 +2213,11 @@ impl BillingEngine {
         let resolved_rcv = if let Some(ref vid) = locked_version {
             self.get_rate_card_version(vid)
         } else {
-            self.resolve_rate_card_version(rate_card_id, exposed_model, reservation_created_at)
-                .or_else(|| {
-                    model_map.as_ref().and_then(|m| {
-                        self.resolve_rate_card_version(
-                            rate_card_id,
-                            &m.target_model,
-                            reservation_created_at,
-                        )
-                    })
-                })
-                .or_else(|| {
-                    self.resolve_rate_card_version(
-                        rate_card_id,
-                        target_model,
-                        reservation_created_at,
-                    )
-                })
+            let models: Vec<&str> = std::iter::once(exposed_model)
+                .chain(model_map.map(|m| m.target_model.as_str()))
+                .chain(std::iter::once(target_model))
+                .collect();
+            self.resolve_price(rate_card_id, &models, reservation_created_at)
         };
 
         let settings = candidate.settings.clone();
@@ -3605,11 +3590,11 @@ impl BillingEngine {
             .iter()
             .find(|m| m.group_id == group_id && m.exposed_model_id == exposed_model_id)
             .cloned()?;
-        let version = self
-            .resolve_rate_card_version(&group.rate_card_id, exposed_model_id, at_secs)
-            .or_else(|| {
-                self.resolve_rate_card_version(&group.rate_card_id, &map.target_model, at_secs)
-            })?;
+        let version = self.resolve_price(
+            &group.rate_card_id,
+            &[exposed_model_id, &map.target_model],
+            at_secs,
+        )?;
         let tokens = UsageTokens {
             uncached_input_tokens: 1_000_000,
             output_tokens: 1_000_000,
@@ -3690,29 +3675,38 @@ impl BillingEngine {
         model: &str,
         at_secs: u64,
     ) -> Option<RateCardVersion> {
+        self.resolve_price(rate_card_id, &[model], at_secs)
+    }
+
+    /// The price of a request whose model is known by the names in `models`, most specific
+    /// first: the exposed model, then the model it is mapped to (and, when settling, the one
+    /// it was routed to). Every price is resolved in this one order: an exact price for any
+    /// of them, then the rate card's wildcard `*`. The wildcard is the catch-all for models
+    /// with no price of their own; tried before the mapped target, it priced a mapped model
+    /// at the catch-all.
+    pub fn resolve_price(
+        &self,
+        rate_card_id: &str,
+        models: &[&str],
+        at_secs: u64,
+    ) -> Option<RateCardVersion> {
         let versions = self.rate_card_versions.read().unwrap();
-
-        let exact = versions
+        let latest = |model: &str| {
+            versions
+                .iter()
+                .filter(|v| {
+                    v.rate_card_id == rate_card_id
+                        && v.model == model
+                        && v.effective_from_secs <= at_secs
+                })
+                .max_by_key(|v| v.effective_from_secs)
+                .cloned()
+        };
+        models
             .iter()
-            .filter(|v| {
-                v.rate_card_id == rate_card_id
-                    && v.model == model
-                    && v.effective_from_secs <= at_secs
-            })
-            .max_by_key(|v| v.effective_from_secs)
-            .cloned();
-
-        if exact.is_some() {
-            return exact;
-        }
-
-        versions
-            .iter()
-            .filter(|v| {
-                v.rate_card_id == rate_card_id && v.model == "*" && v.effective_from_secs <= at_secs
-            })
-            .max_by_key(|v| v.effective_from_secs)
-            .cloned()
+            .filter(|model| **model != "*")
+            .find_map(|model| latest(model))
+            .or_else(|| latest("*"))
     }
 
     /// Retrieve global billing settings.

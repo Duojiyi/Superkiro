@@ -918,3 +918,125 @@ fn a_version_priced_only_on_cache_tokens_still_reserves() {
     version.fixed_cache_read_credit_per_m = 5_000_000;
     assert!(version.calculate_reserve_amount(10_000, 0, 1.0, 1.0, &settings) > 0);
 }
+
+fn output_price(id: &str, rate_card_id: &str, model: &str, credits_per_m: i64) -> RateCardVersion {
+    RateCardVersion {
+        id: id.to_string(),
+        rate_card_id: rate_card_id.to_string(),
+        model: model.to_string(),
+        currency: Currency::Cny,
+        pricing_mode: PricingMode::Fixed,
+        input_price_per_m: 0.0,
+        output_price_per_m: 0.0,
+        cache_creation_price_per_m: 0.0,
+        cache_read_price_per_m: 0.0,
+        fixed_input_credit_per_m: 0,
+        fixed_output_credit_per_m: credits_per_m * MICRO_CREDITS_PER_CREDIT,
+        fixed_cache_creation_credit_per_m: 0,
+        fixed_cache_read_credit_per_m: 0,
+        per_call_credit: 0,
+        margin_multiplier: 1.0,
+        effective_from_secs: 0,
+    }
+}
+
+/// A price is resolved in one order everywhere: the exposed model's own price, then the
+/// price of the model it is mapped to, then the rate card's wildcard. The wildcard was
+/// tried right after the exposed model, so a cheap catch-all priced a mapped model a
+/// thousand times under its target's price, in the reservation, the settlement and the
+/// model list alike.
+#[test]
+fn a_wildcard_price_never_shadows_the_mapped_targets_price() {
+    let engine = BillingEngine::new();
+    let now = 1_000;
+    let mut group = Group::pro_plus("group-target", "Target pricing");
+    group.rate_card_id = "rc-target".to_string();
+    engine.upsert_group(group);
+    engine.upsert_model_map(ModelMap::new(
+        "map-public",
+        "group-target",
+        "public",
+        "prov",
+        "target-x",
+    ));
+    engine.upsert_model_map(ModelMap::new(
+        "map-other",
+        "group-target",
+        "other",
+        "prov",
+        "unpriced-target",
+    ));
+    engine.upsert_rate_card_version(output_price("v-target", "rc-target", "target-x", 1_000));
+    engine.upsert_rate_card_version(output_price("v-star", "rc-target", "*", 1));
+    let mut card = Card::new(
+        "card-target",
+        "group-target",
+        5_000 * MICRO_CREDITS_PER_CREDIT,
+    );
+    card.activate(now, 86_400).unwrap();
+    engine.upsert_card(card);
+    let million_out = UsageTokens {
+        output_tokens: 1_000_000,
+        ..UsageTokens::default()
+    };
+
+    let reservation = engine
+        .reserve(
+            "card-target",
+            "inv-reserved",
+            &ReservationEstimateParams::new(0, 1_000_000).with_model("public"),
+            now,
+            300,
+        )
+        .unwrap();
+    assert_eq!(reservation.rate_card_version.as_deref(), Some("v-target"));
+    assert_eq!(
+        reservation.reserved_micro_credits,
+        1_000 * MICRO_CREDITS_PER_CREDIT
+    );
+    let entry = engine
+        .settle(
+            "inv-reserved",
+            &million_out,
+            "public",
+            "prov",
+            "target-x",
+            now + 1,
+        )
+        .unwrap();
+    assert_eq!(entry.rate_card_version.as_deref(), Some("v-target"));
+    assert_eq!(entry.credits_charged, 1_000 * MICRO_CREDITS_PER_CREDIT);
+
+    // A reservation that named no model is priced when it settles, in the same order.
+    engine
+        .reserve(
+            "card-target",
+            "inv-unnamed",
+            &ReservationEstimateParams::new(0, 1),
+            now,
+            300,
+        )
+        .unwrap();
+    let entry = engine
+        .settle(
+            "inv-unnamed",
+            &million_out,
+            "public",
+            "prov",
+            "target-x",
+            now + 1,
+        )
+        .unwrap();
+    assert_eq!(entry.rate_card_version.as_deref(), Some("v-target"));
+
+    // The model list compares models at the price a request pays.
+    assert_eq!(
+        engine.display_price("group-target", "public", now),
+        Some(1_000 * MICRO_CREDITS_PER_CREDIT)
+    );
+    // The wildcard still prices a model with no price of its own or of its target.
+    assert_eq!(
+        engine.display_price("group-target", "other", now),
+        Some(MICRO_CREDITS_PER_CREDIT)
+    );
+}
