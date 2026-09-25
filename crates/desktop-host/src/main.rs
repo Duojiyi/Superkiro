@@ -282,6 +282,7 @@ async fn native_inner(
                 &backend::download_client(&origin)?,
                 &origin,
                 &release,
+                &state_file,
                 |received, total| {
                     // A percent at a time is plenty for a progress bar.
                     let percent = received * 100 / total.max(1);

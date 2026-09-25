@@ -284,52 +284,113 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The release's bytes, exactly as signed. `progress` hears (received, total).
+/// Where an interrupted download of `release` is kept, so it can resume rather than start
+/// over. Named by hash, so a different release never reuses the wrong bytes.
+fn download_part(state: &Path, release: &Release) -> PathBuf {
+    state.with_file_name(format!(".update-download-{}.part", hex(&release.sha256)))
+}
+
+/// What to do with a part file of `existing` bytes for a release of `size`.
+#[derive(Debug, PartialEq)]
+enum Resume {
+    /// Nothing kept; download the whole thing.
+    Fresh,
+    /// Continue after this many bytes already on disk.
+    From(u64),
+    /// The bytes are all here; only verify.
+    Complete,
+}
+
+fn resume_plan(existing: u64, size: u64) -> Resume {
+    match existing {
+        0 => Resume::Fresh,
+        n if n == size => Resume::Complete,
+        n if n < size => Resume::From(n),
+        // Longer than the signed size: it cannot be these bytes. Start over.
+        _ => Resume::Fresh,
+    }
+}
+
+/// The release's bytes, exactly as signed, resuming an interrupted download of the same
+/// bytes where it left off. `progress` hears (received, total). The verified bytes are read
+/// back from disk, so a resume across restarts is checked whole against the signed hash.
 pub async fn download(
     client: &reqwest::Client,
     origin: &str,
     release: &Release,
+    state: &Path,
     mut progress: impl FnMut(u64, u64),
 ) -> Result<Vec<u8>, String> {
+    use std::io::Write;
     let failed =
         |e: reqwest::Error| format!("[update:download] {}", crate::backend::network_error(e));
-    let mut response = client
-        .get(format!("{origin}{}", release.url))
-        .send()
-        .await
-        .map_err(failed)?;
-    if response.status() != reqwest::StatusCode::OK {
-        return Err(format!(
-            "[update:download] Update HTTP {}",
-            response.status().as_u16()
-        ));
-    }
-    if response
-        .content_length()
-        .is_some_and(|length| length != release.size)
-    {
-        return Err("[update:verify] The update is not the size that was signed".into());
-    }
-    let mut bytes = Vec::with_capacity(release.size as usize);
-    loop {
-        // A stalled line fails in a minute; a slow one may take as long as it needs.
-        let chunk = tokio::time::timeout(Duration::from_secs(60), response.chunk())
-            .await
-            .map_err(|_| "[update:download] Update download timed out".to_string())?
-            .map_err(failed)?;
-        let Some(chunk) = chunk else { break };
-        if chunk.len() as u64 > release.size - bytes.len() as u64 {
-            return Err("[update:verify] The update is larger than was signed".into());
+    let part = download_part(state, release);
+    let existing = fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+    let mut have = match resume_plan(existing, release.size) {
+        Resume::Complete => release.size,
+        Resume::From(n) => n,
+        Resume::Fresh => {
+            let _ = fs::remove_file(&part);
+            0
         }
-        bytes.extend_from_slice(&chunk);
-        progress(bytes.len() as u64, release.size);
+    };
+    progress(have, release.size);
+
+    if have < release.size {
+        let mut request = client.get(format!("{origin}{}", release.url));
+        if have > 0 {
+            request = request.header(reqwest::header::RANGE, format!("bytes={have}-"));
+        }
+        let mut response = request.send().await.map_err(failed)?;
+        let status = response.status();
+        // 206 continues what we have; a plain 200 ignores the range, so start the file over.
+        let mut file = if have > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT {
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&part)
+                .map_err(|e| format!("[update:download] Cannot resume the download: {e}"))?
+        } else if status == reqwest::StatusCode::OK {
+            have = 0;
+            if let Some(dir) = part.parent() {
+                let _ = fs::create_dir_all(dir);
+            }
+            fs::File::create(&part)
+                .map_err(|e| format!("[update:download] Cannot write the download: {e}"))?
+        } else {
+            return Err(format!("[update:download] Update HTTP {}", status.as_u16()));
+        };
+        loop {
+            // A stalled line fails in a minute; a slow one may take as long as it needs. An
+            // interrupted one leaves the part file for the next attempt to continue.
+            let chunk = tokio::time::timeout(Duration::from_secs(60), response.chunk())
+                .await
+                .map_err(|_| "[update:download] Update download timed out".to_string())?
+                .map_err(failed)?;
+            let Some(chunk) = chunk else { break };
+            if chunk.len() as u64 > release.size - have {
+                return Err("[update:verify] The update is larger than was signed".into());
+            }
+            file.write_all(&chunk)
+                .map_err(|e| format!("[update:download] Cannot write the download: {e}"))?;
+            have += chunk.len() as u64;
+            progress(have, release.size);
+        }
+        file.sync_all()
+            .map_err(|_| "[update:download] Cannot write the download".to_string())?;
     }
+
+    let bytes =
+        fs::read(&part).map_err(|_| "[update:download] Cannot read the download".to_string())?;
     if bytes.len() as u64 != release.size {
+        // The part is short (the connection dropped); it stays for the next attempt.
         return Err("[update:download] The update download was cut short".into());
     }
     if ring::digest::digest(&ring::digest::SHA256, &bytes).as_ref() != release.sha256 {
+        // Not the signed bytes: discard, so a corrupt resume cannot wedge every attempt.
+        let _ = fs::remove_file(&part);
         return Err("[update:verify] The update does not match its signed hash".into());
     }
+    let _ = fs::remove_file(&part);
     Ok(bytes)
 }
 
@@ -1026,6 +1087,115 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_download_resumes_from_what_is_already_on_disk() {
+        let size = 13_156_864;
+        assert_eq!(resume_plan(0, size), Resume::Fresh);
+        assert_eq!(resume_plan(4096, size), Resume::From(4096));
+        assert_eq!(resume_plan(size, size), Resume::Complete);
+        // Longer than the signed size cannot be these bytes: start over.
+        assert_eq!(resume_plan(size + 1, size), Resume::Fresh);
+    }
+
+    /// A minimal HTTP server: the first plain GET declares the full length but sends only
+    /// half and closes (an interrupted download); a ranged GET serves 206 with the rest.
+    fn serve_with_one_break(listener: std::net::TcpListener, body: Vec<u8>) {
+        use std::io::{Read, Write};
+        let mut first = true;
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buffer = [0u8; 2048];
+            let mut request = Vec::new();
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => request.extend_from_slice(&buffer[..n]),
+                }
+            }
+            let text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+            let range = text.lines().find_map(|line| {
+                line.strip_prefix("range: bytes=")
+                    .and_then(|r| r.strip_suffix('-'))
+                    .and_then(|n| n.parse::<usize>().ok())
+            });
+            if let Some(start) = range {
+                let tail = &body[start..];
+                let header = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                    tail.len(), start, body.len() - 1, body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(tail);
+            } else if first {
+                first = false;
+                // Full length promised, half delivered, then the socket closes.
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&body[..body.len() / 2]);
+            } else {
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&body);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_download_resumes_over_http_and_verifies_whole() {
+        let dir = scratch("resume-http");
+        let state = dir.join("update-state.json");
+        let body: Vec<u8> = (0..120_000u32).map(|i| (i % 251) as u8).collect();
+        let digest = ring::digest::digest(&ring::digest::SHA256, &body);
+        let mut sha256 = [0u8; 32];
+        sha256.copy_from_slice(digest.as_ref());
+        let release = Release {
+            version: "2026.09.25".into(),
+            url: "/downloads/app".into(),
+            sha256,
+            size: body.len() as u64,
+            mandatory: true,
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let served = body.clone();
+        std::thread::spawn(move || serve_with_one_break(listener, served));
+
+        let client = reqwest::Client::new();
+        // The first attempt is cut short; the part file keeps what arrived.
+        let first = download(&client, &origin, &release, &state, |_, _| {}).await;
+        assert!(first.is_err(), "{first:?}");
+        let part = download_part(&state, &release).metadata().unwrap().len();
+        assert!(
+            part > 0 && part < body.len() as u64,
+            "kept {part} of {}",
+            body.len()
+        );
+
+        // The next attempt resumes above zero and returns the whole, verified download.
+        let mut started_at = u64::MAX;
+        let got = download(&client, &origin, &release, &state, |received, _| {
+            started_at = started_at.min(received);
+        })
+        .await
+        .unwrap();
+        assert_eq!(got, body);
+        assert_eq!(
+            started_at, part,
+            "resumed from the break point, not from zero"
+        );
+        assert!(
+            !download_part(&state, &release).exists(),
+            "part cleaned up on success"
+        );
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]

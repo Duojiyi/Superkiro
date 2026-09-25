@@ -70,16 +70,29 @@ describe('useUpdater and UpdateScreen', () => {
     expect(call).toHaveBeenCalledWith('update_install');
   });
 
-  it('shows download progress from the host', async () => {
+  it('shows animated download progress from the host', async () => {
     host(mandatory);
     render(<Harness/>); await flush();
     const handler = vi.mocked(listen).mock.calls.find(([event]) => event === 'update-progress')![1];
-    act(() => { handler({ event: 'update-progress', id: 1, payload: { received: 2 * 1024 * 1024, total: 4 * 1024 * 1024 } }); });
-    expect(screen.getByText('已下载 2 / 4 MB')).toBeTruthy();
-    const bar = screen.getByLabelText('更新下载进度') as HTMLProgressElement;
-    expect(bar.value).toBe(2 * 1024 * 1024);
-    act(() => { handler({ event: 'update-progress', id: 2, payload: { received: 9, total: 1 } }); });
-    expect(screen.getByText('已下载 2 / 4 MB')).toBeTruthy();
+    act(() => { handler({ event: 'update-progress', id: 1, payload: { received: 0, total: 4 * 1024 * 1024 } }); });
+    act(() => { handler({ event: 'update-progress', id: 2, payload: { received: 2 * 1024 * 1024, total: 4 * 1024 * 1024 } }); });
+    expect(screen.getByText('50%')).toBeTruthy();
+    expect(screen.getByText(/已下载 2 \/ 4 MB/)).toBeTruthy();
+    expect(screen.getByRole('progressbar').getAttribute('aria-valuenow')).toBe('50');
+    // Started from zero, so it is not a resumed download.
+    expect(screen.queryByText(/已从断点续传/)).toBeNull();
+    // Nonsense from the event channel is ignored.
+    act(() => { handler({ event: 'update-progress', id: 3, payload: { received: 9, total: 1 } }); });
+    expect(screen.getByText('50%')).toBeTruthy();
+  });
+
+  it('marks a download that resumed from a break point', async () => {
+    host(mandatory);
+    render(<Harness/>); await flush();
+    const handler = vi.mocked(listen).mock.calls.find(([event]) => event === 'update-progress')![1];
+    // The first event carries a non-zero offset: the download resumed on disk.
+    act(() => { handler({ event: 'update-progress', id: 1, payload: { received: 1 * 1024 * 1024, total: 4 * 1024 * 1024 } }); });
+    expect(screen.getByText(/已从断点续传/)).toBeTruthy();
   });
 
   it('once the new version is in place, says the client is restarting', async () => {

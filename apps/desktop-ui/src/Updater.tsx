@@ -41,7 +41,9 @@ export function useUpdater(blocked: boolean, onUpdated: (version: string) => voi
   const [error, setError] = useState<ClientError | null>(null);
   const [retryAt, setRetryAt] = useState(0);
   const [postponed, setPostponed] = useState(false);
+  const [resumed, setResumed] = useState(false);
   const notified = useRef(false);
+  const sawProgress = useRef(false);
   const confirmed = useRef(false);
   const updatedLatest = useRef(onUpdated);
   updatedLatest.current = onUpdated;
@@ -69,13 +71,15 @@ export function useUpdater(blocked: boolean, onUpdated: (version: string) => voi
     void listen<{ received?: unknown; total?: unknown }>('update-progress', ({ payload }) => {
       const received = Number(payload?.received), total = Number(payload?.total);
       if (Number.isSafeInteger(received) && Number.isSafeInteger(total) && total > 0 && received >= 0 && received <= total) {
+        // The first event carries where the download starts; above zero means it resumed.
+        if (!sawProgress.current) { sawProgress.current = true; if (received > 0) setResumed(true); }
         setProgress({ received, total });
       }
     }).then(unlisten => { if (disposed) unlisten(); else stop = unlisten; }).catch(() => {});
     return () => { disposed = true; stop?.(); };
   }, []);
   const install = useCallback(async () => {
-    setPhase('installing'); setError(null); setProgress(null); setPostponed(false);
+    setPhase('installing'); setError(null); setProgress(null); setPostponed(false); setResumed(false); sawProgress.current = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
@@ -106,7 +110,7 @@ export function useUpdater(blocked: boolean, onUpdated: (version: string) => voi
   const start = useCallback(() => { setPostponed(false); void install(); }, [install]);
   const available = check?.state === 'available' ? check : null;
   return {
-    check, phase, progress, error, install, dismiss, start, postponed,
+    check, phase, progress, error, install, dismiss, start, postponed, resumed,
     /** An update the customer can start from the header: an optional one, or a mandatory one
      * that failed and was put off. */
     offer: available && phase === 'idle' && (!mandatory || postponed) ? available : null,
@@ -121,19 +125,35 @@ export type Updater = ReturnType<typeof useUpdater>;
  * Kiro is always reachable, and a mandatory update that keeps failing can be put off - a
  * customer is never locked out of restoring their configuration or using the client. */
 export function UpdateScreen({ updater, blocked, openDownloads, restore }: { updater: Updater; blocked: boolean; openDownloads: () => void; restore: (() => void) | null }) {
-  const { check, phase, progress, error } = updater;
+  const { check, phase, progress, error, resumed } = updater;
   const mandatory = check?.state === 'available' && check.mandatory === true;
-  const working = phase === 'installing' || phase === 'restarting';
-  const title = phase === 'restarting' ? '正在重启 Superkiro' : working ? '正在更新 Superkiro' : phase === 'failed' ? '更新未完成' : '需要更新 Superkiro';
-  const total = progress?.total ?? check?.size ?? 0;
+  const title = phase === 'restarting' ? '正在重启 Superkiro' : phase === 'installing' ? '正在更新 Superkiro' : phase === 'failed' ? '更新未完成' : '需要更新 Superkiro';
+  // The download's own progress; once it reaches the full size the host is verifying and
+  // installing, which reports no further progress.
+  const percent = progress && progress.total > 0 ? Math.min(100, Math.round((progress.received / progress.total) * 100)) : null;
+  const downloading = phase === 'installing' && percent !== null && percent < 100;
+  const finishing = phase === 'installing' && percent === 100;
+  const connecting = phase === 'installing' && percent === null;
+  const indeterminate = connecting || finishing || (phase === 'idle');
+  const barPercent = phase === 'restarting' ? 100 : downloading ? percent : finishing ? 100 : 0;
   return <section className="update-screen" aria-labelledby="update-title">
     <h1 id="update-title">{title}</h1>
     <p className="subtitle">{check?.version ? `新版本 ${check.version}` : '新版本'}{check?.current ? `（当前 ${check.current}）` : ''}{mandatory ? '为必需更新，' : '，'}完成后客户端会自动重启。Kiro 的连接配置不受影响。</p>
     <div className="panel spaced" role="status" aria-live="polite">
-      {phase === 'restarting' ? <p>新版本已就绪，正在重新打开客户端…</p>
-        : working ? <><p>{progress ? `已下载 ${megabytes(progress.received)} / ${megabytes(progress.total)} MB` : '正在连接更新服务器…'}</p><progress aria-label="更新下载进度" max={total || undefined} value={progress && total ? progress.received : undefined}/></>
-        : phase === 'failed' && error ? <><p>{error.message}</p><p className="muted">错误码：{error.code} · 反馈编号：{error.feedback_id}</p></>
-        : <p>{blocked ? '正在等待当前操作完成，完成后自动开始更新。' : '即将开始更新…'}</p>}
+      {phase === 'failed' && error ? <><p>{error.message}</p><p className="muted">错误码：{error.code} · 反馈编号：{error.feedback_id}</p></>
+        : <div className="update-visual">
+          {phase === 'restarting'
+            ? <div className="update-spinner" aria-hidden="true"/>
+            : <div className="update-bar" role="progressbar" aria-label="更新进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={downloading ? percent! : undefined}>
+                <div className={`update-bar-fill${indeterminate ? ' sliding' : ''}`} style={{ width: `${indeterminate ? 40 : barPercent}%` }}/>
+              </div>}
+          <div className="update-stat">{phase === 'restarting' ? '↻' : downloading ? `${percent}%` : finishing ? '校验并安装' : connecting ? '连接中' : '准备中'}</div>
+          <p className="muted">{phase === 'restarting' ? '新版本已就绪，正在重新打开客户端…'
+            : blocked ? '正在等待当前操作完成，完成后自动开始更新。'
+              : connecting ? '正在连接更新服务器…'
+                : downloading ? `已下载 ${megabytes(progress!.received)} / ${megabytes(progress!.total)} MB${resumed ? ' · 已从断点续传' : ''}`
+                  : finishing ? '正在校验并安装新版本…' : '即将开始更新…'}</p>
+        </div>}
     </div>
     {phase === 'failed' && <>
       <button className="primary full" onClick={() => void updater.install()}>重试更新</button>
