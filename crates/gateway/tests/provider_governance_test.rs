@@ -1,7 +1,8 @@
 use billing::provider::{HealthState, Provider, ProviderFormat, ProviderKey};
 use futures_util::StreamExt;
 use gateway::provider::governance::{
-    execute_stream_with_failover, probe_provider_key, GovernanceError, ProviderKeyPool,
+    execute_stream_with_failover, execute_stream_with_model_fallback, probe_provider_key,
+    GovernanceError, ProviderKeyPool,
 };
 use gateway::provider::{ChatMessage, ChatRequest, ProviderDelta, ProviderStreamEvent};
 use std::time::Duration;
@@ -390,6 +391,219 @@ fn configuration_refresh_preserves_cooldown_but_rotation_recovers() {
     assert!(pool.select_key(110, &[]).is_err());
     pool.add_key(ProviderKey::new("a", "p", "new-secret"));
     assert!(pool.select_key(110, &[]).is_ok());
+}
+
+fn chat_request() -> ChatRequest {
+    ChatRequest {
+        reasoning_effort: None,
+        model: "primary-model".to_string(),
+        messages: vec![ChatMessage::new(
+            "user",
+            serde_json::Value::String("Hello".to_string()),
+        )],
+        temperature: None,
+        max_tokens: None,
+        stream: true,
+        tools: vec![],
+    }
+}
+
+/// An OpenAI-compatible upstream answering every request with `status`, and with a
+/// short streamed answer when that is 200.
+async fn upstream(status: u16) -> MockServer {
+    let server = MockServer::start().await;
+    let sse = "data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\ndata: [DONE]\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(status)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(if status == 200 { sse } else { "unavailable" }),
+        )
+        .mount(&server)
+        .await;
+    server
+}
+
+fn pool(id: &str, base_url: &str, keys: Vec<ProviderKey>) -> ProviderKeyPool {
+    ProviderKeyPool::new(
+        Provider::new(id, id, ProviderFormat::OpenAi, base_url),
+        keys,
+    )
+}
+
+// A fallback chain exists for when earlier targets cannot serve. Targets with no key to
+// try do not use up the attempts, however long the chain or small the budget left.
+#[tokio::test]
+async fn a_chain_reaches_its_healthy_target_past_targets_without_a_key() {
+    for budget in [1, 3] {
+        let healthy = upstream(200).await;
+        // Never contacted; a closed local port should anything go wrong.
+        let keyless = pool("keyless", "http://127.0.0.1:9", vec![]);
+        let cooling = pool(
+            "cooling",
+            "http://127.0.0.1:9",
+            vec![ProviderKey::new("cooling-key", "cooling", "sk-cooling")],
+        );
+        cooling.mark_key_failure(
+            "cooling-key",
+            gateway::now_secs(),
+            Duration::from_secs(3_600),
+        );
+        let candidates = vec![
+            (keyless.clone(), "model-a".to_string()),
+            (cooling, "model-b".to_string()),
+            (keyless, "model-c".to_string()),
+            (
+                pool(
+                    "healthy",
+                    &healthy.uri(),
+                    vec![ProviderKey::new("healthy-key", "healthy", "sk-healthy")],
+                ),
+                "model-d".to_string(),
+            ),
+        ];
+
+        let result = execute_stream_with_model_fallback(
+            &candidates,
+            &reqwest::Client::new(),
+            &chat_request(),
+            Duration::from_secs(60),
+            budget,
+            gateway::now_secs(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("budget {budget}: {error}"));
+        assert_eq!(result.candidate_index, 3);
+        assert_eq!(result.target_model, "model-d");
+        assert_eq!(healthy.received_requests().await.unwrap().len(), 1);
+    }
+}
+
+// With a chain, a transient failure of one key moved straight on to the next target, and
+// the target's other keys were never tried even with attempts left.
+#[tokio::test]
+async fn a_chain_tries_another_key_of_a_target_before_giving_up() {
+    let primary = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", "Bearer sk-busy"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&primary)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", "Bearer sk-spare"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(
+                    "data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\ndata: [DONE]\n\n",
+                ),
+        )
+        .mount(&primary)
+        .await;
+    let fallback = upstream(503).await;
+    let candidates = vec![
+        (
+            pool(
+                "primary",
+                &primary.uri(),
+                vec![
+                    ProviderKey::new("busy", "primary", "sk-busy").with_weight(10),
+                    ProviderKey::new("spare", "primary", "sk-spare").with_weight(1),
+                ],
+            ),
+            "primary-model".to_string(),
+        ),
+        (
+            pool(
+                "fallback",
+                &fallback.uri(),
+                vec![ProviderKey::new("fallback-key", "fallback", "sk-fallback")],
+            ),
+            "fallback-model".to_string(),
+        ),
+    ];
+
+    let result = execute_stream_with_model_fallback(
+        &candidates,
+        &reqwest::Client::new(),
+        &chat_request(),
+        Duration::from_secs(60),
+        3,
+        gateway::now_secs(),
+    )
+    .await
+    .expect("the primary's second key serves the request");
+    assert_eq!(result.key.id, "spare");
+    assert_eq!(result.candidate_index, 0);
+    // A server error may be the provider failing, so the fallback target was tried
+    // before a second key of the same target.
+    assert_eq!(fallback.received_requests().await.unwrap().len(), 1);
+    assert_eq!(primary.received_requests().await.unwrap().len(), 2);
+}
+
+// A rate limit on one key is that key's problem: the target's other key serves the model
+// asked for, instead of the request moving to a different model.
+#[tokio::test]
+async fn a_rate_limited_key_gives_way_to_another_key_of_the_same_target() {
+    let primary = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", "Bearer sk-limited"))
+        .respond_with(ResponseTemplate::new(429))
+        .mount(&primary)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", "Bearer sk-spare"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(
+                    "data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\ndata: [DONE]\n\n",
+                ),
+        )
+        .mount(&primary)
+        .await;
+    let fallback = upstream(200).await;
+    let candidates = vec![
+        (
+            pool(
+                "primary",
+                &primary.uri(),
+                vec![
+                    ProviderKey::new("limited", "primary", "sk-limited").with_weight(10),
+                    ProviderKey::new("spare", "primary", "sk-spare").with_weight(1),
+                ],
+            ),
+            "primary-model".to_string(),
+        ),
+        (
+            pool(
+                "fallback",
+                &fallback.uri(),
+                vec![ProviderKey::new("fallback-key", "fallback", "sk-fallback")],
+            ),
+            "fallback-model".to_string(),
+        ),
+    ];
+
+    let result = execute_stream_with_model_fallback(
+        &candidates,
+        &reqwest::Client::new(),
+        &chat_request(),
+        Duration::from_secs(60),
+        3,
+        gateway::now_secs(),
+    )
+    .await
+    .expect("the primary's other key serves the request");
+    assert_eq!(result.key.id, "spare");
+    assert_eq!(result.target_model, "primary-model");
+    assert!(!result.was_fallback);
+    assert!(fallback.received_requests().await.unwrap().is_empty());
 }
 
 // A provider incident or a rate limit passes; the key must come back when it does.
