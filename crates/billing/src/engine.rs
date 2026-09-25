@@ -1348,8 +1348,9 @@ impl BillingEngine {
                     )
                 })?;
 
-                let snapshot: BillingSnapshot = serde_json::from_str(&decrypted_json)
+                let mut snapshot: BillingSnapshot = serde_json::from_str(&decrypted_json)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                self.rebuild_archive_summary(&mut snapshot, path)?;
                 validate_snapshot(&snapshot)?;
                 if snapshot.version > SNAPSHOT_VERSION
                     || envelope.version != snapshot.version
@@ -1389,8 +1390,9 @@ impl BillingEngine {
             ));
         }
 
-        let snapshot: BillingSnapshot = serde_json::from_str(&content)
+        let mut snapshot: BillingSnapshot = serde_json::from_str(&content)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        self.rebuild_archive_summary(&mut snapshot, path)?;
         validate_snapshot(&snapshot)?;
         if snapshot.version > SNAPSHOT_VERSION {
             return Err(std::io::Error::new(
@@ -1412,6 +1414,66 @@ impl BillingEngine {
         self.import_snapshot(snapshot);
         *self.persistence_path.write().unwrap() = Some(path.to_path_buf());
         *self.last_snapshot_checksum.write().unwrap() = Some(sha256_hex(content.as_bytes()));
+        Ok(())
+    }
+
+    /// Rebuild an archive summary that does not account for every entry its receipts say
+    /// were archived (one saved before the summary counted them, or a damaged one) from the
+    /// archives themselves, found beside the state as the archive endpoint writes them.
+    /// Each is verified against the checksum its receipt holds, so the rebuilt summary is
+    /// as sound as the ledger they drained; the loader then reconciles every card with it.
+    /// It used to refuse to load, telling the operator to rebuild it with nothing to do so.
+    fn rebuild_archive_summary(
+        &self,
+        snapshot: &mut BillingSnapshot,
+        path: &std::path::Path,
+    ) -> std::io::Result<()> {
+        let receipts = &snapshot.archived_ledger_receipts;
+        let counted = receipts
+            .iter()
+            .try_fold(0usize, |sum, r| sum.checked_add(r.drained_entries_count));
+        // Without receipts there is nothing to rebuild from; validation refuses it.
+        if receipts.is_empty() || counted == Some(snapshot.archived_ledger_summary.entries_count) {
+            return Ok(());
+        }
+        let refused = |reason: String| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("archive summary missing or inconsistent, and {reason}; restore the ledger archives beside the state before loading"),
+            )
+        };
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        let kek = self.master_kek.read().unwrap().clone();
+        let mut summary = ArchivedLedgerSummary::default();
+        for receipt in receipts {
+            let name = &receipt.archive_file;
+            if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', ':']) {
+                return Err(refused(format!("archive name {name:?} is invalid")));
+            }
+            let file = [parent.join("ledger_archives").join(name), parent.join(name)]
+                .into_iter()
+                .find(|file| file.exists())
+                .ok_or_else(|| refused(format!("archive {name} is not beside the state")))?;
+            let payload = verify_ledger_archive_with(&file, &receipt.sha256_checksum, kek.as_ref())
+                .map_err(|error| refused(format!("archive {name} does not verify: {error}")))?;
+            if payload.entries_count != receipt.drained_entries_count {
+                return Err(refused(format!(
+                    "archive {name} holds {} entries where its receipt says {}",
+                    payload.entries_count, receipt.drained_entries_count
+                )));
+            }
+            for entry in &payload.entries {
+                summary.include(entry);
+            }
+        }
+        eprintln!(
+            "[kiro-billing] rebuilt the archive summary from {} verified ledger archives",
+            receipts.len()
+        );
+        snapshot.archived_ledger_summary = summary;
         Ok(())
     }
 
