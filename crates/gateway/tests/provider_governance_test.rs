@@ -544,6 +544,62 @@ async fn a_chain_tries_another_key_of_a_target_before_giving_up() {
     assert_eq!(primary.received_requests().await.unwrap().len(), 2);
 }
 
+// When the chain fails, the reason given is the last target's, as each target was first
+// considered: a real failure there is not reported as an earlier target's cooldown.
+#[tokio::test]
+async fn a_failed_chain_reports_its_last_target() {
+    let failing = upstream(503).await;
+    let cooling = pool(
+        "cooling",
+        "http://127.0.0.1:9",
+        vec![ProviderKey::new("cooling-key", "cooling", "sk-cooling")],
+    );
+    cooling.mark_key_failure(
+        "cooling-key",
+        gateway::now_secs(),
+        Duration::from_secs(3_600),
+    );
+    let failing_pool = pool(
+        "failing",
+        &failing.uri(),
+        vec![ProviderKey::new("failing-key", "failing", "sk-failing")],
+    );
+    let run = |candidates: Vec<(ProviderKeyPool, String)>| async move {
+        execute_stream_with_model_fallback(
+            &candidates,
+            &reqwest::Client::new(),
+            &chat_request(),
+            Duration::from_secs(60),
+            3,
+            gateway::now_secs(),
+        )
+        .await
+        .map(|result| result.target_model)
+    };
+
+    let error = run(vec![
+        (cooling.clone(), "model-a".to_string()),
+        (failing_pool.clone(), "model-b".to_string()),
+    ])
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(error, GovernanceError::AllCandidatesFailed { .. }),
+        "{error:?}"
+    );
+
+    let error = run(vec![
+        (failing_pool, "model-b".to_string()),
+        (cooling, "model-a".to_string()),
+    ])
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(error, GovernanceError::AllKeysInCooldown { .. }),
+        "{error:?}"
+    );
+}
+
 // A rate limit on one key is that key's problem: the target's other key serves the model
 // asked for, instead of the request moving to a different model.
 #[tokio::test]

@@ -511,8 +511,10 @@ async fn execute_chain(
     let mut attempts_left = max_attempts.clamp(1, 3);
     let mut tried: Vec<Vec<String>> = vec![Vec::new(); chain.len()];
     let mut failures = Vec::new();
-    // Why the last target considered could not serve, if not a failed attempt.
+    // Why the last target could not serve, if not a failed attempt, as each target was
+    // first considered. Later passes only spend attempts left on untried keys.
     let mut unavailable = None;
+    let mut first_pass = true;
     while attempts_left > 0 {
         let mut attempted = false;
         for (idx, (pool, target_model)) in chain.iter().enumerate() {
@@ -523,11 +525,10 @@ async fn execute_chain(
                     Some(target_model),
                 ) {
                     Ok(key) => key,
-                    // Once a target has been attempted, having no further key to try
-                    // adds nothing to why the request failed.
-                    Err(_) if !tried[idx].is_empty() => break,
                     Err(e) => {
-                        unavailable = Some(e);
+                        if first_pass && tried[idx].is_empty() {
+                            unavailable = Some(e);
+                        }
                         break;
                     }
                 };
@@ -570,7 +571,9 @@ async fn execute_chain(
                             ProviderError::Http(status, _) if matches!(status.as_u16(), 401 | 429)
                         );
                         failures.push((key.id.clone(), e.to_string()));
-                        unavailable = None;
+                        if first_pass {
+                            unavailable = None;
+                        }
                         // A rate-limited or invalid key says nothing about its target's
                         // other keys, which keep the model asked for. Anything else may
                         // be the provider failing, so the next target goes first.
@@ -582,6 +585,7 @@ async fn execute_chain(
                 }
             }
         }
+        first_pass = false;
         if !attempted {
             break;
         }
