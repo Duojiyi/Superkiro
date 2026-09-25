@@ -336,8 +336,11 @@ class PortalBrowserTests(unittest.TestCase):
         self.assertFalse(self.page.locator('.stage').evaluate("el=>el.classList.contains('running')"))
         self.screenshot('home-desktop.png')
         self.assertTrue(all(url.startswith(self.origin) for url in self.requests))
-        # Keep the 250ms motion state deterministic on loaded CI runners.
-        self.page.locator('.stage').scroll_into_view_if_needed()
+        # Keep the 250ms motion state deterministic on loaded CI runners. Scrolling past the
+        # top stops the motion, so start from the top once any earlier scroll has settled.
+        self.page.evaluate('window.scrollTo(0, 0)')
+        self.page.wait_for_function('window.scrollY === 0')
+        self.page.wait_for_timeout(200)
         self.page.clock.install()
         self.page.clock.pause_at(self.page.evaluate('Date.now() + 1000'))
         self.page.emulate_media(reduced_motion='no-preference')
