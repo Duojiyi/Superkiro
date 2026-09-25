@@ -298,7 +298,6 @@ async fn test_portal_web_page_html_endpoint() {
         r#"href="/""#,
         r#"href="/device""#,
         r#"href="/docs""#,
-        r#"href="/admin/""#,
         r#"id="verify-form""#,
         r#"id="card""#,
         r#"type="password""#,
@@ -315,6 +314,8 @@ async fn test_portal_web_page_html_endpoint() {
             "missing portal contract: {marker}"
         );
     }
+    // The customer site does not advertise the administrator console.
+    assert!(!html_str.contains(r#"href="/admin/""#));
 }
 
 #[tokio::test]
