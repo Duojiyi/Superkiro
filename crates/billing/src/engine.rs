@@ -3588,6 +3588,42 @@ impl BillingEngine {
     // Rate Cards, Versioning & Pricing (Spec §5, §6.4, §14.10)
     // ==========================================
 
+    /// What the model list compares models by: the micro-credits a card in `group_id`
+    /// pays for one million uncached input tokens and one million output tokens, every
+    /// multiplier applied, at the price version a request would use. None when none resolves.
+    pub fn display_price(
+        &self,
+        group_id: &str,
+        exposed_model_id: &str,
+        at_secs: u64,
+    ) -> Option<i64> {
+        let group = self.get_group(group_id)?;
+        let map = self
+            .model_maps
+            .read()
+            .unwrap()
+            .iter()
+            .find(|m| m.group_id == group_id && m.exposed_model_id == exposed_model_id)
+            .cloned()?;
+        let version = self
+            .resolve_rate_card_version(&group.rate_card_id, exposed_model_id, at_secs)
+            .or_else(|| {
+                self.resolve_rate_card_version(&group.rate_card_id, &map.target_model, at_secs)
+            })?;
+        let tokens = UsageTokens {
+            uncached_input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+        };
+        Some(version.calculate_charge(
+            &tokens,
+            group.margin_multiplier,
+            map.credit_multiplier,
+            &self.get_settings(),
+        ))
+    }
+
     /// Add or update a rate card header.
     pub fn upsert_rate_card(&self, card: RateCard) {
         {

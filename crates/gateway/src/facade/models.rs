@@ -50,7 +50,13 @@ pub struct ModelInfo {
     pub supports_vision: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_effort_level: Option<String>,
+    /// Shown by Kiro beside the model as "{rate}x Credit".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_multiplier: Option<f64>,
 }
+
+/// The unit Kiro prints after the multiplier, as its own model list does.
+pub const RATE_UNIT: &str = "Credit";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -66,6 +72,10 @@ pub struct ExposedModelItem {
     pub additional_model_request_fields_schema: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_effort_level: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_multiplier: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_unit: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +142,8 @@ impl FacadeHandler for ListAvailableModelsHandler {
                         token_limits: m.token_limits,
                         additional_model_request_fields_schema: schema,
                         default_effort_level: m.default_effort_level,
+                        rate_unit: m.rate_multiplier.map(|_| RATE_UNIT.to_string()),
+                        rate_multiplier: m.rate_multiplier,
                     }
                 })
                 .collect();

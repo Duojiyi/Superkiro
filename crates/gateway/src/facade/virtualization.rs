@@ -57,6 +57,7 @@ impl Default for VirtualGroup {
                     }),
                     supports_reasoning: true,
                     supports_vision: true,
+                    rate_multiplier: None,
                     default_effort_level: Some("high".to_string()),
                 },
                 ModelInfo {
@@ -71,6 +72,7 @@ impl Default for VirtualGroup {
                     }),
                     supports_reasoning: false,
                     supports_vision: false,
+                    rate_multiplier: None,
                     default_effort_level: None,
                 },
                 ModelInfo {
@@ -83,6 +85,7 @@ impl Default for VirtualGroup {
                     }),
                     supports_reasoning: true,
                     supports_vision: false,
+                    rate_multiplier: None,
                     default_effort_level: Some("medium".to_string()),
                 },
             ],
@@ -110,6 +113,78 @@ impl Default for VirtualizationStore {
         store.upsert_group(VirtualGroup::default());
         store
     }
+}
+
+/// "claude-sonnet-4-6" as "Claude Sonnet 4.6": words capitalised, a run of version numbers
+/// joined by dots, known brand spellings kept.
+pub fn display_name(model_id: &str) -> String {
+    let mut words: Vec<String> = Vec::new();
+    for part in model_id
+        .split(['-', '_', ' '])
+        .filter(|part| !part.is_empty())
+    {
+        if part.bytes().all(|b| b.is_ascii_digit()) {
+            if let Some(last) = words.last_mut() {
+                if last.bytes().all(|b| b.is_ascii_digit() || b == b'.') && last.len() <= 4 {
+                    last.push('.');
+                    last.push_str(part);
+                    continue;
+                }
+            }
+            words.push(part.to_string());
+            continue;
+        }
+        let known = match part.to_ascii_lowercase().as_str() {
+            "gpt" => Some("GPT"),
+            "glm" => Some("GLM"),
+            "deepseek" => Some("DeepSeek"),
+            "minimax" => Some("MiniMax"),
+            _ => None,
+        };
+        words.push(known.map(str::to_string).unwrap_or_else(|| {
+            let mut chars = part.chars();
+            chars
+                .next()
+                .map(|first| first.to_uppercase().chain(chars).collect())
+                .unwrap_or_default()
+        }));
+    }
+    words.join(" ")
+}
+
+/// The multipliers the model list shows. A model the operator gave one keeps it; the others
+/// follow by price from the first such model that has a price, or from the group's default
+/// model at 1x when none does.
+fn rate_multipliers(
+    billing: &billing::engine::BillingEngine,
+    group_id: &str,
+    models: &[billing::group::ModelMap],
+    now: u64,
+) -> Vec<Option<f64>> {
+    let prices: Vec<Option<i64>> = models
+        .iter()
+        .map(|m| {
+            billing
+                .display_price(group_id, &m.exposed_model_id, now)
+                .filter(|price| *price > 0)
+        })
+        .collect();
+    let anchor = models
+        .iter()
+        .zip(&prices)
+        .find_map(|(m, price)| Some((m.rate_multiplier?, (*price)?)))
+        .or_else(|| prices.first().copied().flatten().map(|price| (1.0, price)));
+    models
+        .iter()
+        .zip(&prices)
+        .map(|(m, price)| {
+            m.rate_multiplier.or_else(|| {
+                let (rate, anchor_price) = anchor?;
+                let relative = rate * (*price)? as f64 / anchor_price as f64;
+                Some((relative * 100.0).round() / 100.0)
+            })
+        })
+        .collect()
 }
 
 impl VirtualizationStore {
@@ -148,6 +223,7 @@ impl VirtualizationStore {
             }),
             supports_reasoning: false,
             supports_vision: false,
+            rate_multiplier: None,
             default_effort_level: None,
         });
     }
@@ -172,24 +248,39 @@ impl VirtualizationStore {
                 // Fetch models from billing mapped to this group (respecting visibility and sort_order)
                 let billing_models = billing.list_models_for_group(&bg.id, false);
                 let models: Vec<ModelInfo> = if !billing_models.is_empty() {
-                    billing_models
+                    let visible: Vec<_> =
+                        billing_models.into_iter().filter(|m| m.visible).collect();
+                    let rates = rate_multipliers(billing, &bg.id, &visible, crate::now_secs());
+                    visible
                         .into_iter()
-                        .filter(|m| m.visible)
-                        .map(|m| ModelInfo {
-                            model_id: m.exposed_model_id.clone(),
-                            model_name: Some(m.exposed_model_id.clone()),
-                            description: Some(format!("Model mapped to target {}", m.target_model)),
-                            token_limits: Some(TokenLimits::configured(
-                                m.context_window,
-                                m.max_output,
-                            )),
-                            supports_reasoning: m.supports_reasoning,
-                            supports_vision: m.supports_vision,
-                            default_effort_level: if m.supports_reasoning {
-                                Some("medium".to_string())
-                            } else {
-                                None
-                            },
+                        .zip(rates)
+                        .map(|(m, rate_multiplier)| {
+                            let name = m
+                                .display_name
+                                .clone()
+                                .unwrap_or_else(|| display_name(&m.exposed_model_id));
+                            ModelInfo {
+                                model_id: m.exposed_model_id.clone(),
+                                // The upstream target stays internal: never in the list.
+                                description: Some(
+                                    m.description
+                                        .clone()
+                                        .unwrap_or_else(|| format!("{name} model")),
+                                ),
+                                model_name: Some(name),
+                                token_limits: Some(TokenLimits::configured(
+                                    m.context_window,
+                                    m.max_output,
+                                )),
+                                supports_reasoning: m.supports_reasoning,
+                                supports_vision: m.supports_vision,
+                                default_effort_level: if m.supports_reasoning {
+                                    Some("medium".to_string())
+                                } else {
+                                    None
+                                },
+                                rate_multiplier,
+                            }
                         })
                         .collect()
                 } else {

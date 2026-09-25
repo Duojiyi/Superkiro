@@ -95,6 +95,7 @@ impl ImportedProvider {
                     }),
                     supports_reasoning,
                     supports_vision,
+                    rate_multiplier: None,
                     default_effort_level: if supports_reasoning {
                         Some("medium".to_string())
                     } else {

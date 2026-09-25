@@ -157,6 +157,13 @@ impl BillingEngine {
                 || m.aliases.len() > 32
                 || m.aliases.iter().any(|a| !text(a, 128))
                 || m.fallback_chain.len() > 8
+                || m.display_name
+                    .as_deref()
+                    .is_some_and(|name| !text(name, 64))
+                || m.description
+                    .as_deref()
+                    .is_some_and(|text_| !text(text_, 256))
+                || m.rate_multiplier.is_some_and(|rate| !positive(rate))
                 || !ids.insert(("map", m.id.clone()))
             {
                 return Err(invalid("Invalid or duplicate model mapping"));
@@ -378,6 +385,47 @@ mod tests {
         let mut u = update(&e);
         u.groups[0].margin_multiplier = 100.0;
         assert!(e.publish_commercial_config(u, 100).is_ok());
+    }
+    #[test]
+    fn model_list_display_fields_are_bounded() {
+        use crate::provider::{Provider, ProviderFormat};
+        let e = BillingEngine::new();
+        e.upsert_provider(Provider::new(
+            "shared",
+            "Shared",
+            ProviderFormat::Anthropic,
+            "https://upstream.invalid",
+        ));
+        e.upsert_provider_key(ProviderKey::new("shared-key", "shared", "test"));
+        let with = |edit: &dyn Fn(&mut ModelMap)| {
+            let mut u = update(&e);
+            let mut m = ModelMap::new("map-1", "new-tier", "model-a", "shared", "target-a");
+            edit(&mut m);
+            u.models.push(m);
+            u
+        };
+        for bad in [
+            with(&|m| m.display_name = Some("x".repeat(65))),
+            with(&|m| m.display_name = Some(" ".into())),
+            with(&|m| m.description = Some("line\nbreak".into())),
+            with(&|m| m.rate_multiplier = Some(0.0)),
+            with(&|m| m.rate_multiplier = Some(f64::NAN)),
+            with(&|m| m.rate_multiplier = Some(1001.0)),
+        ] {
+            assert!(e.publish_commercial_config(bad, 100).is_err());
+        }
+        let published = e
+            .publish_commercial_config(
+                with(&|m| {
+                    m.display_name = Some("Model A".into());
+                    m.description = Some("Balanced reasoning and coding".into());
+                    m.rate_multiplier = Some(1.3);
+                }),
+                100,
+            )
+            .unwrap();
+        assert_eq!(published.models[0].rate_multiplier, Some(1.3));
+        assert_eq!(published.models[0].display_name.as_deref(), Some("Model A"));
     }
     #[test]
     fn model_aliases_and_provider_isolation_are_enforced() {

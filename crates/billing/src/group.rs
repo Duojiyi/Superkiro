@@ -111,6 +111,16 @@ pub struct ModelMap {
     pub aliases: Vec<String>,
     #[serde(default)]
     pub fallback_chain: Vec<FallbackTarget>,
+    /// The name in the customer's model list; derived from the exposed id when unset.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// The description in the customer's model list; never names the upstream target.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// The cost multiplier the model list shows, as in "2.2x Credit". Informational: what
+    /// a request is charged comes from the price versions. Derived from prices when unset.
+    #[serde(default)]
+    pub rate_multiplier: Option<f64>,
 }
 
 impl ModelMap {
@@ -137,6 +147,9 @@ impl ModelMap {
             sort_order: 0,
             aliases: Vec::new(),
             fallback_chain: Vec::new(),
+            display_name: None,
+            description: None,
+            rate_multiplier: None,
         }
     }
 

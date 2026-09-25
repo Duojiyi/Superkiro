@@ -595,6 +595,9 @@ fn test_stacked_multipliers_model_map_group_and_rate_card() {
         sort_order: 1,
         aliases: Vec::new(),
         fallback_chain: Vec::new(),
+        display_name: None,
+        description: None,
+        rate_multiplier: None,
     };
     engine.upsert_model_map(model_map);
 

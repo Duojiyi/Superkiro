@@ -160,6 +160,7 @@ async fn test_audit_b_group_isolation_custom_models_and_plan() {
             }),
             supports_reasoning: false,
             supports_vision: false,
+            rate_multiplier: None,
             default_effort_level: None,
         }],
         provider_binding_mode: billing::group::ProviderBindingMode::Shared,
@@ -186,6 +187,7 @@ async fn test_audit_b_group_isolation_custom_models_and_plan() {
                 }),
                 supports_reasoning: true,
                 supports_vision: true,
+                rate_multiplier: None,
                 default_effort_level: Some("max".to_string()),
             },
             ModelInfo {
@@ -198,6 +200,7 @@ async fn test_audit_b_group_isolation_custom_models_and_plan() {
                 }),
                 supports_reasoning: true,
                 supports_vision: true,
+                rate_multiplier: None,
                 default_effort_level: Some("max".to_string()),
             },
         ],
