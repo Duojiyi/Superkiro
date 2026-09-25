@@ -3,7 +3,9 @@
 use crate::card::{Card, CardError, CardStatus};
 use crate::ledger::{LedgerEntry, LedgerKind, PricingRates, UsageTokens};
 use crate::provider::{Provider, ProviderKey};
-use crate::reservation::{CreditReservation, ReservationEstimateParams, ReservationState};
+use crate::reservation::{
+    CreditReservation, LockedPricing, ReservationEstimateParams, ReservationState,
+};
 use crate::topup::TopupCode;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1960,7 +1962,7 @@ impl BillingEngine {
             .ok_or_else(|| BillingError::CardNotFound(card_id.to_string()))?;
 
         // 3. Resolve rate card version if model is specified
-        let (reserve_amount, resolved_version) = if let Some(ref model) = params.model {
+        let (reserve_amount, resolved_version, pricing) = if let Some(ref model) = params.model {
             let group = candidate.groups.get(&card.group_id);
             let rate_card_id = group.map(|g| g.rate_card_id.as_str()).unwrap_or("default");
             let group_margin = group.map(|g| g.margin_multiplier).unwrap_or(1.0);
@@ -1990,9 +1992,14 @@ impl BillingEngine {
                 model_multiplier,
                 &settings,
             );
-            (amt, Some(rcv.id))
+            let pricing = LockedPricing {
+                group_margin,
+                model_multiplier,
+                settings,
+            };
+            (amt, Some(rcv.id), Some(pricing))
         } else {
-            (params.calculate_reserve_amount(), None)
+            (params.calculate_reserve_amount(), None, None)
         };
 
         if reserve_amount < 0 {
@@ -2039,6 +2046,7 @@ impl BillingEngine {
             ttl_secs,
         );
         reservation.rate_card_version = resolved_version;
+        reservation.pricing = pricing;
 
         candidate
             .reservations
@@ -2171,7 +2179,7 @@ impl BillingEngine {
         let mut candidate = self.export_snapshot_locked(sequence, previous_checksum);
 
         // 1. Fetch reservation
-        let (reservation_card_id, reservation_created_at, locked_version) = {
+        let (reservation_card_id, reservation_created_at, locked_version, locked_pricing) = {
             let reservation = candidate
                 .reservations
                 .get(invocation_id)
@@ -2191,6 +2199,7 @@ impl BillingEngine {
                 reservation.card_id.clone(),
                 reservation.created_at_secs,
                 reservation.rate_card_version.clone(),
+                reservation.pricing.clone(),
             )
         };
 
@@ -2224,7 +2233,16 @@ impl BillingEngine {
             self.resolve_price(rate_card_id, &models, reservation_created_at)
         };
 
-        let settings = candidate.settings.clone();
+        // A request is charged at what it was reserved at: a publication while it was in
+        // flight changes neither its price version nor these.
+        let (group_margin, model_multiplier, settings) = match locked_pricing {
+            Some(locked) => (
+                locked.group_margin,
+                locked.model_multiplier,
+                locked.settings,
+            ),
+            None => (group_margin, model_multiplier, candidate.settings.clone()),
+        };
         let (charge, mut cost_micro_cny, version_id) = if let Some(ref rcv) = resolved_rcv {
             let cost = rcv.calculate_cost_micro_cny(tokens, &settings);
             let charge = rcv.calculate_charge(tokens, group_margin, model_multiplier, &settings);

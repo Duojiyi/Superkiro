@@ -5,6 +5,7 @@
 //! Unsettled orphan reservations are automatically reclaimed by the janitor after TTL.
 
 use crate::ledger::ceil_nonnegative_to_i64;
+use crate::rate_card::BillingSettings;
 use serde::{Deserialize, Serialize};
 
 /// Lifecycle states of a credit reservation.
@@ -60,8 +61,16 @@ impl ReservationEstimateParams {
     }
 }
 
+/// What a request is charged with besides its price version, captured when it is reserved.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LockedPricing {
+    pub group_margin: f64,
+    pub model_multiplier: f64,
+    pub settings: BillingSettings,
+}
+
 /// Record tracking an active or completed credit reservation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CreditReservation {
     pub id: String,
     pub card_id: String,
@@ -72,6 +81,11 @@ pub struct CreditReservation {
     pub expires_at_secs: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_card_version: Option<String>,
+    /// Captured with `rate_card_version`, so the request settles at what it was reserved
+    /// at whatever is published meanwhile. None on a reservation that named no model, or
+    /// one made before this was captured: those settle at the values current then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<LockedPricing>,
 }
 
 impl CreditReservation {
@@ -92,6 +106,7 @@ impl CreditReservation {
             created_at_secs: now_secs,
             expires_at_secs: now_secs.saturating_add(ttl_secs),
             rate_card_version: None,
+            pricing: None,
         }
     }
 

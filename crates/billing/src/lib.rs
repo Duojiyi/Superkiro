@@ -53,7 +53,9 @@ pub use ledger::{LedgerEntry, LedgerKind, PricingRates, UsageTokens};
 pub use rate_card::{
     BillingSettings, Currency, MarginSummary, PricingMode, RateCard, RateCardVersion,
 };
-pub use reservation::{CreditReservation, ReservationEstimateParams, ReservationState};
+pub use reservation::{
+    CreditReservation, LockedPricing, ReservationEstimateParams, ReservationState,
+};
 pub use template::CardTemplate;
 pub use topup::{
     export_topup_csv, export_topup_json, generate_topup_batch, generate_topup_code,

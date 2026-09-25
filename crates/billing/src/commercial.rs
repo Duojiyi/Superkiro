@@ -103,11 +103,15 @@ impl BillingEngine {
         if view(&c).revision != u.expected_revision {
             return Err(invalid("Configuration changed; reload before publishing"));
         }
-        if c.reservations
-            .values()
-            .any(|r| r.state == ReservationState::Held)
-            || !c.pending_settlements.is_empty()
-        {
+        // A request in flight settles at the price version, margins and settings it captured
+        // when it was reserved, and a pending settlement is already priced, so a publication
+        // reprices neither and need not wait for idle. Only a hold that captured nothing (it
+        // named no model) would settle at whatever is current when it settles.
+        if c.reservations.iter().any(|(id, r)| {
+            r.state == ReservationState::Held
+                && r.pricing.is_none()
+                && !c.pending_settlements.contains_key(id)
+        }) {
             return Err(invalid("Requests are still settling; publish when idle"));
         }
         if let Some(mut settings) = u.settings {
@@ -266,8 +270,9 @@ impl BillingEngine {
             });
             c.rate_card_versions.push(v);
         }
-        // Superseded versions never price a request again (publication waits for idle), and
-        // they are immutable, so counting them would block every later publication.
+        // Superseded versions price no new request (one in flight settles at what it was
+        // admitted with, which passed this bound when published), and they are immutable, so
+        // counting them would block every later publication.
         let live_margin = c
             .rate_card_versions
             .iter()
@@ -366,6 +371,80 @@ mod tests {
         assert!(e.publish_commercial_config(update(&e), 100).is_err());
         assert_eq!(e.commercial_config().revision, before);
         assert!(e.commercial_config().audit.is_empty());
+    }
+    /// A request in flight settles at the price version, margins and settings it captured
+    /// when it was reserved, so a publication never reprices it and need not wait for
+    /// idle: while any customer kept a stream open, a mispriced model could not be fixed.
+    #[test]
+    fn publication_in_flight_never_reprices_a_held_request() {
+        use crate::card::Card;
+        use crate::provider::{Provider, ProviderFormat};
+        use crate::reservation::ReservationEstimateParams;
+        let credit = crate::MICRO_CREDITS_PER_CREDIT;
+        let e = BillingEngine::new();
+        e.upsert_provider(Provider::new(
+            "shared",
+            "Shared",
+            ProviderFormat::Anthropic,
+            "https://upstream.invalid",
+        ));
+        e.upsert_provider_key(ProviderKey::new("shared-key", "shared", "test"));
+        let price = |id: &str, cny_per_m_output: f64, from: u64| -> RateCardVersion {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "rate_card_id": "default", "model": "model-a",
+                "currency": "CNY", "pricing_mode": "cost_plus",
+                "input_price_per_m": 0.0, "output_price_per_m": cny_per_m_output,
+                "cache_creation_price_per_m": 0.0, "cache_read_price_per_m": 0.0,
+                "fixed_input_credit_per_m": 0, "fixed_output_credit_per_m": 0,
+                "fixed_cache_creation_credit_per_m": 0, "fixed_cache_read_credit_per_m": 0,
+                "per_call_credit": 0, "margin_multiplier": 1.0, "effective_from_secs": from
+            }))
+            .unwrap()
+        };
+        let model = |multiplier: f64| {
+            let mut m = ModelMap::new("map-a", "new-tier", "model-a", "shared", "target-a");
+            m.credit_multiplier = multiplier;
+            m
+        };
+        let mut u = update(&e);
+        u.models.push(model(1.0));
+        u.versions.push(price("v1", 0.1, 100));
+        e.publish_commercial_config(u, 100).unwrap();
+        let mut card = Card::new("card", "new-tier", 1_000 * credit);
+        card.activate(100, 86_400).unwrap();
+        e.upsert_card(card);
+        let params = ReservationEstimateParams::new(0, 1_000_000).with_model("model-a");
+        e.reserve("card", "held", &params, 101, 600).unwrap();
+
+        // The price, the group margin, the model multiplier and the face value all change
+        // while "held" is in flight.
+        let mut u = update(&e);
+        u.groups[0].margin_multiplier = 2.0;
+        u.models.push(model(4.0));
+        u.versions.push(price("v2", 2.0, 102));
+        u.settings = Some(BillingSettings {
+            credit_face_value_cny: 0.5,
+            ..e.get_settings()
+        });
+        e.publish_commercial_config(u, 102).unwrap();
+
+        let tokens = UsageTokens {
+            output_tokens: 1_000_000,
+            ..UsageTokens::default()
+        };
+        // 0.1 CNY at 0.01 CNY a credit, as when it was reserved.
+        let held = e
+            .settle("held", &tokens, "model-a", "shared", "target-a", 103)
+            .unwrap();
+        assert_eq!(held.rate_card_version.as_deref(), Some("v1"));
+        assert_eq!(held.credits_charged, 10 * credit);
+        // 2 CNY at 0.5 CNY a credit, times 2 and 4.
+        e.reserve("card", "after", &params, 103, 600).unwrap();
+        let after = e
+            .settle("after", &tokens, "model-a", "shared", "target-a", 104)
+            .unwrap();
+        assert_eq!(after.rate_card_version.as_deref(), Some("v2"));
+        assert_eq!(after.credits_charged, 32 * credit);
     }
     #[test]
     fn stacked_multipliers_and_face_value_are_bounded() {
