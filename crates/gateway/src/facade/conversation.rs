@@ -704,53 +704,21 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
 
             if !ctx.supports_vision {
                 if let Some(ref v_cfg) = self.vision_config {
-                    if v_cfg.enabled {
-                        if let (Some(ref v_url), Some(ref v_key)) =
-                            (&v_cfg.fallback_provider_url, &v_cfg.fallback_api_key)
-                        {
-                            let current_input = &kiro_req
-                                .conversation_state
-                                .current_message
-                                .user_input_message;
-                            // One slot per image, so a failed transcription leaves its
-                            // own image undescribed instead of shifting the rest.
-                            let mut transcriptions = Vec::with_capacity(current_input.images.len());
-                            for img in &current_input.images {
-                                let format =
-                                    crate::translate::images::sniff_format(&img.source.bytes)
-                                        .unwrap_or(img.format.as_str());
-                                let cache_key = vision_cache_key(
-                                    &v_cfg.fallback_model,
-                                    format,
-                                    &img.source.bytes,
-                                    &current_input.content,
-                                );
-                                let transcription = match self.vision_cache.get(&cache_key) {
-                                    Some(cached) => Some(cached),
-                                    None => {
-                                        crate::translate::vision::transcribe_image_with_provider(
-                                            &self.client,
-                                            v_url,
-                                            v_key,
-                                            &v_cfg.fallback_model,
-                                            format,
-                                            &img.source.bytes,
-                                            Some(&current_input.content),
-                                            v_cfg.max_tokens,
-                                        )
-                                        .await
-                                        .ok()
-                                        .inspect(|desc| {
-                                            self.vision_cache.set(cache_key, desc.clone())
-                                        })
-                                    }
-                                };
-                                transcriptions.push(transcription);
-                            }
-                            if transcriptions.iter().any(Option::is_some) {
-                                ctx = ctx.with_image_transcriptions(transcriptions);
-                            }
-                        }
+                    let current_input = &kiro_req
+                        .conversation_state
+                        .current_message
+                        .user_input_message;
+                    let transcriptions = crate::translate::vision::transcribe_images(
+                        &self.client,
+                        v_cfg,
+                        &self.vision_cache,
+                        &current_input.images,
+                        &current_input.content,
+                        crate::translate::vision::TRANSCRIPTION_BUDGET,
+                    )
+                    .await;
+                    if transcriptions.iter().any(Option::is_some) {
+                        ctx = ctx.with_image_transcriptions(transcriptions);
                     }
                 }
             }
@@ -1236,23 +1204,6 @@ fn validate_conversation_request(
     guardrail.validate_payload(prompt_chars, &image_sizes)
 }
 
-/// Transcriptions are shared by every card, so the key must name the image and its
-/// context exactly: SHA-256 over each length-prefixed part, not a 64-bit hash.
-fn vision_cache_key(model: &str, format: &str, bytes: &str, context: &str) -> String {
-    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
-    for part in [model, format, bytes, context] {
-        digest.update(&(part.len() as u64).to_le_bytes());
-        digest.update(part.as_bytes());
-    }
-    let hash: String = digest
-        .finish()
-        .as_ref()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    format!("{model}:{format}:{hash}")
-}
-
 fn max_output_tokens_for_model(
     target_model: &str,
     claims: Option<&AuthClaims>,
@@ -1319,21 +1270,5 @@ mod capability_tests {
             max_output_tokens_for_model("gemini-unknown", None, &billing),
             4096
         );
-    }
-}
-
-#[cfg(test)]
-mod vision_cache_key_tests {
-    use super::vision_cache_key;
-
-    #[test]
-    fn key_is_a_full_digest_of_unambiguous_parts() {
-        let key = vision_cache_key("model", "png", "ab", "c");
-        let digest = key.rsplit(':').next().unwrap();
-        assert_eq!(digest.len(), 64, "SHA-256, not a 64-bit hash: {key}");
-        assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
-        assert_eq!(key, vision_cache_key("model", "png", "ab", "c"));
-        assert_ne!(key, vision_cache_key("model", "png", "a", "bc"));
-        assert_ne!(key, vision_cache_key("model", "png", "ab", "d"));
     }
 }
