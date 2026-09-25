@@ -7,7 +7,11 @@ import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from publish_native_windows import prepare, merge_manifest, validate_history
+import update_signing
+
+FIXTURE = b'MZfixture-not-executable' + update_signing.release_marker('1.2.3')
 
 
 class PublicationTests(unittest.TestCase):
@@ -16,7 +20,13 @@ class PublicationTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         root = Path(self.tmp.name)
         self.exe, self.receipt = root / 'app.exe', root / 'accepted.json'
-        self.exe.write_bytes(b'MZfixture-not-executable')
+        self.exe.write_bytes(FIXTURE)
+        # A key the client under test trusts, standing in for the offline release key.
+        self.key = Ed25519PrivateKey.generate()
+        trusted = patch('update_signing.client_keys',
+                        return_value=[update_signing.public_hex(self.key)])
+        trusted.start()
+        self.addCleanup(trusted.stop)
         self.approval = dict(approvedForPublication=True, version='1.2.3',
                             sha256=hashlib.sha256(self.exe.read_bytes()).hexdigest(),
                             size=self.exe.stat().st_size, platform='windows', arch='x64')
@@ -25,16 +35,49 @@ class PublicationTests(unittest.TestCase):
     def save(self):
         self.receipt.write_text(json.dumps(self.approval), encoding='utf-8')
 
-    def prepare(self):
-        return prepare(self.exe, '1.2.3', self.receipt)
+    def prepare(self, **options):
+        return prepare(self.exe, '1.2.3', self.receipt, self.key, **options)
 
     def test_exact_approved_bytes_and_immutable_url(self):
         data, item = self.prepare()
         self.assertEqual(item['url'], '/downloads/Superkiro-1.2.3-Windows.exe')
-        self.exe.write_bytes(b'MZchanged-build')
-        self.assertEqual(data, b'MZfixture-not-executable')
+        self.exe.write_bytes(b'MZchanged-build' + update_signing.release_marker('1.2.3'))
+        self.assertEqual(data, FIXTURE)
         with self.assertRaises(ValueError):
             self.prepare()
+
+    def test_entry_is_signed_for_clients_and_mandatory_by_default(self):
+        _, item = self.prepare()
+        self.assertTrue(item['mandatory'])
+        self.assertTrue(update_signing.verify(item, item['updateSignature'],
+                                              [update_signing.public_hex(self.key)]))
+        # The signature covers what the client acts on; the rest of the entry stays as it was.
+        self.assertFalse(update_signing.verify(dict(item, version='1.2.4'), item['updateSignature'],
+                                               [update_signing.public_hex(self.key)]))
+        self.assertEqual(item['signature'], 'unsigned')
+        _, optional = self.prepare(mandatory=False)
+        self.assertFalse(optional['mandatory'])
+
+    def test_a_key_clients_do_not_trust_is_refused(self):
+        with self.assertRaisesRegex(ValueError, 'UPDATE_KEYS'):
+            prepare(self.exe, '1.2.3', self.receipt, Ed25519PrivateKey.generate())
+
+    def test_a_binary_built_as_another_version_is_refused(self):
+        for data in [b'MZno-marker', b'MZ' + update_signing.release_marker('1.2.2'),
+                     FIXTURE + update_signing.release_marker('1.2.3')]:
+            self.exe.write_bytes(data)
+            self.approval.update(sha256=hashlib.sha256(data).hexdigest(), size=len(data))
+            self.save()
+            with self.assertRaisesRegex(ValueError, 'SUPERKIRO_RELEASE_VERSION'):
+                self.prepare()
+
+    def test_an_older_version_than_the_published_one_is_refused(self):
+        _, item = self.prepare()
+        newer = dict(item, version='1.10', sha256='c' * 64)
+        with self.assertRaisesRegex(ValueError, 'newer version'):
+            merge_manifest({'releases': [newer]}, item)
+        older = dict(item, version='1.2', sha256='d' * 64)
+        self.assertEqual(merge_manifest({'releases': [older]}, item)['releases'], [item])
 
     def test_unapproved_wrong_version_and_non_executable_fail(self):
         for key, value in [('approvedForPublication', False), ('version', '1.2.4'), ('size', 0)]:
@@ -85,8 +128,9 @@ class PublicationTests(unittest.TestCase):
             publish(object())
 
     def test_unsafe_version_rejected(self):
-        with self.assertRaises(ValueError):
-            prepare(self.exe, '../bad;version', self.receipt)
+        for version in ['../bad;version', 'v1.2.3', '1.2.3-rc1', '1.2.3.4.5']:
+            with self.assertRaises(ValueError):
+                prepare(self.exe, version, self.receipt, self.key)
 
 
 if __name__ == '__main__':

@@ -1,4 +1,9 @@
-"""Publish an explicitly accepted immutable Windows artifact. Importing never connects."""
+"""Publish an explicitly accepted immutable Windows artifact. Importing never connects.
+
+The release entry is signed with the offline update key (update_signing.py): installed
+clients update themselves to it, and only because of that signature. Releases are
+mandatory updates unless published with --optional.
+"""
 import argparse
 import hashlib
 import json
@@ -7,16 +12,29 @@ import re
 import sys
 import uuid
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import update_signing
+
 ROOT = Path(__file__).resolve().parents[1]
 REMOTE = '/opt/kiro-byok/downloads/'
 
 
-def prepare(source, version, acceptance):
-    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,79}', version):
-        raise ValueError('Invalid release version')
+def check_version(version):
+    # Clients compare versions numerically, and each knows its own from its build.
+    if not isinstance(version, str) or not update_signing.VERSION.fullmatch(version):
+        raise ValueError('Release version must be one to four dot-separated numbers, e.g. 2026.09.25')
+
+
+def prepare(source, version, acceptance, key, mandatory=True):
+    check_version(version)
     data = Path(source).read_bytes()
     if data[:2] != b'MZ':
         raise ValueError('Expected native Windows executable')
+    # Built as another version, the client would take this release for newer than itself
+    # and install it again at every start.
+    if data.count(update_signing.release_marker(version)) != 1:
+        raise ValueError('The executable was not built as this release '
+                         '(set SUPERKIRO_RELEASE_VERSION to it when building)')
     digest = hashlib.sha256(data).hexdigest()
     receipt = json.loads(Path(acceptance).read_text(encoding='utf-8-sig'))
     expected = dict(version=version, sha256=digest, size=len(data), platform='windows', arch='x64')
@@ -26,7 +44,7 @@ def prepare(source, version, acceptance):
     item = dict(expected, url=f'/downloads/Superkiro-{version}-Windows.exe',
                 signature='unsigned',
                 systemRequirements='Windows 10/11 x64 · WebView2 · 单文件免安装 · Rust + Tauri')
-    return data, item
+    return data, update_signing.signed_entry(item, key, mandatory)
 
 
 def merge_manifest(previous, item):
@@ -39,8 +57,21 @@ def merge_manifest(previous, item):
         same_target = all(release.get(k) == item[k] for k in ('platform', 'arch'))
         if same_target and release.get('version') == item['version'] and release.get('sha256') != item['sha256']:
             raise ValueError('Version already published with a different digest')
+        if same_target and newer(release.get('version'), item['version']):
+            raise ValueError('A newer version is already published; clients never go back')
     return {'releases': [r for r in releases if
                          (r.get('platform'), r.get('arch')) != (item['platform'], item['arch'])] + [item]}
+
+
+def newer(candidate, current):
+    """Whether numeric version `candidate` is later than `current`, as clients compare."""
+    def parts(version):
+        if not isinstance(version, str) or not update_signing.VERSION.fullmatch(version):
+            return None
+        numbers = [int(p) for p in version.split('.')]
+        return numbers + [0] * (4 - len(numbers))
+    a, b = parts(candidate), parts(current)
+    return a is not None and b is not None and a > b
 
 
 def validate_history(names, item):
@@ -129,8 +160,12 @@ def main():
     parser.add_argument('--version', required=True)
     parser.add_argument('--source', type=Path, required=True)
     parser.add_argument('--acceptance', type=Path, required=True)
+    parser.add_argument('--update-key', type=Path, default=update_signing.KEY)
+    parser.add_argument('--optional', action='store_true',
+                        help='let installed clients postpone this update')
     args = parser.parse_args()
-    data, item = prepare(args.source, args.version, args.acceptance)
+    data, item = prepare(args.source, args.version, args.acceptance,
+                         update_signing.load(args.update_key), mandatory=not args.optional)
     sys.path.insert(0, str(ROOT))
     from deploy.release_candidate import pinned_connection
     ssh = pinned_connection(json.load(sys.stdin))

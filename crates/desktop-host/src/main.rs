@@ -2,6 +2,7 @@
 
 mod backend;
 mod errors;
+mod update;
 mod window_preferences;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -264,6 +265,58 @@ async fn native_inner(
             Ok(()) | Err(keyring::Error::NoEntry) => {}
             Err(_) => return Err("Cannot clear credential".into()),
         },
+        "update_check" => {
+            let origin = update::origin(backend::configured_gateway())?;
+            let client = backend::gateway_client(&origin)?;
+            return update::check(&client, &origin, &state.update_state()).await;
+        }
+        "update_install" => {
+            let origin = update::origin(backend::configured_gateway())?;
+            let state_file = state.update_state();
+            let release =
+                update::available(&backend::gateway_client(&origin)?, &origin, &state_file)
+                    .await?
+                    .ok_or("[update:verify] No update is available")?;
+            let mut reported = 0;
+            let bytes = update::download(
+                &backend::download_client(&origin)?,
+                &origin,
+                &release,
+                |received, total| {
+                    // A percent at a time is plenty for a progress bar.
+                    let percent = received * 100 / total.max(1);
+                    if percent > reported {
+                        reported = percent;
+                        let _ = window.emit(
+                            "update-progress",
+                            json!({"received": received, "total": total}),
+                        );
+                    }
+                },
+            )
+            .await?;
+            // Never in the middle of a takeover or a restore; the page tries again later.
+            // The guard is held until the process exits, so a queued mutation cannot start
+            // and be killed mid-write.
+            let guard = state
+                .operation
+                .try_lock()
+                .map_err(|_| "Operation in progress")?;
+            tauri::async_runtime::spawn_blocking(move || {
+                update::install(&state_file, &bytes, &release)
+            })
+            .await
+            .map_err(|_| "[update:relaunch] The update stopped unexpectedly".to_string())??;
+            // The new version is up and waiting for this process to end before it takes the
+            // lock; it puts the old version back if it never gets there.
+            window.app_handle().exit(0);
+            drop(guard);
+        }
+        "update_confirm" => {
+            // The window is up and talking to the host: the new version has proven itself.
+            let state_file = state.update_state();
+            tauri::async_runtime::spawn_blocking(move || update::confirm(&state_file));
+        }
         "pick_install_path" => {
             let Some(folder) = rfd::AsyncFileDialog::new().pick_folder().await else {
                 return Ok(Value::Null);
@@ -314,6 +367,12 @@ fn close_main(app: &tauri::AppHandle) -> Result<(), String> {
 }
 
 fn main() {
+    // Before the single-instance plugin or the app lock: an update's first boot waits for
+    // the version it replaced to exit, and a version that never confirmed rolls back and
+    // hands off to the old one, which this process then steps aside for.
+    if let update::Startup::Exit = update::startup(update::state_path().as_deref()) {
+        return;
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             show_main(app);
@@ -394,6 +453,12 @@ fn main() {
                 })
                 .build(app)?;
             backend::start_maintenance(host);
+            let update_state = update::state_path();
+            std::thread::spawn(move || {
+                if let Some(state) = update_state {
+                    update::remove_leftovers(&state);
+                }
+            });
             Ok(())
         })
         .on_window_event(|window, event| {

@@ -82,6 +82,12 @@ impl Host {
             _instance: patch_engine::SingleInstanceLock::acquire(Some(&config.join("host.lock")))?,
         })
     }
+    /// Where the update state lives (update.rs): the same file the pre-launch rollback
+    /// check computes, so both agree on it.
+    pub fn update_state(&self) -> PathBuf {
+        crate::update::state_path()
+            .unwrap_or_else(|| self.preferences.with_file_name("update-state.json"))
+    }
     pub fn operation_status(&self) -> Result<Value, String> {
         self.operation_state
             .lock()
@@ -421,7 +427,7 @@ fn known_gateway_hosts() -> Vec<String> {
     hosts.dedup();
     hosts
 }
-fn network_error(error: reqwest::Error) -> String {
+pub(crate) fn network_error(error: reqwest::Error) -> String {
     if error.is_timeout() {
         return "Network timeout".into();
     }
@@ -525,10 +531,26 @@ fn gateway_certificates() -> Result<Vec<reqwest::Certificate>, String> {
     }
     Ok(certificates)
 }
-fn gateway_client(gateway: &str) -> Result<reqwest::Client, String> {
-    let mut builder = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(20));
+pub(crate) fn gateway_client(gateway: &str) -> Result<reqwest::Client, String> {
+    client_for(
+        gateway,
+        reqwest::Client::builder().timeout(Duration::from_secs(20)),
+    )
+}
+/// For update downloads: no overall deadline, which a slow line would miss; each read has
+/// its own (update.rs).
+pub(crate) fn download_client(gateway: &str) -> Result<reqwest::Client, String> {
+    client_for(
+        gateway,
+        reqwest::Client::builder().connect_timeout(Duration::from_secs(20)),
+    )
+}
+/// The gateway this client is configured for.
+pub(crate) fn configured_gateway() -> Result<String, String> {
+    gateway(None)
+}
+fn client_for(gateway: &str, builder: reqwest::ClientBuilder) -> Result<reqwest::Client, String> {
+    let mut builder = builder.redirect(reqwest::redirect::Policy::none());
     let url = reqwest::Url::parse(gateway).map_err(|_| "Invalid gateway URL")?;
     if matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")) {
         builder = builder.no_proxy();

@@ -102,6 +102,18 @@ pub(crate) fn enumerate() -> io::Result<Vec<(u32, u32, String)>> {
     Ok(result)
 }
 
+/// Whether any process named `image` (case-insensitive) was started by `parent` and is
+/// still listed. A parent id is stored at creation and not cleared when the parent exits,
+/// so this reports the parent's own children until that id is reused - long enough to wait
+/// out a just-exited process's helpers.
+pub(crate) fn has_child_process(parent: u32, image: &str) -> bool {
+    enumerate().is_ok_and(|processes| {
+        processes
+            .iter()
+            .any(|(_, ppid, name)| *ppid == parent && name.eq_ignore_ascii_case(image))
+    })
+}
+
 #[repr(C)]
 struct WtsProcessInfo {
     session: u32,

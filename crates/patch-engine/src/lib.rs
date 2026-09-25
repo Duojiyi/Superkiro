@@ -62,6 +62,21 @@ pub use white_label::{default_brand_config_path, ThemeMode, WhiteLabelConfig, Wh
 #[allow(dead_code)] // ponytail: reserved for future Win32 named mutex single-instance
 pub const WIN32_MUTEX_NAME: &str = "kiro";
 
+/// Whether a process named `image` was started by process `parent_pid` and is still
+/// running. Windows only (used to wait out a replaced client's WebView2 helper before the
+/// new one opens its window on the shared user-data folder); always false elsewhere.
+pub fn has_child_process(parent_pid: u32, image: &str) -> bool {
+    #[cfg(windows)]
+    {
+        windows_process::has_child_process(parent_pid, image)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (parent_pid, image);
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

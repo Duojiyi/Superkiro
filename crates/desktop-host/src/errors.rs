@@ -45,6 +45,10 @@ const CODES: &[&str] = &[
     "SK-LOCAL-002",
     "SK-UNKNOWN-001",
     "SK-LOCAL-003",
+    "SK-UPDATE-001",
+    "SK-UPDATE-002",
+    "SK-UPDATE-003",
+    "SK-UPDATE-004",
 ];
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -71,6 +75,20 @@ pub fn classify(raw: &str, path: &str, method: &str) -> Value {
             "SK-BIND-004"
         } else if lower.contains("operation in progress") {
             "SK-LOCAL-002"
+        } else if let Some(code) = raw
+            .strip_prefix("[update:")
+            .and_then(|rest| rest.split(']').next())
+            .and_then(|stage| match stage {
+                "download" => Some("SK-UPDATE-001"),
+                "verify" => Some("SK-UPDATE-002"),
+                "replace" => Some("SK-UPDATE-003"),
+                "relaunch" => Some("SK-UPDATE-004"),
+                _ => None,
+            })
+        {
+            // A failed update leaves the running client as it was; none of these is a
+            // network timeout of a write whose outcome is unknown.
+            code
         } else if lower.contains("reinstall kiro") {
             // Kiro's bundle is still modified and nothing is left to restore it from:
             // retrying cannot help, reinstalling Kiro replaces the file.
@@ -345,6 +363,31 @@ mod tests {
             42
         );
         assert!(classify("[retry-after:86401]", "", "GET")["retry_after_seconds"].is_null());
+    }
+    #[test]
+    fn update_failures_have_their_own_codes() {
+        for (raw, code) in [
+            ("[update:download] Network timeout", "SK-UPDATE-001"),
+            ("[update:verify] The update signature is invalid", "SK-UPDATE-002"),
+            (
+                "[update:replace] Cannot write beside the client: Access is denied. (os error 5)",
+                "SK-UPDATE-003",
+            ),
+            (
+                "[update:relaunch] The updated client did not start; the previous version was put back",
+                "SK-UPDATE-004",
+            ),
+        ] {
+            let error = classify(raw, "native", "update_install");
+            assert_eq!(error["code"], code, "{raw}");
+            assert_eq!(error["outcome"], "failed", "{raw}");
+            assert!(validated(&error).is_some(), "{raw}");
+        }
+        // Waiting for a takeover to finish is not an update failure.
+        assert_eq!(
+            classify("Operation in progress", "native", "update_install")["code"],
+            "SK-LOCAL-002"
+        );
     }
     #[test]
     fn every_code_has_a_desktop_message() {

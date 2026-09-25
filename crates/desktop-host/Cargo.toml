@@ -21,6 +21,11 @@ tauri-plugin-single-instance = "=2.4.4"
 keyring = { version = "3", features = ["windows-native", "apple-native"] }
 rfd = "0.15"
 open = "5"
+# Update signatures and hashes; already in the graph through the engine.
+ring = "0.17"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [features]
 default = ["custom-protocol"]

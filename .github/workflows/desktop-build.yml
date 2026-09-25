@@ -5,6 +5,11 @@ concurrency:
 
 on:
   workflow_dispatch:
+    inputs:
+      release_version:
+        description: 'Release version the clients are built as (e.g. 2026.09.25); empty builds never update themselves'
+        required: false
+        default: ''
   push:
     branches: [main]
   pull_request:
@@ -12,6 +17,7 @@ on:
 env:
   CARGO_BUILD_JOBS: 2
   SUPERKIRO_BUILD_REVISION: ${{ github.sha }}
+  SUPERKIRO_RELEASE_VERSION: ${{ inputs.release_version }}
 permissions:
   contents: read
 jobs:
@@ -40,7 +46,7 @@ jobs:
       - run: cargo fmt -p desktop-host -- --check
       - run: cargo clippy --locked -p desktop-host --all-targets -- -D warnings
       - run: cargo test --locked -p desktop-host -p patch-engine
-      - run: python scripts/build_desktop.py
+      - run: python scripts/build_desktop.py --release-version "${{ inputs.release_version }}"
       - name: Record source and artifact mapping (not signing or acceptance)
         run: python -B deploy/artifact_provenance.py --artifact dist/Superkiro.exe --version "ci-${{ github.run_id }}.${{ github.run_attempt }}" --platform windows --arch x64
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

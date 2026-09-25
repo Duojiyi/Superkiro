@@ -1,4 +1,6 @@
-"""Publish accepted macOS app archives using the shared immutable publication path."""
+"""Publish accepted macOS app archives using the shared immutable publication path.
+
+Signed for in-place updates like the Windows release (publish_native_windows.py)."""
 import argparse
 import hashlib
 import io
@@ -9,7 +11,8 @@ import struct
 import sys
 import tarfile
 
-from publish_native_windows import ROOT, publish
+from publish_native_windows import ROOT, check_version, publish
+import update_signing
 
 
 def validate_archive(data, arch):
@@ -47,22 +50,31 @@ def validate_archive(data, arch):
             raise ValueError('Unexpected app identity')
 
 
-def prepare(source, version, acceptance, arch):
-    import re
-    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,79}', version):
-        raise ValueError('Invalid release version')
+def carries_release(data, version):
+    """Whether the app's executable was built as `version` (see publish_native_windows)."""
+    with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as archive:
+        executable = archive.extractfile('Superkiro.app/Contents/MacOS/Superkiro').read()
+    return executable.count(update_signing.release_marker(version)) == 1
+
+
+def prepare(source, version, acceptance, arch, key, mandatory=True):
+    check_version(version)
     data = Path(source).read_bytes()
     validate_archive(data, arch)
+    if not carries_release(data, version):
+        raise ValueError('The app was not built as this release '
+                         '(set SUPERKIRO_RELEASE_VERSION to it when building)')
     digest = hashlib.sha256(data).hexdigest()
     expected = dict(version=version, sha256=digest, size=len(data), platform='macos', arch=arch)
     receipt = json.loads(Path(acceptance).read_text(encoding='utf-8-sig'))
     if (not isinstance(receipt, dict) or receipt.get('approvedForPublication') is not True
             or any(receipt.get(k) != v for k, v in expected.items())):
         raise ValueError('Acceptance receipt does not approve these exact artifact bytes')
-    return data, dict(expected, url=f"/downloads/Superkiro-{version}-Mac-{'ARM64' if arch == 'arm64' else 'Intel'}.app.tar.gz",
-                      signature='unsigned',
-                      systemRequirements='macOS · ' + ('Apple Silicon' if arch == 'arm64' else 'Intel x64')
-                      + ' · 无 Developer ID 签名或 Apple 公证 · 解压后运行 .app')
+    item = dict(expected, url=f"/downloads/Superkiro-{version}-Mac-{'ARM64' if arch == 'arm64' else 'Intel'}.app.tar.gz",
+                signature='unsigned',
+                systemRequirements='macOS · ' + ('Apple Silicon' if arch == 'arm64' else 'Intel x64')
+                + ' · 无 Developer ID 签名或 Apple 公证 · 解压后运行 .app')
+    return data, update_signing.signed_entry(item, key, mandatory)
 
 
 def main():
@@ -71,8 +83,12 @@ def main():
     parser.add_argument('--source', type=Path, required=True)
     parser.add_argument('--acceptance', type=Path, required=True)
     parser.add_argument('--arch', choices=['arm64', 'x64'], required=True)
+    parser.add_argument('--update-key', type=Path, default=update_signing.KEY)
+    parser.add_argument('--optional', action='store_true',
+                        help='let installed clients postpone this update')
     args = parser.parse_args()
-    data, item = prepare(args.source, args.version, args.acceptance, args.arch)
+    data, item = prepare(args.source, args.version, args.acceptance, args.arch,
+                         update_signing.load(args.update_key), mandatory=not args.optional)
     sys.path.insert(0, str(ROOT))
     from deploy.release_candidate import pinned_connection
     ssh = pinned_connection(json.load(sys.stdin))
