@@ -190,21 +190,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if dev_code.chars().count() < 16 || dev_code.chars().count() > 256 {
             return Err("DEV_CARD_CODE must contain 16..256 characters".into());
         }
-        if billing.find_card_by_secret(&dev_code).is_none() {
-            let dev_template =
-                CardTemplate::tier("standard-monthly", "group-pro-plus").expect("built-in tier");
-            let card = billing::Card::from_template(
-                "card-dev-bootstrap",
-                billing::hash_card_code(&dev_code),
-                &dev_template,
-                Some("bootstrap card".to_string()),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            );
-            billing.upsert_card(card);
-        }
+        seed_bootstrap_card(&billing, &dev_code, gateway::now_secs())
+            .map_err(|e| format!("Failed to save the DEV_CARD_CODE bootstrap card: {e}"))?;
     }
 
     // 2. 装配共享认证与虚拟化上下文
@@ -405,7 +392,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         listener,
         router.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(async {
+        shutdown_signal().await;
+        // A stream may run ten minutes, and the container is killed 90 seconds after it
+        // is told to stop (stop_grace_period). Streams still open after the drain are cut,
+        // so each settles what it streamed before the final save below.
+        tokio::spawn(async {
+            tokio::time::sleep(STREAM_DRAIN).await;
+            println!("[*] Drain over; cutting the streams still open");
+            gateway::stream::cut_open_streams();
+        });
+    })
     .await?;
 
     // 9. 停机持久化保证 (Durability Guarantee on Shutdown)
@@ -418,6 +415,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("[√] Cleanly saved billing snapshot to {:?}", state_file);
     }
     Ok(())
+}
+
+const BOOTSTRAP_CARD_ID: &str = "card-dev-bootstrap";
+
+/// How long a stopping gateway lets open streams finish before cutting them, within the
+/// 90-second stop grace period of the compose files and the release tool.
+const STREAM_DRAIN: Duration = Duration::from_secs(60);
+
+/// Seed the bootstrap card for `dev_code`, once. A card already holding the code is left
+/// alone, and a new code goes to the bootstrap card already there, which keeps its balance
+/// and usage. Replacing that card with a fresh one reset its usage while its ledger kept
+/// it: the state no longer reconciled, so after any failed write the persistence probe
+/// refused to save it (every reservation refused), and the next start refused to load it.
+fn seed_bootstrap_card(
+    billing: &BillingEngine,
+    dev_code: &str,
+    now_secs: u64,
+) -> Result<(), billing::BillingError> {
+    if billing.find_card_by_secret(dev_code).is_some() {
+        return Ok(());
+    }
+    let code_hash = billing::hash_card_code(dev_code);
+    if billing.get_card(BOOTSTRAP_CARD_ID).is_some() {
+        return billing
+            .set_card_code_hash(BOOTSTRAP_CARD_ID, &code_hash)
+            .map(|_| ());
+    }
+    let dev_template =
+        CardTemplate::tier("standard-monthly", "group-pro-plus").expect("built-in tier");
+    let card = billing::Card::from_template(
+        BOOTSTRAP_CARD_ID,
+        code_hash,
+        &dev_template,
+        Some("bootstrap card".to_string()),
+        now_secs,
+    );
+    billing.insert_new_cards_checked(std::iter::once(card))
 }
 
 fn get_secret_from_env_or_file(name: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
@@ -520,6 +554,78 @@ async fn shutdown_signal() {
         "
 [*] Graceful shutdown signal received, draining server connections..."
     );
+}
+
+#[cfg(test)]
+mod bootstrap_card_tests {
+    use super::*;
+    use billing::{ReservationEstimateParams, UsageTokens};
+
+    /// A new DEV_CARD_CODE moves to the bootstrap card already there. The card was
+    /// replaced by a fresh one instead: its usage reset while its ledger kept it, so the
+    /// state no longer reconciled, the persistence probe refused to write it after any
+    /// failed write, and the next start refused to load it.
+    #[test]
+    fn a_rotated_code_keeps_the_bootstrap_cards_usage_and_a_loadable_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "kiro-bootstrap-rotation-{}-{}",
+            std::process::id(),
+            gateway::now_secs()
+        ));
+        let path = dir.join("billing_state.json");
+        let billing = BillingEngine::new();
+        billing.set_persistence_path(&path);
+        let (first, second) = ("first-bootstrap-code-0001", "second-bootstrap-code-0002");
+
+        seed_bootstrap_card(&billing, first, 100).unwrap();
+        billing.activate_card(BOOTSTRAP_CARD_ID, 100, 0).unwrap();
+        let signed_in = billing.get_card(BOOTSTRAP_CARD_ID).unwrap().token_version;
+        billing
+            .reserve(
+                "card-dev-bootstrap",
+                "use",
+                &ReservationEstimateParams::new(0, 1),
+                101,
+                600,
+            )
+            .unwrap();
+        let tokens = UsageTokens {
+            output_tokens: 1,
+            ..UsageTokens::default()
+        };
+        let used = billing
+            .settle("use", &tokens, "m", "p", "t", 102)
+            .unwrap()
+            .credits_charged;
+        assert!(used > 0);
+
+        seed_bootstrap_card(&billing, second, 200).unwrap();
+        let card = billing.get_card(BOOTSTRAP_CARD_ID).unwrap();
+        assert_eq!(card.credit_used, used, "the usage was reset");
+        assert!(
+            card.token_version > signed_in,
+            "the old code's session survived"
+        );
+        // Seeding again with the same code changes nothing.
+        let sequence = billing.snapshot_sequence();
+        seed_bootstrap_card(&billing, second, 300).unwrap();
+        assert_eq!(billing.snapshot_sequence(), sequence);
+        assert!(billing.find_card_by_secret(first).is_none());
+        assert_eq!(
+            billing.find_card_by_secret(second).map(|card| card.id),
+            Some("card-dev-bootstrap".to_string())
+        );
+        let restarted = BillingEngine::new();
+        restarted.load_from_file(&path).unwrap();
+        assert_eq!(
+            restarted
+                .get_card("card-dev-bootstrap")
+                .unwrap()
+                .credit_used,
+            used
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 #[cfg(test)]

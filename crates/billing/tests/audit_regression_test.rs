@@ -455,10 +455,11 @@ fn the_recovery_task_restores_service_once_storage_is_back() {
     let params = ReservationEstimateParams::new(1_000, 1_000);
 
     engine.inject_persistence_fault(true);
+    assert!(engine.sync_to_disk_checked().is_err());
+    assert!(!engine.persistence_ready());
     assert!(engine
         .reserve("card", "during-outage", &params, 100, 600)
         .is_err());
-    assert!(!engine.persistence_ready());
 
     // Storage comes back. Nothing else happens on this deployment.
     engine.inject_persistence_fault(false);

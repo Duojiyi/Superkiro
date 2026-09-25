@@ -24,6 +24,8 @@ use std::time::Duration;
 use wiremock::matchers::{method as wm_method, path as wm_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+mod support;
+
 const GROUP: &str = "group-empty";
 const CARD: &str = "card-empty";
 const MODEL: &str = "claude-sonnet-4-6";
@@ -36,23 +38,40 @@ struct Outcome {
     billing: BillingEngine,
 }
 
-async fn run(frames: &[Value]) -> Outcome {
-    let upstream = MockServer::start().await;
+fn sse(frames: &[Value]) -> String {
     let mut sse: Vec<String> = frames
         .iter()
         .map(|frame| format!("data: {frame}"))
         .collect();
     sse.push("data: [DONE]".into());
     sse.push(String::new());
+    sse.join("\n\n")
+}
+
+async fn run(frames: &[Value]) -> Outcome {
+    run_after(&[], frames).await
+}
+
+/// The upstream answers `first` once, then `frames` to every later attempt.
+async fn run_after(first: &[Value], frames: &[Value]) -> Outcome {
+    let upstream = MockServer::start().await;
+    if !first.is_empty() {
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse(first), "text/event-stream"))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&upstream)
+            .await;
+    }
     Mock::given(wm_method("POST"))
         .and(wm_path("/v1/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_raw(sse.join("\n\n"), "text/event-stream"),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse(frames), "text/event-stream"))
         .mount(&upstream)
         .await;
 
     let billing = BillingEngine::default();
+    billing.upsert_rate_card_version(support::wildcard_price("default"));
     let auth = AuthState::with_billing(
         "test-secret-key-empty-completion-contract-32",
         billing.clone(),
@@ -192,9 +211,27 @@ async fn an_end_marker_without_a_usage_report_is_still_a_failed_relay() {
     assert!(outcome.body.contains("InternalServerException") || !outcome.status.is_success());
 }
 
+async fn usage_entries(billing: &BillingEngine) -> Vec<billing::LedgerEntry> {
+    for _ in 0..200 {
+        let entries: Vec<_> = billing
+            .ledger_entries()
+            .into_iter()
+            .filter(|entry| entry.card_id == CARD && entry.kind == billing::LedgerKind::Usage)
+            .collect();
+        if !entries.is_empty() {
+            return entries;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Vec::new()
+}
+
 /// An empty turn ending with an ordinary stop gives the user nothing, and a failing relay
-/// sends exactly the same thing, so it is retried and never billed. The key answered every
-/// time, so it is not put into cooldown and keeps serving everyone else.
+/// sends exactly the same thing, so it is retried. The key answered every time, so it is
+/// not put into cooldown and keeps serving everyone else. Every attempt reported the input
+/// it consumed, so when none produces anything the request is billed that input once: it
+/// was free, which let a customer prompt for an empty reply over a large context and have
+/// the operator pay for the input three times.
 #[tokio::test]
 async fn an_empty_ordinary_stop_is_retried_without_harming_the_key() {
     let outcome = run(&[
@@ -213,13 +250,34 @@ async fn an_empty_ordinary_stop_is_retried_without_harming_the_key() {
         );
     }
     assert!(outcome.body.contains("InternalServerException"));
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(
-        outcome
-            .billing
-            .ledger_entries()
-            .iter()
-            .all(|entry| entry.card_id != CARD),
-        "an empty ordinary stop must not be billed"
-    );
+    let entries = usage_entries(&outcome.billing).await;
+    assert_eq!(entries.len(), 1, "billed once, not per attempt");
+    assert_eq!(entries[0].input_tokens, 50);
+    assert_eq!(entries[0].output_tokens, 0);
+    let card = outcome.billing.get_card(CARD).unwrap();
+    assert_eq!(card.credit_reserved, 0);
+    assert_eq!(card.credit_used, entries[0].credits_charged);
+}
+
+/// A retry that answers is the attempt the request pays for; the empty attempt before it
+/// is not billed as well.
+#[tokio::test]
+async fn an_empty_attempt_followed_by_an_answer_bills_only_the_answer() {
+    let outcome = run_after(
+        &[
+            json!({"id": "1", "choices": [{"delta": {}, "finish_reason": "stop"}]}),
+            json!({"id": "1", "choices": [], "usage": {"prompt_tokens": 50, "completion_tokens": 0, "total_tokens": 50}}),
+        ],
+        &[
+            json!({"id": "2", "choices": [{"delta": {"content": "Hello"}}]}),
+            json!({"id": "2", "choices": [{"delta": {}, "finish_reason": "stop"}]}),
+            json!({"id": "2", "choices": [], "usage": {"prompt_tokens": 70, "completion_tokens": 3, "total_tokens": 73}}),
+        ],
+    )
+    .await;
+    assert_eq!(outcome.status, StatusCode::OK, "{}", outcome.body);
+    assert_eq!(outcome.upstream_calls, 2);
+    let entries = usage_entries(&outcome.billing).await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!((entries[0].input_tokens, entries[0].output_tokens), (70, 3));
 }

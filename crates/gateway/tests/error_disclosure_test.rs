@@ -23,6 +23,8 @@ use std::time::Duration;
 use wiremock::matchers::{method as wm_method, path as wm_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+mod support;
+
 const GROUP: &str = "group-disclosure";
 const CARD: &str = "card-disclosure";
 const MODEL: &str = "claude-sonnet-4-6";
@@ -41,6 +43,7 @@ async fn failing_upstream_response() -> (StatusCode, String) {
         .await;
 
     let billing = BillingEngine::default();
+    billing.upsert_rate_card_version(support::wildcard_price("default"));
     let auth = AuthState::with_billing(
         "test-secret-key-error-disclosure-contract-32ch",
         billing.clone(),

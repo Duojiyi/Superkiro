@@ -147,6 +147,21 @@ impl StreamGuardConfig {
 
 const DEFAULT_SEND_DEADLINE: Duration = Duration::from_secs(600);
 
+/// Set once, when the gateway is stopping and its drain is over.
+static STOPPING: std::sync::OnceLock<tokio::sync::watch::Sender<bool>> = std::sync::OnceLock::new();
+
+fn stopping() -> &'static tokio::sync::watch::Sender<bool> {
+    STOPPING.get_or_init(|| tokio::sync::watch::channel(false).0)
+}
+
+/// End every open stream, and any that starts from now on, as a response cut off by a
+/// restart, each billed for what it streamed. The gateway calls this when it stops: it
+/// used to wait for every stream, which may run ten minutes, so it was killed with
+/// streams still running, and their holds were dropped at the next start unbilled.
+pub fn cut_open_streams() {
+    stopping().send_replace(true);
+}
+
 /// How long a terminal frame may wait for the client, deadline or not. Without it Kiro
 /// sees a response that simply stops, with no reason and no end.
 const TERMINAL_FRAME_GRACE: Duration = Duration::from_secs(3);
@@ -207,6 +222,13 @@ impl Failure {
                     .into(),
             ),
             "Response exceeded the time limit and was cut off",
+        )
+    }
+
+    fn restarting() -> Self {
+        Self::new(
+            Some("\n\n**网关正在重启，本次响应已被截断。**可以让模型从这里继续。\n".into()),
+            "The gateway is restarting; the response was cut off",
         )
     }
 
@@ -309,6 +331,7 @@ pub fn create_stream_guard_with_send_deadline(
         let mut interval = tokio::time::interval(config.keepalive_interval);
         let deadline_sleep = tokio::time::sleep_until(send_deadline);
         tokio::pin!(deadline_sleep);
+        let mut stop = stopping().subscribe();
         interval.tick().await;
         let mut upstream = Box::pin(upstream_stream);
         let mut tool_calls = ToolCalls::default();
@@ -333,6 +356,10 @@ pub fn create_stream_guard_with_send_deadline(
             tokio::select! {
                 _ = tx.closed() => break,
                 _ = &mut deadline_sleep => break,
+                _ = async { drop(stop.wait_for(|stop| *stop).await) } => {
+                    failure = Some(Failure::restarting());
+                    break;
+                }
                 _ = interval.tick() => {
                     if !send_frame(&tx, Bytes::from(kiro_wire::encoder::encode_keepalive()), send_deadline).await {
                         break;
@@ -398,11 +425,7 @@ pub fn create_stream_guard_with_send_deadline(
                         Some(Ok(ProviderStreamEvent::Usage(next))) => {
                             saw_usage_frame = true;
                             // Output-only Anthropic message_delta must not erase prompt/cache observations.
-                            // A present-but-zero cache field is not a report of input usage: the
-                            // OpenAI adapter fills it from `cached_tokens`, which is usually 0.
-                            has_input_usage |= next.prompt_tokens > 0 || next.uncached_prompt_tokens > 0
-                                || next.cache_read_input_tokens.is_some_and(|tokens| tokens > 0)
-                                || next.cache_creation_input_tokens.is_some_and(|tokens| tokens > 0);
+                            has_input_usage |= reports_input(&next);
                             usage.merge(&next);
                             let wire_usage = kiro_wire::events::TokenUsage {
                                 uncached_input_tokens: usage.uncached_prompt_tokens.min(i64::MAX as u64) as i64,
@@ -605,7 +628,20 @@ pub(crate) fn is_explicit_empty_stop(raw_reason: &str) -> bool {
     empty_turn_notice(Some(&StreamTranslationState::map_stop_reason(raw_reason))).is_some()
 }
 
-fn resolve_settlement_tokens(
+/// Whether a usage report counts the input. A present-but-zero cache field does not: the
+/// OpenAI adapter fills it from `cached_tokens`, which is usually 0.
+pub(crate) fn reports_input(usage: &crate::provider::TokenUsage) -> bool {
+    usage.prompt_tokens > 0
+        || usage.uncached_prompt_tokens > 0
+        || usage
+            .cache_read_input_tokens
+            .is_some_and(|tokens| tokens > 0)
+        || usage
+            .cache_creation_input_tokens
+            .is_some_and(|tokens| tokens > 0)
+}
+
+pub(crate) fn resolve_settlement_tokens(
     usage: &crate::provider::TokenUsage,
     has_input_usage: bool,
     output_units: u64,
@@ -620,14 +656,17 @@ fn resolve_settlement_tokens(
     } else {
         0
     };
-    // An exact report wins, except a report of zero after text was streamed: that is
-    // an upstream that sent a usage frame of zeros, and trusting it bills visible
-    // output as free.
-    let output = if usage.output_tokens_final && !(saw_output && usage.completion_tokens == 0) {
-        usage.completion_tokens
-    } else {
-        usage.completion_tokens.max(streamed)
-    };
+    // An exact report wins, unless it is below half of what was streamed. The estimate
+    // is within that of a real tokenizer (it overcounts CJK and deep indentation at
+    // most about twofold), so such a report is wrong: an upstream that sent a usage
+    // frame of zeros, or an Anthropic-format relay whose final count of 0 left its
+    // opening count of 1, which billed thousands of streamed words as one token.
+    let output =
+        if usage.output_tokens_final && usage.completion_tokens.saturating_mul(2) >= streamed {
+            usage.completion_tokens
+        } else {
+            usage.completion_tokens.max(streamed)
+        };
     Some(UsageTokens {
         uncached_input_tokens: if has_input_usage {
             usage.uncached_prompt_tokens

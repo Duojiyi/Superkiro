@@ -24,6 +24,8 @@ use std::time::Duration;
 use wiremock::matchers::{method as wm_method, path as wm_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+mod support;
+
 const GROUP: &str = "group-vision";
 const CARD: &str = "card-vision";
 const EXPOSED: &str = "claude-opus-5";
@@ -87,6 +89,7 @@ async fn harness(declared_vision: bool, enable_fallback: bool) -> Harness {
         .await;
 
     let billing = BillingEngine::default();
+    billing.upsert_rate_card_version(support::wildcard_price("default"));
     let auth = AuthState::with_billing(
         "test-secret-key-vision-gate-contract-32-chars-ok",
         billing.clone(),

@@ -55,6 +55,8 @@ fn test_t07_verify_snapshot_integrity_clean_state() {
     engine.upsert_provider(prov);
     engine.upsert_provider_key(key);
 
+    // No model: the hold is estimated at the rates given here. A named model would need a
+    // published price.
     let params = ReservationEstimateParams {
         estimated_input_tokens: 100,
         max_output_tokens: 50,
@@ -62,7 +64,7 @@ fn test_t07_verify_snapshot_integrity_clean_state() {
         output_rate_per_m: 30_000_000,
         credit_multiplier: 1.0,
         margin_multiplier: 1.0,
-        model: Some("claude-3-5-sonnet".to_string()),
+        model: None,
     };
     engine
         .reserve("card-t07-01", "inv-t07-01", &params, 1000, 300)

@@ -18,6 +18,8 @@ use kiro_wire::decoder::EventStreamDecoder;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
+mod support;
+
 fn create_test_billing() -> (BillingEngine, String) {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let temp_dir = std::env::temp_dir().join(format!(
@@ -36,6 +38,7 @@ fn create_test_billing() -> (BillingEngine, String) {
     let billing = BillingEngine::new();
     billing.set_persistence_path(&state_file);
     billing.set_master_kek(kek);
+    billing.upsert_rate_card_version(support::wildcard_price("default"));
 
     let mut card = Card::new("card-t06-test", "group-default", 10_000_000);
     let now_secs = SystemTime::now()
@@ -1243,4 +1246,83 @@ async fn a_failed_settlement_is_reported_instead_of_a_normal_end() {
     let message = exception_message(&frames).expect("the stream ends with an exception");
     assert!(message.contains("settlement"), "{message}");
     assert_eq!(frames.last().unwrap().0, "InternalServerException");
+}
+
+/// An Anthropic-format relay that reports one output token at the start and zero at the
+/// end: merged, that was a final count of 1, and thousands of streamed words were billed
+/// as one token. Only a report of exactly zero was checked against what was streamed.
+/// A final count below half of what was streamed cannot be right, so the streamed
+/// estimate is billed; an exact report above that still wins.
+#[tokio::test]
+async fn an_output_count_far_below_what_was_streamed_is_not_trusted() {
+    use gateway::provider::anthropic::AnthropicProvider;
+    use gateway::provider::ModelProvider;
+    let words = "word ".repeat(3_600);
+    let bill = |final_output: u64| {
+        let words = words.clone();
+        async move {
+            let (billing, card_id) = create_test_billing();
+            let inv_id = "inv-underreport";
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            billing
+                .reserve(
+                    &card_id,
+                    inv_id,
+                    &ReservationEstimateParams::new(1_000, 8_000).with_model("claude-3-5-sonnet"),
+                    now,
+                    300,
+                )
+                .unwrap();
+            let lines = [
+                json_line(
+                    serde_json::json!({"type": "message_start", "message": {"usage": {"input_tokens": 1000, "output_tokens": 1}}}),
+                ),
+                json_line(
+                    serde_json::json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": words}}),
+                ),
+                json_line(
+                    serde_json::json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": final_output}}),
+                ),
+                json_line(serde_json::json!({"type": "message_stop"})),
+            ];
+            let events: Vec<_> = lines
+                .iter()
+                .flat_map(|line| AnthropicProvider.parse_stream_line(line).unwrap())
+                .map(Ok)
+                .collect();
+            let settler = BillingSettler::new(
+                billing.clone(),
+                inv_id.into(),
+                "claude-3-5-sonnet".into(),
+                "provider-1".into(),
+                "claude-3-5-sonnet".into(),
+            );
+            collect_and_decode_frames(create_stream_guard(
+                futures_util::stream::iter(events),
+                StreamGuardConfig::default(),
+                None,
+                None,
+                Some(settler),
+            ))
+            .await;
+            let ledger = billing.list_ledger_entries_for_card(&card_id, None);
+            assert_eq!(ledger.len(), 1);
+            (ledger[0].input_tokens, ledger[0].output_tokens)
+        }
+    };
+    let (input, output) = bill(0).await;
+    assert_eq!(input, 1_000);
+    assert!(
+        output >= 3_600,
+        "{output} output tokens billed for 3,600 words"
+    );
+    // A plausible exact count is what is billed.
+    assert_eq!(bill(3_000).await, (1_000, 3_000));
+}
+
+fn json_line(value: serde_json::Value) -> String {
+    format!("data: {value}")
 }

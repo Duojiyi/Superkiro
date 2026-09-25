@@ -28,10 +28,15 @@ use tower::ServiceExt;
 use wiremock::matchers::{method as wm_method, path as wm_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+mod support;
+
 const SECRET: &str = "test-secret-key-32bytes-for-p2-4-groups!!";
 
 fn setup_environment() -> (BillingEngine, AuthState) {
     let billing = BillingEngine::new();
+    for rate_card in ["default", "enterprise"] {
+        billing.upsert_rate_card_version(support::wildcard_price(rate_card));
+    }
     let auth = AuthState::with_billing(SECRET, billing.clone());
     (billing, auth)
 }

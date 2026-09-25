@@ -9,8 +9,11 @@ fn engine() -> BillingEngine {
     engine
 }
 
+/// A settled invocation id is refused for a day, across the janitor, ledger archival and
+/// a restart. Past the day its record is pruned and a reuse is a new request; the
+/// settlement itself stays.
 #[test]
-fn settled_invocation_stays_blocked_after_janitor_archive_and_restart() {
+fn settled_invocation_stays_blocked_for_a_day_across_janitor_archive_and_restart() {
     let engine = engine();
     let params = ReservationEstimateParams::new(0, 1);
     engine.reserve("card", "use", &params, 1, 10).unwrap();
@@ -27,9 +30,9 @@ fn settled_invocation_stays_blocked_after_janitor_archive_and_restart() {
             2,
         )
         .unwrap();
-    engine.run_janitor(700_000);
+    engine.run_janitor(3_600);
     assert!(matches!(
-        engine.reserve("card", "use", &params, 700_000, 10),
+        engine.reserve("card", "use", &params, 3_600, 10),
         Err(BillingError::DuplicateInvocation(_))
     ));
     let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -52,9 +55,15 @@ fn settled_invocation_stays_blocked_after_janitor_archive_and_restart() {
     let recovered = BillingEngine::new();
     recovered.load_from_file(&path).unwrap();
     assert!(matches!(
-        recovered.reserve("card", "use", &params, 700_001, 10),
+        recovered.reserve("card", "use", &params, 3_601, 10),
         Err(BillingError::DuplicateInvocation(_))
     ));
+    assert_eq!(recovered.get_card("card").unwrap().credit_used, 60);
+
+    recovered.run_janitor(700_000);
+    recovered
+        .reserve("card", "use", &params, 700_000, 10)
+        .unwrap();
     assert_eq!(recovered.get_card("card").unwrap().credit_used, 60);
 }
 

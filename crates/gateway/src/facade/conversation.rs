@@ -357,8 +357,18 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
             };
 
             // 5. Credit Reservation (Spec §6.2)
+            let fallback_model = self
+                .provider_config
+                .as_ref()
+                .map(|c| c.model.as_str())
+                .unwrap_or("claude-3-5-sonnet-20241022");
             let mut has_reservation = false;
             let reservation_lease = self.billing.protect_reservation(&invocation_key);
+            let mut hold = HoldRelease {
+                billing: self.billing.clone(),
+                invocation_id: invocation_key.clone(),
+                armed: false,
+            };
             let mut reserved_estimated_input = 2_000u64;
             let mut reserved_max_output = 4_096u32;
             if claims.is_some() || real_provider {
@@ -372,22 +382,21 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                     .as_secs();
 
                 let request_for_reservation = parsed_request.as_ref();
-                let requested_model_for_reservation = request_for_reservation
-                    .and_then(|request| {
-                        request
-                            .conversation_state
-                            .current_message
-                            .user_input_message
-                            .model_id
-                            .as_deref()
-                    })
-                    .filter(|model| !model.trim().is_empty())
-                    .unwrap_or_else(|| {
-                        self.provider_config
-                            .as_ref()
-                            .map(|config| config.model.as_str())
-                            .unwrap_or("default-model")
-                    });
+                // Held and billed as the model the request is sent to.
+                let requested_model_for_reservation = request_for_reservation.map_or_else(
+                    || fallback_model.to_string(),
+                    |request| {
+                        requested_model_id(request, claims.as_ref(), &self.billing, fallback_model)
+                    },
+                );
+                let requested_model_for_reservation = requested_model_for_reservation.as_str();
+                if !valid_model_id(requested_model_for_reservation) {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidRequestException",
+                        "modelId is invalid",
+                    );
+                }
                 let input_limit = input_limit_for_model(
                     requested_model_for_reservation,
                     claims.as_ref(),
@@ -480,6 +489,13 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                                 "Billing persistence is temporarily unavailable",
                             );
                         }
+                        billing::engine::BillingError::ModelNotPriced(_) => {
+                            return error_response(
+                                StatusCode::BAD_REQUEST,
+                                "ValidationException",
+                                "This model has no published price; choose another model or ask your administrator to publish one",
+                            );
+                        }
                         _ => {
                             return error_response(
                                 StatusCode::PAYMENT_REQUIRED,
@@ -490,6 +506,7 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                     }
                 }
                 has_reservation = true;
+                hold.armed = true;
             }
 
             // 6. If no real provider is configured, return fallback stub frame
@@ -577,18 +594,9 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                 }
             }
 
-            let fallback_model = self
-                .provider_config
-                .as_ref()
-                .map(|c| c.model.as_str())
-                .unwrap_or("claude-3-5-sonnet-20241022");
-            let requested_model = kiro_req
-                .conversation_state
-                .current_message
-                .user_input_message
-                .model_id
-                .as_deref()
-                .unwrap_or(fallback_model);
+            let requested_model =
+                requested_model_id(&kiro_req, claims.as_ref(), &self.billing, fallback_model);
+            let requested_model = requested_model.as_str();
             if !valid_model_id(requested_model) {
                 if has_reservation {
                     let _ = self.billing.release(&invocation_key);
@@ -643,7 +651,9 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                 }
             }
 
-            if !mapped_model && self.provider.is_some() && requested_model != fallback_model {
+            // An unmapped request is sent to the fallback model, so that is the only model it
+            // may name: it is held and billed as the model it names.
+            if !mapped_model && requested_model != fallback_model {
                 if has_reservation {
                     let _ = self.billing.release(&invocation_key);
                 }
@@ -874,21 +884,24 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
             }
             let (upstream_stream, actual_provider_id, actual_target_model) =
                 if !candidates.is_empty() {
-                    let (route_result, attempts) = crate::provider::retry::ATTEMPTS
-                        .scope(std::sync::Mutex::new(Vec::new()), async {
-                            let result = execute_stream_with_model_fallback(
-                                &candidates,
-                                &self.client,
-                                &chat_req,
-                                Duration::from_secs(60),
-                                remaining_attempts,
-                                now_secs,
-                            )
-                            .await;
-                            let attempts = crate::provider::retry::ATTEMPTS
-                                .with(|records| records.lock().unwrap().clone());
-                            (result, attempts)
-                        })
+                    let ((route_result, attempts), empty_attempt) =
+                        with_empty_attempt(crate::provider::retry::ATTEMPTS.scope(
+                            std::sync::Mutex::new(Vec::new()),
+                            async {
+                                let result = execute_stream_with_model_fallback(
+                                    &candidates,
+                                    &self.client,
+                                    &chat_req,
+                                    Duration::from_secs(60),
+                                    remaining_attempts,
+                                    now_secs,
+                                )
+                                .await;
+                                let attempts = crate::provider::retry::ATTEMPTS
+                                    .with(|records| records.lock().unwrap().clone());
+                                (result, attempts)
+                            },
+                        ))
                         .await;
                     self.billing
                         .record_trace(billing::observability::RequestTrace {
@@ -927,6 +940,18 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                         });
                     match route_result {
                         Ok(res) => (res.stream, res.provider.id, res.target_model),
+                        // Whatever stopped the last attempt, an empty one consumed input.
+                        Err(_)
+                            if self.bill_empty_attempt(
+                                &invocation_key,
+                                requested_model,
+                                translated_input_estimate,
+                                empty_attempt,
+                            ) =>
+                        {
+                            idempotency_guard.fail();
+                            return empty_attempts_response();
+                        }
                         Err(GovernanceError::AllKeysInCooldown {
                             next_recovery_secs, ..
                         }) => {
@@ -963,16 +988,28 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                     }
                     let mut direct_config = provider_config.clone();
                     direct_config.model = target_model.clone();
-                    match crate::provider::retry::start_stream(
-                        provider.as_ref(),
-                        &self.client,
-                        &direct_config,
-                        &chat_req,
-                        3,
-                    )
-                    .await
-                    {
+                    let (started, empty_attempt) =
+                        with_empty_attempt(crate::provider::retry::start_stream(
+                            provider.as_ref(),
+                            &self.client,
+                            &direct_config,
+                            &chat_req,
+                            3,
+                        ))
+                        .await;
+                    match started {
                         Ok(s) => (s, provider.name().to_string(), target_model.clone()),
+                        Err(_)
+                            if self.bill_empty_attempt(
+                                &invocation_key,
+                                requested_model,
+                                translated_input_estimate,
+                                empty_attempt,
+                            ) =>
+                        {
+                            idempotency_guard.fail();
+                            return empty_attempts_response();
+                        }
                         Err(e) => {
                             // Upstream initiation failed; release reservation in full
                             let _ = self.billing.release(&invocation_key);
@@ -1004,6 +1041,8 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                 context_window: Some(context_window),
             };
 
+            // The stream's settler bills or returns the hold from here on.
+            hold.armed = false;
             let settler = BillingSettler::new(
                 self.billing.clone(),
                 invocation_key.clone(),
@@ -1037,6 +1076,99 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
             )
                 .into_response()
         })
+    }
+}
+
+impl GenerateAssistantResponseHandler {
+    /// Bill what the last empty attempt reported, when no attempt of the request produced
+    /// anything: each consumed the input it reported, and the request pays for it once,
+    /// however many times it was retried. An attempt that answers is billed by its stream
+    /// instead, and an empty attempt before it is not billed as well. Whether it billed;
+    /// a failed save still keeps the charge for the recovery task.
+    fn bill_empty_attempt(
+        &self,
+        invocation_key: &str,
+        exposed_model: &str,
+        estimated_input: u64,
+        empty: Option<crate::provider::retry::EmptyAttempt>,
+    ) -> bool {
+        let Some(empty) = empty else {
+            return false;
+        };
+        let Some(tokens) = crate::stream::resolve_settlement_tokens(
+            &empty.usage,
+            crate::stream::reports_input(&empty.usage),
+            0,
+            false,
+            estimated_input,
+        ) else {
+            return false;
+        };
+        let settled = self.billing.settle(
+            invocation_key,
+            &tokens,
+            exposed_model,
+            &empty.provider_id,
+            &empty.target_model,
+            crate::now_secs(),
+        );
+        if let Err(error) = &settled {
+            eprintln!("[kiro-gateway] settlement failed: {error}");
+        }
+        self.billing.finish_trace(
+            invocation_key,
+            billing::observability::TraceStatus::Error,
+            Some(if settled.is_ok() {
+                "empty_completion"
+            } else {
+                "settlement_failed"
+            }),
+        );
+        true
+    }
+}
+
+/// Run `attempts` with an [`crate::provider::retry::EMPTY_ATTEMPT`] slot, and take what it
+/// holds at the end.
+async fn with_empty_attempt<T>(
+    attempts: impl std::future::Future<Output = T>,
+) -> (T, Option<crate::provider::retry::EmptyAttempt>) {
+    crate::provider::retry::EMPTY_ATTEMPT
+        .scope(std::sync::Mutex::new(None), async {
+            let result = attempts.await;
+            let empty =
+                crate::provider::retry::EMPTY_ATTEMPT.with(|slot| slot.lock().unwrap().take());
+            (result, empty)
+        })
+        .await
+}
+
+/// A request whose every attempt came back empty. It was billed the input consumed, so it
+/// is not retried under the same invocation id.
+fn empty_attempts_response() -> Response {
+    error_response(
+        StatusCode::BAD_GATEWAY,
+        "InternalServerException",
+        "The upstream model returned an empty response to every attempt; the input it read has been billed",
+    )
+}
+
+/// Returns a request's hold when the request ends before its stream's settler takes over:
+/// refused on the way, or dropped at an await because the client went away (Kiro's stop,
+/// a disconnect, the request timeout) while the upstream was being started. That left the
+/// hold for the janitor, eleven minutes later: two such stops locked a two-request card
+/// out, and the retry of either was refused as a duplicate.
+struct HoldRelease {
+    billing: BillingEngine,
+    invocation_id: String,
+    armed: bool,
+}
+
+impl Drop for HoldRelease {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.billing.release(&self.invocation_id);
+        }
     }
 }
 
@@ -1103,6 +1235,40 @@ fn valid_invocation_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
+}
+
+/// The model a request is for: the one it names, or, when it names none, its group's
+/// default — the first model its model list shows — or, in a group that maps no models,
+/// the fallback model every unmapped request is sent to. A request that named no model
+/// was priced as "default-model" and sent to the fallback model, so it was billed at the
+/// built-in default rates whatever its group's models cost.
+fn requested_model_id(
+    request: &GenerateAssistantResponseRequest,
+    claims: Option<&AuthClaims>,
+    billing: &BillingEngine,
+    fallback_model: &str,
+) -> String {
+    if let Some(model) = request
+        .conversation_state
+        .current_message
+        .user_input_message
+        .model_id
+        .as_deref()
+    {
+        return model.to_string();
+    }
+    claims
+        .and_then(|claims| billing.get_group(&claims.group_id))
+        .and_then(|group| {
+            billing
+                .list_models_for_group(&group.id, true)
+                .into_iter()
+                .next()
+        })
+        .map_or_else(
+            || fallback_model.to_string(),
+            |model| model.exposed_model_id,
+        )
 }
 
 fn valid_model_id(model: &str) -> bool {

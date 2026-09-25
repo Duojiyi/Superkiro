@@ -18,8 +18,11 @@ use std::time::Duration;
 use wiremock::matchers::{method as wm_method, path as wm_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+mod support;
+
 fn setup_auth() -> (BillingEngine, AuthState) {
     let billing = BillingEngine::default();
+    billing.upsert_rate_card_version(support::wildcard_price("default"));
     let auth = AuthState::with_billing(
         "test-secret-key-model-fallback-p4-10-audit-ok-32-chars",
         billing.clone(),

@@ -682,29 +682,16 @@ fn test_reserve_and_settle_persistence_failure_leaves_memory_untouched() {
         model: None,
     };
 
-    // 1. Inject fault during reserve
+    // 1. A hold moves no money and is not written, so a storage fault does not refuse it.
     engine.inject_persistence_fault(true);
-    let res = engine.reserve("card-res-tx", "inv-fault-1", &params, NOW_SECS, 300);
-    assert!(res.is_err());
-    let card = engine.get_card("card-res-tx").unwrap();
-    assert_eq!(
-        card.credit_reserved, 0,
-        "credit_reserved must NOT be incremented when persistence fails"
-    );
-    assert_eq!(card.available_credits(), 100 * MICRO_CREDITS_PER_CREDIT);
-
-    // 2. Clear fault and prove storage is writable before admitting new usage.
-    engine.inject_persistence_fault(false);
-    engine.sync_to_disk_checked().unwrap();
     let reservation = engine
         .reserve("card-res-tx", "inv-fault-1", &params, NOW_SECS, 300)
-        .expect("Reservation must succeed when persistence is healthy");
+        .expect("a hold is taken in memory");
     let reserved_amt = reservation.reserved_micro_credits;
     let card = engine.get_card("card-res-tx").unwrap();
     assert_eq!(card.credit_reserved, reserved_amt);
 
-    // 3. Inject fault during settle
-    engine.inject_persistence_fault(true);
+    // 2. The settlement is written, and its failed write changes no balance.
     let tokens = UsageTokens {
         uncached_input_tokens: 100,
         output_tokens: 100,
@@ -738,6 +725,29 @@ fn test_reserve_and_settle_persistence_failure_leaves_memory_untouched() {
             .any(|e| e.invocation_id.as_deref() == Some("inv-fault-1")),
         "Ledger must NOT contain settlement entry when persistence fails"
     );
+    // The priced usage is kept for the recovery task, never refunded.
+    assert_eq!(engine.list_pending_settlements().len(), 1);
+
+    // 3. Once a write has failed, no new hold is taken until one succeeds.
+    assert!(matches!(
+        engine.reserve("card-res-tx", "inv-fault-2", &params, NOW_SECS, 300),
+        Err(BillingError::Persistence(_))
+    ));
+    assert_eq!(
+        engine.get_card("card-res-tx").unwrap().credit_reserved,
+        reserved_amt
+    );
+    // Storage is back: the recovery task completes the settlement, once, and the card
+    // takes holds again.
+    engine.inject_persistence_fault(false);
+    let entry = engine.retry_pending_settlement("inv-fault-1").unwrap();
+    assert_eq!(
+        engine.get_card("card-res-tx").unwrap().credit_used,
+        entry.credits_charged
+    );
+    engine
+        .reserve("card-res-tx", "inv-fault-2", &params, NOW_SECS, 300)
+        .expect("holds are taken again once storage is writable");
 
     let _ = std::fs::remove_file(&path);
 }
