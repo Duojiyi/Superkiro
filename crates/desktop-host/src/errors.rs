@@ -35,8 +35,11 @@ const CODES: &[&str] = &[
     "SK-CONNECT-005",
     "SK-CONNECT-006",
     "SK-CONNECT-007",
+    "SK-CONNECT-008",
+    "SK-CONNECT-009",
     "SK-RESTORE-001",
     "SK-RESTORE-002",
+    "SK-RESTORE-003",
     "SK-BIND-004",
     "SK-LOCAL-001",
     "SK-LOCAL-002",
@@ -72,6 +75,10 @@ pub fn classify(raw: &str, path: &str, method: &str) -> Value {
             // Kiro's bundle is still modified and nothing is left to restore it from:
             // retrying cannot help, reinstalling Kiro replaces the file.
             "SK-RESTORE-002"
+        } else if lower.contains("settings.json has a syntax error") {
+            // Kiro's settings.json has a typo no edit can safely read past. Nothing was
+            // changed; the customer fixes that line and retries.
+            "SK-RESTORE-003"
         } else if lower.contains("kiro") && lower.contains("is unsupported; upgrade to") {
             "SK-KIRO-001"
         } else if let Some(code) = match auth {
@@ -120,6 +127,17 @@ pub fn classify(raw: &str, path: &str, method: &str) -> Value {
         } else if lower.contains("profile other than default") {
             // Only the Default profile is configured; the user must switch windows to it.
             "SK-CONNECT-007"
+        } else if (lower.contains("kiro update is waiting to install")
+            || lower.contains("installation changed after it was checked"))
+            && !lower.contains("recovery record retained")
+        {
+            // Kiro is updating itself, or just did, under the takeover. Nothing was left
+            // changed; letting the update finish and trying again is all it takes.
+            "SK-CONNECT-008"
+        } else if lower.contains("more than one hard link") {
+            // A settings.json with several names: the takeover would split them, so it
+            // changed nothing. The customer removes the extra names first.
+            "SK-CONNECT-009"
         } else if lower.contains("another windows session") {
             // The same user's Kiro in another session: this client can neither ask it to
             // close nor end it, so neither saving here nor forcing helps.
@@ -176,7 +194,33 @@ pub fn classify(raw: &str, path: &str, method: &str) -> Value {
         "SK-NET-001" if method == "POST" => "unknown",
         _ => "failed",
     };
-    json!({"code":code,"feedback_id":format!("sk-{:x}-{:x}-{:x}", now.as_nanos(), std::process::id(), SEQUENCE.fetch_add(1, Ordering::Relaxed)),"stage":stage,"outcome":outcome,"retry_after_seconds":retry,"occurred_at":now.as_secs().to_string()})
+    // Where settings.json has to be fixed: two numbers, never any text from the file.
+    let (line, column) = if code == "SK-RESTORE-003" {
+        (
+            number_after(raw, "at line "),
+            number_after(raw, ", column "),
+        )
+    } else {
+        (None, None)
+    };
+    json!({"code":code,"feedback_id":format!("sk-{:x}-{:x}-{:x}", now.as_nanos(), std::process::id(), SEQUENCE.fetch_add(1, Ordering::Relaxed)),"stage":stage,"outcome":outcome,"retry_after_seconds":retry,"line":line,"column":column,"occurred_at":now.as_secs().to_string()})
+}
+
+/// Bound for a line or column number carried to the page.
+const MAX_POSITION: u64 = 10_000_000;
+
+/// The positive number written right after `label` in `raw`.
+fn number_after(raw: &str, label: &str) -> Option<u64> {
+    let digits: String = raw
+        .split(label)
+        .nth(1)?
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits
+        .parse()
+        .ok()
+        .filter(|value| (1..=MAX_POSITION).contains(value))
 }
 
 /// Rebuild only the public schema; never trust persisted strings or extra fields.
@@ -207,8 +251,18 @@ pub fn validated(value: &Value) -> Option<Value> {
     if !retry.is_null() && retry.as_u64().is_none_or(|v| v > 86400) {
         return None;
     }
+    let (line, column) = (&value["line"], &value["column"]);
+    for position in [line, column] {
+        if !position.is_null()
+            && position
+                .as_u64()
+                .is_none_or(|v| !(1..=MAX_POSITION).contains(&v))
+        {
+            return None;
+        }
+    }
     Some(
-        json!({"code":code,"stage":stage,"outcome":outcome,"feedback_id":id,"occurred_at":occurred,"retry_after_seconds":retry}),
+        json!({"code":code,"stage":stage,"outcome":outcome,"feedback_id":id,"occurred_at":occurred,"retry_after_seconds":retry,"line":line,"column":column}),
     )
 }
 
@@ -240,6 +294,11 @@ mod tests {
             ("Cannot stop Kiro for restore: Kiro is open in another Windows session of this user; close it there and retry", "SK-CONNECT-006"),
             ("[connection:close] Kiro is open in another Windows session of this user; close it there and retry", "SK-CONNECT-006"),
             ("[connection:preflight] Kiro has windows on a profile other than Default; takeover configures only the Default profile", "SK-CONNECT-007"),
+            ("[connection:preflight] A Kiro update is waiting to install; nothing was changed. Open Kiro once so it can finish, then try again", "SK-CONNECT-008"),
+            ("[connection:apply] Login succeeded but takeover failed: Kiro's installation changed after it was checked, likely an update installed as Kiro closed; nothing was changed. Open Kiro once, then try again; your own Kiro sign-in was put back", "SK-CONNECT-008"),
+            ("[connection:preflight] Settings error: I/O error: settings.json has more than one hard link, which a takeover would separate; remove the extra links and try again", "SK-CONNECT-009"),
+            // Something is left for a restore, so this is not the case where nothing changed.
+            ("[connection:apply] Login succeeded but takeover failed: Kiro's installation changed after it was checked; putting your own Kiro sign-in back failed (denied); recovery record retained", "SK-CONNECT-003"),
             ("Cannot stop Kiro for restore: Kiro is running as administrator and cannot be closed from here; close it yourself and retry", "SK-CONNECT-002"),
             ("timed out", "SK-NET-001"),
             ("network", "SK-NET-002"),
@@ -336,6 +395,49 @@ mod tests {
         assert_eq!(reinstall["code"], "SK-RESTORE-002");
         assert_eq!(reinstall["outcome"], "failed");
         assert_eq!(validated(&reinstall), Some(reinstall.clone()));
+        // The same guidance when a restore finds the patch's backup gone.
+        assert_eq!(
+            classify(
+                "Kiro's extension is still modified and its backup is gone or no longer matches; reinstall Kiro to replace it, then restore again",
+                "/api/restore",
+                "POST",
+            )["code"],
+            "SK-RESTORE-002"
+        );
+        // A settings.json the customer has to fix first says where, and nothing else.
+        let syntax = classify(
+            "Settings error: settings.json has a syntax error at line 12, column 5; fix that line and retry",
+            "/api/restore",
+            "POST",
+        );
+        assert_eq!(syntax["code"], "SK-RESTORE-003");
+        assert_eq!(syntax["outcome"], "failed");
+        assert_eq!(
+            (&syntax["line"], &syntax["column"]),
+            (&json!(12), &json!(5))
+        );
+        assert_eq!(validated(&syntax), Some(syntax.clone()));
+        for bad in [json!(0), json!("12"), json!(-1), json!(MAX_POSITION + 1)] {
+            let mut forged = syntax.clone();
+            forged["line"] = bad;
+            assert!(validated(&forged).is_none());
+        }
+        // The same file refusing a takeover, or the cleanup of lost records.
+        for (raw, path) in [
+            ("[connection:preflight] Settings error: settings.json has a syntax error at line 3, column 1; fix that line and retry", "/api/activate"),
+            ("settings.json has a syntax error at line 3, column 1; fix that line and retry", "/api/restore"),
+        ] {
+            let value = classify(raw, path, "POST");
+            assert_eq!(value["code"], "SK-RESTORE-003", "{raw}");
+            assert_eq!(value["line"], 3, "{raw}");
+        }
+        // Positions travel only with that code.
+        let other = classify(
+            "Settings error: oops at line 3, column 4",
+            "/api/restore",
+            "POST",
+        );
+        assert!(other["line"].is_null() && other["column"].is_null());
         assert_eq!(
             classify("credential network timeout", "", "POST")["code"],
             "SK-NET-001"
@@ -375,6 +477,8 @@ mod tests {
             "feedback_id",
             "occurred_at",
             "retry_after_seconds",
+            "line",
+            "column",
         ] {
             let mut bad = value.clone();
             bad[key] = json!("secret");

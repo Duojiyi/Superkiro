@@ -11,6 +11,70 @@ fn test_candidate_paths_are_available_without_reading_host_installation() {
     assert!(!get_candidate_install_paths().is_empty());
 }
 
+/// Closing Kiro is when an update waiting for it installs itself. The installation must
+/// be recognisably the one detected before the close, or the takeover writes nothing;
+/// and an update still waiting to install is seen before Kiro is closed at all.
+#[test]
+fn an_update_that_installs_itself_or_waits_to_is_noticed() {
+    let root = std::env::temp_dir().join(format!("kiro_test_update_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let install_dir = if cfg!(target_os = "macos") {
+        let bundle = root.join("Kiro.app");
+        fs::create_dir_all(bundle.join("Contents/MacOS")).unwrap();
+        fs::write(bundle.join("Contents/MacOS/Kiro"), "").unwrap();
+        bundle
+    } else {
+        root.clone()
+    };
+    let app = if cfg!(target_os = "macos") {
+        install_dir.join("Contents/Resources/app")
+    } else {
+        install_dir.join("resources/app")
+    };
+    let agent = app.join("extensions").join("kiro.kiro-agent");
+    fs::create_dir_all(&agent).unwrap();
+    let mutex = format!("superkiro-update-test-{}", std::process::id());
+    fs::write(
+        app.join("product.json"),
+        serde_json::json!({"win32MutexName": mutex}).to_string(),
+    )
+    .unwrap();
+    fs::write(app.join("package.json"), r#"{"version": "1.2.0"}"#).unwrap();
+    fs::write(agent.join("package.json"), r#"{"version": "1.0.800"}"#).unwrap();
+
+    let install = inspect_installation_dir(&install_dir).unwrap();
+    assert!(install.unchanged());
+    assert!(!install.update_waiting());
+
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn CreateMutexW(
+                attributes: *const std::ffi::c_void,
+                owned: i32,
+                name: *const u16,
+            ) -> *mut std::ffi::c_void;
+            fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+        }
+        // What the installer holds while its update waits for Kiro to close.
+        let name: Vec<u16> = format!("{mutex}-ready").encode_utf16().chain([0]).collect();
+        let held = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+        assert!(!held.is_null());
+        assert!(install.update_waiting());
+        unsafe { CloseHandle(held) };
+        assert!(!install.update_waiting());
+    }
+
+    // The update lands: a new agent extension, then a new Kiro.
+    fs::write(agent.join("package.json"), r#"{"version": "1.0.801"}"#).unwrap();
+    assert!(!install.unchanged());
+    fs::write(agent.join("package.json"), r#"{"version": "1.0.800"}"#).unwrap();
+    fs::write(app.join("package.json"), r#"{"version": "1.2.1"}"#).unwrap();
+    assert!(!install.unchanged());
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn test_inspect_synthetic_sandbox_installation() {
     let sandbox_root =

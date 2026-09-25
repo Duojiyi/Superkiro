@@ -20,8 +20,8 @@ const GATEWAY_ACCOUNT: &str = ":123456789012:";
 pub struct Leftovers {
     /// Patched extension bundles of this user that can be rolled back.
     pub patches: Vec<PathBuf>,
-    /// Patched bundles whose rollback material is gone. Only replacing the file, by
-    /// reinstalling or updating Kiro, undoes them.
+    /// Patched bundles whose rollback material is gone or no longer matches. Only
+    /// replacing the file, by reinstalling or updating Kiro, undoes them.
     pub unrecoverable: Vec<PathBuf>,
     /// settings.json still points Kiro at a gateway this client knows.
     pub settings: bool,
@@ -44,10 +44,13 @@ impl Leftovers {
             if patcher.ownership() != PatchOwnership::Ours {
                 continue;
             }
-            if patcher.has_restore_material() {
-                found.patches.push(path.clone());
-            } else {
+            // A backup that is gone or no longer matches is as lost as no material at
+            // all: counted as restorable, it made restore fail on every attempt with
+            // no word of the reinstall that alone can help.
+            if patcher.restore_material_is_lost() {
                 found.unrecoverable.push(path.clone());
+            } else {
+                found.patches.push(path.clone());
             }
         }
         found.settings = settings.names_gateway(gateway_hosts);
@@ -73,6 +76,14 @@ impl Leftovers {
         token: &TokenStorage,
         gateway_hosts: &[String],
     ) -> Result<(), String> {
+        // Settings no edit can safely change (a syntax error) fail the cleanup before any
+        // file changes, rather than leaving Kiro's official bundle with the gateway's
+        // settings and token.
+        if self.settings {
+            settings
+                .plan_orphan_removal(gateway_hosts)
+                .map_err(|error| error.to_string())?;
+        }
         for path in &self.patches {
             ExtensionPatcher::new(path)
                 .restore()

@@ -140,6 +140,29 @@ fn a_patch_whose_backup_is_gone_needs_a_reinstall_but_the_rest_is_still_undone()
     assert_eq!(patcher.status(), PatchStatus::Patched);
 }
 
+/// A backup deleted or replaced on its own (a cleaner, a virus scanner) is as lost as
+/// no material at all: the state that remains authenticates nothing it could restore.
+#[test]
+fn a_patch_whose_backup_alone_is_gone_or_wrong_is_unrecoverable() {
+    for damage in ["deleted", "replaced"] {
+        let machine = Machine::taken_over(damage);
+        let patcher = ExtensionPatcher::new(&machine.extension);
+        if damage == "deleted" {
+            fs::remove_file(patcher.backup_path()).unwrap();
+        } else {
+            fs::write(patcher.backup_path(), "// some other bundle").unwrap();
+        }
+        assert!(machine.extension.with_extension("js.kpatch-state").exists());
+        let found = machine.scan();
+        assert!(found.patches.is_empty(), "{damage}");
+        assert_eq!(
+            found.unrecoverable,
+            vec![machine.extension.clone()],
+            "{damage}"
+        );
+    }
+}
+
 #[test]
 fn another_users_patch_on_a_shared_install_is_left_alone() {
     let machine = Machine::taken_over("shared");
@@ -176,6 +199,63 @@ fn settings_that_name_another_endpoint_are_not_ours() {
     let settings = machine.settings.read_settings().unwrap();
     assert!(settings.contains_key("kiroAuthConfig"));
     assert_eq!(settings["update.mode"], json!("none"));
+}
+
+/// A settings.json with a syntax error that still names the gateway is a leftover: Kiro
+/// may well still act on it. Removing it fails before any file changes and names the
+/// spot to fix; once fixed, the same cleanup completes.
+#[test]
+fn settings_with_a_syntax_error_are_found_and_nothing_changes_until_they_are_fixed() {
+    let machine = Machine::taken_over("syntax");
+    let taken = fs::read_to_string(machine.settings.path()).unwrap();
+    let broken = format!("{taken}}}\n");
+    fs::write(machine.settings.path(), &broken).unwrap();
+
+    let found = machine.scan();
+    assert!(
+        found.settings,
+        "blind to settings that still name the gateway"
+    );
+    let error = machine.remove(&found).unwrap_err();
+    assert!(
+        error.contains("settings.json has a syntax error at line"),
+        "{error}"
+    );
+    let patcher = ExtensionPatcher::new(&machine.extension);
+    assert_eq!(
+        patcher.status(),
+        PatchStatus::Patched,
+        "the bundle was touched"
+    );
+    assert!(machine.token.load().is_ok(), "the token was touched");
+    assert_eq!(fs::read_to_string(machine.settings.path()).unwrap(), broken);
+
+    fs::write(machine.settings.path(), &taken).unwrap();
+    machine.remove(&machine.scan()).unwrap();
+    assert!(!machine.scan().found());
+    assert_eq!(patcher.status(), PatchStatus::Official);
+}
+
+/// A missing comma Kiro reads past neither hides the leftover settings nor blocks the
+/// cleanup.
+#[test]
+fn a_missing_comma_does_not_hide_leftover_settings() {
+    let machine = Machine::taken_over("missing-comma");
+    let taken = fs::read_to_string(machine.settings.path()).unwrap();
+    assert!(taken.contains("\"editor.fontSize\": 15,"), "{taken}");
+    fs::write(
+        machine.settings.path(),
+        taken.replacen("\"editor.fontSize\": 15,", "\"editor.fontSize\": 15", 1),
+    )
+    .unwrap();
+
+    let found = machine.scan();
+    assert!(found.settings);
+    machine.remove(&found).unwrap();
+    assert!(!machine.scan().found());
+    let settings = fs::read_to_string(machine.settings.path()).unwrap();
+    assert!(!settings.contains("kiroAuthConfig"), "{settings}");
+    assert!(settings.contains("// mine"), "{settings}");
 }
 
 #[test]

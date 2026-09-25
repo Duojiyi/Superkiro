@@ -9,6 +9,7 @@
 //!   byte-order mark survive both takeover and rollback.
 
 use jsonc_parser::cst::{CstInputValue, CstObject, CstObjectProp, CstRootNode};
+use jsonc_parser::JsonValue;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::env;
@@ -27,6 +28,12 @@ pub enum SettingsError {
 
     #[error("Could not determine user configuration directory")]
     ConfigDirNotFound,
+
+    /// Where the file stops being readable, so the customer knows what to fix.
+    #[error(
+        "settings.json has a syntax error at line {line}, column {column}; fix that line and retry"
+    )]
+    Syntax { line: usize, column: usize },
 }
 
 /// Keys managed and modified by Kiro BYOK in `settings.json`.
@@ -161,10 +168,50 @@ impl SettingsManager {
     /// Preserves all other user settings (theme, font, other extensions).
     /// Returns `PriorSettingsState` to enable 100% reversible rollback.
     pub fn merge_byok(&self, gateway_url: &str) -> Result<PriorSettingsState, SettingsError> {
-        let region = REDIRECTED_REGION;
         let prior = self.capture_prior_state()?;
+        self.write_if_changed(&self.plan_merge(gateway_url)?)?;
+        Ok(prior)
+    }
+
+    /// The takeover's settings again, on a machine already taken over (a relaunch): the
+    /// redirection, the proxy bypass and the update freeze, which keeps an update from
+    /// replacing the patch. Autocomplete and telemetry stay as the customer has set them
+    /// since, and a file that already says all this is not written at all.
+    pub fn reassert_byok(&self, gateway_url: &str) -> Result<(), SettingsError> {
+        self.write_if_changed(&self.plan_reassert(gateway_url)?)
+    }
+
+    /// The file [`merge_byok`](Self::merge_byok) would write, built and read back in
+    /// memory; nothing is written. A takeover works this out before it closes Kiro or
+    /// touches the token, so a file it cannot edit is refused while nothing has changed.
+    pub fn plan_merge(&self, gateway_url: &str) -> Result<Vec<u8>, SettingsError> {
+        self.plan_takeover_edit(gateway_url, true)
+    }
+
+    /// What [`reassert_byok`](Self::reassert_byok) would write; nothing is written.
+    pub fn plan_reassert(&self, gateway_url: &str) -> Result<Vec<u8>, SettingsError> {
+        self.plan_takeover_edit(gateway_url, false)
+    }
+
+    fn write_if_changed(&self, bytes: &[u8]) -> Result<(), SettingsError> {
+        if self.read_raw()? == bytes {
+            return Ok(());
+        }
+        self.atomic_write_bytes(bytes)
+    }
+
+    fn plan_takeover_edit(&self, gateway_url: &str, first: bool) -> Result<Vec<u8>, SettingsError> {
+        let region = REDIRECTED_REGION;
+        // Written by rename, a file with other names would keep the takeover under one
+        // name only, and the rollback could not bring them together again.
+        let target = crate::token_storage::link_target(&self.settings_path)?;
+        if target.exists() && hard_links(&target)? > 1 {
+            return Err(invalid_data(
+                "settings.json has more than one hard link, which a takeover would separate; remove the extra links and try again",
+            ));
+        }
         let raw = self.read_raw()?;
-        let text = SettingsText::parse(&raw)?;
+        let text = SettingsText::parse(&raw, Reading::Kiro)?;
         let mut map = parse_settings_bytes(&raw)?;
 
         let gw = gateway_url.trim_end_matches('/');
@@ -180,7 +227,11 @@ impl SettingsManager {
                 }),
             ),
         ];
-        values.extend(our_preferences());
+        values.extend(
+            our_preferences()
+                .into_iter()
+                .filter(|(key, _)| first || *key == "update.mode"),
+        );
 
         // Kiro's core proxy agent drops IP identity on TLS tunnels. Bypass only
         // this gateway; keep the user's other proxy exceptions and TLS checks.
@@ -200,8 +251,7 @@ impl SettingsManager {
             text.set(key, &value);
             map.insert(key.to_string(), value);
         }
-        self.write_text(&text, &map)?;
-        Ok(prior)
+        verified_bytes(&text, &map)
     }
 
     /// Revert BYOK settings back to original state using `PriorSettingsState`.
@@ -216,9 +266,31 @@ impl SettingsManager {
         prior: &PriorSettingsState,
         gateway_url: &str,
     ) -> Result<(), SettingsError> {
+        match self.plan_revert(prior, gateway_url)? {
+            Rollback::Write(bytes) => self.atomic_write_bytes(&bytes),
+            Rollback::Delete => {
+                if self.settings_path.exists() {
+                    fs::remove_file(&self.settings_path)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// What [`revert`](Self::revert) would do, worked out without writing anything, so a
+    /// restore can find out that the settings cannot be rolled back before it touches
+    /// any other file.
+    ///
+    /// A file with a typo Kiro reads past (a missing comma) is rolled back as Kiro reads
+    /// it: only the managed keys change and the typo stays where the customer left it.
+    /// One not even that reading accepts is a [`SettingsError::Syntax`].
+    pub(crate) fn plan_revert(
+        &self,
+        prior: &PriorSettingsState,
+        gateway_url: &str,
+    ) -> Result<Rollback, SettingsError> {
         let raw = self.read_raw()?;
-        let text = SettingsText::parse(&raw)?;
-        let mut map = parse_settings_bytes(&raw)?;
+        let (text, mut map) = read_for_rollback(&raw)?;
         let host = gateway_host(gateway_url.trim_end_matches('/'));
         for (key, value) in reverted_values(prior, &map, host.as_deref()) {
             match value {
@@ -236,34 +308,30 @@ impl SettingsManager {
         if !prior.had_settings_file {
             // Spec §9, T08: settings the user added while BYOK was active keep the file.
             if map.is_empty() {
-                if self.settings_path.exists() {
-                    fs::remove_file(&self.settings_path)?;
+                return Ok(Rollback::Delete);
+            }
+            return verified_bytes(&text, &map).map(Rollback::Write);
+        }
+        // The original bytes would also quietly repair a typo made since, which is the
+        // customer's own edit and stays.
+        if text.reading == Reading::Kiro {
+            if let Some(original) = prior.prior_raw.as_deref() {
+                if parse_settings_bytes(original).is_ok_and(|original_map| original_map == map) {
+                    return Ok(Rollback::Write(original.to_vec()));
                 }
-                return Ok(());
-            }
-            return self.write_text(&text, &map);
-        }
-        if let Some(original) = prior.prior_raw.as_deref() {
-            if parse_settings_bytes(original).is_ok_and(|original_map| original_map == map) {
-                return self.atomic_write_bytes(original);
             }
         }
-        self.write_text(&text, &map)
+        verified_bytes(&text, &map).map(Rollback::Write)
     }
 
-    /// Check if BYOK redirection keys are currently active in `settings.json`.
+    /// Check if BYOK redirection keys are currently active in `settings.json`. Only the
+    /// redirection counts: Tab Autocomplete switched back on by the customer is their
+    /// choice, and refusing "Open Kiro" over it left them no way back into Kiro.
     pub fn is_byok_active(&self, gateway_url: Option<&str>) -> bool {
         let map = match self.read_settings() {
             Ok(m) => m,
             Err(_) => return false,
         };
-
-        let auto_comp = map
-            .get("kiroAgent.enableTabAutocomplete")
-            .and_then(|v| v.as_bool());
-        if auto_comp != Some(false) {
-            return false;
-        }
 
         if let Some(expected_url) = gateway_url {
             let gw = expected_url.trim_end_matches('/');
@@ -313,15 +381,25 @@ impl SettingsManager {
         profiles
     }
 
-    /// Whether the redirection keys still send Kiro to one of `gateway_hosts`. An
-    /// unreadable file tells nothing and counts as no.
+    /// Whether the redirection keys still send Kiro to one of `gateway_hosts`, read as
+    /// tolerantly as Kiro reads them. A file with a syntax error even that reading stops
+    /// at counts as yes when it names one of them anywhere: Kiro may well still act on
+    /// it, and nothing else would ever find that takeover. A file that cannot be read at
+    /// all tells nothing and counts as no.
     pub fn names_gateway(&self, gateway_hosts: &[String]) -> bool {
-        self.read_settings().is_ok_and(|map| {
-            REDIRECTION_KEYS.iter().any(|key| {
+        let Ok(raw) = self.read_raw() else {
+            return false;
+        };
+        match parse_settings_bytes(&raw).or_else(|_| parse_tolerant(&raw)) {
+            Ok(map) => REDIRECTION_KEYS.iter().any(|key| {
                 map.get(*key)
                     .is_some_and(|value| names_host(value, gateway_hosts))
-            })
-        })
+            }),
+            Err(SettingsError::Syntax { .. }) => {
+                mentions_host(&String::from_utf8_lossy(&raw), gateway_hosts)
+            }
+            Err(_) => false,
+        }
     }
 
     /// Undo a takeover whose rollback record is lost, as far as the file itself shows.
@@ -333,12 +411,25 @@ impl SettingsManager {
         &self,
         gateway_hosts: &[String],
     ) -> Result<bool, SettingsError> {
+        let Some(bytes) = self.plan_orphan_removal(gateway_hosts)? else {
+            return Ok(false);
+        };
+        self.atomic_write_bytes(&bytes)?;
+        Ok(true)
+    }
+
+    /// The file [`remove_orphaned_takeover`](Self::remove_orphaned_takeover) would write,
+    /// or none when it has nothing to change; nothing is written. A typo Kiro reads past
+    /// is kept, as in [`plan_revert`](Self::plan_revert).
+    pub(crate) fn plan_orphan_removal(
+        &self,
+        gateway_hosts: &[String],
+    ) -> Result<Option<Vec<u8>>, SettingsError> {
         let raw = self.read_raw()?;
         if raw.is_empty() {
-            return Ok(false);
+            return Ok(None);
         }
-        let text = SettingsText::parse(&raw)?;
-        let mut map = parse_settings_bytes(&raw)?;
+        let (text, mut map) = read_for_rollback(&raw)?;
         let mut changed = false;
         for key in REDIRECTION_KEYS {
             if map
@@ -376,10 +467,10 @@ impl SettingsManager {
             text.remove("update.mode");
             map.remove("update.mode");
         }
-        if changed {
-            self.write_text(&text, &map)?;
+        if !changed {
+            return Ok(None);
         }
-        Ok(changed)
+        verified_bytes(&text, &map).map(Some)
     }
 
     /// The file's bytes, or none when it does not exist.
@@ -391,32 +482,17 @@ impl SettingsManager {
         }
     }
 
-    /// Write an edited file, but only if it reads back as exactly `expected`. The
-    /// editor and the reader are different parsers, and a file they disagree on is
-    /// refused rather than written.
-    fn write_text(
-        &self,
-        text: &SettingsText,
-        expected: &Map<String, Value>,
-    ) -> Result<(), SettingsError> {
-        let bytes = text.to_bytes();
-        if &parse_settings_bytes(&bytes)? != expected {
-            return Err(invalid_data(
-                "settings.json could not be edited in place without changing other settings",
-            ));
-        }
-        self.atomic_write_bytes(&bytes)
-    }
-
     fn atomic_write_bytes(&self, bytes: &[u8]) -> Result<(), SettingsError> {
-        if let Some(parent) = self.settings_path.parent() {
+        // A linked settings.json (dotfiles) is written where it lives, and stays linked.
+        let target = crate::token_storage::link_target(&self.settings_path)?;
+        if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
-        crate::patch::remove_stale_temps(&self.settings_path);
+        crate::patch::remove_stale_temps(&target);
 
-        let temp_file = self.settings_path.with_file_name(format!(
+        let temp_file = target.with_file_name(format!(
             "{}.tmp.{}.{}",
-            self.settings_path
+            target
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("settings.json"),
@@ -433,7 +509,7 @@ impl SettingsManager {
             file.sync_all()?;
         }
 
-        if let Err(e) = atomic_replace(&temp_file, &self.settings_path) {
+        if let Err(e) = atomic_replace(&temp_file, &target) {
             let _ = fs::remove_file(&temp_file);
             return Err(SettingsError::Io(e));
         }
@@ -451,13 +527,109 @@ fn parse_settings_bytes(raw: &[u8]) -> Result<Map<String, Value>, SettingsError>
     if content.trim().is_empty() {
         return Ok(Map::new());
     }
-    match serde_json::from_str::<Value>(&strip_jsonc(content))? {
+    let value = serde_json::from_str::<Value>(&strip_jsonc(content)).map_err(|error| {
+        // A position in the stripped text is off by every comment taken out; the
+        // editor's parser reads the file as it is.
+        match jsonc_parser::parse_to_value(content, &Reading::Kiro.options()) {
+            Err(error) => syntax_error(&error),
+            Ok(_) => SettingsError::Json(error),
+        }
+    })?;
+    match value {
         Value::Object(map) => Ok(map),
         _ => Err(SettingsError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "settings.json must contain an object",
         ))),
     }
+}
+
+/// [`parse_settings_bytes`], reading past a missing comma as Kiro does. A different
+/// parser from the editor's, so an edit that both read the same way is what Kiro reads.
+fn parse_tolerant(raw: &[u8]) -> Result<Map<String, Value>, SettingsError> {
+    let content =
+        std::str::from_utf8(raw).map_err(|_| invalid_data("settings.json is not UTF-8"))?;
+    let content = content.strip_prefix(BOM).unwrap_or(content);
+    match jsonc_parser::parse_to_value(content, &Reading::Tolerant.options())
+        .map_err(|error| syntax_error(&error))?
+    {
+        None => Ok(Map::new()),
+        Some(JsonValue::Object(object)) => object
+            .into_iter()
+            .map(|(key, value)| Ok((key.into_owned(), serde_value(value)?)))
+            .collect(),
+        Some(_) => Err(invalid_data("settings.json must contain an object")),
+    }
+}
+
+fn serde_value(value: JsonValue) -> Result<Value, SettingsError> {
+    Ok(match value {
+        JsonValue::Null => Value::Null,
+        JsonValue::Boolean(value) => Value::Bool(value),
+        // The literal as written, read by the same reader as the rest of the file.
+        JsonValue::Number(text) => serde_json::from_str(text)?,
+        JsonValue::String(text) => Value::String(text.into_owned()),
+        JsonValue::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(serde_value)
+                .collect::<Result<_, _>>()?,
+        ),
+        JsonValue::Object(object) => Value::Object(
+            object
+                .into_iter()
+                .map(|(key, value)| Ok((key.into_owned(), serde_value(value)?)))
+                .collect::<Result<_, SettingsError>>()?,
+        ),
+    })
+}
+
+fn syntax_error(error: &jsonc_parser::errors::ParseError) -> SettingsError {
+    SettingsError::Syntax {
+        line: error.line_display(),
+        column: error.column_display(),
+    }
+}
+
+/// The file, opened for a rollback: read as takeover reads it or, failing that, as
+/// tolerantly as Kiro itself does.
+fn read_for_rollback(raw: &[u8]) -> Result<(SettingsText, Map<String, Value>), SettingsError> {
+    SettingsText::parse(raw, Reading::Kiro)
+        .and_then(|text| Ok((text, parse_settings_bytes(raw)?)))
+        .or_else(|_| {
+            Ok((
+                SettingsText::parse(raw, Reading::Tolerant)?,
+                parse_tolerant(raw)?,
+            ))
+        })
+}
+
+/// The edited file, but only if it reads back as exactly `expected`. The editor and the
+/// reader are different parsers, and a file they disagree on is refused rather than
+/// written.
+fn verified_bytes(
+    text: &SettingsText,
+    expected: &Map<String, Value>,
+) -> Result<Vec<u8>, SettingsError> {
+    let bytes = text.to_bytes();
+    let actual = match text.reading {
+        Reading::Kiro => parse_settings_bytes(&bytes)?,
+        Reading::Tolerant => parse_tolerant(&bytes)?,
+    };
+    if &actual != expected {
+        return Err(invalid_data(
+            "settings.json could not be edited in place without changing other settings",
+        ));
+    }
+    Ok(bytes)
+}
+
+/// A settings rollback worked out in memory.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Rollback {
+    Write(Vec<u8>),
+    /// The file did not exist before takeover and nothing else is in it now.
+    Delete,
 }
 
 /// Preferences takeover sets, with the values it sets them to.
@@ -532,6 +704,17 @@ fn names_host(value: &Value, hosts: &[String]) -> bool {
     }
 }
 
+/// Whether `text` holds a URL on one of `hosts`, for a file too broken to parse.
+fn mentions_host(text: &str, hosts: &[String]) -> bool {
+    hosts.iter().any(|host| {
+        let url = format!("://{host}");
+        text.match_indices(&url).any(|(at, _)| {
+            !text[at + url.len()..]
+                .starts_with(|c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '.'))
+        })
+    })
+}
+
 pub(crate) fn gateway_host(gateway_url: &str) -> Option<String> {
     reqwest::Url::parse(gateway_url)
         .ok()
@@ -547,17 +730,29 @@ fn invalid_data(message: &str) -> SettingsError {
 
 const BOM: &str = "\u{feff}";
 
-/// What Kiro's settings reader accepts: comments and trailing commas, nothing looser.
-/// Parsing more loosely could edit a file Kiro itself rejects into one it reads.
-fn kiro_parse_options() -> jsonc_parser::ParseOptions {
-    jsonc_parser::ParseOptions {
-        allow_comments: true,
-        allow_trailing_commas: true,
-        allow_loose_object_property_names: false,
-        allow_missing_commas: false,
-        allow_single_quoted_strings: false,
-        allow_hexadecimal_numbers: false,
-        allow_unary_plus_numbers: false,
+/// How far a read of settings.json goes past what strict JSON allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reading {
+    /// What takeover accepts: comments and trailing commas, nothing looser. Parsing more
+    /// loosely could edit a file Kiro itself rejects into one it reads.
+    Kiro,
+    /// Also a missing comma, which Kiro's own reader reports and reads past, so a
+    /// customer can leave one while taken over and never notice. Only a rollback reads
+    /// this way: it takes out what takeover put in and leaves the rest as it is.
+    Tolerant,
+}
+
+impl Reading {
+    fn options(self) -> jsonc_parser::ParseOptions {
+        jsonc_parser::ParseOptions {
+            allow_comments: true,
+            allow_trailing_commas: true,
+            allow_loose_object_property_names: false,
+            allow_missing_commas: self == Reading::Tolerant,
+            allow_single_quoted_strings: false,
+            allow_hexadecimal_numbers: false,
+            allow_unary_plus_numbers: false,
+        }
     }
 }
 
@@ -565,14 +760,17 @@ fn kiro_parse_options() -> jsonc_parser::ParseOptions {
 /// (comments, order, indentation, line endings, a byte-order mark) stays as it was.
 struct SettingsText {
     bom: bool,
+    reading: Reading,
     root: CstRootNode,
     object: CstObject,
 }
 
 impl SettingsText {
     /// Refuses a file whose root is not an object, rather than replacing it.
-    fn parse(raw: &[u8]) -> Result<Self, SettingsError> {
-        parse_settings_bytes(raw)?;
+    fn parse(raw: &[u8], reading: Reading) -> Result<Self, SettingsError> {
+        if reading == Reading::Kiro {
+            parse_settings_bytes(raw)?;
+        }
         let text =
             std::str::from_utf8(raw).map_err(|_| invalid_data("settings.json is not UTF-8"))?;
         let (bom, body) = match text.strip_prefix(BOM) {
@@ -580,12 +778,17 @@ impl SettingsText {
             None => (false, text),
         };
         let body = if body.trim().is_empty() { "{}" } else { body };
-        let root = CstRootNode::parse(body, &kiro_parse_options())
-            .map_err(|error| invalid_data(&format!("settings.json: {error}")))?;
+        let root =
+            CstRootNode::parse(body, &reading.options()).map_err(|error| syntax_error(&error))?;
         let object = root
             .object_value()
             .ok_or_else(|| invalid_data("settings.json must contain an object"))?;
-        Ok(Self { bom, root, object })
+        Ok(Self {
+            bom,
+            reading,
+            root,
+            object,
+        })
     }
 
     /// Every top-level member named `key`. Kiro reads the last of duplicates.
@@ -608,7 +811,7 @@ impl SettingsText {
         match props.pop() {
             Some(last) => {
                 for earlier in props {
-                    earlier.remove();
+                    self.remove_member(earlier);
                 }
                 last.set_value(cst_value(value));
             }
@@ -620,8 +823,35 @@ impl SettingsText {
 
     fn remove(&self, key: &str) {
         for prop in self.named(key) {
-            prop.remove();
+            self.remove_member(prop);
         }
+    }
+
+    /// Take out one member and the one comma that separates it. The editor takes the
+    /// member's own comma or, when it has none, the nearest one before it; next to a
+    /// missing comma (a typo Kiro reads past) that is the customer's, and their typo
+    /// would move onto their own line. So first give the right member a comma of its
+    /// own: this one when another member follows it, else the one before it.
+    fn remove_member(&self, prop: CstObjectProp) {
+        if prop.trailing_comma().is_none() {
+            if prop.next_property().is_some() {
+                self.give_comma(&prop);
+            } else if let Some(previous) = prop
+                .previous_property()
+                .filter(|previous| previous.trailing_comma().is_none())
+            {
+                self.give_comma(&previous);
+            }
+        }
+        prop.remove();
+    }
+
+    /// A member inserted right after `prop` makes the editor give `prop` a comma, and
+    /// removing that member again (with its own comma) leaves `prop`'s in place.
+    fn give_comma(&self, prop: &CstObjectProp) {
+        self.object
+            .insert(prop.property_index() + 1, "", CstInputValue::Null)
+            .remove();
     }
 
     fn to_bytes(&self) -> Vec<u8> {
@@ -646,6 +876,38 @@ fn cst_value(value: &Value) -> CstInputValue {
                 .map(|(key, value)| (key.clone(), cst_value(value)))
                 .collect(),
         ),
+    }
+}
+
+/// How many names the file at `path` has.
+fn hard_links(path: &Path) -> std::io::Result<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(fs::metadata(path)?.nlink())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        #[link(name = "kernel32")]
+        extern "system" {
+            // BY_HANDLE_FILE_INFORMATION: thirteen DWORDs, the link count the eleventh.
+            fn GetFileInformationByHandle(
+                file: *mut std::ffi::c_void,
+                information: *mut [u32; 13],
+            ) -> i32;
+        }
+        let file = File::open(path)?;
+        let mut information = [0u32; 13];
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(u64::from(information[10]))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Ok(1)
     }
 }
 

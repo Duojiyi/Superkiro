@@ -6,8 +6,8 @@ use patch_engine::patch::{
     get_launcher_env, ExtensionPatcher, PatchError, PatchStatus, PATCH_MARKER_V1,
     RUNTIME_ENDPOINT_NEEDLE,
 };
-use patch_engine::settings::SettingsManager;
-use patch_engine::snapshot::SnapshotManager;
+use patch_engine::settings::{SettingsError, SettingsManager};
+use patch_engine::snapshot::{SnapshotError, SnapshotManager};
 use serde_json::json;
 use std::fs;
 
@@ -537,6 +537,169 @@ fn test_old_snapshot_migrates_proxy_bypass_and_restores_user_rules() {
         let _ = fs::remove_file(dir.join(file));
     }
     let _ = fs::remove_dir(dir);
+}
+
+/// A taken-over machine: settings, a patched synthetic bundle and the rollback record,
+/// all in a directory of its own.
+fn taken_over(
+    name: &str,
+    settings: &str,
+) -> (
+    std::path::PathBuf,
+    SettingsManager,
+    ExtensionPatcher,
+    SnapshotManager,
+) {
+    let dir = std::env::temp_dir().join(format!("kiro_test_{name}_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("settings.json"), settings).unwrap();
+    fs::write(
+        dir.join("extension.js"),
+        format!("const endpoint = \"{RUNTIME_ENDPOINT_NEEDLE}\";"),
+    )
+    .unwrap();
+    let settings_mgr = SettingsManager::at(dir.join("settings.json"));
+    let patcher = ExtensionPatcher::new(dir.join("extension.js"));
+    let snapshot_mgr = SnapshotManager::at(dir.join("snapshot.json"));
+    snapshot_mgr
+        .takeover(&settings_mgr, Some(&patcher), "https://gw.syntax.test")
+        .unwrap();
+    assert_eq!(patcher.status(), PatchStatus::Patched);
+    (dir, settings_mgr, patcher, snapshot_mgr)
+}
+
+/// A syntax error in settings.json that no reading gets past must fail the restore
+/// before any file changes. Found only after the extension had been rolled back, it
+/// left Kiro with its official bundle but the gateway's settings, and every retry
+/// failed the same way.
+#[test]
+fn a_restore_blocked_by_a_settings_syntax_error_changes_nothing_until_it_is_fixed() {
+    let original = "{\n  \"editor.tabSize\": 2,\n  \"update.mode\": \"manual\"\n}\n";
+    let (dir, settings_mgr, patcher, snapshot_mgr) = taken_over("restore_syntax", original);
+    let taken = fs::read_to_string(settings_mgr.path()).unwrap();
+    let broken = format!("{taken}}}\n");
+    fs::write(settings_mgr.path(), &broken).unwrap();
+
+    let error = snapshot_mgr.restore_official().unwrap_err();
+    assert!(
+        matches!(
+            error,
+            SnapshotError::Settings(SettingsError::Syntax { column: 1, .. })
+        ),
+        "{error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("settings.json has a syntax error at line"),
+        "{error}"
+    );
+    assert_eq!(
+        patcher.status(),
+        PatchStatus::Patched,
+        "the extension was touched"
+    );
+    assert!(patcher.backup_path().exists());
+    assert!(snapshot_mgr.has_active_snapshot());
+    assert_eq!(fs::read_to_string(settings_mgr.path()).unwrap(), broken);
+
+    // Once the customer fixes that line, the same restore completes.
+    fs::write(settings_mgr.path(), &taken).unwrap();
+    snapshot_mgr.restore_official().unwrap();
+    assert_eq!(patcher.status(), PatchStatus::Official);
+    assert!(!snapshot_mgr.has_active_snapshot());
+    assert_eq!(fs::read_to_string(settings_mgr.path()).unwrap(), original);
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// A missing comma Kiro reads past does not stand in the restore's way.
+#[test]
+fn a_restore_reads_past_a_missing_comma_and_keeps_it() {
+    let original = "{\n  \"editor.tabSize\": 2,\n  \"editor.fontSize\": 14,\n  \"update.mode\": \"manual\"\n}\n";
+    let (dir, settings_mgr, patcher, snapshot_mgr) = taken_over("restore_comma", original);
+    let taken = fs::read_to_string(settings_mgr.path()).unwrap();
+    fs::write(
+        settings_mgr.path(),
+        taken.replacen("\"editor.tabSize\": 2,", "\"editor.tabSize\": 2", 1),
+    )
+    .unwrap();
+
+    let summary = snapshot_mgr.restore_official().unwrap();
+    assert!(summary.settings_restored && summary.extension_restored);
+    assert_eq!(patcher.status(), PatchStatus::Official);
+    assert!(!snapshot_mgr.has_active_snapshot());
+    assert_eq!(
+        fs::read_to_string(settings_mgr.path()).unwrap(),
+        original.replacen("\"editor.tabSize\": 2,", "\"editor.tabSize\": 2", 1)
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// While taken over, the customer turns Tab Autocomplete back on and sets telemetry their
+/// own way. Opening Kiro again keeps both (it refused over the first and undid the
+/// second), re-asserts only what keeps the takeover working, and writes nothing when
+/// that already holds.
+#[test]
+fn a_relaunch_keeps_the_customers_own_preferences_and_writes_nothing_needless() {
+    let original = "{\n  \"editor.fontSize\": 14,\n  \"telemetry.telemetryLevel\": \"all\"\n}\n";
+    let (dir, settings_mgr, patcher, snapshot_mgr) = taken_over("relaunch", original);
+    let gw = "https://gw.syntax.test";
+    let modified = || {
+        fs::metadata(settings_mgr.path())
+            .unwrap()
+            .modified()
+            .unwrap()
+    };
+    let before = modified();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    snapshot_mgr
+        .takeover(&settings_mgr, Some(&patcher), gw)
+        .unwrap();
+    assert_eq!(
+        modified(),
+        before,
+        "settings that already held were rewritten"
+    );
+
+    let mut text = fs::read_to_string(settings_mgr.path()).unwrap();
+    for (ours, theirs) in [
+        (
+            "\"kiroAgent.enableTabAutocomplete\": false",
+            "\"kiroAgent.enableTabAutocomplete\": true",
+        ),
+        (
+            "\"telemetry.telemetryLevel\": \"off\"",
+            "\"telemetry.telemetryLevel\": \"error\"",
+        ),
+        ("\"update.mode\": \"none\"", "\"update.mode\": \"default\""),
+    ] {
+        assert!(text.contains(ours), "{text}");
+        text = text.replacen(ours, theirs, 1);
+    }
+    fs::write(settings_mgr.path(), &text).unwrap();
+    snapshot_mgr
+        .validate_takeover(&settings_mgr, Some(&patcher), gw)
+        .expect("Tab Autocomplete switched back on must not block opening Kiro");
+    snapshot_mgr
+        .takeover(&settings_mgr, Some(&patcher), gw)
+        .unwrap();
+    let relaunched = settings_mgr.read_settings().unwrap();
+    assert_eq!(relaunched["kiroAgent.enableTabAutocomplete"], json!(true));
+    assert_eq!(relaunched["telemetry.telemetryLevel"], json!("error"));
+    assert_eq!(
+        relaunched["update.mode"],
+        json!("none"),
+        "the update freeze is what keeps an update off the patch"
+    );
+
+    snapshot_mgr.restore_official().unwrap();
+    let restored = settings_mgr.read_settings().unwrap();
+    assert_eq!(restored["telemetry.telemetryLevel"], json!("error"));
+    assert_eq!(restored["kiroAgent.enableTabAutocomplete"], json!(true));
+    assert!(!restored.contains_key("update.mode"));
+    assert!(!restored.contains_key("kiroAuthConfig"));
+    let _ = fs::remove_dir_all(dir);
 }
 
 /// The mirror case: when the patch is already gone, an unrestorable extension

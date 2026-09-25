@@ -75,6 +75,33 @@ pub struct KiroInstallation {
     pub is_user_level: bool,
 }
 
+impl KiroInstallation {
+    /// Whether this installation is still what it was when detected. An update that
+    /// installs itself as Kiro closes changes Kiro's version or its agent extension's.
+    pub fn unchanged(&self) -> bool {
+        inspect_installation_dir(&self.install_dir).is_ok_and(|now| {
+            now.version == self.version
+                && now.agent_version == self.agent_version
+                && now.agent_extension_dir == self.agent_extension_dir
+        })
+    }
+
+    /// Whether a downloaded Kiro update is waiting for Kiro to close, to install itself
+    /// over the very files a takeover changes. Kiro is built on VS Code, whose Windows
+    /// installer holds `<win32MutexName>-ready` while its update waits; that is the sign
+    /// looked for. None is known elsewhere, so there this answers no.
+    pub fn update_waiting(&self) -> bool {
+        #[cfg(windows)]
+        {
+            crate::windows_process::mutex_exists(&format!("{}-ready", self.win32_mutex_name))
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ProductJson {
     #[serde(rename = "vsCodeVersion")]

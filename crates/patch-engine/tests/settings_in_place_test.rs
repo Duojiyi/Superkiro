@@ -1,6 +1,6 @@
 //! settings.json is edited in place: takeover and rollback change only the keys they
 //! manage, and the user's comments, formatting and later edits survive both.
-use patch_engine::SettingsManager;
+use patch_engine::{SettingsError, SettingsManager};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
@@ -218,6 +218,172 @@ fn a_file_kiro_would_not_read_is_refused_and_left_alone() {
         assert_eq!(text(&manager), original);
         fs::remove_dir_all(dir).unwrap();
     }
+}
+
+/// Kiro reads past a missing comma, so a customer can leave one while taken over and
+/// never notice. The rollback reads the file the same way, takes out only what the
+/// takeover put in, and leaves the customer's typo exactly where it is.
+#[test]
+fn a_rollback_reads_past_a_missing_comma_and_leaves_the_typo_where_it_is() {
+    let original = "{\n  // mine\n  \"editor.tabSize\": 2,\n  \"editor.fontSize\": 14,\n  \"update.mode\": \"manual\"\n}\n";
+    let (dir, manager) = settings_file("missing-comma", original.as_bytes());
+    let prior = manager.merge_byok(GATEWAY).unwrap();
+    edit(&manager, "\"editor.tabSize\": 2,", "\"editor.tabSize\": 2");
+    assert!(manager.read_settings().is_err(), "no longer strict JSONC");
+
+    manager.revert(&prior, GATEWAY).unwrap();
+    assert_eq!(
+        text(&manager),
+        original.replacen("\"editor.tabSize\": 2,", "\"editor.tabSize\": 2", 1)
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// A missing comma right next to a member the takeover added: taking that member out
+/// must not take one of the customer's commas instead, which would move their typo
+/// onto their own line.
+#[test]
+fn a_missing_comma_next_to_a_takeover_key_costs_the_customer_no_comma() {
+    // The customer adds a line at the end and leaves out the comma above it, which
+    // ends the takeover's last member.
+    let original = "{\n  \"editor.tabSize\": 2,\n  \"editor.fontSize\": 14\n}\n";
+    let (dir, manager) = settings_file("comma-after-ours", original.as_bytes());
+    let prior = manager.merge_byok(GATEWAY).unwrap();
+    let merged = text(&manager);
+    let end = merged.rfind('}').unwrap();
+    fs::write(
+        manager.path(),
+        format!(
+            "{}  \"editor.wordWrap\": \"on\"\n{}",
+            &merged[..end],
+            &merged[end..]
+        ),
+    )
+    .unwrap();
+    manager.revert(&prior, GATEWAY).unwrap();
+    assert_eq!(
+        text(&manager),
+        "{\n  \"editor.tabSize\": 2,\n  \"editor.fontSize\": 14,\n  \"editor.wordWrap\": \"on\"\n}\n"
+    );
+    fs::remove_dir_all(dir).unwrap();
+
+    // The customer deletes the comma between their last setting and the takeover's first.
+    let (dir, manager) = settings_file("comma-before-ours", original.as_bytes());
+    let prior = manager.merge_byok(GATEWAY).unwrap();
+    edit(
+        &manager,
+        "\"editor.fontSize\": 14,",
+        "\"editor.fontSize\": 14",
+    );
+    manager.revert(&prior, GATEWAY).unwrap();
+    assert_eq!(text(&manager), original);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// A syntax error even a tolerant reading stops at (here a stray closing brace) is named
+/// by line and column, and nothing is written.
+#[test]
+fn a_syntax_error_no_reading_gets_past_is_located_and_nothing_is_written() {
+    let original = "{\n  \"editor.fontSize\": 14\n}\n";
+    let (dir, manager) = settings_file("stray-brace", original.as_bytes());
+    let prior = manager.merge_byok(GATEWAY).unwrap();
+    let broken = format!("{}}}\n", text(&manager));
+    fs::write(manager.path(), &broken).unwrap();
+    let line = broken.matches('\n').count();
+
+    let error = manager.revert(&prior, GATEWAY).unwrap_err();
+    assert!(
+        matches!(error, SettingsError::Syntax { line: l, column: 1 } if l == line),
+        "{error:?}"
+    );
+    assert!(
+        error.to_string().contains(&format!(
+            "settings.json has a syntax error at line {line}, column 1"
+        )),
+        "{error}"
+    );
+    let hosts = ["gateway.test".to_string()];
+    assert!(manager.names_gateway(&hosts), "blind to a broken file");
+    assert!(matches!(
+        manager.remove_orphaned_takeover(&hosts),
+        Err(SettingsError::Syntax { .. })
+    ));
+    assert_eq!(text(&manager), broken);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// A symbolic link at `link` to `target`.
+fn symlink(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link)
+    }
+}
+
+/// A settings.json linked into a dotfiles repository stays linked: the takeover and its
+/// rollback edit the file it points to. Replaced by rename, the link became a detached
+/// copy, and every later change missed the repository.
+#[test]
+fn a_linked_settings_file_stays_linked_through_takeover_and_rollback() {
+    let original = "{\n  \"editor.fontSize\": 15\n}\n";
+    let (dir, _) = settings_file("linked", b"");
+    let target = dir.join("dotfiles").join("settings.json");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, original).unwrap();
+    let link = dir.join("User").join("settings.json");
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    if let Err(error) = symlink(&target, &link) {
+        eprintln!("skipped: symbolic links cannot be created here ({error})");
+        fs::remove_dir_all(dir).unwrap();
+        return;
+    }
+    let manager = SettingsManager::at(&link);
+
+    let prior = manager.merge_byok(GATEWAY).unwrap();
+    assert!(fs::symlink_metadata(&link)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert!(fs::read_to_string(&target)
+        .unwrap()
+        .contains("kiroAuthConfig"));
+    manager.revert(&prior, GATEWAY).unwrap();
+    assert!(fs::symlink_metadata(&link)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(fs::read_to_string(&target).unwrap(), original);
+    for side in [link.parent().unwrap(), target.parent().unwrap()] {
+        assert_eq!(fs::read_dir(side).unwrap().count(), 1, "{side:?}");
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// A settings.json with a second name (a hard link) is refused: replaced by rename, only
+/// one name would carry the takeover, and the rollback could not join them again.
+#[test]
+fn a_settings_file_with_another_hard_link_is_refused_and_left_alone() {
+    let original = "{\n  \"editor.fontSize\": 15\n}\n";
+    let (dir, manager) = settings_file("hard-link", original.as_bytes());
+    let other = dir.join("settings-elsewhere.json");
+    fs::hard_link(manager.path(), &other).unwrap();
+
+    let error = manager.merge_byok(GATEWAY).unwrap_err();
+    assert!(
+        error.to_string().contains("more than one hard link"),
+        "{error}"
+    );
+    assert!(manager.plan_merge(GATEWAY).is_err());
+    assert_eq!(text(&manager), original);
+    assert_eq!(fs::read_to_string(&other).unwrap(), original);
+
+    fs::remove_file(&other).unwrap();
+    manager.merge_byok(GATEWAY).unwrap();
+    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]

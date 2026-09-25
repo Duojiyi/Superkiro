@@ -165,6 +165,14 @@ pub enum PatchOwnership {
     Theirs,
 }
 
+/// A patch rendered and checked by [`ExtensionPatcher::prepare`]: the bundle it was made
+/// from, and the patched bytes that passed, by hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedPatch {
+    source: String,
+    patched: String,
+}
+
 /// Helper for inspecting and modifying `extension.js`.
 #[derive(Debug, Clone)]
 pub struct ExtensionPatcher {
@@ -211,9 +219,40 @@ impl ExtensionPatcher {
         }
     }
 
-    /// Whether the rollback material a restore needs is present.
-    pub fn has_restore_material(&self) -> bool {
-        self.state_path().exists() || self.backup_path().exists()
+    /// Positive proof that this patch can never be rolled back from its own material:
+    /// the file carries the marker, and what a rollback needs (the state that
+    /// authenticates it, and the backup of the original) is gone or reads as something
+    /// else, or the live file is not what the patch wrote. Only replacing the file, by
+    /// reinstalling or updating Kiro, undoes it then.
+    ///
+    /// A read that fails proves nothing: a virus scan can lock the backup for a moment,
+    /// and telling the customer to reinstall Kiro over that would be wrong.
+    pub fn restore_material_is_lost(&self) -> bool {
+        let gone = |error: std::io::Error| error.kind() == std::io::ErrorKind::NotFound;
+        if !self.marker_present().unwrap_or(false) {
+            return false;
+        }
+        let state: PatchState = match fs::read(self.state_path()) {
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(state) => state,
+                Err(_) => return true,
+            },
+            Err(error) => return gone(error),
+        };
+        let Ok(current) = fs::read(&self.extension_path) else {
+            return false;
+        };
+        let current = content_hash(&current);
+        if current != state.patched_hash && state.previous_patched_hash.as_ref() != Some(&current) {
+            return true;
+        }
+        match fs::read(self.backup_path()) {
+            Ok(backup) => {
+                backup.len() as u64 != state.original_len
+                    || content_hash(&backup) != state.original_hash
+            }
+            Err(error) => gone(error),
+        }
     }
 
     /// Determine current patch status.
@@ -281,9 +320,57 @@ impl ExtensionPatcher {
         Ok(true)
     }
 
+    /// Render the patch for `gateway_url` and have Kiro's own runtime check it, writing
+    /// nothing. The result names the bundle read and the patched bytes that passed, so
+    /// the takeover, once Kiro has been closed, can write exactly those without running
+    /// Kiro again.
+    pub fn prepare(&self, gateway_url: &str) -> Result<PreparedPatch, PatchError> {
+        if !self.extension_path.exists() {
+            return Err(PatchError::FileNotFound(self.extension_path.clone()));
+        }
+        let content = fs::read_to_string(&self.extension_path)
+            .map_err(|e| PatchError::Io(self.extension_path.clone(), e.to_string()))?;
+        let patched = if content.starts_with(PATCH_MARKER_PREFIX) {
+            self.verify_patched_content()?;
+            let repaired = repair_credit_display(&repair_proxy_tls(&content));
+            if repaired != content {
+                validate_javascript(&self.extension_path, &repaired)?;
+            }
+            repaired
+        } else {
+            if self.backup_path().exists() {
+                return Err(PatchError::ExtensionChanged);
+            }
+            let rendered = render_patch(&content, gateway_url, &PatchRecipe::default())?;
+            validate_javascript(&self.extension_path, &rendered)?;
+            rendered
+        };
+        Ok(PreparedPatch {
+            source: content_hash(content.as_bytes()),
+            patched: content_hash(patched.as_bytes()),
+        })
+    }
+
+    /// Whether extension.js is still the bundle `prepared` was made from.
+    pub fn is_as_prepared(&self, prepared: &PreparedPatch) -> Result<bool, PatchError> {
+        let content = fs::read(&self.extension_path)
+            .map_err(|e| PatchError::Io(self.extension_path.clone(), e.to_string()))?;
+        Ok(content_hash(&content) == prepared.source)
+    }
+
     /// Apply the BYOK patch to `extension.js` using default recipe.
     pub fn apply(&self, gateway_url: &str) -> Result<(), PatchError> {
-        self.apply_with_recipe(gateway_url, &PatchRecipe::default())
+        self.apply_checked(gateway_url, &PatchRecipe::default(), None)
+    }
+
+    /// [`apply`](Self::apply), taking the check `prepared` records as done for exactly
+    /// the bytes it names; anything else is checked again.
+    pub fn apply_prepared(
+        &self,
+        gateway_url: &str,
+        prepared: &PreparedPatch,
+    ) -> Result<(), PatchError> {
+        self.apply_checked(gateway_url, &PatchRecipe::default(), Some(prepared))
     }
 
     /// Apply the BYOK patch to `extension.js` using a server-distributed recipe.
@@ -294,6 +381,15 @@ impl ExtensionPatcher {
         &self,
         gateway_url: &str,
         recipe: &PatchRecipe,
+    ) -> Result<(), PatchError> {
+        self.apply_checked(gateway_url, recipe, None)
+    }
+
+    fn apply_checked(
+        &self,
+        gateway_url: &str,
+        recipe: &PatchRecipe,
+        prepared: Option<&PreparedPatch>,
     ) -> Result<(), PatchError> {
         match crate::runtime::detect_kiro_process_state() {
             crate::runtime::ProcessState::Running => return Err(PatchError::KiroRunning),
@@ -311,12 +407,25 @@ impl ExtensionPatcher {
 
         let content = fs::read_to_string(&self.extension_path)
             .map_err(|e| PatchError::Io(self.extension_path.clone(), e.to_string()))?;
+        // Kiro's runtime has already passed exactly these bytes, made from exactly this
+        // bundle, when `prepared` says so.
+        let check = |patched: &str| {
+            let passed = prepared.is_some_and(|prepared| {
+                prepared.source == content_hash(content.as_bytes())
+                    && prepared.patched == content_hash(patched.as_bytes())
+            });
+            if passed {
+                Ok(())
+            } else {
+                validate_javascript(&self.extension_path, patched)
+            }
+        };
 
         if self.status() == PatchStatus::Patched {
             self.verify_patched_content()?;
             let repaired = repair_credit_display(&repair_proxy_tls(&content));
             if repaired != content {
-                validate_javascript(&self.extension_path, &repaired)?;
+                check(&repaired)?;
                 let mut state = self.read_state()?;
                 state.previous_patched_hash = Some(content_hash(content.as_bytes()));
                 state.patched_hash = content_hash(repaired.as_bytes());
@@ -329,7 +438,7 @@ impl ExtensionPatcher {
             return Err(PatchError::ExtensionChanged);
         }
         let full_patched = render_patch(&content, gateway_url, recipe)?;
-        validate_javascript(&self.extension_path, &full_patched)?;
+        check(&full_patched)?;
 
         // No backup or live mutation until both the URL and complete JS parse pass.
         // Persist original identity before the first backup write. A failed/partial
@@ -554,6 +663,20 @@ pub fn validate_gateway_url(url: &str) -> Result<String, PatchError> {
 }
 
 fn render_patch(content: &str, gateway: &str, recipe: &PatchRecipe) -> Result<String, PatchError> {
+    render_patch_for(content, gateway, recipe, current_owner().as_deref())
+}
+
+/// The patched bundle, redirecting only `owner`, the user taking over, as
+/// [`current_owner`] names them. An installation can be shared by every user of the
+/// computer (`/Applications/Kiro.app`, say) while a takeover is one user's: anyone
+/// else's Kiro keeps its official runtime endpoint, and their own token with it. With
+/// no owner known, the redirect applies to everyone, as it always did.
+fn render_patch_for(
+    content: &str,
+    gateway: &str,
+    recipe: &PatchRecipe,
+    owner: Option<&str>,
+) -> Result<String, PatchError> {
     let gateway = validate_gateway_url(gateway)?;
     if !recipe.marker.starts_with("/* @patched-kiro-byok ")
         || !recipe.marker.ends_with(" */")
@@ -573,16 +696,32 @@ fn render_patch(content: &str, gateway: &str, recipe: &PatchRecipe) -> Result<St
         let url = validate_gateway_url(&recipe.replacement.replace("{}", &gateway))?;
         serde_json::to_string(&url).unwrap()
     };
+    // Whether the bundle runs as the owner: their home directory, read and compared the
+    // way `current_owner` reads it.
+    let is_owner = owner.map(|owner| {
+        format!(
+            "String(process.env.{}||\"\").toLowerCase()==={}",
+            if cfg!(windows) { "USERPROFILE" } else { "HOME" },
+            serde_json::to_string(owner).unwrap()
+        )
+    });
     // Match the whole literal, never its contents. This includes the runtime
-    // template literal whose ${t} must disappear along with its backticks.
+    // template literal whose ${t} must disappear along with its backticks: every
+    // occurrence of the needle has to be one, or the patch would miss a use.
+    let needles = content.matches(recipe.needle.as_str()).count();
     let mut body = content.to_string();
     let mut replaced = 0;
     for quote in ['"', '\'', '`'] {
         let literal = format!("{quote}{}{quote}", recipe.needle);
+        // Anyone else keeps the literal as Kiro wrote it.
+        let replacement = match &is_owner {
+            Some(is_owner) => format!("({is_owner}?{replacement}:{literal})"),
+            None => replacement.clone(),
+        };
         replaced += body.matches(&literal).count();
         body = body.replace(&literal, &replacement);
     }
-    if replaced == 0 || body.contains(&recipe.needle) {
+    if replaced == 0 || replaced != needles {
         return Err(PatchError::NeedleNotFound);
     }
     Ok(format!(
@@ -694,7 +833,15 @@ fn verify_run_as_node(executable: &Path) -> Result<(), PatchError> {
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many bundles this thread has had Kiro's runtime check.
+    pub(crate) static JAVASCRIPT_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn validate_javascript(extension_path: &Path, content: &str) -> Result<(), PatchError> {
+    #[cfg(test)]
+    JAVASCRIPT_CHECKS.with(|checks| checks.set(checks.get() + 1));
     check_javascript(javascript_command(extension_path)?, content)
 }
 
@@ -804,6 +951,80 @@ mod proxy_tls_tests {
             render_patch(&bundle, "https://160.202.47.98", &PatchRecipe::default()).unwrap();
         assert!(rendered.contains(expected));
         assert!(!rendered.contains(original));
+    }
+}
+
+#[cfg(test)]
+mod shared_install_tests {
+    use super::*;
+
+    /// An installation every user of the computer shares carries one user's takeover.
+    /// Only that user's Kiro is redirected; anyone else's keeps Kiro's official runtime
+    /// endpoint, so their own token never reaches the gateway.
+    #[test]
+    fn only_the_user_who_took_over_is_redirected() {
+        let dir = std::env::temp_dir().join(format!("shared-install-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let bundle = dir.join("bundle.js");
+        let (home, owner, other) = if cfg!(windows) {
+            ("USERPROFILE", "C:\\Users\\Taker", "C:\\Users\\Someone")
+        } else {
+            ("HOME", "/Users/taker", "/Users/someone")
+        };
+        let source = format!("module.exports = (t) => `{RUNTIME_ENDPOINT_NEEDLE}`;");
+        let rendered = render_patch_for(
+            &source,
+            "https://gw.shared.test",
+            &PatchRecipe::default(),
+            Some(&owner.to_lowercase()),
+        )
+        .unwrap();
+        fs::write(&bundle, rendered).unwrap();
+        let endpoint = |user: &str, launched_with: Option<&str>| {
+            let mut node = Command::new("node");
+            node.args([
+                "-e",
+                "process.stdout.write(require(process.argv[1])('us-east-1'))",
+            ])
+            .arg(&bundle)
+            .env(home, user)
+            .env_remove("KIRO_GATEWAY_URL");
+            if let Some(gateway) = launched_with {
+                node.env("KIRO_GATEWAY_URL", gateway);
+            }
+            let output = node.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8(output.stdout).unwrap()
+        };
+        let official = "https://runtime.us-east-1.kiro.dev";
+        assert_eq!(endpoint(owner, None), "https://gw.shared.test");
+        assert_eq!(
+            endpoint(&owner.to_uppercase(), None),
+            "https://gw.shared.test"
+        );
+        assert_eq!(
+            endpoint(owner, Some("https://gw.launch.test")),
+            "https://gw.launch.test"
+        );
+        assert_eq!(endpoint(other, None), official);
+        assert_eq!(endpoint(other, Some("https://gw.launch.test")), official);
+        assert_eq!(endpoint("", None), official);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Every use of the endpoint is a whole literal, or the patch is refused as before.
+    #[test]
+    fn a_needle_outside_a_whole_literal_still_refuses_the_patch() {
+        let source = format!("a = `{RUNTIME_ENDPOINT_NEEDLE}`; b = `{RUNTIME_ENDPOINT_NEEDLE}/x`;");
+        assert_eq!(
+            render_patch_for(
+                &source,
+                "https://gw.test",
+                &PatchRecipe::default(),
+                Some("/home/taker")
+            ),
+            Err(PatchError::NeedleNotFound)
+        );
     }
 }
 

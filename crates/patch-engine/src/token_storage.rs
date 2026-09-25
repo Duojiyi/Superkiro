@@ -220,7 +220,18 @@ fn create_private_parents(path: &Path) -> std::io::Result<()> {
     restrict_private(path, true)
 }
 
+/// The file a write to `path` has to replace: the final target when `path` is a
+/// symbolic link. Replaced by rename, the link itself would become a detached copy, and
+/// every later change would miss the file it pointed to (a dotfiles repository, say).
+pub(crate) fn link_target(path: &Path) -> std::io::Result<PathBuf> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(path),
+        _ => Ok(path.to_path_buf()),
+    }
+}
+
 pub(crate) fn private_atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let path = &link_target(path)?;
     if let Some(parent) = path.parent() {
         create_private_parents(parent)?;
     }
@@ -272,6 +283,7 @@ pub(crate) fn private_atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result
 /// written privately it came back readable by the user alone.
 #[cfg(windows)]
 pub(crate) fn inherited_atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let path = &link_target(path)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }

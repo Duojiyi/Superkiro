@@ -34,8 +34,8 @@ pub use device::{generate_device_fingerprint, is_valid_device_fingerprint, DEVIC
 pub use doctor::{CheckItem, CheckLevel, Doctor, DoctorError, DoctorReport, TakeoverStatus};
 pub use leftovers::{candidate_extensions, Leftovers};
 pub use patch::{
-    get_launcher_env, ExtensionPatcher, PatchError, PatchRecipe, PatchStatus, BACKUP_SUFFIX,
-    PATCH_MARKER_V1, RUNTIME_ENDPOINT_NEEDLE,
+    get_launcher_env, ExtensionPatcher, PatchError, PatchRecipe, PatchStatus, PreparedPatch,
+    BACKUP_SUFFIX, PATCH_MARKER_V1, RUNTIME_ENDPOINT_NEEDLE,
 };
 pub use preferences::{
     default_preferences_path, Announcement, ClientModelCatalogItem, ClientPreferences, Language,
@@ -50,7 +50,8 @@ pub use settings::{
     default_settings_path, PriorSettingsState, SettingsError, SettingsManager, MANAGED_KEYS,
 };
 pub use snapshot::{
-    RestoreSummary, SnapshotError, SnapshotManager, TakeoverSnapshot, SNAPSHOT_FILENAME,
+    RestoreSummary, SnapshotError, SnapshotManager, TakeoverPlan, TakeoverSnapshot,
+    SNAPSHOT_FILENAME,
 };
 pub use token_storage::{
     default_token_path, parse_iso8601_to_epoch, KiroAuthToken, TokenStorage, TokenStorageError,

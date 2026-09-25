@@ -4,7 +4,7 @@
 //! - Takes a complete, self-contained snapshot before applying any takeover or patch.
 //! - Executes 100% clean rollback restoring official Kiro state with zero residue.
 
-use crate::patch::{ExtensionPatcher, PatchError};
+use crate::patch::{ExtensionPatcher, PatchError, PreparedPatch};
 use crate::runtime::{detect_kiro_process_state, ProcessState};
 use crate::settings::{PriorSettingsState, SettingsError, SettingsManager};
 use serde::{Deserialize, Serialize};
@@ -43,6 +43,20 @@ pub enum SnapshotError {
 
     #[error("No active takeover snapshot found on system")]
     NoActiveSnapshot,
+
+    #[error("Kiro's extension is still modified and its backup is gone or no longer matches; reinstall Kiro to replace it, then restore again")]
+    ReinstallRequired,
+
+    #[error("Kiro's installation changed after it was checked, likely an update installed as Kiro closed; nothing was changed. Open Kiro once, then try again")]
+    InstallationChanged,
+}
+
+/// What a takeover will write, worked out by [`SnapshotManager::plan_takeover`] before
+/// Kiro is closed: the settings edit it makes, and the patched bundle Kiro's own runtime
+/// has passed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TakeoverPlan {
+    patch: Option<PreparedPatch>,
 }
 
 /// Metadata recorded during takeover to ensure precision rollback.
@@ -128,8 +142,74 @@ impl SnapshotManager {
         Ok(())
     }
 
-    /// A repeat operation must match the original durable snapshot and current files.
+    /// Everything a takeover will do, checked without writing anything: see
+    /// [`TakeoverPlan`].
     pub fn validate_takeover(
+        &self,
+        settings: &SettingsManager,
+        patcher: Option<&ExtensionPatcher>,
+        gateway: &str,
+    ) -> Result<(), SnapshotError> {
+        self.plan_takeover(settings, patcher, gateway).map(drop)
+    }
+
+    /// Work out and check what a takeover will write, writing nothing: the settings edit
+    /// is built and read back in memory, and the patch is rendered for `gateway` and run
+    /// past Kiro's own runtime. Done before Kiro is closed and before the token changes,
+    /// a file the takeover cannot edit is refused while nothing has been touched.
+    pub fn plan_takeover(
+        &self,
+        settings: &SettingsManager,
+        patcher: Option<&ExtensionPatcher>,
+        gateway: &str,
+    ) -> Result<TakeoverPlan, SnapshotError> {
+        self.check_records(settings, patcher, gateway)?;
+        self.plan_settings(settings, gateway)?;
+        Ok(TakeoverPlan {
+            patch: patcher.map(|p| p.prepare(gateway)).transpose()?,
+        })
+    }
+
+    /// Whether `plan` still holds for this machine: the same rollback records, a
+    /// settings edit that can still be made, and extension.js the very bundle checked.
+    /// Kiro's runtime does not run again.
+    pub fn confirm_plan(
+        &self,
+        settings: &SettingsManager,
+        patcher: Option<&ExtensionPatcher>,
+        gateway: &str,
+        plan: &TakeoverPlan,
+    ) -> Result<(), SnapshotError> {
+        self.check_records(settings, patcher, gateway)?;
+        self.plan_settings(settings, gateway)?;
+        let unchanged = match (patcher, &plan.patch) {
+            (Some(p), Some(prepared)) => p.is_as_prepared(prepared)?,
+            (None, None) => true,
+            _ => false,
+        };
+        if !unchanged {
+            return Err(SnapshotError::InstallationChanged);
+        }
+        Ok(())
+    }
+
+    /// The settings edit the takeover makes: all of it the first time, the keys it
+    /// re-asserts on a machine already taken over.
+    fn plan_settings(
+        &self,
+        settings: &SettingsManager,
+        gateway: &str,
+    ) -> Result<Vec<u8>, SettingsError> {
+        if self.has_active_snapshot() {
+            settings.plan_reassert(gateway)
+        } else {
+            settings.plan_merge(gateway)
+        }
+    }
+
+    /// A repeat operation must match the original durable snapshot and current files;
+    /// a first one starts from Kiro's official bundle.
+    fn check_records(
         &self,
         settings: &SettingsManager,
         patcher: Option<&ExtensionPatcher>,
@@ -148,14 +228,10 @@ impl SnapshotManager {
             if let Some(p) = patcher {
                 p.verify_patched_content()?;
             }
-        } else {
-            if let Some(p) = patcher {
-                if p.status() != crate::patch::PatchStatus::Official {
-                    return Err(SnapshotError::ActiveTakeoverConflict);
-                }
-                p.dry_run()?;
+        } else if let Some(p) = patcher {
+            if p.status() != crate::patch::PatchStatus::Official {
+                return Err(SnapshotError::ActiveTakeoverConflict);
             }
-            settings.read_settings()?;
         }
         Ok(())
     }
@@ -172,6 +248,30 @@ impl SnapshotManager {
         patcher: Option<&ExtensionPatcher>,
         gateway_url: &str,
     ) -> Result<TakeoverSnapshot, SnapshotError> {
+        self.takeover_with(settings_mgr, patcher, gateway_url, None)
+    }
+
+    /// [`takeover`](Self::takeover) once Kiro has been closed, writing only what `plan`
+    /// checked before. Closing Kiro is when an update waiting for it installs itself, so
+    /// an installation that is no longer the one checked is refused before anything is
+    /// written. Kiro's own runtime is not run again on the bytes it already passed.
+    pub fn takeover_planned(
+        &self,
+        settings_mgr: &SettingsManager,
+        patcher: Option<&ExtensionPatcher>,
+        gateway_url: &str,
+        plan: &TakeoverPlan,
+    ) -> Result<TakeoverSnapshot, SnapshotError> {
+        self.takeover_with(settings_mgr, patcher, gateway_url, Some(plan))
+    }
+
+    fn takeover_with(
+        &self,
+        settings_mgr: &SettingsManager,
+        patcher: Option<&ExtensionPatcher>,
+        gateway_url: &str,
+        plan: Option<&TakeoverPlan>,
+    ) -> Result<TakeoverSnapshot, SnapshotError> {
         match detect_kiro_process_state() {
             ProcessState::Running => return Err(SnapshotError::KiroRunning),
             ProcessState::Unknown => {
@@ -183,7 +283,17 @@ impl SnapshotManager {
         }
 
         let _lock = self.operation_lock()?;
-        self.validate_takeover(settings_mgr, patcher, gateway_url)?;
+        let plan = match plan {
+            Some(plan) => {
+                self.confirm_plan(settings_mgr, patcher, gateway_url, plan)?;
+                plan.clone()
+            }
+            None => self.plan_takeover(settings_mgr, patcher, gateway_url)?,
+        };
+        let apply = |p: &ExtensionPatcher| match &plan.patch {
+            Some(prepared) => p.apply_prepared(gateway_url, prepared),
+            None => p.apply(gateway_url),
+        };
         if self.has_active_snapshot() {
             let mut snapshot = self.load()?;
             if !snapshot.settings_state.proxy_bypass_managed {
@@ -199,9 +309,9 @@ impl SnapshotManager {
                 // Persist rollback data before introducing the new managed key.
                 self.save(&snapshot)?;
             }
-            settings_mgr.merge_byok(gateway_url)?;
+            settings_mgr.reassert_byok(gateway_url)?;
             if let Some(p) = patcher {
-                p.apply(gateway_url)?;
+                apply(p)?;
             }
             return Ok(snapshot);
         }
@@ -230,7 +340,7 @@ impl SnapshotManager {
 
         // 2. Patch extension if provided
         let ext_path = if let Some(p) = patcher {
-            if let Err(e) = p.apply(gateway_url) {
+            if let Err(e) = apply(p) {
                 // Keep the recovery record if rollback itself fails.
                 if settings_mgr.revert(&prior_settings, gateway_url).is_ok()
                     && !p.backup_path().exists()
@@ -276,6 +386,13 @@ impl SnapshotManager {
 
         let _lock = self.operation_lock()?;
         let snapshot = self.load()?;
+        let settings_mgr = SettingsManager::at(&snapshot.settings_path);
+
+        // Settings that cannot be rolled back (a syntax error the customer made while
+        // taken over, say) must fail the restore before any file changes. Found only
+        // after the extension was rolled back, they left Kiro on its official bundle
+        // with the gateway's settings and token, and every retry failed the same way.
+        settings_mgr.plan_revert(&snapshot.settings_state, &snapshot.gateway_url)?;
 
         // Unwind in the reverse of takeover's order. `merge_byok` freezes Kiro's
         // auto-update (`update.mode: "none"`) precisely so an update cannot
@@ -314,12 +431,20 @@ impl SnapshotManager {
                             .to_string(),
                     );
                 }
+                // The patch is live and what would roll it back is gone or no longer
+                // matches, so only reinstalling Kiro replaces the file. Until then the
+                // settings and the token stay as they are: rolled back under a live
+                // patch, the customer's own token would go to the gateway through the
+                // patched runtime endpoint. Once Kiro is reinstalled, this same restore
+                // completes.
+                Err(PatchError::ExtensionChanged) if patcher.restore_material_is_lost() => {
+                    return Err(SnapshotError::ReinstallRequired)
+                }
                 // The patch is live. Abort before mutating anything.
                 Err(error) => return Err(SnapshotError::Patch(error)),
             }
         }
 
-        let settings_mgr = SettingsManager::at(&snapshot.settings_path);
         settings_mgr.revert(&snapshot.settings_state, &snapshot.gateway_url)?;
 
         // The takeover is over either way: the settings are reverted and the patch
@@ -502,6 +627,88 @@ mod os_lock_tests {
         fs::remove_file(path.with_extension("ready")).unwrap();
         fs::remove_file(path).unwrap();
         fs::remove_dir(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+    use crate::patch::{PatchStatus, JAVASCRIPT_CHECKS, RUNTIME_ENDPOINT_NEEDLE};
+
+    const GATEWAY: &str = "https://gw.plan.test";
+    const SETTINGS: &str = "{\n  \"editor.fontSize\": 14\n}\n";
+
+    fn machine(name: &str) -> (PathBuf, SettingsManager, ExtensionPatcher, SnapshotManager) {
+        let dir = env::temp_dir().join(format!("kiro-plan-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("settings.json"), SETTINGS).unwrap();
+        fs::write(
+            dir.join("extension.js"),
+            format!("const e = \"{RUNTIME_ENDPOINT_NEEDLE}\";"),
+        )
+        .unwrap();
+        (
+            dir.clone(),
+            SettingsManager::at(dir.join("settings.json")),
+            ExtensionPatcher::new(dir.join("extension.js")),
+            SnapshotManager::at(dir.join("snapshot.json")),
+        )
+    }
+
+    fn checks() -> usize {
+        JAVASCRIPT_CHECKS.with(|checks| checks.get())
+    }
+
+    /// Kiro's own runtime checks the patched bundle once, before Kiro is closed. After
+    /// the close the takeover writes exactly those bytes without running it again: that
+    /// executable is what an update waiting for Kiro to close replaces.
+    #[test]
+    fn a_planned_takeover_does_not_run_kiro_again() {
+        let (dir, settings, patcher, snapshots) = machine("once");
+        let before = checks();
+        let plan = snapshots
+            .plan_takeover(&settings, Some(&patcher), GATEWAY)
+            .unwrap();
+        assert_eq!(checks(), before + 1);
+        snapshots
+            .takeover_planned(&settings, Some(&patcher), GATEWAY, &plan)
+            .unwrap();
+        assert_eq!(
+            checks(),
+            before + 1,
+            "Kiro's runtime ran again after the close"
+        );
+        assert_eq!(patcher.status(), PatchStatus::Patched);
+        assert!(settings.is_byok_active(Some(GATEWAY)));
+        snapshots.restore_official().unwrap();
+        assert_eq!(fs::read_to_string(settings.path()).unwrap(), SETTINGS);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A bundle that is no longer the one checked (an update that installed itself as
+    /// Kiro closed) is refused before anything is written.
+    #[test]
+    fn a_bundle_changed_since_the_check_is_refused_before_anything_is_written() {
+        let (dir, settings, patcher, snapshots) = machine("changed");
+        let plan = snapshots
+            .plan_takeover(&settings, Some(&patcher), GATEWAY)
+            .unwrap();
+        let updated = format!("/* 2.0 */ const e = \"{RUNTIME_ENDPOINT_NEEDLE}\";");
+        fs::write(patcher.path(), &updated).unwrap();
+
+        let error = snapshots
+            .takeover_planned(&settings, Some(&patcher), GATEWAY, &plan)
+            .unwrap_err();
+        assert!(
+            matches!(error, SnapshotError::InstallationChanged),
+            "{error:?}"
+        );
+        assert_eq!(fs::read_to_string(settings.path()).unwrap(), SETTINGS);
+        assert_eq!(fs::read_to_string(patcher.path()).unwrap(), updated);
+        assert!(!snapshots.has_active_snapshot());
+        assert!(!patcher.backup_path().exists());
+        let _ = fs::remove_dir_all(dir);
     }
 }
 
