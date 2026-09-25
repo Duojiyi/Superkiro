@@ -314,8 +314,8 @@ async fn test_portal_web_page_html_endpoint() {
             "missing portal contract: {marker}"
         );
     }
-    // The customer site does not advertise the administrator console.
-    assert!(!html_str.contains(r#"href="/admin/""#));
+    // The footer leads to the administrator console, which asks for its own sign-in.
+    assert!(html_str.contains(r#"<a href="/admin/">管理后台 ↗</a>"#));
 }
 
 #[tokio::test]

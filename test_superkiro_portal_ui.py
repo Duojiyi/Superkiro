@@ -193,10 +193,13 @@ class PortalBrowserTests(unittest.TestCase):
                          dict(release, platform='macos', arch='arm64', url='/downloads/fixture-arm.dmg'),
                          dict(release, platform='macos', arch='x64', url='/downloads/fixture-x64.dmg')]}
         self.page.locator('#retry-releases').click()
+        # The status is hidden while loading too, so wait for the links, then check it.
+        for key, url in [('windows-x64', '/downloads/fixture-win.exe'),
+                         ('macos-arm64', '/downloads/fixture-arm.dmg'),
+                         ('macos-x64', '/downloads/fixture-x64.dmg')]:
+            expect(self.page.locator(f'.downloads [data-download="{key}"]')).to_have_attribute('href', self.origin + url)
         expect(self.page.locator('#release-status')).to_be_hidden()
         expect(self.page.locator('#retry-releases')).to_be_hidden()
-        for a in self.page.locator('[data-download="macos-x64"]').all():
-            self.assertEqual(a.get_attribute('href'), self.origin + '/downloads/fixture-x64.dmg')
 
     def test_03b_unusable_card_offers_no_unbind_and_another_card_can_follow(self):
         self.goto('/device')
