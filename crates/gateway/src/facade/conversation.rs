@@ -274,15 +274,18 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
             }
 
             // 4. Local Intent Classifier Interception (Optimization)
-            let body_str = String::from_utf8_lossy(&body_bytes);
-            if self.intercept_intent
-                && body_str.contains(INTENT_CLASSIFIER_SIGN_A)
-                && body_str.contains(INTENT_CLASSIFIER_SIGN_B)
-            {
-                let is_spec = body_str.contains("create a spec")
-                    || body_str.contains("specification")
-                    || body_str.contains("需求文档")
-                    || body_str.contains("规范");
+            let classified_message = self
+                .intercept_intent
+                .then(|| intent_classifier_message(&body_bytes))
+                .flatten();
+            if let Some(message) = classified_message {
+                // The instructions themselves describe spec requests; only the user's
+                // message says whether this is one.
+                let message = message.to_lowercase();
+                let is_spec = message.contains("create a spec")
+                    || message.contains("specification")
+                    || message.contains("需求文档")
+                    || message.contains("规范");
                 let probs = if is_spec {
                     serde_json::json!({ "chat": 0, "do": 0.1, "spec": 0.9 })
                 } else {
@@ -1085,6 +1088,41 @@ pub fn render_system_prompt_template(
         .replace("{{group_name}}", &group.name)
         .replace("{{plan_name}}", &group.virtual_plan_name)
         .replace("{{virtual_plan_name}}", &group.virtual_plan_name)
+}
+
+/// The user's message, when `body` is Kiro's intent-classifier call: the classifier
+/// instructions lead the request, as its system prompt or its first message, and no tools
+/// are offered. The same words anywhere else (a pasted log, a file a tool read, a later
+/// message) are the user's own content, and that turn goes to the model.
+fn intent_classifier_message(body: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(body);
+    if !text.contains(INTENT_CLASSIFIER_SIGN_A) || !text.contains(INTENT_CLASSIFIER_SIGN_B) {
+        return None;
+    }
+    let request: GenerateAssistantResponseRequest = serde_json::from_slice(body).ok()?;
+    let state = &request.conversation_state;
+    let current = &state.current_message.user_input_message;
+    if current
+        .user_input_message_context
+        .as_ref()
+        .is_some_and(|context| !context.tools.is_empty())
+    {
+        return None;
+    }
+    let instructions = request
+        .system_prompt
+        .as_deref()
+        .filter(|prompt| !prompt.trim().is_empty())
+        .or_else(|| match state.history.first()? {
+            kiro_wire::requests::conversation::Message::User(user) => {
+                Some(user.user_input_message.content.as_str())
+            }
+            kiro_wire::requests::conversation::Message::Assistant(_) => None,
+        })?
+        .trim_start();
+    (instructions.starts_with(INTENT_CLASSIFIER_SIGN_A)
+        && instructions.contains(INTENT_CLASSIFIER_SIGN_B))
+    .then(|| current.content.clone())
 }
 
 /// The client's invocation id keys idempotency, the credit hold and the request traces,

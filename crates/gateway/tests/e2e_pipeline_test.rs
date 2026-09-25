@@ -215,6 +215,89 @@ async fn test_e2e_conversation_pipeline_with_provider_and_billing_settlement() {
     assert_eq!(card_after_replay.credit_used, card_after.credit_used);
 }
 
+/// Kiro's intent-classifier instructions, abridged: they open with the role, name the
+/// three categories and describe spec requests, then quote the user's last message.
+fn classifier_instructions(user_message: &str) -> String {
+    format!(
+        "\nYou are an intent classifier for a language model.\n\n\
+         Your job is to classify the user's intent based on their conversation history.\n\n\
+         Return ONLY a JSON object with 3 properties (chat, do, spec) representing your \
+         confidence in each category.\n\n\
+         Input belongs in spec mode ONLY if it EXPLICITLY:\n\
+         - Asks to create a specification (or spec)\n\n\
+         Here is the last user message:\n{user_message}"
+    )
+}
+
+/// The request Kiro sends to classify `user_message`. With `system_field` the
+/// instructions travel as the system prompt, otherwise as the first message.
+fn classifier_call(user_message: &str, system_field: bool) -> serde_json::Value {
+    let acknowledgement = serde_json::json!({
+        "assistantResponseMessage": {"content": "I will follow these instructions"}
+    });
+    let mut history = vec![acknowledgement];
+    let mut request = serde_json::json!({});
+    if system_field {
+        request["systemPrompt"] = classifier_instructions(user_message).into();
+    } else {
+        history.insert(
+            0,
+            serde_json::json!({"userInputMessage": {"content": classifier_instructions(user_message)}}),
+        );
+    }
+    request["conversationState"] = serde_json::json!({
+        "conversationId": "conv-intent",
+        "history": history,
+        "currentMessage": {"userInputMessage": {
+            "content": user_message,
+            "userInputMessageContext": {}
+        }}
+    });
+    request
+}
+
+async fn post(
+    app: &axum::Router,
+    invocation_id: &str,
+    body: &serde_json::Value,
+    claims: Option<AuthClaims>,
+) -> (StatusCode, Vec<(String, Vec<u8>)>) {
+    let mut req = Request::builder()
+        .method(Method::POST)
+        .uri("/generateAssistantResponse")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("amz-sdk-invocation-id", invocation_id)
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    if let Some(claims) = claims {
+        req.extensions_mut().insert(claims);
+    }
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let mut decoder = EventStreamDecoder::new();
+    let mut frames = Vec::new();
+    if status == StatusCode::OK {
+        decoder.feed(&bytes).unwrap();
+        while let Some(frame) = decoder.decode().unwrap() {
+            frames.push((frame.event_type().unwrap_or("").to_string(), frame.payload));
+        }
+    }
+    (status, frames)
+}
+
+fn assistant_text(frames: &[(String, Vec<u8>)]) -> String {
+    frames
+        .iter()
+        .filter(|(name, _)| name == "assistantResponseEvent")
+        .map(|(_, payload)| {
+            serde_json::from_slice::<AssistantResponseEvent>(payload)
+                .unwrap()
+                .content
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn test_e2e_intent_classifier_interception_optimization() {
     let billing = BillingEngine::new();
@@ -241,47 +324,154 @@ async fn test_e2e_intent_classifier_interception_optimization() {
     registry.register(conv_handler);
     let app = registry.into_router();
 
-    // Request containing Kiro's internal intent classifier prompt
-    let intent_prompt = "You are an intent classifier for a language model. Classify the user query into (chat, do, spec). User query: Please write a rust function to parse JSON.";
-    let req_body = serde_json::json!({
-        "conversationState": {
-            "currentMessage": {
-                "userInputMessage": {
-                    "content": intent_prompt
-                }
-            }
+    // Kiro's classifier call is answered locally, in either of the shapes Kiro sends.
+    // The instructions themselves describe spec requests; only the user's message decides.
+    for (n, (message, system_field, spec)) in [
+        ("Please write a rust function to parse JSON.", false, false),
+        ("Please write a rust function to parse JSON.", true, false),
+        ("Create a spec for the login feature", false, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (status, frames) = post(
+            &app,
+            &format!("inv-intent-{n}"),
+            &classifier_call(message, system_field),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(frames[0].0, "messageMetadataEvent");
+        assert_eq!(frames[1].0, "assistantResponseEvent");
+        let probs: serde_json::Value = serde_json::from_str(&assistant_text(&frames)).unwrap();
+        assert_eq!(probs["chat"], 0);
+        if spec {
+            assert_eq!(probs["spec"], 0.9, "{message}");
+        } else {
+            assert_eq!(
+                probs["do"], 0.95,
+                "{message} (system field: {system_field})"
+            );
+            assert_eq!(probs["spec"], 0.05);
         }
-    });
-
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri("/generateAssistantResponse")
-        .header(header::CONTENT_TYPE, "application/json")
-        .header("amz-sdk-invocation-id", "inv-intent-001")
-        .body(Body::from(req_body.to_string()))
-        .unwrap();
-
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let mut decoder = EventStreamDecoder::new();
-    decoder.feed(&bytes).unwrap();
-
-    // First frame is messageMetadataEvent
-    let f1 = decoder.decode().unwrap().expect("Frame 1");
-    assert_eq!(f1.event_type(), Some("messageMetadataEvent"));
-
-    // Second frame is assistantResponseEvent with probabilities JSON
-    let f2 = decoder.decode().unwrap().expect("Frame 2");
-    assert_eq!(f2.event_type(), Some("assistantResponseEvent"));
-    let evt: AssistantResponseEvent = serde_json::from_slice(&f2.payload).unwrap();
-    let probs: serde_json::Value = serde_json::from_str(&evt.content).unwrap();
-    assert_eq!(probs["chat"], 0);
-    assert_eq!(probs["do"], 0.95);
-    assert_eq!(probs["spec"], 0.05);
+    }
 
     // No upstream was called and no card credits were touched!
+}
+
+/// The classifier's words inside an ordinary conversation (a pasted log, a file a tool
+/// read, the user's own message) are the user's content: the turn goes to the model.
+#[tokio::test]
+async fn classifier_words_inside_an_ordinary_turn_reach_the_model() {
+    let mock_server = MockServer::start().await;
+    let sse_body = [
+        r#"data: {"type":"message_start","message":{"id":"msg_1","model":"claude-3-5-sonnet","role":"assistant","content":[],"usage":{"input_tokens":150,"output_tokens":0}}}"#,
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Here is the unit test."}}"#,
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":6}}"#,
+        r#"data: {"type":"message_stop"}"#,
+        "",
+    ]
+    .join("\n\n");
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse_body),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let billing = BillingEngine::new();
+    let mut card = Card::new("card-intent-001", "group-default", 100_000_000);
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    card.activate(now_secs, 86400 * 30).unwrap();
+    billing.upsert_card(card);
+    let conv_handler = GenerateAssistantResponseHandler::new(
+        reqwest::Client::new(),
+        Arc::new(AnthropicProvider),
+        ProviderConfig {
+            base_url: mock_server.uri(),
+            api_key: "sk-ant-test-key".to_string(),
+            model: "claude-3-5-sonnet-20241022".to_string(),
+            timeout: Duration::from_secs(5),
+            group_id: None,
+        },
+        billing.clone(),
+        IdempotencyManager::default(),
+    );
+    let mut registry = FacadeRegistry::default();
+    registry.register(conv_handler);
+    let app = registry.into_router();
+
+    let quoted = classifier_instructions("Fix the parser");
+    let tools = serde_json::json!([{"toolSpecification": {
+        "name": "readFile",
+        "description": "Read a file",
+        "inputSchema": {"json": {"type": "object"}}
+    }}]);
+    let kiro_prompt = serde_json::json!({"userInputMessage": {"content": "You are Kiro, working in the user's IDE."}});
+    let acknowledgement = serde_json::json!({"assistantResponseMessage": {"content": "I will follow these instructions."}});
+    let turns = [
+        // A log the user pasted earlier in the conversation.
+        serde_json::json!({"conversationState": {
+            "conversationId": "conv-ordinary-1",
+            "history": [
+                kiro_prompt,
+                acknowledgement,
+                {"userInputMessage": {"content": format!("Why does Kiro log this?\n{quoted}")}},
+                {"assistantResponseMessage": {"content": "That is Kiro's classifier prompt."}}
+            ],
+            "currentMessage": {"userInputMessage": {
+                "content": "Now write a unit test",
+                "userInputMessageContext": {"tools": tools}
+            }}
+        }}),
+        // A file a tool read.
+        serde_json::json!({"conversationState": {
+            "conversationId": "conv-ordinary-2",
+            "history": [
+                kiro_prompt,
+                acknowledgement,
+                {"userInputMessage": {"content": "Read the prompt file"}},
+                {"assistantResponseMessage": {"content": "", "toolUses": [
+                    {"toolUseId": "tool-1", "name": "readFile", "input": {"path": "prompt.txt"}}
+                ]}}
+            ],
+            "currentMessage": {"userInputMessage": {
+                "content": "",
+                "userInputMessageContext": {
+                    "tools": tools,
+                    "toolResults": [{"toolUseId": "tool-1", "status": "success", "content": [{"text": quoted}]}]
+                }
+            }}
+        }}),
+        // The user's own message, opening a conversation.
+        serde_json::json!({"conversationState": {
+            "conversationId": "conv-ordinary-3",
+            "currentMessage": {"userInputMessage": {"content": quoted}}
+        }}),
+    ];
+    for (n, turn) in turns.iter().enumerate() {
+        let (status, frames) = post(
+            &app,
+            &format!("inv-ordinary-{n}"),
+            turn,
+            Some(create_auth_claims("card-intent-001")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "turn {n}");
+        assert_eq!(
+            assistant_text(&frames),
+            "Here is the unit test.",
+            "turn {n}"
+        );
+    }
+    assert_eq!(mock_server.received_requests().await.unwrap().len(), 3);
 }
 
 #[tokio::test]
