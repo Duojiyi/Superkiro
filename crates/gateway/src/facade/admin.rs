@@ -675,6 +675,70 @@ impl FacadeHandler for AdminTracesHandler {
     }
 }
 
+/// One request's content and the upstream model's reply, kept for 24 hours for tracing.
+/// Each read is logged, naming the operator and the request but none of its content.
+pub struct AdminTraceContentHandler {
+    pub auth: Arc<AdminAuthState>,
+}
+
+impl FacadeHandler for AdminTraceContentHandler {
+    fn method(&self) -> Method {
+        Method::GET
+    }
+    fn path(&self) -> &'static str {
+        "/api/v1/admin/traces/content"
+    }
+    fn handle<'a>(&'a self, req: Request<Body>) -> BoxFuture<'a, Response> {
+        Box::pin(async move {
+            if !self.auth.verify(req.headers()) {
+                return unauthorized_response();
+            }
+            let Some(invocation_id) = parse_query(req.uri(), "invocation_id")
+                .and_then(|value| crate::archive::percent_decode(&value))
+                .filter(|value| !value.is_empty() && value.len() <= 512)
+            else {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "ValidationException",
+                    "invocation_id is required",
+                );
+            };
+            let Some(archive) = crate::archive::active() else {
+                return error_response(
+                    StatusCode::NOT_FOUND,
+                    "ResourceNotFoundException",
+                    "请求内容未开启保存",
+                );
+            };
+            let operator = self
+                .auth
+                .authenticated_operator(req.headers())
+                .unwrap_or("admin");
+            let lookup = invocation_id.clone();
+            let record = tokio::task::spawn_blocking(move || archive.read(&lookup, now_secs()))
+                .await
+                .ok()
+                .flatten();
+            eprintln!(
+                "[admin] request content viewed operator={operator} request={} found={}",
+                crate::archive::log_key(&invocation_id),
+                record.is_some()
+            );
+            match record {
+                Some(mut record) => {
+                    record["success"] = serde_json::json!(true);
+                    json_response(StatusCode::OK, &record)
+                }
+                None => error_response(
+                    StatusCode::NOT_FOUND,
+                    "ResourceNotFoundException",
+                    "没有这次请求的内容（只保留 24 小时）",
+                ),
+            }
+        })
+    }
+}
+
 pub struct AdminLedgerExportHandler {
     pub billing: BillingEngine,
     pub auth: Arc<AdminAuthState>,

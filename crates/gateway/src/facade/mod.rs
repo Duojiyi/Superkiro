@@ -291,6 +291,7 @@ impl FacadeRegistry {
                 billing: billing.clone(),
                 auth: auth.clone(),
             })
+            .register(admin::AdminTraceContentHandler { auth: auth.clone() })
             .register(admin::AdminLedgerExportHandler {
                 billing: billing.clone(),
                 auth: auth.clone(),

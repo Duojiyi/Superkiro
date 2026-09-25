@@ -53,6 +53,28 @@ fn vision_fallback_config() -> Option<VisionFallbackConfig> {
     })
 }
 
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// The master key from `KIRO_MASTER_KEK` or `KIRO_MASTER_KEK_FILE`, when one is set.
+fn master_kek_from_env() -> Result<Option<billing::MasterKek>, String> {
+    if std::env::var("KIRO_MASTER_KEK").is_ok() {
+        billing::MasterKek::from_env("KIRO_MASTER_KEK")
+            .map(Some)
+            .map_err(|e| format!("Invalid KIRO_MASTER_KEK: {e}"))
+    } else if let Ok(file_path) = std::env::var("KIRO_MASTER_KEK_FILE") {
+        billing::MasterKek::from_file(file_path.trim())
+            .map(Some)
+            .map_err(|e| format!("Failed to read KIRO_MASTER_KEK_FILE ({file_path}): {e}"))
+    } else {
+        Ok(None)
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -103,19 +125,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     billing.set_persistence_path(&state_file);
 
     // Optional Master KEK for snapshot AEAD encryption (Spec §7, P1-03, P1-05)
-    let master_kek = if std::env::var("KIRO_MASTER_KEK").is_ok() {
-        Some(
-            billing::MasterKek::from_env("KIRO_MASTER_KEK")
-                .map_err(|e| format!("Invalid KIRO_MASTER_KEK: {e}"))?,
-        )
-    } else if let Ok(file_path) = std::env::var("KIRO_MASTER_KEK_FILE") {
-        Some(
-            billing::MasterKek::from_file(file_path.trim())
-                .map_err(|e| format!("Failed to read KIRO_MASTER_KEK_FILE ({file_path}): {e}"))?,
-        )
-    } else {
-        None
-    };
+    let master_kek = master_kek_from_env()?;
+    // Each customer request and its reply, kept 24 hours for tracing: only where the master
+    // key can seal them. Pruned at start and every ten minutes.
+    if let Some(kek) = master_kek_from_env()? {
+        match gateway::archive::RequestArchive::open(
+            Path::new(&data_dir).join("request-archive"),
+            kek,
+        ) {
+            Ok(archive) => {
+                archive.prune(unix_now());
+                gateway::archive::install(archive);
+                tokio::spawn(async {
+                    let mut every = tokio::time::interval(Duration::from_secs(600));
+                    loop {
+                        every.tick().await;
+                        if let Some(archive) = gateway::archive::active() {
+                            let _ = tokio::task::spawn_blocking(move || archive.prune(unix_now()))
+                                .await;
+                        }
+                    }
+                });
+                println!("[√] Request archive enabled: 24 hours, encrypted");
+            }
+            Err(error) => eprintln!("[!] Request archive unavailable: {error}"),
+        }
+    }
     let require_encrypted_snapshots = env_flag("REQUIRE_ENCRYPTED_SNAPSHOTS", true)
         || !env_flag("ALLOW_PLAINTEXT_SNAPSHOTS", false);
     match master_kek {

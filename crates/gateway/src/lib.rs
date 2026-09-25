@@ -2,6 +2,7 @@
 
 pub const SERVICE_NAME: &str = "kiro-byok-gateway";
 
+pub mod archive;
 pub mod auth;
 pub mod facade;
 pub mod guardrail;

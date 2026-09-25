@@ -133,6 +133,10 @@ class PromoteFailureBehaviour(unittest.TestCase):
         restore = ' '.join(self.commands())
         self.assertIn('data.complete', restore)
         self.assertIn('failed-candidate-data', restore)
+        # Kept customer requests never stay in a copy: not the backup, not the failed data.
+        self.assertIn('/data/request-archive', restore)
+        self.assertIn('/failed-candidate-data/request-archive', restore)
+        self.assertIn('diff -qr --exclude=request-archive', restore)
         self.assertIn(OLD, [call.args[1] for call in self.mocks['switch_current'].call_args_list])
 
     def test_ingress_that_never_came_back_is_brought_up(self):

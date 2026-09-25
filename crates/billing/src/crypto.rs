@@ -114,6 +114,46 @@ impl MasterKek {
         Ok(format!("v1:{hex_nonce}:{hex_payload}"))
     }
 
+    /// Seals bytes for one purpose, named by `aad`: the nonce, then the ciphertext and its
+    /// tag. What is sealed for one purpose does not open for another.
+    pub fn seal_bytes(&self, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        SystemRandom::new()
+            .fill(&mut nonce_bytes)
+            .map_err(|_| CryptoError::EncryptionError)?;
+        let key = LessSafeKey::new(
+            UnboundKey::new(&AES_256_GCM, &self.0).map_err(|_| CryptoError::EncryptionError)?,
+        );
+        let mut payload = plaintext.to_vec();
+        key.seal_in_place_append_tag(
+            Nonce::assume_unique_for_key(nonce_bytes),
+            Aad::from(aad),
+            &mut payload,
+        )
+        .map_err(|_| CryptoError::EncryptionError)?;
+        let mut sealed = nonce_bytes.to_vec();
+        sealed.extend_from_slice(&payload);
+        Ok(sealed)
+    }
+
+    /// Opens what [`MasterKek::seal_bytes`] sealed for the same purpose.
+    pub fn open_bytes(&self, aad: &[u8], sealed: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        if sealed.len() < NONCE_LEN {
+            return Err(CryptoError::InvalidCiphertextFormat);
+        }
+        let (nonce, payload) = sealed.split_at(NONCE_LEN);
+        let key = LessSafeKey::new(
+            UnboundKey::new(&AES_256_GCM, &self.0).map_err(|_| CryptoError::DecryptionError)?,
+        );
+        let nonce =
+            Nonce::try_assume_unique_for_key(nonce).map_err(|_| CryptoError::DecryptionError)?;
+        let mut payload = payload.to_vec();
+        let plaintext = key
+            .open_in_place(nonce, Aad::from(aad), &mut payload)
+            .map_err(|_| CryptoError::DecryptionError)?;
+        Ok(plaintext.to_vec())
+    }
+
     /// Decrypt an authenticated ciphertext string back into the provider API key plaintext.
     pub fn decrypt(&self, ciphertext_str: &str) -> Result<String, CryptoError> {
         let parts: Vec<&str> = ciphertext_str.split(':').collect();
@@ -227,6 +267,31 @@ pub fn rotate_all_provider_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sealed_bytes_open_only_for_their_purpose_and_unaltered() {
+        let kek = MasterKek::generate_random().unwrap();
+        let sealed = kek
+            .seal_bytes(b"purpose/1", b"\x00binary\xffpayload")
+            .unwrap();
+        assert_eq!(
+            kek.open_bytes(b"purpose/1", &sealed).unwrap(),
+            b"\x00binary\xffpayload"
+        );
+        assert!(kek.open_bytes(b"purpose/2", &sealed).is_err());
+        let mut tampered = sealed.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(kek.open_bytes(b"purpose/1", &tampered).is_err());
+        assert!(kek.open_bytes(b"purpose/1", &sealed[..4]).is_err());
+        let other = MasterKek::generate_random().unwrap();
+        assert!(other.open_bytes(b"purpose/1", &sealed).is_err());
+        // A fresh nonce each time: the same bytes never seal the same way twice.
+        assert_ne!(
+            sealed,
+            kek.seal_bytes(b"purpose/1", b"\x00binary\xffpayload")
+                .unwrap()
+        );
+    }
 
     #[test]
     fn test_kek_encrypt_decrypt_roundtrip() {

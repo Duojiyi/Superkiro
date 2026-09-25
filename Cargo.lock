@@ -1417,6 +1417,7 @@ dependencies = [
  "bcrypt",
  "billing",
  "bytes",
+ "flate2",
  "futures-util",
  "http-body-util",
  "image",

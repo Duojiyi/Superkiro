@@ -351,6 +351,9 @@ pub fn create_stream_guard_with_send_deadline(
         let mut output_units = 0u64;
         let mut saw_output = false;
         let mut first_output_at: Option<std::time::Instant> = None;
+        // Kept 24 hours for tracing when the archive is on: what the model sent back.
+        let archiving = crate::archive::active().is_some();
+        let mut reply = crate::archive::ArchivedReply::default();
         let mut completed = false;
         let mut rejected_empty = false;
         let context_window = config
@@ -381,11 +384,17 @@ pub fn create_stream_guard_with_send_deadline(
                                 ProviderDelta::Text(text) => {
                                     saw_output |= !text.is_empty();
                                     output_units = output_units.saturating_add(crate::usage_estimate::token_units(&text));
+                                    if archiving {
+                                        reply.truncated |= crate::archive::append_capped(&mut reply.text, &text);
+                                    }
                                     Some(kiro_wire::encoder::encode_assistant_response(&text, Some(&config.model_id)))
                                 }
                                 ProviderDelta::Reasoning(text) => {
                                     saw_output |= !text.is_empty();
                                     output_units = output_units.saturating_add(crate::usage_estimate::token_units(&text));
+                                    if archiving {
+                                        reply.truncated |= crate::archive::append_capped(&mut reply.reasoning, &text);
+                                    }
                                     Some(kiro_wire::encoder::encode_reasoning(Some(&text), None, None))
                                 }
                                 ProviderDelta::ToolCallChunk { index, id, name, arguments } => {
@@ -479,6 +488,9 @@ pub fn create_stream_guard_with_send_deadline(
                                 break;
                             }
                             for buf in std::mem::take(&mut tool_calls.calls) {
+                                if archiving {
+                                    reply.truncated |= archive_tool_call(&mut reply, &buf);
+                                }
                                 if !buf.name.is_empty() || !buf.id.is_empty() {
                                     let frame = kiro_wire::encoder::encode_tool_use(&buf.name, &buf.id, &buf.arguments, true);
                                     if !send_frame(&tx, Bytes::from(frame), send_deadline).await { break 'stream; }
@@ -514,6 +526,12 @@ pub fn create_stream_guard_with_send_deadline(
         }
         let mut settlement_ok = true;
         let mut billable_attempt = false;
+        // A stream cut short never completed its calls; they still show what they carried.
+        if archiving {
+            for buf in std::mem::take(&mut tool_calls.calls) {
+                reply.truncated |= archive_tool_call(&mut reply, &buf);
+            }
+        }
         if let Some(mut settler) = billing_settler.take() {
             if !completed {
                 if let Some(metrics) = &settler.metrics {
@@ -555,6 +573,25 @@ pub fn create_stream_guard_with_send_deadline(
             } else {
                 billing::observability::TraceStatus::Error
             };
+            if archiving {
+                reply.status = match status {
+                    billing::observability::TraceStatus::Success => "success",
+                    billing::observability::TraceStatus::ClientAborted => "client_aborted",
+                    _ => "error",
+                }
+                .into();
+                reply.error = failure
+                    .as_ref()
+                    .map(|failure| failure.error.clone())
+                    .or_else(|| (!settlement_ok).then(|| "Billing settlement failed".to_string()));
+                reply.provider_id = settler.provider_id.clone();
+                reply.target_model = settler.target_model.clone();
+                reply.stop_reason = stop_reason.clone();
+                reply.input_tokens = usage.prompt_tokens;
+                reply.output_tokens = output_tokens;
+                reply.cache_read_tokens = usage.cache_read_input_tokens.unwrap_or(0);
+                reply.cache_write_tokens = usage.cache_creation_input_tokens.unwrap_or(0);
+            }
             settler.billing.finish_trace(
                 &settler.invocation_id,
                 status,
@@ -571,6 +608,11 @@ pub fn create_stream_guard_with_send_deadline(
             settler
                 .billing
                 .note_trace_timing(&settler.invocation_id, ttft_ms, tokens_per_second);
+            if let Some(archive) = crate::archive::active().filter(|_| archiving) {
+                reply.ttft_ms = ttft_ms;
+                reply.tokens_per_second = tokens_per_second;
+                archive.keep_reply(&settler.invocation_id, std::mem::take(&mut reply));
+            }
         }
         if completed && settlement_ok {
             if !tx.is_closed() {
@@ -656,6 +698,21 @@ pub(crate) fn reports_input(usage: &crate::provider::TokenUsage) -> bool {
         || usage
             .cache_creation_input_tokens
             .is_some_and(|tokens| tokens > 0)
+}
+
+/// Adds a tool call to the kept reply; true when its arguments were longer than is kept.
+fn archive_tool_call(reply: &mut crate::archive::ArchivedReply, buf: &ToolBuffer) -> bool {
+    if buf.name.is_empty() && buf.id.is_empty() {
+        return false;
+    }
+    let mut arguments = String::new();
+    let cut = crate::archive::append_capped(&mut arguments, &buf.arguments);
+    reply.tool_calls.push(crate::archive::ArchivedToolCall {
+        id: buf.id.clone(),
+        name: buf.name.clone(),
+        arguments,
+    });
+    cut
 }
 
 /// Time to first output since the request arrived, and output speed after it.

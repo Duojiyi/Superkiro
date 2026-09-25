@@ -609,6 +609,15 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                     "modelId is invalid",
                 );
             }
+            // Kept 24 hours for tracing: the request as it arrived, its reply once it ends.
+            if let (Some(archive), Some(claims)) = (crate::archive::active(), claims.as_ref()) {
+                archive.keep_request(
+                    &invocation_key,
+                    &claims.card_id,
+                    requested_model,
+                    body_bytes.clone(),
+                );
+            }
 
             let mut target_model = fallback_model.to_string();
             let mut fallback_targets = Vec::new();

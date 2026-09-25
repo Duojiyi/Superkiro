@@ -29,6 +29,8 @@ COMMITTED_INPUTS = ['Cargo.toml', 'Cargo.lock', 'crates', 'apps/portal-ui', 'dep
                     'apps/admin-ui/package-lock.json', 'apps/admin-ui/vite.config.ts',
                     'apps/admin-ui/tsconfig.json', 'apps/admin-ui/tailwind.config.js',
                     'apps/admin-ui/postcss.config.js'] + [f'deploy/{name}' for name in CONFIG_FILES]
+# Where the gateway keeps customer requests for 24 hours, inside the data directory.
+REQUEST_ARCHIVE = 'request-archive'
 GATEWAY_IMAGE_LINE = re.compile(r'(?m)^    image: (kiro-byok:[^\s]+)$')
 # Installed from each release so repository fixes reach the nightly backup.
 BACKUP_TOOLS = ['server-backup.py', 'verify-bundle.py', 'backup.sh', 'restore.sh']
@@ -428,7 +430,10 @@ def promote(ssh, report, extra_readiness=None):
             raise RuntimeError('Gateway stop was abnormal; data needs review')
         report['previous_exit_code'] = int(exit_code)
         clean_stop = True
-        run(ssh, f'cp -a {BASE}/data {backup}/data\ndiff -qr {BASE}/data {backup}/data\ntouch {backup}/data.complete')
+        # Customer requests are kept 24 hours for tracing and never in a copy that outlives
+        # them: the release backup, and the copy of it taken off the server, leave them out.
+        run(ssh, f'cp -a {BASE}/data {backup}/data\nrm -rf -- {backup}/data/{REQUEST_ARCHIVE}\n'
+            f'diff -qr --exclude={REQUEST_ARCHIVE} {BASE}/data {backup}/data\ntouch {backup}/data.complete')
         # Read once the old gateway has flushed and stopped: what the new one must load.
         report['ledger_sequence'] = ledger_sequence(ssh)
         report['status'] = 'backed_up'
@@ -461,7 +466,8 @@ def promote(ssh, report, extra_readiness=None):
                 restore = f'{BASE}/data.restore-{release}'
                 run(ssh, f'test -f {backup}/data.complete\ntest ! -e {restore}\n'
                     f'cp -a {backup}/data {restore}\ndiff -qr {backup}/data {restore}\n'
-                    f'test ! -e {backup}/failed-candidate-data\nmv {BASE}/data {backup}/failed-candidate-data\nmv {restore} {BASE}/data')
+                    f'test ! -e {backup}/failed-candidate-data\nmv {BASE}/data {backup}/failed-candidate-data\n'
+                    f'rm -rf -- {backup}/failed-candidate-data/{REQUEST_ARCHIVE}\nmv {restore} {BASE}/data')
                 if report.get('browser_auth_migration'):
                     run(ssh, f'cp -a {configuration}/gateway.env /etc/kiro-byok/gateway.env\ncp -a {configuration}/caddy.env /etc/kiro-byok/caddy.env')
                 switch_current(ssh, old, release)
