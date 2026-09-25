@@ -164,7 +164,7 @@ impl SnapshotManager {
         gateway: &str,
     ) -> Result<TakeoverPlan, SnapshotError> {
         self.check_records(settings, patcher, gateway)?;
-        settings.plan_merge(gateway)?;
+        self.plan_settings(settings, gateway)?;
         Ok(TakeoverPlan {
             patch: patcher.map(|p| p.prepare(gateway)).transpose()?,
         })
@@ -181,7 +181,7 @@ impl SnapshotManager {
         plan: &TakeoverPlan,
     ) -> Result<(), SnapshotError> {
         self.check_records(settings, patcher, gateway)?;
-        settings.plan_merge(gateway)?;
+        self.plan_settings(settings, gateway)?;
         let unchanged = match (patcher, &plan.patch) {
             (Some(p), Some(prepared)) => p.is_as_prepared(prepared)?,
             (None, None) => true,
@@ -191,6 +191,20 @@ impl SnapshotManager {
             return Err(SnapshotError::InstallationChanged);
         }
         Ok(())
+    }
+
+    /// The settings edit the takeover makes: all of it the first time, the keys it
+    /// re-asserts on a machine already taken over.
+    fn plan_settings(
+        &self,
+        settings: &SettingsManager,
+        gateway: &str,
+    ) -> Result<Vec<u8>, SettingsError> {
+        if self.has_active_snapshot() {
+            settings.plan_reassert(gateway)
+        } else {
+            settings.plan_merge(gateway)
+        }
     }
 
     /// A repeat operation must match the original durable snapshot and current files;
@@ -295,7 +309,7 @@ impl SnapshotManager {
                 // Persist rollback data before introducing the new managed key.
                 self.save(&snapshot)?;
             }
-            settings_mgr.merge_byok(gateway_url)?;
+            settings_mgr.reassert_byok(gateway_url)?;
             if let Some(p) = patcher {
                 apply(p)?;
             }

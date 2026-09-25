@@ -169,14 +169,38 @@ impl SettingsManager {
     /// Returns `PriorSettingsState` to enable 100% reversible rollback.
     pub fn merge_byok(&self, gateway_url: &str) -> Result<PriorSettingsState, SettingsError> {
         let prior = self.capture_prior_state()?;
-        self.atomic_write_bytes(&self.plan_merge(gateway_url)?)?;
+        self.write_if_changed(&self.plan_merge(gateway_url)?)?;
         Ok(prior)
+    }
+
+    /// The takeover's settings again, on a machine already taken over (a relaunch): the
+    /// redirection, the proxy bypass and the update freeze, which keeps an update from
+    /// replacing the patch. Autocomplete and telemetry stay as the customer has set them
+    /// since, and a file that already says all this is not written at all.
+    pub fn reassert_byok(&self, gateway_url: &str) -> Result<(), SettingsError> {
+        self.write_if_changed(&self.plan_reassert(gateway_url)?)
     }
 
     /// The file [`merge_byok`](Self::merge_byok) would write, built and read back in
     /// memory; nothing is written. A takeover works this out before it closes Kiro or
     /// touches the token, so a file it cannot edit is refused while nothing has changed.
     pub fn plan_merge(&self, gateway_url: &str) -> Result<Vec<u8>, SettingsError> {
+        self.plan_takeover_edit(gateway_url, true)
+    }
+
+    /// What [`reassert_byok`](Self::reassert_byok) would write; nothing is written.
+    pub fn plan_reassert(&self, gateway_url: &str) -> Result<Vec<u8>, SettingsError> {
+        self.plan_takeover_edit(gateway_url, false)
+    }
+
+    fn write_if_changed(&self, bytes: &[u8]) -> Result<(), SettingsError> {
+        if self.read_raw()? == bytes {
+            return Ok(());
+        }
+        self.atomic_write_bytes(bytes)
+    }
+
+    fn plan_takeover_edit(&self, gateway_url: &str, first: bool) -> Result<Vec<u8>, SettingsError> {
         let region = REDIRECTED_REGION;
         // Written by rename, a file with other names would keep the takeover under one
         // name only, and the rollback could not bring them together again.
@@ -203,7 +227,11 @@ impl SettingsManager {
                 }),
             ),
         ];
-        values.extend(our_preferences());
+        values.extend(
+            our_preferences()
+                .into_iter()
+                .filter(|(key, _)| first || *key == "update.mode"),
+        );
 
         // Kiro's core proxy agent drops IP identity on TLS tunnels. Bypass only
         // this gateway; keep the user's other proxy exceptions and TLS checks.
@@ -296,19 +324,14 @@ impl SettingsManager {
         verified_bytes(&text, &map).map(Rollback::Write)
     }
 
-    /// Check if BYOK redirection keys are currently active in `settings.json`.
+    /// Check if BYOK redirection keys are currently active in `settings.json`. Only the
+    /// redirection counts: Tab Autocomplete switched back on by the customer is their
+    /// choice, and refusing "Open Kiro" over it left them no way back into Kiro.
     pub fn is_byok_active(&self, gateway_url: Option<&str>) -> bool {
         let map = match self.read_settings() {
             Ok(m) => m,
             Err(_) => return false,
         };
-
-        let auto_comp = map
-            .get("kiroAgent.enableTabAutocomplete")
-            .and_then(|v| v.as_bool());
-        if auto_comp != Some(false) {
-            return false;
-        }
 
         if let Some(expected_url) = gateway_url {
             let gw = expected_url.trim_end_matches('/');

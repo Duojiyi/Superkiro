@@ -25,8 +25,9 @@ pub fn reads_only(method: &str, path: &str) -> bool {
 /// anything listed here overwrites the previous entry's support payload. A
 /// working-set trim changes nothing that needs recovering, and letting it claim
 /// the slot destroyed the only evidence a failed restore leaves behind. Launching
-/// the editor is in the same category: it writes no configuration, so recording it
-/// would let the customer's next click erase the failure support asks them to quote.
+/// the editor is in the same category: it writes configuration only where the
+/// takeover's own keys have drifted, and recording it would let the customer's next
+/// click erase the failure support asks them to quote.
 pub fn is_tracked_operation(method: &str, path: &str) -> bool {
     method == "POST"
         && matches!(
