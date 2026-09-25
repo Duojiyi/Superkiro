@@ -365,7 +365,14 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
       } catch {setActionError('调账恢复记录无法读取，请先核对账本；本次未发送删除请求。'); return;}
     }
     const label = {freeze: '冻结', unfreeze: '解冻', ban: '封禁', void: '删除（永久作废）', archive: '归档', unarchive: '取消归档', export: '导出明文卡密'}[action];
-    if (!window.confirm(`确认仅对已选 ${targets.length} 张卡密执行${label}？${action === 'export' ? '下载文件包含秘密，请妥善保管。' : action === 'void' ? '包含已激活卡密；删除后不可恢复或使用，剩余额度失效但账面余额、财务与审计记录保留，不自动退款。有在途请求的卡将拒绝删除，请先冻结并等待结算后重试。' : action === 'archive' || action === 'unarchive' ? '仅改变管理列表展示，不解封、不续期、不修改余额或历史账本。只有已封禁、已到期或已作废的卡密可归档。' : '状态操作可能中断使用，请核对选择。'}`)) return;
+    // Name what is about to change: a count alone let a mis-ticked page be voided.
+    const named = targets.slice(0, 8).map(card => card.id).join('、') + (targets.length > 8 ? ` 等 ${targets.length} 张` : '');
+    const activated = targets.filter(card => card.status !== 'unactivated').length;
+    const withBalance = targets.filter(card => card.creditTotal > card.creditUsed).length;
+    if (!window.confirm(`确认仅对已选 ${targets.length} 张卡密执行${label}？
+${named}
+其中已激活 ${activated} 张，有剩余额度 ${withBalance} 张。
+${action === 'export' ? '下载文件包含秘密，请妥善保管。' : action === 'void' ? (activated ? '含已激活卡密；' : '') + '删除后不可恢复或使用，剩余额度失效但账面余额、财务与审计记录保留，不自动退款。有在途请求的卡将拒绝删除，请先冻结并等待结算后重试。' : action === 'archive' || action === 'unarchive' ? '仅改变管理列表展示，不解封、不续期、不修改余额或历史账本。只有已封禁、已到期或已作废的卡密可归档。' : '状态操作可能中断使用，请核对选择。'}`)) return;
     writing.current = true; setCardBulkBusy(true); setCardBulkResults([]); setActionError('');
     const results: Array<{id: string; result: string}> = [];
     const codes: string[] = [];
