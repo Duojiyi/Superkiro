@@ -8,6 +8,10 @@ type Phase = 'idle' | 'installing' | 'restarting' | 'failed';
 const INTERVAL = 30 * 60 * 1000;
 // Refused because a takeover or restore was running: try again once it is likely done.
 const BUSY_RETRY = 30 * 1000;
+// A dropped network line: retry automatically, resuming from the break point, a few times
+// before asking the customer.
+const NETWORK_RETRY = 3 * 1000;
+const MAX_NETWORK_RETRIES = 3;
 // A backstop so a stuck install never leaves the screen spinning forever with no way out.
 const INSTALL_LIMIT = 15 * 60 * 1000;
 const version = (v: unknown): v is string => typeof v === 'string' && /^\d{1,9}(\.\d{1,9}){0,3}$/.test(v);
@@ -42,8 +46,11 @@ export function useUpdater(blocked: boolean, onUpdated: (version: string) => voi
   const [retryAt, setRetryAt] = useState(0);
   const [postponed, setPostponed] = useState(false);
   const [resumed, setResumed] = useState(false);
+  const [autoRetry, setAutoRetry] = useState(false);
   const notified = useRef(false);
   const sawProgress = useRef(false);
+  const networkRetries = useRef(0);
+  const mandatoryRef = useRef(false);
   const confirmed = useRef(false);
   const updatedLatest = useRef(onUpdated);
   updatedLatest.current = onUpdated;
@@ -79,7 +86,7 @@ export function useUpdater(blocked: boolean, onUpdated: (version: string) => voi
     return () => { disposed = true; stop?.(); };
   }, []);
   const install = useCallback(async () => {
-    setPhase('installing'); setError(null); setProgress(null); setPostponed(false); setResumed(false); sawProgress.current = false;
+    setPhase('installing'); setError(null); setProgress(null); setPostponed(false); setResumed(false); setAutoRetry(false); sawProgress.current = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
@@ -87,15 +94,25 @@ export function useUpdater(blocked: boolean, onUpdated: (version: string) => voi
         new Promise((_, reject) => { timer = setTimeout(() => reject(toClientError({ code: 'SK-UPDATE-004' })), INSTALL_LIMIT); }),
       ]);
       // The host starts the new version and ends this one.
+      networkRetries.current = 0;
       setPhase('restarting');
     } catch (e) {
       const failure = toClientError(e);
       // A takeover or restore is running: fall back to the page and try again shortly.
       if (failure.code === 'SK-LOCAL-002') { setPhase('idle'); setRetryAt(Date.now() + BUSY_RETRY); return; }
+      // A dropped line during a required update: resume automatically a few times before
+      // asking. The download continues from the break point, so a retry does not start over.
+      // An optional update falls through to the failure screen, where the retry also resumes.
+      if (failure.code === 'SK-UPDATE-001' && mandatoryRef.current && networkRetries.current < MAX_NETWORK_RETRIES) {
+        networkRetries.current += 1;
+        setPhase('idle'); setAutoRetry(true); setRetryAt(Date.now() + NETWORK_RETRY);
+        return;
+      }
       setError(failure); setPhase('failed');
     } finally { clearTimeout(timer); }
   }, []);
   const mandatory = check?.state === 'available' && check.mandatory === true;
+  mandatoryRef.current = mandatory;
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     if (retryAt <= now) return;
@@ -106,11 +123,11 @@ export function useUpdater(blocked: boolean, onUpdated: (version: string) => voi
     if (mandatory && phase === 'idle' && !blocked && !postponed && retryAt <= now) void install();
   }, [mandatory, phase, blocked, postponed, retryAt, now, install]);
   // Put a failed mandatory update off so the app is usable; it keeps offering from the header.
-  const dismiss = useCallback(() => { setPhase('idle'); setError(null); setPostponed(true); }, []);
-  const start = useCallback(() => { setPostponed(false); void install(); }, [install]);
+  const dismiss = useCallback(() => { setPhase('idle'); setError(null); setPostponed(true); setAutoRetry(false); }, []);
+  const start = useCallback(() => { setPostponed(false); networkRetries.current = 0; void install(); }, [install]);
   const available = check?.state === 'available' ? check : null;
   return {
-    check, phase, progress, error, install, dismiss, start, postponed, resumed,
+    check, phase, progress, error, install, dismiss, start, postponed, resumed, autoRetry,
     /** An update the customer can start from the header: an optional one, or a mandatory one
      * that failed and was put off. */
     offer: available && phase === 'idle' && (!mandatory || postponed) ? available : null,
@@ -125,7 +142,7 @@ export type Updater = ReturnType<typeof useUpdater>;
  * Kiro is always reachable, and a mandatory update that keeps failing can be put off - a
  * customer is never locked out of restoring their configuration or using the client. */
 export function UpdateScreen({ updater, blocked, openDownloads, restore }: { updater: Updater; blocked: boolean; openDownloads: () => void; restore: (() => void) | null }) {
-  const { check, phase, progress, error, resumed } = updater;
+  const { check, phase, progress, error, resumed, autoRetry } = updater;
   const mandatory = check?.state === 'available' && check.mandatory === true;
   const title = phase === 'restarting' ? '正在重启 Superkiro' : phase === 'installing' ? '正在更新 Superkiro' : phase === 'failed' ? '更新未完成' : '需要更新 Superkiro';
   // The download's own progress; once it reaches the full size the host is verifying and
@@ -150,9 +167,10 @@ export function UpdateScreen({ updater, blocked, openDownloads, restore }: { upd
           <div className="update-stat">{phase === 'restarting' ? '↻' : downloading ? `${percent}%` : finishing ? '校验并安装' : connecting ? '连接中' : '准备中'}</div>
           <p className="muted">{phase === 'restarting' ? '新版本已就绪，正在重新打开客户端…'
             : blocked ? '正在等待当前操作完成，完成后自动开始更新。'
-              : connecting ? '正在连接更新服务器…'
-                : downloading ? `已下载 ${megabytes(progress!.received)} / ${megabytes(progress!.total)} MB${resumed ? ' · 已从断点续传' : ''}`
-                  : finishing ? '正在校验并安装新版本…' : '即将开始更新…'}</p>
+              : autoRetry && phase === 'idle' ? '网络中断，正在自动断点续传重试…'
+                : connecting ? '正在连接更新服务器…'
+                  : downloading ? `已下载 ${megabytes(progress!.received)} / ${megabytes(progress!.total)} MB${resumed ? ' · 已从断点续传' : ''}`
+                    : finishing ? '正在校验并安装新版本…' : '即将开始更新…'}</p>
         </div>}
     </div>
     {phase === 'failed' && <>

@@ -101,6 +101,33 @@ describe('useUpdater and UpdateScreen', () => {
     expect(screen.getByRole('heading', { name: '正在重启 Superkiro' })).toBeTruthy();
   });
 
+  it('a dropped line resumes automatically, then gives up after a few tries', async () => {
+    vi.useFakeTimers();
+    let attempts = 0;
+    host(mandatory, async () => { attempts++; if (attempts <= 2) throw failure('SK-UPDATE-001'); return new Promise(() => {}); });
+    render(<Harness/>); await flush();
+    expect(attempts).toBe(1);
+    expect(screen.getByText(/网络中断，正在自动断点续传重试/)).toBeTruthy();
+    await act(async () => { vi.advanceTimersByTime(3_000); }); await flush();
+    expect(attempts).toBe(2);
+    await act(async () => { vi.advanceTimersByTime(3_000); }); await flush();
+    // The third attempt gets through and proceeds to install (no failure screen).
+    expect(attempts).toBe(3);
+    expect(screen.getByRole('heading', { name: '正在更新 Superkiro' })).toBeTruthy();
+    expect(screen.queryByRole('heading', { name: '更新未完成' })).toBeNull();
+  });
+
+  it('after too many dropped lines it stops and asks the customer', async () => {
+    vi.useFakeTimers();
+    let attempts = 0;
+    host(mandatory, async () => { attempts++; throw failure('SK-UPDATE-001'); });
+    render(<Harness/>); await flush();
+    for (let i = 0; i < 4; i++) { await act(async () => { vi.advanceTimersByTime(3_000); }); await flush(); }
+    // One initial try plus three automatic resumes, then the failure screen.
+    expect(attempts).toBe(4);
+    expect(screen.getByRole('heading', { name: '更新未完成' })).toBeTruthy();
+  });
+
   it('refused by an operation in progress, tries again half a minute later', async () => {
     vi.useFakeTimers();
     let attempts = 0;
