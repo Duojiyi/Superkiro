@@ -274,6 +274,9 @@ pub fn create_stream_guard_with_send_deadline(
     let send_deadline = tokio::time::Instant::now() + send_timeout;
 
     tokio::spawn(async move {
+        // Keepalives fill any silence the client sees. Only a frame sent restarts the
+        // clock: the fragments of a tool call arrive for minutes but are forwarded only
+        // once it is complete.
         let mut interval = tokio::time::interval(config.keepalive_interval);
         let deadline_sleep = tokio::time::sleep_until(send_deadline);
         tokio::pin!(deadline_sleep);
@@ -307,7 +310,6 @@ pub fn create_stream_guard_with_send_deadline(
                     }
                 }
                 event = upstream.next() => {
-                    interval.reset();
                     match event {
                         Some(Ok(ProviderStreamEvent::Delta(delta))) => {
                             let frame = match delta {
@@ -354,6 +356,7 @@ pub fn create_stream_guard_with_send_deadline(
                             };
                             if let Some(frame) = frame {
                                 if !send_frame(&tx, Bytes::from(frame), send_deadline).await { break; }
+                                interval.reset();
                             }
                         }
                         Some(Ok(ProviderStreamEvent::Usage(next))) => {
@@ -378,6 +381,7 @@ pub fn create_stream_guard_with_send_deadline(
                             for frame in frames {
                                 if !send_frame(&tx, Bytes::from(frame), send_deadline).await { break 'stream; }
                             }
+                            interval.reset();
                         }
                         Some(Ok(ProviderStreamEvent::StopReason(reason))) => {
                             stop_reason = Some(StreamTranslationState::map_stop_reason(&reason));

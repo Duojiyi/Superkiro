@@ -121,6 +121,67 @@ async fn test_stream_guard_keepalive_injection_during_idle() {
     assert_eq!(text_evt.content, "Hello after delay");
 }
 
+// A tool call is forwarded only once complete, so nothing else reaches the client while
+// the model writes it. Keepalives must keep flowing meanwhile, or Kiro's watchdog and
+// idle proxies drop a turn that writes a large file.
+#[tokio::test]
+async fn keepalives_continue_while_a_tool_call_is_generated() {
+    let (tx, rx) = mpsc::channel(16);
+    tokio::spawn(async move {
+        for n in 0..40 {
+            let first = n == 0;
+            let _ = tx
+                .send(Ok(ProviderStreamEvent::Delta(
+                    ProviderDelta::ToolCallChunk {
+                        index: 0,
+                        id: first.then(|| "call-write".to_string()),
+                        name: first.then(|| "fsWrite".to_string()),
+                        arguments: if first { "{\"text\":\"" } else { "line " }.to_string(),
+                    },
+                )))
+                .await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let _ = tx
+            .send(Ok(ProviderStreamEvent::Delta(
+                ProviderDelta::ToolCallChunk {
+                    index: 0,
+                    id: None,
+                    name: None,
+                    arguments: "\"}".to_string(),
+                },
+            )))
+            .await;
+        let _ = tx.send(Ok(ProviderStreamEvent::Done)).await;
+    });
+
+    let config = StreamGuardConfig {
+        keepalive_interval: Duration::from_millis(50),
+        model_id: "test-model".to_string(),
+        context_window: None,
+    };
+    let stream = create_stream_guard(ReceiverStream::new(rx), config, None, None, None);
+    let frames = collect_and_decode_frames(stream).await;
+
+    let tool_at = frames
+        .iter()
+        .position(|(name, _)| name == "toolUseEvent")
+        .expect("the tool call is forwarded");
+    let keepalives = frames[..tool_at]
+        .iter()
+        .filter(|(name, payload)| {
+            name == "assistantResponseEvent"
+                && decode_single_event::<AssistantResponseEvent>(payload)
+                    .content
+                    .is_empty()
+        })
+        .count();
+    assert!(
+        keepalives >= 3,
+        "{keepalives} keepalives while the tool call was generated"
+    );
+}
+
 #[tokio::test]
 async fn test_stream_guard_normal_flow_with_tool_use_and_usage() {
     let (tx, rx) = mpsc::channel(16);
