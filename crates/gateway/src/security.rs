@@ -283,7 +283,9 @@ pub struct ContentGuardrailConfig {
     pub max_body_bytes: usize,
     /// Maximum number of images allowed in a single conversation turn (default: 20).
     pub max_images_per_request: usize,
-    /// Maximum size of an individual image before compression (Spec §4.3: 400KB).
+    /// Maximum size of an individual image before compression. Images larger than the
+    /// 400 KB a provider is sent (Spec §4.3) are shrunk to fit, so this is what the shrink
+    /// pipeline accepts, not that size.
     pub max_image_bytes: usize,
     /// Maximum prompt/context characters allowed (default: 2,000,000).
     pub max_prompt_chars: usize,
@@ -294,7 +296,7 @@ impl Default for ContentGuardrailConfig {
         Self {
             max_body_bytes: 10 * 1024 * 1024, // 10 MB
             max_images_per_request: 20,
-            max_image_bytes: 400 * 1024, // 400 KB
+            max_image_bytes: crate::translate::images::MAX_IMAGE_PAYLOAD_BYTES,
             max_prompt_chars: 2_000_000,
         }
     }
