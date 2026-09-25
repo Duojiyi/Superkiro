@@ -97,7 +97,10 @@ const server=http.createServer(async(req,res)=>{
     assert(await page.getByRole('spinbutton',{name:'增减积分数量'}).isDisabled());
     await page.reload();await page.getByRole('button',{name:'重新登录确认调账账户'}).click();
     assert.equal(adjustmentBodies.length,1);
-    await page.getByLabel('密码',{exact:true}).fill('fixture-password');await page.getByRole('button',{name:'登录',exact:true}).click();
+    await page.getByLabel('密码',{exact:true}).fill('fixture-password');
+    // The typed password lives in the input's value property only, never in markup.
+    assert(!(await page.content()).includes('fixture-password'),'password mirrored into the DOM');
+    await page.getByRole('button',{name:'登录',exact:true}).click();
     await page.getByRole('navigation').getByRole('button',{name:'卡密资产',exact:true}).click();
     await page.getByRole('button',{name:'调账',exact:true}).first().click();
     assert.equal(await page.getByRole('textbox',{name:'调账原因说明'}).inputValue(),'fixture adjustment');

@@ -26,6 +26,10 @@ export default function App() {
   const [workspaceVersion, setWorkspaceVersion] = useState(0);
   const [username, setUsername] = useState('admin');
   const [password, setPassword] = useState('');
+  // Uncontrolled: React copies a controlled input's value into its DOM attribute, where
+  // markup snapshots and attribute selectors can read it. The DOM property is enough.
+  const passwordInput = useRef<HTMLInputElement>(null);
+  useEffect(() => {if (!password && passwordInput.current) passwordInput.current.value = '';}, [password]);
   const [totpCode,setTotpCode]=useState('');
   const [totpRequired,setTotpRequired]=useState(false);
   const [busy, setBusy] = useState(false);
@@ -100,7 +104,7 @@ export default function App() {
     <p className="auth-brand">Superkiro</p><h1 id="login-title">管理员登录</h1>
     <form onSubmit={event => {event.preventDefault(); void login();}} aria-busy={busy}>
       <label>用户名<input autoComplete="username" required disabled={busy} value={username} onChange={event => setUsername(event.target.value)} /></label>
-      <label>密码<input type="password" autoComplete="current-password" required disabled={busy} value={password} onChange={event => setPassword(event.target.value)} /></label>
+      <label>密码<input ref={passwordInput} type="password" autoComplete="current-password" required disabled={busy} onChange={event => setPassword(event.target.value)} /></label>
       {totpRequired && <><label>动态验证码{totpRequired?'（必填）':'（已配置 2FA 时填写）'}<input aria-label="动态验证码" inputMode="numeric" autoComplete="one-time-code" pattern="[0-9]{6}" maxLength={6} required={totpRequired} disabled={busy} value={totpCode} onChange={event=>setTotpCode(event.target.value)} /></label>
       <p className="muted">验证码已使用或服务刚重启时，请等待下一轮动态码再试。</p></>}
       {error && <p role="alert">{error}</p>}

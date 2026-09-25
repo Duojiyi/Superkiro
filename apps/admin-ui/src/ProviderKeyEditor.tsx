@@ -7,6 +7,9 @@ export default function ProviderKeyEditor({ selectedKey, onSaved, onDirtyChange,
   const [format, setFormat] = useState('anthropic');
   const [keyId, setKeyId] = useState('');
   const [secret, setSecret] = useState('');
+  // Uncontrolled so the key never lands in the input's DOM attribute.
+  const secretInput = useRef<HTMLInputElement>(null);
+  useEffect(() => {if (!secret && secretInput.current) secretInput.current.value = '';}, [secret]);
   const [models, setModels] = useState('');
   const [weight, setWeight] = useState('1');
   const [enabled, setEnabled] = useState(true);
@@ -120,7 +123,7 @@ export default function ProviderKeyEditor({ selectedKey, onSaved, onDirtyChange,
         <button className="p-2 bg-[#EFF1EF] rounded" disabled={!!review || !provider.trim() || !secret || !baseUrl.trim()} onClick={()=>void createProvider()}>使用下方密钥与模型草稿导入渠道</button>
       </div></details>
       <label className="block">Key ID<input className={cls} value={keyId} onChange={e=>setKeyId(e.target.value)} /></label>
-      <label className="block">API Key（新增必填，更新可留空）<input type="password" autoComplete="new-password" className={cls} value={secret} onChange={e=>setSecret(e.target.value)} /></label>
+      <label className="block">API Key（新增必填，更新可留空）<input ref={secretInput} type="password" autoComplete="new-password" className={cls} onChange={e=>setSecret(e.target.value)} /></label>
       <label className="block">允许模型（每行一个精确 ID）<textarea rows={6} className={cls} value={models} onChange={e=>setModels(e.target.value)} /></label>
       <p className="muted">当前草稿 {modelIds.length} 个唯一模型，保存时自动去重。空列表表示拒绝所有模型，不是允许全部。</p>
       <label className="block">权重<input type="number" min={1} max={1000} step={1} className={cls} value={weight} aria-describedby="key-weight-help" onChange={e=>setWeight(e.target.value)} /></label>
