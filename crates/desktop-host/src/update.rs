@@ -1896,6 +1896,65 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A client bundle as the release archive holds it, with `body` as its executable.
+    #[cfg(target_os = "macos")]
+    fn bundle_in(dir: &Path, body: &[u8]) -> PathBuf {
+        let bundle = dir.join("Superkiro.app");
+        fs::create_dir_all(bundle.join("Contents/MacOS")).unwrap();
+        fs::write(bundle.join("Contents/MacOS/Superkiro"), body).unwrap();
+        bundle
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_macos_bundle_is_unpacked_beside_and_swapped_into_place() {
+        let dir = scratch("macos-swap");
+        let current = bundle_in(&dir, b"old");
+        // The release archive, as publish_native_macos.py checks it: Superkiro.app at its root.
+        let source = dir.join("source");
+        bundle_in(&source, b"new");
+        let release = release_of(b"archive", "9.9.9");
+        let verified = download_part(&current, &release);
+        let packed = Command::new("/usr/bin/tar")
+            .arg("-czf")
+            .arg(&verified)
+            .arg("-C")
+            .arg(&source)
+            .arg("Superkiro.app")
+            .status()
+            .unwrap();
+        assert!(packed.success());
+        let executable = current.join("Contents/MacOS/Superkiro");
+        let pending = stage(&verified, &current, &executable, &release).unwrap();
+        // Staged in its own hidden folder; the customer's bundle and the archive untouched.
+        assert_eq!(fs::read(&executable).unwrap(), b"old");
+        assert_eq!(fs::read(&pending.executable).unwrap(), b"new");
+        assert!(verified.is_file());
+        assert!(staged_root(&pending).is_some());
+        // Put off: the archive stays for the next attempt, the staged copy goes.
+        unstage(&pending, &verified);
+        assert!(verified.is_file());
+        assert!(!pending.staged.exists());
+        // Confirmed: one swap puts the new bundle in place and nothing is left beside it.
+        let pending = stage(&verified, &current, &executable, &release).unwrap();
+        assert!(move_into_place(&pending));
+        assert_eq!(fs::read(&executable).unwrap(), b"new");
+        assert!(!staged_root(&pending).unwrap().exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_macos_swap_exchanges_two_bundles_in_one_step() {
+        let dir = scratch("macos-exchange");
+        let a = bundle_in(&dir.join("a"), b"a");
+        let b = bundle_in(&dir.join("b"), b"b");
+        swap_paths(&a, &b).unwrap();
+        assert_eq!(fs::read(a.join("Contents/MacOS/Superkiro")).unwrap(), b"b");
+        assert_eq!(fs::read(b.join("Contents/MacOS/Superkiro")).unwrap(), b"a");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn an_unreadable_state_is_not_an_empty_one() {
         let dir = scratch("state-read");
