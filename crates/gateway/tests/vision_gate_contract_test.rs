@@ -284,6 +284,54 @@ async fn a_large_screenshot_is_shrunk_instead_of_refused() {
     assert!(!sent.contains(&screenshot[..200]), "and not as it was sent");
 }
 
+/// Kiro resends every earlier image on every turn. Their base64 is not prompt text: a
+/// few screenshots must not push a conversation over the prompt length limit for good.
+#[tokio::test]
+async fn earlier_screenshots_do_not_count_toward_the_prompt_length() {
+    let h = harness(true, false).await;
+    let mut history = Vec::new();
+    for turn in 0..4 {
+        let screenshot = noise_png(360, 360);
+        assert!(
+            screenshot.len() / 4 * 3 <= 400 * 1024,
+            "each fits on its own"
+        );
+        history.push(json!({"userInputMessage": {
+            "content": format!("screenshot {turn}"),
+            "images": [{"format": "png", "source": {"bytes": screenshot}}]
+        }}));
+        history.push(json!({"assistantResponseMessage": {"content": "seen"}}));
+    }
+    let payload = json!({"conversationState": {
+        "conversationId": "conv-vision",
+        "history": history,
+        "currentMessage": {"userInputMessage": {"content": "and now?", "modelId": EXPOSED}}
+    }});
+    assert!(payload.to_string().len() > 2_000_000);
+    let (status, body) = h.send(payload).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        serde_json::to_string(&h.upstream_body().await)
+            .unwrap()
+            .matches("data:image/png;base64,")
+            .count(),
+        4
+    );
+
+    // Text still counts.
+    let (status, body) = h
+        .send(json!({"conversationState": {
+            "conversationId": "conv-vision",
+            "currentMessage": {"userInputMessage": {
+                "content": "x".repeat(2_000_001),
+                "modelId": EXPOSED
+            }}
+        }}))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("Prompt content too long"), "{body}");
+}
+
 /// A configured degradation path must actually run. Before the capability sources
 /// were unified this returned 502 and never called the vision provider at all.
 #[tokio::test]

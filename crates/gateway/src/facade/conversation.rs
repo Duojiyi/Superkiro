@@ -1156,15 +1156,32 @@ fn validate_conversation_request(
         });
     }
 
-    // Validate the complete serialized conversation, including tool schemas,
-    // tool results, tool calls and metadata, rather than only visible text.
-    let prompt_chars = serde_json::to_string(request)
-        .map(|json| json.chars().count())
-        .unwrap_or(usize::MAX);
     let current = &request
         .conversation_state
         .current_message
         .user_input_message;
+    // Validate the complete serialized conversation, including tool schemas,
+    // tool results, tool calls and metadata, rather than only visible text. Image
+    // payloads are left out: Kiro resends every earlier image on every turn, and an
+    // image is bounded by the image limits and reaches the model as an image or a
+    // note, never as text.
+    let image_chars: usize = request
+        .conversation_state
+        .history
+        .iter()
+        .filter_map(|message| match message {
+            kiro_wire::requests::conversation::Message::User(user) => {
+                Some(&user.user_input_message.images)
+            }
+            kiro_wire::requests::conversation::Message::Assistant(_) => None,
+        })
+        .chain([&current.images])
+        .flatten()
+        .map(|image| image.source.bytes.chars().count())
+        .sum();
+    let prompt_chars = serde_json::to_string(request)
+        .map(|json| json.chars().count().saturating_sub(image_chars))
+        .unwrap_or(usize::MAX);
     let mut image_sizes = Vec::with_capacity(current.images.len());
     for image in &current.images {
         let decoded = base64::Engine::decode(
