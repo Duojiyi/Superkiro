@@ -20,3 +20,12 @@ condition = "AND"
 paths = ['^docs/portal-pencil(-v2)?/.*\.pen$']
 regexTarget = "line"
 regexes = ['"fileToken": "81bd6a07-39b4-472b-89cb-678a463b1524"']
+
+# Ed25519 public keys: the client's trusted update key, the debug-only test key, and a
+# cross-language signature test vector. Public by design; no private half is committed.
+[[allowlists]]
+description = "Ed25519 public update keys and a public signature test vector, not credentials"
+condition = "AND"
+paths = ['^crates/desktop-host/src/update\.rs$', '^deploy/update_signing\.py$']
+regexTarget = "secret"
+regexes = ['^(346633520d5a0d37dbf8cc09028724118a84c7eb14181596e2a8439a699263eb|197f6b23e16c8532c6abc838facd5ea789be0c76b2920334039bfa8b3d368d61|03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8)$']
