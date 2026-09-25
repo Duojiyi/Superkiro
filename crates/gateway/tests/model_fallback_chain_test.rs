@@ -256,6 +256,122 @@ async fn test_model_fallback_chain_on_upstream_failure() {
     assert_eq!(fb_body["model"], "gpt-4o-fallback");
 }
 
+/// Where a model is routed is the operator's business. Every frame the customer receives
+/// names the model they asked for, whether the primary target or a fallback answered.
+#[tokio::test]
+async fn frames_name_the_model_asked_for_not_the_upstream_target() {
+    let primary_server = MockServer::start().await;
+    let fallback_server = MockServer::start().await;
+    Mock::given(wm_method("POST"))
+        .and(wm_path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&primary_server)
+        .await;
+    let sse_body = [
+        r#"data: {"id":"3","choices":[{"delta":{"content":"Hello "}}]}"#,
+        r#"data: {"id":"3","choices":[{"delta":{"content":"there"}}]}"#,
+        r#"data: {"id":"3","choices":[],"usage":{"prompt_tokens":15,"completion_tokens":8,"total_tokens":23}}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n");
+    Mock::given(wm_method("POST"))
+        .and(wm_path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+        .mount(&fallback_server)
+        .await;
+
+    let (billing, auth) = setup_auth();
+    billing.upsert_group(Group::pro_plus("group-frames", "Frames Test Group"));
+    create_activated_card(&billing, "card-frames", "group-frames");
+    billing.upsert_model_map(
+        ModelMap::new(
+            "mm-frames",
+            "group-frames",
+            "claude-sonnet-4.5",
+            "p-internal",
+            "internal-cheap-model",
+        )
+        .with_fallback("p-reserve", "internal-reserve-model"),
+    );
+    let primary_pool = ProviderKeyPool::new(
+        Provider::new(
+            "p-internal",
+            "Internal",
+            ProviderFormat::OpenAi,
+            primary_server.uri(),
+        ),
+        vec![ProviderKey::new("k-internal", "p-internal", "sk-1")],
+    );
+    let fallback_pool = ProviderKeyPool::new(
+        Provider::new(
+            "p-reserve",
+            "Reserve",
+            ProviderFormat::OpenAi,
+            fallback_server.uri(),
+        ),
+        vec![ProviderKey::new("k-reserve", "p-reserve", "sk-2")],
+    );
+    let token = auth.issue_token_for_card("card-frames", 3600).unwrap();
+    let conv_handler = GenerateAssistantResponseHandler::new(
+        reqwest::Client::new(),
+        Arc::new(OpenAiProvider),
+        ProviderConfig::new(
+            primary_server.uri(),
+            "sk-1",
+            "internal-cheap-model",
+            Duration::from_secs(5),
+        ),
+        billing.clone(),
+        IdempotencyManager::default(),
+    )
+    .with_pool(primary_pool)
+    .with_fallback_pool("p-reserve", fallback_pool);
+    let mut registry = FacadeRegistry::new();
+    registry.register(conv_handler);
+    let app = registry.into_router_with_auth(auth);
+
+    let req_payload = serde_json::json!({
+        "conversationState": {
+            "conversationId": "conv-frames",
+            "currentMessage": {"userInputMessage": {
+                "content": "Hello",
+                "modelId": "claude-sonnet-4.5"
+            }}
+        }
+    });
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/generateAssistantResponse")
+        .header(header::AUTHORIZATION, format!("Bearer {}", token))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&req_payload).unwrap()))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(fallback_server.received_requests().await.unwrap().len(), 1);
+
+    let mut decoder = kiro_wire::decoder::EventStreamDecoder::new();
+    decoder.feed(&bytes).unwrap();
+    let mut text = String::new();
+    while let Some(frame) = decoder.decode().unwrap() {
+        if frame.event_type() == Some("assistantResponseEvent") {
+            let event: Value = serde_json::from_slice(&frame.payload).unwrap();
+            assert_eq!(event["modelId"], "claude-sonnet-4.5");
+            text.push_str(event["content"].as_str().unwrap());
+        }
+    }
+    assert_eq!(text, "Hello there");
+    let raw = String::from_utf8_lossy(&bytes);
+    assert!(
+        !raw.contains("internal-"),
+        "an upstream target reached the client"
+    );
+}
+
 #[tokio::test]
 async fn test_model_fallback_chain_all_exhausted() {
     let primary_server = MockServer::start().await;

@@ -1030,7 +1030,9 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
             });
             let guard_config = StreamGuardConfig {
                 keepalive_interval: Duration::from_secs(20),
-                model_id: actual_target_model.clone(),
+                // The model the customer asked for. The target, a fallback included, is
+                // internal routing and stays in the server-side traces.
+                model_id: requested_model.to_string(),
                 context_window: Some(context_window),
             };
 
