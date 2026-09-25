@@ -4265,30 +4265,50 @@ impl BillingEngine {
 
     /// Add platform degradation announcement (Spec §14.4).
     pub fn add_announcement(&self, announcement: Announcement) {
-        {
-            let _state_guard = self.state_lock.write().unwrap();
-            let mut anns = self.announcements.write().unwrap();
-            anns.retain(|a| a.id != announcement.id);
-            anns.push(announcement);
-        }
+        self.add_announcement_unsaved(announcement);
         self.sync_to_disk();
     }
 
-    /// Withdraw a published announcement: it stops being shown at once and stays on
-    /// record. Returns false when no announcement has that id.
-    pub fn withdraw_announcement(&self, id: &str) -> bool {
-        let found = {
+    /// Publish an announcement, reporting success only once it is saved: one that lived
+    /// in memory alone would vanish at the next restart while the operator was told it
+    /// was published. On a failed save it is taken back out.
+    pub fn publish_announcement(&self, announcement: Announcement) -> Result<(), BillingError> {
+        let id = announcement.id.clone();
+        self.add_announcement_unsaved(announcement);
+        self.sync_to_disk_checked().inspect_err(|_| {
             let _state_guard = self.state_lock.write().unwrap();
-            let mut anns = self.announcements.write().unwrap();
-            anns.iter_mut()
+            self.announcements.write().unwrap().retain(|a| a.id != id);
+        })
+    }
+
+    fn add_announcement_unsaved(&self, announcement: Announcement) {
+        let _state_guard = self.state_lock.write().unwrap();
+        let mut anns = self.announcements.write().unwrap();
+        anns.retain(|a| a.id != announcement.id);
+        anns.push(announcement);
+    }
+
+    /// Withdraw a published announcement: it stops being shown at once and stays on
+    /// record. Returns false when no announcement has that id; a failed save puts the
+    /// announcement back as it was.
+    pub fn withdraw_announcement(&self, id: &str) -> Result<bool, BillingError> {
+        let set_enabled = |enabled: bool| {
+            let _state_guard = self.state_lock.write().unwrap();
+            self.announcements
+                .write()
+                .unwrap()
+                .iter_mut()
                 .find(|a| a.id == id)
-                .map(|a| a.enabled = false)
+                .map(|a| a.enabled = enabled)
                 .is_some()
         };
-        if found {
-            self.sync_to_disk();
+        if !set_enabled(false) {
+            return Ok(false);
         }
-        found
+        self.sync_to_disk_checked().inspect_err(|_| {
+            set_enabled(true);
+        })?;
+        Ok(true)
     }
 
     /// List active platform announcements (Spec §14.4).

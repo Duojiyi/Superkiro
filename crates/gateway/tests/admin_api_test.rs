@@ -1174,3 +1174,84 @@ async fn a_published_announcement_can_be_withdrawn_and_stops_being_shown() {
     let resp = tower::ServiceExt::oneshot(app, anonymous).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn an_announcement_is_published_or_withdrawn_only_once_saved() {
+    let dir = std::env::temp_dir().join(format!(
+        "kiro_announcement_save_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let path = dir.join("billing_state.json");
+    let billing = BillingEngine::new();
+    billing.set_master_kek(billing::MasterKek::from_bytes([44; 32]));
+    billing.save_to_file(&path).unwrap();
+    let mut registry = FacadeRegistry::new();
+    registry.register_admin_facades(billing.clone(), TEST_ADMIN_KEY.to_string());
+    let app = registry.into_router();
+    let post = |uri: &str, body: serde_json::Value| {
+        Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header("x-admin-key", TEST_ADMIN_KEY)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let notice = json!({"title": "Maintenance", "content": "Tonight", "ttlSecs": 3600});
+    let now = gateway::now_secs();
+
+    billing.inject_persistence_fault(true);
+    let resp = tower::ServiceExt::oneshot(
+        app.clone(),
+        post("/api/v1/admin/announcements", notice.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        billing.list_active_announcements(now).is_empty(),
+        "an unsaved one is not live"
+    );
+
+    billing.inject_persistence_fault(false);
+    let resp = tower::ServiceExt::oneshot(app.clone(), post("/api/v1/admin/announcements", notice))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), 16 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let id = body["announcement"]["id"].as_str().unwrap().to_string();
+
+    billing.inject_persistence_fault(true);
+    let resp = tower::ServiceExt::oneshot(
+        app.clone(),
+        post("/api/v1/admin/announcements/withdraw", json!({ "id": id })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        billing.list_active_announcements(now).len(),
+        1,
+        "still shown"
+    );
+
+    billing.inject_persistence_fault(false);
+    let resp = tower::ServiceExt::oneshot(
+        app,
+        post("/api/v1/admin/announcements/withdraw", json!({ "id": id })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(billing.list_active_announcements(now).is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}

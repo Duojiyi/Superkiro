@@ -1676,7 +1676,13 @@ impl FacadeHandler for AdminCreateAnnouncementHandler {
                 ann = ann.with_expiry(now + ttl);
             }
 
-            self.billing.add_announcement(ann.clone());
+            if self.billing.publish_announcement(ann.clone()).is_err() {
+                return error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ServiceUnavailableException",
+                    "announcement could not be saved; nothing was published",
+                );
+            }
 
             json_response(
                 StatusCode::OK,
@@ -1727,12 +1733,22 @@ impl FacadeHandler for AdminWithdrawAnnouncementHandler {
                     )
                 }
             };
-            if !self.billing.withdraw_announcement(&id) {
-                return error_response(
-                    StatusCode::NOT_FOUND,
-                    "ResourceNotFoundException",
-                    "announcement not found",
-                );
+            match self.billing.withdraw_announcement(&id) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return error_response(
+                        StatusCode::NOT_FOUND,
+                        "ResourceNotFoundException",
+                        "announcement not found",
+                    )
+                }
+                Err(_) => {
+                    return error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "ServiceUnavailableException",
+                        "withdrawal could not be saved; the announcement is still shown",
+                    )
+                }
             }
             eprintln!(
                 "{}",

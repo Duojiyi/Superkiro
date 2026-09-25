@@ -171,7 +171,8 @@ export class AdminApiClient {
     const version = this.sessionVersion;
     const controller = new AbortController();
     this.requests.add(controller);
-    const timer=setTimeout(()=>controller.abort(),15000);
+    // A download (the whole ledger) needs longer than an ordinary call.
+    const timer=setTimeout(()=>controller.abort(),blob?120000:15000);
     try {
       const res = await fetch(`${this.baseUrl}${path}`, {
         ...options, headers, signal: controller.signal, credentials: 'same-origin', cache: 'no-store',
@@ -185,7 +186,8 @@ export class AdminApiClient {
         const error = await res.json().catch(() => ({}));
         if (errorVersion !== this.sessionVersion) throw new Error('管理会话已改变，请重新加载');
         if(path==='/api/v1/admin/session' && errorVersion===this.sessionVersion){this.twoFactorEnabled=typeof error.twoFactorEnabled==='boolean'?error.twoFactorEnabled:undefined;this.totpRequired=error.totpRequired===true;}
-        throw new AdminApiError(error.error || (res.status === 401 ? '用户名或密码错误' : `请求失败 (${res.status})`),res.status);
+        // Admin errors come as {error} or, from the shared handler, {__type, message}.
+        throw new AdminApiError(error.error || error.message || (res.status === 401 ? '用户名或密码错误' : `请求失败 (${res.status})`),res.status);
       }
       const result = await (blob ? res.blob() : res.json());
       if (version !== this.sessionVersion) throw new Error('管理会话已改变，请重新加载');

@@ -481,6 +481,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
         await refreshData();
       }
     } catch (err: any) {
+      if (refused(err)) {sessionStorage.removeItem(issuanceStorageKey); setActionError(`服务端已拒绝，未生成卡密：${err.message}`); return;}
       setIssuanceRecovery('refresh'); setShowBatchModal(false);
       setActionError(`批量制卡结果未确认：${err.message}。请先核对卡密列表，不要立即重复生成。`);
     } finally {
@@ -526,7 +527,10 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
     } finally {writing.current = false; setProviderBusy(false);}
   };
 
+  const exporting = useRef(false);
   const handleExportLedger = async (format: 'json' | 'csv') => {
+    if (exporting.current) return;
+    exporting.current = true;
     try {
       showToast(`正在导出 ${format.toUpperCase()} 对账账本...`);
       const blob = await adminApi.exportLedger(format);
@@ -537,11 +541,12 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
       document.body.appendChild(a);
       a.click();
       a.remove();
-      window.URL.revokeObjectURL(url);
-      showToast(`对账 ${format.toUpperCase()} 导出完成！`);
+      // The browser reads the file after click() returns; revoking at once can cut it.
+      setTimeout(() => window.URL.revokeObjectURL(url), 60000);
+      showToast(`对账 ${format.toUpperCase()} 已开始下载，请在浏览器下载列表中确认文件完整。`);
     } catch (err: any) {
       setActionError(`导出失败：${err.message}`);
-    }
+    } finally {exporting.current = false;}
   };
 
   const handlePruneTraces = async () => {
@@ -591,6 +596,7 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
         refreshData();
       }
     } catch (err: any) {
+      if (refused(err)) {sessionStorage.removeItem(noticeStorageKey); setActionError(`服务端已拒绝，公告未发布：${err.message}`); return;}
       setNoticeRecovery('refresh'); setShowNoticeModal(false);
       setActionError(`公告发布结果未确认：${err.message}。可能已发布，请先刷新并核对现有公告，不要重复提交。`);
     } finally {writing.current=false;setMutationBusy(false);}
@@ -609,6 +615,9 @@ function AdminWorkspace({onLogout: handleLogout,operator,onReauthenticate}: {onL
       setActionError(`公告撤回结果未确认：${err.message}。请刷新公告列表核对。`);
     } finally {writing.current = false; setMutationBusy(false);}
   };
+
+  // Refused by the server's validation or policy: nothing was written, so no review is needed.
+  const refused = (err: unknown) => err instanceof AdminApiError && [400, 403, 404, 409, 413, 422].includes(err.status);
 
   useEffect(() => {setSelectedCardIds([]); setCardPage(0);}, [searchQuery, groupFilter, cardStatusFilter, activeTab]);
   useEffect(() => {setSelectedCardIds([]);}, [cardPage]);
