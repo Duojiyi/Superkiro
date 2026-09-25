@@ -148,10 +148,9 @@ class PortalBrowserTests(unittest.TestCase):
         expect(self.page.locator('#release-status')).to_contain_text('暂无可用发布')
         for key in ['windows-x64', 'macos-arm64', 'macos-x64']:
             self.assert_disabled(key)
-        self.page.locator('[data-mac]').first.click()
-        expect(self.page.locator('#mac-dialog')).to_be_visible()
-        expect(self.page.locator('#mac-dialog')).to_contain_text('尚未签名与公证')
-        self.page.keyboard.press('Escape')
+        # Both Mac downloads are on the page itself, one per chip; no dialog to open.
+        expect(self.page.locator('.downloads [data-download="macos-arm64"]')).to_contain_text('Apple 芯片（M 系列）')
+        expect(self.page.locator('.downloads [data-download="macos-x64"]')).to_contain_text('Intel 芯片')
         self.manifest_status = 404
         self.page.locator('#retry-releases').click()
         expect(self.page.locator('#release-status')).to_contain_text('暂不可用')
@@ -165,12 +164,16 @@ class PortalBrowserTests(unittest.TestCase):
                          dict(release, platform='macos', arch='arm64', url='/downloads/fixture-arm.dmg'),
                          dict(release, platform='macos', url='javascript:alert(1)')]}
         self.goto()
-        expect(self.page.locator('#release-status')).to_contain_text('发布信息已更新')
+        expect(self.page.locator('#release-status')).to_contain_text('部分安装包暂不可用')
         for a in self.page.locator('[data-download="windows-x64"]').all():
             self.assertEqual(a.get_attribute('href'), self.origin + '/downloads/fixture-win.exe')
-        expect(self.page.locator('[data-release="windows-x64"]')).to_contain_text('10.0 MB')
-        expect(self.page.locator('[data-release="windows-x64"]')).to_contain_text('ab' * 32)
+        for a in self.page.locator('[data-download="macos-arm64"]').all():
+            self.assertEqual(a.get_attribute('href'), self.origin + '/downloads/fixture-arm.dmg')
         self.assert_disabled('macos-x64')
+        # A download is only a button: no version, size, requirements or digest to read.
+        downloads = self.page.locator('.downloads').inner_text()
+        for detail in ['ab' * 32, '10.0 MB', 'Windows 测试要求', '1.2.3-test', '签名']:
+            self.assertNotIn(detail, downloads)
         # A failing refresh must revoke stale links, not leave old downloads enabled.
         self.manifest_status = 503
         self.page.locator('#retry-releases').click()
@@ -185,11 +188,20 @@ class PortalBrowserTests(unittest.TestCase):
             self.page.locator('#retry-releases').click()
             expect(self.page.locator('#release-status')).to_contain_text('暂无可用发布')
             self.assert_disabled('windows-x64')
+        # With every download available there is nothing to say at all.
+        self.manifest = {'releases': [release,
+                         dict(release, platform='macos', arch='arm64', url='/downloads/fixture-arm.dmg'),
+                         dict(release, platform='macos', arch='x64', url='/downloads/fixture-x64.dmg')]}
+        self.page.locator('#retry-releases').click()
+        expect(self.page.locator('#release-status')).to_be_hidden()
+        expect(self.page.locator('#retry-releases')).to_be_hidden()
+        for a in self.page.locator('[data-download="macos-x64"]').all():
+            self.assertEqual(a.get_attribute('href'), self.origin + '/downloads/fixture-x64.dmg')
 
     def test_03b_unusable_card_offers_no_unbind_and_another_card_can_follow(self):
         self.goto('/device')
-        # The customer site never advertises the administrator console.
-        self.assertEqual(self.page.locator('a[href="/admin/"]').count(), 0)
+        # The footer leads to the administrator console, which asks for its own sign-in.
+        expect(self.page.locator('footer a[href="/admin/"]')).to_have_text('管理后台 ↗')
         for status, label in (('voided', '已删除（作废）'), ('banned', '已禁用')):
             self.query['status'] = status
             self.verify()
@@ -283,7 +295,7 @@ class PortalBrowserTests(unittest.TestCase):
         self.goto('/docs')
         self.page.get_by_role('button', name='macOS', exact=True).click()
         expect(self.page.locator('[data-platform="macos"]')).to_have_attribute('aria-pressed', 'true')
-        expect(self.page.locator('#platform-help')).to_contain_text('尚未签名与公证')
+        expect(self.page.locator('#platform-help')).to_contain_text('Apple 芯片（M 系列）或 Intel 芯片')
         for name in ['models', 'device', 'restore', 'connection', 'downloads', 'start']:
             self.page.locator(f'.docs-nav a[href="#{name}"]').click()
             expect(self.page.locator(f'[data-doc="{name}"]')).to_be_visible()
@@ -294,7 +306,7 @@ class PortalBrowserTests(unittest.TestCase):
                 self.goto(path)
                 self.assertTrue(self.page.evaluate('document.documentElement.scrollWidth <= innerWidth'), (width, path))
                 self.assertEqual(self.page.locator('h1:visible').count(), 1)
-                self.assertTrue(all(a.get_attribute('href') == '/admin/' for a in self.page.locator('a').all() if '管理入口' in a.inner_text()))
+                self.assertTrue(all(a.get_attribute('href') == '/admin/' for a in self.page.locator('a').all() if '管理后台' in a.inner_text()))
         self.page.set_viewport_size({'width': 375, 'height': 812})
         self.goto('/')
         self.page.locator('.menu').click()
@@ -320,12 +332,6 @@ class PortalBrowserTests(unittest.TestCase):
         self.assertEqual(self.page.locator('.pulse').first.evaluate('(el)=>getComputedStyle(el).animationName'), 'none')
         self.assertFalse(self.page.locator('.stage').evaluate("el=>el.classList.contains('running')"))
         self.screenshot('home-desktop.png')
-        self.page.locator('[data-mac]').first.click()
-        expect(self.page.locator('[data-close="mac-dialog"]')).to_be_focused()
-        self.page.keyboard.press('Shift+Tab')
-        self.assertTrue(self.page.evaluate("document.querySelector('#mac-dialog').contains(document.activeElement)"))
-        self.page.keyboard.press('Escape')
-        expect(self.page.locator('[data-mac]').first).to_be_focused()
         self.assertTrue(all(url.startswith(self.origin) for url in self.requests))
         # Keep the 250ms motion state deterministic on loaded CI runners.
         self.page.locator('.stage').scroll_into_view_if_needed()

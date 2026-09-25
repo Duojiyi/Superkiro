@@ -59,10 +59,6 @@ def carries_release(data, version):
             and not update_signing.debug_build(executable))
 
 
-# Until a real Mac has taken over Kiro and held a conversation, a Mac release says so.
-MAC_BETA = '测试版 · 真机接管验收未完成'
-
-
 def prepare(source, version, acceptance, arch, key, mandatory=True):
     check_version(version)
     data = Path(source).read_bytes()
@@ -79,9 +75,7 @@ def prepare(source, version, acceptance, arch, key, mandatory=True):
     item = dict(expected, url=f"/downloads/Superkiro-{version}-Mac-{'ARM64' if arch == 'arm64' else 'Intel'}.app.tar.gz",
                 signature='unsigned',
                 systemRequirements='macOS · ' + ('Apple Silicon' if arch == 'arm64' else 'Intel x64')
-                + ' · 无 Developer ID 签名或 Apple 公证 · 解压后运行 .app'
-                # Said on every Mac release until a Mac has run a full takeover of Kiro.
-                + ' · ' + MAC_BETA)
+                + ' · 无 Developer ID 签名或 Apple 公证 · 解压后运行 .app')
     return data, update_signing.signed_entry(item, key, mandatory)
 
 

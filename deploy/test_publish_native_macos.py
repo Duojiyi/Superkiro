@@ -74,8 +74,9 @@ class MacPublicationTests(unittest.TestCase):
             self.assertTrue(update_signing.verify(item, item['updateSignature'],
                                                   [update_signing.public_hex(self.key)]))
             self.assertEqual(item['url'], '/downloads/Superkiro-1.2.3-Mac-ARM64.app.tar.gz')
-            # A Mac release says it is a beta until a Mac has taken over Kiro.
-            self.assertTrue(item['systemRequirements'].endswith(' · 测试版 · 真机接管验收未完成'))
+            # A real Mac has taken over Kiro: Mac releases are no longer listed as a beta.
+            self.assertNotIn('测试版', item['systemRequirements'])
+            self.assertIn('无 Developer ID 签名或 Apple 公证', item['systemRequirements'])
             name = f"Superkiro-1.2.3-{item['sha256']}-macos-arm64.app.tar.gz"
             validate_history([name], item)
             with self.assertRaises(ValueError):
