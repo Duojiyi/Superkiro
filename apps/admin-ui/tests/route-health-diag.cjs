@@ -35,6 +35,7 @@ const writes=endpoint=>fixture.writes.filter(write=>write.endpoint===endpoint);
       const box=page.getByRole('alertdialog');await box.waitFor();const text=await box.innerText();
       if(option!==undefined){try{await box.getByRole('checkbox').setChecked(option);}catch(error){
         console.error('DIAG dialog text at open: '+JSON.stringify(text));
+        console.error('DIAG timeline: '+JSON.stringify(await page.evaluate(()=>window.__diag)));
         console.error('DIAG dialogs now: '+JSON.stringify(await page.evaluate(()=>[...document.querySelectorAll('[role=alertdialog],[role=dialog]')].map(e=>({role:e.getAttribute('role'),label:e.getAttribute('aria-label'),text:e.innerText.slice(0,500),inputs:e.querySelectorAll('input').length,underHidden:!!e.closest('[aria-hidden=true]'),inert:!!e.closest('[inert]')})))));
         console.error('DIAG shell: '+JSON.stringify(await page.evaluate(()=>({hidden:document.querySelector('.workspace-shell')?.getAttribute('aria-hidden'),overlay:!!document.querySelector('.session-overlay')}))));
         console.error('DIAG editor: '+JSON.stringify(await page.evaluate(()=>({title:document.querySelector('#key-editor h3')?.textContent,checks:[...document.querySelectorAll('#key-editor .model-checklist input[type=checkbox]')].map(e=>[e.getAttribute('aria-label'),e.checked])}))));
@@ -100,10 +101,17 @@ const writes=endpoint=>fixture.writes.filter(write=>write.endpoint===endpoint);
 
     // A Key's save: the models it would strand are listed and can be hidden in the same step.
     for(const id of ['fixture-model-0','fixture-model-1'])model(id).visible=true;
+    await page.evaluate(()=>{window.__diag=[];const t0=performance.now();const log=m=>window.__diag.push([Math.round(performance.now()-t0),m]);
+      let last='';const poll=()=>{const b=document.querySelector('#key-editor input[aria-label="gpt-6-astra"]');const now=(document.querySelector('#key-editor')?'editor ':'no-editor ')+(b?('astra='+b.checked):'astra-absent')+' boxes='+document.querySelectorAll('#key-editor .model-checklist input').length+' refreshDisabled='+!!document.querySelector('.btn-refresh')?.disabled;if(now!==last){log(now);last=now;}requestAnimationFrame(poll);};poll();
+      document.addEventListener('click',e=>log('click '+((e.target.closest('button')?.textContent)||e.target.getAttribute('aria-label')||e.target.tagName).slice(0,24)),true);
+      document.addEventListener('change',e=>log('change '+e.target.getAttribute('aria-label')+'='+e.target.checked),true);
+      const f=window.fetch;window.fetch=(...a)=>{const u=String(a[0]).replace(location.origin,'').slice(0,40);log('fetch '+u);return f(...a).then(r=>{log('resp '+u);return r;});};log('armed');});
     fixture.config.revision='fixture-rev-20';await refresh();
     const openKey=async(provider,id)=>{await page.locator('.provider-card').filter({hasText:provider}).getByRole('row').filter({hasText:id}).getByRole('button',{name:'编辑',exact:true}).click();await page.locator('#key-editor').waitFor();};
     await openKey('OpenAI 格式 / Fixture','fixture-openai-key-1');
+    await page.evaluate(()=>window.__diag.push([-1,'openKey resolved']));
     await page.getByRole('group',{name:'可用模型'}).getByRole('checkbox',{name:'gpt-6-astra',exact:true}).uncheck();
+    await page.evaluate(()=>window.__diag.push([-1,'uncheck resolved']));
     await button('保存').click();
     const saveFacts=await confirm({option:true});
     for(const expected of ['将无可用线路（客户请求会失败）：gpt-6-astra','少一条备用线路（仍可服务）：gemini-pro','同时隐藏将无可用线路的 1 个模型（先隐藏，再保存）'])
