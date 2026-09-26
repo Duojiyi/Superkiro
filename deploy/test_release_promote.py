@@ -133,8 +133,10 @@ class PromoteFailureBehaviour(unittest.TestCase):
         restore = ' '.join(self.commands())
         self.assertIn('data.complete', restore)
         self.assertIn('failed-candidate-data', restore)
-        # Kept customer requests never stay in a copy: not the backup, not the failed data.
-        self.assertIn('/data/request-archive', restore)
+        # Kept customer requests never stay in a copy: not the backup, not the failed data,
+        # and the backup does not copy them first only to delete them.
+        self.assertIn('--exclude=data/request-archive -cf - data', restore)
+        self.assertNotIn(f'cp -a {rc.BASE}/data ', restore)
         self.assertIn('/failed-candidate-data/request-archive', restore)
         self.assertIn('diff -qr --exclude=request-archive', restore)
         self.assertIn(OLD, [call.args[1] for call in self.mocks['switch_current'].call_args_list])
@@ -167,6 +169,8 @@ class PromoteFailureBehaviour(unittest.TestCase):
 
         def full_disk(ssh, command):
             if command.startswith('df --output=avail'):
+                # The kept requests are not copied, so they need no room.
+                self.assertIn('du -sb --exclude=request-archive', command)
                 return f'{1 << 20}\n{1 << 30}'
             return fake_run(ssh, command)
 
@@ -181,7 +185,7 @@ class PromoteFailureBehaviour(unittest.TestCase):
         report = staged_report()
 
         def copy_fails(ssh, command):
-            if command.startswith(f'cp -a {rc.BASE}/data '):
+            if command.startswith(f'tar -C {rc.BASE} '):
                 raise RuntimeError('Remote operation failed (exit 1); remote output withheld')
             return fake_run(ssh, command)
 

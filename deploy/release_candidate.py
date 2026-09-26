@@ -167,7 +167,7 @@ def verify_ledger_loaded(ssh, sequence):
 def check_free_space(ssh):
     """Room for the data copy, before anything is stopped."""
     free, used = (int(value) for value in run(
-        ssh, f"df --output=avail -B1 {BASE} | tail -n 1\ndu -sb {BASE}/data | cut -f1").split())
+        ssh, f"df --output=avail -B1 {BASE} | tail -n 1\ndu -sb --exclude={REQUEST_ARCHIVE} {BASE}/data | cut -f1").split())
     if free < 2 * used + FREE_SPACE_MARGIN:
         raise PreconditionFailed('Not enough free space for the data backup; nothing was stopped')
 
@@ -432,7 +432,8 @@ def promote(ssh, report, extra_readiness=None):
         clean_stop = True
         # Customer requests are kept 24 hours for tracing and never in a copy that outlives
         # them: the release backup, and the copy of it taken off the server, leave them out.
-        run(ssh, f'cp -a {BASE}/data {backup}/data\nrm -rf -- {backup}/data/{REQUEST_ARCHIVE}\n'
+        # tar skips them outright, instead of copying up to 2 GiB only to delete it.
+        run(ssh, f'tar -C {BASE} --exclude=data/{REQUEST_ARCHIVE} -cf - data | tar -C {backup} -xpf -\n'
             f'diff -qr --exclude={REQUEST_ARCHIVE} {BASE}/data {backup}/data\ntouch {backup}/data.complete')
         # Read once the old gateway has flushed and stopped: what the new one must load.
         report['ledger_sequence'] = ledger_sequence(ssh)
