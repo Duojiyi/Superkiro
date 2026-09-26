@@ -2,6 +2,7 @@
 // cent), to see that the route answers before customers rely on it. Nothing is saved.
 import {useEffect, useRef, useState} from 'react';
 import {adminApi} from './api';
+import {explainRefusal} from './refusal';
 import {probeView, type StatusView} from './status';
 
 export default function Probe({providerId, model, keyId, disabled, title}: {
@@ -22,9 +23,12 @@ export default function Probe({providerId, model, keyId, disabled, title}: {
     try {
       const reply = await adminApi.probeKey({provider_id: providerId, model, ...(keyId ? {key_id: keyId} : {})});
       if (reply.success !== true) throw new Error('服务器未确认测试结果');
-      if (id === run.current) setResult(probeView(reply));
+      const view = probeView(reply);
+      // Which Key answered, when the server chose it.
+      if (!keyId && typeof reply.key_id === 'string' && reply.key_id) view.label += ` · Key ${reply.key_id}`;
+      if (id === run.current) setResult(view);
     } catch (error) {
-      if (id === run.current) setResult({label: `测试没有完成：${error instanceof Error ? error.message : String(error)}`, tone: 'danger'});
+      if (id === run.current) setResult({label: `测试没有完成：${explainRefusal(error instanceof Error ? error.message : String(error))}`, tone: 'danger'});
     }
   };
   return <span className="probe">

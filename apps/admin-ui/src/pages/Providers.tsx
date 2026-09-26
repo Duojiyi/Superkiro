@@ -10,7 +10,7 @@ import {formatFullDateTime, formatRelative} from '../format';
 import ProviderKeyEditor from '../ProviderKeyEditor';
 import {explainRefusal, isRefusal, type PublishOutcome} from '../refusal';
 import {lossFacts, modelName, nameList, routeLosses} from '../routes';
-import {keyAlert, keyStatusView, providerFormatLabel} from '../status';
+import {failureLabel, keyAlert, keyStatusView, providerFormatLabel} from '../status';
 import type {Refresh, ReportError, Row, WriteGuards} from '../types';
 
 /** Which key the editor shows: none, a new provider, a new key of a provider, or an existing key. */
@@ -119,7 +119,7 @@ export default function ProvidersPage({providers, providerKeys, models, groups =
     if (writing.current || loading || failed || resetting) return;
     const confirmed = await confirmAction({
       title: `恢复 Key ${id}？`,
-      facts: [`现在：${keyStatusView(key, Date.now() / 1000).label}`, ...(typeof key.last_error === 'string' && key.last_error ? [`最近错误：${key.last_error}`] : [])],
+      facts: [`现在：${keyStatusView(key, Date.now() / 1000).label}`, ...(failureLabel(key.last_error) ? [`最近错误：${failureLabel(key.last_error)}`] : [])],
       consequence: '清除冷却和异常状态，这个 Key 马上重新接请求；上游仍有问题的话，它会再次进入冷却。',
       confirmLabel: '恢复',
     });
@@ -169,9 +169,9 @@ export default function ProvidersPage({providers, providerKeys, models, groups =
               <td><ModelTags models={key.allowed_models}/></td>
               <td className="num">{String(key.weight ?? 1)}</td>
               <td className="col-status"><StatusBadge view={keyStatusView(key, nowSecs)}/></td>
-              <td>{typeof key.last_error === 'string' && key.last_error
-                ? <span className="clip clip-reason key-error" title={`${key.last_error}${typeof key.last_error_at === 'number' ? `\n${formatFullDateTime(key.last_error_at)}` : ''}`}>
-                  {typeof key.last_error_at === 'number' && <span className="muted">{formatRelative(key.last_error_at)} · </span>}{key.last_error}</span>
+              <td>{failureLabel(key.last_error)
+                ? <span className="clip clip-reason key-error" title={`${failureLabel(key.last_error)}${failureLabel(key.last_error) !== key.last_error ? `（${key.last_error}）` : ''}${typeof key.last_error_at === 'number' ? `\n${formatFullDateTime(key.last_error_at)}` : ''}`}>
+                  {typeof key.last_error_at === 'number' && <span className="muted">{formatRelative(key.last_error_at)} · </span>}{failureLabel(key.last_error)}</span>
                 : <span className="muted">—</span>}</td>
               <td className="col-actions"><span className="row-actions">
                 {keyAlert(key, nowSecs) && <button type="button" className="btn-text" disabled={!!resetting || loading || failed} title="清除冷却或异常状态，马上重新接请求"

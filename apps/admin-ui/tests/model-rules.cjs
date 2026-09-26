@@ -73,6 +73,9 @@ assert.equal(refusal.explainRefusal('Invalid model ID: bad id'), '模型 ID 无�
 assert.match(refusal.explainRefusal('Invalid billing state: Invalid pricing; retroactive publication forbidden'), /早于现在/);
 assert.match(refusal.explainRefusal('Key still serves visible models: map-1', names), /gpt-5（PRO）/);
 assert.equal(refusal.explainRefusal('something new'), 'something new', 'unknown refusals are shown as they are');
+assert.match(refusal.explainRefusal('No enabled Key of this provider may call this model'), /没有启用的 Key 能调用这个模型/);
+assert.equal(refusal.explainRefusal('Unknown key'), '这个 Key 已不存在（可能刚被删除），请刷新');
+assert.equal(refusal.explainRefusal('Invalid billing state: Unknown target provider'), '线路指向的供应商不存在', 'the provider a route names is not the provider that is gone');
 assert.equal(refusal.publishFailure(refused('Invalid body', 400), '发布').uncertain, undefined, 'a malformed request was refused, not applied');
 for (const error of [refused('Billing persistence failed: disk', 503), new Error('请求超时，结果未确认；写操作请核对后重试'), refused('bad gateway', 502)]) {
   assert.equal(refusal.publishFailure(error, '发布').uncertain, true, error.message);
@@ -166,12 +169,15 @@ const soon = t + 600;
 assert.deepEqual([{health_state: 'healthy'}, {health_state: 'cooldown', cooldown_until: soon}, {health_state: 'cooldown'}, {health_state: 'cooldown', cooldown_until: t - 5},
   {health_state: 'degraded'}, {health_state: 'unhealthy'}, {health_state: 'unhealthy', enabled: false}].map(key => status.keyAlert(key, t)),
   ['healthy' && null, 'cooldown', 'cooldown', null, 'degraded', 'unhealthy', null], 'a cooldown whose time has passed is over; a disabled Key raises nothing');
-const unhealthy = status.keyStatusView({health_state: 'unhealthy', last_error: 'HTTP 401 invalid key'}, t);
-assert.deepEqual([unhealthy.label, unhealthy.tone, unhealthy.title], ['不可用', 'danger', '最近错误：HTTP 401 invalid key']);
+const unhealthy = status.keyStatusView({health_state: 'unhealthy', last_error: 'http_401'}, t);
+assert.deepEqual([unhealthy.label, unhealthy.tone, unhealthy.title], ['不可用', 'danger', '最近错误：HTTP 401 · Key 无效或被拒绝']);
+assert.deepEqual(['http_429', 'http_503', 'http_418', 'timeout', 'transport', 'upstream_service', 'protocol', 'empty', 'HTTP 401 invalid key', null].map(status.failureLabel),
+  ['HTTP 429 · 限流', 'HTTP 503 · 上游服务出错', 'HTTP 418', '超时', '网络连接失败', '上游服务报错', '上游回复无法解析', '上游返回空内容', 'HTTP 401 invalid key', ''], 'failure kinds in words; older free text as it is');
 assert.equal(status.keyStatusView({health_state: 'cooldown', cooldown_until: t + 120}, t).label, '冷却中 · 2 分钟');
 assert.deepEqual([45, 89 * 60, 3 * 3600, 5 * 86400].map(status.cooldownText), ['1 分钟', '89 分钟', '约 3 小时', '约 5 天'], 'long cooldowns read in hours or days');
 assert.deepEqual([{format: 'open_ai'}, {format: 'anthropic'}, {api_type: 'openai'}, {}].map(provider => status.providerFormatLabel(provider)), ['OpenAI', 'Anthropic', 'OpenAI', null], 'format first, api_type from older data');
 assert.equal(status.probeView({ok: true, ttft_ms: 410.4, latency_ms: 620}).label, '成功 · 首字 410 ms');
+assert.equal(status.probeView({ok: true, ttft_ms: 410, latency_ms: 620, reply: 'OK'}).title, '回复：OK');
 assert.equal(status.probeView({ok: true, ttft_ms: null, latency_ms: 620}).label, '成功 · 耗时 620 ms');
 assert.equal(status.probeView({ok: false, status: 529, error: 'HTTP 529 overloaded_error: Overloaded'}).label, '失败：HTTP 529 overloaded_error: Overloaded');
 assert.equal(status.probeView({ok: false, status: 502, error: null}).label, '失败：HTTP 502');

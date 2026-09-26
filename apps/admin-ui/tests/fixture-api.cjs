@@ -70,7 +70,7 @@ module.exports = function fixtureApi() {
     : {id:`fixture-price-${i}`, model:m.exposed_model_id, rate_card_id:'fixture-rate', pricing_mode:'fixed', effective_from_secs:now-86400, fixed_input_credit_per_m:3000000, fixed_output_credit_per_m:15000000, fixed_cache_read_credit_per_m:300000, fixed_cache_creation_credit_per_m:3750000}), audit:[{operator:'fixture-admin', reason:'本地测试：更新模型价格', previous_revision:'fixture-rev-1', revision:'fixture-rev-2', created_at_secs:now}]};
   // Providers name their API format as the server does (format: anthropic | open_ai).
   const providers = [{id:'fixture-provider',name:'测试供应商 / Fixture',base_url:'https://fixture.invalid/v1',enabled:true,format:'anthropic'},{id:'fixture-disabled',name:'停用的供应商 / Fixture',base_url:'https://disabled.invalid/v1',enabled:false,format:'anthropic'},{id:'fixture-openai',name:'OpenAI 格式 / Fixture',base_url:'https://openai.invalid/v1',enabled:true,format:'open_ai'}];
-  const keys = [{id:'fixture-key',provider_id:'fixture-provider',allowed_models:models.map(m=>m.target_model),weight:10,enabled:true,health_state:'healthy'},{id:'fixture-backup',provider_id:'fixture-provider',allowed_models:['claude-sonnet'],weight:1,enabled:true,health_state:'cooldown',cooldown_until:4102444800,last_error:'HTTP 529 overloaded_error: Overloaded',last_error_at:Math.floor(Date.now()/1000)-300},{id:'fixture-disabled-key',provider_id:'fixture-disabled',allowed_models:['gpt-5'],weight:1,enabled:true,health_state:'cooldown',cooldown_until:4102444800},{id:'fixture-openai-key-1',provider_id:'fixture-openai',allowed_models:['gpt-6-astra','gpt-5.6-sol','gpt-5.6-terra'],weight:1,enabled:true,health_state:'healthy'}];
+  const keys = [{id:'fixture-key',provider_id:'fixture-provider',allowed_models:models.map(m=>m.target_model),weight:10,enabled:true,health_state:'healthy'},{id:'fixture-backup',provider_id:'fixture-provider',allowed_models:['claude-sonnet'],weight:1,enabled:true,health_state:'cooldown',cooldown_until:4102444800,last_error:'http_529',last_error_at:Math.floor(Date.now()/1000)-300},{id:'fixture-disabled-key',provider_id:'fixture-disabled',allowed_models:['gpt-5'],weight:1,enabled:true,health_state:'cooldown',cooldown_until:4102444800},{id:'fixture-openai-key-1',provider_id:'fixture-openai',allowed_models:['gpt-6-astra','gpt-5.6-sol','gpt-5.6-terra'],weight:1,enabled:true,health_state:'healthy'}];
   // The server's rules for a publication (409 in its words when one is broken), applied as it applies them.
   const refuse = message => ({status: 409, body: {success: false, error: `Invalid billing state: ${message}`}});
   const serves = (providerId, model, among = keys) => providers.some(p => p.id === providerId && p.enabled !== false)
@@ -158,8 +158,8 @@ module.exports = function fixtureApi() {
     if(endpoint==='providers/delete') {
       const index=providers.findIndex(p=>p.id===body.id);if(index<0)return reply({success:false,error:'Unknown provider'},404);
       const users=config.models.filter(m=>m.target_provider_id===body.id||(m.fallback_chain||[]).some(f=>f.provider_id===body.id)).map(m=>m.exposed_model_id);
-      if(users.length)return reply({success:false,error:`Provider still referenced by model mappings: ${users.join(', ')}`},409);
-      if(keys.some(k=>k.provider_id===body.id))return reply({success:false,error:'Provider still has keys'},409);
+      if(users.length)return reply({success:false,error:`Provider still routes models: ${users.join(', ')}`},409);
+      const own=keys.filter(k=>k.provider_id===body.id).map(k=>k.id);if(own.length)return reply({success:false,error:`Provider still has Keys: ${own.join(', ')}`},409);
       providers.splice(index,1);return reply({success:true});
     }
     // A Key's save, delete, health reset, and one tiny real request (测试).
@@ -180,9 +180,9 @@ module.exports = function fixtureApi() {
     if(endpoint==='providers/keys/reset') {const key=keyOf();if(!key)return reply({success:false,error:'Unknown key'},404);Object.assign(key,{health_state:'healthy',cooldown_until:null});return reply({success:true});}
     if(endpoint==='providers/keys/probe') {
       const key=body.key_id?keyOf():keys.find(k=>k.provider_id===body.provider_id&&k.enabled!==false&&(!Array.isArray(k.allowed_models)||k.allowed_models.includes(body.model)));
-      if(!key)return reply({success:true,ok:false,status:0,latency_ms:0,ttft_ms:null,error:'No enabled key allows this model',reply:null});
-      if(String(body.model).includes('overloaded'))return reply({success:true,ok:false,status:529,latency_ms:1840,ttft_ms:null,error:'HTTP 529 overloaded_error: Overloaded',reply:null});
-      return reply({success:true,ok:true,status:200,latency_ms:620,ttft_ms:410,error:null,reply:'OK'});
+      if(!key)return body.key_id?reply({success:false,error:'Unknown key'},404):reply({success:false,error:'No enabled Key of this provider may call this model'},409);
+      if(String(body.model).includes('overloaded'))return reply({success:true,ok:false,status:529,latency_ms:1840,ttft_ms:null,error:'HTTP 529 overloaded_error: Overloaded',reply:null,key_id:key.id});
+      return reply({success:true,ok:true,status:200,latency_ms:620,ttft_ms:410,error:null,reply:'OK',key_id:key.id});
     }
     if(endpoint==='financials') return reply({success:true,basis:'retained_usage_ledger_estimate_not_cash_revenue',settings:config.settings,actualRevenueMicroCny:null,actualGrossProfitMicroCny:null,estimates:{retainedLedgerOnly:true,usageFaceValueMicroCny:1000000,configuredProviderCostMicroCny:420000,faceValueLessCostMicroCny:null,faceValueMarginPercentage:null,costedRequests:17,uncostedRequests:1},dashboard:{total_requests:18,total_credits_charged:27000000,revenue_micro_cny:0,provider_cost_micro_cny:4200000,gross_profit_micro_cny:0,gross_margin_percentage:0},modelRankings:models.map(m=>({model_id:m.exposed_model_id,provider_cost_micro_cny:1400000}))});
     if(endpoint==='announcements') return reply({success:true,announcements:[{id:'fixture-notice',title:'本地测试：服务维护通知',content:'这是隔离的视觉测试公告，不会向真实用户发布。',level:'info',enabled:true,created_at:now}]});

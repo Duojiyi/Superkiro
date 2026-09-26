@@ -207,6 +207,8 @@ export interface ProbeResult {
   ttft_ms: number | null;
   error: string | null;
   reply: string | null;
+  /** The Key that was used: the one named, or the one the server picked. */
+  key_id?: string;
 }
 
 export interface AdminAnnouncement {

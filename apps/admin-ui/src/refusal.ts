@@ -29,6 +29,11 @@ const REFUSALS: Array<[RegExp, (ids: string) => string]> = [
   [/Ambiguous model ID or alias/i, () => '同一分组里有重复的模型 ID 或别名'],
   [/Margins and model multipliers combine/i, () => '版本倍率 × 分组倍率 × 模型倍率超过了 100 倍'],
   [/Invalid or oversized body/i, () => '提交的内容无效或太大'],
+  // A 测试 the server could not start, or a Key or provider that is gone.
+  [/No enabled Key of this provider may call this model/i, () => '这个供应商没有启用的 Key 能调用这个模型：先在“供应商与 Key”里给一个启用的 Key 授权它'],
+  [/The Key's secret is unavailable/i, () => '读不到这个 Key 的密钥：编辑这个 Key，重新填写密钥'],
+  [/^Unknown key$/i, () => '这个 Key 已不存在（可能刚被删除），请刷新'],
+  [/^Unknown provider$/i, () => '这个供应商已不存在（可能刚被删除），请刷新'],
 ];
 
 /**

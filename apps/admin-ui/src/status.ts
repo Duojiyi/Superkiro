@@ -40,9 +40,30 @@ export function keyAlert(key: Row, nowSecs: number): 'cooldown' | 'degraded' | '
   return keyCooldownLeft(key, nowSecs) > 0 || (key.health_state === 'cooldown' && !(until > 0)) ? 'cooldown' : null;
 }
 
+const FAILURE: Record<string, string> = {
+  upstream_service: '上游服务报错',
+  protocol: '上游回复无法解析',
+  timeout: '超时',
+  empty: '上游返回空内容',
+  transport: '网络连接失败',
+};
+const HTTP_FAILURE: Record<number, string> = {401: 'Key 无效或被拒绝', 403: '没有权限', 404: '上游没有这个模型或地址', 429: '限流', 529: '上游过载'};
+
+/**
+ * A failure as the server names it, in attempt traces and as a Key's last error (http_429,
+ * timeout, transport, …), in words. Anything else, such as older free text, is shown as it is.
+ */
+export function failureLabel(value: unknown): string {
+  if (typeof value !== 'string' || !value) return '';
+  const http = /^http_(\d{3})$/.exec(value);
+  if (!http) return FAILURE[value] ?? value;
+  const code = Number(http[1]), words = HTTP_FAILURE[code] ?? (code >= 500 ? '上游服务出错' : '');
+  return words ? `HTTP ${code} · ${words}` : `HTTP ${code}`;
+}
+
 export function keyStatusView(key: Row, nowSecs: number): StatusView {
   if (key.enabled === false) return {label: '已停用', tone: 'neutral'};
-  const error = typeof key.last_error === 'string' && key.last_error ? `最近错误：${key.last_error}` : undefined;
+  const lastError = failureLabel(key.last_error), error = lastError ? `最近错误：${lastError}` : undefined;
   const alert = keyAlert(key, nowSecs), cooldown = keyCooldownLeft(key, nowSecs);
   if (alert === 'unhealthy') return {label: '不可用', tone: 'danger', title: error};
   if (alert === 'degraded') return {label: '异常', tone: 'danger', title: error};
@@ -117,9 +138,10 @@ export function modelStateView(model: Row): StatusView {
 }
 
 /** A 测试 result in a few words: 成功 · 首字 410 ms, or what failed. */
-export function probeView(result: {ok?: unknown; status?: unknown; ttft_ms?: unknown; latency_ms?: unknown; error?: unknown}): StatusView {
+export function probeView(result: {ok?: unknown; status?: unknown; ttft_ms?: unknown; latency_ms?: unknown; error?: unknown; reply?: unknown}): StatusView {
   const ms = (value: unknown) => `${Math.round(Number(value))} ms`;
-  if (result.ok === true) return {label: typeof result.ttft_ms === 'number' ? `成功 · 首字 ${ms(result.ttft_ms)}` : `成功 · 耗时 ${ms(result.latency_ms)}`, tone: 'success'};
+  if (result.ok === true) return {label: typeof result.ttft_ms === 'number' ? `成功 · 首字 ${ms(result.ttft_ms)}` : `成功 · 耗时 ${ms(result.latency_ms)}`, tone: 'success',
+    title: typeof result.reply === 'string' && result.reply ? `回复：${result.reply}` : undefined};
   const error = typeof result.error === 'string' && result.error ? result.error : typeof result.status === 'number' && result.status ? `HTTP ${result.status}` : '没有回复';
   return {label: `失败：${error}`, tone: 'danger', title: error};
 }

@@ -28,7 +28,7 @@ const writes=endpoint=>fixture.writes.filter(write=>write.endpoint===endpoint);
     const nav=name=>page.getByRole('navigation').getByRole('button',{name,exact:true}).click();
     const refresh=async()=>{await button('刷新').click();await page.locator('.btn-refresh:not([disabled])').waitFor();};
     // The OpenAI-format Key has stopped working; the backup Key is cooling down after an overload.
-    Object.assign(key('fixture-openai-key-1'),{health_state:'unhealthy',last_error:'HTTP 401 invalid x-api-key',last_error_at:Math.floor(Date.now()/1000)-7200});
+    Object.assign(key('fixture-openai-key-1'),{health_state:'unhealthy',last_error:'http_401',last_error_at:Math.floor(Date.now()/1000)-7200});
     await page.goto(origin+'/admin/');await page.getByLabel('密码',{exact:true}).fill('fixture-password');await button('登录').click();
     await button('刷新').waitFor();
     const attention=page.locator('.attention-list');
@@ -41,17 +41,19 @@ const writes=endpoint=>fixture.writes.filter(write=>write.endpoint===endpoint);
     await card('测试供应商 / Fixture').locator('.provider-name').getByText('Anthropic',{exact:true}).waitFor();
     const keyRow=(provider,id)=>card(provider).getByRole('row').filter({hasText:id});
     await keyRow('OpenAI 格式 / Fixture','fixture-openai-key-1').getByText('不可用',{exact:true}).waitFor();
-    await keyRow('OpenAI 格式 / Fixture','fixture-openai-key-1').getByText('2 小时前 · HTTP 401 invalid x-api-key').waitFor();
-    await keyRow('测试供应商 / Fixture','fixture-backup').getByText('5 分钟前 · HTTP 529 overloaded_error: Overloaded').waitFor();
+    await keyRow('OpenAI 格式 / Fixture','fixture-openai-key-1').getByText('2 小时前 · HTTP 401 · Key 无效或被拒绝').waitFor();
+    // The server names the failure's kind (http_529); the console says it in words.
+    await keyRow('测试供应商 / Fixture','fixture-backup').getByText('5 分钟前 · HTTP 529 · 上游过载').waitFor();
     assert.equal(await keyRow('测试供应商 / Fixture','fixture-key').getByRole('button',{name:'恢复',exact:true}).count(),0,'a healthy Key needs no 恢复');
     // 恢复 clears the state; the badge follows.
     await keyRow('测试供应商 / Fixture','fixture-backup').getByRole('button',{name:'恢复',exact:true}).click();
     const box=page.getByRole('alertdialog');await box.waitFor();const facts=await box.innerText();
-    assert(facts.includes('现在：冷却中')&&facts.includes('最近错误：HTTP 529 overloaded_error: Overloaded'),facts);
+    assert(facts.includes('现在：冷却中')&&facts.includes('最近错误：HTTP 529 · 上游过载'),facts);
     await box.locator('[data-confirm="accept"]').click();
     await page.locator('.toast').filter({hasText:'已恢复 Key fixture-backup'}).waitFor();
     assert.deepEqual(writes('providers/keys/reset').map(write=>write.body),[{provider_id:'fixture-provider',key_id:'fixture-backup'}]);
     await keyRow('测试供应商 / Fixture','fixture-backup').getByText('正常',{exact:true}).waitFor();
+    await keyRow('测试供应商 / Fixture','fixture-backup').getByText('5 分钟前 · HTTP 529 · 上游过载').waitFor();// the last error stays on record
     assert.equal(await page.locator('#nav-badge-providers [aria-hidden="true"]').textContent(),'1');
     console.log('PASS: live Key health with the last error, 恢复 clears it and the badge follows; format tags from the server’s format');
 
@@ -62,6 +64,7 @@ const writes=endpoint=>fixture.writes.filter(write=>write.endpoint===endpoint);
     const item=name=>picker.locator('li').filter({has:page.getByRole('checkbox',{name,exact:true})});
     await item('claude-sonnet').getByRole('button',{name:'测试',exact:true}).click();
     await item('claude-sonnet').getByRole('status').filter({hasText:'成功 · 首字 410 ms'}).waitFor();
+    assert.equal(await item('claude-sonnet').getByRole('status').textContent(),'成功 · 首字 410 ms','the Key tested is the one in the editor: not named again');
     assert.deepEqual(writes('providers/keys/probe').at(-1).body,{provider_id:'fixture-provider',model:'claude-sonnet',key_id:'fixture-key'});
     await item('overloaded-model').getByRole('button',{name:'测试',exact:true}).click();
     await item('overloaded-model').getByRole('status').filter({hasText:'失败：HTTP 529 overloaded_error: Overloaded'}).waitFor();
@@ -71,10 +74,15 @@ const writes=endpoint=>fixture.writes.filter(write=>write.endpoint===endpoint);
     await nav('模型与定价');
     const modelRow=page.getByRole('row').filter({has:page.getByRole('button',{name:'claude-sonnet 的更多操作',exact:true})});
     await modelRow.getByRole('button',{name:'测试',exact:true}).click();
-    await modelRow.getByRole('status').filter({hasText:'成功 · 首字 410 ms'}).waitFor();
+    await modelRow.getByRole('status').filter({hasText:'成功 · 首字 410 ms · Key fixture-key'}).waitFor();
     assert.deepEqual(writes('providers/keys/probe').at(-1).body,{provider_id:'fixture-provider',model:'claude-sonnet'});
     // 模型与定价 names the provider format too.
     assert((await page.locator('.mapping-editor').getByLabel('供应商',{exact:true}).locator('option').allTextContents()).includes('OpenAI 格式 / Fixture · OpenAI'));
+    // No enabled Key may call the model: the server refuses the test, in words.
+    key('fixture-openai-key-1').enabled=false;await refresh();
+    const astra=page.getByRole('row').filter({has:page.getByRole('button',{name:'gpt-6-astra 的更多操作',exact:true})});
+    await astra.getByRole('button',{name:'测试',exact:true}).click();
+    await astra.getByRole('status').filter({hasText:'测试没有完成：这个供应商没有启用的 Key 能调用这个模型'}).waitFor();
     assert.deepEqual(errors,[]);assert.deepEqual(nativeDialogs,[],'no browser-native dialogs');
     console.log('PASS: 测试 in a Key’s model list (through that Key) and on a model row (through its route): success with first-token time, failures with the error, nothing saved');
   }finally{
