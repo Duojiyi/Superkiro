@@ -648,6 +648,17 @@ div.attention-item:hover {background: transparent;}
 .checklist li.is-warning svg {color: #d4a72c;}
 .checklist li.is-unknown svg {color: var(--text-3);}
 .session-line {margin: 0 0 12px;}
+/* 存储与账本: the saved state against its ceiling, the two archive levels marked on the meter. */
+.storage-line {display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 8px; margin: 0 0 10px;}
+.storage-line b {font-size: 20px; line-height: 28px; font-variant-numeric: tabular-nums;}
+.storage-meter {position: relative; height: 8px; border-radius: 4px; background: var(--neutral-bg);}
+.storage-meter > span {display: block; max-width: 100%; height: 100%; border-radius: 4px; background: #8c959f;}
+.storage-meter > span.is-soon {background: #d4a72c;}
+.storage-meter > span.is-now {background: var(--danger);}
+.storage-meter > i {position: absolute; top: -3px; bottom: -3px; width: 2px; margin-left: -1px; background: var(--text-3);}
+.storage-note {margin: 8px 0 0; font-size: 12px;}
+.storage-archive {display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; margin-top: 12px;}
+.storage-receipt {margin: 12px 0 0; overflow-wrap: anywhere;}
 
 /* ---------- Login ---------- */
 .auth-page {min-height: 100dvh; display: grid; place-items: center; padding: 24px; background: var(--bg-page); color: var(--text-1);}

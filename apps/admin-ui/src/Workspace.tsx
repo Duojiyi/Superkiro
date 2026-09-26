@@ -7,7 +7,7 @@ import {IconClose, IconRefresh, IconWarning} from './components/icons';
 import {isModalOpen, ModalRootContext} from './components/modal';
 import {ToastHost, toast} from './components/toast';
 import {TopbarSlotContext} from './components/ui';
-import {formatClock, formatFullDateTime, formatSessionLeft} from './format';
+import {formatBytes, formatClock, formatFullDateTime, formatSessionLeft} from './format';
 import AnnouncementsPage from './pages/Announcements';
 import CardsPage from './pages/Cards';
 import FinancePage from './pages/Finance';
@@ -18,7 +18,7 @@ import TracesPage from './pages/Traces';
 import {publishFailure, type PublishOutcome} from './refusal';
 import {intentOf, OPEN_PARAM, parseRoute, routeHash, routeOf, type Route} from './route';
 import {brokenRoutes, modelName} from './routes';
-import {keyAlert} from './status';
+import {keyAlert, storageLevel} from './status';
 import type {ErrorAction, Intent, RefreshOptions, Row, Tab} from './types';
 
 const NAV: Array<{group: string; items: Array<{id: Tab; label: string}>}> = [
@@ -321,10 +321,13 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
   // Shown models whose primary route cannot serve (known only once the providers are loaded).
   const broken = providersLoaded ? brokenRoutes(data.models, {providers: data.providers, keys: data.providerKeys}) : [];
   const down = broken.filter(entry => entry.route.down).length;
+  const storage = storageLevel(data.stats);
   const badges: Partial<Record<Tab, {count: number; tone: 'danger' | 'warning'; text: string}>> = {
     ...(failedLastHour ? {traces: {count: failedLastHour, tone: 'danger' as const, text: `近 1 小时 ${failedLastHour} 次失败`}} : {}),
     ...(broken.length ? {models: {count: broken.length, tone: down ? 'danger' as const : 'warning' as const, text: down ? `${down} 个在售模型无可用线路` : `${broken.length} 个在售模型的主线路不可用`}} : {}),
     ...(keyAlerts ? {providers: {count: keyAlerts, tone: 'warning' as const, text: `${keyAlerts} 个 Key 冷却中、冷却后试用中或不可用`}} : {}),
+    ...(storage && storage.level !== 'ok' ? {security: {count: 1, tone: storage.level === 'now' ? 'danger' as const : 'warning' as const,
+      text: `账本存储 ${formatBytes(storage.bytes)} / ${formatBytes(storage.ceiling)}，${storage.level === 'now' ? '请现在归档' : '建议归档'}`}} : {}),
   };
   const staleSections = loadErrors.filter(error => error.stale).map(error => error.section);
 
@@ -417,7 +420,7 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
               updateAnnouncements={announcements => setData(previous => ({...previous, announcements}))}/>}
             {activeTab === 'reconciliation' && <FinancePage financials={data.financials} loading={loading} failed={!!failures.financials}
               refresh={refreshData} reportError={reportError} onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy} refreshEpoch={refreshEpoch}/>}
-            {activeTab === 'security' && <SecurityPage operator={operator} keyCount={providersLoaded ? data.providerKeys.length : null}
+            {activeTab === 'security' && <SecurityPage operator={operator} keyCount={providersLoaded ? data.providerKeys.length : null} stats={data.stats} refresh={refreshData} guards={guards}
               onLogout={() => void onLogout(false)} onLogoutAll={() => void logoutAll()}/>}
           </div>
         </div>

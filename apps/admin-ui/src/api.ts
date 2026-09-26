@@ -23,6 +23,19 @@ export interface AdminStats {
   remainingPoints: number;
   /** Real totals over the last 24 hours and 7 days (newer servers). */
   activity?: AdminActivity;
+  /** Size of the saved billing state (bytes), the level from which to archive the ledger, and the ceiling at which saves fail. */
+  stateBytes?: number;
+  stateWarningBytes?: number;
+  stateCeilingBytes?: number;
+}
+
+/** What POST /ledger/archive did: the entries moved into an archive file beside the saved state, and its size before and after. */
+export interface LedgerArchive {
+  success: boolean;
+  receipt: {archive_id: string; archive_file: string; drained_entries_count: number; sha256_checksum: string; before_ts_secs: number; created_at_secs: number};
+  stateBytesBefore: number;
+  stateBytesAfter: number;
+  stateCeilingBytes: number;
 }
 
 export interface AdminActivityWindow {
@@ -510,6 +523,11 @@ export class AdminApiClient {
   /** What happened to one card, newest first: who did it and why. */
   async getCardHistory(cardId: string): Promise<{success: boolean; cardId: string; events: CardEvent[]}> {
     return this.request(`/api/v1/admin/cards/history?card_id=${encodeURIComponent(cardId)}`);
+  }
+
+  /** Moves ledger entries older than `beforeTsSecs` into an archive file; balances and quotas stay as they are. */
+  async archiveLedger(beforeTsSecs: number): Promise<LedgerArchive> {
+    return this.request('/api/v1/admin/ledger/archive', {method: 'POST', body: JSON.stringify({beforeTsSecs})});
   }
 
   async pruneTraces(cutoffSecs: number): Promise<{ success: boolean; pruned: number }> {

@@ -82,6 +82,20 @@ export function providerFormatLabel(provider: Row): string | null {
   return !format ? null : ['open_ai', 'openai'].includes(format) ? 'OpenAI' : format === 'anthropic' ? 'Anthropic' : format;
 }
 
+/**
+ * The saved billing state against its ceiling, where every save fails and so every request is
+ * refused: archive the ledger soon from the server's warning level, and now from the level at
+ * which the server logs "archive … now" (a quarter of the ceiling: billing's STATE_URGENT_BYTES).
+ * Null when the server does not report its size.
+ */
+export function storageLevel(stats: {stateBytes?: unknown; stateWarningBytes?: unknown; stateCeilingBytes?: unknown} | null | undefined):
+  {bytes: number; warning: number; urgent: number; ceiling: number; level: 'ok' | 'soon' | 'now'} | null {
+  const [bytes, warning, ceiling] = [stats?.stateBytes, stats?.stateWarningBytes, stats?.stateCeilingBytes].map(Number);
+  if (![bytes, warning, ceiling].every(value => Number.isFinite(value) && value >= 0) || !ceiling) return null;
+  const urgent = ceiling / 4;
+  return {bytes, warning, urgent, ceiling, level: bytes >= urgent ? 'now' : bytes >= warning ? 'soon' : 'ok'};
+}
+
 export const TRACE_IN_PROGRESS = ['pending', 'running', 'in_progress'];
 
 export function traceStatusView(status: unknown): StatusView {

@@ -34,6 +34,10 @@ const REFUSALS: Array<[RegExp, (ids: string) => string]> = [
   [/The Key's secret is unavailable/i, () => '读不到这个 Key 的密钥：编辑这个 Key，重新填写密钥'],
   [/^Unknown key$/i, () => '这个 Key 已不存在（可能刚被删除），请刷新'],
   [/^Unknown provider$/i, () => '这个供应商已不存在（可能刚被删除），请刷新'],
+  // Archiving the ledger.
+  [/No ledger entries match the archival cutoff/i, () => '这个日期之前没有可以归档的账本记录：换一个更晚的日期'],
+  [/Billing state is not persisted/i, () => '服务器没有把账本保存到磁盘，没有可以归档的内容'],
+  [/beforeTsSecs must not be in the future/i, () => '归档日期不能晚于今天'],
 ];
 
 /**

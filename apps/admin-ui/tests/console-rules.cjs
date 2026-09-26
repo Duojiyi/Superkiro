@@ -70,4 +70,15 @@ const plain = value => JSON.parse(JSON.stringify(value));
   }
   assert.equal(route.OPEN_PARAM.cards, 'open');assert.equal(route.OPEN_PARAM.providers, 'edit');
   console.log('PASS page addresses: pages and their parameters, defaults left out, unknown values dropped, card codes never kept, read back unchanged');
+
+  // The saved ledger's size: soon from the server's warning level, now from a quarter of the
+  // ceiling (billing's STATE_URGENT_BYTES, where the server logs "archive … now").
+  const status = load('status.ts'), display = load('format.ts');
+  const MB = 1048576, stats = bytes => ({stateBytes: bytes, stateWarningBytes: 32 * MB, stateCeilingBytes: 256 * MB});
+  assert.deepEqual([12 * MB, 32 * MB - 1, 32 * MB, 64 * MB - 1, 64 * MB, 300 * MB].map(bytes => status.storageLevel(stats(bytes)).level), ['ok', 'ok', 'soon', 'soon', 'now', 'now']);
+  assert.equal(status.storageLevel(stats(1)).urgent, 64 * MB);
+  assert.equal(status.storageLevel({}), null, 'an older server that reports no size raises nothing');
+  assert.equal(status.storageLevel(null), null);
+  assert.deepEqual([0, 900, 820 * 1024, 71.25 * MB, 256 * MB, undefined].map(display.formatBytes), ['0 KB', '1 KB', '820 KB', '71.3 MB', '256 MB', '—']);
+  console.log('PASS ledger storage: levels at 32 MB and 64 MB of 256 MB, sizes in KB and MB');
 })().catch(error => {console.error(error); process.exitCode = 1;});

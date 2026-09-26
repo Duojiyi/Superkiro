@@ -60,6 +60,13 @@ export function formatTokenCount(value: unknown): string {
   return String(Math.round(value));
 }
 
+/** Stored sizes, in MB of 1,048,576 bytes as the server counts them: 820 KB · 71.3 MB · 256 MB. */
+export function formatBytes(bytes: unknown): string {
+  if (!isNumber(bytes) || bytes < 0) return '—';
+  if (bytes < 1_048_576) return `${bytes ? Math.max(1, Math.round(bytes / 1024)) : 0} KB`;
+  return `${oneDecimal(bytes / 1_048_576)} MB`;
+}
+
 /** Durations: under a second in ms, otherwise seconds with one decimal. 820 ms · 1.2 s */
 export function formatDuration(ms: unknown): string {
   if (!isNumber(ms) || ms < 0) return '—';

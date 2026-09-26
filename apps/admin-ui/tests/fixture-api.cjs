@@ -11,6 +11,9 @@ module.exports = function fixtureApi() {
   // An OpenAI-format provider's model, as onboarded in production: 272K context, priced in USD.
   models.push(entry({id: 'fixture-model-3', exposed_model_id: 'gpt-6-astra', target_provider_id: 'fixture-openai', target_model: 'gpt-6-astra', group_id: groups[0].id, context_window: 272000, max_output: 128000, credit_multiplier: 1, visible: true, supports_tools: true, supports_vision: true, supports_reasoning: true, sort_order: 1}));
   const cards = ['active', 'unactivated', 'frozen', 'banned', 'expired', 'active'].map((status, i) => ({id: `fixture-card-${i}`, codeRecoverable: i !== 1, status, creditTotal: 2000000000, creditUsed: i*100000000, availableCredits: 2000000000-i*100000000, pointsTotal: 2000, pointsAvailable: 2000-i*100, boundDevices: status === 'unactivated' ? [] : [`fixture-device-${i}`], maxDevices: 1, activatedAt: now-86400, validUntil: now+2592000, groupId: groups[i%4].id, note: '本地视觉测试数据'}));
+  // The saved billing state's size, as GET /stats reports it (billing's warning level and ceiling),
+  // and how far back the ledger has been archived.
+  const storage = {bytes: 13212876, warning: 33554432, ceiling: 268435456, archivedBefore: 0};
   const cardRevision = () => crypto.createHash('sha256').update(cards.map(card => card.id).join('\n')).digest('hex');
   // Requests relative to the real clock, so "近 24 小时" and the 24-hour content archive
   // behave as in production: one every 30 minutes, the newest a minute ago.
@@ -105,7 +108,7 @@ module.exports = function fixtureApi() {
   let authenticated = false, deadline = 0, loginAt = 0;
   const IDLE = 1800, MAX = 8 * 3600;
   const nowSecs = () => Math.floor(Date.now() / 1000);
-  return {writes, cards, traces, providers, keys, config, expire() {authenticated=false;}, get sessionDeadline() {return deadline;}, async handle(req,res) {
+  return {writes, cards, traces, providers, keys, config, storage, expire() {authenticated=false;}, get sessionDeadline() {return deadline;}, async handle(req,res) {
     const url = new URL(req.url, 'http://127.0.0.1');
     const endpoint = url.pathname.replace('/api/v1/admin/', '');
     const reply = (value, status=200) => {res.writeHead(status, {'Content-Type':'application/json'}); res.end(JSON.stringify(value));};
@@ -124,7 +127,7 @@ module.exports = function fixtureApi() {
     if(endpoint==='me' || (endpoint==='session' && req.method==='GET')) return reply({success:true,role:'admin',username:'admin',csrfToken:'fixture-csrf',expiresAt:deadline,expiresIn:deadline-nowSecs(),twoFactorEnabled:false,totpRequired:false});
     if(endpoint==='cards/reveal') return reply({success:true,rawCode:'FIXTURE-RECOVERED-CODE'});
     if(endpoint==='session/revoke') {authenticated=false; res.setHeader('Set-Cookie','fixture_session=; Max-Age=0; Path=/'); return reply({success:true});}
-    if(endpoint==='stats') return reply({success:true,totalCards:cards.length,activeCards:2,unactivatedCards:1,frozenCards:1,bannedCards:1,totalCredits:12000000000,usedCredits:1500000000,remainingCredits:10500000000,totalPoints:12000,usedPoints:1500,remainingPoints:10500,activity:activity()});
+    if(endpoint==='stats') return reply({success:true,stateBytes:storage.bytes,stateWarningBytes:storage.warning,stateCeilingBytes:storage.ceiling,totalCards:cards.length,activeCards:2,unactivatedCards:1,frozenCards:1,bannedCards:1,totalCredits:12000000000,usedCredits:1500000000,remainingCredits:10500000000,totalPoints:12000,usedPoints:1500,remainingPoints:10500,activity:activity()});
     if(endpoint==='cards') return reply({success:true,count:cards.length,cards,revision:cardRevision()});
     // One card's history, newest first: this session's changes, then realistic older events.
     if(endpoint==='cards/history') {
@@ -194,6 +197,19 @@ module.exports = function fixtureApi() {
       return reply({success:true,cards:generated});
     }
     if(endpoint==='cards/status') {const card=cards.find(c=>c.id===body.cardId); assert.ok(card); card.status=body.action==='freeze'?'frozen':body.action==='unfreeze'?'active':'banned'; return reply({success:true,cardId:card.id,newStatus:card.status});}
+    // Archiving the ledger, as its handler answers: a receipt, and the saved size before and after.
+    if(endpoint==='ledger/archive') {
+      const t=Math.floor(Date.now()/1000),before=body.beforeTsSecs;
+      if(!Number.isSafeInteger(before)||before<0)return reply({__type:'SerializationException',message:'invalid type: expected u64'},400);
+      if(before>t)return reply({__type:'ValidationException',message:'beforeTsSecs must not be in the future'},400);
+      // The fixture's ledger reaches back 90 days; archived entries are gone from it.
+      const from=Math.max(t-90*86400,storage.archivedBefore);
+      if(before<=from)return reply({__type:'ValidationException',message:'No ledger entries match the archival cutoff timestamp'},400);
+      const drained=Math.round((before-from)/86400*200),bytesBefore=storage.bytes,archiveId=`arc-${t}-${storage.archivedBefore?1:0}-42`;
+      storage.bytes=Math.max(4194304,storage.bytes-drained*3600);storage.archivedBefore=before;
+      return reply({success:true,receipt:{archive_id:archiveId,archive_file:`ledger_archive_${archiveId}.json`,drained_entries_count:drained,sha256_checksum:crypto.createHash('sha256').update(archiveId).digest('hex'),
+        before_ts_secs:before,created_at_secs:t},stateBytesBefore:bytesBefore,stateBytesAfter:storage.bytes,stateCeilingBytes:storage.ceiling});
+    }
     if(endpoint==='exports/ledger.csv') {res.writeHead(200,{'Content-Type':'text/csv'}); return res.end('id,points\nfixture-ledger,27\n');}
     throw new Error(`Unhandled fixture endpoint: ${req.method} ${endpoint}`);
   }};

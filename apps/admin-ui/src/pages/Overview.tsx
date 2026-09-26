@@ -5,9 +5,9 @@ import {loadAdjustment} from '../adjustment';
 import type {AdminActivityWindow, AdminTrace} from '../api';
 import {EstimateTag, FilterTabs, StatusBadge, TableState, TopbarActions} from '../components/ui';
 import {IconCheck, IconWarning} from '../components/icons';
-import {formatCount, formatCredits, formatCreditsMicro, formatDuration, formatFullDateTime, formatMoney, formatPercent, formatRemaining, shortId} from '../format';
+import {formatBytes, formatCount, formatCredits, formatCreditsMicro, formatDuration, formatFullDateTime, formatMoney, formatPercent, formatRemaining, shortId} from '../format';
 import {brokenRoutes, modelName, nameList, targetProblem} from '../routes';
-import {cooldownText, failureLabel, keyAlert, keyCooldownLeft, keyStatusView, TRACE_IN_PROGRESS} from '../status';
+import {cooldownText, failureLabel, keyAlert, keyCooldownLeft, keyStatusView, storageLevel, TRACE_IN_PROGRESS} from '../status';
 import type {Intent, Row, Tab} from '../types';
 import type {Failures, WorkspaceData} from '../Workspace';
 
@@ -97,6 +97,10 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
   const providerName = (id: unknown) => String(data.providers.find(provider => provider.id === id)?.name ?? id);
   const toKey = (key: Row) => () => onNavigate('providers', {providers: {key: String(key.id)}});
   const toProvider = (id: unknown) => () => onNavigate('providers', {providers: {provider: String(id)}});
+  // The saved state nears the size at which every request is refused: archive the ledger.
+  const storage = storageLevel(data.stats);
+  if (storage && storage.level !== 'ok') attention.push({text: `账本存储 ${formatBytes(storage.bytes)} / ${formatBytes(storage.ceiling)}，${storage.level === 'now'
+    ? '请现在归档：到上限时所有请求都会被拒绝' : '建议归档旧账本'}`, tone: storage.level === 'now' ? 'danger' : 'warning', go: () => onNavigate('security')});
   // Shown models nothing can serve, each with why and links to what to fix.
   const broken = providersLoaded ? brokenRoutes(data.models, {providers: data.providers, keys: data.providerKeys, nowSecs}) : [];
   for (const {model, route} of broken.filter(entry => entry.route.down)) {

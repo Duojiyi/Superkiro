@@ -50,6 +50,7 @@ for (const input of ['', '-1', 'NaN', 'Infinity', '1e3', '1.0000001', '900719925
     [() => api.withdrawAnnouncement('ann-1'), '/announcements/withdraw', {id:'ann-1'}],
     [() => api.updateProviderStatus('provider-1', false), '/providers/status', {providerId:'provider-1',enabled:false}],
     [() => api.pruneTraces(123), '/traces/prune', {cutoffSecs:123}],
+    [() => api.archiveLedger(1788000000), '/ledger/archive', {beforeTsSecs:1788000000}],
     [() => api.manageKey('save', {provider_id:'p',key_id:'k',allowed_models:[]}), '/providers/keys', {provider_id:'p',key_id:'k',allowed_models:[]}],
     [() => api.manageKey('discover', {provider_id:'p',key_id:'k'}), '/providers/keys/discover', {provider_id:'p',key_id:'k'}],
     [() => api.importProvider({providers:[]}), '/providers/import', {format:'cc_switch',content:{providers:[]}}],
