@@ -32,6 +32,20 @@ pub struct ActivityWindow {
     pub provider_cost_micro_cny: i64,
     /// Cards billed at least once in the period.
     pub active_cards: u64,
+    /// Finished requests whose time to first output was measured.
+    pub timed_requests: u64,
+    pub ttft_median_ms: Option<u32>,
+    pub ttft_p90_ms: Option<u32>,
+}
+
+/// One provider's requests over the last 24 hours.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderActivity {
+    pub provider_id: String,
+    pub requests: u64,
+    pub failed: u64,
+    pub ttft_median_ms: Option<u32>,
 }
 
 /// Requests in one clock hour.
@@ -53,6 +67,8 @@ pub struct Activity {
     pub last_7d: ActivityWindow,
     /// Oldest first; the last is the current, unfinished hour.
     pub hourly: Vec<ActivityHour>,
+    /// The last 24 hours by provider, busiest first.
+    pub providers: Vec<ProviderActivity>,
     /// The oldest trace kept: request counts reach back no further than this.
     pub traces_cover_from_secs: Option<u64>,
 }

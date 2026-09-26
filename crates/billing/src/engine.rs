@@ -4529,7 +4529,12 @@ impl BillingEngine {
     /// Requests and billing over the last 24 hours and 7 days, and hour by hour over the
     /// last day, read in place: request outcomes from the traces, charges from the ledger.
     pub fn activity(&self, now: u64) -> crate::observability::Activity {
-        use crate::observability::{Activity, ActivityHour, ActivityWindow};
+        use crate::observability::{Activity, ActivityHour, ActivityWindow, ProviderActivity};
+        // Nearest rank, over timings sorted ascending.
+        fn percentile(sorted: &[u32], percent: usize) -> Option<u32> {
+            let rank = (sorted.len() * percent).div_ceil(100).max(1);
+            sorted.get(rank - 1).copied()
+        }
         const HOUR: u64 = 3600;
         let day_start = now.saturating_sub(24 * HOUR);
         let week_start = now.saturating_sub(7 * 24 * HOUR);
@@ -4552,23 +4557,66 @@ impl BillingEngine {
             }
             window.requests += 1;
         };
+        let mut day_ttft = Vec::new();
+        let mut week_ttft = Vec::new();
+        let mut providers: HashMap<String, (ProviderActivity, Vec<u32>)> = HashMap::new();
         {
             let traces = self.traces.read().unwrap();
             activity.traces_cover_from_secs = traces.iter().map(|trace| trace.ts).min();
-            for trace in traces.iter().filter(|trace| trace.ts <= now) {
+            let finished = traces
+                .iter()
+                .filter(|trace| trace.ts <= now && trace.status != TraceStatus::InProgress);
+            for trace in finished {
                 if trace.ts > week_start {
                     count(&mut activity.last_7d, trace.status);
+                    week_ttft.extend(trace.ttft_ms);
                 }
                 if trace.ts > day_start {
                     count(&mut activity.last_24h, trace.status);
+                    day_ttft.extend(trace.ttft_ms);
+                    if let Some(provider_id) = &trace.provider_id {
+                        let (provider, ttft) =
+                            providers.entry(provider_id.clone()).or_insert_with(|| {
+                                let provider = ProviderActivity {
+                                    provider_id: provider_id.clone(),
+                                    ..ProviderActivity::default()
+                                };
+                                (provider, Vec::new())
+                            });
+                        provider.requests += 1;
+                        provider.failed += u64::from(trace.status == TraceStatus::Error);
+                        ttft.extend(trace.ttft_ms);
+                    }
                 }
-                if trace.ts >= first_hour && trace.status != TraceStatus::InProgress {
+                if trace.ts >= first_hour {
                     let hour = &mut activity.hourly[((trace.ts - first_hour) / HOUR) as usize];
                     hour.requests += 1;
                     hour.failed += u64::from(trace.status == TraceStatus::Error);
                 }
             }
         }
+        for (window, ttft) in [
+            (&mut activity.last_24h, &mut day_ttft),
+            (&mut activity.last_7d, &mut week_ttft),
+        ] {
+            ttft.sort_unstable();
+            window.timed_requests = ttft.len() as u64;
+            window.ttft_median_ms = percentile(ttft, 50);
+            window.ttft_p90_ms = percentile(ttft, 90);
+        }
+        activity.providers = providers
+            .into_values()
+            .map(|(mut provider, mut ttft)| {
+                ttft.sort_unstable();
+                provider.ttft_median_ms = percentile(&ttft, 50);
+                provider
+            })
+            .collect();
+        activity.providers.sort_by(|a, b| {
+            b.requests
+                .cmp(&a.requests)
+                .then_with(|| a.provider_id.cmp(&b.provider_id))
+        });
         let ledger = self.ledger.read().unwrap();
         for (window, start) in [
             (&mut activity.last_24h, day_start),

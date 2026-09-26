@@ -754,9 +754,22 @@ fn activity_counts_real_totals_by_period_and_hour() {
         provider_cost_micro_cny: 0,
         attempt_chain: Vec::new(),
     };
-    engine.record_trace(trace("inv-failed", now - 1800, TraceStatus::Error));
-    engine.record_trace(trace("inv-left", now - 60, TraceStatus::ClientAborted));
-    engine.record_trace(trace("inv-running", now - 10, TraceStatus::InProgress));
+    engine.note_trace_timing("inv-hour-ago", Some(800), Some(40.0));
+    engine.note_trace_timing("inv-two-days", Some(2000), Some(20.0));
+    engine.record_trace(RequestTrace {
+        provider_id: Some("provider-b".into()),
+        ..trace("inv-failed", now - 1800, TraceStatus::Error)
+    });
+    engine.record_trace(RequestTrace {
+        provider_id: Some("provider".into()),
+        ttft_ms: Some(1200),
+        ..trace("inv-left", now - 60, TraceStatus::ClientAborted)
+    });
+    engine.record_trace(RequestTrace {
+        provider_id: Some("provider".into()),
+        ttft_ms: Some(1),
+        ..trace("inv-running", now - 10, TraceStatus::InProgress)
+    });
 
     let activity = engine.activity(now);
     let day = &activity.last_24h;
@@ -783,9 +796,36 @@ fn activity_counts_real_totals_by_period_and_hour() {
     );
     assert_eq!(activity.hourly.iter().map(|h| h.requests).sum::<u64>(), 3);
     assert_eq!(activity.traces_cover_from_secs, Some(now - 8 * 86400));
+    // Time to first output over finished, timed requests; the running one is not counted.
+    assert_eq!(
+        (day.timed_requests, day.ttft_median_ms, day.ttft_p90_ms),
+        (2, Some(800), Some(1200))
+    );
+    assert_eq!(
+        (week.timed_requests, week.ttft_median_ms, week.ttft_p90_ms),
+        (3, Some(1200), Some(2000))
+    );
+    let providers: Vec<_> = activity
+        .providers
+        .iter()
+        .map(|p| {
+            (
+                p.provider_id.as_str(),
+                p.requests,
+                p.failed,
+                p.ttft_median_ms,
+            )
+        })
+        .collect();
+    assert_eq!(
+        providers,
+        [("provider", 2, 0, Some(800)), ("provider-b", 1, 1, None)]
+    );
     // As the stats endpoint sends it.
     let json = serde_json::to_value(&activity).unwrap();
     assert_eq!(json["last24h"]["clientAborted"], 1);
     assert_eq!(json["hourly"][23]["startSecs"], 240 * 3600);
     assert_eq!(json["tracesCoverFromSecs"], now - 8 * 86400);
+    assert_eq!(json["last24h"]["ttftMedianMs"], 800);
+    assert_eq!(json["providers"][0]["providerId"], "provider");
 }
