@@ -33,21 +33,23 @@ export default function ProviderKeyEditor({selectedKey, preset, knownModels = []
   onBusyChange: (busy: boolean) => void;
   onClose?: () => void;
 }) {
-  const [provider, setProvider] = useState(preset?.providerId ?? '');
+  // The first render already shows the saved Key: a list shown unticked until an effect ran
+  // could be read, or edited, as the Key's own.
+  const [provider, setProvider] = useState(selectedKey ? String(selectedKey.provider_id ?? '') : preset?.providerId ?? '');
   const [baseUrl, setBaseUrl] = useState('');
   const [format, setFormat] = useState('anthropic');
-  const [keyId, setKeyId] = useState(preset?.keyId ?? preset?.suggestedKeyId ?? '');
+  const [keyId, setKeyId] = useState(selectedKey ? String(selectedKey.id ?? '') : preset?.keyId ?? preset?.suggestedKeyId ?? '');
   const [secret, setSecret] = useState('');
   // Uncontrolled so the key never lands in the input's DOM attribute.
   const secretInput = useRef<HTMLInputElement>(null);
   useEffect(() => {if (!secret && secretInput.current) secretInput.current.value = '';}, [secret]);
-  const [models, setModels] = useState('');
+  const [models, setModels] = useState(Array.isArray(selectedKey?.allowed_models) ? (selectedKey.allowed_models as unknown[]).join('\n') : '');
   // The list is ticked, not typed; typing stays available behind 手动输入.
   const [manual, setManual] = useState(false);
   const [modelQuery, setModelQuery] = useState('');
   const [seen, setSeen] = useState<string[]>([]);
-  const [weight, setWeight] = useState('1');
-  const [enabled, setEnabled] = useState(true);
+  const [weight, setWeight] = useState(String(selectedKey?.weight ?? 1));
+  const [enabled, setEnabled] = useState(selectedKey?.enabled !== false);
   const [busy, setBusy] = useState(false);
   const [dirty, setDirty] = useState(false);
   const pending = useRef(false);
