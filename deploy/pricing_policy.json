@@ -55,6 +55,12 @@
       6.25,
       0.5
     ],
+    "claude-opus-5-5": [
+      4,
+      20,
+      5,
+      0.2
+    ],
     "claude-sonnet-4-6": [
       3,
       15,
@@ -88,11 +94,15 @@
   },
   "provider_upstream_multipliers": {
     "kimera-primary": 0.08,
-    "kimera-direct": 0.06
+    "kimera-direct": 0.06,
+    "hanyue-max": 0.22
   },
   "verified_context_windows": {
     "gpt-6-astra": 272000,
     "gpt-5.6-sol": 272000,
     "gpt-5.6-terra": 272000
+  },
+  "priced_as": {
+    "claude-opus-5-5": "claude-opus-5"
   }
 }
