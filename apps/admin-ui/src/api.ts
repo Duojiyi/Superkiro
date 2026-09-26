@@ -197,6 +197,18 @@ export interface AdminCardAdjustResponse {
   newAvailablePoints: number;
 }
 
+/** What one test request to an upstream model found. */
+export interface ProbeResult {
+  success: boolean;
+  ok: boolean;
+  /** The upstream's HTTP status (0 when no request was made). */
+  status: number;
+  latency_ms: number;
+  ttft_ms: number | null;
+  error: string | null;
+  reply: string | null;
+}
+
 export interface AdminAnnouncement {
   id: string;
   title: string;
@@ -525,6 +537,11 @@ export class AdminApiClient {
 
   async manageKey(action: 'save' | 'discover', payload: Record<string, unknown>): Promise<{success: boolean; models?: string[]; has_more?: boolean}> {
     return this.request('/api/v1/admin/providers/keys' + (action === 'discover' ? '/discover' : ''), {method: 'POST', body: JSON.stringify(payload)});
+  }
+
+  /** 测试: one tiny real request to this upstream model (a fraction of a cent). Nothing is saved. */
+  async probeKey(payload: {provider_id: string; model: string; key_id?: string}): Promise<ProbeResult> {
+    return this.request('/api/v1/admin/providers/keys/probe', {method: 'POST', body: JSON.stringify(payload)});
   }
 
   /** Refused (409) while it is the only route of a model customers see. */

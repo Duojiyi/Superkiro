@@ -294,6 +294,7 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
     if (kind !== 'models' || !intent?.list || intentUsed.current || !config) return;
     intentUsed.current = true;
     if (!listingBlocked) openListing(intent.list);
+    else say(`没有打开“上架 ${intent.list.model ?? '模型'}”：${listingBlocked}，然后点右上角的“＋ 上架模型”。`, 'warning');
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [intent, config]);
   const searchable = rows.length > 15;
@@ -484,7 +485,7 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
     })()}
 
     {listing && config && <ListModelDrawer preset={listing} config={config} providers={providers} providerKeys={providerKeys}
-      onClose={() => setListing(null)} onPublish={(update, listingReason) => publishOne(update, listingReason, '上架')} onReload={() => load(false, true)}/>}
+      onClose={() => setListing(null)} onPublish={(update, listingReason, check) => publishOne(update, listingReason, '上架', undefined, check)} onReload={() => load(false, true)}/>}
 
     {newGroup && <Modal label="新建分组" onClose={() => setNewGroup(null)} className="dialog-form">
       <h3 className="modal-title">新建分组</h3>

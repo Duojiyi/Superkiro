@@ -1,15 +1,17 @@
 // 上架模型: the rules for listing a new model, as pure functions so they can be tested without
-// a browser. A listing is published in two steps: the model (hidden) together with its first
-// price, then — once that price is in force — the model shown at its place in the list. The
-// server refuses a price that starts in the past, and a request for a model without a price in
-// force would fail, so the model is never shown before its price applies.
-import {buildPriceVersion, MAX_PRICE_MICRO, PRICE_FIELDS, versionIdFor} from './priceChange';
+// a browser. A listing is one publication: the model, shown, together with its first price in
+// force at once (effective_from_secs 0, which the server accepts only for a model its price
+// table has no version of yet). When the table already prices that model ID — another group
+// shares the table — the model is listed at that price, or with a new one from a later time.
+// Either way a customer never sees a model without a price in force.
+import {buildPriceVersion, currentVersion, MAX_PRICE_MICRO, PRICE_FIELDS, versionIdFor} from './priceChange';
 import {canRoute} from './routes';
 
 type Row = Record<string, unknown>;
 
-/** Seconds from publishing a listing to its price taking effect (and the model being shown). */
-export const LISTING_DELAY_SECS = 20;
+/** The model IDs (and aliases) the server accepts. */
+export const MODEL_ID = /^[A-Za-z0-9._:/-]{1,128}$/;
+export const MODEL_ID_RULE = '模型 ID 只能用英文字母、数字和 . _ : / -，最多 128 个字符';
 
 const bytes = (text: string) => new TextEncoder().encode(text).length;
 const validText = (value: unknown, max: number): value is string =>
@@ -81,9 +83,24 @@ export function mappingIdFor(providerId: string, modelId: string, taken: Iterabl
 
 const order = (row: Row) => Number(row.sort_order ?? 0);
 
-/** A group's models in list order. */
+/** A group's models in list order (ties in the order the server lists them). */
 export function groupModels(models: Row[], groupId: unknown): Row[] {
   return models.filter(model => model.group_id === groupId).sort((a, b) => order(a) - order(b));
+}
+
+/** A group's models numbered 0, 1, 2… in the order given, so no two share a place: the ones whose number changes. */
+export function renumbered(ordered: Row[]): Row[] {
+  return ordered.map((model, index) => ({model, index})).filter(({model, index}) => order(model) !== index || model.sort_order === undefined)
+    .map(({model, index}) => ({...model, sort_order: index}));
+}
+
+/** The price table's own versions of this model ID, and the other groups' models that are charged by them. */
+export function sharedPrice(config: {groups: Row[]; models: Row[]; versions: Row[]}, groupId: unknown, modelId: string): {versions: Row[]; groups: Row[]} {
+  const rateCardId = config.groups.find(group => group.id === groupId)?.rate_card_id;
+  const versions = config.versions.filter(version => version.rate_card_id === rateCardId && version.model === modelId);
+  const groups = config.groups.filter(group => group.id !== groupId && group.rate_card_id === rateCardId
+    && config.models.some(model => model.group_id === group.id && model.exposed_model_id === modelId));
+  return {versions, groups};
 }
 
 export interface ListingInput {
@@ -101,8 +118,12 @@ export interface ListingInput {
   reasoning: boolean;
   /** The multiplier the model list shows; empty: the server derives one from the price. */
   rateMultiplier: string;
-  /** ID of the model to place it after; empty: at the end. */
-  after: string;
+  /** The model's own charge multiplier (扣费倍率). */
+  creditMultiplier: string;
+  /** Where in the group: first, last, or after the model with this entry ID. */
+  place: {at: 'first' | 'last'} | {at: 'after'; id: string};
+  /** Charge the price the table already has for this model ID (another group shares the table). */
+  keepPrice: boolean;
   /** Credits per million tokens, as typed, per PRICE_FIELDS; procurement per COST_FIELDS. */
   prices: Record<string, string>;
   costs: Record<string, string>;
@@ -114,14 +135,22 @@ export interface ListingContext {
   providers: Row[];
   keys: Row[];
   nowSecs: number;
+  /** When a new price takes effect for a model ID the table already prices (it cannot start now). */
   effectiveSecs: number;
 }
 
-/**
- * Checks the form and builds the first publication: the model, hidden, and its first price.
- * Throws with the reason, in the words the drawer shows.
- */
-export function buildListing(input: ListingInput, context: ListingContext): {mapping: Row; version: Row} {
+export interface Listing {
+  /** Everything to publish: the new entry, and the group's models whose place number changes. */
+  models: Row[];
+  mapping: Row;
+  /** The new price, or null when the table's existing one is kept. */
+  version: Row | null;
+  /** Other groups whose model of the same ID is charged by the same price. */
+  sharedWith: Row[];
+}
+
+/** Checks the form and builds the one publication. Throws with the reason, in the words the drawer shows. */
+export function buildListing(input: ListingInput, context: ListingContext): Listing {
   const {config, providers, keys} = context;
   const provider = providers.find(item => item.id === input.providerId);
   if (!provider) throw new Error('请选择供应商');
@@ -132,7 +161,8 @@ export function buildListing(input: ListingInput, context: ListingContext): {map
     throw new Error(`${String(provider.name ?? provider.id)} 的 Key 还没有授权 ${targetModel}：先在“供应商与 Key”里勾选它并保存`);
   }
   const modelId = input.modelId.trim();
-  if (!validText(modelId, 128)) throw new Error('请填写模型 ID（客户看到的，不超过 128 字节）');
+  if (!modelId) throw new Error('请填写模型 ID（客户在 Kiro 里看到并请求的）');
+  if (!MODEL_ID.test(modelId)) throw new Error(MODEL_ID_RULE);
   const group = config.groups.find(item => item.id === input.groupId);
   if (!group) throw new Error('请选择分组');
   const rateCardId = group.rate_card_id;
@@ -149,37 +179,43 @@ export function buildListing(input: ListingInput, context: ListingContext): {map
   }
   const rateText = input.rateMultiplier.trim(), rate = Number(rateText);
   if (rateText && (!Number.isFinite(rate) || rate <= 0 || rate > 1000)) throw new Error('显示倍率需大于 0、不超过 1000；留空按价格自动换算');
-  let position = peers.length ? order(peers[peers.length - 1]) + 1 : 0;
-  if (input.after) {
-    const anchor = peers.find(model => model.id === input.after);
-    if (!anchor) throw new Error('要排在其后的模型不在这个分组里，请重新选择位置');
-    position = order(anchor) + 1;
-  }
-  const version = buildPriceVersion(
-    {prices: input.prices, costs: input.costs, currency: input.currency, multiplier: '1', effectiveSecs: context.effectiveSecs,
-      id: versionIdFor(modelId, context.effectiveSecs, config.versions.map(item => item.id))},
-    {model: modelId, rateCardId, versions: config.versions, nowSecs: context.nowSecs, base: null},
-  );
-  if (!Number(version[PRICE_FIELDS[0][0]]) && !Number(version[PRICE_FIELDS[1][0]])) throw new Error('输入和输出售价不能都是 0');
+  const creditText = input.creditMultiplier.trim(), credit = Number(creditText);
+  if (!creditText || !Number.isFinite(credit) || credit <= 0 || credit > 1000) throw new Error('扣费倍率需大于 0、不超过 1000（不加倍填 1）');
   const mapping: Row = {
     id: mappingIdFor(String(provider.id), modelId, config.models.map(model => model.id)),
     group_id: group.id, exposed_model_id: modelId, target_provider_id: provider.id, target_model: targetModel,
     context_window: contextWindow, max_output: maxOutput,
     supports_tools: input.tools, supports_vision: input.vision, supports_reasoning: input.reasoning,
-    credit_multiplier: 1, visible: false, sort_order: position, aliases: [], fallback_chain: [],
+    credit_multiplier: credit, visible: true, sort_order: 0, aliases: [], fallback_chain: [],
     rate_multiplier: rateText ? rate : null, display_name: displayName || null, description: null,
   };
-  return {mapping, version};
-}
-
-/**
- * The second publication: the model as the server holds it, now shown, and the models from its
- * place on moved down one.
- */
-export function showListing(models: Row[], mappingId: string): Row[] {
-  const listed = models.find(model => model.id === mappingId);
-  if (!listed) throw new Error('服务器上没有找到刚上架的模型，请重新加载核对');
-  const shifted = models.filter(model => model.group_id === listed.group_id && model.id !== listed.id && order(model) >= order(listed))
-    .map(model => ({...model, sort_order: order(model) + 1}));
-  return [...shifted, {...listed, visible: true}];
+  // First or last needs no other model to move; between two, the whole group is numbered again,
+  // so a tie can never put the new model anywhere but where it was placed.
+  let moved: Row[] = [];
+  if (input.place.at === 'after') {
+    const anchor = input.place.id, index = peers.findIndex(model => model.id === anchor);
+    if (index < 0) throw new Error('要排在其后的模型不在这个分组里，请重新选择位置');
+    const ordered = [...peers.slice(0, index + 1), mapping, ...peers.slice(index + 1)];
+    mapping.sort_order = index + 1;
+    moved = renumbered(ordered).filter(model => model.id !== mapping.id);
+  } else if (peers.length) mapping.sort_order = input.place.at === 'first' ? Math.min(...peers.map(order)) - 1 : Math.max(...peers.map(order)) + 1;
+  const shared = sharedPrice(config, group.id, modelId);
+  let version: Row | null = null;
+  if (shared.versions.length) {
+    if (!currentVersion(config.versions, rateCardId, [modelId, targetModel], context.nowSecs)) {
+      const next = shared.versions.map(item => Number(item.effective_from_secs)).sort((a, b) => a - b)[0];
+      throw new Error(`价格表里 ${modelId} 的价格还没生效（${new Date(next * 1000).toLocaleString()} 起），生效后再上架，或换一个模型 ID`);
+    }
+    if (!input.keepPrice) version = buildPriceVersion(
+      {prices: input.prices, costs: input.costs, currency: input.currency, multiplier: '1', effectiveSecs: context.effectiveSecs,
+        id: versionIdFor(modelId, context.effectiveSecs, config.versions.map(item => item.id))},
+      {model: modelId, rateCardId, versions: config.versions, nowSecs: context.nowSecs, base: null});
+  } else {
+    version = buildPriceVersion(
+      {prices: input.prices, costs: input.costs, currency: input.currency, multiplier: '1', effectiveSecs: 0,
+        id: versionIdFor(modelId, context.nowSecs, config.versions.map(item => item.id))},
+      {model: modelId, rateCardId, versions: config.versions, nowSecs: context.nowSecs, base: null});
+  }
+  if (version && !Number(version[PRICE_FIELDS[0][0]]) && !Number(version[PRICE_FIELDS[1][0]])) throw new Error('输入和输出售价不能都是 0');
+  return {models: [...moved, mapping], mapping, version, sharedWith: shared.groups};
 }

@@ -77,6 +77,14 @@ export function stopReasonView(reason: unknown): StatusView | null {
   return {label: reason, tone: 'outline'};
 }
 
+/** A 测试 result in a few words: 成功 · 首字 410 ms, or what failed. */
+export function probeView(result: {ok?: unknown; status?: unknown; ttft_ms?: unknown; latency_ms?: unknown; error?: unknown}): StatusView {
+  const ms = (value: unknown) => `${Math.round(Number(value))} ms`;
+  if (result.ok === true) return {label: typeof result.ttft_ms === 'number' ? `成功 · 首字 ${ms(result.ttft_ms)}` : `成功 · 耗时 ${ms(result.latency_ms)}`, tone: 'success'};
+  const error = typeof result.error === 'string' && result.error ? result.error : typeof result.status === 'number' && result.status ? `HTTP ${result.status}` : '没有回复';
+  return {label: `失败：${error}`, tone: 'danger', title: error};
+}
+
 /** Price versions of one model and rate card: the one in force, the scheduled ones, the replaced ones. */
 export function priceVersionView(version: Row, versions: Row[], nowSecs: number): StatusView {
   const from = Number(version.effective_from_secs);

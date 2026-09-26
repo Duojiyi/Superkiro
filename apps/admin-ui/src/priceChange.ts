@@ -98,7 +98,10 @@ export function buildPriceVersion(input: PriceInput, context: {model: string; ra
   const id = input.id.trim();
   if (!validText(id, 128)) throw new Error('版本 ID 无效：不超过 128 字节，不含控制字符');
   if (context.versions.some(version => version.id === id)) throw new Error('版本 ID 已存在，请换一个');
-  if (!Number.isSafeInteger(input.effectiveSecs) || input.effectiveSecs <= context.nowSecs) throw new Error('生效时间需晚于现在，不能追溯生效');
+  // 0 is "now", which the server accepts only for a model the price table has no version of yet.
+  const priced = context.versions.some(version => version.rate_card_id === context.rateCardId && version.model === context.model);
+  if (input.effectiveSecs === 0 && priced) throw new Error('这个模型在价格表里已有价格：新价格只能定在将来生效');
+  if (input.effectiveSecs !== 0 && (!Number.isSafeInteger(input.effectiveSecs) || input.effectiveSecs <= context.nowSecs)) throw new Error('生效时间需晚于现在，不能追溯生效');
   if (context.versions.some(version => version.rate_card_id === context.rateCardId && version.model === context.model && time(version) === input.effectiveSecs)) {
     throw new Error('这一时刻已有这个模型的价格版本，请换一个生效时间');
   }

@@ -245,30 +245,49 @@ assert.deepEqual(plain(routes.authorizedModels('p', listingKeys)), ['model-a', '
 assert(routes.canRoute('p', 'anything', [{provider_id: 'p', enabled: true}]), 'an old Key without a list may call any model');
 const t0 = Math.floor(Date.now() / 1000);
 const listingInput = {providerId: 'p', targetModel: 'new-model', modelId: 'new-model', displayName: '', groupId: 'g', contextWindow: 200000, maxOutput: 32000,
-  tools: true, vision: true, reasoning: false, rateMultiplier: '2.2', after: 'm-a',
+  tools: true, vision: true, reasoning: false, rateMultiplier: '2.2', creditMultiplier: '1', place: {at: 'after', id: 'm-a'}, keepPrice: false,
   prices: {fixed_input_credit_per_m: '40', fixed_output_credit_per_m: '200', fixed_cache_creation_credit_per_m: '50', fixed_cache_read_credit_per_m: '4'},
   costs: {input_price_per_m: '0.88', output_price_per_m: '4.4', cache_creation_price_per_m: '1.1', cache_read_price_per_m: '0.044'}, currency: 'CNY'};
-const listingContext = {config: listingConfig, providers: listingProviders, keys: listingKeys, nowSecs: t0, effectiveSecs: t0 + 20};
+const listingContext = {config: listingConfig, providers: listingProviders, keys: listingKeys, nowSecs: t0, effectiveSecs: t0 + 300};
+// One publication: the model shown at once, with a first price in force now (0), right after model-a.
 const listed = listing.buildListing(listingInput, listingContext);
 assert.deepEqual(plain(listed.mapping), {id: 'p-new-model', group_id: 'g', exposed_model_id: 'new-model', target_provider_id: 'p', target_model: 'new-model',
   context_window: 200000, max_output: 32000, supports_tools: true, supports_vision: true, supports_reasoning: false, credit_multiplier: 1,
-  visible: false, sort_order: 1, aliases: [], fallback_chain: [], rate_multiplier: 2.2, display_name: null, description: null}, 'hidden, right after model-a');
+  visible: true, sort_order: 1, aliases: [], fallback_chain: [], rate_multiplier: 2.2, display_name: null, description: null}, 'shown, right after model-a');
+assert.deepEqual(plain(listed.models.map(row => [row.id, row.sort_order])), [['m-b', 2], ['m-c', 3], ['p-new-model', 1]], 'the group is numbered again from its place on');
 assert.match(listed.version.id, /^new-model-\d{12}$/);
-for (const [field, value] of Object.entries({model: 'new-model', rate_card_id: 'r', pricing_mode: 'fixed', currency: 'CNY', margin_multiplier: 1, effective_from_secs: t0 + 20,
+for (const [field, value] of Object.entries({model: 'new-model', rate_card_id: 'r', pricing_mode: 'fixed', currency: 'CNY', margin_multiplier: 1, effective_from_secs: 0,
   fixed_input_credit_per_m: 40000000, fixed_output_credit_per_m: 200000000, fixed_cache_creation_credit_per_m: 50000000, fixed_cache_read_credit_per_m: 4000000,
   input_price_per_m: 0.88, output_price_per_m: 4.4, cache_creation_price_per_m: 1.1, cache_read_price_per_m: 0.044, per_call_credit: 0})) assert.equal(listed.version[field], value, field);
-assert.equal(listing.buildListing({...listingInput, after: ''}, listingContext).mapping.sort_order, 3, 'at the end by default');
+assert.deepEqual(plain(listing.buildListing({...listingInput, place: {at: 'last'}}, listingContext).models.map(row => [row.id, row.sort_order])), [['p-new-model', 3]], 'last: nothing else moves');
+assert.deepEqual(plain(listing.buildListing({...listingInput, place: {at: 'first'}}, listingContext).models.map(row => [row.id, row.sort_order])), [['p-new-model', -1]], 'first: before every other, nothing else moves');
+// Tied places are numbered apart, so the new model cannot land after the tie's other member.
+const tied = {...listingConfig, models: listingConfig.models.map(row => row.id === 'm-b' ? {...row, sort_order: 0} : row)};
+assert.deepEqual(plain(listing.buildListing(listingInput, {...listingContext, config: tied}).models.map(row => [row.id, row.sort_order])), [['m-b', 2], ['m-c', 3], ['p-new-model', 1]]);
+assert.equal(listing.buildListing({...listingInput, creditMultiplier: '1.5'}, listingContext).mapping.credit_multiplier, 1.5, 'the model multiplier is its own');
 assert.equal(listing.buildListing(listingInput, {...listingContext, config: {...listingConfig, models: [...listingConfig.models, {id: 'p-new-model', group_id: 'other', exposed_model_id: 'x', target_model: 'x', sort_order: 0}]}}).mapping.id, 'p-new-model-2');
 for (const [change_, pattern] of [[{providerId: 'off'}, /已停用/], [{targetModel: 'disabled-only'}, /还没有授权 disabled-only/], [{modelId: 'model-b'}, /已经有 model-b/],
-  [{modelId: 'b-alias'}, /已经有 b-alias/], [{contextWindow: 1000, maxOutput: 2000}, /上下文/], [{contextWindow: null}, /上下文/], [{rateMultiplier: '0'}, /显示倍率/],
-  [{prices: {...listingInput.prices, fixed_input_credit_per_m: '0', fixed_output_credit_per_m: '0'}}, /不能都是 0/], [{after: 'missing'}, /重新选择位置/],
+  [{modelId: 'b-alias'}, /已经有 b-alias/], [{modelId: 'new model'}, /只能用英文字母/], [{modelId: '模型'}, /只能用英文字母/], [{modelId: 'x'.repeat(129)}, /最多 128 个字符/],
+  [{contextWindow: 1000, maxOutput: 2000}, /上下文/], [{contextWindow: null}, /上下文/], [{rateMultiplier: '0'}, /显示倍率/], [{creditMultiplier: ''}, /扣费倍率/], [{creditMultiplier: '1001'}, /扣费倍率/],
+  [{prices: {...listingInput.prices, fixed_input_credit_per_m: '0', fixed_output_credit_per_m: '0'}}, /不能都是 0/], [{place: {at: 'after', id: 'missing'}}, /重新选择位置/],
   [{costs: {...listingInput.costs, output_price_per_m: ''}}, /采购价/], [{groupId: 'nope'}, /请选择分组/]]) {
   assert.throws(() => listing.buildListing({...listingInput, ...change_}, listingContext), pattern, JSON.stringify(change_));
 }
-assert.throws(() => listing.buildListing(listingInput, {...listingContext, effectiveSecs: t0}), /晚于现在/);
-const shown = listing.showListing([...listingConfig.models, listed.mapping], 'p-new-model');
-assert.deepEqual(plain(shown.map(row => [row.id, row.sort_order, row.visible === true])), [['m-b', 2, false], ['m-c', 3, false], ['p-new-model', 1, true]], 'the ones from its place move down one');
-assert.throws(() => listing.showListing(listingConfig.models, 'nope'), /没有找到/);
+// Another group shares the price table and already prices this model ID: listed at that price by
+// default, and a new price can only start later (and is said to apply to that group too).
+const sharedConfig = {...listingConfig, groups: [...listingConfig.groups, {id: 'g2', name: 'G2', rate_card_id: 'r'}],
+  models: [...listingConfig.models, {id: 'g2-new', group_id: 'g2', exposed_model_id: 'new-model', target_provider_id: 'p', target_model: 'new-model', sort_order: 0}],
+  versions: [{id: 'v-shared', rate_card_id: 'r', model: 'new-model', pricing_mode: 'fixed', effective_from_secs: t0 - 100, fixed_input_credit_per_m: 1, fixed_output_credit_per_m: 1}]};
+const kept = listing.buildListing({...listingInput, keepPrice: true}, {...listingContext, config: sharedConfig});
+assert.equal(kept.version, null);assert.deepEqual(plain(kept.sharedWith.map(row => row.id)), ['g2']);
+assert.deepEqual(plain(listing.sharedPrice(sharedConfig, 'g', 'new-model').versions.map(row => row.id)), ['v-shared']);
+assert.equal(listing.buildListing(listingInput, {...listingContext, config: sharedConfig}).version.effective_from_secs, t0 + 300);
+assert.throws(() => listing.buildListing(listingInput, {...listingContext, config: sharedConfig, effectiveSecs: t0}), /晚于现在/);
+const scheduledOnly = {...sharedConfig, versions: [{...sharedConfig.versions[0], effective_from_secs: t0 + 600}]};
+assert.throws(() => listing.buildListing({...listingInput, keepPrice: true}, {...listingContext, config: scheduledOnly}), /还没生效/, 'never shown before a price is in force');
+// A price at 0 ("now") only for a model the table has no version of.
+assert.equal(change.buildPriceVersion({...input, effectiveSecs: 0, id: 'first-now'}, {...context, model: 'brand-new'}).effective_from_secs, 0);
+assert.throws(() => change.buildPriceVersion({...input, effectiveSecs: 0, id: 'first-now'}, context), /已有价格/);
 setup();
 assert(text(render()).includes('＋ 上架模型'), 'the models page offers 上架模型');
-console.log('PASS: 上架模型: display names, official price x multipliers, listing validation, hidden-then-shown order');
+console.log('PASS: 上架模型: display names, official price x multipliers, listing validation, one publication shown with its first price, placement and renumbering, shared price tables');
