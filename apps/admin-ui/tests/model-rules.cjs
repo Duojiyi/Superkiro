@@ -187,6 +187,8 @@ assert.deepEqual([unhealthy.label, unhealthy.tone, unhealthy.title], ['不可用
 assert.deepEqual(['http_429', 'http_503', 'http_418', 'timeout', 'transport', 'upstream_service', 'protocol', 'empty', 'HTTP 401 invalid key', null].map(status.failureLabel),
   ['HTTP 429 · 限流', 'HTTP 503 · 上游服务出错', 'HTTP 418', '超时', '网络连接失败', '上游服务报错', '上游回复无法解析', '上游返回空内容', 'HTTP 401 invalid key', ''], 'failure kinds in words; older free text as it is');
 assert.equal(status.keyStatusView({health_state: 'cooldown', cooldown_until: t + 120}, t).label, '冷却中 · 2 分钟');
+const degraded = status.keyStatusView({health_state: 'degraded', last_error: 'timeout'}, t);
+assert.deepEqual([degraded.label, degraded.tone, degraded.title], ['恢复中', 'warning', '冷却已结束，重新接请求，还没成功过\n最近错误：超时'], 'serving again after a cooldown is less severe than a cooldown');
 assert.deepEqual([45, 89 * 60, 3 * 3600, 5 * 86400].map(status.cooldownText), ['1 分钟', '89 分钟', '约 3 小时', '约 5 天'], 'long cooldowns read in hours or days');
 assert.deepEqual([{format: 'open_ai'}, {format: 'anthropic'}, {api_type: 'openai'}, {}].map(provider => status.providerFormatLabel(provider)), ['OpenAI', 'Anthropic', 'OpenAI', null], 'format first, api_type from older data');
 assert.equal(status.probeView({ok: true, ttft_ms: 410.4, latency_ms: 620}).label, '成功 · 首字 410 ms');

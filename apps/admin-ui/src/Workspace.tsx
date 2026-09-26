@@ -252,7 +252,7 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
   const badges: Partial<Record<Tab, {count: number; tone: 'danger' | 'warning'; text: string}>> = {
     ...(failedLastHour ? {traces: {count: failedLastHour, tone: 'danger' as const, text: `近 1 小时 ${failedLastHour} 次失败`}} : {}),
     ...(broken.length ? {models: {count: broken.length, tone: down ? 'danger' as const : 'warning' as const, text: down ? `${down} 个在售模型无可用线路` : `${broken.length} 个在售模型的主线路不可用`}} : {}),
-    ...(keyAlerts ? {providers: {count: keyAlerts, tone: 'warning' as const, text: `${keyAlerts} 个 Key 冷却中、异常或不可用`}} : {}),
+    ...(keyAlerts ? {providers: {count: keyAlerts, tone: 'warning' as const, text: `${keyAlerts} 个 Key 冷却中、恢复中或不可用`}} : {}),
   };
   const staleSections = loadErrors.filter(error => error.stale).map(error => error.section);
 

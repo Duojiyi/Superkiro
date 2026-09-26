@@ -30,7 +30,8 @@ export function cooldownText(secs: number): string {
 
 /**
  * Why a Key needs attention now, from its live health: cooling down (until a time, or for as long
- * as the server says so), degraded or unhealthy. A disabled Key needs none.
+ * as the server says so), degraded (its cooldown is over and it takes requests again, but none has
+ * succeeded yet) or unhealthy (refused as invalid: out until reset). A disabled Key needs none.
  */
 export function keyAlert(key: Row, nowSecs: number): 'cooldown' | 'degraded' | 'unhealthy' | null {
   if (key.enabled === false) return null;
@@ -66,7 +67,7 @@ export function keyStatusView(key: Row, nowSecs: number): StatusView {
   const lastError = failureLabel(key.last_error), error = lastError ? `最近错误：${lastError}` : undefined;
   const alert = keyAlert(key, nowSecs), cooldown = keyCooldownLeft(key, nowSecs);
   if (alert === 'unhealthy') return {label: '不可用', tone: 'danger', title: error};
-  if (alert === 'degraded') return {label: '异常', tone: 'danger', title: error};
+  if (alert === 'degraded') return {label: '恢复中', tone: 'warning', title: ['冷却已结束，重新接请求，还没成功过', error].filter(Boolean).join('\n')};
   if (alert === 'cooldown') {
     if (cooldown <= 0) return {label: '冷却中', tone: 'warning', title: error};
     return {label: `冷却中 · ${cooldownText(cooldown)}`, tone: 'warning', title: [`${cooldownText(cooldown)}后恢复`, error].filter(Boolean).join('\n')};

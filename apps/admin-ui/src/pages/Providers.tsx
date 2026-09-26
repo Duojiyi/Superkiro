@@ -120,7 +120,7 @@ export default function ProvidersPage({providers, providerKeys, models, groups =
     const confirmed = await confirmAction({
       title: `恢复 Key ${id}？`,
       facts: [`现在：${keyStatusView(key, Date.now() / 1000).label}`, ...(failureLabel(key.last_error) ? [`最近错误：${failureLabel(key.last_error)}`] : [])],
-      consequence: '清除冷却和异常状态，这个 Key 马上重新接请求；上游仍有问题的话，它会再次进入冷却。',
+      consequence: '清除冷却或不可用状态，这个 Key 马上正常接请求；上游仍有问题的话，它会再次进入冷却。',
       confirmLabel: '恢复',
     });
     if (!confirmed || writing.current) return;
@@ -174,7 +174,7 @@ export default function ProvidersPage({providers, providerKeys, models, groups =
                   {typeof key.last_error_at === 'number' && <span className="muted">{formatRelative(key.last_error_at)} · </span>}{failureLabel(key.last_error)}</span>
                 : <span className="muted">—</span>}</td>
               <td className="col-actions"><span className="row-actions">
-                {keyAlert(key, nowSecs) && <button type="button" className="btn-text" disabled={!!resetting || loading || failed} title="清除冷却或异常状态，马上重新接请求"
+                {keyAlert(key, nowSecs) && <button type="button" className="btn-text" disabled={!!resetting || loading || failed} title="清除冷却或不可用状态，马上正常接请求"
                   onClick={() => void reset(key)}>{resetting === String(key.id) ? '恢复中…' : '恢复'}</button>}
                 <button type="button" className="btn-text" onClick={() => void edit({providerId: id, keyId: String(key.id)})}>编辑</button>
               </span></td>

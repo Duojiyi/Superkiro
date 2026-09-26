@@ -96,7 +96,7 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
     attention.push({text: `${coolingKeys.length} 个 Key 冷却中${left.length ? `（${cooldownText(Math.min(...left))}后恢复）` : ''}`, tone: 'warning', go: () => onNavigate('providers')});
   }
   const degradedKeys = liveKeys.filter(key => keyAlert(key, nowSecs) === 'degraded').length;
-  if (degradedKeys) attention.push({text: `${degradedKeys} 个 Key 异常`, tone: 'danger', go: () => onNavigate('providers')});
+  if (degradedKeys) attention.push({text: `${degradedKeys} 个 Key 冷却后恢复中`, tone: 'warning', go: () => onNavigate('providers')});
   const unhealthyKeys = liveKeys.filter(key => keyAlert(key, nowSecs) === 'unhealthy').length;
   if (unhealthyKeys) attention.push({text: `${unhealthyKeys} 个 Key 不可用`, tone: 'danger', go: () => onNavigate('providers')});
   const failedLastHour = data.traces.filter(trace => trace.status === 'error' && Number(trace.ts) > nowSecs - 3600).length;
