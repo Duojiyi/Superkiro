@@ -1910,4 +1910,56 @@ mod tests {
             .unwrap();
         assert_eq!(changed["opus"].updated_at_secs, 300);
     }
+
+    /// A face value change reprices a scheduled official price at its own time: in the same
+    /// publication as the new face value, the console withdraws it and publishes a new ID for
+    /// the same price table, model and time. Withdrawals apply before the check that a model
+    /// has one price per time and before the check that every official price in force or
+    /// scheduled is at the new face value.
+    #[test]
+    fn a_face_value_change_reprices_a_scheduled_official_price_at_its_own_time() {
+        let e = serving_engine();
+        at_face_value(&e, 0.03, 100);
+        let mut u = update(&e);
+        u.versions = vec![
+            priced_from("a-1", "model-a", 0, official(0.03)),
+            priced_from("a-later", "model-a", 500, official(0.03)),
+        ];
+        e.publish_commercial_config(u, 100).unwrap();
+        let reprice = |cancelled: &[&str]| {
+            let mut u = update(&e);
+            u.settings = Some(BillingSettings {
+                credit_face_value_cny: 0.05,
+                ..e.get_settings()
+            });
+            u.cancelled_versions = cancelled.iter().map(|id| id.to_string()).collect();
+            u.versions = vec![
+                priced_from("a-2", "model-a", 0, official(0.05)),
+                priced_from("a-later-2", "model-a", 500, official(0.05)),
+            ];
+            publish(&e, u, 200)
+        };
+        // Not withdrawn, the model would have two prices from the same time.
+        assert_eq!(
+            reprice(&[]).unwrap_err(),
+            "Published prices immutable; use new ID and timestamp"
+        );
+        let config = reprice(&["a-later"]).unwrap();
+        let versions: Vec<_> = config
+            .versions
+            .iter()
+            .map(|v| {
+                let face = v.official.as_ref().unwrap().credit_face_value_cny;
+                (v.id.as_str(), v.effective_from_secs, face)
+            })
+            .collect();
+        assert_eq!(
+            versions,
+            [
+                ("a-1", 100, 0.03),
+                ("a-2", 200, 0.05),
+                ("a-later-2", 500, 0.05)
+            ]
+        );
+    }
 }
