@@ -123,6 +123,43 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .form-error {padding: 8px 12px; border-radius: 6px; background: var(--danger-bg); color: #a40e26; font-size: 13px;}
 .form-error p {margin: 0 0 8px;}
 .note-warning {padding: 8px 12px; border-radius: 6px; background: var(--warning-bg); color: #6c4a00; font-size: 13px;}
+.note-info {padding: 8px 12px; border-radius: 6px; background: var(--info-bg); color: #0a4a8a; font-size: 13px;}
+/* Under an edited input: what it was before. */
+.field-was {font-size: 12px; color: var(--text-3);}
+.check-field .field-was {margin-left: 6px;}
+/* Model capabilities in the list */
+.capabilities {display: inline-flex; gap: 8px; white-space: nowrap;}
+.capability {display: inline-flex; align-items: center; gap: 3px; font-size: 12px; color: var(--text-2);}
+.toolbar-row {display: flex; align-items: center; gap: 12px; margin-bottom: 10px;}
+/* Model and group lists: the row actions stay in view; long upstream names are clipped. */
+.config-table .col-actions {position: sticky; right: 0; background: var(--bg-surface); box-shadow: -8px 0 8px -8px rgba(0, 0, 0, .12);}
+.config-table th.col-actions {z-index: 2; background: var(--bg-muted);}
+.config-table tr.is-selected td.col-actions {background: var(--brand-soft);}
+.clip-upstream {max-width: 220px;}
+/* Below 1440 the display name moves into the model's tooltip. */
+@media (max-width: 1439px) {.config-table .col-display {display: none;}}
+@media (max-width: 1400px) {.config-table th, .config-table td {padding-left: 8px; padding-right: 8px;} .clip-upstream {max-width: 136px;} .capabilities {gap: 6px;}}
+.pricing-result.is-losing strong {color: var(--danger);}
+.table tr.is-muted td {color: var(--text-3);}
+/* 调价 and JSON drawers */
+.price-drawer .price-form, .json-drawer .drawer-body section {display: flex; flex-direction: column; gap: 12px;}
+.price-form h4 {margin: 0 0 6px;}
+.price-compare th[scope="row"] {width: 64px; font-weight: 500; color: var(--text-2); text-align: left;}
+.price-compare input {width: 100%; min-width: 72px; text-align: right;}
+.price-compare .price-change td {font-size: 12px; color: var(--text-3);}
+.price-compare td.is-up {color: var(--danger);}
+.price-compare td.is-down {color: var(--success);}
+.price-costs > summary, .price-advanced > summary, .sample-tokens > summary, .json-raw > summary {cursor: pointer; font-size: 13px; color: var(--text-2); padding: 4px 0;}
+.price-costs[open] > summary, .price-advanced[open] > summary, .sample-tokens[open] > summary {margin-bottom: 8px;}
+.drawer-foot-spacer {flex: 1;}
+.json-drawer .code-input {min-height: 420px;}
+/* A Key's models: a checklist, typing only behind 手动输入 */
+.model-picker-head {display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px;}
+.model-picker-head .button-row {margin-left: auto;}
+.model-search {width: 180px; min-height: 30px;}
+.model-checklist {display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 4px 16px; max-height: 280px; overflow-y: auto; margin: 0; padding: 8px 10px; list-style: none; border: 1px solid var(--border-subtle); border-radius: 6px;}
+.model-checklist .check-field {display: flex; align-items: center; gap: 6px; min-height: 28px; font-size: 13px;}
+.model-checklist .mono {overflow: hidden; text-overflow: ellipsis; white-space: nowrap;}
 .empty-note {padding: 24px 12px; text-align: center; color: var(--text-2);}
 
 /* ---------- App frame (1.2.8) ---------- */
@@ -362,6 +399,9 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 /* ---------- Drawer ---------- */
 .drawer {position: fixed; top: 0; right: 0; bottom: 0; z-index: 40; display: flex; flex-direction: column; width: min(620px, 100vw); background: var(--bg-surface); border-left: 1px solid var(--border); box-shadow: -12px 0 32px rgba(31, 35, 40, .12);}
 .drawer:focus {outline: none;}
+/* On wide screens drawers open below the top bar, so the page title, 刷新 and the page's own
+   top-bar buttons stay in reach. */
+@media (min-width: 701px) {.drawer {top: 57px;}}
 .drawer-head {display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 56px; padding: 8px 12px 8px 16px; border-bottom: 1px solid var(--border-subtle);}
 .drawer-title {display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; min-width: 0;}
 .drawer-model {font-weight: 600;}

@@ -84,7 +84,7 @@ const server=http.createServer(async(req,res)=>{
     await page.route('**/api/v1/admin/commercial-config',async route=>{
       if(route.request().method()!=='POST')return route.fallback();
       saved=route.request().postDataJSON();groups=saved.groups;
-      await route.fulfill({json:{success:true,config:{revision:'saved',groups,models:[],rate_cards:[],versions:[],audit:[]}}});
+      await route.fulfill({json:{success:true,config:{revision:'saved',groups,models:[],rate_cards:[{id:'fixture-rate',name:'测试价格表'}],versions:[],audit:[]}}});
     });
     await page.getByLabel('变更原因',{exact:true}).fill('测试禁止新发卡');
     await button('发布').click();
@@ -94,6 +94,22 @@ const server=http.createServer(async(req,res)=>{
     await page.locator('.toast').filter({hasText:'已发布'}).waitFor();
     assert.equal(saved.groups[0].issuance_enabled,false);assert.equal(saved.groups[1].issuance_enabled,false);
     assert.equal(saved.groups[0].rate_card_id,legacy.rate_card_id);
+    // 新建分组: a small form that adds a row to the draft, published with the normal bar.
+    await page.getByRole('button',{name:'＋ 新建分组',exact:true}).click();
+    const form=page.getByRole('dialog',{name:'新建分组'});await form.waitFor();
+    await form.getByLabel('分组 ID',{exact:true}).fill(legacy.id);await form.getByRole('button',{name:'加入草稿'}).click();await form.getByRole('alert').filter({hasText:'这个 ID 已存在'}).waitFor();
+    await form.getByLabel('分组 ID',{exact:true}).fill('new-group');await form.getByRole('button',{name:'加入草稿'}).click();await form.getByRole('alert').filter({hasText:'请填写名称'}).waitFor();
+    await form.getByLabel('分组名称',{exact:true}).fill('新分组');await form.getByLabel('新分组扣费倍率',{exact:true}).fill('0');await form.getByRole('button',{name:'加入草稿'}).click();
+    await form.getByRole('alert').filter({hasText:'扣费倍率需大于 0'}).waitFor();
+    await form.getByLabel('新分组扣费倍率',{exact:true}).fill('1.2');await form.getByLabel('可发新卡',{exact:true}).uncheck();
+    await form.getByRole('button',{name:'加入草稿'}).click();await form.waitFor({state:'detached'});
+    await page.getByRole('row').filter({hasText:'新分组'}).getByText('新建',{exact:true}).waitFor();
+    assert.equal(saved.groups.length,2,'nothing is sent before 发布');
+    await page.getByLabel('变更原因',{exact:true}).fill('新建测试分组');await button('发布').click();
+    await page.getByRole('alertdialog').locator('[data-confirm="accept"]').click();
+    await page.locator('.toast').filter({hasText:'已发布'}).waitFor();
+    const created=saved.groups.find(group=>group.id==='new-group');
+    assert.deepEqual(created,{id:'new-group',name:'新分组',issuance_enabled:false,provider_binding_mode:'shared',rate_card_id:'fixture-rate',margin_multiplier:1.2,virtual_plan_name:'新分组',virtual_usage_limit:0,system_prompt_prefix:null});
     assert.deepEqual(errors,[]);assert.deepEqual(nativeDialogs,[],'no browser-native dialogs');
     console.log('PASS issuance: flag filtering, legacy/single auto-selection, explicit multiple selection, independent tiers, zero groups, summary, editor persistence');
   } finally {await browser.close();await new Promise(resolve=>server.close(resolve));}

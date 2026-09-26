@@ -135,7 +135,7 @@ const server=http.createServer(async(req,res)=>{
     assert.equal(await page.getByRole('spinbutton',{name:'增减积分数量'}).isDisabled(),false);
     await page.getByRole('button',{name:'取消',exact:true}).click();
     await page.getByRole('navigation').getByRole('button',{name:'模型与定价',exact:true}).click();
-    await page.getByText('编辑 JSON（高级）',{exact:true}).click();
+    await page.getByRole('button',{name:'JSON',exact:true}).click();
     const draft=page.locator('textarea[aria-label="配置 JSON"]');await draft.fill('{"models":[],"privateDraft":"old-sensitive-draft"}');
     holdLoginSession=true;await page.evaluate(()=>window.dispatchEvent(new Event('focus')));await waitForRoute(()=>heldSession);
     assert.equal(await draft.inputValue(),'{"models":[],"privateDraft":"old-sensitive-draft"}');
@@ -168,7 +168,7 @@ const server=http.createServer(async(req,res)=>{
     await page.getByRole('button',{name:'登录',exact:true}).click();
     await page.getByRole('heading',{name:'运营概览',level:2,exact:true}).waitFor();
     await page.getByRole('navigation').getByRole('button',{name:'模型与定价',exact:true}).click();
-    await page.getByText('编辑 JSON（高级）',{exact:true}).click();
+    await page.getByRole('button',{name:'JSON',exact:true}).click();
     // An unpublished draft (no secrets) survives the expired session in this tab and is
     // restored after the next login onto the configuration it was made from, never before.
     await page.getByRole('status').filter({hasText:'已恢复未发布的修改'}).waitFor();
@@ -181,6 +181,9 @@ const server=http.createServer(async(req,res)=>{
     // Expiry must remove the workspace even without further user activity. The server's idle
     // deadline is 2 seconds away; at the deadline the console asks once, in the background (not
     // counted as use), and the server says the session is over.
+    // Let the sign-in's own requests finish first: each reply names the real (30-minute) deadline,
+    // and a late one would rightly move the countdown past the one this step fakes.
+    await page.waitForLoadState('networkidle');
     const idleDeadline=Date.now()/1000+2;let backgroundChecks=0;
     await page.route('**/api/v1/admin/session',async route=>{
       if(route.request().method()!=='GET')return route.fallback();

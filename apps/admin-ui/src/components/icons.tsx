@@ -21,3 +21,6 @@ export const IconInfo = () => <Icon size={14}><circle cx="8" cy="8" r="6.2"/><pa
 export const IconWarning = () => <Icon><path d="M8 2l6.5 11.5h-13z"/><path d="M8 6.5v3.5M8 12v.1"/></Icon>;
 export const IconSortDown = () => <Icon size={12}><path d="M4 6l4 4 4-4"/></Icon>;
 export const IconSortUp = () => <Icon size={12}><path d="M4 10l4-4 4 4"/></Icon>;
+export const IconTool = () => <Icon size={13}><path d="M10.5 2.5a3 3 0 0 0-3.9 3.9L2.5 10.5v3h3l4.1-4.1a3 3 0 0 0 3.9-3.9l-1.8 1.8-1.9-.2-.2-1.9z"/></Icon>;
+export const IconImage = () => <Icon size={13}><rect x="2" y="3" width="12" height="10" rx="1.5"/><circle cx="6" cy="6.5" r="1"/><path d="M14 10.5l-3.5-3.5L4 13"/></Icon>;
+export const IconSpark = () => <Icon size={13}><path d="M8 1.8v3M8 11.2v3M1.8 8h3M11.2 8h3M3.6 3.6l2 2M10.4 10.4l2 2M12.4 3.6l-2 2M5.6 10.4l-2 2"/></Icon>;

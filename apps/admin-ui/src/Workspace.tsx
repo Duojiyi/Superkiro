@@ -292,7 +292,7 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
             {activeTab === 'groups' && <CommercialEditor key="groups" kind="groups" onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy}
               cards={data.cards} onPublished={() => void refreshData({keepSelection: true})} refreshEpoch={refreshEpoch}/>}
             {activeTab === 'models' && <CommercialEditor key="models" kind="models" onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy}
-              onPublished={() => void refreshData({keepSelection: true})} refreshEpoch={refreshEpoch}/>}
+              onPublished={() => void refreshData({keepSelection: true})} refreshEpoch={refreshEpoch} providers={data.providers} providerKeys={data.providerKeys}/>}
             {activeTab === 'providers' && <ProvidersPage providers={data.providers} providerKeys={data.providerKeys} models={data.models}
               loading={loading} failed={!!failures.providers} refresh={refreshData} guards={guards} reportError={reportError}
               editing={keyEditing} setEditing={setKeyEditing} providerDirty={providerDirty} editorBusy={editorBusy}

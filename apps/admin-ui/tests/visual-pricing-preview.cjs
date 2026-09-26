@@ -33,21 +33,24 @@ const server=http.createServer(async(req,res)=>{
   await page.getByLabel('密码',{exact:true}).fill('fixture-password');
   await page.getByRole('button',{name:'登录',exact:true}).click();
   await page.getByRole('navigation').getByRole('button',{name:'模型与定价',exact:true}).click();
-  await page.getByLabel('选择价格版本模板').selectOption('fixture-price-0');
-  await page.getByLabel('新版本 ID',{exact:true}).fill('fixture-price-preview-2030');
-  await page.getByLabel('生效时间（本地时区）').fill('2030-01-01T10:00');
-  await page.getByRole('combobox',{name:/^客户售价单位/}).selectOption('thousand');
-  for(const [label,value]of [['未缓存输入','1000'],['输出','500'],['缓存写入','100'],['缓存读取','200']])await page.getByLabel(label+' Tokens',{exact:true}).fill(value);
-  await page.getByRole('status').filter({hasText:'预计扣费：0.039366 积分（39366 微积分）'}).waitFor();
+  // 调价 for the first model: current prices in, the sample in credits, yuan and margin.
+  const row=page.getByRole('row').filter({hasText:'claude-sonnet'}).filter({has:page.getByRole('button',{name:'调价'})});
+  await row.getByRole('button',{name:'调价',exact:true}).click();
+  const drawer=page.locator('#price-drawer');await drawer.waitFor();
+  await drawer.getByText('示例用量',{exact:true}).click();
+  for(const [index,value] of ['1000','500','100','200'].entries())await drawer.locator('.pricing-tokens input').nth(index).fill(value);
+  // 1000×3 + 500×15 + 100×3.75 + 200×0.3 = 10,935 micro-credits × 1.2 × 1.5 × 2, rounded up once.
+  await drawer.getByRole('status').filter({hasText:'0.039366 积分（≈ ¥0.0004）'}).waitFor();
+  assert((await drawer.getByRole('status').innerText()).includes('毛利'));
   await page.evaluate(()=>{const badge=document.createElement('div');badge.textContent='LOCAL FIXTURE · 本地测试数据 · 未发布';Object.assign(badge.style,{position:'fixed',right:'12px',bottom:'8px',zIndex:'9999',background:'#23272b',color:'white',padding:'8px 12px',fontSize:'12px',pointerEvents:'none'});document.body.append(badge);});
-  await page.getByRole('heading',{name:'积分价格',exact:true}).evaluate(el=>el.scrollIntoView({block:'start'}));
   await page.screenshot({path:path.join(output,'pricing-editor-desktop.png')});
-  await page.getByRole('heading',{name:'扣费示例',exact:true}).evaluate(el=>el.closest('section').scrollIntoView({block:'center'}));
+  await drawer.getByRole('region',{name:'扣费示例'}).scrollIntoViewIfNeeded();
   await page.screenshot({path:path.join(output,'pricing-charge-preview-desktop.png')});
-  await page.getByRole('region',{name:'历史价格版本',exact:true}).evaluate(el=>el.scrollIntoView({block:'center'}));
+  await page.keyboard.press('Escape');await drawer.waitFor({state:'detached'});
+  await page.getByRole('region',{name:'价格版本',exact:true}).evaluate(el=>el.scrollIntoView({block:'center'}));
   await page.screenshot({path:path.join(output,'pricing-history-desktop.png')});
   assert.deepEqual(errors,[]);
   fs.writeFileSync(path.join(output,'results.json'),JSON.stringify({fixtureOnly:true,published:false,viewport:'1440x1200',pricesPerMillion:[3,15,3.75,0.3],tokens:[1000,500,100,200],multipliers:[1.2,1.5,2],expectedMicrocredits:39366,runtimeErrors:errors},null,2));
-  console.log('PASS: editor open, thousand-token units, preview 39366 microcredits, readable history screenshots: '+output);
+  console.log('PASS: price drawer open, preview 39366 microcredits with yuan and margin, readable version list screenshots: '+output);
  }finally{await browser.close();}
 })().catch(error=>{console.error(error);process.exitCode=1;}).finally(()=>server.close());

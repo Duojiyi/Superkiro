@@ -28,6 +28,10 @@ export default function ProviderKeyEditor({selectedKey, preset, knownModels = []
   const secretInput = useRef<HTMLInputElement>(null);
   useEffect(() => {if (!secret && secretInput.current) secretInput.current.value = '';}, [secret]);
   const [models, setModels] = useState('');
+  // The list is ticked, not typed; typing stays available behind 手动输入.
+  const [manual, setManual] = useState(false);
+  const [modelQuery, setModelQuery] = useState('');
+  const [seen, setSeen] = useState<string[]>([]);
   const [weight, setWeight] = useState('1');
   const [enabled, setEnabled] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -170,6 +174,12 @@ export default function ProviderKeyEditor({selectedKey, preset, knownModels = []
 
   const title = mode === 'edit' ? `编辑 Key · ${String(selectedKey!.id)}` : mode === 'add-key' ? `添加 Key · ${preset!.providerId}` : '添加供应商';
   const newFound = discovery ? discovery.models.filter(model => !modelIds.includes(model)) : [];
+  // Everything worth offering: what is ticked, what the Key is authorised for now, what was found.
+  const offered = [...new Set([...modelIds, ...seen, ...(savedModels ?? []), ...(discovery?.models ?? [])])];
+  const needle = modelQuery.trim().toLowerCase();
+  const visible = needle ? offered.filter(model => model.toLowerCase().includes(needle)) : offered;
+  const setTicked = (next: string[]) => {setDirty(true); setSeen(offered); setModels([...new Set(next)].join('\n'));};
+  const tick = (model: string, on: boolean) => setTicked(on ? [...modelIds, model] : modelIds.filter(item => item !== model));
   const discoverBlocked = !provider.trim() ? '填写供应商 ID 后可获取' : mode === 'provider' && !providerExists ? '先保存供应商，再获取模型列表'
     : mode === 'provider' && !secret ? '填写 API Key 后可获取' : !workingKeyId ? '填写 Key ID 后可获取' : undefined;
   const providerBlocked = review ? '先重新读取确认上次的结果' : !provider.trim() || !secret || !baseUrl.trim() ? '填写供应商 ID、上游地址和 API Key 后可保存' : undefined;
@@ -195,10 +205,30 @@ export default function ProviderKeyEditor({selectedKey, preset, knownModels = []
           onChange={event => setSecret(event.target.value)}/></label>
       {mode !== 'provider' && <label className="field"><span className="field-label">权重<InfoTip text="多个 Key 时按权重分配请求（1–1000 的整数）"/></span>
         <input aria-label="权重" type="number" min={1} max={1000} step={1} value={weight} onChange={event => setWeight(event.target.value)}/></label>}
-      <label className="field field-span"><span className="field-label">可用模型（每行一个）</span>
-        <textarea aria-label="可用模型（每行一个）" rows={6} className="mono" value={models} onChange={event => setModels(event.target.value)}/>
+      <div className="field field-span model-picker" role="group" aria-label="可用模型">
+        <div className="model-picker-head">
+          <span className="field-label">可用模型</span>
+          {offered.length > 8 && <input className="model-search" aria-label="搜索模型" placeholder="搜索" value={modelQuery} onChange={event => setModelQuery(event.target.value)}/>}
+          <span className="button-row">
+            <button type="button" className="btn-text" disabled={!visible.length} onClick={() => setTicked([...modelIds, ...visible])}>全选</button>
+            <button type="button" className="btn-text" disabled={!visible.some(model => modelIds.includes(model))} onClick={() => setTicked(modelIds.filter(model => !visible.includes(model)))}>全不选</button>
+            <button type="button" className="btn-text" aria-expanded={manual} onClick={() => setManual(!manual)}>{manual ? '收起手动输入' : '手动输入'}</button>
+          </span>
+        </div>
+        {visible.length ? <ul className="model-checklist">{visible.map(model => {
+          const fresh = !!discovery?.models.includes(model) && !(savedModels ?? []).includes(model);
+          const unlisted = knownModels.length > 0 && modelIds.includes(model) && !knownModels.includes(model);
+          return <li key={model}><label className="check-field">
+            <input type="checkbox" aria-label={model} checked={modelIds.includes(model)} onChange={event => tick(model, event.target.checked)}/>
+            <span className="mono">{model}</span>
+            {fresh && <span className="tag tag-info">新</span>}
+            {unlisted && <span className="tag" title="还没在“模型与定价”上架，客户看不到">未上架</span>}
+          </label></li>;
+        })}</ul> : <p className="muted">{offered.length ? '没有匹配的模型' : '还没有模型：点“获取模型列表”，或手动输入'}</p>}
+        {manual && <label className="field"><span className="field-label">可用模型（每行一个）</span>
+          <textarea aria-label="可用模型（每行一个）" rows={6} className="mono" value={models} onChange={event => setModels(event.target.value)}/></label>}
         {modelIds.length ? <span className="field-hint">已选 {modelIds.length} 个</span> : <span className="field-warning">未选择模型：这个 Key 不会被使用</span>}
-      </label>
+      </div>
       {discovery && <div className="field-span discovery" aria-label="获取到的模型">
         <p>获取到 {discovery.models.length} 个模型{discovery.incomplete ? '（不完整）' : ''}{newFound.length ? `，${newFound.length} 个还不在列表中` : '，都已在列表中'}</p>
         {newFound.length > 0 && <p className="model-tags">{newFound.slice(0, 30).map(model => <span key={model} className="tag tag-info">{model}</span>)}{newFound.length > 30 && <span className="muted">+{newFound.length - 30}</span>}</p>}

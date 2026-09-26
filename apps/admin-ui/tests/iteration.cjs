@@ -61,18 +61,21 @@ const server=http.createServer(async(req,res)=>{
     await page.route('**/api/v1/admin/providers',async route=>{const response=await route.fetch();const body=await response.json();if(savedKey)body.keys[0]={...body.keys[0],...savedKey,id:savedKey.key_id};await route.fulfill({json:body});});
     await page.route('**/api/v1/admin/providers/keys',async route=>{savedKey=route.request().postDataJSON();await route.fulfill({json:{success:true}});});
     await nav('供应商与 Key');await page.getByRole('button',{name:'编辑',exact:true}).first().click();
-    const models=page.getByLabel('可用模型（每行一个）');await models.fill('new-model');await page.getByLabel('启用',{exact:true}).uncheck();
+    const models=page.getByLabel('可用模型（每行一个）');await nav('手动输入');await models.fill('new-model');
+    // Waits until exactly these models are ticked in the Key's checklist.
+    const ticked=async expected=>{await page.waitForFunction(names=>{const boxes=[...document.querySelectorAll('#key-editor .model-checklist input[type=checkbox]')];return JSON.stringify(boxes.filter(box=>box.checked).map(box=>box.getAttribute('aria-label')))===JSON.stringify(names);},expected);return expected;};await page.getByLabel('启用',{exact:true}).uncheck();
     await nav('保存');await answer(true);await page.getByRole('status').filter({hasText:'已保存 Key'}).waitFor();
     await page.waitForFunction(()=>document.querySelector('table')?.textContent.includes('new-model'));
-    await nav('运营概览');await nav('供应商与 Key');await page.waitForFunction(()=>document.querySelector('#key-editor textarea')?.value==='new-model');assert.equal(await models.inputValue(),'new-model');assert.equal(await page.getByLabel('启用',{exact:true}).isChecked(),false);
+    await nav('运营概览');await nav('供应商与 Key');await page.getByRole('group',{name:'可用模型'}).waitFor();
+    await ticked(['new-model']);assert.equal(await page.getByLabel('启用',{exact:true}).isChecked(),false);
     await page.route('**/api/v1/admin/providers',route=>route.fulfill({status:503,json:{error:'refresh unavailable'}}));
-    await models.fill('saved-despite-refresh-failure');await nav('保存');await answer(true);
+    await nav('手动输入');await models.fill('saved-despite-refresh-failure');await nav('保存');await answer(true);
     await page.getByRole('alert').filter({hasText:'部分数据加载失败'}).waitFor();
     await nav('运营概览');await nav('供应商与 Key');
-    await page.waitForFunction(()=>document.querySelector('#key-editor textarea')?.value==='saved-despite-refresh-failure');
+    await ticked(['saved-despite-refresh-failure']);
     assert.equal(await page.getByLabel('启用',{exact:true}).isChecked(),false);
     // Re-opening the Key being edited keeps the draft and its leave guard.
-    await models.fill('unsaved-model');await page.getByRole('button',{name:'编辑',exact:true}).first().click();
+    await nav('手动输入');await models.fill('unsaved-model');await page.getByRole('button',{name:'编辑',exact:true}).first().click();
     assert.equal(await models.inputValue(),'unsaved-model');
     await nav('运营概览');await answer(false);assert.equal(await models.inputValue(),'unsaved-model');
     await nav('调用追踪');await answer(true);
@@ -105,22 +108,28 @@ const server=http.createServer(async(req,res)=>{
     assert.equal(await page.evaluate(()=>Object.keys(sessionStorage).filter(k=>k.includes('pending-adjustment')).length),0);
     await nav('取消');await page.getByRole('button',{name:'调账',exact:true}).nth(1).click();
     assert.equal(await page.getByLabel('增减积分数量').isDisabled(),false);await nav('取消');
-    // Unstaged price edits never silently disappear behind a successful publish.
-    await nav('模型与定价');await page.getByLabel('选择价格版本模板').selectOption('fixture-price-0');
-    await page.getByLabel('新版本 ID',{exact:true}).fill('fixture-new-price');await page.getByLabel('生效时间（本地时区）').fill('2030-01-01T10:00');
-    // The legacy fixture omits the version multiplier; enter it explicitly like an administrator.
-    await page.getByLabel('版本倍率',{exact:true}).fill('1');
-    await page.getByLabel('采购计价币种').selectOption('USD');
-    for(const name of ['采购输入价格','采购输出价格','采购缓存读取价格','采购缓存写入价格'])await page.getByLabel(name+'（计价货币 / 百万 Tokens）',{exact:true}).fill('1');
-    await page.getByLabel('变更原因',{exact:true}).fill('test new price');
+    // A price changes in its own drawer, published on its own; unpublished page edits come first.
+    await nav('模型与定价');
+    const priced=page.getByRole('row').filter({hasText:'claude-sonnet'}).filter({has:page.getByRole('button',{name:'调价'})});
+    await page.getByLabel('上下文长度',{exact:true}).fill('150000');
+    const priceButton=priced.getByRole('button',{name:'调价',exact:true});
+    assert(await priceButton.isDisabled());assert.equal(await priceButton.getAttribute('title'),'先发布或放弃未发布的修改，再调价');
+    await nav('放弃修改');await answer(true);await page.waitForFunction(()=>![...document.querySelectorAll('button')].some(b=>b.textContent==='放弃修改'));
     const config=(await (await page.request.get(origin+'/api/v1/admin/commercial-config')).json()).config;let publishBodies=[];
-    await page.route('**/api/v1/admin/commercial-config',route=>{if(route.request().method()!=='POST')return route.continue();const body=route.request().postDataJSON();publishBodies.push(body);return route.fulfill({json:{success:true,config:{...config,versions:[...config.versions,...body.versions]}}});});
-    await nav('发布');await page.getByRole('status').filter({hasText:'价格编辑尚未加入发布草稿'}).waitFor();
-    assert.equal(await page.getByRole('alertdialog').count(),0,'unstaged prices never reach the confirmation');
-    assert.equal(publishBodies.length,0);assert.equal(await page.getByLabel('新版本 ID',{exact:true}).inputValue(),'fixture-new-price');
-    await nav('加入价格草稿');await nav('发布');await answer(true);
-    await page.locator('.toast').filter({hasText:'已发布'}).waitFor();assert.equal(publishBodies.length,1);assert.equal(publishBodies[0].versions[0].id,'fixture-new-price');assert.equal(publishBodies[0].versions[0].margin_multiplier,1);
-    console.log('PASS: definite insufficient-balance rejection clears only uncommitted intent; another card remains editable; unstaged prices block publish without losing inputs; staged version is submitted');
+    await page.route('**/api/v1/admin/commercial-config',route=>{if(route.request().method()!=='POST')return route.continue();const body=route.request().postDataJSON();publishBodies.push(body);return route.fulfill({json:{success:true,config:{...config,revision:'fixture-after-price',versions:[...config.versions,...body.versions]}}});});
+    await priceButton.click();
+    const drawer=page.locator('#price-drawer');await drawer.waitFor();
+    await drawer.getByLabel('新输入售价',{exact:true}).fill('2.5');await drawer.getByLabel('调价原因',{exact:true}).fill('test new price');
+    // The legacy fixture has no procurement prices: they are asked for, and nothing is sent until given.
+    await drawer.getByRole('button',{name:'发布调价',exact:true}).click();
+    await drawer.getByRole('alert').filter({hasText:'采购价需在'}).waitFor();assert.equal(await page.getByRole('alertdialog').count(),0);assert.equal(publishBodies.length,0);
+    for(const label of ['输入','输出','缓存写','缓存读'])await drawer.getByLabel(`采购${label}价`,{exact:true}).fill('1');
+    await drawer.getByRole('button',{name:'发布调价',exact:true}).click();await answer(true);
+    await page.locator('.toast').filter({hasText:'已发布 claude-sonnet 的新价格'}).waitFor();
+    assert.equal(publishBodies.length,1);assert.equal(publishBodies[0].expected_revision,config.revision);assert.equal(publishBodies[0].reason,'test new price');
+    const version=publishBodies[0].versions[0];
+    assert.match(version.id,/^claude-sonnet-\d{12}$/);assert.equal(version.margin_multiplier,1);assert.equal(version.fixed_input_credit_per_m,2500000);assert.equal(version.currency,'USD');
+    console.log('PASS: definite insufficient-balance rejection clears only uncommitted intent; another card remains editable; price changes wait for page edits; missing procurement prices block the send; the new version carries the generated ID');
     assert.deepEqual(errors,[]);assert.deepEqual(nativeDialogs,[],'no browser-native dialogs');
     console.log('PASS: committed issuance lost response locks across reload; failed review cannot unlock; successful review never submits; saved Key remount uses latest permissions; same-Key edit preserves dirty guard; trace details receive focus');
   } finally {await browser.close();}

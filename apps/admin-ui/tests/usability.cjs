@@ -157,6 +157,10 @@ const server=http.createServer(async(req,res)=>{
     assert(await page.getByRole('button',{name:'已核对，继续',exact:true}).isDisabled());
     await nav('分组与权益');
     await page.getByRole('button',{name:'编辑',exact:true}).first().waitFor();
+    // The publish bar appears only once something changed.
+    assert.equal(await page.getByRole('region',{name:'发布'}).count(),0);
+    await page.getByLabel('名称',{exact:true}).fill('PRO（已改名）');
+    await page.getByText('原 PRO',{exact:true}).waitFor();
     await page.getByLabel('变更原因',{exact:true}).fill('fixture negative acknowledgement');
     await page.route('**/api/v1/admin/commercial-config',route=>route.request().method()==='POST' ? route.fulfill({status:200,contentType:'application/json',body:'{"success":false}'}) : route.continue());
     await page.getByRole('button',{name:'发布',exact:true}).click();await answer(page,true);

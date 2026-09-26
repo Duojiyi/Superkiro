@@ -46,7 +46,19 @@ const server=http.createServer(async(req,res)=>{
   const shot=async name=>{await page.locator('.toast').waitFor({state:'hidden'});await page.screenshot({path:path.join(output,name),fullPage:true});};
   for(const [id,name] of pages){
    await nav(name);
-   if(id==='pricing'){await page.getByRole('combobox',{name:'选择价格版本模板'}).selectOption('fixture-price-0');assert.equal(await page.getByLabel(/^未缓存输入售价（积分 \/ 百万 Tokens）/).inputValue(),'3');}
+   if(id==='pricing'){
+    // Each model shows its current price; an OpenAI-format model with 272K context reads 272K.
+    const astra=page.getByRole('row').filter({hasText:'gpt-6-astra'}).filter({has:page.getByRole('button',{name:'调价'})});
+    assert((await astra.innerText()).includes('272K / 128K'));assert((await astra.innerText()).includes('1.25 / 10'));
+    await astra.getByRole('button',{name:'调价',exact:true}).click();
+    const priceDrawer=page.locator('#price-drawer');await priceDrawer.waitFor();
+    assert.equal(await priceDrawer.getByLabel('新输入售价',{exact:true}).inputValue(),'1.25');
+    await priceDrawer.getByLabel('新输出售价',{exact:true}).fill('8');
+    await priceDrawer.locator('.price-change').getByText('−20%',{exact:true}).waitFor();
+    assert(/≈ ¥/.test(await priceDrawer.getByRole('status').innerText()),'the sample shows yuan');
+    await shot('price-drawer-desktop.png');
+    await page.keyboard.press('Escape');await priceDrawer.waitFor({state:'detached'});
+   }
    assert.ok(await page.locator('tbody tr').count(),`${id} nonempty table`);
    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,`${id} desktop overflow`);
    await shot(`${id}-desktop.png`);
