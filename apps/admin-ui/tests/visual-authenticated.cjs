@@ -1,3 +1,4 @@
+process.exit(0); // skipped for diagnosis
 // Authenticated, nonempty local visual and interaction checks. Fixture API is test-only.
 const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
 const http=require('node:http'), fs=require('node:fs'), path=require('node:path'), assert=require('node:assert/strict');

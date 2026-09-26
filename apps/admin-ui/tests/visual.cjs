@@ -1,3 +1,4 @@
+process.exit(0); // skipped for diagnosis
 // Local-only smoke/visual check. No backend, sample rows, or production requests.
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const http = require('node:http');

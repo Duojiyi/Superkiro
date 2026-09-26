@@ -3,7 +3,9 @@ const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
 const http=require('node:http'),fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
 const fixture=require('./fixture-api.cjs')();
 const root=path.resolve(__dirname,'../dist');
+const diagRequests=[],t0=Date.now();
 const server=http.createServer(async(req,res)=>{
+  if(req.url.startsWith('/api/'))diagRequests.push([Date.now()-t0,req.method,req.url]);
   try{
     if(req.url.startsWith('/api/'))return await fixture.handle(req,res);
     const file=path.resolve(root,decodeURIComponent(req.url.split('?')[0]).replace(/^\/admin\/?/,'')||'index.html');
@@ -31,7 +33,17 @@ const writes=endpoint=>fixture.writes.filter(write=>write.endpoint===endpoint);
     // Opens the confirmation, returns its text, optionally ticks or unticks its option, then answers.
     const confirm=async({accept=true,option}={})=>{
       const box=page.getByRole('alertdialog');await box.waitFor();const text=await box.innerText();
-      if(option!==undefined)await box.getByRole('checkbox').setChecked(option);
+      if(option!==undefined){try{await box.getByRole('checkbox').setChecked(option);}catch(error){
+        console.error('DIAG dialog text at open: '+JSON.stringify(text));
+        console.error('DIAG dialogs now: '+JSON.stringify(await page.evaluate(()=>[...document.querySelectorAll('[role=alertdialog],[role=dialog]')].map(e=>({role:e.getAttribute('role'),label:e.getAttribute('aria-label'),text:e.innerText.slice(0,500),inputs:e.querySelectorAll('input').length,underHidden:!!e.closest('[aria-hidden=true]'),inert:!!e.closest('[inert]')})))));
+        console.error('DIAG shell: '+JSON.stringify(await page.evaluate(()=>({hidden:document.querySelector('.workspace-shell')?.getAttribute('aria-hidden'),overlay:!!document.querySelector('.session-overlay')}))));
+        console.error('DIAG editor: '+JSON.stringify(await page.evaluate(()=>({title:document.querySelector('#key-editor h3')?.textContent,checks:[...document.querySelectorAll('#key-editor .model-checklist input[type=checkbox]')].map(e=>[e.getAttribute('aria-label'),e.checked])}))));
+        console.error('DIAG fixture keys: '+JSON.stringify(fixture.keys.map(k=>[k.id,k.provider_id,k.enabled,k.allowed_models])));
+        console.error('DIAG fixture models: '+JSON.stringify(fixture.config.models.map(m=>[m.id,m.exposed_model_id,m.visible,m.retired,m.target_provider_id,m.target_model])));
+        console.error('DIAG fixture providers: '+JSON.stringify(fixture.providers.map(p=>[p.id,p.enabled])));
+        console.error('DIAG writes: '+JSON.stringify(fixture.writes.map(w=>w.endpoint)));
+        console.error('DIAG requests: '+JSON.stringify(diagRequests.slice(-40)));
+        throw error;}}
       await (accept?box.locator('[data-confirm="accept"]'):box.getByRole('button',{name:'取消',exact:true})).click();
       await box.waitFor({state:'detached'});return text;
     };
