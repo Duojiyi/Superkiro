@@ -96,6 +96,8 @@ fn aggregates_only_committed_usage_in_utc_window_without_retry_or_cache_double_c
         output_tokens: 999,
         credits_charged: 999,
         provider_cost_micro_cny: 999,
+        needed_micro_credits: None,
+        available_micro_credits: None,
         attempt_chain: vec![],
     });
     let stats = engine.settled_usage("card", now).unwrap();

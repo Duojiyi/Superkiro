@@ -2795,6 +2795,8 @@ impl BillingEngine {
             output_tokens: entry.output_tokens,
             credits_charged: entry.credits_charged,
             provider_cost_micro_cny: entry.provider_cost_micro_cny,
+            needed_micro_credits: None,
+            available_micro_credits: None,
             attempt_chain,
         });
         if candidate.traces.len() > MAX_RETAINED_TRACES {

@@ -26,6 +26,8 @@ fn test_record_and_list_request_traces() {
         output_tokens: 350,
         credits_charged: 25_000_000,
         provider_cost_micro_cny: 15_000,
+        needed_micro_credits: None,
+        available_micro_credits: None,
         attempt_chain: vec![AttemptRecord {
             key_id: "k-1".to_string(),
             provider_id: "deepseek-direct".to_string(),
@@ -50,6 +52,8 @@ fn test_record_and_list_request_traces() {
         output_tokens: 0,
         credits_charged: 0,
         provider_cost_micro_cny: 0,
+        needed_micro_credits: None,
+        available_micro_credits: None,
         attempt_chain: vec![AttemptRecord {
             key_id: "k-2".to_string(),
             provider_id: "deepseek-direct".to_string(),
@@ -235,6 +239,8 @@ fn test_provider_health_summary_metrics() {
         output_tokens: 50,
         credits_charged: 1000,
         provider_cost_micro_cny: 500,
+        needed_micro_credits: None,
+        available_micro_credits: None,
         attempt_chain: vec![],
     });
 
@@ -253,6 +259,8 @@ fn test_provider_health_summary_metrics() {
         output_tokens: 50,
         credits_charged: 1000,
         provider_cost_micro_cny: 500,
+        needed_micro_credits: None,
+        available_micro_credits: None,
         attempt_chain: vec![],
     });
 
@@ -271,6 +279,8 @@ fn test_provider_health_summary_metrics() {
         output_tokens: 0,
         credits_charged: 0,
         provider_cost_micro_cny: 0,
+        needed_micro_credits: None,
+        available_micro_credits: None,
         attempt_chain: vec![],
     });
 
@@ -491,6 +501,8 @@ fn test_data_retention_pruning_policy() {
         output_tokens: 0,
         credits_charged: 0,
         provider_cost_micro_cny: 0,
+        needed_micro_credits: None,
+        available_micro_credits: None,
         attempt_chain: vec![],
     };
 
@@ -544,6 +556,8 @@ fn retry_history_survives_single_settlement_and_final_delivery_error() {
             output_tokens: 0,
             credits_charged: 0,
             provider_cost_micro_cny: 0,
+            needed_micro_credits: None,
+            available_micro_credits: None,
             attempt_chain: vec![AttemptRecord {
                 key_id: format!("key-{index}"),
                 provider_id: "provider".into(),
@@ -660,6 +674,8 @@ fn traces_ride_along_with_the_next_commit_instead_of_saving_on_their_own() {
         output_tokens: 0,
         credits_charged: 0,
         provider_cost_micro_cny: 0,
+        needed_micro_credits: None,
+        available_micro_credits: None,
         attempt_chain: Vec::new(),
     });
     engine.finish_trace("inv-trace", TraceStatus::Success, None);
@@ -752,6 +768,8 @@ fn activity_counts_real_totals_by_period_and_hour() {
         output_tokens: 0,
         credits_charged: 0,
         provider_cost_micro_cny: 0,
+        needed_micro_credits: None,
+        available_micro_credits: None,
         attempt_chain: Vec::new(),
     };
     engine.note_trace_timing("inv-hour-ago", Some(800), Some(40.0));

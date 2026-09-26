@@ -473,6 +473,12 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                             current,
                             max,
                         } => {
+                            self.record_refusal(
+                                claims.as_ref(),
+                                &invocation_key,
+                                requested_model_for_reservation,
+                                "concurrency_limit",
+                            );
                             return crate::guardrail::format_kiro_throttle_response(
                                 StatusCode::TOO_MANY_REQUESTS,
                                 "ThrottlingException",
@@ -486,6 +492,12 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                             current,
                             needed,
                         } => {
+                            self.record_refusal(
+                                claims.as_ref(),
+                                &invocation_key,
+                                requested_model_for_reservation,
+                                "usage_limit",
+                            );
                             return crate::guardrail::format_kiro_throttle_response(
                                 StatusCode::TOO_MANY_REQUESTS,
                                 "ThrottlingException",
@@ -499,6 +511,12 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                             current,
                             needed,
                         } => {
+                            self.record_refusal(
+                                claims.as_ref(),
+                                &invocation_key,
+                                requested_model_for_reservation,
+                                "usage_limit",
+                            );
                             return crate::guardrail::format_kiro_throttle_response(
                                 StatusCode::TOO_MANY_REQUESTS,
                                 "ThrottlingException",
@@ -528,6 +546,22 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                                 StatusCode::BAD_REQUEST,
                                 "ValidationException",
                                 "This model has no published price; choose another model or ask your administrator to publish one",
+                            );
+                        }
+                        billing::engine::BillingError::Card(
+                            billing::card::CardError::InsufficientCredit { available, needed },
+                        ) => {
+                            self.record_balance_refusal(
+                                claims.as_ref(),
+                                &invocation_key,
+                                requested_model_for_reservation,
+                                needed,
+                                available,
+                            );
+                            return error_response(
+                                StatusCode::PAYMENT_REQUIRED,
+                                "InsufficientCreditException",
+                                &format!("Credit reservation failed: {}", e),
                             );
                         }
                         _ => {
@@ -1036,6 +1070,8 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                             output_tokens: 0,
                             credits_charged: 0,
                             provider_cost_micro_cny: 0,
+                            needed_micro_credits: None,
+                            available_micro_credits: None,
                             attempt_chain: attempts,
                         });
                     match route_result {
@@ -1203,38 +1239,29 @@ impl GenerateAssistantResponseHandler {
         model: &str,
         error_class: &str,
     ) {
-        let Some(claims) = claims else {
-            return;
-        };
-        self.billing
-            .record_trace(billing::observability::RequestTrace {
-                id: format!(
-                    "refused-{}-{}",
-                    invocation_key,
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos()
-                ),
-                card_id: claims.card_id.clone(),
-                ts: crate::now_secs(),
-                invocation_id: invocation_key.to_string(),
-                exposed_model: if valid_model_id(model) {
-                    model.trim().to_string()
-                } else {
-                    String::new()
-                },
-                status: billing::observability::TraceStatus::Error,
-                ttft_ms: None,
-                tokens_per_second: None,
-                error_class: Some(error_class.to_string()),
-                provider_id: None,
-                input_tokens: 0,
-                output_tokens: 0,
-                credits_charged: 0,
-                provider_cost_micro_cny: 0,
-                attempt_chain: Vec::new(),
-            });
+        if let Some(trace) = refusal_trace(claims, invocation_key, model, error_class) {
+            self.billing.record_trace(trace);
+        }
+    }
+
+    /// Records a request refused because the card's balance could not cover what it needed
+    /// to start: how much that was, and what the card had.
+    fn record_balance_refusal(
+        &self,
+        claims: Option<&AuthClaims>,
+        invocation_key: &str,
+        model: &str,
+        needed: i64,
+        available: i64,
+    ) {
+        if let Some(trace) = refusal_trace(claims, invocation_key, model, "insufficient_balance") {
+            self.billing
+                .record_trace(billing::observability::RequestTrace {
+                    needed_micro_credits: Some(needed),
+                    available_micro_credits: Some(available),
+                    ..trace
+                });
+        }
     }
 
     /// Bill what the last empty attempt reported, when no attempt of the request produced
@@ -1298,6 +1325,37 @@ async fn with_empty_attempt<T>(
             (result, empty)
         })
         .await
+}
+
+/// The trace of an authenticated request refused before it was routed, charged nothing.
+fn refusal_trace(
+    claims: Option<&AuthClaims>,
+    invocation_key: &str,
+    model: &str,
+    error_class: &str,
+) -> Option<billing::observability::RequestTrace> {
+    let claims = claims?;
+    Some(billing::observability::RequestTrace {
+        id: format!(
+            "refused-{}-{}",
+            invocation_key,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ),
+        card_id: claims.card_id.clone(),
+        ts: crate::now_secs(),
+        invocation_id: invocation_key.to_string(),
+        exposed_model: if valid_model_id(model) {
+            model.trim().to_string()
+        } else {
+            String::new()
+        },
+        status: billing::observability::TraceStatus::Error,
+        error_class: Some(error_class.to_string()),
+        ..Default::default()
+    })
 }
 
 /// How a request whose upstream could not be started is traced. When no Key may call its

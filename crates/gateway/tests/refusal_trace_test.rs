@@ -170,6 +170,16 @@ type Refusal = (
     &'static str,
 );
 
+/// A request refused by a limit of the card: its invocation, how the card is limited, and
+/// the status and error code it is refused with and the error class its trace records.
+type LimitRefusal = (
+    &'static str,
+    fn(&mut Card),
+    StatusCode,
+    &'static str,
+    &'static str,
+);
+
 fn plain(_: &mut Value) {}
 
 fn with_reasoning(body: &mut Value) {
@@ -381,6 +391,104 @@ async fn each_refusal_before_routing_is_traced_and_charged_nothing() {
     let (status, body) = turn(&app, "inv-served", Some("listed-model"), plain).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(models_sent(&upstream).await, ["up-listed"]);
+}
+
+/// A request the card's own limits refuse — its balance, its concurrency, its daily or
+/// monthly limit — leaves a trace too, with what it needed for want of balance. The
+/// customer's response is as it was.
+#[tokio::test]
+async fn refusals_for_the_cards_own_limits_are_traced_and_charged_nothing() {
+    let upstream = upstream(200).await;
+    let billing = engine(
+        vec![Provider::new(
+            "prov",
+            "Upstream",
+            ProviderFormat::OpenAi,
+            upstream.uri(),
+        )],
+        vec![ProviderKey::new("key", "prov", "sk-test")],
+        vec![ModelMap::new(
+            "map-listed",
+            GROUP,
+            "listed-model",
+            "prov",
+            "up-listed",
+        )],
+        &["listed-model"],
+    );
+    let (app, _) = serve(&billing);
+    let funded = billing.get_card(CARD).unwrap();
+    let limit = |edit: fn(&mut Card)| {
+        let mut card = funded.clone();
+        edit(&mut card);
+        billing.upsert_card(card);
+    };
+    let cases: [LimitRefusal; 4] = [
+        (
+            "inv-broke",
+            |card| card.credit_total = 10,
+            StatusCode::PAYMENT_REQUIRED,
+            "InsufficientCreditException",
+            "insufficient_balance",
+        ),
+        (
+            "inv-busy",
+            |card| card.max_concurrency = 0,
+            StatusCode::TOO_MANY_REQUESTS,
+            "CONCURRENCY_LIMIT_EXCEEDED",
+            "concurrency_limit",
+        ),
+        (
+            "inv-daily",
+            |card| card.daily_credit_limit = Some(0),
+            StatusCode::TOO_MANY_REQUESTS,
+            "DAILY_LIMIT_EXCEEDED",
+            "usage_limit",
+        ),
+        (
+            "inv-monthly",
+            |card| card.monthly_credit_limit = Some(0),
+            StatusCode::TOO_MANY_REQUESTS,
+            "MONTHLY_LIMIT_EXCEEDED",
+            "usage_limit",
+        ),
+    ];
+    for (invocation, edit, status, code, class) in cases {
+        limit(edit);
+        let (got, body) = turn(&app, invocation, Some("listed-model"), plain).await;
+        assert_eq!(got, status, "{invocation}: {body}");
+        assert!(body.contains(code), "{invocation}: {body}");
+        let traces = billing.list_traces(Some(CARD), 100);
+        let invocation_id = format!("{CARD}:{invocation}");
+        let trace: Vec<_> = traces
+            .iter()
+            .filter(|trace| trace.invocation_id == invocation_id)
+            .collect();
+        assert_eq!(trace.len(), 1, "{invocation}");
+        let trace = trace[0];
+        assert_eq!(trace.status, billing::TraceStatus::Error);
+        assert_eq!(trace.error_class.as_deref(), Some(class), "{invocation}");
+        assert_eq!(trace.exposed_model, "listed-model");
+        assert_eq!(trace.provider_id, None);
+        assert!(trace.attempt_chain.is_empty());
+        assert_eq!((trace.credits_charged, trace.input_tokens), (0, 0));
+        if class == "insufficient_balance" {
+            // What the request needed to start, and what the card had.
+            assert_eq!(trace.available_micro_credits, Some(10));
+            let needed = trace.needed_micro_credits.unwrap();
+            assert!(needed > 10, "{needed}");
+            assert!(
+                body.contains(&format!("available 10 micro-credits, needed {needed}")),
+                "{body}"
+            );
+        } else {
+            assert_eq!(trace.needed_micro_credits, None);
+            assert_eq!(trace.available_micro_credits, None);
+        }
+    }
+    assert!(models_sent(&upstream).await.is_empty());
+    let card = billing.get_card(CARD).unwrap();
+    assert_eq!((card.credit_reserved, card.credit_used), (0, 0));
 }
 
 #[tokio::test]

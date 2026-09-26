@@ -86,7 +86,7 @@ pub struct AttemptRecord {
 /// Request execution trace (Spec §5, §14.4).
 ///
 /// Strictly captures metrics, tokens, costs, and attempt chains without conversation text.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RequestTrace {
     pub id: String,
     pub card_id: String,
@@ -102,6 +102,12 @@ pub struct RequestTrace {
     pub output_tokens: u64,
     pub credits_charged: i64,
     pub provider_cost_micro_cny: i64,
+    /// For a request refused for want of balance: the micro-credits it needed to start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needed_micro_credits: Option<i64>,
+    /// And the micro-credits the card had.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_micro_credits: Option<i64>,
     pub attempt_chain: Vec<AttemptRecord>,
 }
 
