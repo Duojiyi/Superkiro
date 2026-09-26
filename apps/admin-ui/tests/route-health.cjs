@@ -130,8 +130,28 @@ const writes=endpoint=>fixture.writes.filter(write=>write.endpoint===endpoint);
     await button('删除 Key').click();await confirm();
     await page.getByRole('status').filter({hasText:'已隐藏 gpt-6-astra；但没收到删除结果（Provider persistence failed）'}).waitFor();
     assert.equal(model('fixture-model-3').visible,false);assert(key('fixture-openai-key-2'));
-    assert.deepEqual(errors,[]);assert.deepEqual(nativeDialogs,[],'no browser-native dialogs');
     console.log('PASS: 删除 Key: no-loss delete, server refusal explained with the model named, hide-then-delete; a failure after hiding says the model stays hidden');
+
+    // Live health counts: gemini-pro's backup Key is refused as invalid (401), so it would not take
+    // over; stopping the primary provider leaves gemini-pro with nothing, and the dialog says so.
+    Object.assign(key('fixture-openai-key-2'),{health_state:'unhealthy',last_error:'http_401'});await refresh();
+    await page.getByRole('switch',{name:'启用 测试供应商 / Fixture',exact:true}).click();
+    const healthFacts=await confirm({accept:false});
+    const stranded=/将无可用线路（客户请求会失败）：(.+)/.exec(healthFacts)?.[1].split('、').sort();
+    assert.deepEqual(stranded,['claude-sonnet','gemini-pro','gpt-5'],healthFacts);assert(!healthFacts.includes('改由备用线路服务'),healthFacts);
+    // Deleting a Key that is refused changes nothing for customers, but the server still refuses to
+    // strand a shown model's last enabled Key: the model is named and hidden first.
+    model('fixture-model-3').visible=true;fixture.config.revision='fixture-rev-50';await refresh();
+    // (The editor still waits for the unconfirmed delete above to be checked: a fresh one starts clean.)
+    await page.locator('#key-editor').getByRole('button',{name:'关闭编辑器',exact:true}).click();await page.locator('#key-editor').waitFor({state:'detached'});
+    await openKey('OpenAI 格式 / Fixture','fixture-openai-key-2');
+    await button('删除 Key').click();
+    const deadBox=page.getByRole('alertdialog');await deadBox.waitFor();
+    assert((await deadBox.innerText()).includes('已经无可用线路，但删除前要先隐藏：gpt-6-astra'),await deadBox.innerText());
+    assert(await deadBox.getByRole('checkbox').isChecked());
+    await deadBox.getByRole('button',{name:'取消',exact:true}).click();await deadBox.waitFor({state:'detached'});
+    assert.deepEqual(errors,[]);assert.deepEqual(nativeDialogs,[],'no browser-native dialogs');
+    console.log('PASS: losses and the delete guard follow live Key health');
   }finally{
     await browser?.close();server.close();
   }

@@ -127,6 +127,10 @@ const until=async ready=>{const end=Date.now()+10000;while(!ready()){assert(Date
     await until(()=>importPosts===1);await editor.waitFor({state:'detached'});
     assert.equal(keyPosts.length,keyPostsBefore,'the new-provider form never calls the Key API');
     // Models: explicit token units; routing picked from lists; an edited input shows what it was.
+    // The Key saved above no longer lists claude-sonnet, whose other Key is cooling down and so does
+    // not serve it: give the model back to the saved Key, or no draft of it could be published.
+    savedKey={...savedKey,allowed_models:[...savedKey.allowed_models,'claude-sonnet']};
+    await button('刷新').click();await page.locator('.btn-refresh:not([disabled])').waitFor();
     await nav('模型与定价');
     const tokenContext=page.getByLabel('上下文长度',{exact:true}),tokenOutput=page.getByLabel('最大输出',{exact:true});
     await tokenContext.waitFor();

@@ -32,8 +32,29 @@ const writes=endpoint=>fixture.writes.filter(write=>write.endpoint===endpoint);
     await page.goto(origin+'/admin/');await page.getByLabel('密码',{exact:true}).fill('fixture-password');await button('登录').click();
     await button('刷新').waitFor();
     const attention=page.locator('.attention-list');
-    await attention.getByText('1 个 Key 冷却中（',{exact:false}).waitFor();await attention.getByText('1 个 Key 不可用',{exact:false}).waitFor();
+    await attention.getByText('Key fixture-backup（测试供应商 / Fixture）冷却中，',{exact:false}).waitFor();
+    await attention.getByText('Key fixture-openai-key-1（OpenAI 格式 / Fixture）不可用：HTTP 401 · Key 无效或被拒绝',{exact:false}).waitFor();
     assert.equal(await page.locator('#nav-badge-providers [aria-hidden="true"]').textContent(),'2');
+    // gpt-6-astra's only route is that Key: nothing can serve it. It is named in red with the reason,
+    // first in the list, with a way to the Key and to the model; the other pages show it broken too.
+    const dead=attention.locator('li').first();
+    assert.equal(await dead.locator('.attention-text').innerText(),'gpt-6-astra：唯一线路 OpenAI 格式 / Fixture 的 Key 返回 401');
+    assert((await dead.locator('.attention-item').getAttribute('class')).includes('is-danger'));
+    await page.getByRole('alert').filter({hasText:'1 个在售模型无可用线路，客户请求会失败：gpt-6-astra（OpenAI 格式 / Fixture 的 Key 返回 401）'}).waitFor();
+    assert.equal(await page.locator('#nav-badge-models [aria-hidden="true"]').textContent(),'1');
+    // Success rates are coloured like the 成功率 KPI (fixture: 44 of 47 did not fail, 93.6%).
+    const rateCell=page.locator('.panel').filter({hasText:'服务健康'}).getByRole('row').filter({hasText:'测试供应商 / Fixture'}).locator('td.num').first();
+    assert.deepEqual([await rateCell.innerText(),await rateCell.getAttribute('class')],['93.6%','num is-warning']);
+    await dead.getByRole('button',{name:'查看 Key',exact:true}).click();
+    await page.getByRole('heading',{name:'供应商与 Key',level:2,exact:true}).waitFor();
+    assert.equal(await page.locator('tr.is-pointed').getAttribute('data-key-id'),'fixture-openai-key-1','the Key to fix is marked');
+    assert.equal(await page.evaluate(()=>location.hash),'#/providers?key=fixture-openai-key-1');
+    await page.evaluate(()=>history.back());await page.getByRole('heading',{name:'运营概览',level:2,exact:true}).waitFor();
+    await attention.locator('li').first().getByRole('button',{name:'去模型与定价',exact:true}).click();
+    const astraRow=page.getByRole('row').filter({has:page.getByRole('button',{name:'gpt-6-astra 的更多操作',exact:true})});
+    const mark=astraRow.getByText('无可用线路',{exact:true});await mark.waitFor();
+    assert.equal(await mark.getAttribute('title'),'OpenAI 格式 / Fixture 的 Key 返回 401');
+    await nav('运营概览');
     await nav('供应商与 Key');
     // The format comes from the server's `format` field.
     const card=name=>page.locator('.provider-card').filter({hasText:name});

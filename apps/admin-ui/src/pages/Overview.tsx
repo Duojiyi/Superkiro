@@ -7,12 +7,17 @@ import {EstimateTag, FilterTabs, StatusBadge, TableState, TopbarActions} from '.
 import {IconCheck, IconWarning} from '../components/icons';
 import {formatCount, formatCredits, formatCreditsMicro, formatDuration, formatFullDateTime, formatMoney, formatPercent, formatRemaining, shortId} from '../format';
 import {brokenRoutes, modelName, nameList, targetProblem} from '../routes';
-import {cooldownText, keyAlert, keyCooldownLeft, keyStatusView, TRACE_IN_PROGRESS} from '../status';
-import type {Intent, Tab} from '../types';
+import {cooldownText, failureLabel, keyAlert, keyCooldownLeft, keyStatusView, TRACE_IN_PROGRESS} from '../status';
+import type {Intent, Row, Tab} from '../types';
 import type {Failures, WorkspaceData} from '../Workspace';
 
 type Range = '24h' | '7d';
 const DAY = 86400;
+/** What needs attention, most urgent first; `links` when it concerns more than one place. */
+interface AttentionItem {text: string; tone: 'warning' | 'danger' | 'info'; go: () => void; links?: Array<{label: string; go: () => void}>}
+const URGENCY = {danger: 0, warning: 1, info: 2};
+/** A success rate's colour, as the 成功率 KPI has it. */
+const rateTone = (rate: number | null) => rate === null ? undefined : rate < 90 ? 'danger' as const : rate < 95 ? 'warning' as const : undefined;
 
 /** Totals from the loaded traces, for servers that do not report activity yet. */
 function windowFromTraces(traces: AdminTrace[], start: number): AdminActivityWindow {
@@ -86,21 +91,43 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
     ? (typeof cover === 'number' && cover > nowSecs - DAY ? `调用记录从 ${formatFullDateTime(cover)} 起` : undefined)
     : `按最近 ${data.traces.length} 条调用记录统计`;
 
-  // Only what someone can act on, each a link to the filtered list. Nothing at zero.
-  const attention: Array<{text: string; tone: 'warning' | 'danger' | 'info'; go: () => void}> = [];
+  // Only what someone can act on, each naming what it is about and landing on it (the Key or
+  // provider marked, or the filtered list). Nothing at zero.
+  const attention: AttentionItem[] = [];
+  const providerName = (id: unknown) => String(data.providers.find(provider => provider.id === id)?.name ?? id);
+  const toKey = (key: Row) => () => onNavigate('providers', {providers: {key: String(key.id)}});
+  const toProvider = (id: unknown) => () => onNavigate('providers', {providers: {provider: String(id)}});
+  // Shown models nothing can serve, each with why and links to what to fix.
+  const broken = providersLoaded ? brokenRoutes(data.models, {providers: data.providers, keys: data.providerKeys, nowSecs}) : [];
+  for (const {model, route} of broken.filter(entry => entry.route.down)) {
+    const problem = targetProblem(route.primary, data.providers, nowSecs), fix = route.primary.keys?.[0];
+    const links = [...(fix ? [{label: '查看 Key', go: toKey(fix)}] : ['no_key', 'provider_disabled'].includes(String(route.primary.problem)) ? [{label: '查看供应商', go: toProvider(route.primary.provider_id)}] : []),
+      {label: '去模型与定价', go: () => onNavigate('models')}];
+    attention.push({text: `${modelName(model, data.models, data.groups)}：${route.backups.length ? `主线路 ${problem}，${route.backups.length} 条备用线路也不能用` : `唯一线路 ${problem}`}`,
+      tone: 'danger', go: links[0].go, links});
+  }
+  // Keys by state: each named when there are a few, else the first few and how many.
+  const keyItems = (keys: Row[], one: (key: Row) => string, many: string, tone: AttentionItem['tone']) => {
+    if (keys.length <= 3) for (const key of keys) attention.push({text: one(key), tone, go: toKey(key)});
+    else attention.push({text: `${keys.length} 个 Key ${many}：${nameList(keys.map(key => String(key.id)), 3)}`, tone, go: toKey(keys[0])});
+  };
   // A Key of a disabled provider serves nothing, so its cooldown needs no attention.
   const liveKeys = data.providerKeys.filter(key => key.enabled !== false && data.providers.find(provider => provider.id === key.provider_id)?.enabled !== false);
   const coolingKeys = liveKeys.filter(key => keyAlert(key, nowSecs) === 'cooldown');
-  if (coolingKeys.length) {
-    const left = coolingKeys.map(key => keyCooldownLeft(key, nowSecs)).filter(value => value > 0);
-    attention.push({text: `${coolingKeys.length} 个 Key 冷却中${left.length ? `（${cooldownText(Math.min(...left))}后恢复）` : ''}`, tone: 'warning', go: () => onNavigate('providers')});
+  const left = coolingKeys.map(key => keyCooldownLeft(key, nowSecs)).filter(value => value > 0);
+  keyItems(coolingKeys, key => `Key ${String(key.id)}（${providerName(key.provider_id)}）冷却中${keyCooldownLeft(key, nowSecs) > 0 ? `，${cooldownText(keyCooldownLeft(key, nowSecs))}后恢复` : ''}`,
+    `冷却中${left.length ? `（最早 ${cooldownText(Math.min(...left))}后恢复）` : ''}`, 'warning');
+  keyItems(liveKeys.filter(key => keyAlert(key, nowSecs) === 'degraded'), key => `Key ${String(key.id)}（${providerName(key.provider_id)}）冷却后试用中`, '冷却后试用中', 'warning');
+  keyItems(liveKeys.filter(key => keyAlert(key, nowSecs) === 'unhealthy'),
+    key => `Key ${String(key.id)}（${providerName(key.provider_id)}）不可用${failureLabel(key.last_error) ? `：${failureLabel(key.last_error)}` : ''}`, '不可用', 'danger');
+  // Failed requests, by model: one model is named and filtered on, several give the busiest.
+  const failedLastHour = data.traces.filter(trace => trace.status === 'error' && Number(trace.ts) > nowSecs - 3600);
+  if (failedLastHour.length) {
+    const byModel = [...failedLastHour.reduce((counts, trace) => counts.set(String(trace.exposed_model ?? '—'), (counts.get(String(trace.exposed_model ?? '—')) ?? 0) + 1), new Map<string, number>())].sort((a, b) => b[1] - a[1]);
+    const only = byModel.length === 1 && byModel[0][0] !== '—' ? byModel[0][0] : null;
+    attention.push({text: only ? `近 1 小时 ${only} 失败 ${failedLastHour.length} 次` : `近 1 小时 ${failedLastHour.length} 次失败请求（最多：${byModel[0][0]} ${byModel[0][1]} 次）`,
+      tone: 'danger', go: () => onNavigate('traces', {traces: {status: 'error', window: 'hour', ...(only ? {model: only} : {})}})});
   }
-  const degradedKeys = liveKeys.filter(key => keyAlert(key, nowSecs) === 'degraded').length;
-  if (degradedKeys) attention.push({text: `${degradedKeys} 个 Key 冷却后恢复中`, tone: 'warning', go: () => onNavigate('providers')});
-  const unhealthyKeys = liveKeys.filter(key => keyAlert(key, nowSecs) === 'unhealthy').length;
-  if (unhealthyKeys) attention.push({text: `${unhealthyKeys} 个 Key 不可用`, tone: 'danger', go: () => onNavigate('providers')});
-  const failedLastHour = data.traces.filter(trace => trace.status === 'error' && Number(trace.ts) > nowSecs - 3600).length;
-  if (failedLastHour) attention.push({text: `近 1 小时 ${failedLastHour} 次失败请求`, tone: 'danger', go: () => onNavigate('traces', {traces: {status: 'error', window: 'hour'}})});
   const frozen = currentCards.filter(card => card.status === 'frozen').length;
   if (frozen) attention.push({text: `${frozen} 张卡已冻结`, tone: 'warning', go: () => onNavigate('cards', {cards: {status: 'FROZEN'}})});
   const expiring = currentCards.filter(card => ['active', 'frozen'].includes(card.status) && card.validUntil != null && card.validUntil > nowSecs && card.validUntil <= nowSecs + 7 * DAY).length;
@@ -109,7 +136,7 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
   if (low) attention.push({text: `${low} 张卡余额低于 10%`, tone: 'info', go: () => onNavigate('cards', {cards: {quick: 'low'}})});
   try {
     const pending = operator ? loadAdjustment(sessionStorage, operator) : null;
-    if (pending) attention.push({text: `卡 ${shortId(pending.cardId, 'card')} 有一笔调账结果未确认`, tone: 'danger', go: () => onNavigate('cards')});
+    if (pending) attention.push({text: `卡 ${shortId(pending.cardId, 'card')} 有一笔调账结果未确认`, tone: 'danger', go: () => onNavigate('cards', {cards: {status: 'ALL', search: pending.cardId, open: pending.cardId}})});
   } catch {
     attention.push({text: '调账恢复记录无法读取', tone: 'danger', go: () => onNavigate('cards')});
   }
@@ -120,10 +147,10 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
     if (!notice.enabled || !notice.expires_at || notice.expires_at <= nowSecs || notice.expires_at > nowSecs + DAY) continue;
     attention.push({text: `公告「${notice.title}」${formatRemaining(notice.expires_at, now).text.replace('剩 ', '')}后到期`, tone: 'info', go: () => onNavigate('announcements')});
   }
+  attention.sort((a, b) => URGENCY[a.tone] - URGENCY[b.tone]);
   const unknown = failures.cards || failures.providers || failures.traces;
   // Shown models whose primary route cannot serve: those nothing can serve, and those a backup serves.
-  const broken = providersLoaded ? brokenRoutes(data.models, {providers: data.providers, keys: data.providerKeys}) : [];
-  const describe = (entries: typeof broken) => nameList(entries.map(({model, route}) => `${modelName(model, data.models, data.groups)}（${targetProblem(route.primary, data.providers)}）`), 4);
+  const describe = (entries: typeof broken) => nameList(entries.map(({model, route}) => `${modelName(model, data.models, data.groups)}（${targetProblem(route.primary, data.providers, nowSecs)}）`), 4);
   const down = broken.filter(entry => entry.route.down), takeover = broken.filter(entry => !entry.route.down);
 
   const providerRows = data.providers.map(provider => {
@@ -140,7 +167,7 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
     const failed = reported ? reported.failed : traced.filter(trace => trace.status === 'error').length;
     const timed = traced.map(trace => trace.ttft_ms).filter((value): value is number => typeof value === 'number').sort((a, b) => a - b);
     const median = reported ? reported.ttftMedianMs : timed.length ? timed[Math.floor((timed.length - 1) / 2)] : null;
-    return {provider, keys, counts, requests, failed, median};
+    return {provider, keys, counts, rate: requests ? (requests - failed) / requests * 100 : null, median};
   });
 
   return <div className="page-stack">
@@ -157,7 +184,7 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
           <button type="button" className="link" onClick={() => onNavigate('traces', {traces: {status: 'error', window: range === '24h' ? 'day' : 'all'}})}>失败 {formatCount(period.failed)}</button>
           {period.clientAborted > 0 && <span> · 中断 {formatCount(period.clientAborted)}</span>}
         </>}/>
-      <Kpi label="成功率" estimate={requestEstimate} value={formatPercent(rate)} tone={rate === null ? undefined : rate < 90 ? 'danger' : rate < 95 ? 'warning' : undefined}
+      <Kpi label="成功率" estimate={requestEstimate} value={formatPercent(rate)} tone={rateTone(rate)}
         sub={period ? `${formatCount(period.succeeded)} 次成功` : undefined}/>
       <Kpi label="首字耗时" value={period?.timedRequests ? `${formatDuration(period.ttftMedianMs)} / ${formatDuration(period.ttftP90Ms)}` : '—'}
         sub={period?.timedRequests ? `中位数 / P90 · ${formatCount(period.timedRequests)} 次有计时` : period ? '没有计时的请求' : undefined}/>
@@ -192,7 +219,10 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
       <section className="panel attention">
         <h3>需要关注</h3>
         {attention.length ? <ul className="attention-list">
-          {attention.map(item => <li key={item.text}><button type="button" className={`attention-item is-${item.tone}`} onClick={item.go}>{item.text}<span aria-hidden="true">›</span></button></li>)}
+          {attention.map(item => <li key={item.text}>{item.links
+            ? <div className={`attention-item is-${item.tone}`}><span className="attention-text">{item.text}</span>
+              <span className="attention-links">{item.links.map(link => <button key={link.label} type="button" className="btn-text btn-small" onClick={link.go}>{link.label}</button>)}</span></div>
+            : <button type="button" className={`attention-item is-${item.tone}`} onClick={item.go}>{item.text}<span aria-hidden="true">›</span></button>}</li>)}
         </ul> : loading && !providersLoaded ? <p className="muted">正在加载…</p>
           : unknown ? <p className="muted">部分数据没有加载，暂时无法确认</p>
           : <p className="all-good"><IconCheck/>一切正常</p>}
@@ -204,13 +234,13 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
       <div className="table-scroll"><table className="table">
         <thead><tr><th>供应商</th><th className="col-status">状态</th><th>Key</th><th className="num">近 24 小时成功率</th><th className="num">首字中位数</th><th className="col-actions"><span className="sr-only">操作</span></th></tr></thead>
         <tbody>
-          {providerRows.map(({provider, keys, counts, requests, failed, median}) => <tr key={String(provider.id)}>
+          {providerRows.map(({provider, keys, counts, rate, median}) => <tr key={String(provider.id)}>
             <td className="cell-strong">{String(provider.name || provider.id)}</td>
             <td className="col-status"><StatusBadge view={provider.enabled === false ? {label: '已停用', tone: 'neutral'} : {label: '启用', tone: 'success'}}/></td>
             <td>{keys.length ? <span className="key-summary">{[...counts.entries()].map(([label, value]) => <span key={label} className={`dot-label dot-${value.tone}`}>{value.count} {label}</span>)}</span> : <span className="muted">没有 Key</span>}</td>
-            <td className="num">{requests ? formatPercent((requests - failed) / requests * 100) : '—'}</td>
+            <td className={`num${rateTone(rate) ? ` is-${rateTone(rate)}` : ''}`}>{formatPercent(rate)}</td>
             <td className="num">{formatDuration(median)}</td>
-            <td className="col-actions"><button type="button" className="btn-text" onClick={() => onNavigate('providers')}>查看</button></td>
+            <td className="col-actions"><button type="button" className="btn-text" onClick={toProvider(provider.id)}>查看</button></td>
           </tr>)}
           {!data.providers.length && <TableState colSpan={6} loading={loading} failed={failures.providers} empty="还没有供应商" onRetry={onRetry}
             action={<button type="button" className="btn btn-small" onClick={() => onNavigate('providers')}>添加供应商</button>}/>}

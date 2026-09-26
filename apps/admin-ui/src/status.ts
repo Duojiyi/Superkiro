@@ -67,7 +67,7 @@ export function keyStatusView(key: Row, nowSecs: number): StatusView {
   const lastError = failureLabel(key.last_error), error = lastError ? `最近错误：${lastError}` : undefined;
   const alert = keyAlert(key, nowSecs), cooldown = keyCooldownLeft(key, nowSecs);
   if (alert === 'unhealthy') return {label: '不可用', tone: 'danger', title: error};
-  if (alert === 'degraded') return {label: '恢复中', tone: 'warning', title: ['冷却已结束，重新接请求，还没成功过', error].filter(Boolean).join('\n')};
+  if (alert === 'degraded') return {label: '冷却后试用中', tone: 'warning', title: ['冷却已结束，重新接请求，还没成功过', error].filter(Boolean).join('\n')};
   if (alert === 'cooldown') {
     if (cooldown <= 0) return {label: '冷却中', tone: 'warning', title: error};
     return {label: `冷却中 · ${cooldownText(cooldown)}`, tone: 'warning', title: [`${cooldownText(cooldown)}后恢复`, error].filter(Boolean).join('\n')};

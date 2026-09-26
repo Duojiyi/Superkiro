@@ -34,10 +34,10 @@ const server=http.createServer(async(req,res)=>{
   assert.equal(await page.locator('.chart-column').count(),24);
   const bars=await page.locator('.chart-column').evaluateAll(nodes=>nodes.map(n=>[Number(n.dataset.requests),Number(n.dataset.failed)]));
   assert(bars.reduce((a,[r])=>a+r,0)>0);assert.equal(bars.reduce((a,[,f])=>a+f,0),3);
-  // A cooling Key of a disabled provider raises nothing: one badge, one attention item, for the enabled provider's Key.
+  // A cooling Key of a disabled provider raises nothing: one badge, one attention item, for the enabled provider's Key, named.
   assert.equal(await page.locator('#nav-badge-providers [aria-hidden="true"]').textContent(),'1');
   const coolingItems=await page.locator('.attention-list li').filter({hasText:'冷却中'}).allInnerTexts();
-  assert.equal(coolingItems.length,1);assert(coolingItems[0].startsWith('1 个 Key 冷却中'),coolingItems[0]);
+  assert.equal(coolingItems.length,1);assert(coolingItems[0].startsWith('Key fixture-backup（测试供应商 / Fixture）冷却中'),coolingItems[0]);
   // Add screenshot-only provenance. No application code or production assets know about fixtures.
   await page.evaluate(()=>{const b=document.createElement('div');b.textContent='LOCAL FIXTURE · 已认证测试数据 · 非生产';Object.assign(b.style,{position:'fixed',bottom:'8px',right:'12px',zIndex:'9999',background:'#23272b',color:'white',padding:'6px 10px',fontSize:'11px',borderRadius:'4px',pointerEvents:'none'});document.body.append(b);});
   const pages=[['overview','运营概览'],['cards','卡密资产'],['providers','供应商与 Key'],['pricing','模型与定价'],['groups','分组与权益'],['trace','调用追踪'],['finance','财务对账'],['security','安全与审计'],['announcements','公告管理']];

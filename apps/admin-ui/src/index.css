@@ -551,6 +551,10 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .attention-item.is-warning::before {background: #d4a72c;}
 .attention-item.is-info::before {background: var(--info);}
 .attention-item > span {margin-left: auto; color: var(--text-3);}
+/* An item about more than one place (a model and the Key to fix): its words, and a link to each. */
+div.attention-item:hover {background: transparent;}
+.attention-item > .attention-text {flex: 1; min-width: 0; margin-left: 0; color: inherit;}
+.attention-links {display: inline-flex; flex-wrap: wrap; justify-content: flex-end; gap: 2px; flex-shrink: 0;}
 .all-good {display: flex; align-items: center; gap: 8px; margin: 0; color: var(--success); font-weight: 500;}
 .key-summary {display: inline-flex; align-items: center; flex-wrap: nowrap;}
 

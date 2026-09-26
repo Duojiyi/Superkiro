@@ -164,7 +164,7 @@ assert.equal(tokens.formatTokens(200000),'200K Tokens（200,000）');
 assert.equal(tokens.formatTokens(1000000),'1M Tokens（1,000,000）');
 assert.equal(display.formatTokenCount(272000),'272K');
 const model = {id: 'model-1', exposed_model_id: 'test-model', target_model: 'upstream', target_provider_id: 'p', group_id: 'g', credit_multiplier: 4};
-const routes = load('routes.ts');
+const routes = load('routes.ts', {'./status': load('status.ts'), './format': display});
 const Editor = load('CommercialEditor.tsx', {'./tokens': tokens, './api': {adminApi: {}}, './format': display, './priceChange': change, './routes': routes,
   // Dialogs, drawers and messages only run from event handlers; the render tree just names the components.
   './components/confirm': {confirmAction: async () => true}, './components/toast': {toast: {success() {}, info() {}, error() {}}},

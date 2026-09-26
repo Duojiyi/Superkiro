@@ -6,7 +6,7 @@ import {toast} from './components/toast';
 import {InfoTip} from './components/ui';
 import Probe from './Probe';
 import {explainRefusal, isRefusal, type PublishOutcome} from './refusal';
-import {lossFacts, modelName, nameList, routeLosses, type RouteLosses} from './routes';
+import {deleteBlockers, lossFacts, modelName, nameList, routeLosses, type RouteLosses} from './routes';
 
 type Row = Record<string, unknown>;
 type Message = {tone: 'error' | 'warning' | 'info'; text: string} | null;
@@ -204,18 +204,23 @@ export default function ProviderKeyEditor({selectedKey, preset, knownModels = []
     if (pending.current || review || mode !== 'edit') return;
     const target = {provider: provider.trim(), key: keyId.trim()};
     const losses = lossesIf(null);
+    // Models already without a route (this Key is refused, say) lose nothing more, but the server
+    // still will not delete the last enabled Key of a shown model's primary route: hide them too.
+    const blocked = routes && selectedKey ? deleteBlockers(routes.models, routes.keys, selectedKey).filter(model => !losses.down.includes(model)) : [];
+    const hide = [...losses.down, ...blocked];
     const answer = await ask({
       title: `删除 Key ${target.key}？`,
-      facts: [`${target.provider} 的 Key · 可用模型 ${savedModels ? `${savedModels.length} 个` : '不限（旧版）'}`, ...lossFacts(losses, nameOf)],
-      option: onHideModels && losses.down.length ? {label: `同时隐藏将无可用线路的 ${losses.down.length} 个模型（先隐藏，再删除）`, checked: true} : undefined,
-      consequence: `删除后不能恢复：要再用，需重新添加 Key 并填写 API Key。${losses.down.length ? '在售模型只剩这条线路时，不隐藏它们服务器会拒绝删除。' : ''}`,
+      facts: [`${target.provider} 的 Key · 可用模型 ${savedModels ? `${savedModels.length} 个` : '不限（旧版）'}`, ...lossFacts(losses, nameOf),
+        ...(blocked.length ? [`已经无可用线路，但删除前要先隐藏：${nameList(blocked.map(nameOf))}`] : [])],
+      option: onHideModels && hide.length ? {label: `同时隐藏将无可用线路的 ${hide.length} 个模型（先隐藏，再删除）`, checked: true} : undefined,
+      consequence: `删除后不能恢复：要再用，需重新添加 Key 并填写 API Key。${hide.length ? '在售模型只剩这条线路时，不隐藏它们服务器会拒绝删除。' : ''}`,
       confirmLabel: '删除', danger: true,
     });
     if (!answer.confirmed || pending.current) return;
     pending.current = true; setBusy(true);
     let hidden: string | null = null;
     try {
-      if (answer.option && !(hidden = await hideFirst(losses.down, '删除'))) return;
+      if (answer.option && !(hidden = await hideFirst(hide, '删除'))) return;
       const result = await adminApi.deleteKey(target.provider, target.key);
       if (result.success !== true) throw new AdminApiError('服务器未确认删除', 400);
       setDirty(false); setMessage(null);
