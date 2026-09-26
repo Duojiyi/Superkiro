@@ -8,7 +8,7 @@
 
 use crate::detect::{get_candidate_install_paths, inspect_installation_dir};
 use crate::patch::{ExtensionPatcher, PatchOwnership};
-use crate::settings::SettingsManager;
+use crate::settings::{Profile, SettingsManager};
 use crate::token_storage::TokenStorage;
 use std::path::{Path, PathBuf};
 
@@ -25,6 +25,8 @@ pub struct Leftovers {
     pub unrecoverable: Vec<PathBuf>,
     /// settings.json still points Kiro at a gateway this client knows.
     pub settings: bool,
+    /// The settings.json of other Kiro profiles that still point Kiro at one.
+    pub profile_settings: Vec<PathBuf>,
     /// The token Kiro holds was issued by the gateway.
     pub token: bool,
 }
@@ -54,6 +56,12 @@ impl Leftovers {
             }
         }
         found.settings = settings.names_gateway(gateway_hosts);
+        found.profile_settings = settings
+            .profile_files()
+            .into_iter()
+            .filter(|profile| profile.settings.names_gateway(gateway_hosts))
+            .map(|profile| profile.settings.path().to_path_buf())
+            .collect();
         found.token = token
             .load()
             .is_ok_and(|token| token.profile_arn.contains(GATEWAY_ACCOUNT));
@@ -61,7 +69,11 @@ impl Leftovers {
     }
 
     pub fn found(&self) -> bool {
-        !self.patches.is_empty() || !self.unrecoverable.is_empty() || self.settings || self.token
+        !self.patches.is_empty()
+            || !self.unrecoverable.is_empty()
+            || self.settings
+            || !self.profile_settings.is_empty()
+            || self.token
     }
 
     /// Undo what was found. Kiro must not be running.
@@ -86,6 +98,20 @@ impl Leftovers {
                 .plan_orphan_removal(gateway_hosts)
                 .map_err(|error| error.to_string())?;
         }
+        let profiles: Vec<Profile> = settings
+            .profile_files()
+            .into_iter()
+            .filter(|profile| {
+                self.profile_settings
+                    .contains(&profile.settings.path().to_path_buf())
+            })
+            .collect();
+        for profile in &profiles {
+            profile
+                .settings
+                .plan_orphan_removal(gateway_hosts)
+                .map_err(|error| error.in_profile(&profile.name).to_string())?;
+        }
         for path in &self.patches {
             ExtensionPatcher::new(path)
                 .restore()
@@ -101,6 +127,12 @@ impl Leftovers {
             settings
                 .remove_orphaned_takeover(gateway_hosts)
                 .map_err(|error| error.to_string())?;
+        }
+        for profile in &profiles {
+            profile
+                .settings
+                .remove_orphaned_takeover(gateway_hosts)
+                .map_err(|error| error.in_profile(&profile.name).to_string())?;
         }
         if self.token {
             token.clear().map_err(|error| error.to_string())?;

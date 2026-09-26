@@ -171,8 +171,25 @@ impl Doctor {
             });
         }
 
-        // 3. Settings Configuration Check
-        let settings_active = self.settings_mgr.is_byok_active(Some(gw));
+        // 3. Settings Configuration Check: Default's settings, and those of every other
+        // profile with its own, which a window on that profile reads instead.
+        let default_active = self.settings_mgr.is_byok_active(Some(gw));
+        let unconfigured: Vec<String> = match self.settings_mgr.profiles() {
+            Ok(profiles) => profiles
+                .into_iter()
+                .filter(|profile| !profile.settings.is_byok_active(Some(gw)))
+                .map(|profile| profile.name)
+                .collect(),
+            Err(error) => vec![error.to_string()],
+        };
+        let settings_active = default_active && unconfigured.is_empty();
+        // Anything still sending Kiro to this gateway, a profile's settings included.
+        let redirected = default_active
+            || self
+                .settings_mgr
+                .profile_files()
+                .iter()
+                .any(|profile| profile.settings.is_byok_active(Some(gw)));
         if settings_active {
             items.push(CheckItem {
                 name: "Settings Configuration".to_string(),
@@ -183,7 +200,14 @@ impl Doctor {
             items.push(CheckItem {
                 name: "Settings Configuration".to_string(),
                 level: CheckLevel::Warning,
-                detail: "BYOK settings not applied in settings.json".to_string(),
+                detail: if default_active {
+                    format!(
+                        "BYOK settings not applied for Kiro profiles: {}; open Kiro from the client to apply them",
+                        unconfigured.join(", ")
+                    )
+                } else {
+                    "BYOK settings not applied in settings.json".to_string()
+                },
             });
         }
 
@@ -313,12 +337,12 @@ impl Doctor {
             TakeoverStatus::UpgradeDetected
         } else if settings_active && patch_verified && token_valid && bypass_ready {
             TakeoverStatus::ReadyForIdeCheck
-        } else if !settings_active
+        } else if !redirected
             && patch_status == PatchStatus::Official
             && !self.token_storage.exists()
         {
             TakeoverStatus::NotTakenOver
-        } else if !token_valid && settings_active {
+        } else if !token_valid && default_active {
             TakeoverStatus::TokenExpired
         } else {
             TakeoverStatus::Incomplete

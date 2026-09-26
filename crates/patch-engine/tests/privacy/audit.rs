@@ -72,6 +72,7 @@ fn audit_snapshot_and_staging_permissions_and_replace_cleanup() {
             prior_raw: Some(b"{\"proxySecret\":\"fixture\"}".to_vec()),
             ..Default::default()
         },
+        profiles: Vec::new(),
     };
     // Replacement must also repair a pre-existing permissive destination.
     fs::write(&path, b"old").unwrap();

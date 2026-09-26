@@ -257,7 +257,20 @@ impl AuthClient {
 
         let url = format!("{}/oauth/token", gateway_base_url.trim_end_matches('/'));
 
-        let resp = self.http()?.post(&url).json(&req_body).send().await?;
+        let http = self.http()?;
+        let request = || http.post(&url).json(&req_body).send();
+        // A sign-in cut off before any answer (a local proxy dropping the TLS handshake,
+        // say) is sent once more. That is safe even if the first one reached the gateway:
+        // it binds the same device, bound to this card by then, which the gateway accepts
+        // as it is, and it only replaces tokens that never arrived. An answer, whatever it
+        // says, is final.
+        let resp = match request().await {
+            Err(error) if unanswered(&error) => {
+                tokio::time::sleep(LOGIN_RETRY_DELAY).await;
+                request().await?
+            }
+            result => result?,
+        };
 
         if !resp.status().is_success() {
             return Err(AuthClientError::from_response(resp).await);
@@ -407,6 +420,16 @@ impl AuthClient {
     pub fn logout(&self) -> Result<bool, AuthClientError> {
         Ok(self.storage.clear()?)
     }
+}
+
+/// How long a sign-in cut off before any answer waits before its one retry.
+const LOGIN_RETRY_DELAY: Duration = Duration::from_millis(1500);
+
+/// Whether a request failed before any answer came back: it never connected, its TLS
+/// handshake or proxy tunnel was cut off, or the connection closed under it. Not a
+/// timeout, which has already had all of its time.
+fn unanswered(error: &reqwest::Error) -> bool {
+    error.is_request() && !error.is_timeout()
 }
 
 // reqwest Display omits the transport/TLS cause. Keep its source chain for diagnostics.
@@ -578,6 +601,130 @@ mod client_contract_tests {
             let _ = server.await;
         }
     }
+    const TOKEN: &str = r#"{"accessToken":"a1","refreshToken":"r1","profileArn":"arn:aws:codewhisperer:us-east-1:123456789012:profile/X","expiresAt":"2030-01-01T00:00:00Z"}"#;
+
+    fn client() -> AuthClient {
+        let unused = std::env::temp_dir().join(format!("retry-token-{}.json", std::process::id()));
+        AuthClient::with_ca(TokenStorage::at(unused), None)
+    }
+
+    /// Read one HTTP request off `socket`, headers and body.
+    async fn read_request(socket: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncReadExt;
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            let count = socket.read(&mut buffer).await.unwrap();
+            assert!(count > 0, "the request ended early");
+            request.extend_from_slice(&buffer[..count]);
+            let text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+            if let Some(end) = text.find("\r\n\r\n") {
+                let length = text
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .map_or(0, |value| value.trim().parse::<usize>().unwrap());
+                if request.len() >= end + 4 + length {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// A sign-in whose connection is cut before any answer (here after the whole request
+    /// went out) is sent once more, after a pause, and the second answer counts.
+    #[tokio::test]
+    async fn a_sign_in_cut_off_before_any_answer_is_sent_once_more() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            read_request(&mut first).await;
+            drop(first);
+            let (mut second, _) = listener.accept().await.unwrap();
+            read_request(&mut second).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{TOKEN}",
+                TOKEN.len()
+            );
+            second.write_all(response.as_bytes()).await.unwrap();
+        });
+        let started = std::time::Instant::now();
+        let token = client()
+            .authenticate(&base, "card", Some("device"))
+            .await
+            .unwrap();
+        assert_eq!(token.access_token, "a1");
+        assert!(started.elapsed() >= LOGIN_RETRY_DELAY);
+        server.await.unwrap();
+    }
+
+    /// A local proxy that cuts off the TLS handshake every time: one retry, then the
+    /// error, which says the handshake was cut off rather than that a certificate failed.
+    #[tokio::test]
+    async fn a_tls_handshake_cut_off_is_retried_once_then_reported() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("https://{}", listener.local_addr().unwrap());
+        let connections = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = connections.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                counted.fetch_add(1, Ordering::SeqCst);
+                // The whole ClientHello record, so the close reaches the client as the end
+                // of the handshake rather than as a reset.
+                let mut header = [0u8; 5];
+                socket.read_exact(&mut header).await.unwrap();
+                let mut hello = vec![0u8; usize::from(u16::from_be_bytes([header[3], header[4]]))];
+                socket.read_exact(&mut hello).await.unwrap();
+            }
+        });
+        let error = client()
+            .authenticate(&base, "card", Some("device"))
+            .await
+            .unwrap_err();
+        server.abort();
+        assert_eq!(connections.load(Ordering::SeqCst), 2);
+        assert!(matches!(error, AuthClientError::Network(_)), "{error}");
+        assert!(error.to_string().contains("tls handshake eof"), "{error}");
+        assert!(!error.to_string().contains("certificate"), "{error}");
+    }
+
+    /// Once an answer has begun, it is final: a refusal, or one cut off in its body, is
+    /// reported at once and the sign-in is not sent again.
+    #[tokio::test]
+    async fn an_answer_is_never_followed_by_a_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::AsyncWriteExt;
+        for response in [
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 500\r\nConnection: close\r\n\r\n{\"accessToken\"",
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let requests = std::sync::Arc::new(AtomicUsize::new(0));
+            let counted = requests.clone();
+            let server = tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    read_request(&mut socket).await;
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                }
+            });
+            let started = std::time::Instant::now();
+            assert!(client()
+                .authenticate(&base, "card", Some("device"))
+                .await
+                .is_err());
+            server.abort();
+            assert_eq!(requests.load(Ordering::SeqCst), 1, "{response}");
+            assert!(started.elapsed() < LOGIN_RETRY_DELAY, "{response}");
+        }
+    }
+
     #[tokio::test]
     async fn rejection_retains_only_whitelisted_category_and_bounded_retry() {
         for (field, category, retry, expected, seconds) in [

@@ -33,6 +33,20 @@ describe('structured client errors', () => {
       expect(other.message).not.toContain('出错位置');
     }
   });
+  it('names the Kiro profile whose settings stopped a takeover, and where to fix them', () => {
+    const error = toClientError({code:'SK-CONNECT-007', line:3, column:5, profile:'Work'});
+    expect(error.message).toContain('配置文件（Profile）');
+    expect(error.message).toContain('「Work」');
+    expect(error.message).toContain('第 3 行第 5 列');
+    expect(error.message).not.toContain('切换到 Default');
+    expect(toClientError({code:'SK-RESTORE-003', line:12, column:5, profile:'Work'}).message).toContain('「Work」');
+    for (const [code, profile] of [['SK-CONNECT-007', 5], ['SK-CONNECT-007', ''], ['SK-CONNECT-007', 'Wo\u0007rk'], ['SK-CONNECT-007', 'x'.repeat(129)], ['SK-CONNECT-001', 'Work']] as const) {
+      const other = toClientError({code, profile});
+      expect(other.profile).toBeNull();
+      expect(other.message).not.toContain('出错的配置文件');
+    }
+    expect(feedbackText(error, {app_version:'0.1.3', kiro_version:'1.1.14'})).not.toContain('Work');
+  });
   it('bounds cooldown and accepts release versions', () => {
     const error = toClientError({code:'SK-BIND-002', retry_after_seconds:60});
     expect(error.message).toContain('60 秒');

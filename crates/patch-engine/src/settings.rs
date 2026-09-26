@@ -34,6 +34,24 @@ pub enum SettingsError {
         "settings.json has a syntax error at line {line}, column {column}; fix that line and retry"
     )]
     Syntax { line: usize, column: usize },
+
+    /// The settings of one of Kiro's other profiles, named as Kiro names it so the
+    /// customer knows which one to open and fix. The name is quoted as a JSON string.
+    #[error("Kiro profile {}: {error}", Value::from(.name.as_str()))]
+    Profile {
+        name: String,
+        error: Box<SettingsError>,
+    },
+}
+
+impl SettingsError {
+    /// This error, met in the settings of Kiro's profile `name`.
+    pub(crate) fn in_profile(self, name: &str) -> Self {
+        Self::Profile {
+            name: name.to_string(),
+            error: Box::new(self),
+        }
+    }
 }
 
 /// Keys managed and modified by Kiro BYOK in `settings.json`.
@@ -93,10 +111,48 @@ pub struct PriorSettingsState {
     pub prior_raw: Option<Vec<u8>>,
 }
 
+impl PriorSettingsState {
+    /// This record without what can only be the takeover's own settings, copied in before
+    /// it was made: a redirection to `gateway_url`, and its host in the proxy bypass list.
+    /// Kiro copies Default's settings into a profile made from it; put back, they would
+    /// leave that profile sending the customer's traffic to the gateway after a restore.
+    pub(crate) fn without_takeover_of(mut self, gateway_url: &str) -> Self {
+        let Some(host) = gateway_host(gateway_url.trim_end_matches('/')) else {
+            return self;
+        };
+        let hosts = [host];
+        for key in REDIRECTION_KEYS {
+            if self
+                .prior_values
+                .get(key)
+                .is_some_and(|value| names_host(value, &hosts))
+            {
+                self.prior_values.remove(key);
+            }
+        }
+        if let Some(Value::Array(list)) = self.prior_values.get_mut("http.noProxy") {
+            list.retain(|entry| entry.as_str() != Some(hosts[0].as_str()));
+            if list.is_empty() {
+                self.prior_values.remove("http.noProxy");
+            }
+        }
+        self
+    }
+}
+
 /// Manager for safe reading, merging, and rolling back Kiro's `settings.json`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingsManager {
     settings_path: PathBuf,
+}
+
+/// One of Kiro's profiles other than Default, with a settings.json of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Profile {
+    /// What Kiro calls it; its id when Kiro gives it no name.
+    pub name: String,
+    /// Its own settings.json, `User/profiles/<id>/settings.json`.
+    pub settings: SettingsManager,
 }
 
 impl Default for SettingsManager {
@@ -348,37 +404,121 @@ impl SettingsManager {
         }
     }
 
-    /// Profiles other than Default that a Kiro window or workspace is set to use.
+    /// Kiro's profiles other than Default that read a settings.json of their own, which a
+    /// takeover configures as it does Default's: a window on one would otherwise get the
+    /// gateway's token with the official endpoints.
     ///
-    /// A profile reads its own `profiles/<id>/settings.json`, which takeover does not
-    /// write. A window on one would get the gateway's token with the official
-    /// endpoints, so takeover is refused while any is in use. Read from Kiro's
-    /// `globalStorage/storage.json`; an unreadable file reports none.
-    pub fn profiles_in_use(&self) -> Vec<String> {
-        let Some(storage) = self
-            .settings_path
-            .parent()
-            .map(|user| user.join("globalStorage").join("storage.json"))
-        else {
-            return Vec::new();
+    /// Kiro keeps them as VS Code does, in `globalStorage/storage.json` beside this file:
+    /// the profiles it lists (`userDataProfiles`), each in `profiles/<location>` and read
+    /// through `profiles/<location>/settings.json` unless it uses Default's settings
+    /// (`useDefaultFlags.settings`), and the profile each folder or empty window is set to
+    /// use (`profileAssociations`), which may name one not listed. An unreadable
+    /// storage.json lists none, as Kiro then knows none. A listed profile whose location
+    /// is not a folder name as Kiro makes them cannot be found safely, and is an error.
+    pub fn profiles(&self) -> Result<Vec<Profile>, SettingsError> {
+        let Some(state) = self.stored_state() else {
+            return Ok(Vec::new());
         };
-        let Some(state) = fs::read(storage)
-            .ok()
-            .and_then(|raw| parse_settings_bytes(&raw).ok())
-        else {
-            return Vec::new();
-        };
-        let mut profiles: Vec<String> = ["workspaces", "emptyWindows"]
+        let mut known = vec![DEFAULT_PROFILE];
+        let mut profiles = Vec::new();
+        let stored = state.get("userDataProfiles").and_then(Value::as_array);
+        for profile in stored.into_iter().flatten() {
+            // Kiro passes over a profile without a name or a location, and so does this.
+            let name = profile
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let location = profile.get("location").unwrap_or(&Value::Null);
+            if name.is_empty() || location.is_null() || location.as_str() == Some("") {
+                continue;
+            }
+            let Some(folder) = location.as_str().filter(|folder| plain_folder(folder)) else {
+                return Err(invalid_data(
+                    "its location in storage.json is not a folder name as Kiro makes them",
+                )
+                .in_profile(name));
+            };
+            if known.contains(&folder) {
+                continue;
+            }
+            known.push(folder);
+            if profile
+                .pointer("/useDefaultFlags/settings")
+                .and_then(Value::as_bool)
+                != Some(true)
+            {
+                profiles.push(self.profile(name, folder));
+            }
+        }
+        let mut associated: Vec<&str> = ["workspaces", "emptyWindows"]
             .iter()
             .filter_map(|kind| state.get("profileAssociations")?.get(*kind)?.as_object())
             .flat_map(|associations| associations.values())
             .filter_map(Value::as_str)
-            .filter(|profile| *profile != DEFAULT_PROFILE)
-            .map(str::to_owned)
+            .filter(|id| plain_folder(id) && !known.contains(id))
             .collect();
-        profiles.sort();
-        profiles.dedup();
-        profiles
+        associated.sort_unstable();
+        associated.dedup();
+        profiles.extend(associated.into_iter().map(|id| self.profile(id, id)));
+        Ok(profiles)
+    }
+
+    /// Every profile settings.json on disk beside this file (`profiles/*/settings.json`),
+    /// whether Kiro still lists the profile or not: where a takeover's keys may remain.
+    /// Each is named as Kiro names the profile, else by its folder.
+    pub fn profile_files(&self) -> Vec<Profile> {
+        let Some(user) = self.settings_path.parent() else {
+            return Vec::new();
+        };
+        let Ok(entries) = fs::read_dir(user.join("profiles")) else {
+            return Vec::new();
+        };
+        let state = self.stored_state().unwrap_or_default();
+        let name_of = |folder: &str| {
+            state
+                .get("userDataProfiles")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find(|profile| profile.get("location").and_then(Value::as_str) == Some(folder))
+                .and_then(|profile| profile.get("name")?.as_str())
+                .filter(|name| !name.is_empty())
+                .unwrap_or(folder)
+                .to_string()
+        };
+        let mut files: Vec<Profile> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let folder = entry.file_name().into_string().ok()?;
+                entry
+                    .path()
+                    .join("settings.json")
+                    .is_file()
+                    .then(|| self.profile(&name_of(&folder), &folder))
+            })
+            .collect();
+        files.sort_by(|a, b| a.settings.path().cmp(b.settings.path()));
+        files
+    }
+
+    /// The profile `name`, kept in `profiles/<folder>` beside this file.
+    fn profile(&self, name: &str, folder: &str) -> Profile {
+        let user = self.settings_path.parent().unwrap_or(Path::new(""));
+        Profile {
+            name: name.to_string(),
+            settings: Self::at(user.join("profiles").join(folder).join("settings.json")),
+        }
+    }
+
+    /// Kiro's own state, `globalStorage/storage.json` beside this file, where it keeps its
+    /// profiles; none when it cannot be read.
+    fn stored_state(&self) -> Option<Map<String, Value>> {
+        let storage = self
+            .settings_path
+            .parent()?
+            .join("globalStorage")
+            .join("storage.json");
+        parse_settings_bytes(&fs::read(storage).ok()?).ok()
     }
 
     /// Whether the redirection keys still send Kiro to one of `gateway_hosts`, read as
@@ -690,6 +830,15 @@ fn reverted_values(
 
 /// How Kiro names the Default profile in its window associations.
 const DEFAULT_PROFILE: &str = "__default__profile__";
+
+/// Whether `folder` is a profile folder name as Kiro makes them (a hash in hex, perhaps
+/// with a sign): one plain path segment, which cannot lead outside `profiles`.
+fn plain_folder(folder: &str) -> bool {
+    !matches!(folder, "" | "." | "..")
+        && folder
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
 
 /// The keys that point Kiro's own traffic at an endpoint.
 const REDIRECTION_KEYS: [&str; 2] = ["kiroAuthConfig", "codewhisperer.config"];

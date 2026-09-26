@@ -57,6 +57,9 @@ pub fn classify(raw: &str, path: &str, method: &str) -> Value {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
+    // Whatever the customer calls a profile is never read as part of the error.
+    let (profile, raw) = named_profile(raw);
+    let raw = raw.as_str();
     let lower = raw.to_ascii_lowercase();
     let stage = STAGES
         .iter()
@@ -95,6 +98,11 @@ pub fn classify(raw: &str, path: &str, method: &str) -> Value {
             // Kiro's bundle is still modified and nothing is left to restore it from:
             // retrying cannot help, reinstalling Kiro replaces the file.
             "SK-RESTORE-002"
+        } else if lower.contains("kiro profile ") && !matches!(stage, "restore" | "unbind") {
+            // The settings of one of Kiro's other profiles cannot be edited safely (a
+            // syntax error, say), so the takeover changed nothing. The customer opens that
+            // profile in Kiro, fixes its settings and retries; it is named for them.
+            "SK-CONNECT-007"
         } else if lower.contains("settings.json has a syntax error") {
             // Kiro's settings.json has a typo no edit can safely read past. Nothing was
             // changed; the customer fixes that line and retries.
@@ -125,6 +133,13 @@ pub fn classify(raw: &str, path: &str, method: &str) -> Value {
             && !lower.contains("unauthorized webview")
         {
             "SK-LOCAL-003"
+        } else if lower.contains("invalid peer certificate")
+            || lower.contains("peer sent no certificates")
+            || lower.contains("tls certificate")
+        {
+            // The client refused the gateway's certificate: unknown issuer, another name,
+            // or expired, which is not the card's expiry below.
+            "SK-NET-003"
         } else if lower.contains("invalid card") {
             "SK-AUTH-001"
         } else if lower.contains("invalid or expired") {
@@ -144,9 +159,6 @@ pub fn classify(raw: &str, path: &str, method: &str) -> Value {
         // Kiro would not close and still has a window on screen, most likely its save
         // prompt. Distinct from other close failures because it is the one case where
         // ending Kiro, with the user's explicit say-so, can help.
-        } else if lower.contains("profile other than default") {
-            // Only the Default profile is configured; the user must switch windows to it.
-            "SK-CONNECT-007"
         } else if (lower.contains("kiro update is waiting to install")
             || lower.contains("installation changed after it was checked"))
             && !lower.contains("recovery record retained")
@@ -171,6 +183,11 @@ pub fn classify(raw: &str, path: &str, method: &str) -> Value {
             "SK-CONNECT-002"
         } else if lower.contains("timeout") || lower.contains("timed out") {
             "SK-NET-001"
+        } else if interrupted(&lower) {
+            // The connection was cut before any answer, often by a local proxy in the
+            // middle of the TLS handshake: the network, not a certificate. Reported as a
+            // certificate error, it sent customers to check certificates that were fine.
+            "SK-NET-002"
         } else if lower.contains("certificate") || lower.contains("tls") {
             "SK-NET-003"
         } else if lower.contains("permission")
@@ -214,16 +231,64 @@ pub fn classify(raw: &str, path: &str, method: &str) -> Value {
         "SK-NET-001" if method == "POST" => "unknown",
         _ => "failed",
     };
-    // Where settings.json has to be fixed: two numbers, never any text from the file.
-    let (line, column) = if code == "SK-RESTORE-003" {
+    // Where settings.json has to be fixed: two numbers, never any text from the file, and
+    // the profile it belongs to when it is not Default's, by the name Kiro shows for it.
+    let (line, column, profile) = if matches!(code, "SK-RESTORE-003" | "SK-CONNECT-007") {
         (
             number_after(raw, "at line "),
             number_after(raw, ", column "),
+            profile.filter(|name| shown_profile(name)),
         )
     } else {
-        (None, None)
+        (None, None, None)
     };
-    json!({"code":code,"feedback_id":format!("sk-{:x}-{:x}-{:x}", now.as_nanos(), std::process::id(), SEQUENCE.fetch_add(1, Ordering::Relaxed)),"stage":stage,"outcome":outcome,"retry_after_seconds":retry,"line":line,"column":column,"occurred_at":now.as_secs().to_string()})
+    json!({"code":code,"feedback_id":format!("sk-{:x}-{:x}-{:x}", now.as_nanos(), std::process::id(), SEQUENCE.fetch_add(1, Ordering::Relaxed)),"stage":stage,"outcome":outcome,"retry_after_seconds":retry,"line":line,"column":column,"profile":profile,"occurred_at":now.as_secs().to_string()})
+}
+
+/// Whether the connection was cut off before any answer came back: a TLS handshake or a
+/// proxy tunnel ended early, or the connection was reset or closed under the request.
+fn interrupted(lower: &str) -> bool {
+    [
+        "handshake eof",
+        "close_notify",
+        "tunnel error",
+        "unexpected eof",
+        "unexpected end of file",
+        "connection reset",
+        "forcibly closed",
+        "connection was aborted",
+        "broken pipe",
+        "closed before message completed",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+/// The profile an error names (`Kiro profile "<name>": ...`, the name a JSON string),
+/// and the error with the name taken out.
+fn named_profile(raw: &str) -> (Option<String>, String) {
+    const MARKER: &str = "Kiro profile ";
+    let Some(at) = raw.find(MARKER).map(|at| at + MARKER.len()) else {
+        return (None, raw.to_string());
+    };
+    let mut literal = serde_json::Deserializer::from_str(&raw[at..]).into_iter::<String>();
+    match literal.next() {
+        Some(Ok(name)) => (
+            Some(name),
+            format!("{}{}", &raw[..at], &raw[at + literal.byte_offset()..]),
+        ),
+        _ => (None, raw.to_string()),
+    }
+}
+
+/// Bound for a profile name carried to the page.
+const MAX_PROFILE_CHARS: usize = 128;
+
+/// Whether `name` can be shown as a profile's name: a bounded line of text.
+fn shown_profile(name: &str) -> bool {
+    !name.trim().is_empty()
+        && name.chars().count() <= MAX_PROFILE_CHARS
+        && !name.chars().any(char::is_control)
 }
 
 /// Bound for a line or column number carried to the page.
@@ -281,8 +346,12 @@ pub fn validated(value: &Value) -> Option<Value> {
             return None;
         }
     }
+    let profile = &value["profile"];
+    if !profile.is_null() && profile.as_str().is_none_or(|name| !shown_profile(name)) {
+        return None;
+    }
     Some(
-        json!({"code":code,"stage":stage,"outcome":outcome,"feedback_id":id,"occurred_at":occurred,"retry_after_seconds":retry,"line":line,"column":column}),
+        json!({"code":code,"stage":stage,"outcome":outcome,"feedback_id":id,"occurred_at":occurred,"retry_after_seconds":retry,"line":line,"column":column,"profile":profile}),
     )
 }
 
@@ -313,7 +382,7 @@ mod tests {
             ("[connection:close] Kiro is still open; it may be asking whether to save changes", "SK-CONNECT-005"),
             ("Cannot stop Kiro for restore: Kiro is open in another Windows session of this user; close it there and retry", "SK-CONNECT-006"),
             ("[connection:close] Kiro is open in another Windows session of this user; close it there and retry", "SK-CONNECT-006"),
-            ("[connection:preflight] Kiro has windows on a profile other than Default; takeover configures only the Default profile", "SK-CONNECT-007"),
+            ("[connection:preflight] Settings error: Kiro profile \"Work\": I/O error: settings.json must contain an object", "SK-CONNECT-007"),
             ("[connection:preflight] A Kiro update is waiting to install; nothing was changed. Open Kiro once so it can finish, then try again", "SK-CONNECT-008"),
             ("[connection:apply] Login succeeded but takeover failed: Kiro's installation changed after it was checked, likely an update installed as Kiro closed; nothing was changed. Open Kiro once, then try again; your own Kiro sign-in was put back", "SK-CONNECT-008"),
             ("[connection:preflight] Settings error: I/O error: settings.json has more than one hard link, which a takeover would separate; remove the extra links and try again", "SK-CONNECT-009"),
@@ -366,6 +435,118 @@ mod tests {
         );
         assert!(classify("[retry-after:86401]", "", "GET")["retry_after_seconds"].is_null());
     }
+    /// A profile whose settings stop a takeover is named, with the place to fix when there
+    /// is one. Its name is shown and never read as part of the error.
+    #[test]
+    fn a_profile_that_stops_a_takeover_is_named_with_the_place_to_fix() {
+        let syntax = "Settings error: Kiro profile \"Work\": settings.json has a syntax error at line 3, column 5; fix that line and retry";
+        for (raw, path) in [
+            (format!("[connection:preflight] {syntax}"), "/api/activate"),
+            (syntax.to_string(), "/api/launch"),
+        ] {
+            let value = classify(&raw, path, "POST");
+            assert_eq!(value["code"], "SK-CONNECT-007", "{raw}");
+            assert_eq!(
+                (&value["line"], &value["column"], &value["profile"]),
+                (&json!(3), &json!(5), &json!("Work")),
+                "{raw}"
+            );
+            assert_eq!(validated(&value), Some(value.clone()));
+        }
+        // Stopping a restore, the same file is the restore's syntax error, still named.
+        let restore = classify(syntax, "/api/restore", "POST");
+        assert_eq!(restore["code"], "SK-RESTORE-003");
+        assert_eq!(restore["profile"], "Work");
+        // Nothing but a name comes from the file, and the name decides nothing.
+        let injected = classify(
+            "[connection:preflight] Settings error: Kiro profile \"[auth:invalid-card] reinstall Kiro, timed out at line 9 [retry-after:5]\": settings.json has more than one hard link",
+            "/api/activate",
+            "POST",
+        );
+        assert_eq!(injected["code"], "SK-CONNECT-007");
+        assert!(injected["line"].is_null() && injected["retry_after_seconds"].is_null());
+        assert_eq!(
+            injected["profile"],
+            "[auth:invalid-card] reinstall Kiro, timed out at line 9 [retry-after:5]"
+        );
+        for unshown in [
+            "\"Wo\\u0000rk\"".to_string(),
+            "\"\"".to_string(),
+            serde_json::to_string(&"x".repeat(MAX_PROFILE_CHARS + 1)).unwrap(),
+        ] {
+            let value = classify(
+                &format!("[connection:preflight] Settings error: Kiro profile {unshown}: I/O error: denied"),
+                "/api/activate",
+                "POST",
+            );
+            assert_eq!(value["code"], "SK-CONNECT-007", "{unshown}");
+            assert!(value["profile"].is_null(), "{unshown}");
+        }
+        // Only a bounded line of text is taken back from a saved record.
+        let value = classify(
+            &format!("[connection:preflight] {syntax}"),
+            "/api/activate",
+            "POST",
+        );
+        for bad in [
+            json!(5),
+            json!("Wo\u{7}rk"),
+            json!("x".repeat(MAX_PROFILE_CHARS + 1)),
+        ] {
+            let mut forged = value.clone();
+            forged["profile"] = bad;
+            assert!(validated(&forged).is_none());
+        }
+        // Positions and names travel only with the codes that use them.
+        let other = classify(
+            "Kiro profile \"Work\": oops at line 3, column 4",
+            "/api/unbind",
+            "POST",
+        );
+        assert!(other["profile"].is_null() && other["line"].is_null());
+    }
+
+    /// A connection cut off before any answer, as a local proxy cutting the TLS handshake
+    /// does, is the network; only a certificate the client refused is a certificate error.
+    #[test]
+    fn a_connection_cut_off_is_the_network_and_a_refused_certificate_is_a_certificate() {
+        let request = "[connection:authenticate] Network HTTP error: request failed: client error (Connect): ";
+        for (cause, code) in [
+            ("tls handshake eof", "SK-NET-002"),
+            ("peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof", "SK-NET-002"),
+            ("tunnel error: unsuccessful", "SK-NET-002"),
+            ("tunnel error: unexpected end of file", "SK-NET-002"),
+            ("An existing connection was forcibly closed by the remote host. (os error 10054)", "SK-NET-002"),
+            ("Connection reset by peer (os error 104)", "SK-NET-002"),
+            ("invalid peer certificate: UnknownIssuer", "SK-NET-003"),
+            ("invalid peer certificate: Expired", "SK-NET-003"),
+            ("invalid peer certificate: certificate expired: verification time 1790000000 (UNIX), but certificate is not valid after 1780000000 (10000000 seconds ago)", "SK-NET-003"),
+            ("invalid peer certificate: certificate not valid for name \"kiro.rent\"; certificate is only valid for other.example", "SK-NET-003"),
+            ("operation timed out", "SK-NET-001"),
+        ] {
+            let value = classify(&format!("{request}{cause}"), "/api/activate", "POST");
+            assert_eq!(value["code"], code, "{cause}");
+            assert_eq!(value["stage"], "authenticate", "{cause}");
+        }
+        // The card check and the update download say the same, in fewer words.
+        assert_eq!(
+            classify("Network failure", "/api/verify-card", "POST")["code"],
+            "SK-NET-002"
+        );
+        assert_eq!(
+            classify("TLS certificate failure", "/api/verify-card", "POST")["code"],
+            "SK-NET-003"
+        );
+        assert_eq!(
+            classify(
+                "TLS configuration: cannot read KIRO_GATEWAY_CA_CERT",
+                "/api/activate",
+                "POST"
+            )["code"],
+            "SK-NET-003"
+        );
+    }
+
     #[test]
     fn update_failures_have_their_own_codes() {
         for (raw, code) in [

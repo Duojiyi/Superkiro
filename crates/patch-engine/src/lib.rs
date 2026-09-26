@@ -47,10 +47,11 @@ pub use runtime::{
     is_process_running_by_name, ProcessState, SingleInstanceError, SingleInstanceLock,
 };
 pub use settings::{
-    default_settings_path, PriorSettingsState, SettingsError, SettingsManager, MANAGED_KEYS,
+    default_settings_path, PriorSettingsState, Profile, SettingsError, SettingsManager,
+    MANAGED_KEYS,
 };
 pub use snapshot::{
-    RestoreSummary, SnapshotError, SnapshotManager, TakeoverPlan, TakeoverSnapshot,
+    ProfileRecord, RestoreSummary, SnapshotError, SnapshotManager, TakeoverPlan, TakeoverSnapshot,
     SNAPSHOT_FILENAME,
 };
 pub use token_storage::{

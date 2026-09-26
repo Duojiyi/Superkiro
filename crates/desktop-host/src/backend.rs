@@ -433,9 +433,14 @@ pub(crate) fn network_error(error: reqwest::Error) -> String {
     }
     let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
     while let Some(cause) = source {
-        let text = cause.to_string().to_ascii_lowercase();
-        if text.contains("tls") || text.contains("certificate") {
-            return "TLS failure".into();
+        // Only a certificate the client refused is a TLS failure; a handshake cut off
+        // part-way (by a local proxy, say) is the network's.
+        if cause
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("certificate")
+        {
+            return "TLS certificate failure".into();
         }
         source = cause.source();
     }
@@ -1040,6 +1045,31 @@ mod tests {
         assert_eq!(result["authorization"]["remainingPoints"], 5);
         assert_eq!(result["success"], true);
         server.await.unwrap();
+    }
+    /// A card check whose TLS handshake is cut off, as a local proxy can, is a network
+    /// failure: it used to be reported as a certificate the client had refused.
+    #[tokio::test]
+    async fn a_card_check_cut_off_in_its_tls_handshake_is_a_network_failure() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // The whole ClientHello record, then close.
+            let mut header = [0u8; 5];
+            stream.read_exact(&mut header).await.unwrap();
+            let mut hello = vec![0u8; usize::from(u16::from_be_bytes([header[3], header[4]]))];
+            stream.read_exact(&mut hello).await.unwrap();
+        });
+        let error = verify_card(&format!("https://{address}"), "test-card")
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert_eq!(error, "Network failure");
+        assert_eq!(
+            crate::errors::classify(&error, "/api/verify-card", "POST")["code"],
+            "SK-NET-002"
+        );
     }
     #[test]
     fn automatic_maintenance_requires_threshold_and_cooldown() {

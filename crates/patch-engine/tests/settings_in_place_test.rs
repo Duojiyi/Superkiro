@@ -399,14 +399,21 @@ fn a_takeover_of_no_file_rolls_back_to_no_file() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+/// Kiro's profiles are read as VS Code reads them: those it lists, each with settings of
+/// its own unless it uses Default's, and any a folder or window is set to use.
 #[test]
-fn windows_on_a_profile_other_than_default_are_reported() {
+fn profiles_with_settings_of_their_own_are_found() {
     let (dir, manager) = settings_file("profiles", b"{}");
     let storage = dir.join("globalStorage").join("storage.json");
     fs::create_dir_all(storage.parent().unwrap()).unwrap();
     assert!(
-        manager.profiles_in_use().is_empty(),
+        manager.profiles().unwrap().is_empty(),
         "no storage, nothing known"
+    );
+    fs::write(&storage, "{ not json").unwrap();
+    assert!(
+        manager.profiles().unwrap().is_empty(),
+        "unreadable, nothing known"
     );
 
     fs::write(
@@ -414,13 +421,43 @@ fn windows_on_a_profile_other_than_default_are_reported() {
         r#"{"profileAssociations": {"workspaces": {"file:///d%3A/a": "__default__profile__"}, "emptyWindows": {"1": "__default__profile__"}}}"#,
     )
     .unwrap();
-    assert!(manager.profiles_in_use().is_empty());
+    assert!(manager.profiles().unwrap().is_empty());
 
     fs::write(
         &storage,
-        r#"{"userDataProfiles": [{"location": "-7a1b", "name": "Work"}], "profileAssociations": {"workspaces": {"file:///d%3A/a": "-7a1b", "file:///d%3A/b": "__default__profile__"}, "emptyWindows": {"1": "-7a1b"}}}"#,
+        r#"{"userDataProfiles": [
+            {"location": "-7a1b", "name": "Work"},
+            {"location": "5e5e", "name": "Shared", "useDefaultFlags": {"settings": true}},
+            {"location": "9c9c"},
+            {"name": "Nowhere"}
+        ], "profileAssociations": {
+            "workspaces": {"file:///d%3A/a": "-7a1b", "file:///d%3A/b": "__default__profile__", "file:///d%3A/c": "5e5e", "file:///d%3A/d": "..\\up"},
+            "emptyWindows": {"1": "4b4b", "2": "-7a1b"}
+        }}"#,
     )
     .unwrap();
-    assert_eq!(manager.profiles_in_use(), vec!["-7a1b".to_string()]);
+    let found: Vec<(String, PathBuf)> = manager
+        .profiles()
+        .unwrap()
+        .into_iter()
+        .map(|profile| (profile.name, profile.settings.path().to_path_buf()))
+        .collect();
+    let settings = |folder: &str| dir.join("profiles").join(folder).join("settings.json");
+    assert_eq!(
+        found,
+        [
+            ("Work".to_string(), settings("-7a1b")),
+            ("4b4b".to_string(), settings("4b4b"))
+        ]
+    );
+
+    // A location that is not a folder name as Kiro makes them could lead anywhere.
+    fs::write(
+        &storage,
+        r#"{"userDataProfiles": [{"location": "../../elsewhere", "name": "Odd"}]}"#,
+    )
+    .unwrap();
+    let error = manager.profiles().unwrap_err().to_string();
+    assert!(error.starts_with("Kiro profile \"Odd\": "), "{error}");
     fs::remove_dir_all(dir).unwrap();
 }

@@ -6,7 +6,7 @@
 
 use crate::patch::{ExtensionPatcher, PatchError, PreparedPatch};
 use crate::runtime::{detect_kiro_process_state, ProcessState};
-use crate::settings::{PriorSettingsState, SettingsError, SettingsManager};
+use crate::settings::{PriorSettingsState, Profile, SettingsError, SettingsManager};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs::{self, File};
@@ -67,6 +67,87 @@ pub struct TakeoverSnapshot {
     pub settings_path: PathBuf,
     pub settings_state: PriorSettingsState,
     pub extension_path: Option<PathBuf>,
+    /// The settings.json of each of Kiro's other profiles the takeover configured, as it
+    /// found them. Records written before profiles were configured have none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiles: Vec<ProfileRecord>,
+}
+
+impl TakeoverSnapshot {
+    /// Put the settings back as the takeover found them: Default's, then each profile's.
+    fn revert_settings(&self) -> Result<(), SettingsError> {
+        SettingsManager::at(&self.settings_path).revert(&self.settings_state, &self.gateway_url)?;
+        self.profiles
+            .iter()
+            .try_for_each(|profile| profile.revert(&self.gateway_url))
+    }
+}
+
+/// A profile's settings.json as the takeover found it, for its rollback.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProfileRecord {
+    pub name: String,
+    pub settings_path: PathBuf,
+    pub settings_state: PriorSettingsState,
+    /// Folders the takeover made for the file, outermost first. The rollback removes
+    /// each it finds empty; one Kiro has put something in since is Kiro's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub created_folders: Vec<PathBuf>,
+}
+
+impl ProfileRecord {
+    /// `profile` as it is now, before the takeover writes its settings.
+    fn capture(profile: &Profile, gateway_url: &str) -> Result<Self, SettingsError> {
+        let path = profile.settings.path();
+        let mut created_folders: Vec<PathBuf> = path
+            .ancestors()
+            .skip(1)
+            .take_while(|folder| !folder.exists())
+            .map(Path::to_path_buf)
+            .collect();
+        created_folders.reverse();
+        let settings_state = profile
+            .settings
+            .capture_prior_state()
+            .map_err(|error| error.in_profile(&profile.name))?
+            .without_takeover_of(gateway_url);
+        Ok(Self {
+            name: profile.name.clone(),
+            settings_path: path.to_path_buf(),
+            settings_state,
+            created_folders,
+        })
+    }
+
+    fn settings(&self) -> SettingsManager {
+        SettingsManager::at(&self.settings_path)
+    }
+
+    /// What the rollback does to the file, worked out without writing anything; nothing
+    /// when the file is gone (the profile removed in Kiro), and none of ours with it.
+    fn plan_revert(&self, gateway_url: &str) -> Result<(), SettingsError> {
+        if self.settings_path.exists() {
+            self.settings()
+                .plan_revert(&self.settings_state, gateway_url)
+                .map_err(|error| error.in_profile(&self.name))?;
+        }
+        Ok(())
+    }
+
+    /// Put the file back as the takeover found it, and take away the folders it made.
+    fn revert(&self, gateway_url: &str) -> Result<(), SettingsError> {
+        if self.settings_path.exists() {
+            self.settings()
+                .revert(&self.settings_state, gateway_url)
+                .map_err(|error| error.in_profile(&self.name))?;
+        }
+        for folder in self.created_folders.iter().rev() {
+            // Removes only an empty folder, and there is nothing to do for one that is
+            // gone or no longer empty.
+            let _ = fs::remove_dir(folder);
+        }
+        Ok(())
+    }
 }
 
 /// Summary of what was restored during official rollback.
@@ -194,17 +275,33 @@ impl SnapshotManager {
     }
 
     /// The settings edit the takeover makes: all of it the first time, the keys it
-    /// re-asserts on a machine already taken over.
+    /// re-asserts on a machine already taken over. The same for each of Kiro's other
+    /// profiles with settings of their own, all of it for one made since the takeover; a
+    /// profile whose settings cannot be edited is named in the error.
     fn plan_settings(
         &self,
         settings: &SettingsManager,
         gateway: &str,
-    ) -> Result<Vec<u8>, SettingsError> {
-        if self.has_active_snapshot() {
-            settings.plan_reassert(gateway)
+    ) -> Result<(), SnapshotError> {
+        let recorded = if self.has_active_snapshot() {
+            settings.plan_reassert(gateway)?;
+            self.load()?.profiles
         } else {
-            settings.plan_merge(gateway)
+            settings.plan_merge(gateway)?;
+            Vec::new()
+        };
+        for profile in settings.profiles()? {
+            let planned = if recorded
+                .iter()
+                .any(|r| r.settings_path == profile.settings.path())
+            {
+                profile.settings.plan_reassert(gateway)
+            } else {
+                profile.settings.plan_merge(gateway)
+            };
+            planned.map_err(|error| error.in_profile(&profile.name))?;
         }
+        Ok(())
     }
 
     /// A repeat operation must match the original durable snapshot and current files;
@@ -309,7 +406,37 @@ impl SnapshotManager {
                 // Persist rollback data before introducing the new managed key.
                 self.save(&snapshot)?;
             }
+            // A profile made in Kiro since the takeover gets all of it, recorded first as
+            // the others were: until now its windows had the gateway's token without the
+            // gateway's endpoints.
+            let profiles = settings_mgr.profiles()?;
+            let recorded = snapshot.profiles.len();
+            for profile in &profiles {
+                if !snapshot
+                    .profiles
+                    .iter()
+                    .any(|record| record.settings_path == profile.settings.path())
+                {
+                    snapshot
+                        .profiles
+                        .push(ProfileRecord::capture(profile, gateway_url)?);
+                }
+            }
+            if snapshot.profiles.len() > recorded {
+                self.save(&snapshot)?;
+            }
             settings_mgr.reassert_byok(gateway_url)?;
+            for profile in &profiles {
+                let new = snapshot.profiles[recorded..]
+                    .iter()
+                    .any(|record| record.settings_path == profile.settings.path());
+                if new {
+                    profile.settings.merge_byok(gateway_url).map(drop)
+                } else {
+                    profile.settings.reassert_byok(gateway_url)
+                }
+                .map_err(|error| error.in_profile(&profile.name))?;
+            }
             if let Some(p) = patcher {
                 apply(p)?;
             }
@@ -323,12 +450,17 @@ impl SnapshotManager {
 
         // 1. Capture the rollback record and publish it before any mutation.
         let prior_settings = settings_mgr.capture_prior_state()?;
+        let profiles = settings_mgr.profiles()?;
         let planned_snapshot = TakeoverSnapshot {
             created_at: now_secs,
             gateway_url: gateway_url.to_string(),
             settings_path: settings_mgr.path().to_path_buf(),
-            settings_state: prior_settings.clone(),
+            settings_state: prior_settings,
             extension_path: patcher.map(|p| p.path().to_path_buf()),
+            profiles: profiles
+                .iter()
+                .map(|profile| ProfileRecord::capture(profile, gateway_url))
+                .collect::<Result<_, _>>()?,
         };
         self.save(&planned_snapshot)?;
 
@@ -337,14 +469,21 @@ impl SnapshotManager {
             let _ = fs::remove_file(&self.snapshot_path);
             return Err(SnapshotError::Settings(error));
         }
+        for profile in &profiles {
+            if let Err(error) = profile.settings.merge_byok(gateway_url) {
+                // Keep the recovery record if rollback itself fails.
+                if planned_snapshot.revert_settings().is_ok() {
+                    let _ = fs::remove_file(&self.snapshot_path);
+                }
+                return Err(SnapshotError::Settings(error.in_profile(&profile.name)));
+            }
+        }
 
         // 2. Patch extension if provided
         let ext_path = if let Some(p) = patcher {
             if let Err(e) = apply(p) {
                 // Keep the recovery record if rollback itself fails.
-                if settings_mgr.revert(&prior_settings, gateway_url).is_ok()
-                    && !p.backup_path().exists()
-                {
+                if planned_snapshot.revert_settings().is_ok() && !p.backup_path().exists() {
                     let _ = fs::remove_file(&self.snapshot_path);
                 }
                 return Err(SnapshotError::Patch(e));
@@ -392,7 +531,11 @@ impl SnapshotManager {
         // taken over, say) must fail the restore before any file changes. Found only
         // after the extension was rolled back, they left Kiro on its official bundle
         // with the gateway's settings and token, and every retry failed the same way.
+        // Each profile's settings are checked the same way.
         settings_mgr.plan_revert(&snapshot.settings_state, &snapshot.gateway_url)?;
+        for profile in &snapshot.profiles {
+            profile.plan_revert(&snapshot.gateway_url)?;
+        }
 
         // Unwind in the reverse of takeover's order. `merge_byok` freezes Kiro's
         // auto-update (`update.mode: "none"`) precisely so an update cannot
@@ -445,7 +588,7 @@ impl SnapshotManager {
             }
         }
 
-        settings_mgr.revert(&snapshot.settings_state, &snapshot.gateway_url)?;
+        snapshot.revert_settings()?;
 
         // The takeover is over either way: the settings are reverted and the patch
         // is either rolled back or provably gone along with its material. Keeping

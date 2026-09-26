@@ -262,13 +262,11 @@ impl DesktopSession {
         let snapshots = SnapshotManager::default();
         let settings = SettingsManager::default();
         // Everything the takeover will write, checked while Kiro is still open and the
-        // customer's own token untouched.
+        // customer's own token untouched: Default's settings and those of every other
+        // profile with its own.
         let plan = snapshots
             .plan_takeover(&settings, Some(&patcher), gateway)
             .map_err(|e| format!("[connection:preflight] {e}"))?;
-        if !settings.profiles_in_use().is_empty() {
-            return Err("[connection:preflight] Kiro has windows on a profile other than Default; takeover configures only the Default profile".into());
-        }
         // Closing Kiro would let a waiting update install itself over the files the
         // takeover is about to change.
         if installation.update_waiting() {
@@ -325,7 +323,8 @@ impl DesktopSession {
         Ok(())
     }
 
-    /// Relaunch without re-entering or persisting card secrets.
+    /// Relaunch without re-entering or persisting card secrets. The takeover's settings
+    /// are re-asserted on the way, which also configures a profile made in Kiro since.
     pub fn launch(&self, installation: &crate::KiroInstallation) -> Result<(), String> {
         let _lock = self.lock()?;
         crate::ensure_kiro_stopped()?;
