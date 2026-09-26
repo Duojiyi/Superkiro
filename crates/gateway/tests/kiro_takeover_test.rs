@@ -299,3 +299,114 @@ async fn the_gateways_own_length_limits_are_overflows_too() {
     assert!(server.received_requests().await.unwrap().is_empty());
     nothing_charged(&billing);
 }
+
+/// The upstream models `server` was asked for, in order.
+async fn models_sent(server: &MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|request| {
+            serde_json::from_slice::<Value>(&request.body).unwrap()["model"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
+fn usage_entries(billing: &BillingEngine) -> Vec<billing::LedgerEntry> {
+    billing
+        .ledger_entries()
+        .into_iter()
+        .filter(|entry| entry.card_id == CARD && entry.kind == billing::LedgerKind::Usage)
+        .collect()
+}
+
+fn listed(billing: &BillingEngine) -> Vec<String> {
+    gateway::facade::virtualization::VirtualizationStore::with_billing(billing.clone(), GROUP)
+        .get_group(Some(GROUP))
+        .models
+        .into_iter()
+        .map(|model| model.model_id)
+        .collect()
+}
+
+/// Kiro's commit messages and spec sub-intents ask for its fast model by a name no model
+/// list carries. It is the model given that name, hidden or not, and is billed as it.
+#[tokio::test]
+async fn kiros_fast_model_is_the_model_named_for_it_and_billed_as_it() {
+    let server = upstream(
+        ResponseTemplate::new(200).set_body_raw(anthropic_answer("fix: typo"), "text/event-stream"),
+    )
+    .await;
+    let main = ModelMap::new("map-main", GROUP, "main-model", "prov", "up-main");
+    let mut cheap = ModelMap::new("map-cheap", GROUP, "cheap-model", "prov", "up-cheap")
+        .with_alias("simple-task");
+    cheap.visible = false;
+    cheap.sort_order = 1;
+    let billing = engine(ProviderFormat::Anthropic, &server.uri(), vec![main, cheap]);
+    let app = serve(&billing);
+
+    let reply = send(
+        &app,
+        "inv-fast",
+        body(
+            json!({"content": "Write a commit message", "modelId": "simple-task"}),
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(models_sent(&server).await, vec!["up-cheap"]);
+    let usage = usage_entries(&billing);
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].exposed_model, "cheap-model");
+    assert!(usage[0].credits_charged > 0);
+    assert_eq!(listed(&billing), vec!["main-model"]);
+}
+
+#[tokio::test]
+async fn without_a_model_named_for_it_kiros_fast_model_is_the_group_default() {
+    let server = upstream(
+        ResponseTemplate::new(200).set_body_raw(anthropic_answer("fix: typo"), "text/event-stream"),
+    )
+    .await;
+    let main = ModelMap::new("map-main", GROUP, "main-model", "prov", "up-main");
+    let mut other = ModelMap::new("map-other", GROUP, "other-model", "prov", "up-other");
+    other.sort_order = 1;
+    // Exposed under the name itself, it is still never listed.
+    let mut named = ModelMap::new("map-named", GROUP, "simple-task", "prov", "up-named");
+    named.sort_order = 2;
+    let billing = engine(ProviderFormat::Anthropic, &server.uri(), vec![main, other]);
+    let app = serve(&billing);
+
+    let reply = send(
+        &app,
+        "inv-default",
+        body(
+            json!({"content": "Summarize", "modelId": "simple-task"}),
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(models_sent(&server).await, vec!["up-main"]);
+    assert_eq!(usage_entries(&billing)[0].exposed_model, "main-model");
+
+    billing.upsert_rate_card_version(price("simple-task"));
+    billing.upsert_model_map(named);
+    assert_eq!(listed(&billing), vec!["main-model", "other-model"]);
+    let reply = send(
+        &app,
+        "inv-named",
+        body(
+            json!({"content": "Summarize", "modelId": "simple-task"}),
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(models_sent(&server).await, vec!["up-main", "up-named"]);
+}

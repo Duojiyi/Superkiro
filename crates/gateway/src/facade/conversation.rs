@@ -10,6 +10,7 @@
 //! 5. Upstream provider streaming invocation (Spec §15.2).
 //! 6. Binary AWS EventStream encoding, 20s keepalive injection, and client disconnect cancellation (Spec §4.6, §6.3).
 
+use super::models::SIMPLE_TASK_MODEL;
 use super::{error_response, input_too_long, BoxFuture, FacadeHandler, Response};
 use crate::auth::AuthClaims;
 use crate::guardrail::{format_kiro_throttle_response, CapacityGuardrail};
@@ -276,23 +277,11 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
             }
 
             // 4. Local Intent Classifier Interception (Optimization)
-            let classified_message = self
-                .intercept_intent
-                .then(|| intent_classifier_message(&body_bytes))
-                .flatten();
-            if let Some(message) = classified_message {
-                // The instructions themselves describe spec requests; only the user's
-                // message says whether this is one.
-                let message = message.to_lowercase();
-                let is_spec = message.contains("create a spec")
-                    || message.contains("specification")
-                    || message.contains("需求文档")
-                    || message.contains("规范");
-                let probs = if is_spec {
-                    serde_json::json!({ "chat": 0, "do": 0.1, "spec": 0.9 })
-                } else {
-                    serde_json::json!({ "chat": 0, "do": 0.95, "spec": 0.05 })
-                };
+            if self.intercept_intent && is_intent_classifier_call(&body_bytes) {
+                // Do is the classifier's own default, and the answer when unsure. Guessing
+                // spec from words in the message sent "代码规范" (coding conventions) and
+                // "the OpenAPI specification" to spec editing; a spec is still one click.
+                let probs = serde_json::json!({ "chat": 0, "do": 0.95, "spec": 0.05 });
 
                 let meta_frame = encode_event(
                     "messageMetadataEvent",
@@ -732,7 +721,8 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                         .current_message
                         .user_input_message
                         .model_id
-                        .is_some()
+                        .as_deref()
+                        .is_some_and(|model| model != SIMPLE_TASK_MODEL)
                         && !billing_models.is_empty()
                     {
                         if has_reservation {
@@ -1436,16 +1426,18 @@ pub fn render_system_prompt_template(
         .replace("{{virtual_plan_name}}", &group.virtual_plan_name)
 }
 
-/// The user's message, when `body` is Kiro's intent-classifier call: the classifier
-/// instructions lead the request, as its system prompt or its first message, and no tools
-/// are offered. The same words anywhere else (a pasted log, a file a tool read, a later
-/// message) are the user's own content, and that turn goes to the model.
-fn intent_classifier_message(body: &[u8]) -> Option<String> {
+/// Whether `body` is Kiro's intent-classifier call: the classifier instructions lead the
+/// request, as its system prompt or its first message, and no tools are offered. The same
+/// words anywhere else (a pasted log, a file a tool read, a later message) are the user's
+/// own content, and that turn goes to the model.
+fn is_intent_classifier_call(body: &[u8]) -> bool {
     let text = String::from_utf8_lossy(body);
     if !text.contains(INTENT_CLASSIFIER_SIGN_A) || !text.contains(INTENT_CLASSIFIER_SIGN_B) {
-        return None;
+        return false;
     }
-    let request: GenerateAssistantResponseRequest = serde_json::from_slice(body).ok()?;
+    let Ok(request) = serde_json::from_slice::<GenerateAssistantResponseRequest>(body) else {
+        return false;
+    };
     let state = &request.conversation_state;
     let current = &state.current_message.user_input_message;
     if current
@@ -1453,7 +1445,7 @@ fn intent_classifier_message(body: &[u8]) -> Option<String> {
         .as_ref()
         .is_some_and(|context| !context.tools.is_empty())
     {
-        return None;
+        return false;
     }
     let instructions = request
         .system_prompt
@@ -1464,11 +1456,12 @@ fn intent_classifier_message(body: &[u8]) -> Option<String> {
                 Some(user.user_input_message.content.as_str())
             }
             kiro_wire::requests::conversation::Message::Assistant(_) => None,
-        })?
-        .trim_start();
-    (instructions.starts_with(INTENT_CLASSIFIER_SIGN_A)
-        && instructions.contains(INTENT_CLASSIFIER_SIGN_B))
-    .then(|| current.content.clone())
+        })
+        .map(str::trim_start);
+    instructions.is_some_and(|instructions| {
+        instructions.starts_with(INTENT_CLASSIFIER_SIGN_A)
+            && instructions.contains(INTENT_CLASSIFIER_SIGN_B)
+    })
 }
 
 /// The client's invocation id keys idempotency, the credit hold and the request traces,
@@ -1486,28 +1479,40 @@ fn valid_invocation_id(id: &str) -> bool {
 /// the fallback model every unmapped request is sent to. A request that named no model
 /// was priced as "default-model" and sent to the fallback model, so it was billed at the
 /// built-in default rates whatever its group's models cost.
+///
+/// Kiro's fast model is the model given its name, as an alias as a rule, listed or hidden,
+/// or else the group's default; it is held, routed and billed as that model. Refused for want of a
+/// price, it failed Kiro's commit messages and its spec sub-intents.
 fn requested_model_id(
     request: &GenerateAssistantResponseRequest,
     claims: Option<&AuthClaims>,
     billing: &BillingEngine,
     fallback_model: &str,
 ) -> String {
-    if let Some(model) = request
+    let named = request
         .conversation_state
         .current_message
         .user_input_message
         .model_id
-        .as_deref()
-    {
+        .as_deref();
+    if let Some(model) = named.filter(|model| *model != SIMPLE_TASK_MODEL) {
         return model.to_string();
     }
-    claims
-        .and_then(|claims| billing.get_group(&claims.group_id))
-        .and_then(|group| {
-            billing
-                .list_models_for_group(&group.id, true)
-                .into_iter()
-                .next()
+    let group = claims.and_then(|claims| billing.get_group(&claims.group_id));
+    let fast_model = named.and(group.as_ref()).and_then(|group| {
+        billing
+            .list_models_for_group(&group.id, false)
+            .into_iter()
+            .find(|model| !model.retired && model.matches_model(SIMPLE_TASK_MODEL))
+    });
+    fast_model
+        .or_else(|| {
+            group.and_then(|group| {
+                billing
+                    .list_models_for_group(&group.id, true)
+                    .into_iter()
+                    .next()
+            })
         })
         .map_or_else(
             || fallback_model.to_string(),
