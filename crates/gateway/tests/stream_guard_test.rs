@@ -316,6 +316,7 @@ async fn test_stream_guard_normal_flow_with_tool_use_and_usage() {
                 completion_tokens: 45,
                 total_tokens: 195,
                 output_tokens_final: true,
+                prompt_final: false,
                 cache_read_input_tokens: Some(50),
                 cache_creation_input_tokens: Some(20),
             })))

@@ -217,6 +217,10 @@ pub struct TokenUsage {
     /// True only for a final completion-usage report (not Anthropic message_start).
     #[serde(default)]
     pub output_tokens_final: bool,
+    /// True for a completion report that restates the prompt (an Anthropic message_delta
+    /// carrying input tokens): its prompt counts replace the ones reported before it.
+    #[serde(default)]
+    pub prompt_final: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_read_input_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -225,30 +229,37 @@ pub struct TokenUsage {
 
 impl TokenUsage {
     /// Merge a subsequent usage snapshot (e.g. Anthropic message_delta output_tokens)
-    /// without erasing previously received prompt tokens or cache statistics.
+    /// without erasing previously received prompt tokens or cache statistics. A final
+    /// restatement of the prompt replaces the counts before it, and later snapshots
+    /// leave it standing.
     pub fn merge(&mut self, other: &TokenUsage) {
-        self.uncached_prompt_tokens = self
-            .uncached_prompt_tokens
-            .max(other.uncached_prompt_tokens);
-        self.prompt_tokens = self.prompt_tokens.max(other.prompt_tokens);
+        if other.prompt_final {
+            self.uncached_prompt_tokens = other.uncached_prompt_tokens;
+            self.cache_read_input_tokens = other
+                .cache_read_input_tokens
+                .or(self.cache_read_input_tokens);
+            self.cache_creation_input_tokens = other
+                .cache_creation_input_tokens
+                .or(self.cache_creation_input_tokens);
+            self.prompt_tokens = self
+                .uncached_prompt_tokens
+                .saturating_add(self.cache_read_input_tokens.unwrap_or(0))
+                .saturating_add(self.cache_creation_input_tokens.unwrap_or(0));
+            self.prompt_final = true;
+        } else if !self.prompt_final {
+            self.uncached_prompt_tokens = self
+                .uncached_prompt_tokens
+                .max(other.uncached_prompt_tokens);
+            self.prompt_tokens = self.prompt_tokens.max(other.prompt_tokens);
+            // None orders below Some, so a count is never erased by a missing one.
+            self.cache_read_input_tokens = self
+                .cache_read_input_tokens
+                .max(other.cache_read_input_tokens);
+            self.cache_creation_input_tokens = self
+                .cache_creation_input_tokens
+                .max(other.cache_creation_input_tokens);
+        }
         self.completion_tokens = self.completion_tokens.max(other.completion_tokens);
-        let cr = match (self.cache_read_input_tokens, other.cache_read_input_tokens) {
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        };
-        self.cache_read_input_tokens = cr;
-        let cw = match (
-            self.cache_creation_input_tokens,
-            other.cache_creation_input_tokens,
-        ) {
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        };
-        self.cache_creation_input_tokens = cw;
         self.output_tokens_final |= other.output_tokens_final;
         self.total_tokens = self.prompt_tokens.saturating_add(self.completion_tokens);
     }

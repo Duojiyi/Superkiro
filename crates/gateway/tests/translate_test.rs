@@ -256,6 +256,7 @@ fn test_stop_reason_and_usage_translation() {
         completion_tokens: 45,
         total_tokens: 195,
         output_tokens_final: true,
+        prompt_final: false,
         cache_read_input_tokens: Some(60),
         cache_creation_input_tokens: None,
     });
@@ -359,6 +360,77 @@ fn test_t05_official_usage_normalization() {
     assert_eq!(initial_usage.total_tokens, 375);
     assert_eq!(initial_usage.cache_read_input_tokens, Some(200));
     assert_eq!(initial_usage.cache_creation_input_tokens, Some(50));
+}
+
+#[test]
+fn a_restated_prompt_in_message_delta_replaces_the_message_start_estimate() {
+    let anthropic = AnthropicProvider;
+    let merged = |start: serde_json::Value, end: serde_json::Value| {
+        let usage_of = |event: serde_json::Value| {
+            anthropic
+                .parse_stream_line(&format!("data: {event}"))
+                .unwrap()
+                .into_iter()
+                .find_map(|e| match e {
+                    ProviderStreamEvent::Usage(u) => Some(u),
+                    _ => None,
+                })
+                .expect("usage")
+        };
+        let mut usage = usage_of(serde_json::json!({
+            "type": "message_start", "message": {"usage": start}}));
+        usage.merge(&usage_of(serde_json::json!({
+            "type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": end})));
+        (
+            usage.uncached_prompt_tokens,
+            usage.cache_creation_input_tokens,
+            usage.cache_read_input_tokens,
+            usage.prompt_tokens,
+            usage.completion_tokens,
+        )
+    };
+
+    // Two real relay requests: the counts restated at the end are the ones billed,
+    // whether they are above the opening estimate or below it.
+    assert_eq!(
+        merged(
+            serde_json::json!({"input_tokens": 4, "cache_creation_input_tokens": 50_366,
+                "cache_read_input_tokens": 144_948, "output_tokens": 1}),
+            serde_json::json!({"input_tokens": 22_943, "cache_creation_input_tokens": 67_994,
+                "cache_read_input_tokens": 195_680, "output_tokens": 907}),
+        ),
+        (22_943, Some(67_994), Some(195_680), 286_617, 907)
+    );
+    assert_eq!(
+        merged(
+            serde_json::json!({"input_tokens": 1_679, "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0, "output_tokens": 1}),
+            serde_json::json!({"input_tokens": 43, "cache_creation_input_tokens": 9_038,
+                "cache_read_input_tokens": 0, "output_tokens": 1}),
+        ),
+        (43, Some(9_038), Some(0), 9_081, 1)
+    );
+
+    let start = serde_json::json!({"input_tokens": 100, "cache_read_input_tokens": 200,
+        "cache_creation_input_tokens": 50, "output_tokens": 1});
+    // A restatement of zeros is a placeholder: the opening counts stand.
+    assert_eq!(
+        merged(
+            start.clone(),
+            serde_json::json!({"input_tokens": 0, "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0, "output_tokens": 25}),
+        ),
+        (100, Some(50), Some(200), 350, 25)
+    );
+    // A cache count the restatement leaves out keeps its opening value.
+    assert_eq!(
+        merged(
+            start,
+            serde_json::json!({"input_tokens": 120, "cache_read_input_tokens": null,
+                "output_tokens": 25}),
+        ),
+        (120, Some(50), Some(200), 370, 25)
+    );
 }
 
 // --------------------------------------------------------------------------

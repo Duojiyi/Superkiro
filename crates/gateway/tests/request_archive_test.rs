@@ -129,6 +129,7 @@ async fn an_administrator_reads_a_request_and_the_models_reply_for_24_hours() {
                 completion_tokens: 30,
                 total_tokens: 1030,
                 output_tokens_final: true,
+                prompt_final: false,
                 cache_read_input_tokens: Some(100),
                 cache_creation_input_tokens: None,
             }),

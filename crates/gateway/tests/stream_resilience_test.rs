@@ -295,6 +295,7 @@ async fn test_t06_error_after_usage_settles_actual_usage() {
                 completion_tokens: 15,
                 total_tokens: 95,
                 output_tokens_final: true,
+                prompt_final: false,
                 cache_read_input_tokens: Some(30),
                 cache_creation_input_tokens: None,
             })))
@@ -394,6 +395,7 @@ async fn test_t06_clean_stream_done_settles_and_commits_idempotency() {
                 completion_tokens: 20,
                 total_tokens: 120,
                 output_tokens_final: true,
+                prompt_final: false,
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
             })))
@@ -493,6 +495,7 @@ async fn test_t06_duplicate_done_events_are_idempotent() {
                 completion_tokens: 10,
                 total_tokens: 60,
                 output_tokens_final: true,
+                prompt_final: false,
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
             })))
@@ -932,6 +935,7 @@ async fn completed_tool_invocation_settles_once_and_replay_is_rejected() {
             completion_tokens: 12,
             total_tokens: 52,
             output_tokens_final: true,
+            prompt_final: false,
             cache_read_input_tokens: None,
             cache_creation_input_tokens: None,
         })),
@@ -1369,6 +1373,7 @@ async fn a_streamed_response_records_its_time_to_first_output() {
                 completion_tokens: 40,
                 total_tokens: 1040,
                 output_tokens_final: true,
+                prompt_final: false,
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
             })))

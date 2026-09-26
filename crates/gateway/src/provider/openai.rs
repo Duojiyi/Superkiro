@@ -245,6 +245,7 @@ impl ModelProvider for OpenAiProvider {
             completion_tokens,
             total_tokens,
             output_tokens_final: true,
+            prompt_final: false,
             cache_read_input_tokens: cached_tokens,
             cache_creation_input_tokens: None,
         })

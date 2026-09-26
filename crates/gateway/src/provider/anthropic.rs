@@ -361,23 +361,23 @@ impl ModelProvider for AnthropicProvider {
                         events.push(ProviderStreamEvent::StopReason(stop_reason.to_string()));
                     }
                 }
-                if let Some(usage) = val.get("usage") {
-                    let output_tokens = usage
-                        .get("output_tokens")
-                        .and_then(|o| o.as_u64())
-                        .unwrap_or(0);
-                    events.push(ProviderStreamEvent::Usage(TokenUsage {
-                        uncached_prompt_tokens: 0,
-                        prompt_tokens: 0,
-                        completion_tokens: output_tokens,
-                        total_tokens: output_tokens,
-                        output_tokens_final: usage
-                            .get("output_tokens")
-                            .and_then(|v| v.as_u64())
-                            .is_some(),
-                        cache_read_input_tokens: None,
-                        cache_creation_input_tokens: None,
-                    }));
+                if let Some(mut usage) = self.extract_usage(&val) {
+                    // These counts are cumulative. A relay that learns the real prompt
+                    // counts only when the reply ends sends an estimate at message_start
+                    // and bills what it restates here, so a restatement replaces the
+                    // estimate. A report of zeros is a placeholder, not a count.
+                    usage.prompt_final =
+                        val["usage"].get("input_tokens").is_some_and(Value::is_u64)
+                            && usage.prompt_tokens > 0;
+                    if !usage.prompt_final {
+                        usage = TokenUsage {
+                            completion_tokens: usage.completion_tokens,
+                            total_tokens: usage.completion_tokens,
+                            output_tokens_final: usage.output_tokens_final,
+                            ..TokenUsage::default()
+                        };
+                    }
+                    events.push(ProviderStreamEvent::Usage(usage));
                 }
             }
             "message_stop" => {
@@ -419,6 +419,7 @@ impl ModelProvider for AnthropicProvider {
                 .get("output_tokens")
                 .and_then(|v| v.as_u64())
                 .is_some(),
+            prompt_final: false,
             cache_read_input_tokens: cache_read,
             cache_creation_input_tokens: cache_creation,
         })
