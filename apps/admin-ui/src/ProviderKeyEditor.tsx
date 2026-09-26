@@ -67,12 +67,14 @@ export default function ProviderKeyEditor({selectedKey, preset, knownModels = []
   const validateModels = () => {
     if (modelIds.length > 1000 || modelIds.some(model => !validText(model, 256))) throw new Error('最多 1000 个模型，每个 ID 不超过 256 字节');
   };
-  const writeFailure = (error: unknown, target: {provider: string; key: string}, action = '保存') => {
+  /** `hidden`: the models already hidden on the way, which stay hidden whatever happened next. */
+  const writeFailure = (error: unknown, target: {provider: string; key: string}, action = '保存', hidden: string | null = null) => {
     const rejected = isRefusal(error);
     if (!rejected) setReview(target);
     const text = error instanceof Error ? error.message : String(error);
-    setMessage({tone: 'error', text: rejected ? `${action}失败：${explainRefusal(text, id => nameOfId(id))}。修改已保留，请修正后再${action}。`
-      : `没收到${action}结果（${text}），已暂停保存、删除和导入。请重新读取确认后再操作，不要重复提交。`});
+    const done = hidden ? `已隐藏 ${hidden}；但` : '';
+    setMessage({tone: 'error', text: rejected ? `${done}${action}失败：${explainRefusal(text, id => nameOfId(id))}。修改已保留，请修正后再${action}。`
+      : `${done}没收到${action}结果（${text}），已暂停保存、删除和导入。请重新读取确认后再操作，不要重复提交。`});
   };
   useEffect(() => {onDirtyChange(dirty);}, [dirty, onDirtyChange]);
   useEffect(() => {onBusyChange(busy); return () => onBusyChange(false);}, [busy, onBusyChange]);
@@ -164,7 +166,7 @@ export default function ProviderKeyEditor({selectedKey, preset, knownModels = []
         onSaved?.({id: keyId.trim(), provider_id: provider.trim(), allowed_models: modelIds, weight: Number(weight), enabled});
       }
     } catch (error) {
-      if (action === 'save') writeFailure(error, {provider: provider.trim(), key: keyId.trim()});
+      if (action === 'save') writeFailure(error, {provider: provider.trim(), key: keyId.trim()}, '保存', hidden);
       else setMessage({tone: 'error', text: `获取失败（${error instanceof Error ? error.message : String(error)}），可用模型没有改动，可以重试`});
     } finally {pending.current = false; setBusy(false);}
   };
@@ -217,7 +219,7 @@ export default function ProviderKeyEditor({selectedKey, preset, knownModels = []
       setDirty(false); setMessage(null);
       toast.success(hidden ? `已隐藏 ${hidden}，并删除 Key ${target.key}` : `已删除 Key ${target.key}`);
       onDeleted?.();
-    } catch (error) {writeFailure(error, target, '删除');}
+    } catch (error) {writeFailure(error, target, '删除', hidden);}
     finally {pending.current = false; setBusy(false);}
   };
 

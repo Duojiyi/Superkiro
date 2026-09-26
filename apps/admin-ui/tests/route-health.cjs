@@ -122,8 +122,16 @@ const writes=endpoint=>fixture.writes.filter(write=>write.endpoint===endpoint);
     await box.locator('[data-confirm="accept"]').click();
     await page.locator('.toast').filter({hasText:'已隐藏 gpt-6-astra，并删除 Key fixture-openai-key-1'}).waitFor();
     assert.equal(key('fixture-openai-key-1'),undefined);assert.equal(model('fixture-model-3').visible,false);
+    // Hidden on the way, then the delete is not confirmed: the message says the model stays hidden.
+    model('fixture-model-3').visible=true;fixture.keys.push({id:'fixture-openai-key-2',provider_id:'fixture-openai',allowed_models:['gpt-6-astra'],weight:1,enabled:true,health_state:'healthy'});
+    fixture.config.revision='fixture-rev-40';await refresh();
+    await page.route('**/api/v1/admin/providers/keys/delete',route=>route.fulfill({status:503,json:{success:false,error:'Provider persistence failed'}}),{times:1});
+    await openKey('OpenAI 格式 / Fixture','fixture-openai-key-2');
+    await button('删除 Key').click();await confirm();
+    await page.getByRole('status').filter({hasText:'已隐藏 gpt-6-astra；但没收到删除结果（Provider persistence failed）'}).waitFor();
+    assert.equal(model('fixture-model-3').visible,false);assert(key('fixture-openai-key-2'));
     assert.deepEqual(errors,[]);assert.deepEqual(nativeDialogs,[],'no browser-native dialogs');
-    console.log('PASS: 删除 Key: no-loss delete, server refusal explained with the model named, hide-then-delete');
+    console.log('PASS: 删除 Key: no-loss delete, server refusal explained with the model named, hide-then-delete; a failure after hiding says the model stays hidden');
   }finally{
     await browser?.close();server.close();
   }
