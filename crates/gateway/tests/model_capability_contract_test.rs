@@ -123,6 +123,8 @@ async fn configured_capabilities_reach_catalog_upstream_billing_and_usage() {
                         models: vec![invalid],
                         rate_cards: vec![],
                         versions: vec![],
+                        removed_models: vec![],
+                        cancelled_versions: vec![],
                     },
                     1_700_000_000
                 )
@@ -138,6 +140,8 @@ async fn configured_capabilities_reach_catalog_upstream_billing_and_usage() {
                     models: vec![model_map.clone()],
                     rate_cards: vec![],
                     versions: vec![],
+                    removed_models: vec![],
+                    cancelled_versions: vec![],
                 },
                 1_700_000_000,
             )

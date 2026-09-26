@@ -162,6 +162,21 @@ async fn production_cookie_login_csrf_reveal_logout_and_fail_closed() {
             assert!(body.get("rawCode").is_none());
         }
     }
+    // Provider upkeep and test calls are refused without the CSRF token, like any change.
+    for path in [
+        "providers/update",
+        "providers/delete",
+        "providers/keys/delete",
+        "providers/keys/reset",
+        "providers/keys/probe",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request("POST", path, Some(cookie), None, json!({})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+    }
     let response = app
         .clone()
         .oneshot(request(

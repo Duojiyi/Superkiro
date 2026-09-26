@@ -24,6 +24,12 @@ pub struct CommercialUpdate {
     pub rate_cards: Vec<RateCard>,
     #[serde(default)]
     pub versions: Vec<RateCardVersion>,
+    /// Mappings to delete, by ID; only a hidden or retired one can be.
+    #[serde(default)]
+    pub removed_models: Vec<String>,
+    /// Price versions to withdraw, by ID; only one not yet in force can be.
+    #[serde(default)]
+    pub cancelled_versions: Vec<String>,
 }
 #[derive(Debug, Serialize)]
 pub struct CommercialConfig {
@@ -76,6 +82,9 @@ const MIN_CREDIT_FACE_VALUE_CNY: f64 = 0.0001;
 fn invalid(s: &str) -> BillingError {
     BillingError::InvalidState(s.into())
 }
+fn invalid_ids(what: &str, ids: &[&str]) -> BillingError {
+    BillingError::InvalidState(format!("{what}: {}", ids.join(", ")))
+}
 impl BillingEngine {
     pub fn commercial_config(&self) -> CommercialConfig {
         view(&self.export_snapshot())
@@ -88,7 +97,13 @@ impl BillingEngine {
         if !text(&u.reason, 500) {
             return Err(invalid("Publication reason required (max 500 bytes)"));
         }
-        if u.groups.len() + u.models.len() + u.rate_cards.len() + u.versions.len() == 0
+        if u.groups.len()
+            + u.models.len()
+            + u.rate_cards.len()
+            + u.versions.len()
+            + u.removed_models.len()
+            + u.cancelled_versions.len()
+            == 0
             && u.settings.is_none()
         {
             return Err(invalid("Empty publication"));
@@ -150,16 +165,23 @@ impl BillingEngine {
             }
             c.groups.insert(g.id.clone(), g);
         }
+        // Only the mappings this publication lists are held to the model ID rule requests
+        // meet, and to being servable: one published before either rule still loads.
+        let mut published = std::collections::HashSet::new();
         for m in u.models {
+            if let Some(id) = std::iter::once(&m.exposed_model_id)
+                .chain(&m.aliases)
+                .find(|id| !crate::group::valid_model_id(id))
+            {
+                return Err(invalid_ids("Invalid model ID", &[id.as_str()]));
+            }
             if !text(&m.id, 128)
-                || !text(&m.exposed_model_id, 128)
                 || !text(&m.target_model, 256)
                 || !positive(m.credit_multiplier)
                 || m.max_output == 0
                 || m.max_output > m.context_window
                 || m.context_window > 10_000_000
                 || m.aliases.len() > 32
-                || m.aliases.iter().any(|a| !text(a, 128))
                 || m.fallback_chain.len() > 8
                 || m.display_name
                     .as_deref()
@@ -172,6 +194,7 @@ impl BillingEngine {
             {
                 return Err(invalid("Invalid or duplicate model mapping"));
             }
+            published.insert(m.id.clone());
             if let Some(old) = c.model_maps.iter_mut().find(|v| v.id == m.id) {
                 if old.group_id != m.group_id {
                     return Err(invalid("Cannot move mapping between groups"));
@@ -181,7 +204,22 @@ impl BillingEngine {
                 c.model_maps.push(m);
             }
         }
+        // A model customers can see is withdrawn first, by hiding or retiring it.
+        for id in &u.removed_models {
+            match c.model_maps.iter().position(|m| m.id == *id) {
+                Some(i) if !c.model_maps[i].is_listed() => {
+                    c.model_maps.remove(i);
+                }
+                _ => {
+                    return Err(invalid_ids(
+                        "Only hidden or retired mappings can be removed",
+                        &[id.as_str()],
+                    ))
+                }
+            }
+        }
         let mut exposed = std::collections::HashSet::new();
+        let mut unroutable = Vec::new();
         for m in &c.model_maps {
             let g = c
                 .groups
@@ -196,20 +234,28 @@ impl BillingEngine {
                     .providers
                     .get(id)
                     .ok_or_else(|| invalid("Unknown target provider"))?;
-                if m.visible
-                    && (!p.enabled
-                        || !c
-                            .provider_keys
-                            .values()
-                            .any(|k| k.provider_id == *id && k.enabled && k.supports_model(model)))
-                {
-                    return Err(invalid(
-                        "Visible model target has no enabled compatible key",
-                    ));
-                }
                 if !text(model, 256) || !g.can_access_provider(p.group_id.as_deref()) {
                     return Err(invalid("Provider not accessible to model group"));
                 }
+            }
+            // A model this publication lists for customers must be servable by its primary
+            // target. One published earlier that has since lost its provider or Key no
+            // longer blocks every later publication, and a fallback may be disabled:
+            // requests pass over it.
+            if published.contains(&m.id)
+                && m.is_listed()
+                && !(c
+                    .providers
+                    .get(&m.target_provider_id)
+                    .is_some_and(|p| p.enabled)
+                    && c.provider_keys.values().any(|k| {
+                        k.provider_id == m.target_provider_id
+                            && k.enabled
+                            && k.supports_model(&m.target_model)
+                    }))
+                && !unroutable.contains(&m.exposed_model_id.as_str())
+            {
+                unroutable.push(m.exposed_model_id.as_str());
             }
             for name in std::iter::once(&m.exposed_model_id).chain(m.aliases.iter()) {
                 if !exposed.insert((&m.group_id, name)) {
@@ -217,7 +263,34 @@ impl BillingEngine {
                 }
             }
         }
-        for v in u.versions {
+        if !unroutable.is_empty() {
+            return Err(invalid_ids(
+                "Visible model target has no enabled compatible key",
+                &unroutable,
+            ));
+        }
+        // A price that is or was in force may have priced a request; only a scheduled one
+        // is withdrawn, before this publication's prices, which may replace it.
+        for id in &u.cancelled_versions {
+            match c.rate_card_versions.iter().position(|v| v.id == *id) {
+                Some(i) if c.rate_card_versions[i].effective_from_secs > now => {
+                    c.rate_card_versions.remove(i);
+                }
+                _ => {
+                    return Err(invalid_ids(
+                        "Only scheduled prices can be cancelled",
+                        &[id.as_str()],
+                    ))
+                }
+            }
+        }
+        // The models that already have a price, before this publication adds any.
+        let priced: std::collections::HashSet<(String, String)> = c
+            .rate_card_versions
+            .iter()
+            .map(|v| (v.rate_card_id.clone(), v.model.clone()))
+            .collect();
+        for mut v in u.versions {
             let prices = [
                 v.input_price_per_m,
                 v.output_price_per_m,
@@ -241,11 +314,21 @@ impl BillingEngine {
                 // 10^18 priced a single request past what a balance can hold.
                 || fixed.iter().any(|p| *p < 0 || *p > 1_000_000_000_000)
                 || !c.rate_cards.contains_key(&v.rate_card_id)
-                || v.effective_from_secs < now
             {
                 return Err(invalid(
                     "Invalid pricing; retroactive publication forbidden",
                 ));
+            }
+            if v.effective_from_secs < now {
+                // A model's first price may start now, whatever time it names: it replaces
+                // no price of its own, and a request in flight keeps the price it was
+                // reserved at. Any later price is scheduled, never back-dated.
+                if priced.contains(&(v.rate_card_id.clone(), v.model.clone())) {
+                    return Err(invalid(
+                        "Invalid pricing; retroactive publication forbidden",
+                    ));
+                }
+                v.effective_from_secs = now;
             }
             if c.rate_card_versions.iter().any(|x| {
                 x.id == v.id
@@ -336,6 +419,8 @@ mod tests {
             models: vec![],
             rate_cards: vec![RateCard::new("default", "Default", 100)],
             versions: vec![],
+            removed_models: vec![],
+            cancelled_versions: vec![],
         }
     }
     #[test]
@@ -623,5 +708,315 @@ mod tests {
         assert!(matches!(result, Err(BillingError::Persistence(_))));
         assert_eq!(e.commercial_config().revision, before);
         assert!(e.commercial_config().audit.is_empty());
+    }
+
+    /// An engine with one tier and a provider "p" whose one Key may call anything.
+    fn serving_engine() -> BillingEngine {
+        let e = BillingEngine::new();
+        e.upsert_provider(Provider::new(
+            "p",
+            "P",
+            crate::provider::ProviderFormat::OpenAi,
+            "https://example.com",
+        ));
+        e.upsert_provider_key(ProviderKey::new("k", "p", "test"));
+        e.publish_commercial_config(update(&e), 100).unwrap();
+        e
+    }
+    fn publish_models(e: &BillingEngine, models: Vec<ModelMap>) -> Result<(), String> {
+        let mut u = update(e);
+        u.models = models;
+        e.publish_commercial_config(u, 100)
+            .map(|_| ())
+            .map_err(|error| match error {
+                BillingError::InvalidState(message) => message,
+                other => other.to_string(),
+            })
+    }
+    fn wildcard(id: &str, per_call: i64, from: u64) -> RateCardVersion {
+        price(id, "*", per_call, from)
+    }
+    fn price(id: &str, model: &str, per_call: i64, from: u64) -> RateCardVersion {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "rate_card_id": "default", "model": model,
+            "currency": "CNY", "pricing_mode": "per_call",
+            "input_price_per_m": 0.0, "output_price_per_m": 0.0,
+            "cache_creation_price_per_m": 0.0, "cache_read_price_per_m": 0.0,
+            "fixed_input_credit_per_m": 0, "fixed_output_credit_per_m": 0,
+            "fixed_cache_creation_credit_per_m": 0, "fixed_cache_read_credit_per_m": 0,
+            "per_call_credit": per_call, "margin_multiplier": 1.0, "effective_from_secs": from
+        }))
+        .unwrap()
+    }
+
+    /// Disabling a provider used to freeze every later publication, whatever it changed:
+    /// each re-checked every visible model, fallbacks included. Only a model the
+    /// publication lists for customers must now be servable, by its primary target.
+    #[test]
+    fn a_broken_model_blocks_only_its_own_publication() {
+        let e = serving_engine();
+        let model = |id: &str| ModelMap::new(format!("map-{id}"), "new-tier", id, "p", "target");
+        publish_models(&e, vec![model("model-a")]).unwrap();
+        e.set_provider_enabled("p", false).unwrap();
+
+        // Unrelated publications go through.
+        e.publish_commercial_config(update(&e), 101).unwrap();
+        // The broken models are named when they are published for customers.
+        assert_eq!(
+            publish_models(&e, vec![model("model-a"), model("model-b")]),
+            Err("Visible model target has no enabled compatible key: model-a, model-b".into())
+        );
+        // Hidden or retired, they need no route.
+        let mut hidden = model("model-a");
+        hidden.visible = false;
+        let mut retired = model("model-b");
+        retired.retired = true;
+        publish_models(&e, vec![hidden, retired]).unwrap();
+
+        // A Key that may not call the target is no route either.
+        e.set_provider_enabled("p", true).unwrap();
+        let mut key = ProviderKey::new("k", "p", "test");
+        key.allowed_models = Some(vec!["other".into()]);
+        e.upsert_provider_key(key);
+        assert_eq!(
+            publish_models(&e, vec![model("model-c")]),
+            Err("Visible model target has no enabled compatible key: model-c".into())
+        );
+        e.upsert_provider_key(ProviderKey::new("k", "p", "test"));
+
+        // A fallback may be disabled, but must name a provider.
+        let mut idle = Provider::new(
+            "idle",
+            "Idle",
+            crate::provider::ProviderFormat::OpenAi,
+            "https://example.com",
+        );
+        idle.enabled = false;
+        e.upsert_provider(idle);
+        publish_models(&e, vec![model("model-c").with_fallback("idle", "spare")]).unwrap();
+        assert_eq!(
+            publish_models(&e, vec![model("model-d").with_fallback("ghost", "spare")]),
+            Err("Unknown target provider".into())
+        );
+        // Structure is still checked for every mapping, not only the published ones.
+        e.upsert_model_map(ModelMap::new(
+            "map-stray",
+            "new-tier",
+            "stray",
+            "ghost",
+            "t",
+        ));
+        assert!(e.publish_commercial_config(update(&e), 102).is_err());
+    }
+
+    /// A model's first price may be published to start now, which is how a client asks
+    /// for it; the server's clock decides when that is. A request in flight still settles
+    /// at the price it was reserved at.
+    #[test]
+    fn a_models_first_price_starts_now_and_spares_requests_in_flight() {
+        use crate::card::Card;
+        use crate::reservation::ReservationEstimateParams;
+        let credit = crate::MICRO_CREDITS_PER_CREDIT;
+        let e = serving_engine();
+        let mut u = update(&e);
+        u.models.push(ModelMap::new(
+            "map-a", "new-tier", "model-a", "p", "target-a",
+        ));
+        u.versions.push(wildcard("v-star", credit, 100));
+        e.publish_commercial_config(u, 100).unwrap();
+        let mut card = Card::new("card", "new-tier", 1_000 * credit);
+        card.activate(100, 86_400).unwrap();
+        e.upsert_card(card);
+        let params = ReservationEstimateParams::new(0, 1).with_model("model-a");
+        let held = e.reserve("card", "held", &params, 101, 600).unwrap();
+        assert_eq!(held.rate_card_version.as_deref(), Some("v-star"));
+
+        let mut first = update(&e);
+        first.versions.push(price("v-a", "model-a", 5 * credit, 0));
+        let published = e.publish_commercial_config(first, 102).unwrap();
+        let stamped = published.versions.iter().find(|v| v.id == "v-a").unwrap();
+        assert_eq!(stamped.effective_from_secs, 102);
+        let audit = e.list_rate_card_audit_logs(Some("default"));
+        let entry = audit.iter().find(|log| log.version_id == "v-a").unwrap();
+        assert_eq!(entry.created_at_secs, 102);
+        assert_eq!(entry.previous_version_id.as_deref(), Some("v-star"));
+        assert_eq!(published.audit.last().unwrap().created_at_secs, 102);
+
+        // The model has a price now: another one may not start in the past.
+        let mut second = update(&e);
+        second.versions.push(price("v-a2", "model-a", credit, 0));
+        assert!(e.publish_commercial_config(second, 103).is_err());
+
+        let tokens = UsageTokens::default();
+        let settled = e
+            .settle("held", &tokens, "model-a", "p", "target-a", 103)
+            .unwrap();
+        assert_eq!(settled.rate_card_version.as_deref(), Some("v-star"));
+        assert_eq!(settled.credits_charged, credit);
+        e.reserve("card", "after", &params, 103, 600).unwrap();
+        let after = e
+            .settle("after", &tokens, "model-a", "p", "target-a", 104)
+            .unwrap();
+        assert_eq!(after.rate_card_version.as_deref(), Some("v-a"));
+        assert_eq!(after.credits_charged, 5 * credit);
+    }
+
+    /// Whether a model has a price is decided by what was published before: a first price
+    /// from now and a later one publish together in either order, and a model gets one
+    /// first price.
+    #[test]
+    fn a_first_price_from_now_may_come_with_later_prices() {
+        for later_first in [false, true] {
+            let e = serving_engine();
+            let mut u = update(&e);
+            u.versions = vec![price("v-now", "m", 1, 0), price("v-later", "m", 2, 500)];
+            if later_first {
+                u.versions.reverse();
+            }
+            let config = e.publish_commercial_config(u, 100).unwrap();
+            let stamped = config.versions.iter().find(|v| v.id == "v-now").unwrap();
+            assert_eq!(stamped.effective_from_secs, 100);
+        }
+        let e = serving_engine();
+        let mut u = update(&e);
+        u.versions = vec![price("v-a", "m", 1, 0), price("v-b", "m", 2, 0)];
+        assert!(e.publish_commercial_config(u, 100).is_err());
+        assert!(e.commercial_config().versions.is_empty());
+    }
+
+    #[test]
+    fn only_withdrawn_models_are_removed_and_only_scheduled_prices_cancelled() {
+        let e = serving_engine();
+        let mut listed = ModelMap::new("map-listed", "new-tier", "listed", "p", "t");
+        let mut hidden = ModelMap::new("map-hidden", "new-tier", "hidden", "p", "t");
+        hidden.visible = false;
+        let mut retired = ModelMap::new("map-retired", "new-tier", "retired", "p", "t");
+        retired.retired = true;
+        let mut u = update(&e);
+        u.models = vec![listed.clone(), hidden, retired];
+        u.versions = vec![
+            price("v-now", "listed", 1, 100),
+            price("v-later", "listed", 2, 500),
+        ];
+        e.publish_commercial_config(u, 100).unwrap();
+        let attempt = |removed: &[&str], cancelled: &[&str]| {
+            let u = CommercialUpdate {
+                groups: vec![],
+                rate_cards: vec![],
+                removed_models: removed.iter().map(|id| id.to_string()).collect(),
+                cancelled_versions: cancelled.iter().map(|id| id.to_string()).collect(),
+                ..update(&e)
+            };
+            e.publish_commercial_config(u, 200)
+        };
+        for (removed, message) in [
+            (
+                "map-listed",
+                "Only hidden or retired mappings can be removed: map-listed",
+            ),
+            (
+                "map-unknown",
+                "Only hidden or retired mappings can be removed: map-unknown",
+            ),
+        ] {
+            assert_eq!(
+                attempt(&[removed], &[]).unwrap_err(),
+                BillingError::InvalidState(message.into())
+            );
+        }
+        for (cancelled, message) in [
+            ("v-now", "Only scheduled prices can be cancelled: v-now"),
+            (
+                "v-unknown",
+                "Only scheduled prices can be cancelled: v-unknown",
+            ),
+        ] {
+            assert_eq!(
+                attempt(&[], &[cancelled]).unwrap_err(),
+                BillingError::InvalidState(message.into())
+            );
+        }
+        let config = attempt(&["map-hidden", "map-retired"], &["v-later"]).unwrap();
+        let ids: Vec<_> = config.models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["map-listed"]);
+        let ids: Vec<_> = config.versions.iter().map(|v| v.id.as_str()).collect();
+        assert_eq!(ids, ["v-now"]);
+
+        // Withdrawn in one publication and removed in the next.
+        listed.retired = true;
+        publish_models(&e, vec![listed]).unwrap();
+        assert!(attempt(&["map-listed"], &[]).unwrap().models.is_empty());
+        // A scheduled price is replaced in one publication: cancelled, then published anew.
+        let mut u = update(&e);
+        u.versions = vec![price("v-soon", "listed", 3, 800)];
+        e.publish_commercial_config(u, 300).unwrap();
+        let mut u = update(&e);
+        u.cancelled_versions = vec!["v-soon".into()];
+        u.versions = vec![price("v-soon-2", "listed", 4, 800)];
+        let config = e.publish_commercial_config(u, 300).unwrap();
+        assert!(config.versions.iter().any(|v| v.id == "v-soon-2"));
+        assert!(!config.versions.iter().any(|v| v.id == "v-soon"));
+    }
+
+    #[test]
+    fn a_retired_flag_survives_a_restart_and_older_mappings_load_without_it() {
+        let e = serving_engine();
+        let mut retired = ModelMap::new("map-r", "new-tier", "model-r", "p", "t");
+        retired.retired = true;
+        publish_models(&e, vec![retired]).unwrap();
+        let restored = BillingEngine::new();
+        restored.import_snapshot(e.export_snapshot());
+        assert!(restored.commercial_config().models[0].retired);
+        assert!(restored.list_models_for_group("new-tier", true).is_empty());
+
+        let mut older = serde_json::to_value(ModelMap::new("m", "g", "x", "p", "t")).unwrap();
+        older.as_object_mut().unwrap().remove("retired");
+        let older: ModelMap = serde_json::from_value(older).unwrap();
+        assert!(!older.retired && older.is_listed());
+    }
+
+    /// A published ID or alias is what requests may name; an older mapping that is not
+    /// still loads, and blocks no publication that leaves it alone.
+    #[test]
+    fn published_model_ids_follow_the_request_rule() {
+        let e = serving_engine();
+        let model = |id: &str| ModelMap::new("map-x", "new-tier", id, "p", "t");
+        let long = "m".repeat(129);
+        for (mapping, bad) in [
+            (model("model a"), "model a"),
+            (model("model\u{e9}"), "model\u{e9}"),
+            (model(&long), long.as_str()),
+            (model(""), ""),
+            (model("model-x").with_alias("alias@x"), "alias@x"),
+        ] {
+            assert_eq!(
+                publish_models(&e, vec![mapping]),
+                Err(format!("Invalid model ID: {bad}"))
+            );
+        }
+        publish_models(&e, vec![model("vendor/model-1.5:beta_2").with_alias("m.x")]).unwrap();
+
+        e.upsert_model_map(ModelMap::new("map-old", "new-tier", "old model", "p", "t"));
+        let file = std::env::temp_dir().join(format!(
+            "kiro-model-id-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        e.save_to_file(&file).unwrap();
+        let restored = BillingEngine::new();
+        let loaded = restored.load_from_file(&file);
+        std::fs::remove_file(&file).unwrap();
+        loaded.unwrap();
+        assert!(restored
+            .commercial_config()
+            .models
+            .iter()
+            .any(|m| m.exposed_model_id == "old model"));
+        restored
+            .publish_commercial_config(update(&restored), 200)
+            .unwrap();
     }
 }

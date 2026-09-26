@@ -474,6 +474,22 @@ fn check_quota(
     Ok(())
 }
 
+/// The names a request's price is looked up under, most specific first: the name it
+/// asked for, its mapping's own ID, so that an alias is priced like the model, then the
+/// mapped target.
+fn price_names<'a>(requested: &'a str, map: Option<&'a ModelMap>) -> Vec<&'a str> {
+    let mut names = vec![requested];
+    for name in map
+        .into_iter()
+        .flat_map(|m| [m.exposed_model_id.as_str(), m.target_model.as_str()])
+    {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
 /// Immutable audit receipt for an archived batch of settled ledger entries (Spec §14.6, T03).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ArchivedLedgerReceipt {
@@ -2058,6 +2074,132 @@ impl BillingEngine {
         })
     }
 
+    /// Edit a provider in place, durably, leaving its Keys as they are. False when there is
+    /// no such provider.
+    pub fn edit_provider(
+        &self,
+        provider_id: &str,
+        edit: impl FnOnce(&mut Provider),
+    ) -> Result<bool, BillingError> {
+        let _state_guard = self.state_lock.write().unwrap();
+        let sequence = self
+            .snapshot_sequence
+            .load(Ordering::Acquire)
+            .saturating_add(1);
+        let previous_checksum = self.last_snapshot_checksum.read().unwrap().clone();
+        let mut candidate = self.export_snapshot_locked(sequence, previous_checksum);
+        let Some(provider) = candidate.providers.get_mut(provider_id) else {
+            return Ok(false);
+        };
+        edit(provider);
+        let updated = provider.clone();
+        self.commit_candidate_snapshot(&candidate, || {
+            self.providers
+                .write()
+                .unwrap()
+                .insert(updated.id.clone(), updated);
+            true
+        })
+    }
+
+    /// Delete a Key, durably, unless it is the last enabled Key allowed to call the primary
+    /// target of a model customers see. False when the provider has no such Key.
+    pub fn delete_provider_key(
+        &self,
+        provider_id: &str,
+        key_id: &str,
+    ) -> Result<bool, BillingError> {
+        let _state_guard = self.state_lock.write().unwrap();
+        let sequence = self
+            .snapshot_sequence
+            .load(Ordering::Acquire)
+            .saturating_add(1);
+        let previous_checksum = self.last_snapshot_checksum.read().unwrap().clone();
+        let mut candidate = self.export_snapshot_locked(sequence, previous_checksum);
+        let Some(key) = candidate
+            .provider_keys
+            .get(key_id)
+            .filter(|key| key.provider_id == provider_id)
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        candidate.provider_keys.remove(key_id);
+        let serves = |key: &ProviderKey, model: &ModelMap| {
+            key.provider_id == model.target_provider_id
+                && key.enabled
+                && key.supports_model(&model.target_model)
+        };
+        let stranded: std::collections::BTreeSet<&str> = candidate
+            .model_maps
+            .iter()
+            .filter(|m| {
+                m.is_listed()
+                    && serves(&key, m)
+                    && !candidate.provider_keys.values().any(|k| serves(k, m))
+            })
+            .map(|m| m.exposed_model_id.as_str())
+            .collect();
+        if !stranded.is_empty() {
+            return Err(BillingError::InvalidState(format!(
+                "Key still serves visible models: {}",
+                stranded.into_iter().collect::<Vec<_>>().join(", ")
+            )));
+        }
+        self.commit_candidate_snapshot(&candidate, || {
+            self.provider_keys.write().unwrap().remove(key_id);
+            true
+        })
+    }
+
+    /// Delete a provider, durably, once no mapping names it, as its target or a fallback,
+    /// and it has no Keys. False when there is no such provider.
+    pub fn delete_provider(&self, provider_id: &str) -> Result<bool, BillingError> {
+        let _state_guard = self.state_lock.write().unwrap();
+        let sequence = self
+            .snapshot_sequence
+            .load(Ordering::Acquire)
+            .saturating_add(1);
+        let previous_checksum = self.last_snapshot_checksum.read().unwrap().clone();
+        let mut candidate = self.export_snapshot_locked(sequence, previous_checksum);
+        if candidate.providers.remove(provider_id).is_none() {
+            return Ok(false);
+        }
+        let models: std::collections::BTreeSet<&str> = candidate
+            .model_maps
+            .iter()
+            .filter(|m| {
+                m.target_provider_id == provider_id
+                    || m.fallback_chain
+                        .iter()
+                        .any(|f| f.provider_id == provider_id)
+            })
+            .map(|m| m.exposed_model_id.as_str())
+            .collect();
+        if !models.is_empty() {
+            return Err(BillingError::InvalidState(format!(
+                "Provider still routes models: {}",
+                models.into_iter().collect::<Vec<_>>().join(", ")
+            )));
+        }
+        let keys: std::collections::BTreeSet<&str> = candidate
+            .provider_keys
+            .values()
+            .filter(|k| k.provider_id == provider_id)
+            .map(|k| k.id.as_str())
+            .collect();
+        if !keys.is_empty() {
+            return Err(BillingError::InvalidState(format!(
+                "Provider still has Keys: {}",
+                keys.into_iter().collect::<Vec<_>>().join(", ")
+            )));
+        }
+        self.commit_candidate_snapshot(&candidate, || {
+            self.providers.write().unwrap().remove(provider_id);
+            true
+        })
+    }
+
     /// Step 1: Pre-request credit reservation (Spec §6.2).
     ///
     /// Freezes upper-bound estimated credits before forwarding request to upstream provider.
@@ -2120,9 +2262,7 @@ impl BillingEngine {
                 .unwrap_or(params.credit_multiplier);
 
             let settings = self.settings.read().unwrap().clone();
-            let models: Vec<&str> = std::iter::once(model.as_str())
-                .chain(model_map.map(|m| m.target_model.as_str()))
-                .collect();
+            let models = price_names(model, model_map);
             // A named model is never billed at the built-in default rates: without a
             // published price it is refused here, before any work. It used to reserve and
             // settle at 15 and 60 credits per million tokens, its margins dropped.
@@ -2362,10 +2502,10 @@ impl BillingEngine {
         let resolved_rcv = if let Some(ref vid) = locked_version {
             self.get_rate_card_version(vid)
         } else {
-            let models: Vec<&str> = std::iter::once(exposed_model)
-                .chain(model_map.map(|m| m.target_model.as_str()))
-                .chain(std::iter::once(target_model))
-                .collect();
+            let mut models = price_names(exposed_model, model_map);
+            if !models.contains(&target_model) {
+                models.push(target_model);
+            }
             self.resolve_price(rate_card_id, &models, reservation_created_at)
         };
 
@@ -2399,27 +2539,30 @@ impl BillingEngine {
         };
 
         // Provider-qualified model prices take precedence over shared target-model prices.
+        // Served by its primary target, a model costs what its own price version says, the
+        // one it is charged at; a fallback costs what its target does.
         let qualified_model = format!("{provider_id}/{target_model}");
-        let cost_version = [qualified_model.as_str(), target_model, "*"]
-            .into_iter()
-            .find_map(|model| {
-                candidate
-                    .rate_card_versions
-                    .iter()
-                    .filter(|v| {
-                        v.rate_card_id == rate_card_id
-                            && v.model == model
-                            && v.effective_from_secs <= reservation_created_at
-                    })
-                    .max_by_key(|v| v.effective_from_secs)
-            })
+        let latest = |model: &str| {
+            candidate
+                .rate_card_versions
+                .iter()
+                .filter(|v| {
+                    v.rate_card_id == rate_card_id
+                        && v.model == model
+                        && v.effective_from_secs <= reservation_created_at
+                })
+                .max_by_key(|v| v.effective_from_secs)
+        };
+        let cost_version = latest(&qualified_model)
             .or_else(|| {
                 model_map
                     .filter(|m| {
                         m.target_provider_id == provider_id && m.target_model == target_model
                     })
                     .and(resolved_rcv.as_ref())
-            });
+            })
+            .or_else(|| latest(target_model))
+            .or_else(|| latest("*"));
         let cost_source = if let Some(version) = cost_version {
             cost_micro_cny = version.calculate_cost_micro_cny(tokens, &settings);
             format!("provider_cost:rate_card_version={}", version.id)
@@ -3828,12 +3971,13 @@ impl BillingEngine {
         self.sync_to_disk();
     }
 
-    /// List models mapped to a group, optionally filtering by visibility and sorted by sort_order.
+    /// List models mapped to a group, optionally only those customers see (visible and not
+    /// retired), sorted by sort_order.
     pub fn list_models_for_group(&self, group_id: &str, only_visible: bool) -> Vec<ModelMap> {
         let r = self.model_maps.read().unwrap();
         let mut list: Vec<ModelMap> = r
             .iter()
-            .filter(|m| m.group_id == group_id && (!only_visible || m.visible))
+            .filter(|m| m.group_id == group_id && (!only_visible || m.is_listed()))
             .cloned()
             .collect();
         list.sort_by_key(|m| m.sort_order);

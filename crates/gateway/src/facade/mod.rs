@@ -225,6 +225,20 @@ impl FacadeRegistry {
     ) -> &mut Self {
         self.admin_auth = Some(auth.clone());
         let runtime = self.runtime.clone();
+        for action in [
+            commercial::ProviderAction::Update,
+            commercial::ProviderAction::Delete,
+            commercial::ProviderAction::DeleteKey,
+            commercial::ProviderAction::ResetKey,
+            commercial::ProviderAction::ProbeKey,
+        ] {
+            self.register(commercial::ProviderMaintenanceHandler::new(
+                billing.clone(),
+                auth.clone(),
+                runtime.clone(),
+                action,
+            ));
+        }
         self.register(admin::AdminSessionHandler { auth: auth.clone() })
             .register(admin::AdminRevokeSessionsHandler { auth: auth.clone() })
             .register(admin::AdminMeHandler { auth: auth.clone() })
@@ -285,6 +299,7 @@ impl FacadeRegistry {
             .register(admin::AdminProvidersHandler {
                 billing: billing.clone(),
                 auth: auth.clone(),
+                runtime: runtime.clone(),
             })
             .register(admin::AdminProviderStatusHandler {
                 billing: billing.clone(),

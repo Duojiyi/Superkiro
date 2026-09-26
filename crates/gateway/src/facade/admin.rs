@@ -532,6 +532,7 @@ pub struct AdminFinancialsHandler {
 pub struct AdminProvidersHandler {
     pub billing: BillingEngine,
     pub auth: Arc<AdminAuthState>,
+    pub runtime: Option<crate::provider::ProviderRuntimeRegistry>,
 }
 
 impl FacadeHandler for AdminProvidersHandler {
@@ -547,7 +548,31 @@ impl FacadeHandler for AdminProvidersHandler {
                 return unauthorized_response();
             }
             let providers = self.billing.list_providers();
-            let keys = self.billing.list_provider_keys(None);
+            // A key's health is the running gateway's: cooldowns and retirements after an
+            // invalid-key reply live in memory, never in the saved key.
+            let now = now_secs();
+            let live = self
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.key_health(now))
+                .unwrap_or_default();
+            let keys: Vec<serde_json::Value> =
+                self.billing
+                    .list_provider_keys(None)
+                    .into_iter()
+                    .map(|key| {
+                        let health = live.get(&key.id).cloned().unwrap_or_else(|| {
+                            crate::provider::governance::KeyHealth::of(&key, now)
+                        });
+                        let mut value = serde_json::to_value(&key).unwrap_or_default();
+                        if let (Some(fields), Ok(serde_json::Value::Object(health))) =
+                            (value.as_object_mut(), serde_json::to_value(health))
+                        {
+                            fields.extend(health);
+                        }
+                        value
+                    })
+                    .collect();
             json_response(
                 StatusCode::OK,
                 &serde_json::json!({ "success": true, "providers": providers, "keys": keys }),

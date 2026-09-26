@@ -48,6 +48,38 @@ struct KeyEntry {
     key: ProviderKey,
     current_weight: i64,
     consecutive_failures: u32,
+    /// The last failure that cooled the key down or retired it, and when.
+    last_error: Option<(String, u64)>,
+}
+
+/// A key's health in the running gateway, as the admin console shows it. Kept in memory:
+/// a restart starts every key healthy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct KeyHealth {
+    /// "healthy", "cooldown", "degraded" (tried again after a cooldown, not yet recovered)
+    /// or "unhealthy" (rejected as invalid; left out until reset or its secret changes).
+    pub health_state: &'static str,
+    pub cooldown_until: Option<u64>,
+    pub last_error: Option<String>,
+    pub last_error_at: Option<u64>,
+}
+
+impl KeyHealth {
+    /// The health `key` records, with no failure noted.
+    pub fn of(key: &ProviderKey, now_secs: u64) -> Self {
+        let cooldown_until = key.cooldown_until.filter(|until| *until > now_secs);
+        Self {
+            health_state: match key.health_state {
+                HealthState::Unhealthy => "unhealthy",
+                _ if cooldown_until.is_some() => "cooldown",
+                HealthState::Degraded => "degraded",
+                HealthState::Healthy => "healthy",
+            },
+            cooldown_until,
+            last_error: None,
+            last_error_at: None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -71,6 +103,7 @@ impl ProviderKeyPool {
                 key: k,
                 current_weight: 0,
                 consecutive_failures: 0,
+                last_error: None,
             })
             .collect();
 
@@ -96,6 +129,7 @@ impl ProviderKeyPool {
                 key,
                 current_weight: 0,
                 consecutive_failures: 0,
+                last_error: None,
             });
         }
     }
@@ -258,6 +292,45 @@ impl ProviderKeyPool {
             entry.key.mark_success();
         }
     }
+
+    /// Note the failure that just cooled a key down or retired it, named as its attempt is.
+    pub fn note_key_error(&self, key_id: &str, error: &ProviderError, at_secs: u64) {
+        let mut guard = self.inner.lock().unwrap();
+        if let Some(entry) = guard.keys.iter_mut().find(|e| e.key.id == key_id) {
+            entry.last_error = Some((super::retry::failure_class(error), at_secs));
+        }
+    }
+
+    /// The operator's reset: the key leaves its cooldown or its retirement, as after a
+    /// success; its last failure stays on record. A retired key was also switched off, and
+    /// is on again once synced with its saved state. False when the pool has no such key.
+    pub fn reset_key(&self, key_id: &str) -> bool {
+        let mut guard = self.inner.lock().unwrap();
+        let Some(entry) = guard.keys.iter_mut().find(|e| e.key.id == key_id) else {
+            return false;
+        };
+        entry.consecutive_failures = 0;
+        entry.key.mark_success();
+        true
+    }
+
+    /// Each key's live health, by key ID.
+    pub fn key_health(&self, now_secs: u64) -> Vec<(String, KeyHealth)> {
+        self.inner
+            .lock()
+            .unwrap()
+            .keys
+            .iter()
+            .map(|entry| {
+                let mut health = KeyHealth::of(&entry.key, now_secs);
+                if let Some((error, at)) = &entry.last_error {
+                    health.last_error = Some(error.clone());
+                    health.last_error_at = Some(*at);
+                }
+                (entry.key.id.clone(), health)
+            })
+            .collect()
+    }
 }
 
 /// Check whether an upstream error warrants key cooldown and failover (Spec §14.3).
@@ -335,15 +408,18 @@ async fn attempt_with_key(
             ),
         )
         .await;
+    let failed_at = crate::now_secs().max(now_secs);
     match &result {
         Ok(_) => pool.mark_key_success(&key.id),
         // Worth another key, but not a reason to cool this one down.
         Err(ProviderError::EmptyCompletion) => {}
-        Err(ProviderError::Http(status, _)) if status.as_u16() == 401 => {
-            pool.mark_key_unhealthy(&key.id)
+        Err(error @ ProviderError::Http(status, _)) if status.as_u16() == 401 => {
+            pool.mark_key_unhealthy(&key.id);
+            pool.note_key_error(&key.id, error, failed_at);
         }
         Err(error) if is_cooldown_error(error) => {
-            pool.mark_key_failure(&key.id, crate::now_secs().max(now_secs), default_cooldown)
+            pool.mark_key_failure(&key.id, failed_at, default_cooldown);
+            pool.note_key_error(&key.id, error, failed_at);
         }
         // A problem with the request says nothing about the key.
         Err(_) => {}
@@ -610,12 +686,22 @@ pub struct ProbeBenchmarkResult {
     pub tokens_emitted: u64,
     pub error: Option<String>,
     pub timestamp_secs: u64,
+    /// The start of the model's answer, at most [`PROBE_REPLY_CHARS`] characters.
+    pub reply: Option<String>,
 }
+
+/// How much of a probe's answer is kept.
+pub const PROBE_REPLY_CHARS: usize = 80;
 
 /// Perform a connectivity probe and latency/throughput benchmark on a provider key (Spec §14.3).
 ///
-/// Sends a lightweight ping prompt ("ping", max_tokens=5), measures TTFT and tok/s,
-/// and returns a comprehensive benchmark result.
+/// Sends one minimal request as traffic is sent: in the provider's format, streamed, and
+/// started by the same code, without retries, asking for a one-word answer with a small
+/// output limit. Measures TTFT and tok/s and keeps the start of the answer. The key's
+/// runtime health is left as it is: a probe is the operator's check, not traffic, so a
+/// failed one never takes a serving key out of rotation and a passing one never returns a
+/// key the router retired. The secret never appears in the result, even when an upstream
+/// echoes it in an error.
 pub async fn probe_provider_key(
     client: &reqwest::Client,
     provider: &Provider,
@@ -624,16 +710,11 @@ pub async fn probe_provider_key(
     now_secs: u64,
 ) -> ProbeBenchmarkResult {
     let start = Instant::now();
-    let provider_impl: Box<dyn ModelProvider> = match provider.format {
-        ProviderFormat::OpenAi => Box::new(OpenAiProvider),
-        ProviderFormat::Anthropic => Box::new(AnthropicProvider),
-    };
-
     let config = ProviderConfig::new(
         &provider.base_url,
         &key.api_key,
         target_model,
-        Duration::from_secs(15),
+        Duration::from_secs(30),
     );
 
     let probe_req = ChatRequest {
@@ -641,20 +722,37 @@ pub async fn probe_provider_key(
         model: target_model.to_string(),
         messages: vec![ChatMessage::new(
             "user",
-            serde_json::Value::String("ping".to_string()),
+            serde_json::Value::String("Reply with OK".to_string()),
         )],
-        temperature: Some(0.0),
-        max_tokens: Some(5),
+        // What a translated Kiro request carries.
+        temperature: Some(0.7),
+        max_tokens: Some(16),
         stream: true,
         tools: vec![],
     };
+    let redact = |text: String| -> String {
+        let text = if key.api_key.is_empty() {
+            text
+        } else {
+            text.replace(&key.api_key, "[redacted]")
+        };
+        text.chars().take(300).collect()
+    };
 
-    match provider_impl.chat_stream(client, &config, &probe_req).await {
+    match super::retry::start_stream(
+        provider_adapter(provider).as_ref(),
+        client,
+        &config,
+        &probe_req,
+        1,
+    )
+    .await
+    {
         Err(e) => {
             let total_latency_ms = start.elapsed().as_millis() as u64;
-            let (status_code, err_text) = match e {
-                ProviderError::Http(status, msg) => (Some(status.as_u16()), msg),
-                other => (None, other.to_string()),
+            let status_code = match &e {
+                ProviderError::Http(status, _) => Some(status.as_u16()),
+                _ => None,
             };
             ProbeBenchmarkResult {
                 key_id: key.id.clone(),
@@ -665,27 +763,33 @@ pub async fn probe_provider_key(
                 ttft_ms: None,
                 tokens_per_second: None,
                 tokens_emitted: 0,
-                error: Some(err_text),
+                error: Some(redact(e.to_string())),
                 timestamp_secs: now_secs,
+                reply: None,
             }
         }
         Ok(mut stream) => {
             let mut ttft_ms = None;
             let mut tokens_emitted = 0u64;
             let mut stream_error = None;
+            let mut reply = String::new();
 
             while let Some(event_res) = stream.next().await {
                 match event_res {
-                    Ok(ProviderStreamEvent::Delta(ProviderDelta::Text(text))) => {
+                    Ok(ProviderStreamEvent::Delta(delta)) => {
                         if ttft_ms.is_none() {
                             ttft_ms = Some(start.elapsed().as_millis() as u64);
                         }
-                        tokens_emitted += text.split_whitespace().count().max(1) as u64;
+                        if let ProviderDelta::Text(text) = delta {
+                            tokens_emitted += text.split_whitespace().count().max(1) as u64;
+                            let room = PROBE_REPLY_CHARS.saturating_sub(reply.chars().count());
+                            reply.extend(text.chars().take(room));
+                        }
                     }
                     Ok(ProviderStreamEvent::Done) => break,
                     Ok(_) => {}
                     Err(e) => {
-                        stream_error = Some(e.to_string());
+                        stream_error = Some(redact(e.to_string()));
                         break;
                     }
                 }
@@ -704,6 +808,10 @@ pub async fn probe_provider_key(
                 None
             };
 
+            let reply: String = redact(reply.trim().to_string())
+                .chars()
+                .take(PROBE_REPLY_CHARS)
+                .collect();
             ProbeBenchmarkResult {
                 key_id: key.id.clone(),
                 provider_id: provider.id.clone(),
@@ -715,6 +823,7 @@ pub async fn probe_provider_key(
                 tokens_emitted,
                 error: stream_error,
                 timestamp_secs: now_secs,
+                reply: (!reply.is_empty()).then_some(reply),
             }
         }
     }

@@ -41,6 +41,19 @@ pub struct ImportedProviderSummary {
     pub models: Vec<String>,
 }
 
+/// A provider's base URL uses HTTPS, except a loopback endpoint for development.
+pub(crate) fn check_base_url(base_url: &str) -> Result<(), &'static str> {
+    let url = Url::parse(base_url).map_err(|_| "provider base_url must be a valid URL")?;
+    if url.scheme() != "https"
+        && !url
+            .host_str()
+            .is_some_and(|host| host == "127.0.0.1" || host == "localhost")
+    {
+        return Err("provider base_url must use HTTPS except for loopback development endpoints");
+    }
+    Ok(())
+}
+
 pub struct ProviderImportHandler {
     pub store: Option<VirtualizationStore>,
     pub billing: Option<billing::BillingEngine>,
@@ -200,25 +213,11 @@ impl FacadeHandler for ProviderImportHandler {
             };
 
             for item in &imported {
-                let url = match Url::parse(&item.base_url) {
-                    Ok(url) => url,
-                    Err(_) => {
-                        return error_response(
-                            StatusCode::BAD_REQUEST,
-                            "InvalidRequestException",
-                            "provider base_url must be a valid URL",
-                        )
-                    }
-                };
-                if url.scheme() != "https"
-                    && !url
-                        .host_str()
-                        .is_some_and(|host| host == "127.0.0.1" || host == "localhost")
-                {
+                if let Err(message) = check_base_url(&item.base_url) {
                     return error_response(
                         StatusCode::BAD_REQUEST,
                         "InvalidRequestException",
-                        "provider base_url must use HTTPS except for loopback development endpoints",
+                        message,
                     );
                 }
                 if item.api_key.trim().is_empty() || item.api_key.chars().count() > 4096 {

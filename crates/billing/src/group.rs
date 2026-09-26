@@ -121,6 +121,19 @@ pub struct ModelMap {
     /// a request is charged comes from the price versions. Derived from prices when unset.
     #[serde(default)]
     pub rate_multiplier: Option<f64>,
+    /// Withdrawn for good: never listed, and a request for it is refused as for a model the
+    /// group does not list. Unlike a hidden model, it cannot be requested by its ID.
+    #[serde(default)]
+    pub retired: bool,
+}
+
+/// What a request may name as its model, and what a publication may expose: 1-128 ASCII
+/// letters, digits and `- _ . : /`.
+pub fn valid_model_id(id: &str) -> bool {
+    (1..=128).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':' | b'/'))
 }
 
 impl ModelMap {
@@ -150,7 +163,13 @@ impl ModelMap {
             display_name: None,
             description: None,
             rate_multiplier: None,
+            retired: false,
         }
+    }
+
+    /// Whether customers see the model: visible and not retired.
+    pub fn is_listed(&self) -> bool {
+        self.visible && !self.retired
     }
 
     pub fn with_alias(mut self, alias: impl Into<String>) -> Self {

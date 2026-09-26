@@ -132,6 +132,8 @@ async fn harness(declared_vision: bool, enable_fallback: bool) -> Harness {
                 models: vec![model_map],
                 rate_cards: vec![],
                 versions: vec![],
+                removed_models: vec![],
+                cancelled_versions: vec![],
             },
             1_700_000_000,
         )

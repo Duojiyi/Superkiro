@@ -2,7 +2,7 @@
 //! pipeline.  Persisting a provider is not useful if the request path keeps a
 //! stale startup-only provider list, so both surfaces update this registry.
 
-use super::governance::ProviderKeyPool;
+use super::governance::{KeyHealth, ProviderKeyPool};
 use billing::group::Group;
 use billing::provider::{Provider, ProviderKey};
 use billing::BillingEngine;
@@ -94,6 +94,28 @@ impl ProviderRuntimeRegistry {
 
     pub fn pool_for(&self, provider_id: &str) -> Option<ProviderKeyPool> {
         self.inner.read().ok()?.pools.get(provider_id).cloned()
+    }
+
+    /// The live health of every key the gateway routes with, by key ID.
+    pub fn key_health(&self, now_secs: u64) -> HashMap<String, KeyHealth> {
+        let pools: Vec<ProviderKeyPool> = self
+            .inner
+            .read()
+            .map(|state| state.pools.values().cloned().collect())
+            .unwrap_or_default();
+        pools
+            .iter()
+            .flat_map(|pool| pool.key_health(now_secs))
+            .collect()
+    }
+
+    /// Clear a key's cooldown or retirement. A retired key was also switched off here, so
+    /// the registry is synced first: the key serves again unless it is saved disabled.
+    /// False when the gateway does not route with it.
+    pub fn reset_key(&self, billing: &BillingEngine, provider_id: &str, key_id: &str) -> bool {
+        self.sync_from_billing(billing);
+        self.pool_for(provider_id)
+            .is_some_and(|pool| pool.reset_key(key_id))
     }
 
     pub fn default_pool(&self) -> Option<ProviderKeyPool> {

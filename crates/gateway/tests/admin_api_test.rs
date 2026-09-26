@@ -1328,3 +1328,126 @@ async fn test_admin_card_history_names_the_operator_and_reason() {
         assert_eq!(response.status(), expected, "{uri}");
     }
 }
+
+/// The console publishes JSON: a model's first price from now (`effective_from_secs: 0`), a
+/// retired flag, and mappings and scheduled prices removed by ID. What refuses a publication
+/// is named in its 409.
+#[tokio::test]
+async fn publication_takes_first_prices_from_now_retirement_and_removals() {
+    use tower::ServiceExt;
+    let (billing, app) = setup_admin_app();
+    billing.upsert_group(billing::Group::pro_plus("group-admin", "Admin"));
+    billing.upsert_provider(billing::Provider::new(
+        "prov",
+        "Upstream",
+        billing::ProviderFormat::OpenAi,
+        "https://example.com",
+    ));
+    billing.upsert_provider_key(billing::ProviderKey::new("key", "prov", "sk-test"));
+    let publish = |update: serde_json::Value| {
+        let app = app.clone();
+        let mut update = update;
+        update["expected_revision"] = json!(billing.commercial_config().revision);
+        update["reason"] = json!("console publication");
+        async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/admin/commercial-config")
+                        .header("x-admin-key", TEST_ADMIN_KEY)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(update.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            )
+        }
+    };
+    let mapping = serde_json::to_value(billing::ModelMap::new(
+        "map-new",
+        "group-admin",
+        "new-model",
+        "prov",
+        "upstream-new",
+    ))
+    .unwrap();
+    let price = |id: &str, from: u64| {
+        serde_json::to_value(billing::RateCardVersion {
+            id: id.to_string(),
+            rate_card_id: "default".to_string(),
+            model: "new-model".to_string(),
+            currency: billing::Currency::Cny,
+            pricing_mode: billing::PricingMode::Fixed,
+            input_price_per_m: 0.0,
+            output_price_per_m: 0.0,
+            cache_creation_price_per_m: 0.0,
+            cache_read_price_per_m: 0.0,
+            fixed_input_credit_per_m: 1_000_000,
+            fixed_output_credit_per_m: 1_000_000,
+            fixed_cache_creation_credit_per_m: 0,
+            fixed_cache_read_credit_per_m: 0,
+            per_call_credit: 0,
+            margin_multiplier: 1.0,
+            effective_from_secs: from,
+        })
+        .unwrap()
+    };
+    let before = gateway::now_secs();
+    let (status, body) = publish(json!({
+        "rate_cards": [{"id": "default", "name": "Default", "created_at_secs": 1}],
+        "models": [mapping.clone()],
+        "versions": [price("v-now", 0), price("v-later", before + 86_400)],
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let versions = body["config"]["versions"].as_array().unwrap();
+    let now = versions.iter().find(|v| v["id"] == "v-now").unwrap();
+    assert!(now["effective_from_secs"].as_u64().unwrap() >= before);
+
+    let mut retired = mapping.clone();
+    retired["retired"] = json!(true);
+    let (status, body) = publish(json!({"models": [retired]})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["config"]["models"][0]["retired"], true);
+
+    let mut invalid = mapping.clone();
+    invalid["exposed_model_id"] = json!("new model");
+    for (update, message) in [
+        (
+            json!({"removed_models": ["map-unknown"]}),
+            "Only hidden or retired mappings can be removed: map-unknown",
+        ),
+        (
+            json!({"cancelled_versions": ["v-now"]}),
+            "Only scheduled prices can be cancelled: v-now",
+        ),
+        (json!({"models": [invalid]}), "Invalid model ID: new model"),
+    ] {
+        let (status, body) = publish(update).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body["error"].as_str().unwrap().ends_with(message), "{body}");
+    }
+    let (status, body) = publish(json!({
+        "removed_models": ["map-new"],
+        "cancelled_versions": ["v-later"],
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["config"]["models"].as_array().unwrap().is_empty());
+    let ids: Vec<_> = body["config"]["versions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["v-now"]);
+}

@@ -255,8 +255,10 @@ impl VirtualizationStore {
                 // Fetch models from billing mapped to this group (respecting visibility and sort_order)
                 let billing_models = billing.list_models_for_group(&bg.id, false);
                 let models: Vec<ModelInfo> = if !billing_models.is_empty() {
-                    let visible: Vec<_> =
-                        billing_models.into_iter().filter(|m| m.visible).collect();
+                    let visible: Vec<_> = billing_models
+                        .into_iter()
+                        .filter(|m| m.is_listed())
+                        .collect();
                     let rates = rate_multipliers(billing, &bg.id, &visible, crate::now_secs());
                     visible
                         .into_iter()

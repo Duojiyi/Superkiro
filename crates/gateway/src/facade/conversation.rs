@@ -393,10 +393,36 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                 );
                 let requested_model_for_reservation = requested_model_for_reservation.as_str();
                 if !valid_model_id(requested_model_for_reservation) {
+                    self.record_refusal(
+                        claims.as_ref(),
+                        &invocation_key,
+                        requested_model_for_reservation,
+                        "invalid_model",
+                    );
                     return error_response(
                         StatusCode::BAD_REQUEST,
                         "InvalidRequestException",
                         "modelId is invalid",
+                    );
+                }
+                // A retired model is refused as one its group does not list, before
+                // anything is held.
+                if claims.as_ref().is_some_and(|claims| {
+                    self.billing
+                        .list_models_for_group(&claims.group_id, false)
+                        .iter()
+                        .any(|m| m.retired && m.matches_model(requested_model_for_reservation))
+                }) {
+                    self.record_refusal(
+                        claims.as_ref(),
+                        &invocation_key,
+                        requested_model_for_reservation,
+                        "model_retired",
+                    );
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        "ValidationException",
+                        "Requested model is not available for this card group",
                     );
                 }
                 let input_limit = input_limit_for_model(
@@ -492,6 +518,12 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                             );
                         }
                         billing::engine::BillingError::ModelNotPriced(_) => {
+                            self.record_refusal(
+                                claims.as_ref(),
+                                &invocation_key,
+                                requested_model_for_reservation,
+                                "no_price",
+                            );
                             return error_response(
                                 StatusCode::BAD_REQUEST,
                                 "ValidationException",
@@ -526,6 +558,15 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                     if has_reservation {
                         let _ = self.billing.release(&invocation_key);
                     }
+                    let model = parsed_request.as_ref().map(|request| {
+                        requested_model_id(request, claims.as_ref(), &self.billing, fallback_model)
+                    });
+                    self.record_refusal(
+                        claims.as_ref(),
+                        &invocation_key,
+                        model.as_deref().unwrap_or_default(),
+                        "no_route",
+                    );
                     return error_response(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "ServiceUnavailableException",
@@ -583,6 +624,17 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                             if has_reservation {
                                 let _ = self.billing.release(&invocation_key);
                             }
+                            self.record_refusal(
+                                Some(claims),
+                                &invocation_key,
+                                &requested_model_id(
+                                    &kiro_req,
+                                    Some(claims),
+                                    &self.billing,
+                                    fallback_model,
+                                ),
+                                "no_route",
+                            );
                             return error_response(
                                 StatusCode::FORBIDDEN,
                                 "AccessDeniedException",
@@ -603,6 +655,12 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                 if has_reservation {
                     let _ = self.billing.release(&invocation_key);
                 }
+                self.record_refusal(
+                    claims.as_ref(),
+                    &invocation_key,
+                    requested_model,
+                    "invalid_model",
+                );
                 return error_response(
                     StatusCode::BAD_REQUEST,
                     "InvalidRequestException",
@@ -629,9 +687,10 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
             if let Some(ref claims) = claims {
                 if let Some(group) = self.billing.get_group(&claims.group_id) {
                     let billing_models = self.billing.list_models_for_group(&group.id, false);
+                    // A retired mapping is never routed; a hidden one may still be named.
                     if let Some(m) = billing_models
                         .iter()
-                        .find(|bm| bm.matches_model(requested_model))
+                        .find(|bm| !bm.retired && bm.matches_model(requested_model))
                     {
                         target_model = m.target_model.clone();
                         fallback_targets = m.full_target_chain();
@@ -653,6 +712,12 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                         if has_reservation {
                             let _ = self.billing.release(&invocation_key);
                         }
+                        self.record_refusal(
+                            Some(claims),
+                            &invocation_key,
+                            requested_model,
+                            "model_not_listed",
+                        );
                         return error_response(
                             StatusCode::BAD_REQUEST,
                             "ValidationException",
@@ -668,6 +733,12 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                 if has_reservation {
                     let _ = self.billing.release(&invocation_key);
                 }
+                self.record_refusal(
+                    claims.as_ref(),
+                    &invocation_key,
+                    requested_model,
+                    "model_not_listed",
+                );
                 return error_response(
                     StatusCode::BAD_REQUEST,
                     "ValidationException",
@@ -678,6 +749,12 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                 if has_reservation {
                     let _ = self.billing.release(&invocation_key);
                 }
+                self.record_refusal(
+                    claims.as_ref(),
+                    &invocation_key,
+                    requested_model,
+                    "unsupported_capability",
+                );
                 return error_response(
                     StatusCode::BAD_REQUEST,
                     "ValidationException",
@@ -712,6 +789,12 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                 if has_reservation {
                     let _ = self.billing.release(&invocation_key);
                 }
+                self.record_refusal(
+                    claims.as_ref(),
+                    &invocation_key,
+                    requested_model,
+                    "unsupported_capability",
+                );
                 return error_response(
                     StatusCode::BAD_REQUEST,
                     "ValidationException",
@@ -852,6 +935,12 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                 }
                 if candidates.is_empty() {
                     let _ = self.billing.release(&invocation_key);
+                    self.record_refusal(
+                        claims.as_ref(),
+                        &invocation_key,
+                        requested_model,
+                        "no_route",
+                    );
                     return error_response(
                         StatusCode::BAD_GATEWAY,
                         "RoutingException",
@@ -941,7 +1030,7 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                             error_class: route_result
                                 .as_ref()
                                 .err()
-                                .map(|_| "upstream_start_failed".into()),
+                                .map(|error| route_failure_class(error, &attempts).into()),
                             provider_id: attempts.last().map(|a| a.provider_id.clone()),
                             input_tokens: 0,
                             output_tokens: 0,
@@ -990,6 +1079,12 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                     if let Some(ref g) = card_group {
                         if !g.can_access_provider(provider_config.group_id.as_deref()) {
                             let _ = self.billing.release(&invocation_key);
+                            self.record_refusal(
+                                claims.as_ref(),
+                                &invocation_key,
+                                requested_model,
+                                "no_route",
+                            );
                             return error_response(
                                 StatusCode::FORBIDDEN,
                                 "AccessDeniedException",
@@ -1033,6 +1128,12 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                     }
                 } else {
                     let _ = self.billing.release(&invocation_key);
+                    self.record_refusal(
+                        claims.as_ref(),
+                        &invocation_key,
+                        requested_model,
+                        "no_route",
+                    );
                     return error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "ServiceUnavailableException",
@@ -1092,6 +1193,50 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
 }
 
 impl GenerateAssistantResponseHandler {
+    /// Records an authenticated request refused before it was routed: nothing was sent
+    /// upstream and nothing is charged. The model it named is kept only when it is a valid
+    /// model ID; the request's content is never kept.
+    fn record_refusal(
+        &self,
+        claims: Option<&AuthClaims>,
+        invocation_key: &str,
+        model: &str,
+        error_class: &str,
+    ) {
+        let Some(claims) = claims else {
+            return;
+        };
+        self.billing
+            .record_trace(billing::observability::RequestTrace {
+                id: format!(
+                    "refused-{}-{}",
+                    invocation_key,
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                ),
+                card_id: claims.card_id.clone(),
+                ts: crate::now_secs(),
+                invocation_id: invocation_key.to_string(),
+                exposed_model: if valid_model_id(model) {
+                    model.trim().to_string()
+                } else {
+                    String::new()
+                },
+                status: billing::observability::TraceStatus::Error,
+                ttft_ms: None,
+                tokens_per_second: None,
+                error_class: Some(error_class.to_string()),
+                provider_id: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                credits_charged: 0,
+                provider_cost_micro_cny: 0,
+                attempt_chain: Vec::new(),
+            });
+    }
+
     /// Bill what the last empty attempt reported, when no attempt of the request produced
     /// anything: each consumed the input it reported, and the request pays for it once,
     /// however many times it was retried. An attempt that answers is billed by its stream
@@ -1153,6 +1298,18 @@ async fn with_empty_attempt<T>(
             (result, empty)
         })
         .await
+}
+
+/// How a request whose upstream could not be started is traced. When no Key may call its
+/// target, nothing was sent: it is refused for want of a route.
+fn route_failure_class(
+    error: &GovernanceError,
+    attempts: &[billing::observability::AttemptRecord],
+) -> &'static str {
+    match error {
+        GovernanceError::NoAvailableKeys { .. } if attempts.is_empty() => "no_route",
+        _ => "upstream_start_failed",
+    }
 }
 
 /// A request whose every attempt came back empty. It was billed the input consumed, so it
@@ -1283,13 +1440,9 @@ fn requested_model_id(
         )
 }
 
+/// The rule a published model ID and alias meet, around surrounding whitespace.
 fn valid_model_id(model: &str) -> bool {
-    let model = model.trim();
-    !model.is_empty()
-        && model.chars().count() <= 128
-        && model
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '/'))
+    billing::group::valid_model_id(model.trim())
 }
 
 fn estimate_input_tokens(request: &GenerateAssistantResponseRequest) -> u64 {

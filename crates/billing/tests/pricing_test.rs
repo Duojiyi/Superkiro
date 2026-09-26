@@ -598,6 +598,7 @@ fn test_stacked_multipliers_model_map_group_and_rate_card() {
         display_name: None,
         description: None,
         rate_multiplier: None,
+        retired: false,
     };
     engine.upsert_model_map(model_map);
 
@@ -1085,4 +1086,158 @@ fn a_model_without_a_published_price_is_refused_before_any_work() {
         )
         .unwrap();
     assert_eq!(reservation.rate_card_version.as_deref(), Some("v-priced"));
+}
+
+/// A price version that also records what the upstream costs: `cost_cny_per_m` CNY per
+/// million output tokens.
+fn priced(
+    id: &str,
+    rate_card_id: &str,
+    model: &str,
+    credits_per_m: i64,
+    cost_cny_per_m: f64,
+) -> RateCardVersion {
+    RateCardVersion {
+        output_price_per_m: cost_cny_per_m,
+        ..output_price(id, rate_card_id, model, credits_per_m)
+    }
+}
+
+/// One activated card in `group_id`, pricing from `rate_card_id`, and its mappings.
+fn priced_engine(group_id: &str, rate_card_id: &str, maps: Vec<ModelMap>) -> BillingEngine {
+    let engine = BillingEngine::new();
+    let mut group = Group::pro_plus(group_id, "Pricing");
+    group.rate_card_id = rate_card_id.to_string();
+    engine.upsert_group(group);
+    for map in maps {
+        engine.upsert_model_map(map);
+    }
+    let mut card = Card::new("card", group_id, 5_000 * MICRO_CREDITS_PER_CREDIT);
+    card.activate(1_000, 86_400).unwrap();
+    engine.upsert_card(card);
+    engine
+}
+
+/// Reserve `requested` and settle one million output tokens served by `provider/target`.
+fn million_out(
+    engine: &BillingEngine,
+    invocation: &str,
+    requested: &str,
+    provider: &str,
+    target: &str,
+) -> billing::ledger::LedgerEntry {
+    let params = ReservationEstimateParams::new(0, 1_000_000).with_model(requested);
+    engine
+        .reserve("card", invocation, &params, 1_000, 300)
+        .unwrap();
+    let tokens = UsageTokens {
+        output_tokens: 1_000_000,
+        ..UsageTokens::default()
+    };
+    engine
+        .settle(invocation, &tokens, requested, provider, target, 1_001)
+        .unwrap()
+}
+
+/// Every listed model is exposed under its target's own name and requested by it, so its
+/// price and cost are resolved as they always were: the price named after it, the cost from
+/// a provider-qualified version first, and a fallback costed as its own target.
+#[test]
+fn a_model_exposed_as_its_target_is_priced_and_costed_as_before() {
+    let engine = priced_engine(
+        "group-same",
+        "rc-same",
+        vec![
+            ModelMap::new("map-x", "group-same", "model-x", "prov-a", "model-x")
+                .with_fallback("prov-b", "backup-x"),
+        ],
+    );
+    engine.upsert_rate_card_version(priced("v-model", "rc-same", "model-x", 100, 7.0));
+    engine.upsert_rate_card_version(priced("v-star", "rc-same", "*", 1, 1.0));
+    engine.upsert_rate_card_version(priced("v-backup", "rc-same", "backup-x", 50, 3.0));
+
+    let primary = million_out(&engine, "inv-primary", "model-x", "prov-a", "model-x");
+    assert_eq!(primary.rate_card_version.as_deref(), Some("v-model"));
+    assert_eq!(primary.credits_charged, 100 * MICRO_CREDITS_PER_CREDIT);
+    assert_eq!(primary.provider_cost_micro_cny, 7_000_000);
+    assert_eq!(
+        primary.reason.as_deref(),
+        Some("provider_cost:rate_card_version=v-model")
+    );
+
+    let fallback = million_out(&engine, "inv-fallback", "model-x", "prov-b", "backup-x");
+    assert_eq!(fallback.rate_card_version.as_deref(), Some("v-model"));
+    assert_eq!(fallback.credits_charged, 100 * MICRO_CREDITS_PER_CREDIT);
+    assert_eq!(fallback.provider_cost_micro_cny, 3_000_000);
+
+    engine.upsert_rate_card_version(priced("v-qualified", "rc-same", "prov-a/model-x", 1, 5.0));
+    let qualified = million_out(&engine, "inv-qualified", "model-x", "prov-a", "model-x");
+    assert_eq!(qualified.rate_card_version.as_deref(), Some("v-model"));
+    assert_eq!(qualified.credits_charged, 100 * MICRO_CREDITS_PER_CREDIT);
+    assert_eq!(qualified.provider_cost_micro_cny, 5_000_000);
+    assert_eq!(
+        engine.display_price("group-same", "model-x", 1_000),
+        Some(100 * MICRO_CREDITS_PER_CREDIT)
+    );
+}
+
+/// A request through an alias is the model's request: it pays the model's own price, as
+/// its exposed ID does, not its target's. Served by its primary target, it is costed at
+/// that price too, ahead of a price published for the target.
+#[test]
+fn a_request_through_an_alias_is_priced_like_the_model() {
+    let engine = priced_engine(
+        "group-alias",
+        "rc-alias",
+        vec![
+            ModelMap::new("map-a", "group-alias", "model-a", "prov", "upstream-a")
+                .with_alias("alias-a"),
+        ],
+    );
+    engine.upsert_rate_card_version(priced("v-model-a", "rc-alias", "model-a", 100, 6.0));
+    engine.upsert_rate_card_version(priced("v-upstream-a", "rc-alias", "upstream-a", 1, 2.0));
+
+    for (invocation, requested) in [("inv-alias", "alias-a"), ("inv-exposed", "model-a")] {
+        let entry = million_out(&engine, invocation, requested, "prov", "upstream-a");
+        assert_eq!(entry.rate_card_version.as_deref(), Some("v-model-a"));
+        assert_eq!(entry.credits_charged, 100 * MICRO_CREDITS_PER_CREDIT);
+        assert_eq!(entry.provider_cost_micro_cny, 6_000_000);
+    }
+}
+
+/// A fallback's own provider-qualified cost applies when it serves: ahead of its target's
+/// shared price, and never the primary target's cost, whatever the request is charged.
+#[test]
+fn a_provider_qualified_cost_applies_to_a_fallback_served_request() {
+    let engine = priced_engine(
+        "group-fallback",
+        "rc-fallback",
+        vec![
+            ModelMap::new("map-f", "group-fallback", "model-f", "prov-main", "main-f")
+                .with_fallback("prov-backup", "backup-f")
+                .with_fallback("prov-other", "backup-f"),
+        ],
+    );
+    engine.upsert_rate_card_version(priced("v-model-f", "rc-fallback", "model-f", 100, 9.0));
+    engine.upsert_rate_card_version(priced("v-backup-f", "rc-fallback", "backup-f", 1, 4.0));
+    engine.upsert_rate_card_version(priced(
+        "v-qualified",
+        "rc-fallback",
+        "prov-backup/backup-f",
+        1,
+        2.0,
+    ));
+
+    let qualified = million_out(&engine, "inv-backup", "model-f", "prov-backup", "backup-f");
+    assert_eq!(qualified.rate_card_version.as_deref(), Some("v-model-f"));
+    assert_eq!(qualified.credits_charged, 100 * MICRO_CREDITS_PER_CREDIT);
+    assert_eq!(qualified.provider_cost_micro_cny, 2_000_000);
+    assert_eq!(
+        qualified.reason.as_deref(),
+        Some("provider_cost:rate_card_version=v-qualified")
+    );
+
+    let shared = million_out(&engine, "inv-other", "model-f", "prov-other", "backup-f");
+    assert_eq!(shared.rate_card_version.as_deref(), Some("v-model-f"));
+    assert_eq!(shared.provider_cost_micro_cny, 4_000_000);
 }

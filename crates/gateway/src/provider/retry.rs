@@ -37,6 +37,19 @@ pub(crate) fn stream_error(value: &serde_json::Value) -> ProviderError {
     }
 }
 
+/// A failed attempt as traces and the console name it: its kind only, never the upstream's
+/// message, which can carry prompts or credentials.
+pub(crate) fn failure_class(error: &ProviderError) -> String {
+    match error {
+        ProviderError::Http(status, _) => format!("http_{}", status.as_u16()),
+        ProviderError::Service => "upstream_service".into(),
+        ProviderError::Parse(_) => "protocol".into(),
+        ProviderError::Timeout | ProviderError::Watchdog(_) => "timeout".into(),
+        ProviderError::EmptyCompletion => "empty".into(),
+        _ => "transport".into(),
+    }
+}
+
 fn retryable(error: &ProviderError) -> bool {
     match error {
         // 429 is deliberately left to key cooldown: this adapter cannot yet retain Retry-After.
@@ -138,14 +151,7 @@ pub async fn start_stream(
                         key_id: key_id.clone(),
                         provider_id: provider_id.clone(),
                         success: result.is_ok(),
-                        error: result.as_ref().err().map(|e| match e {
-                            ProviderError::Http(status, _) => format!("http_{}", status.as_u16()),
-                            ProviderError::Service => "upstream_service".into(),
-                            ProviderError::Parse(_) => "protocol".into(),
-                            ProviderError::Timeout | ProviderError::Watchdog(_) => "timeout".into(),
-                            ProviderError::EmptyCompletion => "empty".into(),
-                            _ => "transport".into(),
-                        }),
+                        error: result.as_ref().err().map(failure_class),
                         latency_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
                     });
             });

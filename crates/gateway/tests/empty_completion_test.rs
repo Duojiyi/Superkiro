@@ -110,6 +110,8 @@ async fn run_after(first: &[Value], frames: &[Value]) -> Outcome {
                 models: vec![mapping],
                 rate_cards: vec![],
                 versions: vec![],
+                removed_models: vec![],
+                cancelled_versions: vec![],
             },
             1_700_000_000,
         )
