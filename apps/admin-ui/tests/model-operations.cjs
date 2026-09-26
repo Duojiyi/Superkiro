@@ -26,10 +26,11 @@ const model=id=>fixture.config.models.find(row=>row.id===id);
     await page.route('**/*',route=>new URL(route.request().url()).origin===origin?route.continue():route.abort());
     const button=name=>page.getByRole('button',{name,exact:true});
     const nav=name=>page.getByRole('navigation').getByRole('button',{name,exact:true}).click();
-    const confirm=async({option,reason}={})=>{
+    const confirm=async({option,reason,typed}={})=>{
       const box=page.getByRole('alertdialog');await box.waitFor();const text=await box.innerText();
       if(option!==undefined)await box.getByRole('checkbox').setChecked(option);
-      if(reason!==undefined)await box.locator('#confirm-reason').fill(reason);
+      if(reason!==undefined){assert(await box.locator('[data-confirm="accept"]').isDisabled(),'a reason is required first');await box.locator('#confirm-reason').fill(reason);}
+      if(typed!==undefined)await box.getByLabel('确认输入').fill(typed);
       await box.locator('[data-confirm="accept"]').click();await box.waitFor({state:'detached'});return text;
     };
     const bar=page.getByRole('region',{name:'发布'});
@@ -116,6 +117,57 @@ const model=id=>fixture.config.models.find(row=>row.id===id);
     assert.deepEqual(await page.evaluate(()=>JSON.parse(localStorage.getItem('admin-listing-rates:v2'))),{retail:'0.3',upstream:{'fixture-provider':'0.06'}});
     await drawer.getByRole('button',{name:'取消',exact:true}).click();await drawer.waitFor({state:'detached'});
     console.log('PASS: 调价 computes new prices and costs from official prices, remembering the multipliers per provider');
+
+    // 隐藏 / 下架 / 恢复 / 删除, each confirmed with what it does, a reason, and the state shown.
+    const menu=async(name,item)=>{await button(`${name} 的更多操作`).click();const entry=page.getByRole('menuitem',{name:item,exact:true});await entry.waitFor();return entry;};
+    const state=name=>page.getByRole('row').filter({has:page.getByRole('button',{name:`${name} 的更多操作`,exact:true})}).locator('td.col-status');
+    assert.equal(await state('claude-sonnet').innerText(),'在售');
+    assert(await (await menu('claude-sonnet','删除（仅隐藏或已下架的条目）')).isDisabled(),'a model on sale cannot be deleted');
+    await page.keyboard.press('Escape');
+    await (await menu('claude-sonnet','隐藏（已在用的客户仍可用）')).click();
+    const hideFacts=await confirm({reason:'先不对新客户开放'});
+    assert(hideFacts.includes('它是 PRO 的默认模型：之后默认变为 gpt-6-astra')&&hideFacts.includes('已经在用这个模型 ID 的客户仍可继续调用'),hideFacts);
+    await page.locator('.toast').filter({hasText:'已隐藏 claude-sonnet'}).waitFor();
+    let sentState=published().at(-1).body;
+    assert.deepEqual([sentState.reason,sentState.models.map(row=>[row.id,row.visible,row.retired])],['先不对新客户开放',[['fixture-model-0',false,false]]]);
+    assert.equal(await state('claude-sonnet').innerText(),'隐藏');
+    await header.getByText('Kiro 默认：gpt-6-astra').waitFor();
+    await (await menu('claude-sonnet','下架（停止服务）')).click();
+    assert((await confirm({reason:'上游停止供应'})).includes('所有请求都会被拒绝，包括已经在用的客户'));
+    await page.locator('.toast').filter({hasText:'已下架 claude-sonnet'}).waitFor();
+    assert.deepEqual(published().at(-1).body.models.map(row=>[row.id,row.visible,row.retired]),[['fixture-model-0',false,true]]);
+    assert.equal(await state('claude-sonnet').innerText(),'已下架');
+    // A server that does not keep 已下架 is called out, not shown as retired.
+    let strip=true;
+    await page.route('**/api/v1/admin/commercial-config',async route=>{
+      if(route.request().method()!=='POST'||!strip)return route.fallback();
+      strip=false;const response=await route.fetch(),body=await response.json();
+      for(const row of body.config.models)delete row.retired;
+      return route.fulfill({response,json:body});
+    });
+    await (await menu('gemini-pro','下架（停止服务）')).click();await confirm({reason:'试下架'});
+    await page.getByRole('status').filter({hasText:'服务器没有记下“已下架”（可能还不支持）：gemini-pro 已隐藏，但已经在用它的客户仍能调用'}).waitFor();
+    await button('刷新').click();await page.locator('.btn-refresh:not([disabled])').waitFor();
+    // 恢复 needs a route that serves and a price in force.
+    await (await menu('claude-sonnet','恢复')).click();await confirm({reason:'恢复供应'});
+    await page.locator('.toast').filter({hasText:'已恢复 claude-sonnet'}).waitFor();
+    assert.deepEqual(published().at(-1).body.models.map(row=>[row.id,row.visible,row.retired]),[['fixture-model-0',true,false]]);
+    assert.equal(await state('claude-sonnet').innerText(),'在售');
+    const key=fixture.keys.find(row=>row.id==='fixture-key'),allowed=key.allowed_models;key.allowed_models=allowed.filter(name=>name!=='gemini-pro');
+    await button('刷新').click();await page.locator('.btn-refresh:not([disabled])').waitFor();
+    const count=published().length;
+    await (await menu('gemini-pro','恢复')).click();
+    await page.getByRole('status').filter({hasText:'不能恢复 gemini-pro：主线路不能用（测试供应商 / Fixture 没有启用的 Key 授权 gemini-pro）'}).waitFor();
+    assert.equal(published().length,count,'nothing is sent');
+    key.allowed_models=allowed;
+    // 删除: only hidden or retired entries, the word typed, and a reason.
+    await (await menu('gemini-pro','删除（仅隐藏或已下架的条目）')).click();
+    assert((await confirm({reason:'不再供应',typed:'删除'})).includes('不能撤销'));
+    await page.locator('.toast').filter({hasText:'已删除 gemini-pro'}).waitFor();
+    assert.deepEqual(Object.keys(published().at(-1).body).sort(),['expected_revision','reason','removed_models']);
+    assert.deepEqual(published().at(-1).body.removed_models,['fixture-model-2']);
+    assert.equal(await page.getByRole('rowgroup',{name:'PRO Max',exact:true}).count(),0,'the group without models is no longer listed');
+    console.log('PASS: 隐藏 / 下架 / 恢复 / 删除: consequences and the next default stated, reasons required, state column, a server not keeping 已下架 called out, 恢复 refused without a route, 删除 only when not on sale');
   }finally{
     await browser?.close();server.close();
   }

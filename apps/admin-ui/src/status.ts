@@ -51,6 +51,13 @@ const ERROR_CLASS: Record<string, string> = {
   stream_incomplete: '输出中断',
   empty_completion: '上游返回空内容',
   settlement_failed: '结算失败',
+  // Refused before any upstream was tried.
+  no_price: '没有生效中的价格',
+  model_not_listed: '模型未上架',
+  model_retired: '模型已下架',
+  invalid_model: '模型 ID 无效',
+  no_route: '无可用线路',
+  unsupported_capability: '模型不支持这项能力',
 };
 
 /** A failure class in words; unknown classes are shown as they are. */
@@ -75,6 +82,13 @@ export function stopReasonView(reason: unknown): StatusView | null {
   if (reason === 'tool_use') return {label: '调用工具', tone: 'info', title: reason};
   if (reason === 'max_tokens') return {label: '达到输出上限', tone: 'warning', title: reason};
   return {label: reason, tone: 'outline'};
+}
+
+/** A model as customers meet it: 在售 (listed), 隐藏 (not listed, still served to whoever uses its ID), 已下架 (refused). */
+export function modelStateView(model: Row): StatusView {
+  if (model.retired === true) return {label: '已下架', tone: 'neutral', title: '不在客户的模型列表里，请求会被拒绝'};
+  if (model.visible === false) return {label: '隐藏', tone: 'outline', title: '不在客户的模型列表里；已经在用这个模型 ID 的客户仍可调用'};
+  return {label: '在售', tone: 'success'};
 }
 
 /** A 测试 result in a few words: 成功 · 首字 410 ms, or what failed. */

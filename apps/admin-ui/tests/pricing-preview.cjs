@@ -169,7 +169,7 @@ const Editor = load('CommercialEditor.tsx', {'./tokens': tokens, './api': {admin
   // Dialogs, drawers and messages only run from event handlers; the render tree just names the components.
   './components/confirm': {confirmAction: async () => true}, './components/toast': {toast: {success() {}, info() {}, error() {}}},
   './components/modal': {Drawer: 'Drawer', Modal: 'Modal'}, './components/icons': {IconImage: 'IconImage', IconSpark: 'IconSpark', IconTool: 'IconTool'},
-  './components/ui': {InfoTip: 'InfoTip', Tag: 'Tag', TopbarActions: 'TopbarActions'}, './PriceDrawer': {default: 'PriceDrawer'}, './PriceVersions': {default: 'PriceVersions'}, './ListModelDrawer': {default: 'ListModelDrawer'},
+  './components/ui': {InfoTip: 'InfoTip', StatusBadge: 'StatusBadge', Tag: 'Tag', TopbarActions: 'TopbarActions'}, './status': load('status.ts'), './PriceDrawer': {default: 'PriceDrawer'}, './PriceVersions': {default: 'PriceVersions'}, './ListModelDrawer': {default: 'ListModelDrawer'},
   './RouteEditor': {default: 'RouteEditor'}, './RouteSwitchDrawer': {default: 'RouteSwitchDrawer'}, './BulkPriceDrawer': {default: 'BulkPriceDrawer'}, './components/menu': {Menu: 'Menu'},
   './listing': load('listing.ts', {'./priceChange': change, './routes': routes}),
   react, 'react/jsx-runtime': runtime}).default;

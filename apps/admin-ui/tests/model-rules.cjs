@@ -154,3 +154,9 @@ for (const [how, value, pattern] of [['percent', '-100', /100%/], ['factor', '0'
 }
 assert.throws(() => change.scaledPrice(change.MAX_PRICE_MICRO, 'factor', '2'), /最多 1,000,000/);
 console.log('PASS bulk prices: factors and percentages exact, half up, with their limits');
+
+// States as customers meet them, and the refusals traces now name.
+const status = load('status.ts');
+assert.deepEqual([{}, {visible: false}, {retired: true}, {visible: false, retired: true}].map(row => status.modelStateView(row).label), ['在售', '隐藏', '已下架', '已下架']);
+assert.equal(status.errorClassLabel('model_retired'), '模型已下架');assert.equal(status.errorClassLabel('no_route'), '无可用线路');assert.equal(status.errorClassLabel('something_new'), 'something_new');
+console.log('PASS model states 在售 / 隐藏 / 已下架 and refusal classes in words');

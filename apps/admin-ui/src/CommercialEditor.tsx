@@ -1,11 +1,11 @@
 import { parseTokenInput, formatTokens } from './tokens';
 import { useEffect, useRef, useState } from 'react';
 import { adminApi, AdminApiError, type AdminCardItem, type CommercialConfig } from './api';
-import { confirmAction } from './components/confirm';
+import { ask, confirmAction } from './components/confirm';
 import { toast } from './components/toast';
 import { Drawer, Modal } from './components/modal';
 import { Menu } from './components/menu';
-import { InfoTip, Tag, TopbarActions } from './components/ui';
+import { InfoTip, StatusBadge, Tag, TopbarActions } from './components/ui';
 import { IconImage, IconSpark, IconTool } from './components/icons';
 import { formatClock, formatCount, formatTokenCount, shortHash } from './format';
 import { creditsText, currentVersion, timeDraftVersions } from './priceChange';
@@ -19,6 +19,7 @@ import RouteSwitchDrawer, { type SwitchedRoute } from './RouteSwitchDrawer';
 import { rebaseDraft } from './rebase';
 import { publishFailure } from './refusal';
 import { authorizedModels, canRoute, isLive, modelName, modelRoute, nameList, targetProblem, targetsOf, targetState } from './routes';
+import { modelStateView } from './status';
 
 type Row = Record<string, unknown>;
 
@@ -284,14 +285,19 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
   // One change published on its own: 调价 (a price version), 上架 (a new model), a row action.
   // `done` is the confirmation shown on success; `check`, what to look for when the result is
   // not confirmed.
-  const publishOne = async (update: {models?: Row[]; versions?: Row[]; removed_models?: string[]; cancelled_versions?: string[]}, updateReason: string, action: string, done?: string, check?: string): Promise<PublishOutcome> => {
+  // `verify` looks at the configuration the server returns and says what it did not keep, if anything.
+  const publishOne = async (update: {models?: Row[]; versions?: Row[]; removed_models?: string[]; cancelled_versions?: string[]}, updateReason: string, action: string, done?: string, check?: string, verify?: (next: CommercialConfig) => string): Promise<PublishOutcome> => {
     if (!config || pending.current || needsReview || dirty) return {ok: false, message: '有未完成的发布或修改，请先处理'};
     pending.current = true; setBusy(true); setMessage('');
     try {
       const result = await adminApi.publishCommercialConfig({...update, expected_revision: config.revision, reason: updateReason});
       if (result.success !== true) throw new AdminApiError('服务器未确认发布成功', 400);
       if (!result.config?.revision) throw new Error('服务器未返回可核对的配置版本');
-      if (alive.current) {apply(result.config, false); if (done) toast.success(done); onPublished?.();}
+      if (alive.current) {
+        apply(result.config, false); if (done) toast.success(done); onPublished?.();
+        const warning = verify?.(result.config);
+        if (warning) say(warning, 'warning');
+      }
       return {ok: true};
     } catch (error) {
       // Refusals (the server says 409 for every rule) change nothing and can be corrected.
@@ -319,7 +325,7 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
   };
   // 调价 and 上架 publish on their own, so only from a page with nothing else unpublished.
   const ownBlocked = (action: string) => needsReview ? '请先重新加载确认上次发布' : dirty ? `先发布或放弃未发布的修改，再${action}` : busy ? '正在处理' : undefined;
-  const priceBlocked = ownBlocked('调价'), listingBlocked = ownBlocked('上架'), canListModels = kind === 'models';
+  const priceBlocked = ownBlocked('调价'), listingBlocked = ownBlocked('上架'), stateBlocked = ownBlocked('操作'), canListModels = kind === 'models';
   const openListing = (preset: {providerId?: string; model?: string}) => {setJsonOpen(false); setPriceModel(null); setSwitching(false); setBulkPricing(false); setListing(preset);};
   // A link from 供应商与 Key opens the drawer for that provider's model, once, when the page has loaded.
   const intentUsed = useRef(false);
@@ -473,7 +479,7 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
                 <td key="a"><span className="capabilities">{capability(row)}</span></td>,
                 <td key="p" className="num" title={price ? `版本 ${String(price.id)}（积分 / 百万 Tokens）` : '没有生效中的价格'}>{price && price.pricing_mode === 'fixed'
                   ? `${creditsText(price.fixed_input_credit_per_m) ?? '?'} / ${creditsText(price.fixed_output_credit_per_m) ?? '?'}` : price ? '非固定' : <span className="is-warning">未定价</span>}</td>,
-                <td key="v">{row.visible === false ? <span className="muted">隐藏</span> : '✓'}</td>];
+                <td key="v" className="col-status"><StatusBadge view={modelStateView(row)}/></td>];
             return <tr key={String(row.id ?? index)} className={active ? 'is-selected' : undefined}>
               {kind === 'models' && <td className="col-check"><input type="checkbox" aria-label={`选择 ${String(row.exposed_model_id ?? row.id)}`} disabled={!published}
                 title={published ? undefined : '先发布这个模型'} checked={picked.includes(String(row.id))} onChange={event => pick(String(row.id), event.target.checked)}/></td>}
@@ -488,9 +494,51 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
                   onClick={() => {setJsonOpen(false); setListing(null); setPriceModel(String(row.id));}}>调价</button>}
                 {kind === 'models' && <Menu label={`${name} 的更多操作`} disabled={busy} items={[
                   {label: '设为默认（排到最前）', disabled: (isDefault && !tiedDefault) || !isLive(row), title: isDefault && !tiedDefault ? '已经是默认模型' : !isLive(row) ? '客户看不到的模型不能做默认' : undefined, onSelect: () => move(row, 'first')},
+                  // The state actions publish on their own, so only for a published model and a page with nothing unpublished.
+                  ...(published ? [
+                    ...(isLive(row) ? [{label: '隐藏（已在用的客户仍可用）', disabled: !!stateBlocked, title: stateBlocked, onSelect: () => void changeState(row, 'hide')}] : []),
+                    ...(!isLive(row) ? [{label: '恢复', disabled: !!stateBlocked, title: stateBlocked, onSelect: () => void changeState(row, 'restore')}] : []),
+                    ...(row.retired !== true ? [{label: '下架（停止服务）', danger: true, disabled: !!stateBlocked, title: stateBlocked, onSelect: () => void changeState(row, 'retire')}] : []),
+                    {label: '删除（仅隐藏或已下架的条目）', danger: true, disabled: !!stateBlocked || isLive(row), title: isLive(row) ? '先隐藏或下架，再删除' : stateBlocked, onSelect: () => void changeState(row, 'remove')},
+                  ] : []),
                 ]}/>}
               </span></td>
             </tr>;
+  };
+
+  // 隐藏 / 下架 / 恢复 / 删除: one published model, on its own, with a reason, after a confirmation
+  // that says what customers will see and whether requests still work.
+  type StateAction = 'hide' | 'retire' | 'restore' | 'remove';
+  const changeState = async (row: Row, action: StateAction) => {
+    const model = configModels.find(item => item.id === row.id);
+    if (!model || !config) return;
+    const blocked = ownBlocked('操作');
+    if (blocked) {say(blocked, 'warning'); return;}
+    const name = modelName(model, configModels, configGroups), group = String(configGroups.find(item => item.id === model.group_id)?.name ?? model.group_id);
+    if (action === 'restore') {
+      const route = modelRoute(model, {providers, keys: providerKeys});
+      if (routesKnown && !route.primary.ok) {say(`不能恢复 ${name}：主线路不能用（${targetProblem(route.primary, providers)}）。先修好线路，或在“线路”里换一条`, 'warning'); return;}
+      if (!priceOf(model)) {say(`不能恢复 ${name}：它没有生效中的价格，先调价`, 'warning'); return;}
+    }
+    // Hiding or retiring the group's default makes the next shown model the default.
+    const wasDefault = defaultModel(configModels, model.group_id) === model && action !== 'restore';
+    const nextDefault = wasDefault ? defaultModel(configModels.filter(item => item !== model), model.group_id) : null;
+    const plan = {
+      hide: {label: '隐藏', title: `隐藏 ${name}？`, change: {visible: false}, consequence: '客户的模型列表里不再显示；已经在用这个模型 ID 的客户仍可继续调用，照常扣费。'},
+      retire: {label: '下架', title: `下架 ${name}？`, change: {visible: false, retired: true}, danger: true, consequence: '不再显示，所有请求都会被拒绝，包括已经在用的客户。线路和价格都保留，可以随时恢复。'},
+      restore: {label: '恢复', title: `恢复 ${name}？`, change: {visible: true, retired: false}, consequence: '重新出现在客户的模型列表里，可以正常调用。'},
+      remove: {label: '删除', title: `删除 ${name}？`, change: null, danger: true, typed: '删除', consequence: '删除这个模型条目，不能撤销：要再卖需要重新上架。它的价格版本仍留在价格表里。'},
+    }[action];
+    const answer = await ask({title: plan.title, facts: [`${group} · 现在：${modelStateView(model).label}`,
+      ...(wasDefault ? [nextDefault ? `它是 ${group} 的默认模型：之后默认变为 ${String(nextDefault.exposed_model_id)}` : `它是 ${group} 唯一对客户可见的模型：之后这个分组没有可选的模型`] : [])],
+      consequence: plan.consequence, confirmLabel: plan.label, danger: 'danger' in plan && plan.danger, typed: 'typed' in plan ? plan.typed : undefined,
+      reason: {label: '原因', required: true, maxLength: 160, placeholder: action === 'retire' ? '例：上游停止供应' : action === 'hide' ? '例：先不对新客户开放' : undefined}});
+    if (!answer.confirmed) return;
+    const outcome = await publishOne(plan.change ? {models: [{...model, ...plan.change}]} : {removed_models: [String(model.id)]}, answer.reason, plan.label, `已${plan.label} ${name}`,
+      action === 'remove' ? `列表里是否还有 ${name}` : `${name} 的状态是否已是“${plan.label === '恢复' ? '在售' : plan.label === '下架' ? '已下架' : '隐藏'}”`,
+      // A server that does not know 已下架 keeps serving the model: say so, rather than showing it retired.
+      next => action === 'retire' && next.models.find(item => item.id === model.id)?.retired !== true ? `服务器没有记下“已下架”（可能还不支持）：${name} 已隐藏，但已经在用它的客户仍能调用` : '');
+    if (!outcome.ok && !outcome.uncertain) say(outcome.message);
   };
 
   // 新建分组: a small form; the new row goes into the draft and is published with the bar.
@@ -542,7 +590,7 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
             ref={element => {if (element) element.indeterminate = pickedModels.length > 0 && pickedModels.length < configModels.length;}} disabled={!configModels.length}
             onChange={event => setPicked(event.target.checked ? configModels.map(model => String(model.id)) : [])}/></th>}
           {kind === 'models' && <th className="col-order">顺序</th>}
-          {(kind === 'groups' ? ['名称', '可发卡', '对外套餐名', '用量上限', '价格表', '倍率', '卡密数', ''] : ['模型', '显示名', '线路', '上下文 / 输出', '能力', '当前价格（入/出）', '客户可见', '']).map((label, index) =>
+          {(kind === 'groups' ? ['名称', '可发卡', '对外套餐名', '用量上限', '价格表', '倍率', '卡密数', ''] : ['模型', '显示名', '线路', '上下文 / 输出', '能力', '当前价格（入/出）', '状态', '']).map((label, index) =>
           <th key={index} className={['用量上限', '倍率', '卡密数', '上下文 / 输出', '当前价格（入/出）'].includes(label) ? 'num' : label === '显示名' ? 'col-display' : label ? undefined : 'col-actions'}>{label || <span className="sr-only">操作</span>}</th>)}</tr></thead>
         {kind === 'groups' ? <tbody>{listed.map(renderRow)}</tbody> : sections.map(section => <tbody key={String(section.id)} aria-label={section.name}>
           <tr className="group-row"><th colSpan={10} scope="colgroup">
