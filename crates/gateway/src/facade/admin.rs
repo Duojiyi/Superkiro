@@ -562,6 +562,34 @@ pub struct AdminStatsHandler {
     pub auth: Arc<AdminAuthState>,
 }
 
+/// Why the saved state cannot be written, in words the operator can act on. The error
+/// itself names server paths and sizes, which are not shown.
+fn persistence_problem(error: Option<&str>) -> &'static str {
+    let error = error.unwrap_or_default().to_ascii_lowercase();
+    let names = |needles: &[&str]| needles.iter().any(|needle| error.contains(needle));
+    if names(&["exceeds maximum allowable limit"]) {
+        "The saved state has reached its size ceiling; archive old ledger entries"
+    } else if names(&[
+        "os error 28",
+        "os error 112",
+        "no space left",
+        "not enough space",
+    ]) {
+        "The disk holding the saved state is full"
+    } else if names(&[
+        "os error 5)",
+        "os error 13",
+        "permission denied",
+        "access is denied",
+    ]) {
+        "The saved state cannot be written: permission denied"
+    } else if names(&["master kek"]) {
+        "Saving this state needs the master key, which is not configured"
+    } else {
+        "The saved state could not be written"
+    }
+}
+
 pub struct AdminFinancialsHandler {
     pub billing: BillingEngine,
     pub auth: Arc<AdminAuthState>,
@@ -1088,6 +1116,9 @@ impl FacadeHandler for AdminArchiveLedgerHandler {
                     StatusCode::OK,
                     &serde_json::json!({
                         "success": true,
+                        // What moved, and where to: the console shows it as a receipt.
+                        "movedEntries": receipt.drained_entries_count,
+                        "archiveFile": receipt.archive_file,
                         "receipt": receipt,
                         "stateBytesBefore": before_bytes,
                         "stateBytesAfter": self.billing.state_size().0,
@@ -1293,6 +1324,7 @@ impl FacadeHandler for AdminStatsHandler {
             let remaining_credits = total_credits.saturating_sub(used_credits);
             let micro = billing::MICRO_CREDITS_PER_CREDIT as f64;
             let (state_bytes, state_ceiling_bytes) = self.billing.state_size();
+            let persistence_ready = self.billing.persistence_ready();
 
             json_response(
                 StatusCode::OK,
@@ -1302,6 +1334,12 @@ impl FacadeHandler for AdminStatsHandler {
                     "stateBytes": state_bytes,
                     "stateWarningBytes": billing::engine::STATE_WARNING_BYTES,
                     "stateCeilingBytes": state_ceiling_bytes,
+                    "lastSavedAtSecs": self.billing.last_saved_at(),
+                    // While a write has failed, every change and every request is refused.
+                    "persistenceReady": persistence_ready,
+                    "persistenceError": (!persistence_ready).then(|| {
+                        persistence_problem(self.billing.last_persistence_error().as_deref())
+                    }),
                     "totalCards": total_cards,
                     "activeCards": active_cards,
                     "unactivatedCards": unactivated_cards,
@@ -2449,5 +2487,46 @@ impl FacadeHandler for AdminSnapshotSyncHandler {
                 ),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::persistence_problem;
+
+    #[test]
+    fn a_persistence_problem_is_named_without_its_paths_or_sizes() {
+        for (error, problem) in [
+            (
+                "billing snapshot size 300000000 bytes exceeds maximum allowable limit of 268435456 bytes",
+                "The saved state has reached its size ceiling; archive old ledger entries",
+            ),
+            (
+                "There is not enough space on the disk. (os error 112)",
+                "The disk holding the saved state is full",
+            ),
+            (
+                "No space left on device (os error 28)",
+                "The disk holding the saved state is full",
+            ),
+            (
+                "Access is denied. (os error 5)",
+                "The saved state cannot be written: permission denied",
+            ),
+            (
+                "persisting issuance replay secrets requires a master KEK",
+                "Saving this state needs the master key, which is not configured",
+            ),
+            (
+                r"C:\data\billing_state.json.gen_42: injected persistence fault",
+                "The saved state could not be written",
+            ),
+        ] {
+            assert_eq!(persistence_problem(Some(error)), problem, "{error}");
+        }
+        assert_eq!(
+            persistence_problem(None),
+            "The saved state could not be written"
+        );
     }
 }

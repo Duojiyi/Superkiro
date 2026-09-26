@@ -1112,6 +1112,11 @@ async fn the_operator_can_archive_the_ledger_to_shrink_the_saved_state() {
     let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(result["receipt"]["drained_entries_count"], 1);
     assert!(result["stateBytesAfter"].as_u64().unwrap() > 0);
+    // The receipt: what moved, where to, and the saved state's size before and after.
+    assert_eq!(result["movedEntries"], 1);
+    assert_eq!(result["archiveFile"], result["receipt"]["archive_file"]);
+    assert!(result["stateBytesBefore"].as_u64().unwrap() > 0);
+    assert!(result["stateCeilingBytes"].as_u64().unwrap() > 0);
 
     // The balance is unchanged, and the archive is not readable without the key.
     assert_eq!(billing.get_card("card-archive").unwrap().credit_used, used);
@@ -2080,4 +2085,108 @@ async fn traces_are_filtered_on_the_server_with_totals_for_the_whole_match() {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"], message);
     }
+}
+
+#[tokio::test]
+async fn stats_say_when_the_state_was_last_saved_and_whether_saving_works() {
+    let dir = std::env::temp_dir().join(format!(
+        "kiro-admin-stats-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let path = dir.join("billing_state.json");
+    let (billing, app) = setup_admin_app();
+    billing.set_master_kek(billing::MasterKek::from_bytes([5; 32]));
+    let (_, stats) = admin_call(&app, Method::GET, "/api/v1/admin/stats", None).await;
+    // Not saved anywhere yet.
+    assert_eq!(stats["lastSavedAtSecs"], serde_json::Value::Null);
+    assert_eq!(stats["persistenceReady"], true);
+
+    let before = gateway::now_secs();
+    billing.save_to_file(&path).unwrap();
+    billing.record_trace(billing::RequestTrace {
+        id: "trace-stats".into(),
+        card_id: "card-admin-02".into(),
+        ts: gateway::now_secs(),
+        invocation_id: "card-admin-02:inv".into(),
+        exposed_model: "model".into(),
+        provider_id: Some("backup".into()),
+        attempt_chain: vec![
+            billing::AttemptRecord {
+                key_id: "key-a".into(),
+                provider_id: "primary".into(),
+                success: false,
+                error: Some("http_429".into()),
+                latency_ms: 5,
+            },
+            billing::AttemptRecord {
+                key_id: "key-b".into(),
+                provider_id: "backup".into(),
+                success: true,
+                error: None,
+                latency_ms: 5,
+            },
+        ],
+        ..billing::RequestTrace::default()
+    });
+    let (status, stats) = admin_call(&app, Method::GET, "/api/v1/admin/stats", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let saved_at = stats["lastSavedAtSecs"].as_u64().unwrap();
+    assert!(
+        saved_at >= before && saved_at <= gateway::now_secs(),
+        "{stats}"
+    );
+    assert_eq!(stats["persistenceReady"], true);
+    assert_eq!(stats["persistenceError"], serde_json::Value::Null);
+    assert!(stats["stateBytes"].as_u64().unwrap() > 0);
+    // Attempts by provider and Key, and requests by model, beside the existing activity.
+    let activity = &stats["activity"];
+    assert!(activity["providers"].is_array());
+    assert_eq!(activity["providerAttempts"][0]["providerId"], "backup");
+    let primary = activity["providerAttempts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["providerId"] == "primary")
+        .unwrap();
+    assert_eq!(primary["last1h"]["takenOver"], 1);
+    assert_eq!(primary["last7d"]["failuresByKind"]["http_429"], 1);
+    assert_eq!(activity["keyAttempts"].as_array().unwrap().len(), 2);
+    assert_eq!(activity["modelHealth"][0]["model"], "model");
+    assert!(activity["modelUsage7d"].is_array());
+
+    // A failed write: saving stops, and the stats say why without the server's paths.
+    billing.inject_persistence_fault(true);
+    let (status, body) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/cards/note",
+        Some(json!({"cardId": "card-admin-02", "note": "VIP"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        body["error"],
+        "The change could not be saved, so nothing was changed; retry shortly"
+    );
+    assert_eq!(billing.get_card("card-admin-02").unwrap().note, None);
+    let (_, stats) = admin_call(&app, Method::GET, "/api/v1/admin/stats", None).await;
+    assert_eq!(stats["persistenceReady"], false);
+    assert_eq!(
+        stats["persistenceError"],
+        "The saved state could not be written"
+    );
+    assert_eq!(stats["lastSavedAtSecs"], saved_at);
+    billing.inject_persistence_fault(false);
+
+    // After a restart, the loaded state's save time and size.
+    let restarted = BillingEngine::new();
+    restarted.set_master_kek(billing::MasterKek::from_bytes([5; 32]));
+    restarted.load_from_file(&path).unwrap();
+    assert_eq!(restarted.last_saved_at(), Some(saved_at));
+    assert_eq!(restarted.state_size().0, billing.state_size().0);
+    let _ = std::fs::remove_dir_all(dir);
 }

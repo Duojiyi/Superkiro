@@ -185,6 +185,8 @@ pub struct BillingEngine {
     snapshot_sequence: Arc<AtomicU64>,
     /// Size of the last saved snapshot file, as written.
     snapshot_bytes: Arc<AtomicU64>,
+    /// When the saved state was last written; zero before the first save or load.
+    last_saved_at: Arc<AtomicU64>,
     last_snapshot_checksum: Arc<RwLock<Option<String>>>,
     last_persistence_error: Arc<RwLock<Option<String>>>,
     /// Serializes cross-table mutations with snapshot reads so a published file
@@ -656,6 +658,7 @@ impl BillingEngine {
             persistence_lock: Arc::new(Mutex::new(())),
             snapshot_sequence: Arc::new(AtomicU64::new(0)),
             snapshot_bytes: Arc::new(AtomicU64::new(0)),
+            last_saved_at: Arc::new(AtomicU64::new(0)),
             last_snapshot_checksum: Arc::new(RwLock::new(None)),
             last_persistence_error: Arc::new(RwLock::new(None)),
             state_lock: Arc::new(RwLock::new(())),
@@ -1174,7 +1177,23 @@ impl BillingEngine {
         *self.last_snapshot_checksum.write().unwrap() = Some(published_checksum);
         *self.last_persistence_error.write().unwrap() = None;
         self.note_snapshot_size(file_content.len() as u64);
+        self.last_saved_at
+            .store(snapshot.timestamp, Ordering::Release);
         Ok(())
+    }
+
+    /// When the saved state was last written, by this process or, after a restart, by the
+    /// one that saved the state it loaded. `None` before any save or load.
+    pub fn last_saved_at(&self) -> Option<u64> {
+        Some(self.last_saved_at.load(Ordering::Acquire)).filter(|secs| *secs > 0)
+    }
+
+    /// A state just loaded from `content`, saved at `saved_at`: its size and save time are
+    /// the saved state's until the next save.
+    fn note_loaded_state(&self, content: &str, saved_at: u64) {
+        self.snapshot_bytes
+            .store(content.len() as u64, Ordering::Release);
+        self.last_saved_at.store(saved_at, Ordering::Release);
     }
 
     /// Record the saved size, and tell the operator once each time it crosses a level.
@@ -1398,10 +1417,12 @@ impl BillingEngine {
                 } else {
                     self.ensure_snapshot_not_rolled_back(path, snapshot.sequence)?;
                 }
+                let saved_at = snapshot.timestamp;
                 self.import_snapshot(snapshot);
                 *self.persistence_path.write().unwrap() = Some(path.to_path_buf());
                 *self.last_snapshot_checksum.write().unwrap() =
                     Some(sha256_hex(content.as_bytes()));
+                self.note_loaded_state(&content, saved_at);
                 return Ok(());
             }
         }
@@ -1437,9 +1458,11 @@ impl BillingEngine {
         } else {
             self.ensure_snapshot_not_rolled_back(path, snapshot.sequence)?;
         }
+        let saved_at = snapshot.timestamp;
         self.import_snapshot(snapshot);
         *self.persistence_path.write().unwrap() = Some(path.to_path_buf());
         *self.last_snapshot_checksum.write().unwrap() = Some(sha256_hex(content.as_bytes()));
+        self.note_loaded_state(&content, saved_at);
         Ok(())
     }
 
