@@ -2279,7 +2279,14 @@ impl BillingEngine {
             let pricing = LockedPricing {
                 group_margin,
                 model_multiplier,
-                settings,
+                // What settlement prices with. The rest is for the console, and would only
+                // grow every request's saved reservation.
+                settings: BillingSettings {
+                    credit_face_value_cny: settings.credit_face_value_cny,
+                    usd_cny_rate: settings.usd_cny_rate,
+                    rate_updated_at_secs: settings.rate_updated_at_secs,
+                    ..BillingSettings::default()
+                },
             };
             (amt, Some(rcv.id), Some(pricing))
         } else {

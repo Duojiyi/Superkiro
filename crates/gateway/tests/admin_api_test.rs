@@ -1398,6 +1398,7 @@ async fn publication_takes_first_prices_from_now_retirement_and_removals() {
             per_call_credit: 0,
             margin_multiplier: 1.0,
             effective_from_secs: from,
+            official: None,
         })
         .unwrap()
     };
@@ -1450,4 +1451,106 @@ async fn publication_takes_first_prices_from_now_retirement_and_removals() {
         .map(|v| v["id"].as_str().unwrap())
         .collect();
     assert_eq!(ids, ["v-now"]);
+}
+
+/// The console publishes the official pricing settings and a price with the official price it
+/// was computed from, and reads both back. A new face value that leaves that price at the old
+/// one is refused with 409, naming it.
+#[tokio::test]
+async fn official_pricing_publishes_and_reads_back_through_the_admin_api() {
+    use tower::ServiceExt;
+    let (billing, app) = setup_admin_app();
+    let send = |body: Option<serde_json::Value>| {
+        let app = app.clone();
+        let revision = billing.commercial_config().revision;
+        async move {
+            let request = Request::builder()
+                .uri("/api/v1/admin/commercial-config")
+                .header("x-admin-key", TEST_ADMIN_KEY);
+            let request = match body {
+                Some(mut update) => {
+                    update["expected_revision"] = json!(revision);
+                    update["reason"] = json!("official pricing");
+                    request
+                        .method(Method::POST)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(update.to_string()))
+                }
+                None => request.body(Body::empty()),
+            };
+            let response = app.oneshot(request.unwrap()).await.unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            )
+        }
+    };
+    // Claude Opus 5's official prices, billed by the upstream at others: 8 credits an
+    // official dollar at 0.03 CNY a credit, and 0.22 of what the upstream bills.
+    let official = json!({
+        "input_usd_per_m": 5.0,
+        "output_usd_per_m": 25.0,
+        "cache_creation_usd_per_m": 6.25,
+        "cache_read_usd_per_m": 0.5,
+        "price_multiplier": 0.24,
+        "cost_multiplier": 0.22,
+        "cost_basis_usd_per_m": [2.0, 25.0, 6.25, 0.5],
+        "usd_cny": 1.0,
+        "credit_face_value_cny": 0.03
+    });
+    let settings = json!({
+        "credit_face_value_cny": 0.03,
+        "usd_cny_rate": 7.25,
+        "official_usd_cny": 1.0,
+        "default_price_multiplier": 0.24,
+        "default_cost_multiplier": 0.08,
+        "provider_cost_multipliers": {"hanyue-max": 0.22, "kimera-primary": 0.08}
+    });
+    let (status, body) = send(Some(json!({
+        "settings": settings,
+        "versions": [{
+            "id": "opus-5-5-official", "rate_card_id": "default", "model": "claude-opus-5-5",
+            "currency": "CNY", "pricing_mode": "fixed",
+            "input_price_per_m": 0.44, "output_price_per_m": 5.5,
+            "cache_creation_price_per_m": 1.375, "cache_read_price_per_m": 0.11,
+            "fixed_input_credit_per_m": 40_000_000, "fixed_output_credit_per_m": 200_000_000,
+            "fixed_cache_creation_credit_per_m": 50_000_000,
+            "fixed_cache_read_credit_per_m": 4_000_000,
+            "per_call_credit": 0, "margin_multiplier": 1.0, "effective_from_secs": 0,
+            "official": official
+        }]
+    })))
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = send(None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let config = &body["config"];
+    for field in [
+        "official_usd_cny",
+        "default_price_multiplier",
+        "default_cost_multiplier",
+        "provider_cost_multipliers",
+    ] {
+        assert_eq!(config["settings"][field], settings[field], "{field}");
+    }
+    assert_eq!(config["versions"][0]["official"], official);
+
+    // What the console sends today: the face value alone.
+    let (status, body) = send(Some(json!({
+        "settings": {"credit_face_value_cny": 0.05, "usd_cny_rate": 7.25}
+    })))
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .ends_with("Official pricing is at a stale face value or rate: claude-opus-5-5"),
+        "{body}"
+    );
 }

@@ -10,6 +10,7 @@
 use crate::ledger::{ceil_nonnegative_to_i64, UsageTokens};
 use crate::MICRO_CREDITS_PER_CREDIT;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Currency denomination for upstream provider prices (Spec §5, §14.10.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,6 +34,8 @@ pub enum PricingMode {
 }
 
 /// Global billing anchor settings (Spec §5, §14.10.1, §14.10.5).
+///
+/// Unknown fields are ignored, so an older release still loads settings a later one saved.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BillingSettings {
     /// RMB face value of 1 credit (e.g. 0.01 = 0.01 CNY per credit, i.e. 1分钱/积分).
@@ -42,6 +45,19 @@ pub struct BillingSettings {
     /// Unix timestamp when the exchange rate was updated.
     #[serde(default)]
     pub rate_updated_at_secs: u64,
+    /// CNY per official US dollar in prices computed from official ones; 1.0 when unset.
+    /// Not `usd_cny_rate`, which converts USD cost-plus prices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub official_usd_cny: Option<f64>,
+    /// 计费倍率 offered for a price computed from an official one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_price_multiplier: Option<f64>,
+    /// 成本倍率 offered for a provider with none of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_cost_multiplier: Option<f64>,
+    /// 成本倍率 by provider ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_cost_multipliers: Option<BTreeMap<String, f64>>,
 }
 
 impl Default for BillingSettings {
@@ -50,8 +66,44 @@ impl Default for BillingSettings {
             credit_face_value_cny: 0.01,
             usd_cny_rate: 7.25,
             rate_updated_at_secs: 0,
+            official_usd_cny: None,
+            default_price_multiplier: None,
+            default_cost_multiplier: None,
+            provider_cost_multipliers: None,
         }
     }
+}
+
+impl BillingSettings {
+    /// CNY per official US dollar: ¥1 = $1 unless set.
+    pub fn official_usd_cny(&self) -> f64 {
+        self.official_usd_cny.unwrap_or(1.0)
+    }
+}
+
+/// What a version's prices were computed from: official list prices in USD per 1M tokens, the
+/// multipliers, and the settings used. Publication checks that it gives the version's credits
+/// and costs; settlement still charges the version's own fields.
+///
+/// Unknown fields are ignored here and on the version, so an older release still loads it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OfficialPricing {
+    pub input_usd_per_m: f64,
+    pub output_usd_per_m: f64,
+    pub cache_creation_usd_per_m: f64,
+    pub cache_read_usd_per_m: f64,
+    /// 计费倍率: our price is official × this, in CNY at `usd_cny`.
+    pub price_multiplier: f64,
+    /// 成本倍率: our cost is the cost basis × this, in CNY at `usd_cny`.
+    pub cost_multiplier: f64,
+    /// Input, output, cache write and cache read, when the upstream bills other prices than
+    /// the official ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_basis_usd_per_m: Option<[f64; 4]>,
+    /// `BillingSettings::official_usd_cny` used.
+    pub usd_cny: f64,
+    /// `BillingSettings::credit_face_value_cny` used.
+    pub credit_face_value_cny: f64,
 }
 
 /// Rate card header group (Spec §5).
@@ -101,6 +153,11 @@ pub struct RateCardVersion {
 
     // Version activation timestamp (Spec §6.4)
     pub effective_from_secs: u64,
+
+    /// What the fixed credits and CNY costs were computed from, when priced from an official
+    /// price.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub official: Option<OfficialPricing>,
 }
 
 impl RateCardVersion {

@@ -1,5 +1,6 @@
 //! Validated atomic publication. No secrets are exposed by this view.
 use super::*;
+use crate::rate_card::{Currency, OfficialPricing, PricingMode};
 use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommercialAudit {
@@ -73,6 +74,72 @@ fn text(s: &str, max: usize) -> bool {
 fn positive(n: f64) -> bool {
     n.is_finite() && n > 0.0 && n <= 1000.0
 }
+/// 计费倍率 and 成本倍率.
+fn multiplier(n: f64) -> bool {
+    n.is_finite() && n > 0.0 && n <= 100.0
+}
+/// Why a version's official block does not describe it. Its credits are official × 计费倍率 ×
+/// CNY per official dollar ÷ face value, computed in this order in f64 as the console does, to
+/// within one micro-credit; a route's cost charges nothing, so its credits are 0. Its costs are
+/// the cost basis × 成本倍率 × CNY per official dollar, in CNY.
+fn official_mismatch(
+    v: &RateCardVersion,
+    o: &OfficialPricing,
+    route_cost: bool,
+) -> Option<&'static str> {
+    let official = [
+        o.input_usd_per_m,
+        o.output_usd_per_m,
+        o.cache_creation_usd_per_m,
+        o.cache_read_usd_per_m,
+    ];
+    let basis = o.cost_basis_usd_per_m.unwrap_or(official);
+    if v.pricing_mode != PricingMode::Fixed
+        || v.currency != Currency::Cny
+        || v.margin_multiplier != 1.0
+        || v.per_call_credit != 0
+        || official
+            .iter()
+            .chain(&basis)
+            .any(|usd| !(0.0..=10_000.0).contains(usd))
+        || !official.iter().any(|usd| *usd > 0.0)
+        || !multiplier(o.price_multiplier)
+        || !multiplier(o.cost_multiplier)
+        || !positive(o.usd_cny)
+        || !positive(o.credit_face_value_cny)
+    {
+        return Some("Invalid official pricing");
+    }
+    let credits = [
+        v.fixed_input_credit_per_m,
+        v.fixed_output_credit_per_m,
+        v.fixed_cache_creation_credit_per_m,
+        v.fixed_cache_read_credit_per_m,
+    ];
+    if official.iter().zip(credits).any(|(usd, fixed)| {
+        if route_cost {
+            return fixed != 0;
+        }
+        let expected =
+            (usd * o.price_multiplier * o.usd_cny / o.credit_face_value_cny * 1_000_000.0).round();
+        (fixed as f64 - expected).abs() > 1.0
+    }) {
+        return Some("Official pricing does not match the credits of");
+    }
+    let costs = [
+        v.input_price_per_m,
+        v.output_price_per_m,
+        v.cache_creation_price_per_m,
+        v.cache_read_price_per_m,
+    ];
+    if basis.iter().zip(costs).any(|(usd, cost)| {
+        let expected = usd * o.cost_multiplier * o.usd_cny;
+        (cost - expected).abs() > (1e-9 * cost.abs().max(expected.abs())).max(1e-12)
+    }) {
+        return Some("Official pricing does not match the cost of");
+    }
+    None
+}
 /// Version margin x group margin x model credit multiplier, as met by one request. Each is
 /// bounded on its own, but together they reached 10^9, which saturates the reservation and
 /// takes the model offline.
@@ -129,6 +196,7 @@ impl BillingEngine {
         }) {
             return Err(invalid("Requests are still settling; publish when idle"));
         }
+        let mut repriced = false;
         if let Some(mut settings) = u.settings {
             if !positive(settings.credit_face_value_cny)
                 || settings.credit_face_value_cny < MIN_CREDIT_FACE_VALUE_CNY
@@ -138,6 +206,49 @@ impl BillingEngine {
                     "Face value must be 0.0001-1000 and the exchange rate positive and at most 1000",
                 ));
             }
+            // Left out, these keep their value: a console that does not know them never
+            // wipes them.
+            let current = &c.settings;
+            settings.official_usd_cny = settings.official_usd_cny.or(current.official_usd_cny);
+            settings.default_price_multiplier = settings
+                .default_price_multiplier
+                .or(current.default_price_multiplier);
+            settings.default_cost_multiplier = settings
+                .default_cost_multiplier
+                .or(current.default_cost_multiplier);
+            if settings.provider_cost_multipliers.is_none() {
+                settings.provider_cost_multipliers = current.provider_cost_multipliers.clone();
+            }
+            if settings
+                .official_usd_cny
+                .is_some_and(|rate| !positive(rate))
+            {
+                return Err(invalid(
+                    "The official dollar rate must be positive and at most 1000",
+                ));
+            }
+            if settings
+                .default_price_multiplier
+                .into_iter()
+                .chain(settings.default_cost_multiplier)
+                .any(|m| !multiplier(m))
+                || settings
+                    .provider_cost_multipliers
+                    .as_ref()
+                    .is_some_and(|by_provider| {
+                        by_provider.len() > 200
+                            || by_provider
+                                .iter()
+                                .any(|(id, m)| !text(id, 128) || !multiplier(*m))
+                    })
+            {
+                return Err(invalid(
+                    "Multipliers must be positive and at most 100, for at most 200 providers",
+                ));
+            }
+            // Either one reprices every price computed from an official one (see below).
+            repriced = settings.credit_face_value_cny != current.credit_face_value_cny
+                || settings.official_usd_cny() != current.official_usd_cny();
             settings.rate_updated_at_secs = now;
             c.settings = settings;
         }
@@ -290,6 +401,7 @@ impl BillingEngine {
             .iter()
             .map(|v| (v.rate_card_id.clone(), v.model.clone()))
             .collect();
+        let mut new_versions = std::collections::HashSet::new();
         for mut v in u.versions {
             let prices = [
                 v.input_price_per_m,
@@ -319,11 +431,26 @@ impl BillingEngine {
                     "Invalid pricing; retroactive publication forbidden",
                 ));
             }
+            if let Some(o) = &v.official {
+                // `<provider>/<upstream model>`: what that route costs, charging nothing.
+                let route_cost = c.providers.keys().any(|id| {
+                    v.model
+                        .strip_prefix(id.as_str())
+                        .is_some_and(|rest| rest.starts_with('/'))
+                });
+                if let Some(problem) = official_mismatch(&v, o, route_cost) {
+                    return Err(invalid_ids(problem, &[v.model.as_str()]));
+                }
+            }
             if v.effective_from_secs < now {
                 // A model's first price may start now, whatever time it names: it replaces
                 // no price of its own, and a request in flight keeps the price it was
-                // reserved at. Any later price is scheduled, never back-dated.
-                if priced.contains(&(v.rate_card_id.clone(), v.model.clone())) {
+                // reserved at. So may a price computed from an official one when this
+                // publication changes what it is computed at. Any other later price is
+                // scheduled, never back-dated.
+                if priced.contains(&(v.rate_card_id.clone(), v.model.clone()))
+                    && !(repriced && v.official.is_some())
+                {
                     return Err(invalid(
                         "Invalid pricing; retroactive publication forbidden",
                     ));
@@ -351,7 +478,39 @@ impl BillingEngine {
                     .resolve_rate_card_version(&v.rate_card_id, &v.model, now)
                     .map(|x| x.id),
             });
+            new_versions.insert(v.id.clone());
             c.rate_card_versions.push(v);
+        }
+        // In force now, or scheduled: a version no later one in force has superseded.
+        let live = |v: &RateCardVersion| {
+            v.effective_from_secs > now
+                || !c.rate_card_versions.iter().any(|w| {
+                    w.rate_card_id == v.rate_card_id
+                        && w.model == v.model
+                        && w.effective_from_secs > v.effective_from_secs
+                        && w.effective_from_secs <= now
+                })
+        };
+        // A price computed from an official one is at the face value and official dollar rate
+        // in force: one this publication makes, and after it changes either, every one in
+        // force or scheduled, which the console reprices or withdraws. Other prices keep their
+        // credits, and an older stale one blocks no unrelated publication.
+        let mut stale = Vec::new();
+        for v in c.rate_card_versions.iter().filter(|v| live(v)) {
+            if v.official.as_ref().is_some_and(|o| {
+                (repriced || new_versions.contains(&v.id))
+                    && (o.credit_face_value_cny != c.settings.credit_face_value_cny
+                        || o.usd_cny != c.settings.official_usd_cny())
+            }) && !stale.contains(&v.model.as_str())
+            {
+                stale.push(v.model.as_str());
+            }
+        }
+        if !stale.is_empty() {
+            return Err(invalid_ids(
+                "Official pricing is at a stale face value or rate",
+                &stale,
+            ));
         }
         // Superseded versions price no new request (one in flight settles at what it was
         // admitted with, which passed this bound when published), and they are immutable, so
@@ -359,15 +518,7 @@ impl BillingEngine {
         let live_margin = c
             .rate_card_versions
             .iter()
-            .filter(|v| {
-                v.effective_from_secs > now
-                    || !c.rate_card_versions.iter().any(|w| {
-                        w.rate_card_id == v.rate_card_id
-                            && w.model == v.model
-                            && w.effective_from_secs > v.effective_from_secs
-                            && w.effective_from_secs <= now
-                    })
-            })
+            .filter(|v| live(v))
             .map(|v| v.margin_multiplier)
             .fold(1.0, f64::max);
         let group_margin = c
@@ -723,15 +874,21 @@ mod tests {
         e.publish_commercial_config(update(&e), 100).unwrap();
         e
     }
-    fn publish_models(e: &BillingEngine, models: Vec<ModelMap>) -> Result<(), String> {
-        let mut u = update(e);
-        u.models = models;
-        e.publish_commercial_config(u, 100)
-            .map(|_| ())
+    fn publish(
+        e: &BillingEngine,
+        u: CommercialUpdate,
+        now: u64,
+    ) -> Result<CommercialConfig, String> {
+        e.publish_commercial_config(u, now)
             .map_err(|error| match error {
                 BillingError::InvalidState(message) => message,
                 other => other.to_string(),
             })
+    }
+    fn publish_models(e: &BillingEngine, models: Vec<ModelMap>) -> Result<(), String> {
+        let mut u = update(e);
+        u.models = models;
+        publish(e, u, 100).map(|_| ())
     }
     fn wildcard(id: &str, per_call: i64, from: u64) -> RateCardVersion {
         price(id, "*", per_call, from)
@@ -1018,5 +1175,420 @@ mod tests {
         restored
             .publish_commercial_config(update(&restored), 200)
             .unwrap();
+    }
+
+    /// Claude Opus 5's official prices ($5 / $25 / $6.25 / $0.50 per million tokens) at 计费倍率
+    /// 0.24 and 成本倍率 0.08, ¥1 to the official dollar, at `face` CNY a credit.
+    fn official(face: f64) -> OfficialPricing {
+        OfficialPricing {
+            input_usd_per_m: 5.0,
+            output_usd_per_m: 25.0,
+            cache_creation_usd_per_m: 6.25,
+            cache_read_usd_per_m: 0.5,
+            price_multiplier: 0.24,
+            cost_multiplier: 0.08,
+            cost_basis_usd_per_m: None,
+            usd_cny: 1.0,
+            credit_face_value_cny: face,
+        }
+    }
+    /// A fixed CNY price computed from `o` the way the console computes it.
+    fn priced_from(id: &str, model: &str, from: u64, o: OfficialPricing) -> RateCardVersion {
+        let official = [
+            o.input_usd_per_m,
+            o.output_usd_per_m,
+            o.cache_creation_usd_per_m,
+            o.cache_read_usd_per_m,
+        ];
+        let credits = official.map(|usd| {
+            (usd * o.price_multiplier * o.usd_cny / o.credit_face_value_cny * 1_000_000.0).round()
+                as i64
+        });
+        let costs = o
+            .cost_basis_usd_per_m
+            .unwrap_or(official)
+            .map(|usd| usd * o.cost_multiplier * o.usd_cny);
+        RateCardVersion {
+            id: id.into(),
+            rate_card_id: "default".into(),
+            model: model.into(),
+            currency: Currency::Cny,
+            pricing_mode: PricingMode::Fixed,
+            input_price_per_m: costs[0],
+            output_price_per_m: costs[1],
+            cache_creation_price_per_m: costs[2],
+            cache_read_price_per_m: costs[3],
+            fixed_input_credit_per_m: credits[0],
+            fixed_output_credit_per_m: credits[1],
+            fixed_cache_creation_credit_per_m: credits[2],
+            fixed_cache_read_credit_per_m: credits[3],
+            per_call_credit: 0,
+            margin_multiplier: 1.0,
+            effective_from_secs: from,
+            official: Some(o),
+        }
+    }
+    fn at_face_value(e: &BillingEngine, face: f64, now: u64) {
+        let mut u = update(e);
+        u.settings = Some(BillingSettings {
+            credit_face_value_cny: face,
+            ..e.get_settings()
+        });
+        e.publish_commercial_config(u, now).unwrap();
+    }
+
+    /// A price computed from an official one carries what it was computed from, and is
+    /// published only when that gives its credits (to within one micro-credit) and its costs.
+    /// A route's cost charges nothing; a model ID with a '/' that names no provider is a model.
+    #[test]
+    fn an_official_price_publishes_only_when_it_gives_its_credits_and_costs() {
+        let e = serving_engine();
+        at_face_value(&e, 0.03, 100);
+        let attempt = |v: RateCardVersion| {
+            let mut u = update(&e);
+            u.versions = vec![v];
+            publish(&e, u, 100)
+        };
+        let opus = |edit: &dyn Fn(&mut RateCardVersion)| {
+            let mut v = priced_from("v-opus", "claude-opus-5", 0, official(0.03));
+            edit(&mut v);
+            v
+        };
+        let block =
+            |edit: &dyn Fn(&mut OfficialPricing)| opus(&|v| edit(v.official.as_mut().unwrap()));
+        // Eight credits an official dollar: 40, 200, 50 and 4 credits a million tokens.
+        let v = opus(&|_| {});
+        assert_eq!(
+            [
+                v.fixed_input_credit_per_m,
+                v.fixed_output_credit_per_m,
+                v.fixed_cache_creation_credit_per_m,
+                v.fixed_cache_read_credit_per_m,
+            ],
+            [40_000_000, 200_000_000, 50_000_000, 4_000_000]
+        );
+        let credits = "Official pricing does not match the credits of: claude-opus-5";
+        let cost = "Official pricing does not match the cost of: claude-opus-5";
+        let invalid = "Invalid official pricing: claude-opus-5";
+        for (v, message) in [
+            (opus(&|v| v.fixed_output_credit_per_m += 2), credits),
+            (opus(&|v| v.fixed_cache_read_credit_per_m = 0), credits),
+            (opus(&|v| v.output_price_per_m = 2.000_001), cost),
+            (
+                block(&|o| o.cost_basis_usd_per_m = Some([2.0, 25.0, 6.25, 0.5])),
+                cost,
+            ),
+            (opus(&|v| v.pricing_mode = PricingMode::CostPlus), invalid),
+            (opus(&|v| v.currency = Currency::Usd), invalid),
+            (opus(&|v| v.margin_multiplier = 1.3), invalid),
+            (opus(&|v| v.per_call_credit = 1), invalid),
+            (block(&|o| o.input_usd_per_m = f64::NAN), invalid),
+            (block(&|o| o.output_usd_per_m = 10_000.5), invalid),
+            (
+                block(&|o| o.cost_basis_usd_per_m = Some([-1.0, 25.0, 6.25, 0.5])),
+                invalid,
+            ),
+            (block(&|o| o.price_multiplier = 0.0), invalid),
+            (block(&|o| o.cost_multiplier = 100.5), invalid),
+            (block(&|o| o.credit_face_value_cny = 0.0), invalid),
+            (
+                block(&|o| {
+                    o.input_usd_per_m = 0.0;
+                    o.output_usd_per_m = 0.0;
+                    o.cache_creation_usd_per_m = 0.0;
+                    o.cache_read_usd_per_m = 0.0;
+                }),
+                invalid,
+            ),
+        ] {
+            assert_eq!(attempt(v).unwrap_err(), message);
+        }
+
+        // Within one micro-credit, as the console may round; read back with its block.
+        let config = attempt(opus(&|v| v.fixed_cache_read_credit_per_m += 1)).unwrap();
+        let read = config.versions.iter().find(|v| v.id == "v-opus").unwrap();
+        assert_eq!(read.official, Some(official(0.03)));
+        assert_eq!(read.fixed_cache_read_credit_per_m, 4_000_001);
+        // An upstream that bills other prices: the costs are of those, the credits of the
+        // official ones.
+        let billed = OfficialPricing {
+            cost_multiplier: 0.22,
+            cost_basis_usd_per_m: Some([2.0, 25.0, 6.25, 0.5]),
+            ..official(0.03)
+        };
+        let config = attempt(priced_from("v-billed", "claude-opus-5-5", 0, billed)).unwrap();
+        let read = config.versions.iter().find(|v| v.id == "v-billed").unwrap();
+        assert_eq!(read.fixed_input_credit_per_m, 40_000_000);
+        assert!((read.input_price_per_m - 0.44).abs() < 1e-12);
+
+        let mut route = priced_from("v-route", "p/target", 0, official(0.03));
+        assert_eq!(
+            attempt(route.clone()).unwrap_err(),
+            "Official pricing does not match the credits of: p/target"
+        );
+        route.fixed_input_credit_per_m = 0;
+        route.fixed_output_credit_per_m = 0;
+        route.fixed_cache_creation_credit_per_m = 0;
+        route.fixed_cache_read_credit_per_m = 0;
+        attempt(route).unwrap();
+        attempt(priced_from("v-vendor", "vendor/model", 0, official(0.03))).unwrap();
+    }
+
+    /// The official pricing settings are bounded, and one a publication leaves out keeps its
+    /// value: a console that does not know them never wipes them.
+    #[test]
+    fn official_pricing_settings_are_bounded_and_kept_when_left_out() {
+        let e = serving_engine();
+        assert_eq!(e.get_settings().official_usd_cny(), 1.0);
+        let with = |edit: &dyn Fn(&mut BillingSettings)| {
+            let mut settings = e.get_settings();
+            edit(&mut settings);
+            let mut u = update(&e);
+            u.settings = Some(settings);
+            publish(&e, u, 100)
+        };
+        let providers = |entries: Vec<(String, f64)>| -> Option<BTreeMap<String, f64>> {
+            Some(entries.into_iter().collect())
+        };
+        let rate = "The official dollar rate must be positive and at most 1000";
+        let multipliers = "Multipliers must be positive and at most 100, for at most 200 providers";
+        for (refused, message) in [
+            (with(&|s| s.official_usd_cny = Some(0.0)), rate),
+            (with(&|s| s.official_usd_cny = Some(1000.5)), rate),
+            (with(&|s| s.official_usd_cny = Some(f64::INFINITY)), rate),
+            (
+                with(&|s| s.default_price_multiplier = Some(0.0)),
+                multipliers,
+            ),
+            (
+                with(&|s| s.default_cost_multiplier = Some(100.5)),
+                multipliers,
+            ),
+            (
+                with(&|s| s.provider_cost_multipliers = providers(vec![(" ".into(), 0.08)])),
+                multipliers,
+            ),
+            (
+                with(&|s| s.provider_cost_multipliers = providers(vec![("p".repeat(129), 0.08)])),
+                multipliers,
+            ),
+            (
+                with(&|s| s.provider_cost_multipliers = providers(vec![("p".into(), f64::NAN)])),
+                multipliers,
+            ),
+            (
+                with(&|s| {
+                    s.provider_cost_multipliers =
+                        providers((0..201).map(|i| (format!("p{i}"), 0.08)).collect())
+                }),
+                multipliers,
+            ),
+        ] {
+            assert_eq!(refused.unwrap_err(), message);
+        }
+
+        let set = with(&|s| {
+            s.official_usd_cny = Some(1.0);
+            s.default_price_multiplier = Some(0.24);
+            s.default_cost_multiplier = Some(0.08);
+            s.provider_cost_multipliers = providers(vec![
+                ("hanyue-max".into(), 0.22),
+                ("kimera-direct".into(), 0.06),
+            ]);
+        })
+        .unwrap()
+        .settings;
+        // What the console sends today: the face value and the exchange rate alone.
+        let mut u = update(&e);
+        u.settings = Some(
+            serde_json::from_value(
+                serde_json::json!({"credit_face_value_cny": 0.03, "usd_cny_rate": 7.0}),
+            )
+            .unwrap(),
+        );
+        let kept = publish(&e, u, 101).unwrap().settings;
+        assert_eq!((kept.credit_face_value_cny, kept.usd_cny_rate), (0.03, 7.0));
+        assert_eq!(
+            BillingSettings {
+                credit_face_value_cny: 0.01,
+                usd_cny_rate: 7.25,
+                rate_updated_at_secs: 100,
+                ..kept
+            },
+            set
+        );
+    }
+
+    /// Changing the face value (or the CNY an official dollar counts) reprices every price
+    /// computed from an official one in the same publication, from now: one left at the old
+    /// value, in force or scheduled, is refused by name. Other prices keep their credits and
+    /// are never back-dated, and a request in flight settles at what it was reserved at.
+    #[test]
+    fn a_face_value_change_reprices_every_official_price_at_once() {
+        use crate::card::Card;
+        use crate::reservation::ReservationEstimateParams;
+        let credit = crate::MICRO_CREDITS_PER_CREDIT;
+        let e = serving_engine();
+        let mut u = update(&e);
+        u.settings = Some(BillingSettings {
+            credit_face_value_cny: 0.03,
+            provider_cost_multipliers: Some([("p".to_string(), 0.08)].into()),
+            ..e.get_settings()
+        });
+        u.models = vec![ModelMap::new(
+            "map-a", "new-tier", "model-a", "p", "target-a",
+        )];
+        u.versions = vec![
+            priced_from("a-1", "model-a", 0, official(0.03)),
+            priced_from("a-later", "model-a", 500, official(0.03)),
+            priced_from("b-1", "model-b", 0, official(0.03)),
+            price("c-1", "model-c", 7, 0),
+        ];
+        e.publish_commercial_config(u, 100).unwrap();
+        let mut card = Card::new("card", "new-tier", 1_000 * credit);
+        card.activate(100, 86_400).unwrap();
+        e.upsert_card(card);
+        let params = ReservationEstimateParams::new(0, 1_000_000).with_model("model-a");
+        let hold = e.reserve("card", "held", &params, 101, 600).unwrap();
+        // Settlement prices with the face value and the exchange rate; the console's
+        // multipliers stay out of every request's saved hold.
+        let locked = hold.pricing.unwrap().settings;
+        assert_eq!(locked.credit_face_value_cny, 0.03);
+        assert_eq!(locked.provider_cost_multipliers, None);
+
+        let reprice = |versions: Vec<RateCardVersion>, cancelled: &[&str]| {
+            let mut u = update(&e);
+            u.settings = Some(BillingSettings {
+                credit_face_value_cny: 0.05,
+                ..e.get_settings()
+            });
+            u.versions = versions;
+            u.cancelled_versions = cancelled.iter().map(|id| id.to_string()).collect();
+            publish(&e, u, 200)
+        };
+        let at_new_face_value = || {
+            vec![
+                priced_from("a-2", "model-a", 0, official(0.05)),
+                priced_from("b-2", "model-b", 0, official(0.05)),
+            ]
+        };
+        let stale = "Official pricing is at a stale face value or rate";
+        assert_eq!(
+            reprice(vec![], &[]).unwrap_err(),
+            format!("{stale}: model-a, model-b")
+        );
+        // model-a's scheduled price is stale too, until it is withdrawn or repriced.
+        assert_eq!(
+            reprice(at_new_face_value(), &[]).unwrap_err(),
+            format!("{stale}: model-a")
+        );
+        let mut old = at_new_face_value();
+        old[1] = priced_from("b-2", "model-b", 0, official(0.03));
+        assert_eq!(
+            reprice(old, &["a-later"]).unwrap_err(),
+            format!("{stale}: model-b")
+        );
+        // Only a price computed from an official one may start now.
+        let mut back_dated = at_new_face_value();
+        back_dated.push(price("c-2", "model-c", 8, 0));
+        assert_eq!(
+            reprice(back_dated, &["a-later"]).unwrap_err(),
+            "Invalid pricing; retroactive publication forbidden"
+        );
+        let config = reprice(at_new_face_value(), &["a-later"]).unwrap();
+        for id in ["a-2", "b-2"] {
+            let v = config.versions.iter().find(|v| v.id == id).unwrap();
+            assert_eq!(v.effective_from_secs, 200);
+        }
+        let other = e
+            .resolve_rate_card_version("default", "model-c", 200)
+            .unwrap();
+        assert_eq!(other.id, "c-1");
+
+        let tokens = UsageTokens {
+            output_tokens: 1_000_000,
+            ..UsageTokens::default()
+        };
+        // $25 at 0.24 and 0.03 CNY a credit, as when it was reserved.
+        let held = e
+            .settle("held", &tokens, "model-a", "p", "target-a", 201)
+            .unwrap();
+        assert_eq!(held.rate_card_version.as_deref(), Some("a-1"));
+        assert_eq!(held.credits_charged, 200 * credit);
+        // At 0.05 CNY a credit.
+        e.reserve("card", "after", &params, 202, 600).unwrap();
+        let after = e
+            .settle("after", &tokens, "model-a", "p", "target-a", 203)
+            .unwrap();
+        assert_eq!(after.rate_card_version.as_deref(), Some("a-2"));
+        assert_eq!(after.credits_charged, 120 * credit);
+
+        // The CNY an official dollar counts reprices them the same way.
+        let mut u = update(&e);
+        u.settings = Some(BillingSettings {
+            official_usd_cny: Some(2.0),
+            ..e.get_settings()
+        });
+        assert_eq!(
+            publish(&e, u, 300).unwrap_err(),
+            format!("{stale}: model-a, model-b")
+        );
+    }
+
+    /// A price left at an older face value (an older release changed it, knowing nothing of
+    /// official prices) blocks no unrelated publication, and a new official price is still
+    /// held to the face value in force.
+    #[test]
+    fn a_stale_official_price_blocks_no_unrelated_publication() {
+        let e = serving_engine();
+        at_face_value(&e, 0.03, 100);
+        let mut u = update(&e);
+        u.versions = vec![priced_from("a-1", "model-a", 0, official(0.03))];
+        e.publish_commercial_config(u, 100).unwrap();
+        e.update_settings(BillingSettings {
+            credit_face_value_cny: 0.05,
+            ..e.get_settings()
+        });
+        publish(&e, update(&e), 101).unwrap();
+        let mut u = update(&e);
+        u.versions = vec![priced_from("b-1", "model-b", 0, official(0.03))];
+        assert_eq!(
+            publish(&e, u, 101).unwrap_err(),
+            "Official pricing is at a stale face value or rate: model-b"
+        );
+        let mut u = update(&e);
+        u.versions = vec![priced_from("b-1", "model-b", 0, official(0.05))];
+        publish(&e, u, 101).unwrap();
+    }
+
+    /// An older release ignores what it does not know, so it still loads prices and settings
+    /// a later one saved: the official block, the new settings, and any field added later.
+    /// Without them, prices and settings are saved as before, so the revision is unchanged.
+    #[test]
+    fn prices_and_settings_with_unknown_fields_still_load() {
+        let mut saved = serde_json::to_value(priced_from("v", "m", 0, official(0.03))).unwrap();
+        saved["added_later"] = serde_json::json!(1);
+        saved["official"]["added_later"] = serde_json::json!("x");
+        let loaded: RateCardVersion = serde_json::from_value(saved).unwrap();
+        assert_eq!(loaded.official, Some(official(0.03)));
+        let settings: BillingSettings = serde_json::from_value(serde_json::json!({
+            "credit_face_value_cny": 0.03,
+            "usd_cny_rate": 7.25,
+            "official_usd_cny": 1.0,
+            "added_later": true
+        }))
+        .unwrap();
+        assert_eq!(settings.official_usd_cny, Some(1.0));
+
+        let plain = serde_json::to_value(price("p", "m", 1, 0)).unwrap();
+        assert!(plain.get("official").is_none());
+        assert_eq!(
+            serde_json::to_value(BillingSettings::default()).unwrap(),
+            serde_json::json!({
+                "credit_face_value_cny": 0.01,
+                "usd_cny_rate": 7.25,
+                "rate_updated_at_secs": 0
+            })
+        );
     }
 }

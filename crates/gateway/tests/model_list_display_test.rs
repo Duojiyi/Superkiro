@@ -33,6 +33,7 @@ fn price(model: &str, input: i64, output: i64) -> RateCardVersion {
         per_call_credit: 0,
         margin_multiplier: 1.0,
         effective_from_secs: 0,
+        official: None,
     }
 }
 

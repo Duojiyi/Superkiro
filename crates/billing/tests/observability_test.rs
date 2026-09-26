@@ -137,6 +137,7 @@ fn test_cost_vs_revenue_gross_margin_dashboard() {
         credit_face_value_cny: 0.01,
         usd_cny_rate: 7.25,
         rate_updated_at_secs: 1000,
+        ..BillingSettings::default()
     };
     engine.update_settings(settings);
 
@@ -610,6 +611,7 @@ fn reports_saturate_instead_of_wrapping_on_extreme_entries() {
         credit_face_value_cny: 0.01,
         usd_cny_rate: 7.25,
         rate_updated_at_secs: 1,
+        ..BillingSettings::default()
     };
 
     let margin = compute_margin_dashboard(&entries, &settings);

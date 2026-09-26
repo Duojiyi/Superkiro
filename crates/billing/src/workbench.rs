@@ -68,6 +68,7 @@ impl ModelPresets {
             per_call_credit: 0,
             margin_multiplier: 1.30, // 30% default target gross margin
             effective_from_secs: now_secs,
+            official: None,
         })
     }
 }
