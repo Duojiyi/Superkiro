@@ -605,3 +605,51 @@ fn openai_usage_without_a_total_saturates() {
         .expect("usage");
     assert_eq!(usage.total_tokens, u64::MAX);
 }
+
+/// A tool result reaches the model as the text the tool produced. Sent as the JSON of
+/// Kiro's block list, a file line with a Windows path reached it as
+/// `[{"text":"let p = \"C:\\\\Users\\\\x\";..."}]`: every quote, newline and backslash
+/// escaped, which an exact str_replace `oldStr` then had to undo.
+#[test]
+fn tool_results_reach_both_providers_as_their_text() {
+    let file = "let p = \"C:\\Users\\x\";\nfn main() {}";
+    let request: GenerateAssistantResponseRequest = serde_json::from_value(serde_json::json!({
+        "conversationState": {
+            "conversationId": "tool-text",
+            "history": [
+                {"userInputMessage": {"content": "read main.rs"}},
+                {"assistantResponseMessage": {"content": "", "toolUses": [
+                    {"toolUseId": "t1", "name": "readFile", "input": {"path": "main.rs"}}
+                ]}}
+            ],
+            "currentMessage": {"userInputMessage": {"content": "", "userInputMessageContext": {
+                "toolResults": [{"toolUseId": "t1", "status": "error",
+                    "content": [{"text": file}, {"json": {"exit": 1}}]}]
+            }}}
+        }
+    }))
+    .unwrap();
+    let chat =
+        translate_kiro_to_chat_request(&request, &mut TranslationContext::new("claude-sonnet-4-6"));
+    let expected = format!("{file}\n{{\n  \"exit\": 1\n}}");
+
+    let anthropic = AnthropicProvider.translate_request(&chat).unwrap();
+    let result = anthropic["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|message| message["content"].as_array().cloned().unwrap_or_default())
+        .find(|block| block["type"] == "tool_result")
+        .unwrap();
+    assert_eq!(result["content"], expected.as_str());
+    assert_eq!(result["is_error"], true);
+
+    let openai = OpenAiProvider.translate_request(&chat).unwrap();
+    let tool = openai["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .unwrap();
+    assert_eq!(tool["content"], expected.as_str());
+}

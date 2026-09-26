@@ -269,6 +269,25 @@ fn format_user_content(
     }
 }
 
+/// A tool result as the model should read it: its text blocks joined, a JSON block pretty
+/// printed. Sent as the JSON of the block list, every newline, quote and backslash of a
+/// file a tool read reached the model escaped, and a Windows path doubled, so an exact
+/// `oldStr` for str_replace had to be un-escaped by the model first.
+fn tool_result_text(blocks: &[serde_json::Value]) -> String {
+    blocks
+        .iter()
+        .map(|block| match block {
+            serde_json::Value::String(text) => text.clone(),
+            _ => match (block.get("text"), block.get("json")) {
+                (Some(serde_json::Value::String(text)), _) => text.clone(),
+                (_, Some(json)) => serde_json::to_string_pretty(json).unwrap_or_default(),
+                _ => block.to_string(),
+            },
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Translate Kiro's `GenerateAssistantResponseRequest` into generic `ChatRequest`.
 pub fn translate_kiro_to_chat_request(
     kiro_req: &GenerateAssistantResponseRequest,
@@ -334,7 +353,7 @@ pub fn translate_kiro_to_chat_request(
                 // Historical tool results in user context
                 if let Some(ref ctx_data) = user_msg.user_input_message_context {
                     for tr in &ctx_data.tool_results {
-                        let content_str = serde_json::to_string(&tr.content).unwrap_or_default();
+                        let content_str = tool_result_text(&tr.content);
                         let is_error = tr.status.as_deref().map(|s| s == "error" || s == "failed");
                         raw_messages.push(ConversationMessage {
                             role: "tool".to_string(),
@@ -372,7 +391,7 @@ pub fn translate_kiro_to_chat_request(
     // 3. Process current user message: tool results and prompt content
     if let Some(ref ctx_data) = current_input.user_input_message_context {
         for tr in &ctx_data.tool_results {
-            let content_str = serde_json::to_string(&tr.content).unwrap_or_default();
+            let content_str = tool_result_text(&tr.content);
             let is_error = tr.status.as_deref().map(|s| s == "error" || s == "failed");
             raw_messages.push(ConversationMessage {
                 role: "tool".to_string(),
