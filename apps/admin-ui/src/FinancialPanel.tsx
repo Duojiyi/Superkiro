@@ -5,10 +5,15 @@ import {toast} from './components/toast';
 import {InfoTip} from './components/ui';
 import {parseFinancialSettings} from './financial';
 import {formatDateTime} from './format';
+import {publishFailure} from './refusal';
 
 type Message = {tone: 'error' | 'warning' | 'info'; text: string} | null;
 
-/** 结算参数: the credit face value and the USD rate, published with a reason against the version read. */
+/**
+ * 结算参数: the credit face value and the USD rate, published with a reason against the version
+ * read. A refusal leaves the values to correct; a publication that crossed another one can be
+ * sent again on the latest version with the same values (重新加载并保留修改).
+ */
 export default function FinancialPanel({onPublished, onDirtyChange, onBusyChange, refreshEpoch = 0}: {data?: AdminFinancials | null; onPublished: () => Promise<void>; onDirtyChange: (dirty: boolean) => void; onBusyChange: (busy: boolean) => void; refreshEpoch?: number}) {
   const [config, setConfig] = useState<CommercialConfig | null>(null);
   const [face, setFace] = useState(''), [rate, setRate] = useState(''), [reason, setReason] = useState('');
@@ -19,6 +24,8 @@ export default function FinancialPanel({onPublished, onDirtyChange, onBusyChange
   const [needsReview, setNeedsReview] = useState(false);
   // The console was refreshed while these settings had unpublished edits.
   const [serverChanged, setServerChanged] = useState(false);
+  // The last publication was refused because the configuration changed meanwhile.
+  const [conflict, setConflict] = useState(false);
   const dirty = !!reason.trim() || (!!config?.settings && (face !== String(config.settings.credit_face_value_cny) || rate !== String(config.settings.usd_cny_rate)));
   let inputError = '';
   if (config?.settings) {try {parseFinancialSettings(face, rate);} catch (error) {inputError = error instanceof Error ? error.message : '请填写有效数值';}}
@@ -27,7 +34,7 @@ export default function FinancialPanel({onPublished, onDirtyChange, onBusyChange
   useEffect(() => {onDirtyChange(dirty);}, [dirty, onDirtyChange]);
   useEffect(() => () => onDirtyChange(false), [onDirtyChange]);
   const apply = (next: CommercialConfig) => {
-    setConfig(next); setServerChanged(false);
+    setConfig(next); setServerChanged(false); setConflict(false);
     setFace(next.settings ? String(next.settings.credit_face_value_cny) : '');
     setRate(next.settings ? String(next.settings.usd_cny_rate) : '');
   };
@@ -94,12 +101,33 @@ export default function FinancialPanel({onPublished, onDirtyChange, onBusyChange
       }
     } catch (error) {
       if (alive.current) {
-        const mustReview = submitted && !(error instanceof AdminApiError && [400, 401, 403, 413, 422].includes(error.status));
-        if (mustReview) setNeedsReview(true);
         const text = error instanceof Error ? error.message : '发布失败';
-        setMessage({tone: 'error', text: mustReview ? `没收到发布结果（${text}），请重新加载确认后再发布；修改已保留` : text});
+        const failure = submitted ? publishFailure(error, '发布') : {message: text, uncertain: false, conflict: false};
+        if (failure.uncertain) {setNeedsReview(true); setMessage({tone: 'error', text: `没收到发布结果（${text}），请重新加载确认后再发布；修改已保留`});}
+        else if (failure.conflict) {setConflict(true); setMessage({tone: 'warning', text: '配置刚被别人更新（或在另一个窗口发布过），这次什么都没有发布。点“重新加载并保留修改”：读取最新配置，你填的数值和原因都保留。'});}
+        else setMessage({tone: 'error', text: failure.message});
       }
     } finally {if (submitted) {pending.current = false; if (alive.current) {setBusy(false); setPublishing(false);}}}
+  }
+
+  // 重新加载并保留修改: the latest version, with the values and reason typed here kept.
+  async function reloadKeeping() {
+    if (pending.current) return;
+    const typed = {face, rate, reason}, started = config?.settings;
+    pending.current = true; setBusy(true);
+    try {
+      const result = await adminApi.getCommercialConfig();
+      if (result.success !== true || !result.config?.revision) throw new Error('配置读取未确认');
+      if (!alive.current) return;
+      apply(result.config); setNeedsReview(false);
+      setFace(typed.face); setRate(typed.rate); setReason(typed.reason);
+      const now = result.config.settings;
+      setMessage(now && started && (now.credit_face_value_cny !== started.credit_face_value_cny || now.usd_cny_rate !== started.usd_cny_rate)
+        ? {tone: 'warning', text: `服务器上的结算参数已改为：积分面值 ${now.credit_face_value_cny} 元/积分、美元汇率 ${now.usd_cny_rate}。你填的数值仍在输入框里，请核对后再发布。`}
+        : {tone: 'info', text: '已读取最新配置，你填的数值和原因都保留了，可以再发布'});
+    } catch (error) {
+      if (alive.current) setMessage({tone: 'error', text: `重新加载失败（${error instanceof Error ? error.message : '配置读取失败'}），修改已保留，可以再试`});
+    } finally {pending.current = false; if (alive.current) setBusy(false);}
   }
 
   const blockedReason = needsReview ? '请重新加载确认后再发布' : !config?.settings ? '结算参数没有加载' : inputError ? inputError : !reason.trim() ? '填写变更原因后可发布' : reasonBytes > 500 ? '原因太长（最多约 160 字）' : undefined;
@@ -130,6 +158,7 @@ export default function FinancialPanel({onPublished, onDirtyChange, onBusyChange
             if (dirty && !(await confirmAction({title: '放弃未发布的修改？', consequence: '会重新加载服务器上的结算参数。', confirmLabel: '放弃修改'}))) return;
             void load(true);
           }}>{dirty ? (serverChanged && !needsReview ? '放弃修改并加载' : '放弃修改') : '重新加载'}</button>}
+          {(conflict || (serverChanged && !needsReview)) && dirty && <button type="button" className="btn" disabled={busy} onClick={() => void reloadKeeping()}>重新加载并保留修改</button>}
           <button type="submit" className="btn btn-primary" disabled={busy || !!blockedReason} title={blockedReason}>{publishing ? '发布中…' : '发布'}</button>
         </div>
       </div>

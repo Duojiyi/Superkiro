@@ -11,14 +11,18 @@ import { creditsText, currentVersion } from './priceChange';
 import PriceDrawer, { type PublishOutcome } from './PriceDrawer';
 import PriceVersions from './PriceVersions';
 import ListModelDrawer from './ListModelDrawer';
-import { authorizedModels, canRoute, isLive, modelRoute, targetProblem } from './routes';
+import { rebaseDraft } from './rebase';
+import { publishFailure } from './refusal';
+import { authorizedModels, canRoute, isLive, modelName, modelRoute, nameList, targetProblem } from './routes';
 
 type Row = Record<string, unknown>;
 
 // 分组与权益 / 模型与定价: a list, the row being edited, and — only when something changed — a
 // bar at the bottom with the reason and 发布. Everything is published together against the
 // version read, with a reason; a publish without a confirmed result blocks the next one until
-// a reload. Prices change one model at a time in their own drawer (调价).
+// a reload, while a refusal changes nothing and leaves the draft to correct (or, when the
+// configuration changed meanwhile, to reapply onto the new one). Prices change one model at a
+// time in their own drawer (调价).
 export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, cards, onPublished, refreshEpoch = 0, providers = [], providerKeys = [], routesKnown = false, intent }: {
   kind: 'groups' | 'models';
   onDirtyChange: (dirty: boolean) => void;
@@ -56,6 +60,8 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
   const [query, setQuery] = useState('');
   const [newGroup, setNewGroup] = useState<Record<string, string | boolean> | null>(null);
   const [newGroupError, setNewGroupError] = useState('');
+  // The last publication was refused because the configuration changed meanwhile.
+  const [conflict, setConflict] = useState(false);
   const say = (text: string, tone: 'error' | 'warning' | 'info' = 'error') => {setMessage(text); setMessageTone(tone);};
   const dirty = draft !== loadedDraft || !!reason.trim();
   const validText = (value: unknown, max: number) => typeof value === 'string' && !!value.trim() && new TextEncoder().encode(value).length <= max && !/[\x00-\x1f\x7f-\x9f]/.test(value);
@@ -105,7 +111,7 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
     if (keepSaved) {try {saved = JSON.parse(sessionStorage.getItem(draftKey) || '{}') ?? {};} catch {/* nothing to restore */}}
     else {try {sessionStorage.removeItem(draftKey);} catch {/* nothing kept */}}
     const restore = saved.base === value && typeof saved.draft === 'string' && typeof saved.reason === 'string';
-    setConfig(next); setServerChanged(false);
+    setConfig(next); setServerChanged(false); setConflict(false);
     setSelected(current => next[kind].some(row => String(row.id) === current) ? current : String(next[kind][0]?.id ?? '')); setReason(restore ? String(saved.reason) : ''); setLoadedDraft(value); setDraft(restore ? String(saved.draft) : value); setNeedsReview(false);
     return restore ? 'restored' : typeof saved.draft === 'string' ? 'stale' : 'none';
   };
@@ -145,6 +151,15 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
   }, [refreshEpoch]);
   const editedRows = rows.filter(isEdited);
   const newVersions = Array.isArray(parsedDraft.versions) ? parsedDraft.versions.length : 0;
+  // A model the server names, as the list names it.
+  const nameOfId = (id: string) => {const models = config?.models ?? []; const model = [...rows, ...models].find(row => row.id === id || row.exposed_model_id === id); return model ? modelName(model, models, config?.groups ?? []) : id;};
+  // Models and their rate cards are upserted by ID, so only what changed is sent: the server then
+  // checks only those entries, and an unrelated model without a route cannot block a publication.
+  const served = (section: string, id: unknown) => (section === 'models' ? config?.models : section === 'rate_cards' ? config?.rate_cards : undefined)?.find(row => row.id === id);
+  const publication = () => kind === 'groups' ? parsedDraft : Object.fromEntries(Object.entries(parsedDraft)
+    .map(([section, entries]) => [section, section === 'versions' || section === 'settings' || !Array.isArray(entries) ? entries
+      : entries.filter(row => JSON.stringify(row) !== JSON.stringify(served(section, row.id)))])
+    .filter(([section, entries]) => section === 'settings' || (Array.isArray(entries) && entries.length > 0)));
   const publish = async () => {
     if (!config || pending.current || needsReview) return;
     let submitted = false;
@@ -178,6 +193,8 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
       }
       const names = editedRows.map(row => String(row.name ?? row.exposed_model_id ?? row.id));
       const changes = names.length + newVersions;
+      const update = publication();
+      if (kind === 'models' && !Object.keys(update).length) throw new Error('没有要发布的修改（只填了原因）');
       const confirmed = await confirmAction({
         title: changes ? `发布 ${changes} 项修改？` : `发布${kind === 'groups' ? '分组' : '模型与价格'}配置？`,
         facts: [
@@ -190,24 +207,50 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
         confirmLabel: '发布',
       });
       if (!confirmed || !alive.current || pending.current) return;
-      pending.current = true; submitted = true; setBusy(true); setPublishing(true); setMessage('');
-      const result = await adminApi.publishCommercialConfig({...parsedDraft, expected_revision: config.revision, reason: reason.trim()});
+      pending.current = true; submitted = true; setBusy(true); setPublishing(true); setMessage(''); setConflict(false);
+      const result = await adminApi.publishCommercialConfig({...update, expected_revision: config.revision, reason: reason.trim()});
       if (result.success !== true) throw new AdminApiError('服务器未确认发布成功', 400);
       if (!result.config?.revision) throw new Error('服务器未返回可核对的配置版本');
       try {sessionStorage.removeItem(draftKey);} catch {/* published; nothing left to keep */}
       if (alive.current) {apply(result.config, false); toast.success('已发布'); onPublished?.();}
     } catch (error) {
       if (alive.current) {
-        const mustReview = submitted && !(error instanceof AdminApiError && [400, 401, 403, 413, 422].includes(error.status));
-        if (mustReview) setNeedsReview(true);
         const text = error instanceof Error ? error.message : String(error);
-        say(mustReview ? `没收到发布结果（${text}）。修改已保留，请重新加载确认后再发布，不要重复提交。` : text);
+        // A refusal (the server said no) changed nothing: the draft stays as typed, to correct.
+        const failure = submitted ? publishFailure(error, '发布', nameOfId) : {message: text, uncertain: false, conflict: false};
+        if (failure.uncertain) {setNeedsReview(true); say(`没收到发布结果（${text}）。修改已保留，请重新加载确认后再发布，不要重复提交。`);}
+        else if (failure.conflict) {setConflict(true); say('配置刚被别人更新（或在另一个窗口发布过），这次什么都没有发布。点“重新加载并保留修改”：读取最新配置，再把你的修改套上去。', 'warning');}
+        else say(failure.message);
       }
     } finally {if (submitted) {pending.current = false; if (alive.current) {setBusy(false); setPublishing(false);}}}
   };
-  // One change published on its own: 调价 (a price version) or a step of 上架 (the new model).
-  // `done` is the confirmation shown on success; the listing drawer shows its own at the end.
-  const publishOne = async (update: {models?: Row[]; versions?: Row[]}, updateReason: string, action: string, done?: string): Promise<PublishOutcome> => {
+  // 重新加载并保留修改: the latest configuration, with this draft's edits applied again where the
+  // same fields have not been changed on the server meanwhile; the reason is kept.
+  const reloadKeeping = async () => {
+    if (!config || pending.current || draftError) return;
+    pending.current = true; setBusy(true);
+    try {
+      const result = await adminApi.getCommercialConfig();
+      if (result.success !== true || !result.config?.revision) throw new Error('服务器未确认配置读取成功');
+      if (!alive.current) return;
+      const next = result.config, keptReason = reason;
+      const view = kind === 'groups' ? {groups: next.groups} : {models: next.models, rate_cards: next.rate_cards, versions: next.versions};
+      const rebased = rebaseDraft(JSON.parse(loadedDraft), parsedDraft, view);
+      apply(next, false);
+      setDraft(JSON.stringify(rebased.draft, null, 2)); setReason(keptReason);
+      const label = (row: Record<string, unknown>) => String(row.name ?? (row.exposed_model_id ? modelName(row, next.models, next.groups) : row.id));
+      const lost = rebased.skipped.map(item => item.reason === 'removed' ? `${label(item.row)}（服务器上已删除）` : item.reason === 'exists' ? `新建的 ${String(item.row.id)}（服务器上已有这个 ID）`
+        : `${label(item.row)} 的${labels[item.field ?? ''] ?? item.field}（服务器现为 ${shownValue(item.field ?? '', item.server)}）`);
+      say(lost.length ? `已读取最新配置。${rebased.applied ? `保留了 ${rebased.applied} 项修改；` : ''}这些修改没有套用，因为别人已经改过：${nameList(lost, 8)}。请核对后再发布。`
+        : `已读取最新配置，并保留了你的 ${rebased.applied} 项修改，请核对后再发布`, lost.length ? 'warning' : 'info');
+    } catch (error) {
+      if (alive.current) say(`重新加载失败（${error instanceof Error ? error.message : String(error)}），修改已保留，可以再试`);
+    } finally {pending.current = false; if (alive.current) setBusy(false);}
+  };
+  // One change published on its own: 调价 (a price version), 上架 (a new model), a row action.
+  // `done` is the confirmation shown on success; `check`, what to look for when the result is
+  // not confirmed.
+  const publishOne = async (update: {models?: Row[]; versions?: Row[]; removed_models?: string[]; cancelled_versions?: string[]}, updateReason: string, action: string, done?: string, check?: string): Promise<PublishOutcome> => {
     if (!config || pending.current || needsReview || dirty) return {ok: false, message: '有未完成的发布或修改，请先处理'};
     pending.current = true; setBusy(true); setMessage('');
     try {
@@ -217,15 +260,10 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
       if (alive.current) {apply(result.config, false); if (done) toast.success(done); onPublished?.();}
       return {ok: true};
     } catch (error) {
-      const text = error instanceof Error ? error.message : String(error);
-      // Refusals (the server says 409 for every validation) change nothing and can be corrected.
-      if (error instanceof AdminApiError && error.status === 409) {
-        const conflict = /configuration changed|reload/i.test(text);
-        return {ok: false, conflict, message: conflict ? '配置刚被更新，请重新加载后再发布（已填的内容会保留）' : `服务器拒绝了这次${action}：${text}`};
-      }
-      if (error instanceof AdminApiError && [400, 401, 403, 413, 422].includes(error.status)) return {ok: false, message: text};
-      if (alive.current) {setNeedsReview(true); say(`没收到${action}结果（${text}）。请重新加载核对后再操作，不要重复提交。`);}
-      return {ok: false, uncertain: true, message: text};
+      // Refusals (the server says 409 for every rule) change nothing and can be corrected.
+      const failure = publishFailure(error, action, nameOfId);
+      if (failure.uncertain && alive.current) {setNeedsReview(true); say(`没收到${action}结果（${failure.message}）。请点“重新加载”后核对${check ? `${check}` : '是否已生效'}，不要重复提交。`);}
+      return failure;
     } finally {pending.current = false; if (alive.current) setBusy(false);}
   };
   const publishPrice = (version: Row, priceReason: string) => publishOne({versions: [version]}, priceReason, '调价', `已发布 ${String(version.model)} 的新价格`);
@@ -480,6 +518,7 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
         {/* Discarding is offered only when there is something to discard (or to review). */}
         {(dirty || needsReview || serverChanged || !config) && <button type="button" className="btn" disabled={busy} onClick={() => void reload()}>
           {dirty ? (serverChanged && !needsReview ? '放弃修改并加载' : '放弃修改') : '重新加载'}</button>}
+        {(conflict || (serverChanged && !needsReview)) && dirty && !draftError && <button type="button" className="btn" disabled={busy} onClick={() => void reloadKeeping()}>重新加载并保留修改</button>}
         <button type="button" className="btn btn-primary" disabled={busy || !!publishBlocked} title={publishBlocked} onClick={() => void publish()}>{publishing ? '发布中…' : '发布'}</button>
       </div>
       {message && <p role="status" className={`message message-${messageTone}`}>{message}</p>}

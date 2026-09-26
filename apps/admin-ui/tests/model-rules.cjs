@@ -78,3 +78,19 @@ for (const error of [refused('Billing persistence failed: disk', 503), new Error
   assert.equal(refusal.publishFailure(error, '发布').uncertain, true, error.message);
 }
 console.log('PASS refusals: 409 and request errors are refusals in plain words with model names; timeouts and server errors are unconfirmed');
+
+// 重新加载并保留修改: edits reapplied where the field is untouched on the server; the rest reported.
+const {rebaseDraft, rebaseRows} = load('rebase.ts');
+const base = [{id: 'a', context_window: 200000, visible: true}, {id: 'b', context_window: 100000, max_output: 8000}, {id: 'gone', context_window: 1}];
+const edited = [{id: 'a', context_window: 1000000, visible: true}, {id: 'b', context_window: 128000, max_output: 16000}, {id: 'gone', context_window: 2}, {id: 'new', context_window: 5}, {id: 'taken', context_window: 6}];
+const server = [{id: 'a', context_window: 200000, visible: false}, {id: 'b', context_window: 64000, max_output: 8000}, {id: 'taken', context_window: 7}];
+const rebased = rebaseRows(base, edited, server);
+assert.deepEqual(plain(rebased.rows), [{id: 'a', context_window: 1000000, visible: false}, {id: 'b', context_window: 64000, max_output: 16000}, {id: 'taken', context_window: 7}, {id: 'new', context_window: 5}],
+  'a field changed only here is applied; one changed on the server keeps the server value; another field changed there stays');
+assert.equal(rebased.applied, 3);
+assert.deepEqual(plain(rebased.skipped.map(item => [item.row.id, item.reason, item.field ?? null, item.server ?? null])),
+  [['b', 'changed', 'context_window', 64000], ['gone', 'removed', null, null], ['taken', 'exists', null, null]]);
+const whole = rebaseDraft({models: base, versions: []}, {models: edited.slice(0, 1), versions: [{id: 'v-new'}, {id: 'v-taken'}]}, {models: server, versions: [{id: 'v-taken'}]});
+assert.deepEqual(plain(whole.draft.versions), [{id: 'v-new'}], 'a new price version whose ID has since been used is dropped and reported');
+assert.equal(whole.skipped.at(-1).reason, 'exists');
+console.log('PASS rebase: edits reapplied onto the latest configuration where untouched, conflicts, deletions and taken IDs reported');
