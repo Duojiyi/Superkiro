@@ -115,8 +115,9 @@ async fn production_cookie_login_csrf_reveal_logout_and_fail_closed() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["cache-control"], "no-store");
     let session = json_body(response).await;
-    assert_eq!(session["expiresAt"], login["expiresAt"]);
-    assert!(session["expiresIn"].as_u64().unwrap() <= 900);
+    // Each use moves the half-hour idle deadline on: never earlier than at sign-in.
+    assert!(session["expiresAt"].as_u64().unwrap() >= login["expiresAt"].as_u64().unwrap());
+    assert!(session["expiresIn"].as_u64().unwrap() <= 1800);
     assert_eq!(session["twoFactorEnabled"], false);
     let csrf = session["csrfToken"].as_str().unwrap();
     for (auth_cookie, expected) in [

@@ -50,11 +50,30 @@ fn parse_query(uri: &axum::http::Uri, key: &str) -> Option<String> {
         .find_map(|(name, value)| (name == key).then(|| value.to_string()))
 }
 
+/// A request carrying this header is the console refreshing itself: it keeps the session
+/// alive no longer, so an unattended console still signs out when idle.
+pub const BACKGROUND_HEADER: &str = "x-admin-background";
+
+/// A live session: the token's own expiry, how long it may sit unused, and its last use.
+#[derive(Debug, Clone, Copy)]
+struct SessionEntry {
+    exp: u64,
+    idle_secs: u64,
+    last_used: u64,
+}
+
+impl SessionEntry {
+    /// When it ends if not used again: idle time after its last use, never past the token.
+    fn deadline(&self) -> u64 {
+        self.last_used.saturating_add(self.idle_secs).min(self.exp)
+    }
+}
+
 /// Shared admin authorization state.
 #[derive(Clone)]
 pub struct AdminAuthState {
     pub admin_key: String,
-    sessions: Arc<std::sync::RwLock<HashMap<String, u64>>>,
+    sessions: Arc<std::sync::RwLock<HashMap<String, SessionEntry>>>,
     session_epoch: Arc<AtomicU64>,
     legacy_key_allowed: bool,
     pub browser: Option<super::admin_login::BrowserAuth>,
@@ -127,13 +146,19 @@ impl AdminAuthState {
 
     /// Verify a short-lived signed administrator session token.
     pub fn verify_session(&self, headers: &axum::http::HeaderMap) -> bool {
+        self.verify_session_deadline(headers).is_some()
+    }
+
+    /// Verify a session token and count the request as a use of it, unless it is marked as
+    /// background; returns when the session now ends if it is not used again.
+    pub fn verify_session_deadline(&self, headers: &axum::http::HeaderMap) -> Option<u64> {
         let token = headers
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "))
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        let Some(token) = token else { return false };
+        let token = token?;
 
         let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
         validation.validate_exp = true;
@@ -143,26 +168,26 @@ impl AdminAuthState {
             &jsonwebtoken::DecodingKey::from_secret(self.admin_key.as_bytes()),
             &validation,
         );
-        let Ok(data) = decoded else { return false };
-        let claims = data.claims;
+        let claims = decoded.ok()?.claims;
         if claims.sub != "admin" || claims.role != "admin" {
-            return false;
+            return None;
         }
         if claims.epoch != self.session_epoch.load(Ordering::Acquire) {
-            return false;
+            return None;
         }
         let now = now_secs();
         if claims.exp <= now {
-            return false;
+            return None;
         }
-        let mut sessions = match self.sessions.write() {
-            Ok(value) => value,
-            Err(_) => return false,
-        };
-        sessions.retain(|_, exp| *exp > now);
-        sessions
-            .get(&claims.jti)
-            .is_some_and(|exp| *exp >= claims.exp)
+        let mut sessions = self.sessions.write().ok()?;
+        sessions.retain(|_, entry| entry.deadline() > now);
+        let entry = sessions
+            .get_mut(&claims.jti)
+            .filter(|entry| entry.exp >= claims.exp)?;
+        if !headers.contains_key(BACKGROUND_HEADER) {
+            entry.last_used = now;
+        }
+        Some(entry.deadline())
     }
 
     /// Verify either a session or the legacy key. The latter exists only for
@@ -177,10 +202,26 @@ impl AdminAuthState {
         self.verify(headers).then_some("admin")
     }
 
+    /// A session that ends `ttl_secs` after it is issued, used or not.
     pub fn issue_session(&self, ttl_secs: u64) -> Result<AdminSessionResponse, String> {
-        let now = now_secs();
         let ttl = ttl_secs.clamp(60, 3600);
-        let exp = now.saturating_add(ttl);
+        self.issue(ttl, ttl)
+    }
+
+    /// A session that ends after `idle_secs` without use, and `max_secs` after sign-in at the
+    /// latest. The reply names the idle deadline; each use moves it on.
+    pub fn issue_idle_session(
+        &self,
+        idle_secs: u64,
+        max_secs: u64,
+    ) -> Result<AdminSessionResponse, String> {
+        let max = max_secs.clamp(1, 12 * 3600);
+        self.issue(idle_secs.clamp(1, max), max)
+    }
+
+    fn issue(&self, idle_secs: u64, max_secs: u64) -> Result<AdminSessionResponse, String> {
+        let now = now_secs();
+        let exp = now.saturating_add(max_secs);
         // Random IDs prevent a pre-restart session matching a newly issued one.
         use ring::rand::SecureRandom;
         let mut random = [0u8; 32];
@@ -210,17 +251,30 @@ impl AdminAuthState {
             .sessions
             .write()
             .map_err(|_| "admin session store poisoned".to_string())?;
-        sessions.retain(|_, expires| *expires > now);
+        sessions.retain(|_, entry| entry.deadline() > now);
         if sessions.len() >= 256 {
             return Err("too many active admin sessions".to_string());
         }
-        sessions.insert(jti, exp);
+        let entry = SessionEntry {
+            exp,
+            idle_secs,
+            last_used: now,
+        };
+        sessions.insert(jti, entry);
         Ok(AdminSessionResponse {
             access_token: token,
             token_type: "Bearer".to_string(),
-            expires_in: ttl,
-            expires_at: exp,
+            expires_in: entry.deadline() - now,
+            expires_at: entry.deadline(),
         })
+    }
+
+    /// Tests only: move every session's last use `secs` into the past.
+    #[cfg(test)]
+    pub(crate) fn backdate_session_use(&self, secs: u64) {
+        for entry in self.sessions.write().unwrap().values_mut() {
+            entry.last_used = entry.last_used.saturating_sub(secs);
+        }
     }
 
     pub fn revoke_all_sessions(&self) {

@@ -6,7 +6,6 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     middleware::Next,
 };
-use base64::Engine;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -14,7 +13,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Semaphore;
 
 const COOKIE: &str = "__Host-admin_session";
-const TTL: u64 = 900;
+/// A session ends after 30 minutes without use, and 8 hours after sign-in at the latest.
+const IDLE: u64 = 30 * 60;
+const MAX_AGE: u64 = 8 * 3600;
+/// Tells the console when its session ends, after each request that used it.
+const SESSION_EXPIRES_HEADER: &str = "x-admin-session-expires";
 const MAX_LOGIN_SOURCES: usize = 4096;
 const MAX_PASSWORD_CHECKS: usize = 4;
 /// Sources that logged in successfully keep a lane of their own for this long.
@@ -306,17 +309,6 @@ impl Totp {
     }
 }
 
-// Read exp only after signature, issuer, epoch and revocation have been verified.
-fn verified_expiry(token: &str) -> Option<u64> {
-    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(token.split('.').nth(1)?)
-        .ok()?;
-    serde_json::from_slice::<serde_json::Value>(&payload)
-        .ok()?
-        .get("exp")?
-        .as_u64()
-}
-
 fn reply(status: StatusCode, message: &str) -> Response {
     json_response(
         status,
@@ -446,7 +438,7 @@ pub async fn handle(
             return browser.session_error("Invalid administrator credentials or verification code");
         }
         browser.remember_source(&source);
-        let Ok(session) = auth.issue_session(TTL) else {
+        let Ok(session) = auth.issue_idle_session(IDLE, MAX_AGE) else {
             return no_store(reply(
                 StatusCode::TOO_MANY_REQUESTS,
                 "Too many administrator sessions",
@@ -466,7 +458,8 @@ pub async fn handle(
                 "expiresIn": session.expires_at.saturating_sub(now_secs()), "expiresAt": session.expires_at,
                 "twoFactorEnabled": browser.totp.is_some(), "totpRequired": browser.totp.is_some()}),
         );
-        cookie(&mut response, &session.access_token, TTL);
+        // The cookie lasts as long as the session could; the server enforces the idle limit.
+        cookie(&mut response, &session.access_token, MAX_AGE);
         return no_store(response);
     }
     // Browser production surface accepts only the host-only session cookie, never an admin key.
@@ -477,17 +470,14 @@ pub async fn handle(
         return browser.session_error("Invalid administrator credentials or verification code");
     };
     req.headers_mut().insert(header::AUTHORIZATION, value);
-    if !auth.verify_session(req.headers()) {
+    let Some(expires_at) = auth.verify_session_deadline(req.headers()) else {
         let mut response =
             browser.session_error("Invalid administrator credentials or verification code");
         cookie(&mut response, "", 0);
         return no_store(response);
-    }
+    };
     if req.uri().path() == "/api/v1/admin/session" && req.method() == "GET" {
-        let Some(expires_at) = verified_expiry(&token) else {
-            return browser.session_error("Invalid session");
-        };
-        return no_store(json_response(
+        let mut response = json_response(
             StatusCode::OK,
             &serde_json::json!({
                 // The one operator account: the console names who acts without a new sign-in.
@@ -495,7 +485,11 @@ pub async fn handle(
                 "expiresAt": expires_at, "expiresIn": expires_at.saturating_sub(now_secs()),
                 "twoFactorEnabled": browser.totp.is_some(), "totpRequired": browser.totp.is_some()
             }),
-        ));
+        );
+        if let Ok(value) = expires_at.to_string().parse() {
+            response.headers_mut().insert(SESSION_EXPIRES_HEADER, value);
+        }
+        return no_store(response);
     }
     if mutation {
         let supplied = req
@@ -511,6 +505,8 @@ pub async fn handle(
     let mut response = next.run(req).await;
     if logout && response.status().is_success() {
         cookie(&mut response, "", 0);
+    } else if let Ok(value) = expires_at.to_string().parse() {
+        response.headers_mut().insert(SESSION_EXPIRES_HEADER, value);
     }
     no_store(response)
 }
@@ -535,6 +531,7 @@ fn session_cookie(headers: &HeaderMap) -> Option<String> {
 mod tests {
     use super::*;
     use axum::{body::Body, middleware, routing::any, Router};
+    use base64::Engine;
     use tower::ServiceExt;
 
     // Published RFC 6238 test fixture, never a deployment credential.
@@ -661,7 +658,8 @@ mod tests {
             serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
         assert_eq!(body["twoFactorEnabled"], true);
         let expires = body["expiresAt"].as_u64().unwrap();
-        assert!((now_secs() + 898..=now_secs() + 900).contains(&expires));
+        // The idle deadline: half an hour from now, moved on by each use.
+        assert!((now_secs() + IDLE - 2..=now_secs() + IDLE).contains(&expires));
         let session = app
             .clone()
             .oneshot(request(
@@ -678,7 +676,7 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_slice(&to_bytes(session.into_body(), 4096).await.unwrap()).unwrap();
         assert_eq!(body["expiresAt"], expires);
-        assert!(body["expiresIn"].as_u64().unwrap() <= 900);
+        assert!(body["expiresIn"].as_u64().unwrap() <= IDLE);
         for _ in 0..6 {
             assert_eq!(
                 app.clone()
@@ -699,7 +697,92 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_deadline_is_actual_non_sliding_and_expired_is_cleared() {
+    async fn session_deadline_moves_with_use_but_not_background_refreshes() {
+        let auth = AdminAuthState::new("test-signing-key");
+        let session = auth.issue_idle_session(IDLE, MAX_AGE).unwrap();
+        assert_eq!(session.expires_in, IDLE);
+        let browser = BrowserAuth::new(
+            "https://admin.test".into(),
+            bcrypt::hash("test-password", 4).unwrap(),
+        )
+        .unwrap();
+        let app = app_with_auth(browser, auth.clone());
+        let cookie = format!("{COOKIE}={}", session.access_token);
+        let check = |background: bool| {
+            let mut request = request("GET", "session", Some(&cookie), None, None, "");
+            if background {
+                request
+                    .headers_mut()
+                    .insert(super::super::admin::BACKGROUND_HEADER, "1".parse().unwrap());
+            }
+            app.clone().oneshot(request)
+        };
+        let deadline = |response: &Response| -> u64 {
+            response.headers()[SESSION_EXPIRES_HEADER]
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap()
+        };
+
+        // Twenty minutes idle: a background refresh leaves the deadline where it was.
+        auth.backdate_session_use(20 * 60);
+        let response = check(true).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let idle_deadline = deadline(&response);
+        assert!(idle_deadline <= now_secs() + 10 * 60, "{idle_deadline}");
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["expiresAt"], idle_deadline);
+        assert_eq!(body["username"], "admin");
+
+        // A real use moves it half an hour on, without a new cookie or CSRF token.
+        let response = check(false).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key(header::SET_COOKIE));
+        let used = deadline(&response);
+        assert!(
+            used >= now_secs() + IDLE - 2 && used > idle_deadline,
+            "{used}"
+        );
+
+        // Half an hour without use ends it, and the browser drops the cookie.
+        auth.backdate_session_use(IDLE + 1);
+        let response = check(false).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .contains("Max-Age=0"));
+    }
+
+    #[tokio::test]
+    async fn session_never_outlives_its_token_however_often_it_is_used() {
+        let auth = AdminAuthState::new("test-signing-key");
+        // Idle limit longer than the token: the token's own end still applies.
+        let session = auth.issue_idle_session(IDLE, 60).unwrap();
+        assert_eq!(session.expires_in, 60);
+        let browser = BrowserAuth::new(
+            "https://admin.test".into(),
+            bcrypt::hash("test-password", 4).unwrap(),
+        )
+        .unwrap();
+        let app = app_with_auth(browser, auth);
+        let cookie = format!("{COOKIE}={}", session.access_token);
+        let response = app
+            .clone()
+            .oneshot(request("GET", "session", Some(&cookie), None, None, ""))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["expiresAt"], session.expires_at);
+        assert!(body["expiresIn"].as_u64().unwrap() <= 60);
+    }
+
+    #[tokio::test]
+    async fn expired_session_token_is_refused_and_cleared() {
         let auth = AdminAuthState::new("test-signing-key");
         let session = auth.issue_session(60).unwrap();
         let browser = BrowserAuth::new(
@@ -708,31 +791,6 @@ mod tests {
         )
         .unwrap();
         let app = app_with_auth(browser, auth);
-        let cookie = format!("{COOKIE}={}", session.access_token);
-        let mut remaining = 0;
-        for attempt in 0..2 {
-            let response = app
-                .clone()
-                .oneshot(request("GET", "session", Some(&cookie), None, None, ""))
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            assert!(!response.headers().contains_key(header::SET_COOKIE));
-            let body: serde_json::Value =
-                serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap())
-                    .unwrap();
-            assert_eq!(body["expiresAt"], session.expires_at);
-            assert_eq!(body["username"], "admin");
-            let ttl = body["expiresIn"].as_u64().unwrap();
-            assert!(ttl <= 60);
-            if attempt == 1 {
-                assert!(ttl < remaining);
-            }
-            remaining = ttl;
-            if attempt == 0 {
-                tokio::time::sleep(Duration::from_millis(1100)).await;
-            }
-        }
         // Signed with the fixture key and existing jti; expiry is strictly enforced,
         // independently of JWT library leeway and the server-side session entry.
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -858,7 +916,7 @@ mod tests {
             "Secure",
             "SameSite=Strict",
             "Path=/",
-            "Max-Age=900",
+            "Max-Age=28800",
         ] {
             assert!(set_cookie.contains(flag));
         }

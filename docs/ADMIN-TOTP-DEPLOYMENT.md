@@ -93,16 +93,20 @@ Successful HTTP 200 JSON:
 {
   "success": true,
   "authenticated": true,
-  "expiresAt": 1800000900,
-  "expiresIn": 900,
+  "expiresAt": 1800001800,
+  "expiresIn": 1800,
   "twoFactorEnabled": true,
   "totpRequired": true
 }
 ```
 
-`expiresAt` is an absolute Unix timestamp in **seconds**, not milliseconds.
-`expiresIn` is the remaining whole seconds, never a refreshed TTL. The server
-issues a fixed 900-second session and a Secure, HttpOnly, SameSite=Strict cookie.
+`expiresAt` is an absolute Unix timestamp in **seconds**, not milliseconds, and
+`expiresIn` the remaining whole seconds. A session ends after 30 minutes without
+use and 8 hours after sign-in at the latest: each authenticated request moves
+the deadline on, and every authenticated response reports it in the
+`x-admin-session-expires` header. Requests sent with `x-admin-background: 1`
+(the console refreshing itself) do not count as use. The Secure, HttpOnly,
+SameSite=Strict cookie lasts 8 hours; the server enforces the idle limit.
 Re-login revokes the previous supplied browser session. No access token or CSRF
 token is returned in the login body; obtain CSRF from authenticated GET below.
 

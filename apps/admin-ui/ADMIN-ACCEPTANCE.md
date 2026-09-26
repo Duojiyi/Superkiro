@@ -3,7 +3,7 @@
 ## 已接入
 
 - 登录：用户名 `admin` + 密码；服务端 `ADMIN_BROWSER_LOGIN=true`，`ADMIN_ORIGIN` 必须是精确 HTTPS origin，`ADMIN_PASSWORD_HASH` 为 bcrypt。`ADMIN_KEY` 仅留服务端，不输入浏览器。
-- Cookie：`__Host-admin_session`、Secure、HttpOnly、SameSite=Strict、15 分钟；刷新恢复会话；写请求携带 `GET /api/v1/admin/session` 返回的 CSRF。登录全局每分钟 10 次预算。
+- Cookie：`__Host-admin_session`、Secure、HttpOnly、SameSite=Strict；30 分钟无操作失效，最长 8 小时（自动刷新请求带 `x-admin-background: 1`，不算操作）；刷新恢复会话；写请求携带 `GET /api/v1/admin/session` 返回的 CSRF。登录全局每分钟 10 次预算。
 - 认证门禁：checking 时仅检查会话；未认证只渲染独立登录页，无取消入口，不请求后台数据。401 或退出立即卸载后台、清除会话令牌并中止在途请求；重登录不保留筛选或编辑草稿。服务端撤销失败仍保持本地退出，并明确提示撤销未确认。
 - 卡密：分页读取、搜索筛选、四档批量生成、结果表格、逐卡/整批复制与 CSV、冻结/解冻/封禁、带原因调账。按需 POST `/cards/reveal`，关闭清除明文；`codeRecoverable=false` 禁用并说明旧卡不可恢复。
 - 供应商：渠道导入、启停、Key 权限/权重/状态保存、候选模型发现（不会自动发布用户目录）。缺少必填项的操作禁用。
