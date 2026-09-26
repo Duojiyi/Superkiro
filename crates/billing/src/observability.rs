@@ -5,6 +5,7 @@
 use crate::ledger::LedgerEntry;
 use crate::rate_card::BillingSettings;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Request execution status (Spec §5, §14.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -71,6 +72,131 @@ pub struct Activity {
     pub providers: Vec<ProviderActivity>,
     /// The oldest trace kept: request counts reach back no further than this.
     pub traces_cover_from_secs: Option<u64>,
+    /// Every upstream attempt by provider, from each request's attempt chain, busiest
+    /// first: a provider that fails over to a backup shows its failures, though the backup
+    /// answered.
+    #[serde(rename = "providerAttempts")]
+    pub provider_attempts: Vec<ProviderAttempts>,
+    /// The same by Key.
+    #[serde(rename = "keyAttempts")]
+    pub key_attempts: Vec<KeyAttempts>,
+    /// Requests by the model the customer asked for, busiest first.
+    #[serde(rename = "modelHealth")]
+    pub model_health: Vec<ModelHealth>,
+    /// Billed requests and the cards that made them by customer model over the last 7 days,
+    /// from the ledger, busiest first.
+    #[serde(rename = "modelUsage7d")]
+    pub model_usage_7d: Vec<ModelUsage>,
+}
+
+/// Error classes of requests refused for the card's own balance or limits: they say
+/// nothing about the model asked for.
+pub const CARD_LIMIT_REFUSALS: [&str; 3] =
+    ["insufficient_balance", "concurrency_limit", "usage_limit"];
+
+/// Upstream attempts over one period.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttemptWindow {
+    pub attempts: u64,
+    pub failures: u64,
+    /// Failed attempts after which another provider answered the request.
+    pub taken_over: u64,
+    /// Failures by the kind attempt chains name: http_429, http_401, timeout, transport,
+    /// upstream_service, protocol, empty.
+    pub failures_by_kind: BTreeMap<String, u64>,
+}
+
+impl AttemptWindow {
+    pub(crate) fn count(&mut self, attempt: &AttemptRecord, taken_over: bool) {
+        self.attempts += 1;
+        if !attempt.success {
+            self.failures += 1;
+            self.taken_over += u64::from(taken_over);
+            let kind = attempt.error.as_deref().unwrap_or("unknown");
+            *self.failures_by_kind.entry(kind.to_string()).or_default() += 1;
+        }
+    }
+}
+
+/// One provider's attempts over the last hour, 24 hours and 7 days.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderAttempts {
+    pub provider_id: String,
+    #[serde(rename = "last1h")]
+    pub last_1h: AttemptWindow,
+    #[serde(rename = "last24h")]
+    pub last_24h: AttemptWindow,
+    #[serde(rename = "last7d")]
+    pub last_7d: AttemptWindow,
+}
+
+/// One Key's attempts over the last hour, 24 hours and 7 days.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyAttempts {
+    pub key_id: String,
+    pub provider_id: String,
+    #[serde(rename = "last1h")]
+    pub last_1h: AttemptWindow,
+    #[serde(rename = "last24h")]
+    pub last_24h: AttemptWindow,
+    #[serde(rename = "last7d")]
+    pub last_7d: AttemptWindow,
+}
+
+/// Finished requests for one customer model over one period. Refusals for the card's own
+/// balance or limits are not counted.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelHealthWindow {
+    pub requests: u64,
+    pub failures: u64,
+    pub last_failure_at: Option<u64>,
+    /// The commonest kind of failure, the earliest in name on a tie.
+    pub top_failure_kind: Option<String>,
+    /// Failures by kind: the request's error class, else its last failed attempt's kind.
+    pub failures_by_kind: BTreeMap<String, u64>,
+}
+
+impl ModelHealthWindow {
+    pub(crate) fn count(&mut self, ts: u64, failure: Option<&str>) {
+        self.requests += 1;
+        if let Some(kind) = failure {
+            self.failures += 1;
+            self.last_failure_at = self.last_failure_at.max(Some(ts));
+            *self.failures_by_kind.entry(kind.to_string()).or_default() += 1;
+            self.top_failure_kind = self
+                .failures_by_kind
+                .iter()
+                .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
+                .map(|(kind, _)| kind.clone());
+        }
+    }
+}
+
+/// One customer model's requests over the last hour, 24 hours and 7 days.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelHealth {
+    pub model: String,
+    #[serde(rename = "last1h")]
+    pub last_1h: ModelHealthWindow,
+    #[serde(rename = "last24h")]
+    pub last_24h: ModelHealthWindow,
+    #[serde(rename = "last7d")]
+    pub last_7d: ModelHealthWindow,
+}
+
+/// One customer model's billed use over the last 7 days.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelUsage {
+    pub model: String,
+    pub requests: u64,
+    /// Distinct cards billed for it.
+    pub cards: u64,
 }
 
 /// Single failover or execution attempt record within a request trace (Spec §5, §14.4).

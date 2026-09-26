@@ -2,7 +2,7 @@
 //! Such refusals left no trace, so the console could not tell a customer's failed requests
 //! from ones never made. A retired model is never listed, and a request for it is refused as
 //! for a model its group does not list. A fallback target may be disabled: requests pass it
-//! over.
+//! over. A primary that fails over to its backup counts as a failure taken over.
 
 use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
@@ -489,6 +489,67 @@ async fn refusals_for_the_cards_own_limits_are_traced_and_charged_nothing() {
     assert!(models_sent(&upstream).await.is_empty());
     let card = billing.get_card(CARD).unwrap();
     assert_eq!((card.credit_reserved, card.credit_used), (0, 0));
+}
+
+/// A primary refused with 429 whose backup answers: the request succeeded, and the
+/// primary's attempt counts as a failure taken over by another provider.
+#[tokio::test]
+async fn a_primary_failing_over_to_its_backup_counts_as_taken_over() {
+    let primary = upstream(429).await;
+    let backup = upstream(200).await;
+    let billing = engine(
+        vec![
+            Provider::new("prov", "Primary", ProviderFormat::OpenAi, primary.uri()),
+            Provider::new("prov-spare", "Spare", ProviderFormat::OpenAi, backup.uri()),
+        ],
+        vec![
+            ProviderKey::new("key", "prov", "sk-primary"),
+            ProviderKey::new("key-spare", "prov-spare", "sk-spare"),
+        ],
+        vec![
+            ModelMap::new("map-chained", GROUP, "chained-model", "prov", "up-primary")
+                .with_fallback("prov-spare", "up-spare"),
+        ],
+        &["chained-model"],
+    );
+    let (app, _) = serve(&billing);
+    let (status, body) = turn(&app, "inv-taken-over", Some("chained-model"), plain).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(models_sent(&primary).await, ["up-primary"]);
+    assert_eq!(models_sent(&backup).await, ["up-spare"]);
+
+    let activity = billing.activity(gateway::now_secs());
+    // By the provider that answered, the primary does not appear at all.
+    let answered: Vec<_> = activity
+        .providers
+        .iter()
+        .map(|row| row.provider_id.as_str())
+        .collect();
+    assert_eq!(answered, ["prov-spare"]);
+    let attempts = |id: &str| {
+        let row = activity
+            .provider_attempts
+            .iter()
+            .find(|row| row.provider_id == id)
+            .unwrap();
+        (
+            row.last_1h.attempts,
+            row.last_1h.failures,
+            row.last_1h.taken_over,
+            row.last_1h.failures_by_kind.get("http_429").copied(),
+        )
+    };
+    assert_eq!(attempts("prov"), (1, 1, 1, Some(1)));
+    assert_eq!(attempts("prov-spare"), (1, 0, 0, None));
+    let key = activity
+        .key_attempts
+        .iter()
+        .find(|row| row.key_id == "key")
+        .unwrap();
+    assert_eq!((key.last_24h.failures, key.last_24h.taken_over), (1, 1));
+    let model = &activity.model_health[0];
+    assert_eq!(model.model, "chained-model");
+    assert_eq!((model.last_1h.requests, model.last_1h.failures), (1, 0));
 }
 
 #[tokio::test]

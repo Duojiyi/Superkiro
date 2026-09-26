@@ -847,3 +847,229 @@ fn activity_counts_real_totals_by_period_and_hour() {
     assert_eq!(json["last24h"]["ttftMedianMs"], 800);
     assert_eq!(json["providers"][0]["providerId"], "provider");
 }
+
+fn attempt(provider: &str, key: &str, error: Option<&str>) -> AttemptRecord {
+    AttemptRecord {
+        key_id: key.into(),
+        provider_id: provider.into(),
+        success: error.is_none(),
+        error: error.map(str::to_string),
+        latency_ms: 10,
+    }
+}
+
+/// Counts every attempt of every request, not only the provider that answered: a primary
+/// failing over to a backup shows its failure, taken over.
+#[test]
+fn activity_counts_attempts_by_provider_key_and_model() {
+    let engine = BillingEngine::new();
+    let now = 1_000_000;
+    let trace = |id: &str, ts: u64, model: &str, status: TraceStatus| RequestTrace {
+        id: id.into(),
+        card_id: "card".into(),
+        ts,
+        invocation_id: id.into(),
+        exposed_model: model.into(),
+        status,
+        ..RequestTrace::default()
+    };
+    // The primary is refused and the backup answers.
+    engine.record_trace(RequestTrace {
+        attempt_chain: vec![
+            attempt("primary", "key-a", Some("http_429")),
+            attempt("backup", "key-b", None),
+        ],
+        ..trace("failed-over", now - 600, "model-a", TraceStatus::Success)
+    });
+    // The primary times out and answers with its other Key: no provider took over.
+    engine.record_trace(RequestTrace {
+        attempt_chain: vec![
+            attempt("primary", "key-a", Some("timeout")),
+            attempt("primary", "key-a2", None),
+        ],
+        ..trace("retried", now - 2 * 3600, "model-a", TraceStatus::Success)
+    });
+    // Everything failed.
+    engine.record_trace(RequestTrace {
+        error_class: Some("upstream_start_failed".into()),
+        attempt_chain: vec![attempt("backup", "key-b", Some("http_500"))],
+        ..trace("failed", now - 3 * 86_400, "model-b", TraceStatus::Error)
+    });
+    // Still streaming: its attempts count, the request does not yet.
+    engine.record_trace(RequestTrace {
+        attempt_chain: vec![attempt("primary", "key-a", None)],
+        ..trace("running", now - 50, "model-a", TraceStatus::InProgress)
+    });
+    // Refused for the card's balance: nothing about the model.
+    engine.record_trace(RequestTrace {
+        error_class: Some("insufficient_balance".into()),
+        ..trace("broke", now - 100, "model-a", TraceStatus::Error)
+    });
+    // Refused for want of a route.
+    engine.record_trace(RequestTrace {
+        error_class: Some("no_route".into()),
+        ..trace("unrouted", now - 10, "model-c", TraceStatus::Error)
+    });
+    // Older than a week.
+    engine.record_trace(RequestTrace {
+        attempt_chain: vec![attempt("primary", "key-a", Some("http_401"))],
+        ..trace("old", now - 8 * 86_400, "model-a", TraceStatus::Error)
+    });
+
+    let activity = engine.activity(now);
+    let windows = |row: &billing::observability::AttemptWindow| {
+        (
+            row.attempts,
+            row.failures,
+            row.taken_over,
+            row.failures_by_kind.clone(),
+        )
+    };
+    let kinds = |pairs: &[(&str, u64)]| {
+        pairs
+            .iter()
+            .map(|(kind, count)| (kind.to_string(), *count))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let ids: Vec<_> = activity
+        .provider_attempts
+        .iter()
+        .map(|row| row.provider_id.as_str())
+        .collect();
+    assert_eq!(ids, ["primary", "backup"]);
+    let primary = &activity.provider_attempts[0];
+    assert_eq!(
+        windows(&primary.last_1h),
+        (2, 1, 1, kinds(&[("http_429", 1)]))
+    );
+    assert_eq!(
+        windows(&primary.last_24h),
+        (4, 2, 1, kinds(&[("http_429", 1), ("timeout", 1)]))
+    );
+    assert_eq!(windows(&primary.last_7d), windows(&primary.last_24h));
+    let backup = &activity.provider_attempts[1];
+    assert_eq!(windows(&backup.last_1h), (1, 0, 0, kinds(&[])));
+    assert_eq!(
+        windows(&backup.last_7d),
+        (2, 1, 0, kinds(&[("http_500", 1)]))
+    );
+
+    let keys: Vec<_> = activity
+        .key_attempts
+        .iter()
+        .map(|row| {
+            (
+                row.key_id.as_str(),
+                row.provider_id.as_str(),
+                row.last_7d.attempts,
+                row.last_7d.failures,
+                row.last_7d.taken_over,
+            )
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            ("key-a", "primary", 3, 2, 1),
+            ("key-b", "backup", 2, 1, 0),
+            ("key-a2", "primary", 1, 0, 0),
+        ]
+    );
+
+    let models: Vec<_> = activity
+        .model_health
+        .iter()
+        .map(|row| row.model.as_str())
+        .collect();
+    assert_eq!(models, ["model-a", "model-b", "model-c"]);
+    let model_a = &activity.model_health[0];
+    assert_eq!((model_a.last_1h.requests, model_a.last_1h.failures), (1, 0));
+    assert_eq!(
+        (model_a.last_24h.requests, model_a.last_24h.failures),
+        (2, 0)
+    );
+    let model_b = &activity.model_health[1];
+    assert_eq!(model_b.last_24h.requests, 0);
+    assert_eq!(
+        (
+            model_b.last_7d.requests,
+            model_b.last_7d.failures,
+            model_b.last_7d.last_failure_at,
+            model_b.last_7d.top_failure_kind.as_deref()
+        ),
+        (1, 1, Some(now - 3 * 86_400), Some("upstream_start_failed"))
+    );
+    let model_c = &activity.model_health[2];
+    assert_eq!(
+        model_c.last_1h.top_failure_kind.as_deref(),
+        Some("no_route")
+    );
+    assert_eq!(model_c.last_1h.last_failure_at, Some(now - 10));
+
+    // As the stats endpoint sends it.
+    let json = serde_json::to_value(&activity).unwrap();
+    assert_eq!(json["providerAttempts"][0]["providerId"], "primary");
+    assert_eq!(json["providerAttempts"][0]["last1h"]["takenOver"], 1);
+    assert_eq!(
+        json["providerAttempts"][0]["last24h"]["failuresByKind"]["timeout"],
+        1
+    );
+    assert_eq!(json["keyAttempts"][0]["keyId"], "key-a");
+    assert_eq!(
+        json["modelHealth"][1]["last7d"]["lastFailureAt"],
+        now - 3 * 86_400
+    );
+    assert_eq!(
+        json["modelHealth"][1]["last7d"]["topFailureKind"],
+        "upstream_start_failed"
+    );
+    assert_eq!(json["modelUsage7d"], serde_json::json!([]));
+}
+
+/// Billed use by customer model over the last week, from the ledger: requests and cards.
+#[test]
+fn activity_counts_a_weeks_billed_requests_and_cards_by_model() {
+    let engine = BillingEngine::new();
+    let now = 1_000_000;
+    for id in ["card-1", "card-2"] {
+        let mut card = Card::new(id, "group", 100_000_000);
+        card.status = CardStatus::Active;
+        engine.upsert_card(card);
+    }
+    let tokens = UsageTokens {
+        uncached_input_tokens: 100,
+        output_tokens: 100,
+        cache_creation_tokens: 0,
+        cache_read_tokens: 0,
+    };
+    for (invocation, card, model, at) in [
+        ("inv-1", "card-1", "model-a", now - 60),
+        ("inv-2", "card-1", "model-a", now - 86_400),
+        ("inv-3", "card-2", "model-a", now - 2 * 86_400),
+        ("inv-4", "card-2", "model-b", now - 3 * 86_400),
+        ("inv-5", "card-2", "model-b", now - 8 * 86_400),
+    ] {
+        engine
+            .reserve(
+                card,
+                invocation,
+                &ReservationEstimateParams::new(100, 100),
+                at - 1,
+                60,
+            )
+            .unwrap();
+        engine
+            .settle(invocation, &tokens, model, "provider", "target", at)
+            .unwrap();
+    }
+    let usage: Vec<_> = engine
+        .activity(now)
+        .model_usage_7d
+        .iter()
+        .map(|row| (row.model.clone(), row.requests, row.cards))
+        .collect();
+    assert_eq!(
+        usage,
+        [("model-a".to_string(), 3, 2), ("model-b".to_string(), 1, 1)]
+    );
+}

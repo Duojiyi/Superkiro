@@ -5220,6 +5220,7 @@ impl BillingEngine {
                 .cmp(&a.requests)
                 .then_with(|| a.provider_id.cmp(&b.provider_id))
         });
+        self.attempt_activity(&mut activity, now);
         let ledger = self.ledger.read().unwrap();
         for (window, start) in [
             (&mut activity.last_24h, day_start),
@@ -5243,7 +5244,154 @@ impl BillingEngine {
             }
             window.active_cards = cards.len() as u64;
         }
+        let mut usage: BTreeMap<&str, (u64, std::collections::HashSet<&str>)> = BTreeMap::new();
+        for entry in ledger.iter().filter(|entry| {
+            entry.kind == crate::ledger::LedgerKind::Usage
+                && entry.ts_secs > week_start
+                && entry.ts_secs <= now
+        }) {
+            let (requests, cards) = usage.entry(entry.exposed_model.as_str()).or_default();
+            *requests += 1;
+            cards.insert(entry.card_id.as_str());
+        }
+        activity.model_usage_7d = usage
+            .into_iter()
+            .map(
+                |(model, (requests, cards))| crate::observability::ModelUsage {
+                    model: model.to_string(),
+                    requests,
+                    cards: cards.len() as u64,
+                },
+            )
+            .collect();
+        activity.model_usage_7d.sort_by(|a, b| {
+            b.requests
+                .cmp(&a.requests)
+                .then_with(|| a.model.cmp(&b.model))
+        });
         activity
+    }
+
+    /// Upstream attempts by provider and by Key, and requests by customer model, over the
+    /// last hour, 24 hours and 7 days, from the traces. Every attempt counts, whether or not
+    /// its provider answered in the end; a running request's attempts are known already.
+    fn attempt_activity(&self, activity: &mut crate::observability::Activity, now: u64) {
+        use crate::observability::{
+            AttemptWindow, KeyAttempts, ModelHealth, ModelHealthWindow, ProviderAttempts,
+            CARD_LIMIT_REFUSALS,
+        };
+        const HOUR: u64 = 3600;
+        let starts = [
+            now.saturating_sub(HOUR),
+            now.saturating_sub(24 * HOUR),
+            now.saturating_sub(7 * 24 * HOUR),
+        ];
+        let mut providers: BTreeMap<String, ProviderAttempts> = BTreeMap::new();
+        let mut keys: BTreeMap<String, KeyAttempts> = BTreeMap::new();
+        let mut models: BTreeMap<String, ModelHealth> = BTreeMap::new();
+        let traces = self.traces.read().unwrap();
+        for trace in traces
+            .iter()
+            .filter(|trace| trace.ts > starts[2] && trace.ts <= now)
+        {
+            let within = starts.map(|start| trace.ts > start);
+            for (index, attempt) in trace.attempt_chain.iter().enumerate() {
+                let taken_over = trace.attempt_chain[index + 1..]
+                    .iter()
+                    .any(|later| later.success && later.provider_id != attempt.provider_id);
+                let provider = providers
+                    .entry(attempt.provider_id.clone())
+                    .or_insert_with(|| ProviderAttempts {
+                        provider_id: attempt.provider_id.clone(),
+                        ..ProviderAttempts::default()
+                    });
+                let windows: [&mut AttemptWindow; 3] = [
+                    &mut provider.last_1h,
+                    &mut provider.last_24h,
+                    &mut provider.last_7d,
+                ];
+                for (window, inside) in windows.into_iter().zip(within) {
+                    if inside {
+                        window.count(attempt, taken_over);
+                    }
+                }
+                if attempt.key_id.is_empty() {
+                    continue;
+                }
+                let key = keys
+                    .entry(attempt.key_id.clone())
+                    .or_insert_with(|| KeyAttempts {
+                        key_id: attempt.key_id.clone(),
+                        provider_id: attempt.provider_id.clone(),
+                        ..KeyAttempts::default()
+                    });
+                let windows: [&mut AttemptWindow; 3] =
+                    [&mut key.last_1h, &mut key.last_24h, &mut key.last_7d];
+                for (window, inside) in windows.into_iter().zip(within) {
+                    if inside {
+                        window.count(attempt, taken_over);
+                    }
+                }
+            }
+            let refused_for_card = trace
+                .error_class
+                .as_deref()
+                .is_some_and(|class| CARD_LIMIT_REFUSALS.contains(&class));
+            if trace.status == TraceStatus::InProgress
+                || trace.exposed_model.is_empty()
+                || refused_for_card
+            {
+                continue;
+            }
+            let failure = (trace.status == TraceStatus::Error).then(|| {
+                trace
+                    .error_class
+                    .clone()
+                    .or_else(|| {
+                        trace
+                            .attempt_chain
+                            .iter()
+                            .rev()
+                            .find(|attempt| !attempt.success)
+                            .and_then(|attempt| attempt.error.clone())
+                    })
+                    .unwrap_or_else(|| "unknown".to_string())
+            });
+            let model = models
+                .entry(trace.exposed_model.clone())
+                .or_insert_with(|| ModelHealth {
+                    model: trace.exposed_model.clone(),
+                    ..ModelHealth::default()
+                });
+            let windows: [&mut ModelHealthWindow; 3] =
+                [&mut model.last_1h, &mut model.last_24h, &mut model.last_7d];
+            for (window, inside) in windows.into_iter().zip(within) {
+                if inside {
+                    window.count(trace.ts, failure.as_deref());
+                }
+            }
+        }
+        activity.provider_attempts = providers.into_values().collect();
+        activity.provider_attempts.sort_by(|a, b| {
+            b.last_7d
+                .attempts
+                .cmp(&a.last_7d.attempts)
+                .then_with(|| a.provider_id.cmp(&b.provider_id))
+        });
+        activity.key_attempts = keys.into_values().collect();
+        activity.key_attempts.sort_by(|a, b| {
+            b.last_7d
+                .attempts
+                .cmp(&a.last_7d.attempts)
+                .then_with(|| a.key_id.cmp(&b.key_id))
+        });
+        activity.model_health = models.into_values().collect();
+        activity.model_health.sort_by(|a, b| {
+            b.last_7d
+                .requests
+                .cmp(&a.last_7d.requests)
+                .then_with(|| a.model.cmp(&b.model))
+        });
     }
 
     /// List recorded request execution traces.
