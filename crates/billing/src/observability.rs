@@ -2,7 +2,7 @@
 //!
 //! Spec §5 (Data Model) & Spec §14.4 (Observability & Financial Reconciliation).
 
-use crate::ledger::LedgerEntry;
+use crate::ledger::{EarnedCredits, LedgerEntry};
 use crate::rate_card::BillingSettings;
 use serde::{Deserialize, Serialize};
 
@@ -238,6 +238,7 @@ pub fn compute_margin_dashboard(
     let mut total_requests = 0u64;
     let mut total_credits_charged = 0i64;
     let mut provider_cost_micro_cny = 0i64;
+    let mut earned = EarnedCredits::default();
 
     for entry in entries {
         if entry.kind == crate::ledger::LedgerKind::Usage {
@@ -247,6 +248,12 @@ pub fn compute_margin_dashboard(
             total_credits_charged = total_credits_charged.saturating_add(entry.credits_charged);
             provider_cost_micro_cny =
                 provider_cost_micro_cny.saturating_add(entry.provider_cost_micro_cny);
+            earned.add(
+                entry
+                    .credit_face_value_cny
+                    .unwrap_or(settings.credit_face_value_cny),
+                entry.credits_charged,
+            );
         }
     }
 
@@ -254,8 +261,9 @@ pub fn compute_margin_dashboard(
     // 1 credit = 1_000_000 micro-credits.
     // revenue_micro_cny = (credits_charged / 1_000_000) * (credit_face_value_cny * 1_000_000)
     //                   = credits_charged * credit_face_value_cny
-    let revenue_micro_cny =
-        (total_credits_charged as f64 * settings.credit_face_value_cny).round() as i64;
+    // Each entry's credits count at the face value they were earned at, so a later change
+    // of it does not restate past revenue; an entry that records none, at the current one.
+    let revenue_micro_cny = earned.revenue_micro_cny();
     let gross_profit_micro_cny = revenue_micro_cny.saturating_sub(provider_cost_micro_cny);
 
     let gross_margin_percentage = if revenue_micro_cny > 0 {
@@ -287,6 +295,7 @@ pub fn compute_model_cost_rankings(
         total_tokens: u64,
         cost_micro_cny: i64,
         credits: i64,
+        earned: EarnedCredits,
     }
 
     let mut map: HashMap<String, Agg> = HashMap::new();
@@ -302,13 +311,20 @@ pub fn compute_model_cost_rankings(
                 .cost_micro_cny
                 .saturating_add(entry.provider_cost_micro_cny);
             agg.credits = agg.credits.saturating_add(entry.credits_charged);
+            agg.earned.add(
+                entry
+                    .credit_face_value_cny
+                    .unwrap_or(settings.credit_face_value_cny),
+                entry.credits_charged,
+            );
         }
     }
 
     let mut rankings: Vec<ModelCostRanking> = map
         .into_iter()
         .map(|(model_id, agg)| {
-            let revenue = (agg.credits as f64 * settings.credit_face_value_cny).round() as i64;
+            // At the face value each entry was earned at, as in the dashboard.
+            let revenue = agg.earned.revenue_micro_cny();
             let profit = revenue.saturating_sub(agg.cost_micro_cny);
             let margin = if revenue > 0 {
                 ((profit as f64) / (revenue as f64)) * 100.0

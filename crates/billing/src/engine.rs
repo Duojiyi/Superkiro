@@ -1,7 +1,7 @@
 //! Unified billing engine managing cards, reservations, settlements, and ledger (Spec §5, §6).
 
 use crate::card::{Card, CardError, CardEvent, CardStatus};
-use crate::ledger::{LedgerEntry, LedgerKind, PricingRates, UsageTokens};
+use crate::ledger::{EarnedCredits, LedgerEntry, LedgerKind, PricingRates, UsageTokens};
 use crate::provider::{Provider, ProviderKey};
 use crate::reservation::{
     CreditReservation, LockedPricing, ReservationEstimateParams, ReservationState,
@@ -2607,6 +2607,8 @@ impl BillingEngine {
             ts_secs: now_secs,
             operator_id: None,
             reason: Some(cost_source),
+            // Revenue counts these credits at the face value they were sold at.
+            credit_face_value_cny: Some(settings.credit_face_value_cny),
         };
         let pending = PendingSettlement {
             entry,
@@ -3068,6 +3070,7 @@ impl BillingEngine {
             ts_secs: now_secs,
             operator_id: Some(operator_id.to_string()),
             reason: (!reason.is_empty()).then(|| reason.to_string()),
+            credit_face_value_cny: None,
         }
     }
 
@@ -3564,6 +3567,7 @@ impl BillingEngine {
             ts_secs: now_secs,
             operator_id: Some(op.to_string()),
             reason: Some(res.to_string()),
+            credit_face_value_cny: None,
         };
         candidate.ledger.push(entry.clone());
         let updated_card = card.clone();
@@ -3659,6 +3663,7 @@ impl BillingEngine {
             ts_secs: now_secs,
             operator_id: Some(op.to_string()),
             reason: Some(res.to_string()),
+            credit_face_value_cny: None,
         };
         candidate.ledger.push(entry.clone());
         let updated_card = card.clone();
@@ -3921,6 +3926,7 @@ impl BillingEngine {
             ts_secs: now_secs,
             operator_id: Some(operator.to_string()),
             reason: Some(format!("Redeemed top-up code {}", topup_id)),
+            credit_face_value_cny: None,
         };
         candidate.ledger.push(entry.clone());
 
@@ -4285,6 +4291,7 @@ impl BillingEngine {
             ts_secs: now_secs,
             operator_id: Some(op.to_string()),
             reason: Some(res.to_string()),
+            credit_face_value_cny: None,
         };
 
         candidate.ledger.push(entry.clone());
@@ -4501,18 +4508,29 @@ impl BillingEngine {
             .cards
             .values()
             .fold(0i64, |sum, c| sum.saturating_add(c.provider_cost_micro_cny));
+        // Each entry's credits at the face value it was earned at. The archive keeps usage
+        // by card, not by face value, so archived usage counts at the current one.
+        let mut earned = EarnedCredits::default();
+        earned.add(face_val, total_credits_charged);
 
         for entry in ledger.iter() {
             if entry.kind == LedgerKind::Usage {
                 total_credits_charged = total_credits_charged.saturating_add(entry.credits_charged);
                 total_provider_cost_micro_cny =
                     total_provider_cost_micro_cny.saturating_add(entry.provider_cost_micro_cny);
+                earned.add(
+                    entry
+                        .credit_face_value_cny
+                        .filter(|face| *face > 0.0)
+                        .unwrap_or(face_val),
+                    entry.credits_charged,
+                );
             }
         }
 
         // Revenue in micro-CNY = (credits / 1_000_000) * face_value * 1_000_000
         //                      = credits * face_value
-        let total_revenue_micro_cny = ((total_credits_charged as f64) * face_val).round() as i64;
+        let total_revenue_micro_cny = earned.revenue_micro_cny();
         let gross_profit_micro_cny =
             total_revenue_micro_cny.saturating_sub(total_provider_cost_micro_cny);
         let gross_margin_rate = if total_revenue_micro_cny > 0 {

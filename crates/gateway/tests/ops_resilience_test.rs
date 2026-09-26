@@ -144,6 +144,7 @@ fn test_db_jitter_isolation_queue_and_auth_cache() {
             ts_secs: 1000 + i as u64,
             operator_id: None,
             reason: None,
+            credit_face_value_cny: None,
         };
         assert!(jitter.enqueue_ledger_entry(entry).is_ok());
     }
@@ -169,6 +170,7 @@ fn test_db_jitter_isolation_queue_and_auth_cache() {
         ts_secs: 2000,
         operator_id: None,
         reason: None,
+        credit_face_value_cny: None,
     };
     assert!(jitter.enqueue_ledger_entry(entry_overflow).is_err());
 

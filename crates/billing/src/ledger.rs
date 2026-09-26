@@ -120,4 +120,29 @@ pub struct LedgerEntry {
     pub operator_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// CNY per credit in the settings a usage entry's request was reserved at: what its credits
+    /// were earned at. None on other entries, and on usage settled before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credit_face_value_cny: Option<f64>,
+}
+
+/// Micro-credits added up by the face value (CNY per credit) they were earned at.
+#[derive(Debug, Default)]
+pub(crate) struct EarnedCredits(Vec<(f64, i64)>);
+
+impl EarnedCredits {
+    pub(crate) fn add(&mut self, face_value_cny: f64, micro_credits: i64) {
+        match self.0.iter_mut().find(|(face, _)| *face == face_value_cny) {
+            Some((_, total)) => *total = total.saturating_add(micro_credits),
+            None => self.0.push((face_value_cny, micro_credits)),
+        }
+    }
+
+    /// Micro-credits × CNY per credit = micro-CNY, each total at its own face value. While the
+    /// face value never changes there is one total, priced as the whole ledger always was.
+    pub(crate) fn revenue_micro_cny(&self) -> i64 {
+        self.0.iter().fold(0i64, |sum, (face, credits)| {
+            sum.saturating_add((*credits as f64 * face).round() as i64)
+        })
+    }
 }

@@ -605,6 +605,7 @@ fn reports_saturate_instead_of_wrapping_on_extreme_entries() {
         ts_secs: 1,
         operator_id: None,
         reason: None,
+        credit_face_value_cny: None,
     };
     let entries = [entry("a"), entry("b")];
     let settings = BillingSettings {
@@ -830,4 +831,100 @@ fn activity_counts_real_totals_by_period_and_hour() {
     assert_eq!(json["tracesCoverFromSecs"], now - 8 * 86400);
     assert_eq!(json["last24h"]["ttftMedianMs"], 800);
     assert_eq!(json["providers"][0]["providerId"], "provider");
+}
+
+/// Revenue counts each request's credits at the face value they were sold at, so changing the
+/// face value restates no past revenue. An entry settled before the face value was recorded
+/// counts at the current one, and while it never changes, revenue is as it always was.
+#[test]
+fn revenue_keeps_the_face_value_it_was_earned_at() {
+    use billing::ledger::LedgerEntry;
+    use billing::observability::compute_margin_dashboard;
+    use billing::rate_card::{Currency, PricingMode, RateCardVersion};
+    let credit = billing::MICRO_CREDITS_PER_CREDIT;
+    let engine = BillingEngine::new();
+    let mut card = Card::new("card-face", "group-pro-plus", 1_000 * credit);
+    card.status = CardStatus::Active;
+    engine.upsert_card(card);
+    // 10 credits and 0.1 CNY of cost per million output tokens.
+    engine.upsert_rate_card_version(RateCardVersion {
+        id: "m-fixed".into(),
+        rate_card_id: "default".into(),
+        model: "m".into(),
+        currency: Currency::Cny,
+        pricing_mode: PricingMode::Fixed,
+        input_price_per_m: 0.0,
+        output_price_per_m: 0.1,
+        cache_creation_price_per_m: 0.0,
+        cache_read_price_per_m: 0.0,
+        fixed_input_credit_per_m: 0,
+        fixed_output_credit_per_m: 10 * credit,
+        fixed_cache_creation_credit_per_m: 0,
+        fixed_cache_read_credit_per_m: 0,
+        per_call_credit: 0,
+        margin_multiplier: 1.0,
+        effective_from_secs: 0,
+        official: None,
+    });
+    let at_face_value = |face: f64| {
+        engine.update_settings(BillingSettings {
+            credit_face_value_cny: face,
+            ..BillingSettings::default()
+        })
+    };
+    let settle = |id: &str, now: u64| {
+        let params = ReservationEstimateParams::new(0, 1_000_000).with_model("m");
+        engine.reserve("card-face", id, &params, now, 60).unwrap();
+        let tokens = UsageTokens {
+            output_tokens: 1_000_000,
+            ..UsageTokens::default()
+        };
+        engine.settle(id, &tokens, "m", "p", "m", now + 1).unwrap()
+    };
+
+    at_face_value(0.03);
+    let first = settle("inv-1", 100);
+    assert_eq!(first.credit_face_value_cny, Some(0.03));
+    // 10 credits at 0.03 CNY.
+    assert_eq!(
+        engine.get_margin_dashboard(None, None).revenue_micro_cny,
+        300_000
+    );
+
+    at_face_value(0.05);
+    let second = settle("inv-2", 200);
+    assert_eq!(second.credit_face_value_cny, Some(0.05));
+    // Still 0.3 CNY for the first, and 10 credits at 0.05 CNY.
+    let dashboard = engine.get_margin_dashboard(None, None);
+    assert_eq!(dashboard.revenue_micro_cny, 800_000);
+    assert_eq!(dashboard.gross_profit_micro_cny, 600_000);
+    assert_eq!(engine.get_margin_summary().total_revenue_micro_cny, 800_000);
+    let rankings = engine.get_model_cost_rankings(None, None);
+    assert_eq!(rankings[0].margin_percentage, 75.0);
+    let version = engine.get_rate_card_version("m-fixed").unwrap();
+    let simulated = engine.simulate_candidate_pricing(&version, None, 300, 30.0);
+    assert_eq!(simulated.original_revenue_micro_cny, 800_000);
+    // The same prices sold today, at today's face value.
+    assert_eq!(simulated.simulated_revenue_micro_cny, 1_000_000);
+
+    // An entry from before the face value was recorded counts at the current one.
+    let mut older = serde_json::to_value(&first).unwrap();
+    older
+        .as_object_mut()
+        .unwrap()
+        .remove("credit_face_value_cny");
+    let older: LedgerEntry = serde_json::from_value(older).unwrap();
+    assert_eq!(older.credit_face_value_cny, None);
+    let settings = engine.get_settings();
+    let revenue = compute_margin_dashboard(&[older.clone(), second], &settings).revenue_micro_cny;
+    assert_eq!(revenue, 1_000_000);
+    // Saved without it, as before; and an older release ignores it, as any unknown field.
+    assert!(serde_json::to_value(&older)
+        .unwrap()
+        .get("credit_face_value_cny")
+        .is_none());
+    let mut later = serde_json::to_value(&first).unwrap();
+    later["added_later"] = serde_json::json!(true);
+    let later: LedgerEntry = serde_json::from_value(later).unwrap();
+    assert_eq!(later.credit_face_value_cny, Some(0.03));
 }
