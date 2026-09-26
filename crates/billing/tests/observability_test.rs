@@ -26,6 +26,8 @@ fn test_record_and_list_request_traces() {
         output_tokens: 350,
         credits_charged: 25_000_000,
         provider_cost_micro_cny: 15_000,
+        needed_micro_credits: None,
+        available_micro_credits: None,
         attempt_chain: vec![AttemptRecord {
             key_id: "k-1".to_string(),
             provider_id: "deepseek-direct".to_string(),
@@ -50,6 +52,8 @@ fn test_record_and_list_request_traces() {
         output_tokens: 0,
         credits_charged: 0,
         provider_cost_micro_cny: 0,
+        needed_micro_credits: None,
+        available_micro_credits: None,
         attempt_chain: vec![AttemptRecord {
             key_id: "k-2".to_string(),
             provider_id: "deepseek-direct".to_string(),
@@ -236,6 +240,8 @@ fn test_provider_health_summary_metrics() {
         output_tokens: 50,
         credits_charged: 1000,
         provider_cost_micro_cny: 500,
+        needed_micro_credits: None,
+        available_micro_credits: None,
         attempt_chain: vec![],
     });
 
@@ -254,6 +260,8 @@ fn test_provider_health_summary_metrics() {
         output_tokens: 50,
         credits_charged: 1000,
         provider_cost_micro_cny: 500,
+        needed_micro_credits: None,
+        available_micro_credits: None,
         attempt_chain: vec![],
     });
 
@@ -272,6 +280,8 @@ fn test_provider_health_summary_metrics() {
         output_tokens: 0,
         credits_charged: 0,
         provider_cost_micro_cny: 0,
+        needed_micro_credits: None,
+        available_micro_credits: None,
         attempt_chain: vec![],
     });
 
@@ -492,6 +502,8 @@ fn test_data_retention_pruning_policy() {
         output_tokens: 0,
         credits_charged: 0,
         provider_cost_micro_cny: 0,
+        needed_micro_credits: None,
+        available_micro_credits: None,
         attempt_chain: vec![],
     };
 
@@ -545,6 +557,8 @@ fn retry_history_survives_single_settlement_and_final_delivery_error() {
             output_tokens: 0,
             credits_charged: 0,
             provider_cost_micro_cny: 0,
+            needed_micro_credits: None,
+            available_micro_credits: None,
             attempt_chain: vec![AttemptRecord {
                 key_id: format!("key-{index}"),
                 provider_id: "provider".into(),
@@ -663,6 +677,8 @@ fn traces_ride_along_with_the_next_commit_instead_of_saving_on_their_own() {
         output_tokens: 0,
         credits_charged: 0,
         provider_cost_micro_cny: 0,
+        needed_micro_credits: None,
+        available_micro_credits: None,
         attempt_chain: Vec::new(),
     });
     engine.finish_trace("inv-trace", TraceStatus::Success, None);
@@ -755,6 +771,8 @@ fn activity_counts_real_totals_by_period_and_hour() {
         output_tokens: 0,
         credits_charged: 0,
         provider_cost_micro_cny: 0,
+        needed_micro_credits: None,
+        available_micro_credits: None,
         attempt_chain: Vec::new(),
     };
     engine.note_trace_timing("inv-hour-ago", Some(800), Some(40.0));
@@ -927,4 +945,658 @@ fn revenue_keeps_the_face_value_it_was_earned_at() {
     later["added_later"] = serde_json::json!(true);
     let later: LedgerEntry = serde_json::from_value(later).unwrap();
     assert_eq!(later.credit_face_value_cny, Some(0.03));
+}
+
+fn attempt(provider: &str, key: &str, error: Option<&str>) -> AttemptRecord {
+    AttemptRecord {
+        key_id: key.into(),
+        provider_id: provider.into(),
+        success: error.is_none(),
+        error: error.map(str::to_string),
+        latency_ms: 10,
+    }
+}
+
+/// Counts every attempt of every request, not only the provider that answered: a primary
+/// failing over to a backup shows its failure, taken over.
+#[test]
+fn activity_counts_attempts_by_provider_key_and_model() {
+    let engine = BillingEngine::new();
+    let now = 1_000_000;
+    let trace = |id: &str, ts: u64, model: &str, status: TraceStatus| RequestTrace {
+        id: id.into(),
+        card_id: "card".into(),
+        ts,
+        invocation_id: id.into(),
+        exposed_model: model.into(),
+        status,
+        ..RequestTrace::default()
+    };
+    // The primary is refused and the backup answers.
+    engine.record_trace(RequestTrace {
+        attempt_chain: vec![
+            attempt("primary", "key-a", Some("http_429")),
+            attempt("backup", "key-b", None),
+        ],
+        ..trace("failed-over", now - 600, "model-a", TraceStatus::Success)
+    });
+    // The primary times out and answers with its other Key: no provider took over.
+    engine.record_trace(RequestTrace {
+        attempt_chain: vec![
+            attempt("primary", "key-a", Some("timeout")),
+            attempt("primary", "key-a2", None),
+        ],
+        ..trace("retried", now - 2 * 3600, "model-a", TraceStatus::Success)
+    });
+    // Everything failed.
+    engine.record_trace(RequestTrace {
+        error_class: Some("upstream_start_failed".into()),
+        attempt_chain: vec![attempt("backup", "key-b", Some("http_500"))],
+        ..trace("failed", now - 3 * 86_400, "model-b", TraceStatus::Error)
+    });
+    // Still streaming: its attempts count, the request does not yet.
+    engine.record_trace(RequestTrace {
+        attempt_chain: vec![attempt("primary", "key-a", None)],
+        ..trace("running", now - 50, "model-a", TraceStatus::InProgress)
+    });
+    // Refused for the card's balance: nothing about the model.
+    engine.record_trace(RequestTrace {
+        error_class: Some("insufficient_balance".into()),
+        ..trace("broke", now - 100, "model-a", TraceStatus::Error)
+    });
+    // Refused for want of a route.
+    engine.record_trace(RequestTrace {
+        error_class: Some("no_route".into()),
+        ..trace("unrouted", now - 10, "model-c", TraceStatus::Error)
+    });
+    // Older than a week.
+    engine.record_trace(RequestTrace {
+        attempt_chain: vec![attempt("primary", "key-a", Some("http_401"))],
+        ..trace("old", now - 8 * 86_400, "model-a", TraceStatus::Error)
+    });
+
+    let activity = engine.activity(now);
+    let windows = |row: &billing::observability::AttemptWindow| {
+        (
+            row.attempts,
+            row.failures,
+            row.taken_over,
+            row.failures_by_kind.clone(),
+        )
+    };
+    let kinds = |pairs: &[(&str, u64)]| {
+        pairs
+            .iter()
+            .map(|(kind, count)| (kind.to_string(), *count))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let ids: Vec<_> = activity
+        .provider_attempts
+        .iter()
+        .map(|row| row.provider_id.as_str())
+        .collect();
+    assert_eq!(ids, ["primary", "backup"]);
+    let primary = &activity.provider_attempts[0];
+    assert_eq!(
+        windows(&primary.last_1h),
+        (2, 1, 1, kinds(&[("http_429", 1)]))
+    );
+    assert_eq!(
+        windows(&primary.last_24h),
+        (4, 2, 1, kinds(&[("http_429", 1), ("timeout", 1)]))
+    );
+    assert_eq!(windows(&primary.last_7d), windows(&primary.last_24h));
+    let backup = &activity.provider_attempts[1];
+    assert_eq!(windows(&backup.last_1h), (1, 0, 0, kinds(&[])));
+    assert_eq!(
+        windows(&backup.last_7d),
+        (2, 1, 0, kinds(&[("http_500", 1)]))
+    );
+
+    let keys: Vec<_> = activity
+        .key_attempts
+        .iter()
+        .map(|row| {
+            (
+                row.key_id.as_str(),
+                row.provider_id.as_str(),
+                row.last_7d.attempts,
+                row.last_7d.failures,
+                row.last_7d.taken_over,
+            )
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            ("key-a", "primary", 3, 2, 1),
+            ("key-b", "backup", 2, 1, 0),
+            ("key-a2", "primary", 1, 0, 0),
+        ]
+    );
+
+    let models: Vec<_> = activity
+        .model_health
+        .iter()
+        .map(|row| row.model.as_str())
+        .collect();
+    assert_eq!(models, ["model-a", "model-b", "model-c"]);
+    let model_a = &activity.model_health[0];
+    assert_eq!((model_a.last_1h.requests, model_a.last_1h.failures), (1, 0));
+    assert_eq!(
+        (model_a.last_24h.requests, model_a.last_24h.failures),
+        (2, 0)
+    );
+    let model_b = &activity.model_health[1];
+    assert_eq!(model_b.last_24h.requests, 0);
+    assert_eq!(
+        (
+            model_b.last_7d.requests,
+            model_b.last_7d.failures,
+            model_b.last_7d.last_failure_at,
+            model_b.last_7d.top_failure_kind.as_deref()
+        ),
+        (1, 1, Some(now - 3 * 86_400), Some("upstream_start_failed"))
+    );
+    let model_c = &activity.model_health[2];
+    assert_eq!(
+        model_c.last_1h.top_failure_kind.as_deref(),
+        Some("no_route")
+    );
+    assert_eq!(model_c.last_1h.last_failure_at, Some(now - 10));
+
+    // As the stats endpoint sends it.
+    let json = serde_json::to_value(&activity).unwrap();
+    assert_eq!(json["providerAttempts"][0]["providerId"], "primary");
+    assert_eq!(json["providerAttempts"][0]["last1h"]["takenOver"], 1);
+    assert_eq!(
+        json["providerAttempts"][0]["last24h"]["failuresByKind"]["timeout"],
+        1
+    );
+    assert_eq!(json["keyAttempts"][0]["keyId"], "key-a");
+    assert_eq!(
+        json["modelHealth"][1]["last7d"]["lastFailureAt"],
+        now - 3 * 86_400
+    );
+    assert_eq!(
+        json["modelHealth"][1]["last7d"]["topFailureKind"],
+        "upstream_start_failed"
+    );
+    assert_eq!(json["modelUsage7d"], serde_json::json!([]));
+}
+
+/// Billed use by customer model over the last week, from the ledger: requests and cards.
+#[test]
+fn activity_counts_a_weeks_billed_requests_and_cards_by_model() {
+    let engine = BillingEngine::new();
+    let now = 1_000_000;
+    for id in ["card-1", "card-2"] {
+        let mut card = Card::new(id, "group", 100_000_000);
+        card.status = CardStatus::Active;
+        engine.upsert_card(card);
+    }
+    let tokens = UsageTokens {
+        uncached_input_tokens: 100,
+        output_tokens: 100,
+        cache_creation_tokens: 0,
+        cache_read_tokens: 0,
+    };
+    for (invocation, card, model, at) in [
+        ("inv-1", "card-1", "model-a", now - 60),
+        ("inv-2", "card-1", "model-a", now - 86_400),
+        ("inv-3", "card-2", "model-a", now - 2 * 86_400),
+        ("inv-4", "card-2", "model-b", now - 3 * 86_400),
+        ("inv-5", "card-2", "model-b", now - 8 * 86_400),
+    ] {
+        engine
+            .reserve(
+                card,
+                invocation,
+                &ReservationEstimateParams::new(100, 100),
+                at - 1,
+                60,
+            )
+            .unwrap();
+        engine
+            .settle(invocation, &tokens, model, "provider", "target", at)
+            .unwrap();
+    }
+    let usage: Vec<_> = engine
+        .activity(now)
+        .model_usage_7d
+        .iter()
+        .map(|row| (row.model.clone(), row.requests, row.cards))
+        .collect();
+    assert_eq!(
+        usage,
+        [("model-a".to_string(), 3, 2), ("model-b".to_string(), 1, 1)]
+    );
+}
+
+/// A billed request: the whole prompt as input, cache reads and writes within it.
+fn usage_entry(
+    id: &str,
+    provider: &str,
+    tokens: (u64, u64, u64, u64),
+    credits: i64,
+    cost: i64,
+    costed: bool,
+) -> billing::ledger::LedgerEntry {
+    let (uncached, output, read, write) = tokens;
+    billing::ledger::LedgerEntry {
+        id: format!("led-{id}"),
+        card_id: "card".into(),
+        kind: billing::ledger::LedgerKind::Usage,
+        invocation_id: Some(id.into()),
+        exposed_model: "model".into(),
+        provider_id: provider.into(),
+        target_model: "target".into(),
+        input_tokens: uncached + read + write,
+        output_tokens: output,
+        cache_creation_tokens: write,
+        cache_read_tokens: read,
+        credits_charged: credits,
+        provider_cost_micro_cny: cost,
+        rate_card_version: costed.then(|| "price-v1".to_string()),
+        ts_secs: 1_000,
+        operator_id: None,
+        reason: None,
+    }
+}
+
+#[test]
+fn finance_by_provider_and_margin_over_costed_requests_only() {
+    let entries = vec![
+        usage_entry(
+            "a1",
+            "prov-a",
+            (1_000, 200, 300, 400),
+            5_000_000,
+            20_000,
+            true,
+        ),
+        usage_entry("a2", "prov-a", (500, 100, 0, 0), 1_000_000, 5_000, true),
+        usage_entry("b1", "prov-b", (100, 10, 0, 50), 3_000_000, 90_000, true),
+        // Priced by no published version: its cost is unknown.
+        usage_entry("u1", "prov-b", (100, 10, 0, 0), 7_000_000, 1, false),
+    ];
+    let costs = billing::observability::compute_provider_costs(&entries);
+    let rows: Vec<_> = costs
+        .iter()
+        .map(|row| {
+            (
+                row.provider_id.as_str(),
+                row.requests,
+                row.uncached_input_tokens,
+                row.output_tokens,
+                row.cache_read_tokens,
+                row.cache_write_tokens,
+                row.cost_micro_cny,
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ("prov-b", 2, 200, 20, 0, 50, 90_001),
+            ("prov-a", 2, 1_500, 300, 300, 400, 25_000),
+        ]
+    );
+
+    let settings = BillingSettings {
+        credit_face_value_cny: 0.01,
+        ..BillingSettings::default()
+    };
+    let margin = billing::observability::compute_costed_margin(&entries, &settings);
+    assert_eq!(
+        (margin.costed_requests, margin.costed_credits),
+        (3, 9_000_000)
+    );
+    // Nine credits at one fen each.
+    assert_eq!(margin.revenue_micro_cny, 90_000);
+    assert_eq!(margin.cost_micro_cny, 115_000);
+    assert_eq!(margin.gross_profit_micro_cny, -25_000);
+    assert!((margin.margin_percentage.unwrap() + 27.777).abs() < 0.01);
+    assert_eq!(
+        (margin.uncosted_requests, margin.uncosted_credits),
+        (1, 7_000_000)
+    );
+    let none = billing::observability::compute_costed_margin(&[], &settings);
+    assert_eq!(none.margin_percentage, None);
+}
+
+#[test]
+fn sales_count_cards_issued_and_activated_in_the_period_at_list_price() {
+    let tier = |id: &str, points: i64, created: u64, activated: Option<u64>| {
+        let mut card = Card::new(id, "group", points * 1_000_000);
+        card.created_at = created;
+        card.activated_at = activated;
+        if activated.is_some() {
+            card.status = CardStatus::Active;
+        }
+        card
+    };
+    let mut misprint = tier("misprint", 1000, 150, None);
+    misprint.status = CardStatus::Voided;
+    let mut refunded = tier("refunded", 2000, 150, Some(160));
+    refunded.status = CardStatus::Voided;
+    let cards = [
+        tier("pro", 1000, 150, None),
+        tier("pro-plus", 2000, 120, Some(190)),
+        tier("power", 10000, 50, Some(150)),
+        tier("custom", 123, 150, Some(150)),
+        tier("later", 5000, 200, Some(250)),
+        misprint,
+        refunded,
+    ];
+    let sales = billing::observability::compute_sales(cards.iter(), Some(100), Some(200));
+    // Issued in [100, 200): pro, pro-plus, custom and the refunded card; the misprint was
+    // voided unsold, "later" is at the end of the period and "power" before it.
+    assert_eq!(sales.issued_cards, 4);
+    assert_eq!(sales.unpriced_issued_cards, 1);
+    assert_eq!(
+        sales.issued_value_micro_cny,
+        30_000_000 + 55_000_000 + 55_000_000
+    );
+    // Activated in it: pro-plus, power, custom, refunded.
+    assert_eq!(sales.activated_cards, 4);
+    assert_eq!(sales.unpriced_activated_cards, 1);
+    assert_eq!(
+        sales.activated_value_micro_cny,
+        55_000_000 + 250_000_000 + 55_000_000
+    );
+    let plans: Vec<_> = sales
+        .by_plan
+        .iter()
+        .map(|plan| (plan.template_id, plan.issued_cards, plan.activated_cards))
+        .collect();
+    assert_eq!(
+        plans,
+        [
+            ("tier-1000", 1, 0),
+            ("tier-2000", 2, 2),
+            ("tier-5000", 0, 0),
+            ("tier-10000", 0, 1)
+        ]
+    );
+    // Without a period, every card.
+    let all = billing::observability::compute_sales(cards.iter(), None, None);
+    assert_eq!((all.issued_cards, all.activated_cards), (6, 5));
+}
+
+#[test]
+fn liability_is_the_balance_of_cards_that_can_still_be_used() {
+    let now = 10_000;
+    let card = |id: &str, status: CardStatus, total: i64, used: i64| {
+        let mut card = Card::new(id, "group", total);
+        card.status = status;
+        card.credit_used = used;
+        card
+    };
+    let mut lapsed = card("lapsed", CardStatus::Active, 5_000_000, 0);
+    lapsed.valid_until = Some(now - 1);
+    let mut current = card("current", CardStatus::Active, 5_000_000, 1_000_000);
+    current.valid_until = Some(now + 1);
+    let mut archived = card("archived", CardStatus::Expired, 5_000_000, 0);
+    archived.archived_at = Some(1);
+    let cards = [
+        current,
+        lapsed,
+        archived,
+        card("waiting", CardStatus::Unactivated, 2_000_000, 0),
+        card("frozen", CardStatus::Frozen, 3_000_000, 500_000),
+        card("banned", CardStatus::Banned, 9_000_000, 0),
+        card("voided", CardStatus::Voided, 9_000_000, 0),
+        card("expired", CardStatus::Expired, 9_000_000, 0),
+        card("in-debt", CardStatus::Active, 1_000_000, 4_000_000),
+    ];
+    let settings = BillingSettings {
+        credit_face_value_cny: 0.02,
+        ..BillingSettings::default()
+    };
+    let liability = billing::observability::compute_liability(cards.iter(), &settings, now);
+    // current 4, waiting 2, frozen 2.5, in-debt 0 credits.
+    assert_eq!(liability.cards, 4);
+    assert_eq!(liability.micro_credits, 8_500_000);
+    assert_eq!(liability.value_micro_cny, 170_000);
+    assert_eq!(
+        (
+            liability.unactivated_cards,
+            liability.unactivated_micro_credits
+        ),
+        (1, 2_000_000)
+    );
+}
+
+#[test]
+fn the_ledger_csv_adds_readable_columns_after_the_original_ones() {
+    let engine = BillingEngine::new();
+    engine.upsert_provider(billing::Provider::new(
+        "prov-1",
+        "Upstream One",
+        billing::ProviderFormat::OpenAi,
+        "https://example.invalid",
+    ));
+    let mut card = Card::new("card-readable", "group-pro-plus", 100_000_000);
+    card.status = CardStatus::Active;
+    engine.upsert_card(card);
+    engine
+        .reserve(
+            "card-readable",
+            "inv-readable",
+            &ReservationEstimateParams::new(500, 100),
+            1_700_000_000,
+            60,
+        )
+        .unwrap();
+    let entry = engine
+        .settle(
+            "inv-readable",
+            &UsageTokens {
+                uncached_input_tokens: 500,
+                output_tokens: 100,
+                cache_creation_tokens: 30,
+                cache_read_tokens: 70,
+            },
+            "gpt-4o",
+            "prov-1",
+            "gpt-4o",
+            1_700_000_000,
+        )
+        .unwrap();
+    engine
+        .adjust_balance(
+            "card-readable",
+            -1_500_000,
+            "admin",
+            "correction",
+            1_700_000_100,
+        )
+        .unwrap();
+
+    let rows = csv_rows(&engine.export_ledger_csv(Some("card-readable")));
+    assert_eq!(
+        rows[0],
+        [
+            "id",
+            "card_id",
+            "ts",
+            "kind",
+            "invocation_id",
+            "exposed_model",
+            "provider_id",
+            "input_tokens",
+            "output_tokens",
+            "credits_charged",
+            "provider_cost_micro_cny",
+            "time_utc",
+            "provider_name",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "credits",
+            "revenue_cny",
+            "cost_cny"
+        ]
+    );
+    let usage = &rows[1];
+    assert_eq!(usage[11], "2023-11-14T22:13:20Z");
+    assert_eq!(usage[12], "Upstream One");
+    assert_eq!((usage[13].as_str(), usage[14].as_str()), ("70", "30"));
+    let credits = entry.credits_charged;
+    assert_eq!(
+        usage[15].parse::<f64>().unwrap(),
+        credits as f64 / 1_000_000.0
+    );
+    // At the default face value of one fen per credit.
+    assert_eq!(
+        usage[16].parse::<f64>().unwrap(),
+        (credits as f64 * 0.01).round() / 1_000_000.0
+    );
+    assert_eq!(
+        usage[17].parse::<f64>().unwrap(),
+        entry.provider_cost_micro_cny as f64 / 1_000_000.0
+    );
+    // An adjustment: credits as a signed decimal, no revenue or cost.
+    let adjustment = &rows[2];
+    assert_eq!(adjustment[15], "-1.5");
+    assert_eq!((adjustment[16].as_str(), adjustment[17].as_str()), ("", ""));
+    assert_eq!(adjustment[12], "system");
+}
+
+#[test]
+fn iso_times_are_utc_calendar_dates() {
+    for (secs, iso) in [
+        (0, "1970-01-01T00:00:00Z"),
+        (951_782_400, "2000-02-29T00:00:00Z"),
+        (1_700_000_000, "2023-11-14T22:13:20Z"),
+        (4_102_444_799, "2099-12-31T23:59:59Z"),
+    ] {
+        assert_eq!(billing::observability::iso_utc(secs), iso);
+    }
+}
+
+#[test]
+fn plan_prices_name_the_issuance_tiers() {
+    for plan in billing::template::PLAN_PRICES {
+        let template = billing::CardTemplate::tier(plan.template_id, "group").unwrap();
+        assert_eq!(template.credit_total, plan.points * 1_000_000);
+        assert_eq!(template.name, plan.name);
+        let card = Card::new("card", "group", template.credit_total);
+        assert_eq!(card.plan_name(), Some(plan.name));
+    }
+}
+
+#[test]
+fn trace_search_filters_the_retained_traces_and_totals_every_match() {
+    let engine = BillingEngine::new();
+    let trace = |id: &str, card: &str, model: &str, ts: u64, status: TraceStatus| RequestTrace {
+        id: id.into(),
+        card_id: card.into(),
+        ts,
+        invocation_id: id.into(),
+        exposed_model: model.into(),
+        status,
+        ..RequestTrace::default()
+    };
+    engine.record_trace(RequestTrace {
+        provider_id: Some("backup".into()),
+        credits_charged: 5,
+        provider_cost_micro_cny: 50,
+        attempt_chain: vec![
+            attempt("primary", "key-a", Some("http_429")),
+            attempt("backup", "key-b", None),
+        ],
+        ..trace("t1", "card-a", "model-a", 100, TraceStatus::Success)
+    });
+    engine.record_trace(RequestTrace {
+        provider_id: Some("primary".into()),
+        ..trace("t2", "card-a", "model-b", 200, TraceStatus::Error)
+    });
+    engine.record_trace(RequestTrace {
+        provider_id: Some("primary".into()),
+        credits_charged: 7,
+        provider_cost_micro_cny: 70,
+        ..trace("t3", "card-b", "model-a", 300, TraceStatus::Success)
+    });
+    engine.record_trace(RequestTrace {
+        provider_id: Some("backup".into()),
+        credits_charged: 2,
+        provider_cost_micro_cny: 20,
+        ..trace("t4", "card-a", "model-a", 400, TraceStatus::ClientAborted)
+    });
+    let search = |filter: billing::observability::TraceFilter, limit: usize| {
+        let (traces, totals) = engine.search_traces(&filter, limit);
+        let ids: Vec<String> = traces.into_iter().map(|trace| trace.id).collect();
+        (
+            ids,
+            (
+                totals.count,
+                totals.failures,
+                totals.credits_charged,
+                totals.cost_micro_cny,
+            ),
+        )
+    };
+    use billing::observability::TraceFilter;
+    // Newest first, at most the limit; the totals count every match.
+    assert_eq!(
+        search(TraceFilter::default(), 2),
+        (vec!["t4".into(), "t3".into()], (4, 1, 14, 140))
+    );
+    assert_eq!(
+        search(
+            TraceFilter {
+                card_id: Some("card-a".into()),
+                ..TraceFilter::default()
+            },
+            10
+        ),
+        (vec!["t4".into(), "t2".into(), "t1".into()], (3, 1, 7, 70))
+    );
+    assert_eq!(
+        search(
+            TraceFilter {
+                model: Some("model-a".into()),
+                from_secs: Some(150),
+                ..TraceFilter::default()
+            },
+            10
+        )
+        .0,
+        ["t4", "t3"]
+    );
+    // A provider matches the requests it answered and those it was tried for.
+    assert_eq!(
+        search(
+            TraceFilter {
+                provider: Some("primary".into()),
+                ..TraceFilter::default()
+            },
+            10
+        )
+        .0,
+        ["t3", "t2", "t1"]
+    );
+    assert_eq!(
+        search(
+            TraceFilter {
+                status: Some(TraceStatus::Error),
+                ..TraceFilter::default()
+            },
+            10
+        ),
+        (vec!["t2".into()], (1, 1, 0, 0))
+    );
+    // Up to, not including, the end.
+    assert_eq!(
+        search(
+            TraceFilter {
+                to_secs: Some(300),
+                ..TraceFilter::default()
+            },
+            10
+        )
+        .0,
+        ["t2", "t1"]
+    );
 }

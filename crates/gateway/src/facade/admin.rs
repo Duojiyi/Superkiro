@@ -4,9 +4,11 @@
 //! - `GET /api/v1/admin/me`: verify admin auth credentials
 //! - `GET /api/v1/admin/stats`: system overview and financial metrics
 //! - `GET /api/v1/admin/cards`: query cards with filtering
-//! - `POST /api/v1/admin/cards/status`: freeze, unfreeze, ban, void, archive, or unarchive cards (persisted)
+//! - `POST /api/v1/admin/cards/status`: freeze, unfreeze, ban, unban, void, archive, or unarchive cards (persisted)
 //! - `GET /api/v1/admin/cards/history`: what happened to one card, who did it and why
 //! - `POST /api/v1/admin/cards/adjust`: manual balance adjustment (persisted)
+//! - `POST /api/v1/admin/cards/devices/unbind`, `.../rebinds/reset`, `.../validity`,
+//!   `.../note`, `.../group`: support actions, each written to the card's history
 //! - `POST /api/v1/admin/cards/batch`: batch generate cards from template
 //! - `GET /api/v1/admin/announcements`: list announcements
 //! - `POST /api/v1/admin/announcements`: publish announcement
@@ -21,7 +23,7 @@ use axum::{
     http::{header, Method, Request, StatusCode},
     response::IntoResponse,
 };
-use billing::card::CardStatus;
+use billing::card::{Card, CardStatus};
 use billing::engine::BillingEngine;
 use billing::observability::{Announcement, AnnouncementLevel};
 use billing::CardTemplate;
@@ -43,11 +45,47 @@ fn valid_text(value: &str, max: usize) -> bool {
     !trimmed.is_empty() && trimmed.chars().count() <= max
 }
 
+/// The reason a support action is taken for, as the card's history keeps it: 1 to 200
+/// bytes once trimmed.
+fn support_reason(reason: Option<&str>) -> Option<&str> {
+    reason
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty() && reason.len() <= 200)
+}
+
+/// A refusal as the admin API answers one: nothing was changed.
+fn failure(status: StatusCode, message: &str) -> Response {
+    json_response(
+        status,
+        &serde_json::json!({ "success": false, "error": message }),
+    )
+}
+
 fn parse_query(uri: &axum::http::Uri, key: &str) -> Option<String> {
     uri.query()?
         .split('&')
         .filter_map(|pair| pair.split_once('='))
         .find_map(|(name, value)| (name == key).then(|| value.to_string()))
+}
+
+/// The period a report covers, from `fromSecs` up to but not including `toSecs`; an end
+/// not given is open.
+fn report_period(uri: &axum::http::Uri) -> Result<(Option<u64>, Option<u64>), &'static str> {
+    let bound = |key: &str| {
+        parse_query(uri, key)
+            .map(|value| value.parse::<u64>())
+            .transpose()
+            .map_err(|_| "fromSecs and toSecs must be whole seconds")
+    };
+    let (from, to) = (bound("fromSecs")?, bound("toSecs")?);
+    if from.zip(to).is_some_and(|(from, to)| from >= to) {
+        return Err("fromSecs must be before toSecs");
+    }
+    Ok((from, to))
+}
+
+fn within_period(ts: u64, (from, to): (Option<u64>, Option<u64>)) -> bool {
+    from.is_none_or(|from| ts >= from) && to.is_none_or(|to| ts < to)
 }
 
 /// A request carrying this header is the console refreshing itself: it keeps the session
@@ -524,6 +562,34 @@ pub struct AdminStatsHandler {
     pub auth: Arc<AdminAuthState>,
 }
 
+/// Why the saved state cannot be written, in words the operator can act on. The error
+/// itself names server paths and sizes, which are not shown.
+fn persistence_problem(error: Option<&str>) -> &'static str {
+    let error = error.unwrap_or_default().to_ascii_lowercase();
+    let names = |needles: &[&str]| needles.iter().any(|needle| error.contains(needle));
+    if names(&["exceeds maximum allowable limit"]) {
+        "The saved state has reached its size ceiling; archive old ledger entries"
+    } else if names(&[
+        "os error 28",
+        "os error 112",
+        "no space left",
+        "not enough space",
+    ]) {
+        "The disk holding the saved state is full"
+    } else if names(&[
+        "os error 5)",
+        "os error 13",
+        "permission denied",
+        "access is denied",
+    ]) {
+        "The saved state cannot be written: permission denied"
+    } else if names(&["master kek"]) {
+        "Saving this state needs the master key, which is not configured"
+    } else {
+        "The saved state could not be written"
+    }
+}
+
 pub struct AdminFinancialsHandler {
     pub billing: BillingEngine,
     pub auth: Arc<AdminAuthState>,
@@ -676,8 +742,15 @@ impl FacadeHandler for AdminFinancialsHandler {
             if !self.auth.verify(req.headers()) {
                 return unauthorized_response();
             }
+            let period = match report_period(req.uri()) {
+                Ok(period) => period,
+                Err(message) => return failure(StatusCode::BAD_REQUEST, message),
+            };
             // One snapshot keeps estimates, coverage and their settings consistent.
-            let snapshot = self.billing.export_snapshot();
+            let mut snapshot = self.billing.export_snapshot();
+            snapshot
+                .ledger
+                .retain(|entry| within_period(entry.ts_secs, period));
             let dashboard = billing::observability::compute_margin_dashboard(
                 &snapshot.ledger,
                 &snapshot.settings,
@@ -695,10 +768,20 @@ impl FacadeHandler for AdminFinancialsHandler {
                 })
                 .count() as u64;
             let uncosted_requests = dashboard.total_requests.saturating_sub(costed_requests);
+            let (from_secs, to_secs) = period;
             json_response(
                 StatusCode::OK,
                 &serde_json::json!({
                     "success": true,
+                    "fromSecs": from_secs,
+                    "toSecs": to_secs,
+                    // What each upstream should bill for the period.
+                    "byProvider": billing::observability::compute_provider_costs(&snapshot.ledger),
+                    "margin": billing::observability::compute_costed_margin(&snapshot.ledger, &snapshot.settings),
+                    "sales": billing::observability::compute_sales(snapshot.cards.values(), from_secs, to_secs),
+                    // Balances still owed, now, whatever the period.
+                    "liability": billing::observability::compute_liability(snapshot.cards.values(), &snapshot.settings, now_secs()),
+                    "planPrices": billing::template::PLAN_PRICES,
                     "dashboard": dashboard,
                     "modelRankings": rankings,
                     "basis": "retained_usage_ledger_estimate_not_cash_revenue",
@@ -737,18 +820,49 @@ impl FacadeHandler for AdminTracesHandler {
             if !self.auth.verify(req.headers()) {
                 return unauthorized_response();
             }
-            let card_id = parse_query(req.uri(), "card_id");
+            let (from_secs, to_secs) = match report_period(req.uri()) {
+                Ok(period) => period,
+                Err(message) => return failure(StatusCode::BAD_REQUEST, message),
+            };
+            let text = |key: &str| {
+                parse_query(req.uri(), key)
+                    .and_then(|value| crate::archive::percent_decode(&value))
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            };
+            let status = match text("status") {
+                None => None,
+                Some(status) => match serde_json::from_value(serde_json::json!(status)) {
+                    Ok(status) => Some(status),
+                    Err(_) => {
+                        return failure(
+                            StatusCode::BAD_REQUEST,
+                            "status must be success, error, client_aborted or in_progress",
+                        )
+                    }
+                },
+            };
+            let filter = billing::observability::TraceFilter {
+                from_secs,
+                to_secs,
+                card_id: text("cardId").or_else(|| text("card_id")),
+                model: text("model"),
+                provider: text("provider"),
+                status,
+            };
             let limit = parse_query(req.uri(), "limit")
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(100)
                 .clamp(1, 500);
-            let traces = self.billing.list_traces(card_id.as_deref(), limit);
+            let (traces, totals) = self.billing.search_traces(&filter, limit);
             json_response(
                 StatusCode::OK,
                 &serde_json::json!({
                     "success": true,
                     "count": traces.len(),
                     "traces": traces,
+                    // Over every retained trace that matched, not only those returned.
+                    "totals": totals,
                 }),
             )
         })
@@ -1002,6 +1116,9 @@ impl FacadeHandler for AdminArchiveLedgerHandler {
                     StatusCode::OK,
                     &serde_json::json!({
                         "success": true,
+                        // What moved, and where to: the console shows it as a receipt.
+                        "movedEntries": receipt.drained_entries_count,
+                        "archiveFile": receipt.archive_file,
                         "receipt": receipt,
                         "stateBytesBefore": before_bytes,
                         "stateBytesAfter": self.billing.state_size().0,
@@ -1207,6 +1324,7 @@ impl FacadeHandler for AdminStatsHandler {
             let remaining_credits = total_credits.saturating_sub(used_credits);
             let micro = billing::MICRO_CREDITS_PER_CREDIT as f64;
             let (state_bytes, state_ceiling_bytes) = self.billing.state_size();
+            let persistence_ready = self.billing.persistence_ready();
 
             json_response(
                 StatusCode::OK,
@@ -1216,6 +1334,12 @@ impl FacadeHandler for AdminStatsHandler {
                     "stateBytes": state_bytes,
                     "stateWarningBytes": billing::engine::STATE_WARNING_BYTES,
                     "stateCeilingBytes": state_ceiling_bytes,
+                    "lastSavedAtSecs": self.billing.last_saved_at(),
+                    // While a write has failed, every change and every request is refused.
+                    "persistenceReady": persistence_ready,
+                    "persistenceError": (!persistence_ready).then(|| {
+                        persistence_problem(self.billing.last_persistence_error().as_deref())
+                    }),
                     "totalCards": total_cards,
                     "activeCards": active_cards,
                     "unactivatedCards": unactivated_cards,
@@ -1329,6 +1453,8 @@ pub struct AdminCardItem {
     pub id: String,
     pub code_recoverable: bool,
     pub status: String,
+    /// The status as the customer meets it: `expired` for an active card past its expiry.
+    pub effective_status: String,
     pub credit_total: i64,
     pub credit_used: i64,
     pub available_credits: i64,
@@ -1336,11 +1462,58 @@ pub struct AdminCardItem {
     pub points_available: f64,
     pub bound_devices: Vec<String>,
     pub max_devices: u32,
+    /// Unbindings the customer has used of `max_rebinds`.
+    pub rebinds_used: u32,
+    pub max_rebinds: u32,
+    /// When the customer may unbind again, while a cooldown runs.
+    pub rebind_cooldown_until: Option<u64>,
     pub archived_at: Option<u64>,
     pub activated_at: Option<u64>,
     pub valid_until: Option<u64>,
+    /// For a card not yet activated, how long it is valid from activation.
+    pub activation_duration_secs: Option<u64>,
     pub group_id: String,
     pub note: Option<String>,
+}
+
+fn status_name(status: CardStatus) -> &'static str {
+    match status {
+        CardStatus::Active => "active",
+        CardStatus::Unactivated => "unactivated",
+        CardStatus::Frozen => "frozen",
+        CardStatus::Banned => "banned",
+        CardStatus::Voided => "voided",
+        CardStatus::Expired => "expired",
+    }
+}
+
+/// A card as the console lists and shows it.
+fn card_view(card: Card, now: u64) -> AdminCardItem {
+    let micro = billing::MICRO_CREDITS_PER_CREDIT as f64;
+    AdminCardItem {
+        code_recoverable: card.code_encrypted.is_some(),
+        status: status_name(card.status).to_string(),
+        effective_status: status_name(card.effective_status(now)).to_string(),
+        credit_total: card.credit_total,
+        credit_used: card.credit_used,
+        available_credits: card.available_credits(),
+        points_total: (card.credit_total as f64) / micro,
+        points_available: (card.available_credits() as f64) / micro,
+        max_devices: card.max_devices,
+        rebinds_used: card.rebind_count,
+        max_rebinds: card.max_rebinds,
+        rebind_cooldown_until: card.rebind_cooldown_until(now),
+        archived_at: card.archived_at,
+        activated_at: card.activated_at,
+        valid_until: card.valid_until,
+        activation_duration_secs: card
+            .activation_duration_secs
+            .filter(|_| card.activated_at.is_none()),
+        id: card.id,
+        bound_devices: card.bound_devices,
+        group_id: card.group_id,
+        note: card.note,
+    }
 }
 
 impl FacadeHandler for AdminCardsHandler {
@@ -1365,7 +1538,6 @@ impl FacadeHandler for AdminCardsHandler {
             let revision = billing::card::hex_encode(
                 ring::digest::digest(&ring::digest::SHA256, &revision_input).as_ref(),
             );
-            let micro = billing::MICRO_CREDITS_PER_CREDIT as f64;
             let offset = parse_query(req.uri(), "offset")
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(0);
@@ -1374,35 +1546,12 @@ impl FacadeHandler for AdminCardsHandler {
                 .unwrap_or(100)
                 .clamp(1, 500);
 
+            let now = now_secs();
             let items: Vec<AdminCardItem> = cards
                 .into_iter()
                 .skip(offset)
                 .take(limit)
-                .map(|c| AdminCardItem {
-                    id: c.id.clone(),
-                    code_recoverable: c.code_encrypted.is_some(),
-                    status: match c.status {
-                        CardStatus::Active => "active",
-                        CardStatus::Unactivated => "unactivated",
-                        CardStatus::Frozen => "frozen",
-                        CardStatus::Banned => "banned",
-                        CardStatus::Voided => "voided",
-                        CardStatus::Expired => "expired",
-                    }
-                    .to_string(),
-                    credit_total: c.credit_total,
-                    credit_used: c.credit_used,
-                    available_credits: c.available_credits(),
-                    points_total: (c.credit_total as f64) / micro,
-                    points_available: (c.available_credits() as f64) / micro,
-                    bound_devices: c.bound_devices,
-                    max_devices: c.max_devices,
-                    archived_at: c.archived_at,
-                    activated_at: c.activated_at,
-                    valid_until: c.valid_until,
-                    group_id: c.group_id,
-                    note: c.note,
-                })
+                .map(|card| card_view(card, now))
                 .collect();
 
             json_response(
@@ -1428,7 +1577,8 @@ impl FacadeHandler for AdminCardsHandler {
 #[serde(rename_all = "camelCase")]
 pub struct AdminCardStatusRequest {
     pub card_id: String,
-    pub action: String, // "freeze" | "unfreeze" | "ban" | "void" | "archive" | "unarchive"
+    // "freeze" | "unfreeze" | "ban" | "unban" | "void" | "archive" | "unarchive"
+    pub action: String,
     pub reason: Option<String>,
 }
 
@@ -1469,6 +1619,13 @@ impl FacadeHandler for AdminCardStatusHandler {
                 }
             };
 
+            // Lifting a ban is never done without saying why.
+            if req_data.action == "unban" && support_reason(req_data.reason.as_deref()).is_none() {
+                return failure(
+                    StatusCode::BAD_REQUEST,
+                    "A reason of 1 to 200 bytes is required",
+                );
+            }
             let reason = req_data
                 .reason
                 .unwrap_or_else(|| "admin-action".to_string());
@@ -1491,6 +1648,9 @@ impl FacadeHandler for AdminCardStatusHandler {
                 "ban" => self
                     .billing
                     .ban_card(card_id, operator_id, &reason, now_secs()),
+                "unban" => self
+                    .billing
+                    .unban_card(card_id, operator_id, &reason, now_secs()),
                 "void" => self
                     .billing
                     .void_card(card_id, operator_id, &reason, now_secs()),
@@ -1507,7 +1667,7 @@ impl FacadeHandler for AdminCardStatusHandler {
                         [(header::CONTENT_TYPE, "application/json")],
                         axum::Json(serde_json::json!({
                             "success": false,
-                            "error": "Invalid action: must be 'freeze', 'unfreeze', 'ban', 'void', 'archive', or 'unarchive'",
+                            "error": "Invalid action: must be 'freeze', 'unfreeze', 'ban', 'unban', 'void', 'archive', or 'unarchive'",
                         })),
                     )
                         .into_response();
@@ -1522,6 +1682,7 @@ impl FacadeHandler for AdminCardStatusHandler {
                         "cardId": card_id,
                         "newStatus": card.status,
                         "archivedAt": card.archived_at,
+                        "card": card_view(card, now_secs()),
                     }),
                 ),
                 Err(e) => (
@@ -1585,14 +1746,21 @@ impl FacadeHandler for AdminCardHistoryHandler {
                         "points": (event.credits as f64) / micro,
                         "operator": event.operator,
                         "reason": event.reason,
+                        "invocationId": event.invocation_id,
+                        "detail": event.detail,
                     })
                 })
                 .collect();
+            let card = self
+                .billing
+                .get_card(&card_id)
+                .map(|card| card_view(card, now_secs()));
             json_response(
                 StatusCode::OK,
                 &serde_json::json!({
                     "success": true,
                     "cardId": card_id,
+                    "card": card,
                     "events": events,
                 }),
             )
@@ -1612,6 +1780,8 @@ pub struct AdminCardAdjustRequest {
     pub reason: Option<String>,
     #[serde(alias = "idempotency_key")]
     pub idempotency_key: Option<String>,
+    /// The request the adjustment makes up for, as its trace names it.
+    pub invocation_id: Option<String>,
 }
 
 pub struct AdminCardAdjustHandler {
@@ -1728,15 +1898,31 @@ impl FacadeHandler for AdminCardAdjustHandler {
                     "reason is invalid",
                 );
             }
+            // As a trace names a request: the card, a colon and the client's invocation id.
+            let invocation_id = req_data.invocation_id.as_deref().map(str::trim);
+            if invocation_id.is_some_and(|id| {
+                id.is_empty()
+                    || id.len() > 128
+                    || !id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b))
+            }) {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRequestException",
+                    "invocationId must be 1-128 ASCII letters, digits, -_.:",
+                );
+            }
 
             let now = now_secs();
-            match self.billing.adjust_balance_idempotent(
+            match self.billing.adjust_balance_linked(
                 &req_data.card_id,
                 delta_credits,
                 operator_id,
                 &reason,
                 now,
                 Some(idempotency_key),
+                invocation_id,
             ) {
                 Ok(_entry) => {
                     let card = self.billing.get_card(&req_data.card_id);
@@ -1778,6 +1964,289 @@ impl FacadeHandler for AdminCardAdjustHandler {
                         .into_response()
                 }
             }
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 5b. Card support actions (POST /api/v1/admin/cards/{devices/unbind, rebinds/reset,
+//     validity, note, group})
+// ---------------------------------------------------------------------------
+
+/// What an operator does for a customer's card. Each is written to the card's history
+/// with the operator, and the reply shows the card as it now is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CardAction {
+    /// Free the device seat; the customer's rebind allowance is left as it is.
+    UnbindDevice,
+    /// Clear the unbindings used and the cooldown.
+    ResetRebinds,
+    /// Extend up to 500 cards' validity, by days or to a time.
+    ExtendValidity,
+    /// Replace the note.
+    Note,
+    /// Move the card to another group.
+    ChangeGroup,
+}
+
+pub struct AdminCardActionHandler {
+    pub billing: BillingEngine,
+    pub auth: Arc<AdminAuthState>,
+    pub action: CardAction,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UnbindRequest {
+    card_id: String,
+    device_id: String,
+    reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ResetRebindsRequest {
+    card_id: String,
+    reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ValidityRequest {
+    card_ids: Vec<String>,
+    days: Option<u64>,
+    valid_until_secs: Option<u64>,
+    reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NoteRequest {
+    card_id: String,
+    note: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GroupRequest {
+    card_id: String,
+    group_id: String,
+    reason: Option<String>,
+}
+
+/// Longest extension, by days or to a time from now.
+const MAX_EXTENSION_DAYS: u64 = 3650;
+
+/// Why a support action was refused; a change that could not be saved changed nothing.
+fn card_action_refused(error: billing::BillingError) -> Response {
+    match error {
+        billing::BillingError::CardNotFound(_) | billing::BillingError::DeviceNotFound { .. } => {
+            failure(StatusCode::NOT_FOUND, &error.to_string())
+        }
+        billing::BillingError::InvalidAdjustment(message) => {
+            failure(StatusCode::BAD_REQUEST, &message)
+        }
+        billing::BillingError::InvalidState(message) => failure(StatusCode::CONFLICT, &message),
+        billing::BillingError::Persistence(_) => failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The change could not be saved, so nothing was changed; retry shortly",
+        ),
+        other => failure(StatusCode::CONFLICT, &other.to_string()),
+    }
+}
+
+impl AdminCardActionHandler {
+    fn one_card(result: Result<Card, billing::BillingError>) -> Response {
+        match result {
+            Ok(card) => json_response(
+                StatusCode::OK,
+                &serde_json::json!({ "success": true, "card": card_view(card, now_secs()) }),
+            ),
+            Err(error) => card_action_refused(error),
+        }
+    }
+
+    fn unbind(&self, operator: &str, body: UnbindRequest) -> Response {
+        let device_id = body.device_id.trim();
+        if !valid_text(&body.card_id, 128) || device_id.is_empty() || device_id.len() > 256 {
+            return failure(StatusCode::BAD_REQUEST, "cardId and deviceId are required");
+        }
+        let Some(reason) = support_reason(body.reason.as_deref()) else {
+            return failure(
+                StatusCode::BAD_REQUEST,
+                "A reason of 1 to 200 bytes is required",
+            );
+        };
+        Self::one_card(self.billing.admin_unbind_device(
+            body.card_id.trim(),
+            device_id,
+            operator,
+            reason,
+            now_secs(),
+        ))
+    }
+
+    fn reset_rebinds(&self, operator: &str, body: ResetRebindsRequest) -> Response {
+        if !valid_text(&body.card_id, 128) {
+            return failure(StatusCode::BAD_REQUEST, "cardId is required");
+        }
+        let Some(reason) = support_reason(body.reason.as_deref()) else {
+            return failure(
+                StatusCode::BAD_REQUEST,
+                "A reason of 1 to 200 bytes is required",
+            );
+        };
+        Self::one_card(self.billing.reset_rebinds(
+            body.card_id.trim(),
+            operator,
+            reason,
+            now_secs(),
+        ))
+    }
+
+    fn extend(&self, operator: &str, body: ValidityRequest) -> Response {
+        if body.card_ids.is_empty() || body.card_ids.len() > 500 {
+            return failure(StatusCode::BAD_REQUEST, "cardIds must name 1 to 500 cards");
+        }
+        if !body.card_ids.iter().all(|id| valid_text(id, 128)) {
+            return failure(StatusCode::BAD_REQUEST, "Invalid card ID in cardIds");
+        }
+        let now = now_secs();
+        let extension = match (body.days, body.valid_until_secs) {
+            (Some(days), None) if (1..=MAX_EXTENSION_DAYS).contains(&days) => {
+                billing::ValidityExtension::Days(days)
+            }
+            (Some(_), None) => {
+                return failure(StatusCode::BAD_REQUEST, "days must be between 1 and 3650")
+            }
+            (None, Some(until))
+                if until > now && until <= now.saturating_add(MAX_EXTENSION_DAYS * 86_400) =>
+            {
+                billing::ValidityExtension::Until(until)
+            }
+            (None, Some(_)) => {
+                return failure(
+                    StatusCode::BAD_REQUEST,
+                    "validUntilSecs must be in the future and within 3650 days",
+                )
+            }
+            _ => {
+                return failure(
+                    StatusCode::BAD_REQUEST,
+                    "Give exactly one of days and validUntilSecs",
+                )
+            }
+        };
+        let Some(reason) = support_reason(body.reason.as_deref()) else {
+            return failure(
+                StatusCode::BAD_REQUEST,
+                "A reason of 1 to 200 bytes is required",
+            );
+        };
+        let card_ids: Vec<String> = body
+            .card_ids
+            .iter()
+            .map(|id| id.trim().to_string())
+            .collect();
+        match self
+            .billing
+            .extend_validity(&card_ids, extension, operator, reason, now)
+        {
+            Ok(cards) => {
+                let cards: Vec<AdminCardItem> =
+                    cards.into_iter().map(|card| card_view(card, now)).collect();
+                json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({ "success": true, "count": cards.len(), "cards": cards }),
+                )
+            }
+            Err(error) => card_action_refused(error),
+        }
+    }
+
+    fn note(&self, operator: &str, body: NoteRequest) -> Response {
+        if !valid_text(&body.card_id, 128) {
+            return failure(StatusCode::BAD_REQUEST, "cardId is required");
+        }
+        let note = body.note.as_deref().map(str::trim).unwrap_or_default();
+        if note.len() > 256 || note.chars().any(char::is_control) {
+            return failure(
+                StatusCode::BAD_REQUEST,
+                "note must be at most 256 bytes, without control characters",
+            );
+        }
+        Self::one_card(self.billing.set_card_note(
+            body.card_id.trim(),
+            (!note.is_empty()).then_some(note),
+            operator,
+            now_secs(),
+        ))
+    }
+
+    fn change_group(&self, operator: &str, body: GroupRequest) -> Response {
+        if !valid_text(&body.card_id, 128) || !valid_text(&body.group_id, 64) {
+            return failure(StatusCode::BAD_REQUEST, "cardId and groupId are required");
+        }
+        let Some(reason) = support_reason(body.reason.as_deref()) else {
+            return failure(
+                StatusCode::BAD_REQUEST,
+                "A reason of 1 to 200 bytes is required",
+            );
+        };
+        Self::one_card(self.billing.change_card_group(
+            body.card_id.trim(),
+            body.group_id.trim(),
+            operator,
+            reason,
+            now_secs(),
+        ))
+    }
+}
+
+/// The request body, or what is wrong with it.
+fn card_action_body<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
+    serde_json::from_slice(bytes).map_err(|error| format!("Invalid request body: {error}"))
+}
+
+impl FacadeHandler for AdminCardActionHandler {
+    fn method(&self) -> Method {
+        Method::POST
+    }
+
+    fn path(&self) -> &'static str {
+        match self.action {
+            CardAction::UnbindDevice => "/api/v1/admin/cards/devices/unbind",
+            CardAction::ResetRebinds => "/api/v1/admin/cards/rebinds/reset",
+            CardAction::ExtendValidity => "/api/v1/admin/cards/validity",
+            CardAction::Note => "/api/v1/admin/cards/note",
+            CardAction::ChangeGroup => "/api/v1/admin/cards/group",
+        }
+    }
+
+    fn handle<'a>(&'a self, req: Request<Body>) -> BoxFuture<'a, Response> {
+        Box::pin(async move {
+            let Some(operator) = self.auth.authenticated_operator(req.headers()) else {
+                return unauthorized_response();
+            };
+            let Ok(bytes) = axum::body::to_bytes(req.into_body(), 64 * 1024).await else {
+                return failure(StatusCode::BAD_REQUEST, "Invalid request body");
+            };
+            let response = match self.action {
+                CardAction::UnbindDevice => {
+                    card_action_body(&bytes).map(|body| self.unbind(operator, body))
+                }
+                CardAction::ResetRebinds => {
+                    card_action_body(&bytes).map(|body| self.reset_rebinds(operator, body))
+                }
+                CardAction::ExtendValidity => {
+                    card_action_body(&bytes).map(|body| self.extend(operator, body))
+                }
+                CardAction::Note => card_action_body(&bytes).map(|body| self.note(operator, body)),
+                CardAction::ChangeGroup => {
+                    card_action_body(&bytes).map(|body| self.change_group(operator, body))
+                }
+            };
+            response.unwrap_or_else(|message| failure(StatusCode::BAD_REQUEST, &message))
         })
     }
 }
@@ -2018,5 +2487,46 @@ impl FacadeHandler for AdminSnapshotSyncHandler {
                 ),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::persistence_problem;
+
+    #[test]
+    fn a_persistence_problem_is_named_without_its_paths_or_sizes() {
+        for (error, problem) in [
+            (
+                "billing snapshot size 300000000 bytes exceeds maximum allowable limit of 268435456 bytes",
+                "The saved state has reached its size ceiling; archive old ledger entries",
+            ),
+            (
+                "There is not enough space on the disk. (os error 112)",
+                "The disk holding the saved state is full",
+            ),
+            (
+                "No space left on device (os error 28)",
+                "The disk holding the saved state is full",
+            ),
+            (
+                "Access is denied. (os error 5)",
+                "The saved state cannot be written: permission denied",
+            ),
+            (
+                "persisting issuance replay secrets requires a master KEK",
+                "Saving this state needs the master key, which is not configured",
+            ),
+            (
+                r"C:\data\billing_state.json.gen_42: injected persistence fault",
+                "The saved state could not be written",
+            ),
+        ] {
+            assert_eq!(persistence_problem(Some(error)), problem, "{error}");
+        }
+        assert_eq!(
+            persistence_problem(None),
+            "The saved state could not be written"
+        );
     }
 }

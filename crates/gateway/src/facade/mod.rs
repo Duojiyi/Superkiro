@@ -239,6 +239,19 @@ impl FacadeRegistry {
                 action,
             ));
         }
+        for action in [
+            admin::CardAction::UnbindDevice,
+            admin::CardAction::ResetRebinds,
+            admin::CardAction::ExtendValidity,
+            admin::CardAction::Note,
+            admin::CardAction::ChangeGroup,
+        ] {
+            self.register(admin::AdminCardActionHandler {
+                billing: billing.clone(),
+                auth: auth.clone(),
+                action,
+            });
+        }
         self.register(admin::AdminSessionHandler { auth: auth.clone() })
             .register(admin::AdminRevokeSessionsHandler { auth: auth.clone() })
             .register(admin::AdminMeHandler { auth: auth.clone() })

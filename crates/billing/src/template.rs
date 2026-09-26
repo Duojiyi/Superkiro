@@ -2,6 +2,44 @@
 
 use serde::{Deserialize, Serialize};
 
+/// What a card of an issuance tier sells for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanPrice {
+    pub template_id: &'static str,
+    pub name: &'static str,
+    pub points: i64,
+    pub price_micro_cny: i64,
+}
+
+/// The tiers' list prices: the one place the server and the console take them from.
+pub const PLAN_PRICES: [PlanPrice; 4] = [
+    PlanPrice {
+        template_id: "tier-1000",
+        name: "PRO",
+        points: 1000,
+        price_micro_cny: 30_000_000,
+    },
+    PlanPrice {
+        template_id: "tier-2000",
+        name: "PRO+",
+        points: 2000,
+        price_micro_cny: 55_000_000,
+    },
+    PlanPrice {
+        template_id: "tier-5000",
+        name: "PRO Max",
+        points: 5000,
+        price_micro_cny: 130_000_000,
+    },
+    PlanPrice {
+        template_id: "tier-10000",
+        name: "Power",
+        points: 10000,
+        price_micro_cny: 250_000_000,
+    },
+];
+
 /// Card type template (Spec §5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CardTemplate {

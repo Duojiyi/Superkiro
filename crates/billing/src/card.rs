@@ -17,12 +17,17 @@ use thiserror::Error;
 #[serde(rename_all = "camelCase")]
 pub struct CardEvent {
     pub ts_secs: u64,
-    /// issued, activated, topup, adjust, freeze, unfreeze, ban, void, archive or unarchive.
+    /// issued, activated, topup, adjust, freeze, unfreeze, ban, unban, void, archive,
+    /// unarchive, unbind, rebinds_reset, extend, note or group.
     pub action: String,
     /// Change to the balance in micro-credits; for `issued`, the credits issued.
     pub credits: i64,
     pub operator: Option<String>,
     pub reason: Option<String>,
+    /// For an adjustment, the request it makes up for.
+    pub invocation_id: Option<String>,
+    /// What else the change recorded: the device unbound, the new expiry, the groups.
+    pub detail: Option<serde_json::Value>,
 }
 
 /// Status lifecycle of a card key.
@@ -252,6 +257,24 @@ impl Card {
                 Ok(())
             }
         }
+    }
+
+    /// The status as the customer meets it: an active card past its expiry is expired,
+    /// though its stored status still says active.
+    pub fn effective_status(&self, now_secs: u64) -> CardStatus {
+        match self.valid_until {
+            Some(until) if self.status == CardStatus::Active && now_secs >= until => {
+                CardStatus::Expired
+            }
+            _ => self.status,
+        }
+    }
+
+    /// When the customer may unbind their device again, while a cooldown is running.
+    pub fn rebind_cooldown_until(&self, now_secs: u64) -> Option<u64> {
+        self.last_rebind_at
+            .map(|last| last.saturating_add(self.rebind_cooldown_secs))
+            .filter(|until| *until > now_secs)
     }
 
     /// Verify card is active and not expired.

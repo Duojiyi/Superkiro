@@ -5,6 +5,7 @@
 use crate::ledger::{EarnedCredits, LedgerEntry};
 use crate::rate_card::BillingSettings;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Request execution status (Spec §5, §14.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -71,6 +72,131 @@ pub struct Activity {
     pub providers: Vec<ProviderActivity>,
     /// The oldest trace kept: request counts reach back no further than this.
     pub traces_cover_from_secs: Option<u64>,
+    /// Every upstream attempt by provider, from each request's attempt chain, busiest
+    /// first: a provider that fails over to a backup shows its failures, though the backup
+    /// answered.
+    #[serde(rename = "providerAttempts")]
+    pub provider_attempts: Vec<ProviderAttempts>,
+    /// The same by Key.
+    #[serde(rename = "keyAttempts")]
+    pub key_attempts: Vec<KeyAttempts>,
+    /// Requests by the model the customer asked for, busiest first.
+    #[serde(rename = "modelHealth")]
+    pub model_health: Vec<ModelHealth>,
+    /// Billed requests and the cards that made them by customer model over the last 7 days,
+    /// from the ledger, busiest first.
+    #[serde(rename = "modelUsage7d")]
+    pub model_usage_7d: Vec<ModelUsage>,
+}
+
+/// Error classes of requests refused for the card's own balance or limits: they say
+/// nothing about the model asked for.
+pub const CARD_LIMIT_REFUSALS: [&str; 3] =
+    ["insufficient_balance", "concurrency_limit", "usage_limit"];
+
+/// Upstream attempts over one period.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttemptWindow {
+    pub attempts: u64,
+    pub failures: u64,
+    /// Failed attempts after which another provider answered the request.
+    pub taken_over: u64,
+    /// Failures by the kind attempt chains name: http_429, http_401, timeout, transport,
+    /// upstream_service, protocol, empty.
+    pub failures_by_kind: BTreeMap<String, u64>,
+}
+
+impl AttemptWindow {
+    pub(crate) fn count(&mut self, attempt: &AttemptRecord, taken_over: bool) {
+        self.attempts += 1;
+        if !attempt.success {
+            self.failures += 1;
+            self.taken_over += u64::from(taken_over);
+            let kind = attempt.error.as_deref().unwrap_or("unknown");
+            *self.failures_by_kind.entry(kind.to_string()).or_default() += 1;
+        }
+    }
+}
+
+/// One provider's attempts over the last hour, 24 hours and 7 days.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderAttempts {
+    pub provider_id: String,
+    #[serde(rename = "last1h")]
+    pub last_1h: AttemptWindow,
+    #[serde(rename = "last24h")]
+    pub last_24h: AttemptWindow,
+    #[serde(rename = "last7d")]
+    pub last_7d: AttemptWindow,
+}
+
+/// One Key's attempts over the last hour, 24 hours and 7 days.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyAttempts {
+    pub key_id: String,
+    pub provider_id: String,
+    #[serde(rename = "last1h")]
+    pub last_1h: AttemptWindow,
+    #[serde(rename = "last24h")]
+    pub last_24h: AttemptWindow,
+    #[serde(rename = "last7d")]
+    pub last_7d: AttemptWindow,
+}
+
+/// Finished requests for one customer model over one period. Refusals for the card's own
+/// balance or limits are not counted.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelHealthWindow {
+    pub requests: u64,
+    pub failures: u64,
+    pub last_failure_at: Option<u64>,
+    /// The commonest kind of failure, the earliest in name on a tie.
+    pub top_failure_kind: Option<String>,
+    /// Failures by kind: the request's error class, else its last failed attempt's kind.
+    pub failures_by_kind: BTreeMap<String, u64>,
+}
+
+impl ModelHealthWindow {
+    pub(crate) fn count(&mut self, ts: u64, failure: Option<&str>) {
+        self.requests += 1;
+        if let Some(kind) = failure {
+            self.failures += 1;
+            self.last_failure_at = self.last_failure_at.max(Some(ts));
+            *self.failures_by_kind.entry(kind.to_string()).or_default() += 1;
+            self.top_failure_kind = self
+                .failures_by_kind
+                .iter()
+                .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
+                .map(|(kind, _)| kind.clone());
+        }
+    }
+}
+
+/// One customer model's requests over the last hour, 24 hours and 7 days.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelHealth {
+    pub model: String,
+    #[serde(rename = "last1h")]
+    pub last_1h: ModelHealthWindow,
+    #[serde(rename = "last24h")]
+    pub last_24h: ModelHealthWindow,
+    #[serde(rename = "last7d")]
+    pub last_7d: ModelHealthWindow,
+}
+
+/// One customer model's billed use over the last 7 days.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelUsage {
+    pub model: String,
+    pub requests: u64,
+    /// Distinct cards billed for it.
+    pub cards: u64,
 }
 
 /// Single failover or execution attempt record within a request trace (Spec §5, §14.4).
@@ -86,7 +212,7 @@ pub struct AttemptRecord {
 /// Request execution trace (Spec §5, §14.4).
 ///
 /// Strictly captures metrics, tokens, costs, and attempt chains without conversation text.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RequestTrace {
     pub id: String,
     pub card_id: String,
@@ -102,7 +228,58 @@ pub struct RequestTrace {
     pub output_tokens: u64,
     pub credits_charged: i64,
     pub provider_cost_micro_cny: i64,
+    /// For a request refused for want of balance: the micro-credits it needed to start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needed_micro_credits: Option<i64>,
+    /// And the micro-credits the card had.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_micro_credits: Option<i64>,
     pub attempt_chain: Vec<AttemptRecord>,
+}
+
+/// Which traces a search keeps; all of them when nothing is set.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TraceFilter {
+    /// From this time on.
+    pub from_secs: Option<u64>,
+    /// Before this time.
+    pub to_secs: Option<u64>,
+    pub card_id: Option<String>,
+    /// The model the customer asked for.
+    pub model: Option<String>,
+    /// The provider that answered, or any provider an attempt was made to.
+    pub provider: Option<String>,
+    pub status: Option<TraceStatus>,
+}
+
+impl TraceFilter {
+    pub fn matches(&self, trace: &RequestTrace) -> bool {
+        self.from_secs.is_none_or(|from| trace.ts >= from)
+            && self.to_secs.is_none_or(|to| trace.ts < to)
+            && self.card_id.as_ref().is_none_or(|id| trace.card_id == *id)
+            && self
+                .model
+                .as_ref()
+                .is_none_or(|model| trace.exposed_model == *model)
+            && self.provider.as_ref().is_none_or(|provider| {
+                trace.provider_id.as_ref() == Some(provider)
+                    || trace
+                        .attempt_chain
+                        .iter()
+                        .any(|attempt| attempt.provider_id == *provider)
+            })
+            && self.status.is_none_or(|status| trace.status == status)
+    }
+}
+
+/// Totals over every trace a search matched, not only those returned.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TraceTotals {
+    pub count: u64,
+    pub failures: u64,
+    pub credits_charged: i64,
+    pub cost_micro_cny: i64,
 }
 
 /// Daily aggregated usage summary (Spec §14.4).
@@ -248,12 +425,7 @@ pub fn compute_margin_dashboard(
             total_credits_charged = total_credits_charged.saturating_add(entry.credits_charged);
             provider_cost_micro_cny =
                 provider_cost_micro_cny.saturating_add(entry.provider_cost_micro_cny);
-            earned.add(
-                entry
-                    .credit_face_value_cny
-                    .unwrap_or(settings.credit_face_value_cny),
-                entry.credits_charged,
-            );
+            earned.add(entry_face_value(entry, settings), entry.credits_charged);
         }
     }
 
@@ -311,12 +483,7 @@ pub fn compute_model_cost_rankings(
                 .cost_micro_cny
                 .saturating_add(entry.provider_cost_micro_cny);
             agg.credits = agg.credits.saturating_add(entry.credits_charged);
-            agg.earned.add(
-                entry
-                    .credit_face_value_cny
-                    .unwrap_or(settings.credit_face_value_cny),
-                entry.credits_charged,
-            );
+            agg.earned.add(entry_face_value(entry, settings), entry.credits_charged);
         }
     }
 
@@ -345,6 +512,247 @@ pub fn compute_model_cost_rankings(
     // Sort by highest provider cost descending
     rankings.sort_by_key(|b| std::cmp::Reverse(b.provider_cost_micro_cny));
     rankings
+}
+
+/// The ¥ face value of one credit a ledger entry was sold at: the one recorded when it was
+/// settled, else (entries settled before it was recorded) the current settings' face value.
+pub fn entry_face_value(entry: &LedgerEntry, settings: &BillingSettings) -> f64 {
+    entry
+        .credit_face_value_cny
+        .unwrap_or(settings.credit_face_value_cny)
+}
+
+/// Micro-credits at a ¥ face value per credit, in micro-CNY.
+pub fn face_value_micro_cny(micro_credits: i64, face_value_cny: f64) -> i64 {
+    (micro_credits as f64 * face_value_cny).round() as i64
+}
+
+/// What one upstream served over a period, and what it should bill for it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderCost {
+    pub provider_id: String,
+    pub requests: u64,
+    pub uncached_input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cost_micro_cny: i64,
+}
+
+/// Billed requests by the provider that served them, dearest first.
+pub fn compute_provider_costs(entries: &[LedgerEntry]) -> Vec<ProviderCost> {
+    let mut providers: BTreeMap<&str, ProviderCost> = BTreeMap::new();
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.kind == crate::ledger::LedgerKind::Usage)
+    {
+        let row = providers
+            .entry(entry.provider_id.as_str())
+            .or_insert_with(|| ProviderCost {
+                provider_id: entry.provider_id.clone(),
+                ..ProviderCost::default()
+            });
+        row.requests += 1;
+        // The entry's input is the whole prompt: uncached, cache reads and cache writes.
+        row.uncached_input_tokens = row.uncached_input_tokens.saturating_add(
+            entry
+                .input_tokens
+                .saturating_sub(entry.cache_read_tokens)
+                .saturating_sub(entry.cache_creation_tokens),
+        );
+        row.output_tokens = row.output_tokens.saturating_add(entry.output_tokens);
+        row.cache_read_tokens = row
+            .cache_read_tokens
+            .saturating_add(entry.cache_read_tokens);
+        row.cache_write_tokens = row
+            .cache_write_tokens
+            .saturating_add(entry.cache_creation_tokens);
+        row.cost_micro_cny = row
+            .cost_micro_cny
+            .saturating_add(entry.provider_cost_micro_cny);
+    }
+    let mut rows: Vec<ProviderCost> = providers.into_values().collect();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.cost_micro_cny));
+    rows
+}
+
+/// Margin over the requests whose cost is known, and what is left out: one model without
+/// a cost no longer blanks the whole.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CostedMargin {
+    pub costed_requests: u64,
+    pub costed_credits: i64,
+    pub revenue_micro_cny: i64,
+    pub cost_micro_cny: i64,
+    pub gross_profit_micro_cny: i64,
+    /// Null without revenue.
+    pub margin_percentage: Option<f64>,
+    pub uncosted_requests: u64,
+    pub uncosted_credits: i64,
+}
+
+/// A billed request is costed when it was priced by a published price version.
+pub fn compute_costed_margin(entries: &[LedgerEntry], settings: &BillingSettings) -> CostedMargin {
+    let mut margin = CostedMargin::default();
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.kind == crate::ledger::LedgerKind::Usage)
+    {
+        if entry.rate_card_version.is_none() {
+            margin.uncosted_requests += 1;
+            margin.uncosted_credits = margin
+                .uncosted_credits
+                .saturating_add(entry.credits_charged);
+            continue;
+        }
+        margin.costed_requests += 1;
+        margin.costed_credits = margin.costed_credits.saturating_add(entry.credits_charged);
+        margin.revenue_micro_cny = margin
+            .revenue_micro_cny
+            .saturating_add(face_value_micro_cny(
+                entry.credits_charged,
+                entry_face_value(entry, settings),
+            ));
+        margin.cost_micro_cny = margin
+            .cost_micro_cny
+            .saturating_add(entry.provider_cost_micro_cny);
+    }
+    margin.gross_profit_micro_cny = margin
+        .revenue_micro_cny
+        .saturating_sub(margin.cost_micro_cny);
+    margin.margin_percentage = (margin.revenue_micro_cny > 0)
+        .then(|| margin.gross_profit_micro_cny as f64 / margin.revenue_micro_cny as f64 * 100.0);
+    margin
+}
+
+/// Cards of one tier issued and activated over a period.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanSales {
+    pub template_id: &'static str,
+    pub name: &'static str,
+    pub points: i64,
+    pub price_micro_cny: i64,
+    pub issued_cards: u64,
+    pub activated_cards: u64,
+}
+
+/// Cards issued and activated over a period, and their value at the tiers' list prices.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Sales {
+    pub issued_cards: u64,
+    pub issued_value_micro_cny: i64,
+    pub activated_cards: u64,
+    pub activated_value_micro_cny: i64,
+    /// Cards whose credits match no tier: counted, not valued.
+    pub unpriced_issued_cards: u64,
+    pub unpriced_activated_cards: u64,
+    pub by_plan: Vec<PlanSales>,
+}
+
+/// Issued counts cards created in `[from, to)`, less those voided without ever being
+/// activated, which were never sold; activated counts cards activated in it.
+pub fn compute_sales<'a>(
+    cards: impl IntoIterator<Item = &'a crate::card::Card>,
+    from: Option<u64>,
+    to: Option<u64>,
+) -> Sales {
+    let within = |ts: u64| from.is_none_or(|from| ts >= from) && to.is_none_or(|to| ts < to);
+    let mut sales = Sales {
+        by_plan: crate::template::PLAN_PRICES
+            .iter()
+            .map(|plan| PlanSales {
+                template_id: plan.template_id,
+                name: plan.name,
+                points: plan.points,
+                price_micro_cny: plan.price_micro_cny,
+                issued_cards: 0,
+                activated_cards: 0,
+            })
+            .collect(),
+        ..Sales::default()
+    };
+    for card in cards {
+        let plan = card.issued_credits.and_then(|credits| {
+            crate::template::PLAN_PRICES.iter().position(|plan| {
+                plan.points.saturating_mul(crate::MICRO_CREDITS_PER_CREDIT) == credits
+            })
+        });
+        let never_sold =
+            card.status == crate::card::CardStatus::Voided && card.activated_at.is_none();
+        if within(card.created_at) && !never_sold {
+            sales.issued_cards += 1;
+            match plan {
+                Some(index) => {
+                    sales.by_plan[index].issued_cards += 1;
+                    sales.issued_value_micro_cny = sales
+                        .issued_value_micro_cny
+                        .saturating_add(sales.by_plan[index].price_micro_cny);
+                }
+                None => sales.unpriced_issued_cards += 1,
+            }
+        }
+        if card.activated_at.is_some_and(within) {
+            sales.activated_cards += 1;
+            match plan {
+                Some(index) => {
+                    sales.by_plan[index].activated_cards += 1;
+                    sales.activated_value_micro_cny = sales
+                        .activated_value_micro_cny
+                        .saturating_add(sales.by_plan[index].price_micro_cny);
+                }
+                None => sales.unpriced_activated_cards += 1,
+            }
+        }
+    }
+    sales
+}
+
+/// Credits still owed to customers: the balances of cards that can still be used.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Liability {
+    pub cards: u64,
+    pub micro_credits: i64,
+    /// At the current face value.
+    pub value_micro_cny: i64,
+    /// Of those, cards not yet activated, which may not have been sold yet.
+    pub unactivated_cards: u64,
+    pub unactivated_micro_credits: i64,
+}
+
+/// Every card that is not expired, voided, banned or archived; frozen ones included.
+pub fn compute_liability<'a>(
+    cards: impl IntoIterator<Item = &'a crate::card::Card>,
+    settings: &BillingSettings,
+    now_secs: u64,
+) -> Liability {
+    use crate::card::CardStatus;
+    let mut liability = Liability::default();
+    for card in cards {
+        let usable = card.archived_at.is_none()
+            && !matches!(
+                card.effective_status(now_secs),
+                CardStatus::Expired | CardStatus::Voided | CardStatus::Banned
+            );
+        if !usable {
+            continue;
+        }
+        let balance = card.credit_total.saturating_sub(card.credit_used).max(0);
+        liability.cards += 1;
+        liability.micro_credits = liability.micro_credits.saturating_add(balance);
+        if card.status == CardStatus::Unactivated {
+            liability.unactivated_cards += 1;
+            liability.unactivated_micro_credits =
+                liability.unactivated_micro_credits.saturating_add(balance);
+        }
+    }
+    liability.value_micro_cny =
+        face_value_micro_cny(liability.micro_credits, settings.credit_face_value_cny);
+    liability
 }
 
 /// Compute provider health metrics from request traces (Spec §14.4).
@@ -413,10 +821,32 @@ pub fn compute_provider_health(
 
 /// Export ledger entries to CSV format for financial reconciliation (Spec §14.4).
 pub fn export_reconciliation_csv(entries: &[LedgerEntry]) -> String {
-    let mut csv = String::from("id,card_id,ts,kind,invocation_id,exposed_model,provider_id,input_tokens,output_tokens,credits_charged,provider_cost_micro_cny\n");
+    export_ledger_csv(
+        entries,
+        &std::collections::HashMap::new(),
+        &BillingSettings::default(),
+    )
+}
+
+/// The ledger as CSV. The original columns come first, so tools reading them keep working;
+/// readable ones follow: the time in UTC, the provider's name, cache reads and writes,
+/// credits as a decimal, and for usage its ¥ revenue at face value and ¥ cost.
+pub fn export_ledger_csv(
+    entries: &[LedgerEntry],
+    provider_names: &std::collections::HashMap<String, String>,
+    settings: &BillingSettings,
+) -> String {
+    let mut csv = String::from("id,card_id,ts,kind,invocation_id,exposed_model,provider_id,input_tokens,output_tokens,credits_charged,provider_cost_micro_cny,time_utc,provider_name,cache_read_tokens,cache_write_tokens,credits,revenue_cny,cost_cny\n");
     for e in entries {
+        let usage = e.kind == crate::ledger::LedgerKind::Usage;
+        let revenue = usage.then(|| {
+            micro_decimal(face_value_micro_cny(
+                e.credits_charged,
+                entry_face_value(e, settings),
+            ))
+        });
         csv.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             csv_text(&e.id),
             csv_text(&e.card_id),
             e.ts_secs,
@@ -427,10 +857,62 @@ pub fn export_reconciliation_csv(entries: &[LedgerEntry]) -> String {
             e.input_tokens,
             e.output_tokens,
             e.credits_charged,
-            e.provider_cost_micro_cny
+            e.provider_cost_micro_cny,
+            csv_text(&iso_utc(e.ts_secs)),
+            csv_text(provider_names.get(&e.provider_id).unwrap_or(&e.provider_id)),
+            e.cache_read_tokens,
+            e.cache_creation_tokens,
+            micro_decimal(e.credits_charged),
+            revenue.unwrap_or_default(),
+            if usage {
+                micro_decimal(e.provider_cost_micro_cny)
+            } else {
+                String::new()
+            },
         ));
     }
     csv
+}
+
+/// A micro-unit amount as a decimal of whole units, without trailing zeros: -1.5, 2, 0.000001.
+fn micro_decimal(micro: i64) -> String {
+    let sign = if micro < 0 { "-" } else { "" };
+    let (whole, fraction) = (
+        micro.unsigned_abs() / 1_000_000,
+        micro.unsigned_abs() % 1_000_000,
+    );
+    if fraction == 0 {
+        format!("{sign}{whole}")
+    } else {
+        let fraction = format!("{fraction:06}");
+        format!("{sign}{whole}.{}", fraction.trim_end_matches('0'))
+    }
+}
+
+/// Unix seconds as ISO-8601 in UTC, such as 2023-11-14T22:13:20Z.
+pub fn iso_utc(secs: u64) -> String {
+    // Days to a civil date, after Howard Hinnant's days_from_civil inverse.
+    let days = (secs / 86_400) as i64 + 719_468;
+    let era = days.div_euclid(146_097);
+    let day_of_era = days.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    let clock = secs % 86_400;
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        clock / 3600,
+        clock % 3600 / 60,
+        clock % 60
+    )
 }
 
 /// A text cell for an export an operator opens in a spreadsheet. Some text comes from
