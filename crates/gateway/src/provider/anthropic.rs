@@ -1,5 +1,6 @@
 //! Anthropic-compatible model provider implementation (Spec §15.2).
 
+use super::family::{ModelFamily, Reasoning};
 use super::{
     endpoint_with_suffix, process_byte_stream, sanitize_upstream_error_body, BoxFuture, BoxStream,
     ChatRequest, ModelProvider, ProviderConfig, ProviderDelta, ProviderError, ProviderStreamEvent,
@@ -11,6 +12,14 @@ use serde_json::Value;
 use std::time::Duration;
 
 pub struct AnthropicProvider;
+
+fn adaptive_thinking(summarized: bool) -> Value {
+    if summarized {
+        serde_json::json!({"type": "adaptive", "display": "summarized"})
+    } else {
+        serde_json::json!({"type": "adaptive"})
+    }
+}
 
 fn normalize_content_block(val: &Value) -> Value {
     // An attached PDF, as the translator writes it (OpenAI's `file` part).
@@ -199,39 +208,58 @@ impl ModelProvider for AnthropicProvider {
             body["system"] = serde_json::json!(system_text);
         }
 
-        if let Some(temp) = req.temperature {
-            body["temperature"] = serde_json::json!(temp);
-        }
-
-        if let Some(effort) = req.reasoning_effort {
-            use kiro_wire::requests::conversation::ReasoningEffort::*;
-            if max_tokens <= 1024 {
-                return Err(ProviderError::Serialization(
-                    "Thinking requires max output greater than 1024".into(),
-                ));
+        let family = super::family::family(&req.model);
+        let mut thinking = false;
+        match (family.reasoning, req.reasoning_effort) {
+            (
+                Reasoning::Adaptive {
+                    xhigh, summarized, ..
+                },
+                Some(effort),
+            ) => {
+                body["thinking"] = adaptive_thinking(summarized);
+                body["output_config"] =
+                    serde_json::json!({"effort": ModelFamily::adaptive_effort(xhigh, effort)});
+                thinking = true;
             }
-            let model = req.model.to_ascii_lowercase();
-            let adaptive = model.contains("sonnet-4-6")
-                || model.contains("sonnet-4.6")
-                || model.contains("opus-4-6")
-                || model.contains("opus-4.6");
-            if adaptive {
-                body["thinking"] = serde_json::json!({"type": "adaptive"});
-                body["output_config"] = serde_json::json!({"effort": match effort {
-                    Low => "low", Medium => "medium", Max if model.contains("opus") => "max",
-                    High | Xhigh | Max => "high",
-                }});
-            } else {
-                let budget = match effort {
+            // It thinks anyway, and streams an empty text while it does unless it is asked
+            // for a summary: a long silent pause, then the answer.
+            (
+                Reasoning::Adaptive {
+                    summarized: true,
+                    by_default: true,
+                    ..
+                },
+                None,
+            ) => {
+                body["thinking"] = adaptive_thinking(true);
+                thinking = true;
+            }
+            (Reasoning::Adaptive { .. }, None) | (_, None) => {}
+            // Older Claude models, and any this format carries that the table does not know,
+            // think within a budget that leaves a quarter of the output for the answer.
+            (_, Some(effort)) => {
+                use kiro_wire::requests::conversation::ReasoningEffort::*;
+                let wanted = match effort {
                     Low => 1024,
                     Medium => 4096,
                     High => 8192,
                     Xhigh => 16384,
                     Max => 24576,
                 };
-                body["thinking"] = serde_json::json!({"type": "enabled", "budget_tokens": budget.min(max_tokens - 1)});
+                let budget = wanted.min(max_tokens.saturating_sub((max_tokens / 4).max(1024)));
+                if budget < 1024 {
+                    return Err(ProviderError::Serialization(
+                        "Thinking needs a max output of at least 2048 tokens".into(),
+                    ));
+                }
+                body["thinking"] = serde_json::json!({"type": "enabled", "budget_tokens": budget});
+                thinking = true;
             }
-            body.as_object_mut().unwrap().remove("temperature");
+        }
+        // Thinking takes no sampling parameters, and current models take none at all.
+        if let Some(temp) = req.temperature.filter(|_| family.sampling && !thinking) {
+            body["temperature"] = serde_json::json!(temp);
         }
 
         if !req.tools.is_empty() {

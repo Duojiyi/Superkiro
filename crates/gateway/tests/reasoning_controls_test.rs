@@ -46,48 +46,96 @@ fn precedence_alias_and_invalid_effort() {
 }
 #[test]
 fn legacy_budget_respects_reserved_output_and_adaptive_models_use_effort() {
-    for (name, expected) in [
-        ("low", 1024),
-        ("medium", 4096),
-        ("high", 8192),
-        ("xhigh", 16384),
-        ("max", 24576),
+    for (name, budget, effort_4_6) in [
+        ("low", 1024, "low"),
+        ("medium", 4096, "medium"),
+        ("high", 8192, "high"),
+        ("xhigh", 16384, "high"),
+        // A quarter of the output stays for the answer.
+        ("max", 24000, "max"),
     ] {
         let mut value = wire();
         value["additionalModelRequestFields"] = json!({"output_config":{"effort":name}});
         let mut request = translated(value, "claude-sonnet-4-5");
         request.max_tokens = Some(32000);
         let body = AnthropicProvider.translate_request(&request).unwrap();
-        assert_eq!(body["thinking"]["budget_tokens"], expected);
+        assert_eq!(body["thinking"]["budget_tokens"], budget, "{name}");
         assert!(body.get("temperature").is_none());
+        assert!(body.get("output_config").is_none());
         request.max_tokens = Some(2048);
-        assert!(
-            AnthropicProvider.translate_request(&request).unwrap()["thinking"]["budget_tokens"]
-                .as_u64()
-                .unwrap()
-                < 2048
+        assert_eq!(
+            AnthropicProvider.translate_request(&request).unwrap()["thinking"]["budget_tokens"],
+            1024
         );
         request.max_tokens = Some(1024);
         assert!(AnthropicProvider.translate_request(&request).is_err());
+
+        // 4.6 thinks adaptively, without xhigh, and summarizes by default.
         request.max_tokens = Some(32000);
         request.model = "claude-sonnet-4-6".into();
         let adaptive = AnthropicProvider.translate_request(&request).unwrap();
-        assert_eq!(adaptive["thinking"]["type"], "adaptive");
-        assert!(adaptive["thinking"].get("budget_tokens").is_none());
-        assert_ne!(adaptive["output_config"]["effort"], "max");
+        assert_eq!(adaptive["thinking"], json!({"type": "adaptive"}), "{name}");
+        assert_eq!(adaptive["output_config"]["effort"], effort_4_6, "{name}");
+        assert!(adaptive.get("temperature").is_none());
+
+        // Current models take every level and are asked for a readable summary.
+        request.model = "claude-opus-5-5".into();
+        let current = AnthropicProvider.translate_request(&request).unwrap();
+        assert_eq!(
+            current["thinking"],
+            json!({"type": "adaptive", "display": "summarized"})
+        );
+        assert_eq!(current["output_config"]["effort"], name);
+        assert!(current.get("temperature").is_none());
+        // A tiny output limit is no reason to refuse: adaptive thinking has no budget.
+        request.max_tokens = Some(1024);
+        assert!(AnthropicProvider.translate_request(&request).is_ok());
     }
 }
+
+/// Only a model known to take sampling parameters is sent a temperature; current Claude
+/// models refuse one with a 400, and a model the table does not know gets none.
 #[test]
-fn no_effort_preserves_existing_requests() {
-    let request = translated(wire(), "plain-model");
-    for body in [
-        AnthropicProvider.translate_request(&request).unwrap(),
-        OpenAiProvider.translate_request(&request).unwrap(),
-    ] {
-        assert!(body.get("thinking").is_none());
-        assert!(body.get("reasoning_effort").is_none());
-        assert!(body.get("temperature").is_some());
+fn without_effort_each_family_gets_only_what_it_takes() {
+    let body = |model: &str, anthropic: bool| {
+        let request = translated(wire(), model);
+        if anthropic {
+            AnthropicProvider.translate_request(&request).unwrap()
+        } else {
+            OpenAiProvider.translate_request(&request).unwrap()
+        }
+    };
+    for anthropic in [true, false] {
+        let plain = body("plain-model", anthropic);
+        assert!(plain.get("thinking").is_none());
+        assert!(plain.get("reasoning_effort").is_none());
+        assert!(plain.get("temperature").is_none());
     }
+    assert!(body("claude-sonnet-4-6", true).get("temperature").is_some());
+    assert!(body("claude-haiku-4-5", true).get("temperature").is_some());
+    assert!(body("gpt-4o", false).get("temperature").is_some());
+
+    // Opus 4.7 does not think unasked; Opus 5.5 always does, visibly only with a summary.
+    let opus_4_7 = body("claude-opus-4-7", true);
+    assert!(opus_4_7.get("thinking").is_none() && opus_4_7.get("temperature").is_none());
+    let opus_5_5 = body("claude-opus-5-5", true);
+    assert_eq!(
+        opus_5_5["thinking"],
+        json!({"type": "adaptive", "display": "summarized"})
+    );
+    assert!(opus_5_5.get("output_config").is_none());
+    assert!(opus_5_5.get("temperature").is_none());
+
+    // OpenAI reasoning models count output in max_completion_tokens.
+    let mut request = translated(wire(), "o3");
+    request.max_tokens = Some(8192);
+    let o3 = OpenAiProvider.translate_request(&request).unwrap();
+    assert_eq!(o3["max_completion_tokens"], 8192);
+    assert!(o3.get("max_tokens").is_none() && o3.get("temperature").is_none());
+    request.model = "deepseek-chat".into();
+    let other = OpenAiProvider.translate_request(&request).unwrap();
+    assert_eq!(other["max_tokens"], 8192);
+    assert!(other.get("max_completion_tokens").is_none());
 }
 
 #[test]

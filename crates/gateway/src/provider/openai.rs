@@ -81,11 +81,23 @@ impl ModelProvider for OpenAiProvider {
                 High | Xhigh | Max => "high",
             });
         }
-        if let Some(temp) = req.temperature.filter(|_| req.reasoning_effort.is_none()) {
+        // Reasoning models take no temperature and count their output, reasoning included,
+        // in max_completion_tokens; a model the family table does not know is sent no
+        // sampling parameters.
+        let family = super::family::family(&req.model);
+        if let Some(temp) = req
+            .temperature
+            .filter(|_| family.sampling && req.reasoning_effort.is_none())
+        {
             body["temperature"] = serde_json::json!(temp);
         }
         if let Some(max_tokens) = req.max_tokens {
-            body["max_tokens"] = serde_json::json!(max_tokens);
+            let field = if family.max_completion_tokens() {
+                "max_completion_tokens"
+            } else {
+                "max_tokens"
+            };
+            body[field] = serde_json::json!(max_tokens);
         }
         if !req.tools.is_empty() {
             let tools: Vec<Value> = req

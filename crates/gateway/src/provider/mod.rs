@@ -11,6 +11,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 pub mod anthropic;
+pub mod family;
 pub mod governance;
 pub mod import;
 pub mod openai;
