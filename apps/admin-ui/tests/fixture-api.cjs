@@ -75,37 +75,120 @@ module.exports = function fixtureApi() {
   const refuse = message => ({status: 409, body: {success: false, error: `Invalid billing state: ${message}`}});
   const serves = (providerId, model, among = keys) => providers.some(p => p.id === providerId && p.enabled !== false)
     && among.some(k => k.provider_id === providerId && k.enabled !== false && (!Array.isArray(k.allowed_models) || k.allowed_models.includes(model)));
+  // Official pricing, checked as crates/billing/src/commercial.rs checks it.
+  const OFFICIAL = ['input_usd_per_m', 'output_usd_per_m', 'cache_creation_usd_per_m', 'cache_read_usd_per_m'];
+  const CREDITS = ['fixed_input_credit_per_m', 'fixed_output_credit_per_m', 'fixed_cache_creation_credit_per_m', 'fixed_cache_read_credit_per_m'];
+  const COSTS = ['input_price_per_m', 'output_price_per_m', 'cache_creation_price_per_m', 'cache_read_price_per_m'];
+  const OPTIONAL_SETTINGS = ['official_usd_cny', 'default_price_multiplier', 'default_cost_multiplier', 'provider_cost_multipliers', 'official_prices', 'route_costs'];
+  const text = (value, max) => typeof value === 'string' && !!value.trim() && Buffer.byteLength(value) <= max && !/[\u0000-\u001f\u007f-\u009f]/.test(value);
+  const number = value => typeof value === 'number' && Number.isFinite(value);
+  const positive = value => number(value) && value > 0 && value <= 1000;
+  const multiplier = value => number(value) && value > 0 && value <= 100;
+  const usd = value => number(value) && value >= 0 && value <= 10000;
+  const officialRate = settings => settings.official_usd_cny ?? 1;
+  const officialMismatch = (v, o, routeCost) => {
+    const official = OFFICIAL.map(field => o[field]), basis = o.cost_basis_usd_per_m ?? official;
+    if (v.pricing_mode !== 'fixed' || v.currency !== 'CNY' || v.margin_multiplier !== 1 || v.per_call_credit !== 0 || ![...official, ...basis].every(usd) || basis.length !== 4
+      || !official.some(value => value > 0) || !multiplier(o.price_multiplier) || !multiplier(o.cost_multiplier) || !positive(o.usd_cny) || !positive(o.credit_face_value_cny)) return 'Invalid official pricing';
+    if (official.some((value, i) => routeCost ? v[CREDITS[i]] !== 0 : Math.abs(v[CREDITS[i]] - Math.round(value * o.price_multiplier * o.usd_cny / o.credit_face_value_cny * 1000000)) > 1)) return 'Official pricing does not match the credits of';
+    if (basis.some((value, i) => {const expected = value * o.cost_multiplier * o.usd_cny, cost = v[COSTS[i]]; return !(Math.abs(cost - expected) <= Math.max(1e-9 * Math.max(Math.abs(cost), Math.abs(expected)), 1e-12));})) return 'Official pricing does not match the cost of';
+    return '';
+  };
+  // A request field the server cannot deserialize is a 400, as serde reports it.
+  const malformed = message => ({status: 400, body: {success: false, error: message}});
   const publish = body => {
+    if (!text(body.reason, 500)) return refuse('Publication reason required (max 500 bytes)');
+    if (!['groups', 'models', 'rate_cards', 'versions', 'removed_models', 'cancelled_versions'].some(key => (body[key] || []).length) && !body.settings) return refuse('Empty publication');
     if (body.expected_revision !== config.revision) return refuse('Configuration changed; reload before publishing');
-    if (typeof body.reason !== 'string' || !body.reason.trim()) return refuse('Publication reason required (max 500 bytes)');
     const t = Math.floor(Date.now() / 1000);
+    let settings = config.settings, repriced = false;
+    if (body.settings) {
+      const next = body.settings;
+      if (!number(next.credit_face_value_cny) || !number(next.usd_cny_rate)) return malformed('missing field `credit_face_value_cny` or `usd_cny_rate`');
+      if (!positive(next.credit_face_value_cny) || next.credit_face_value_cny < 0.0001 || !positive(next.usd_cny_rate)) return refuse('Face value must be 0.0001-1000 and the exchange rate positive and at most 1000');
+      // Left out, the newer settings keep their value: a console that does not know them never wipes them. Unknown fields are dropped.
+      settings = {credit_face_value_cny: next.credit_face_value_cny, usd_cny_rate: next.usd_cny_rate};
+      for (const field of OPTIONAL_SETTINGS) {const value = next[field] ?? config.settings[field]; if (value != null) settings[field] = value;}
+      if (Object.values(settings.official_prices ?? {}).some(price => !price || OFFICIAL.some(field => !number(price[field])))) return malformed('missing field in official_prices');
+      if (Object.values(settings.route_costs ?? {}).some(cost => !cost || typeof cost !== 'object')) return malformed('invalid type in route_costs');
+      if (settings.official_usd_cny !== undefined && !positive(settings.official_usd_cny)) return refuse('The official dollar rate must be positive and at most 1000');
+      const byProvider = Object.entries(settings.provider_cost_multipliers ?? {});
+      if ([settings.default_price_multiplier, settings.default_cost_multiplier].some(value => value !== undefined && !multiplier(value)) || byProvider.length > 200 || byProvider.some(([id, value]) => !text(id, 128) || !multiplier(value)))
+        return refuse('Multipliers must be positive and at most 100, for at most 200 providers');
+      const prices = Object.entries(settings.official_prices ?? {});
+      if (prices.length > 1000 || prices.some(([name, price]) => !text(name, 256) || !OFFICIAL.every(field => usd(price[field])) || (price.note != null && (typeof price.note !== 'string' || Buffer.byteLength(price.note) > 256 || /[\u0000-\u001f\u007f-\u009f]/.test(price.note)))))
+        return refuse('Official prices: at most 1000, named in 1-256 bytes, priced 0-10000, notes of at most 256 bytes');
+      const routes = Object.entries(settings.route_costs ?? {});
+      if (routes.length > 1000 || routes.some(([route, cost]) => {const cut = route.indexOf('/'); return !text(route, 256) || cut < 1 || cut === route.length - 1 || (cost.cost_multiplier != null && !multiplier(cost.cost_multiplier)) || (cost.basis_usd_per_m != null && !(Array.isArray(cost.basis_usd_per_m) && cost.basis_usd_per_m.length === 4 && cost.basis_usd_per_m.every(usd)));}))
+        return refuse('Route costs: at most 1000, named <provider>/<upstream model> in at most 256 bytes, multipliers positive and at most 100, prices 0-10000');
+      // An official price's time is when its prices last changed; the server stamps it.
+      if (settings.official_prices) settings.official_prices = Object.fromEntries(prices.map(([name, price]) => {
+        const old = config.settings.official_prices?.[name];
+        return [name, {...Object.fromEntries(OFFICIAL.map(field => [field, price[field]])), ...(price.note != null ? {note: price.note} : {}),
+          updated_at_secs: old && OFFICIAL.every(field => old[field] === price[field]) ? old.updated_at_secs : t}];
+      }));
+      if (settings.route_costs) settings.route_costs = Object.fromEntries(routes.map(([route, cost]) => [route, {...(cost.cost_multiplier != null ? {cost_multiplier: cost.cost_multiplier} : {}), ...(cost.basis_usd_per_m != null ? {basis_usd_per_m: cost.basis_usd_per_m} : {})}]));
+      repriced = settings.credit_face_value_cny !== config.settings.credit_face_value_cny || officialRate(settings) !== officialRate(config.settings);
+      settings.rate_updated_at_secs = t;
+    }
     for (const m of body.models || []) for (const id of [m.exposed_model_id, ...(m.aliases || [])]) if (!/^[A-Za-z0-9._:/-]{1,128}$/.test(String(id))) return refuse(`Invalid model ID: ${id}`);
-    // Only the entries in this publication are checked: a shown, unretired one needs its primary target to serve.
-    const stranded = (body.models || []).filter(m => m.visible !== false && m.retired !== true && !serves(m.target_provider_id, m.target_model)).map(m => m.exposed_model_id);
-    if (stranded.length) return refuse(`Visible model target has no enabled compatible key: ${stranded.join(', ')}`);
+    for (const m of body.models || []) {const old = config.models.find(row => row.id === m.id); if (old && old.group_id !== m.group_id) return refuse('Cannot move mapping between groups');}
     const nextModels = [...config.models.filter(row => !(body.models || []).some(next => next.id === row.id)), ...(body.models || [])];
     for (const id of body.removed_models || []) {const m = nextModels.find(row => row.id === id); if (!m || (m.visible !== false && m.retired !== true)) return refuse(`Only hidden or retired mappings can be removed: ${id}`);}
+    const models = nextModels.filter(row => !(body.removed_models || []).includes(row.id));
+    const exposed = new Set();
+    for (const m of models) for (const name of [m.exposed_model_id, ...(m.aliases || [])]) {const key = `${m.group_id}\n${name}`; if (exposed.has(key)) return refuse('Ambiguous model ID or alias'); exposed.add(key);}
+    // Only the entries in this publication are checked: a shown, unretired one needs its primary target to serve.
+    const stranded = [...new Set((body.models || []).filter(m => m.visible !== false && m.retired !== true && models.some(row => row.id === m.id) && !serves(m.target_provider_id, m.target_model)).map(m => m.exposed_model_id))];
+    if (stranded.length) return refuse(`Visible model target has no enabled compatible key: ${stranded.join(', ')}`);
+    // A scheduled price is withdrawn before this publication's prices, which may replace it.
     for (const id of body.cancelled_versions || []) {const v = config.versions.find(row => row.id === id); if (!v || v.effective_from_secs <= t) return refuse(`Only scheduled prices can be cancelled: ${id}`);}
-    // 0 is "now", only for a model the rate card has no version of yet; otherwise nothing may start in the past.
-    const versions = [];
+    let versions = config.versions.filter(row => !(body.cancelled_versions || []).includes(row.id));
+    const priced = new Set(versions.map(row => `${row.rate_card_id}\n${row.model}`)), added = new Set();
     for (const v of body.versions || []) {
-      const first = !config.versions.some(row => row.rate_card_id === v.rate_card_id && row.model === v.model);
-      if (v.effective_from_secs === 0 ? !first : !(v.effective_from_secs >= t)) return refuse('Invalid pricing; retroactive publication forbidden');
-      const at = v.effective_from_secs === 0 ? t : v.effective_from_secs;
-      if ([...config.versions, ...versions].some(row => row.id === v.id || (row.rate_card_id === v.rate_card_id && row.model === v.model && row.effective_from_secs === at))) return refuse('Published prices immutable; use new ID and timestamp');
-      versions.push({...v, effective_from_secs: at});
+      const fields = ['id', 'rate_card_id', 'model', 'currency', 'pricing_mode', ...COSTS, ...CREDITS, 'per_call_credit', 'margin_multiplier', 'effective_from_secs'];
+      const missing = [...fields.filter(field => v[field] === undefined || v[field] === null),
+        ...(v.official ? [...OFFICIAL, 'price_multiplier', 'cost_multiplier', 'usd_cny', 'credit_face_value_cny'].filter(field => !number(v.official[field])) : [])][0];
+      if (missing) return malformed(`missing field \`${missing}\``);
+      if (v.official?.cost_basis_usd_per_m != null && !(Array.isArray(v.official.cost_basis_usd_per_m) && v.official.cost_basis_usd_per_m.length === 4 && v.official.cost_basis_usd_per_m.every(number))) return malformed('invalid length for `cost_basis_usd_per_m`');
+      if (!text(v.id, 128) || !text(v.model, 256) || !positive(v.margin_multiplier) || !COSTS.every(field => number(v[field]) && v[field] >= 0 && v[field] <= 1000000)
+        || ![...CREDITS, 'per_call_credit'].every(field => Number.isSafeInteger(v[field]) && v[field] >= 0 && v[field] <= 1000000000000) || !config.rate_cards.some(card => card.id === v.rate_card_id))
+        return refuse('Invalid pricing; retroactive publication forbidden');
+      if (v.official) {
+        // `<provider>/<upstream model>`: what that route costs, charging nothing.
+        const routeCost = providers.some(p => v.model.startsWith(`${p.id}/`));
+        const problem = officialMismatch(v, v.official, routeCost);
+        if (problem) return refuse(`${problem}: ${v.model}`);
+      }
+      let at = v.effective_from_secs;
+      if (at < t) {
+        // A model's first price may start now, and so may an official one when this publication changes what it is computed at.
+        if (priced.has(`${v.rate_card_id}\n${v.model}`) && !(repriced && v.official)) return refuse('Invalid pricing; retroactive publication forbidden');
+        at = t;
+      }
+      if (versions.some(row => row.id === v.id || (row.rate_card_id === v.rate_card_id && row.model === v.model && row.effective_from_secs === at))) return refuse('Published prices immutable; use new ID and timestamp');
+      versions = [...versions, {...v, effective_from_secs: at}];
+      added.add(v.id);
     }
-    if (body.settings) config.settings = {...body.settings, rate_updated_at_secs: now + 1};
-    config.versions = [...config.versions.filter(row => !(body.cancelled_versions || []).includes(row.id)), ...versions];
-    if (body.groups) config.groups = [...config.groups.filter(row => !body.groups.some(next => next.id === row.id)), ...body.groups];
-    config.models = nextModels.filter(row => !(body.removed_models || []).includes(row.id));
+    // Every official price in force or scheduled is at the face value and rate in force: those this publication adds, and after it changes either, all of them.
+    const live = v => v.effective_from_secs > t || !versions.some(w => w.rate_card_id === v.rate_card_id && w.model === v.model && w.effective_from_secs > v.effective_from_secs && w.effective_from_secs <= t);
+    const stale = [...new Set(versions.filter(v => live(v) && v.official && (repriced || added.has(v.id)) && (v.official.credit_face_value_cny !== settings.credit_face_value_cny || v.official.usd_cny !== officialRate(settings))).map(v => v.model))];
+    if (stale.length) return refuse(`Official pricing is at a stale face value or rate: ${stale.join(', ')}`);
+    const groupsAfter = body.groups ? [...config.groups.filter(row => !body.groups.some(next => next.id === row.id)), ...body.groups] : config.groups;
+    const most = values => values.reduce((max, value) => Math.max(max, Number(value ?? 1)), 1);
+    if (most(versions.filter(live).map(v => v.margin_multiplier)) * most(groupsAfter.map(g => g.margin_multiplier)) * most(models.map(m => m.credit_multiplier)) > 100) return refuse('Margins and model multipliers combine to more than 100x');
+    config.settings = settings;
+    config.versions = versions;
+    if (body.rate_cards) config.rate_cards = [...config.rate_cards.filter(row => !body.rate_cards.some(next => next.id === row.id)), ...body.rate_cards];
+    config.groups = groupsAfter;
+    config.models = models;
     config.revision = `fixture-rev-${Number(config.revision.split('-').pop()) + 1}`;
     return {status: 200, body: {success: true, config}};
   };
   let authenticated = false, deadline = 0, loginAt = 0;
   const IDLE = 1800, MAX = 8 * 3600;
   const nowSecs = () => Math.floor(Date.now() / 1000);
-  return {writes, traces, providers, keys, config, expire() {authenticated=false;}, get sessionDeadline() {return deadline;}, async handle(req,res) {
+  return {writes, traces, providers, keys, config, publish, expire() {authenticated=false;}, get sessionDeadline() {return deadline;}, async handle(req,res) {
     const url = new URL(req.url, 'http://127.0.0.1');
     const endpoint = url.pathname.replace('/api/v1/admin/', '');
     const reply = (value, status=200) => {res.writeHead(status, {'Content-Type':'application/json'}); res.end(JSON.stringify(value));};
@@ -146,7 +229,7 @@ module.exports = function fixtureApi() {
     if(endpoint==='traces/content') {const record=traceContent(url.searchParams.get('invocation_id'));return record?reply(record):reply({__type:'ResourceNotFoundException',message:'没有这次请求的内容（只保留 24 小时）'},404);}
     if(endpoint==='commercial-config') {
       if(req.method==='POST') {
-        if(body.settings){assert.deepEqual(Object.keys(body).sort(),['expected_revision','reason','settings']);assert.deepEqual(Object.keys(body.settings).sort(),['credit_face_value_cny','usd_cny_rate']);}
+        // CommercialUpdate denies unknown fields.
         assert.ok(Object.keys(body).every(key=>['expected_revision','reason','settings','groups','models','rate_cards','versions','removed_models','cancelled_versions'].includes(key)));
         const result=publish(body);return reply(result.body,result.status);
       }
