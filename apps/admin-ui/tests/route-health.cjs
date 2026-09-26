@@ -3,7 +3,9 @@ const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
 const http=require('node:http'),fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
 const fixture=require('./fixture-api.cjs')();
 const root=path.resolve(__dirname,'../dist');
+const diagRequests=[],diagConsole=[],t0=Date.now();
 const server=http.createServer(async(req,res)=>{
+  if(req.url.startsWith('/api/'))diagRequests.push([Date.now()-t0,req.method,req.url]);
   try{
     if(req.url.startsWith('/api/'))return await fixture.handle(req,res);
     const file=path.resolve(root,decodeURIComponent(req.url.split('?')[0]).replace(/^\/admin\/?/,'')||'index.html');
@@ -23,7 +25,6 @@ const writes=endpoint=>fixture.writes.filter(write=>write.endpoint===endpoint);
     page.setDefaultTimeout(10000);
     const origin=`http://127.0.0.1:${server.address().port}`;
     page.on('pageerror',error=>{errors.push(error.message);console.error('Browser error:',error.message);});
-    const diagRequests=[],diagConsole=[],t0=Date.now();page.on('request',r=>{if(r.url().includes('/api/'))diagRequests.push([Date.now()-t0,r.method(),r.url().replace(origin,'')]);});page.on('console',m=>diagConsole.push([Date.now()-t0,m.type(),m.text().slice(0,200)]));
     const nativeDialogs=[];page.on('dialog',dialog=>{nativeDialogs.push(dialog.message());void dialog.dismiss();});
     await page.route('**/*',route=>new URL(route.request().url()).origin===origin?route.continue():route.abort());
     const button=name=>page.getByRole('button',{name,exact:true});
