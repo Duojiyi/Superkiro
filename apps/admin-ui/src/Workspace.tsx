@@ -112,8 +112,11 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
   const [topbarSlot, setTopbarSlot] = useState<HTMLElement | null>(null);
   const [keyEditing, setKeyEditing] = useState<KeyEditing | null>(null);
 
+  // Refreshes can overlap; only the latest may write, so a slow older one never undoes newer data.
+  const refreshSeq = useRef(0);
   const refreshData = useCallback(async (options: RefreshOptions = {}) => {
     if (!mounted.current) return;
+    const seq = ++refreshSeq.current;
     if (!options.keepSelection) setSelectionEpoch(value => value + 1);
     setLoading(true);
     const errors: Array<{section: Section; message: string}> = [];
@@ -131,7 +134,7 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
         adminApi.getProviders().catch(failed('providers')),
         adminApi.getCommercialConfig().catch(failed('config')),
       ]);
-      if (!mounted.current) return;
+      if (!mounted.current || seq !== refreshSeq.current) return;
       const unavailable: Failures = {
         stats: stats?.success !== true, cards: cards?.success !== true, announcements: notices?.success !== true,
         financials: financials?.success !== true, traces: traces?.success !== true, providers: providers?.success !== true,
@@ -161,9 +164,9 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
       if (providers?.success) setProvidersLoaded(true);
     } catch (error) {
       console.error('Failed to load admin data:', error);
-      if (mounted.current) setLoadErrors([{section: '全部', message: error instanceof Error ? error.message : String(error), stale: true}]);
+      if (mounted.current && seq === refreshSeq.current) setLoadErrors([{section: '全部', message: error instanceof Error ? error.message : String(error), stale: true}]);
     } finally {
-      if (mounted.current) setLoading(false);
+      if (mounted.current && seq === refreshSeq.current) setLoading(false);
     }
   }, []);
 
