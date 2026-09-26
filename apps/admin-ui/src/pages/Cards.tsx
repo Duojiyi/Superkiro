@@ -10,10 +10,11 @@ import {isModalOpen, Modal} from '../components/modal';
 import {toast} from '../components/toast';
 import {FilterTabs, IdCell, Pager, StatusBadge, TableState, Tag, TopbarActions, type TabOption} from '../components/ui';
 import {formatBatchNote, formatCount, formatCredits, formatFullDateTime, formatMoney, formatRemaining, shortId} from '../format';
+import {cardCodeOf, cardIdForCode} from '../cardCode';
 import {adjustmentPointsToMicro} from '../pricing';
 import {cardStatusView} from '../status';
 import CardDrawer from './CardDrawer';
-import type {CardQuickFilter, CardTab, ErrorAction, Refresh, ReportError, Row, WriteGuards} from '../types';
+import type {CardQuickFilter, CardTab, ErrorAction, Intent, Refresh, ReportError, ReportRoute, Row, WriteGuards} from '../types';
 
 const TIERS = [
   {id: 'tier-1000', name: 'PRO', points: 1000, price_cny: 30},
@@ -112,7 +113,7 @@ function Devices({card}: {card: AdminCardItem}) {
 
 interface Generated {cards: GeneratedCard[]; tier: string; points: number; groupName: string}
 
-export default function CardsPage({cards, groups, configFailed, loading, failed, operator, refresh, guards, reportError, actionError, onBusyChange, onReauthenticate, selectionEpoch, intent, updateCards, onOpenTrace}: {
+export default function CardsPage({cards, groups, configFailed, loading, failed, operator, refresh, guards, reportError, actionError, onBusyChange, onReauthenticate, selectionEpoch, intent, intentRevision = 0, onRoute, updateCards, onOpenTrace}: {
   cards: AdminCardItem[];
   groups: Row[];
   configFailed: boolean;
@@ -126,7 +127,10 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
   onBusyChange: (busy: boolean) => void;
   onReauthenticate: () => void;
   selectionEpoch: number;
-  intent?: {status?: CardTab; quick?: CardQuickFilter; search?: string};
+  intent?: Intent['cards'];
+  /** Changes when Back or Forward brings the page to another `intent`. */
+  intentRevision?: number;
+  onRoute?: ReportRoute;
   updateCards: (cards: AdminCardItem[]) => void;
   /** Opens 调用追踪 for one card, with one request's details open when given. */
   onOpenTrace: (cardId: string, traceId?: string) => void;
@@ -140,7 +144,7 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
   const [statusTab, setStatusTab] = useState<CardTab>(intent?.status ?? 'CURRENT');
   const [quick, setQuick] = useState<CardQuickFilter | null>(intent?.quick ?? null);
   const [search, setSearch] = useState(intent?.search ?? '');
-  const [groupFilter, setGroupFilter] = useState('ALL');
+  const [groupFilter, setGroupFilter] = useState(intent?.group ?? 'ALL');
   const [sort, setSort] = useState<{key: 'balance' | 'expiry'; direction: 1 | -1} | null>(null);
   const [page, setPage] = useState(0);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
@@ -217,8 +221,43 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
   const pageCardIds = JSON.stringify(pageCards.map(card => card.id));
 
   // ---- Card details: a row click opens them; ↑/↓ move through the rows in view ----
-  const [detailId, setDetailId] = useState<string | null>(null);
+  const [detailId, setDetailId] = useState<string | null>(intent?.open ?? null);
   const detailCard = detailId ? cards.find(card => card.id === detailId) ?? null : null;
+  // A card the address names that the list does not have (any more): its details stay closed.
+  useEffect(() => {if (detailId && !detailCard && !loading && !failed) setDetailId(null);}, [detailId, detailCard, loading, failed]);
+
+  // ---- The address: Back and Forward bring the filters and details they name; changes are reported ----
+  const appliedRevision = useRef(intentRevision);
+  useEffect(() => {
+    if (intentRevision === appliedRevision.current) return;
+    appliedRevision.current = intentRevision;
+    setStatusTab(intent?.status ?? 'CURRENT'); setQuick(intent?.quick ?? null); setSearch(intent?.search ?? '');
+    setGroupFilter(intent?.group ?? 'ALL'); setDetailId(intent?.open ?? null);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [intentRevision]);
+  useEffect(() => {onRoute?.({cards: {status: statusTab, quick: quick ?? undefined, search, group: groupFilter, open: detailId ?? undefined}});},
+    [onRoute, statusTab, quick, search, groupFilter, detailId]);
+
+  // ---- A card code in the search box: its card ID takes its place once known, and the card opens ----
+  const [codeLookup, setCodeLookup] = useState<{cardId: string} | {error: string} | null>(null);
+  const lookup = useRef(0);
+  const changeSearch = (text: string) => {
+    const code = cardCodeOf(text), attempt = ++lookup.current;
+    setCodeLookup(null);
+    if (!code) {setSearch(text); return;}
+    // The code itself is never shown, sent or kept.
+    setSearch('');
+    cardIdForCode(code).then(cardId => {
+      if (!alive.current || attempt !== lookup.current) return;
+      const card = cards.find(item => item.id === cardId);
+      setSearch(cardId); setCodeLookup({cardId}); setQuick(null); setGroupFilter('ALL');
+      setStatusTab(tab => card && matchesTab(card, tab) ? tab : 'ALL');
+      // Opened now if the card is known, or once the list arrives if it is still loading.
+      if (card || loading) setDetailId(cardId);
+    }, () => {if (alive.current && attempt === lookup.current) setCodeLookup({error: '这个浏览器不能在本机算出卡密 ID（控制台要用 HTTPS 打开）：请改用卡密 ID 搜索'});});
+  };
+  const codeNote = !codeLookup ? null : 'error' in codeLookup ? codeLookup.error : search !== codeLookup.cardId ? null
+    : cards.some(card => card.id === codeLookup.cardId) ? '按卡密找到 1 张' : loading ? '正在按卡密查找…' : `按卡密没有找到：没有卡密 ID 为 ${codeLookup.cardId} 的卡`;
   const detailIndex = detailId ? filtered.findIndex(card => card.id === detailId) : -1;
   const moveDetail = (step: number) => {
     const next = detailIndex >= 0 ? filtered[detailIndex + step] : undefined;
@@ -252,7 +291,7 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
     setSelectedIds(ids => ids.filter(id => visible.includes(id)));
   }, [pageCardIds]);
   const filtersActive = !!search.trim() || groupFilter !== 'ALL' || statusTab !== 'CURRENT' || !!quick;
-  const resetFilters = () => {setSelectedIds([]); setSearch(''); setGroupFilter('ALL'); setStatusTab('CURRENT'); setQuick(null); setPage(0);};
+  const resetFilters = () => {setSelectedIds([]); setSearch(''); setCodeLookup(null); setGroupFilter('ALL'); setStatusTab('CURRENT'); setQuick(null); setPage(0);};
 
   const tabCount = (tab: CardTab) => scoped.filter(card => matchesTab(card, tab)).length;
   const tabs: TabOption<CardTab>[] = ([
@@ -646,7 +685,7 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
     <div className="toolbar">
       <div className="filter-bar" role="search" aria-label="卡密筛选">
         <label className="search-field"><IconSearch/>
-          <input type="text" aria-label="搜索卡密" placeholder="卡密 ID、备注或设备 ID" value={search} disabled={bulkBusy} onChange={event => setSearch(event.target.value)}/>
+          <input type="text" aria-label="搜索卡密" placeholder="卡密原文、卡密 ID、备注或设备 ID" value={search} disabled={bulkBusy} onChange={event => changeSearch(event.target.value)}/>
         </label>
         <label className="inline-field"><span>分组</span>
           <select aria-label="分组筛选" value={groupFilter} disabled={bulkBusy} onChange={event => setGroupFilter(event.target.value)}>
@@ -666,7 +705,9 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
       <FilterTabs label="状态筛选" value={statusTab} options={tabs} onChange={setStatusTab} disabled={bulkBusy}/>
     </div>
 
-    {filtersActive && filtered.length > 0 && <p className="filter-summary">筛选出 {formatCount(filtered.length)} 张{failed ? '（可能不是最新）' : ''}
+    {codeNote && <p className="filter-summary" role="status">{codeNote}
+      {filtersActive && <button type="button" className="btn-text" disabled={bulkBusy} onClick={resetFilters}>清除筛选</button>}</p>}
+    {!codeNote && filtersActive && filtered.length > 0 && <p className="filter-summary">筛选出 {formatCount(filtered.length)} 张{failed ? '（可能不是最新）' : ''}
       <button type="button" className="btn-text" disabled={bulkBusy} onClick={resetFilters}>清除筛选</button></p>}
 
     {someSelected && <div className="selection-bar" role="region" aria-label="批量卡密管理">

@@ -1,7 +1,7 @@
 // 供应商与 Key: each provider with an on/off switch and its keys, each Key's live health and last
 // error (恢复 puts a cooling or failing Key back to work); the key editor opens only when a key
 // is being edited or added.
-import {useEffect, useState, type MutableRefObject} from 'react';
+import {useEffect, useRef, useState, type MutableRefObject} from 'react';
 import {adminApi} from '../api';
 import {ask, confirmAction} from '../components/confirm';
 import {toast} from '../components/toast';
@@ -11,9 +11,12 @@ import ProviderKeyEditor from '../ProviderKeyEditor';
 import {explainRefusal, isRefusal, type PublishOutcome} from '../refusal';
 import {lossFacts, modelName, nameList, routeLosses} from '../routes';
 import {failureLabel, keyAlert, keyStatusView, providerFormatLabel} from '../status';
-import type {Refresh, ReportError, Row, WriteGuards} from '../types';
+import type {Intent, Refresh, ReportError, ReportRoute, Row, WriteGuards} from '../types';
 
-/** Which key the editor shows: none, a new provider, a new key of a provider, or an existing key. */
+/**
+ * Which key the editor shows: none, a new provider, a new key of a provider, or an existing key
+ * (from an address, first only its ID: the provider is found once the Keys are loaded).
+ */
 export interface KeyEditing {providerId?: string; keyId?: string; suggestedKeyId?: string}
 
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
@@ -28,7 +31,7 @@ function ModelTags({models}: {models: unknown}) {
   </span>;
 }
 
-export default function ProvidersPage({providers, providerKeys, models, groups = [], loading, failed, refresh, guards, reportError, editing, setEditing, providerDirty, editorBusy, onDirtyChange, onBusyChange, mergeKey, onListModel, onHideModels}: {
+export default function ProvidersPage({providers, providerKeys, models, groups = [], loading, failed, refresh, guards, reportError, editing, setEditing, providerDirty, editorBusy, onDirtyChange, onBusyChange, mergeKey, onListModel, onHideModels, intent, intentRevision = 0, onRoute}: {
   providers: Row[];
   providerKeys: Row[];
   models: Row[];
@@ -49,6 +52,10 @@ export default function ProvidersPage({providers, providerKeys, models, groups =
   onListModel?: (providerId: string, model: string) => void;
   /** 同时隐藏这些模型: publishes these models hidden, before the change that leaves them without a route. */
   onHideModels?: (models: Row[], reason: string) => Promise<PublishOutcome>;
+  intent?: Intent['providers'];
+  /** Changes when Back or Forward brings the page to another `intent`. */
+  intentRevision?: number;
+  onRoute?: ReportRoute;
 }) {
   const {writing} = guards;
   const [switching, setSwitching] = useState<string | null>(null);
@@ -57,6 +64,34 @@ export default function ProvidersPage({providers, providerKeys, models, groups =
   const nowSecs = Date.now() / 1000;
   useEffect(() => {if (scrollToken) document.getElementById('key-editor')?.scrollIntoView({behavior: 'smooth', block: 'start'});}, [scrollToken]);
 
+  // A link names a provider or a Key (运营概览's 需要关注): it is scrolled into view and marked
+  // until the operator turns to something else.
+  const [pointed, setPointed] = useState<{provider?: string; key?: string}>({provider: intent?.provider, key: intent?.key});
+  const appliedRevision = useRef(intentRevision);
+  useEffect(() => {
+    if (intentRevision === appliedRevision.current) return;
+    appliedRevision.current = intentRevision;
+    setPointed({provider: intent?.provider, key: intent?.key});
+    setEditing(intent?.edit ? {keyId: intent.edit} : null);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [intentRevision]);
+  const scrolledTo = useRef('');
+  useEffect(() => {
+    const target = pointed.key ? `[data-key-id="${CSS.escape(pointed.key)}"]` : pointed.provider ? `[data-provider-id="${CSS.escape(pointed.provider)}"]` : '';
+    const element = target ? document.querySelector(target) : null;
+    if (!element || scrolledTo.current === target) return;
+    scrolledTo.current = target;
+    element.scrollIntoView({block: 'center'});
+  }, [pointed, providers, providerKeys]);
+  // An editor opened from an address knows only the Key's ID; its provider comes with the Keys.
+  useEffect(() => {
+    if (!editing?.keyId || editing.providerId) return;
+    const key = providerKeys.find(item => item.id === editing.keyId);
+    if (key) setEditing({providerId: String(key.provider_id), keyId: editing.keyId});
+    else if (!loading && !failed) setEditing(null);
+  }, [editing, providerKeys, loading, failed, setEditing]);
+  useEffect(() => {onRoute?.({providers: {...pointed, edit: editing?.keyId}});}, [onRoute, pointed, editing]);
+
   const edit = async (target: KeyEditing | null) => {
     const same = !!target && !!editing && target.providerId === editing.providerId && target.keyId === editing.keyId;
     if (!same) {
@@ -64,6 +99,7 @@ export default function ProvidersPage({providers, providerKeys, models, groups =
       if (providerDirty.current && !(await confirmAction({title: '有未保存的修改，确定离开？', consequence: 'Key 的修改还没有保存。', confirmLabel: '放弃修改'}))) return;
       providerDirty.current = false;
       setEditing(target);
+      setPointed({});
     }
     if (target) setScrollToken(token => token + 1);
   };
@@ -149,7 +185,7 @@ export default function ProvidersPage({providers, providerKeys, models, groups =
       const id = String(provider.id);
       const keys = providerKeys.filter(key => key.provider_id === id);
       const enabled = provider.enabled !== false;
-      return <section key={id} className="panel provider-card">
+      return <section key={id} className={`panel provider-card${pointed.provider === id ? ' is-pointed' : ''}`} data-provider-id={id}>
         <div className="provider-head">
           <div className="provider-name">
             <h3>{String(provider.name || id)}</h3>
@@ -164,7 +200,7 @@ export default function ProvidersPage({providers, providerKeys, models, groups =
           <thead><tr><th className="col-key">Key</th><th>模型</th><th className="num col-weight">权重</th><th className="col-status">状态</th><th>最近错误</th><th className="col-actions"><span className="sr-only">操作</span></th></tr></thead>
           <tbody>{keys.map(key => {
             const active = editing?.providerId === id && editing?.keyId === key.id;
-            return <tr key={String(key.id)} className={active ? 'is-selected' : undefined}>
+            return <tr key={String(key.id)} data-key-id={String(key.id)} className={[active && 'is-selected', pointed.key === key.id && 'is-pointed'].filter(Boolean).join(' ') || undefined}>
               <td className="mono nowrap col-key" title={String(key.id)}>{String(key.id)}</td>
               <td><ModelTags models={key.allowed_models}/></td>
               <td className="num">{String(key.weight ?? 1)}</td>
@@ -187,7 +223,7 @@ export default function ProvidersPage({providers, providerKeys, models, groups =
     {!providers.length && <section className="panel"><ListState loading={loading} failed={failed} empty="还没有供应商" onRetry={() => void refresh()}
       action={<button type="button" className="btn btn-small" onClick={() => void edit({})}>添加供应商</button>}/></section>}
 
-    {editing && <ProviderKeyEditor key={`${editing.providerId ?? 'new'}:${editing.keyId ?? 'new'}`} selectedKey={selectedKey} preset={editing}
+    {editing && (editing.providerId || !editing.keyId) && <ProviderKeyEditor key={`${editing.providerId ?? 'new'}:${editing.keyId ?? 'new'}`} selectedKey={selectedKey} preset={editing}
       knownModels={models.filter(model => model.target_provider_id === editing.providerId).map(model => String(model.target_model ?? '')).filter(Boolean)}
       modelsKnown={models.length > 0} onListModel={onListModel} knownProviders={providers.map(provider => String(provider.id))}
       routes={{models, groups, providers, keys: providerKeys}} onHideModels={onHideModels}

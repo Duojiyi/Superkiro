@@ -9,8 +9,9 @@ import {Drawer, isModalOpen} from '../components/modal';
 import {toast} from '../components/toast';
 import {FilterTabs, IdCell, Pager, StatusBadge, TableState, TopbarActions, copyText, type TabOption} from '../components/ui';
 import {formatCharge, formatClock, formatCount, formatDateTime, formatDuration, formatFullDateTime, formatListTime, formatMoney, formatRelative, formatShortDate, formatSpeed, formatTokenCount} from '../format';
+import {cardCodeOf, cardIdForCode} from '../cardCode';
 import {errorClassLabel, TRACE_IN_PROGRESS, traceStatusView} from '../status';
-import type {Refresh, ReportError, TraceTab, TraceWindow, WriteGuards} from '../types';
+import type {Intent, Refresh, ReportError, ReportRoute, TraceTab, TraceWindow, WriteGuards} from '../types';
 import {ConversationView, RawView, ReplyView} from './TraceContent';
 
 const PAGE_SIZE = 50;
@@ -23,7 +24,7 @@ const statusMatches = (trace: AdminTrace, tab: TraceTab) =>
 const ttftTone = (ms: unknown) => typeof ms === 'number' ? (ms > 15000 ? 'is-danger' : ms > 5000 ? 'is-warning' : '') : '';
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
-export default function TracesPage({traces, cards, loading, failed, refresh, guards, reportError, intent, onOpenCard}: {
+export default function TracesPage({traces, cards, loading, failed, refresh, guards, reportError, intent, intentRevision = 0, onRoute, onOpenCard}: {
   traces: AdminTrace[];
   cards: AdminCardItem[];
   loading: boolean;
@@ -31,7 +32,10 @@ export default function TracesPage({traces, cards, loading, failed, refresh, gua
   refresh: Refresh;
   guards: WriteGuards;
   reportError: ReportError;
-  intent?: {status?: TraceTab; window?: TraceWindow; search?: string; open?: string};
+  intent?: Intent['traces'];
+  /** Changes when Back or Forward brings the page to another `intent`. */
+  intentRevision?: number;
+  onRoute?: ReportRoute;
   onOpenCard: (cardId: string) => void;
 }) {
   const {writing} = guards;
@@ -40,10 +44,10 @@ export default function TracesPage({traces, cards, loading, failed, refresh, gua
   // Arriving from a card's details: that card's requests, with the one clicked already open.
   const [query, setQuery] = useState(intent?.search ?? '');
   const [status, setStatus] = useState<TraceTab>(intent?.status ?? 'ALL');
-  const [model, setModel] = useState('ALL');
-  const [provider, setProvider] = useState('ALL');
+  const [model, setModel] = useState(intent?.model ?? 'ALL');
+  const [provider, setProvider] = useState(intent?.provider ?? 'ALL');
   // Under 失败: one failure reason at a time.
-  const [reason, setReason] = useState<string | null>(null);
+  const [reason, setReason] = useState<string | null>(intent?.reason ?? null);
   const [range, setRange] = useState<TraceWindow>(intent?.window ?? 'all');
   const [sort, setSort] = useState<{key: SortKey; direction: 1 | -1}>({key: 'time', direction: -1});
   const [page, setPage] = useState(0);
@@ -73,6 +77,33 @@ export default function TracesPage({traces, cards, loading, failed, refresh, gua
   useEffect(() => {setPage(0);}, [query, status, model, provider, reason, range, sort]);
   useEffect(() => {if (status !== 'error') setReason(null);}, [status]);
 
+  // The address: Back and Forward bring the filters and details they name; changes are reported.
+  const appliedRevision = useRef(intentRevision);
+  useEffect(() => {
+    if (intentRevision === appliedRevision.current) return;
+    appliedRevision.current = intentRevision;
+    setQuery(intent?.search ?? ''); setStatus(intent?.status ?? 'ALL'); setModel(intent?.model ?? 'ALL'); setProvider(intent?.provider ?? 'ALL');
+    setReason(intent?.reason ?? null); setRange(intent?.window ?? 'all'); setSelectedId(intent?.open ?? null);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [intentRevision]);
+  useEffect(() => {onRoute?.({traces: {status, window: range, search: query, card: exactCard ?? undefined, reason: reason ?? undefined, model, provider, open: selectedId ?? undefined}});},
+    [onRoute, status, range, query, exactCard, reason, model, provider, selectedId]);
+
+  // A card code in the search box: its card ID takes its place once known.
+  const [codeLookup, setCodeLookup] = useState<{cardId: string} | {error: string} | null>(null);
+  const lookup = useRef(0);
+  const changeQuery = (text: string) => {
+    const code = cardCodeOf(text), attempt = ++lookup.current;
+    setCodeLookup(null);
+    if (!code) {setQuery(text); return;}
+    // The code itself is never shown, sent or kept.
+    setQuery('');
+    cardIdForCode(code).then(cardId => {if (alive.current && attempt === lookup.current) {setQuery(cardId); setCodeLookup({cardId});}},
+      () => {if (alive.current && attempt === lookup.current) setCodeLookup({error: '这个浏览器不能在本机算出卡密 ID（控制台要用 HTTPS 打开）：请改用卡密 ID 搜索'});});
+  };
+  const codeNote = !codeLookup ? null : 'error' in codeLookup ? codeLookup.error : query !== codeLookup.cardId ? null
+    : cards.some(card => card.id === codeLookup.cardId) ? '按卡密找到 1 张' : loading ? '正在按卡密查找…' : `按卡密没有找到：没有卡密 ID 为 ${codeLookup.cardId} 的卡`;
+
   const nowSecs = Date.now() / 1000;
   const text = query.trim().toLowerCase();
   const scoped = source.filter(trace =>
@@ -100,7 +131,7 @@ export default function TracesPage({traces, cards, loading, failed, refresh, gua
   const selectedIndex = selectedId ? filtered.findIndex(trace => trace.id === selectedId) : -1;
   const selected = selectedIndex >= 0 ? filtered[selectedIndex] : selectedId ? source.find(trace => trace.id === selectedId) ?? null : null;
   const filtersActive = !!text || status !== 'ALL' || model !== 'ALL' || provider !== 'ALL' || reason !== null || range !== 'all';
-  const resetFilters = () => {setQuery(''); setStatus('ALL'); setModel('ALL'); setProvider('ALL'); setReason(null); setRange('all'); setPage(0);};
+  const resetFilters = () => {setQuery(''); setCodeLookup(null); setStatus('ALL'); setModel('ALL'); setProvider('ALL'); setReason(null); setRange('all'); setPage(0);};
   const providers = Array.from(new Set(source.map(trace => String(trace.provider_id ?? '')).filter(Boolean))).sort();
   const models = Array.from(new Set(source.map(trace => String(trace.exposed_model ?? '')).filter(Boolean))).sort();
   const oldest = source.length ? Math.min(...source.map(trace => Number(trace.ts))) : null;
@@ -166,7 +197,7 @@ export default function TracesPage({traces, cards, loading, failed, refresh, gua
     <div className="toolbar">
       <div className="filter-bar" role="search" aria-label="追踪筛选">
         <label className="search-field"><IconSearch/>
-          <input type="text" aria-label="搜索调用记录" placeholder="卡密 ID 或请求 ID" value={query} onChange={event => setQuery(event.target.value)}/>
+          <input type="text" aria-label="搜索调用记录" placeholder="卡密原文、卡密 ID 或请求 ID" value={query} onChange={event => changeQuery(event.target.value)}/>
         </label>
         <label className="inline-field"><span>模型</span>
           <select aria-label="模型筛选" value={model} onChange={event => setModel(event.target.value)}>
@@ -193,6 +224,7 @@ export default function TracesPage({traces, cards, loading, failed, refresh, gua
     </div>
 
     <p className="filter-summary">
+      {codeNote && <span role="status">{codeNote} · </span>}
       {scopedToCard ? `这张卡最近 ${formatCount(source.length)} 次请求` : `最近 ${formatCount(source.length)} 次请求${oldest ? `（${formatShortDate(oldest)} ${formatClock(oldest)} 起）` : ''}`}
       {cardScope?.failed && <span className="is-warning"> · 没能按这张卡查询，显示的是最近的请求</span>}
       {filtersActive && <> · 匹配 {formatCount(filtered.length)} 条{filtered.length > 0 && <button type="button" className="btn-text" onClick={resetFilters}>清除筛选</button>}</>}

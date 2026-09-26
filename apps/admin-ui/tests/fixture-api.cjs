@@ -105,7 +105,7 @@ module.exports = function fixtureApi() {
   let authenticated = false, deadline = 0, loginAt = 0;
   const IDLE = 1800, MAX = 8 * 3600;
   const nowSecs = () => Math.floor(Date.now() / 1000);
-  return {writes, traces, providers, keys, config, expire() {authenticated=false;}, get sessionDeadline() {return deadline;}, async handle(req,res) {
+  return {writes, cards, traces, providers, keys, config, expire() {authenticated=false;}, get sessionDeadline() {return deadline;}, async handle(req,res) {
     const url = new URL(req.url, 'http://127.0.0.1');
     const endpoint = url.pathname.replace('/api/v1/admin/', '');
     const reply = (value, status=200) => {res.writeHead(status, {'Content-Type':'application/json'}); res.end(JSON.stringify(value));};

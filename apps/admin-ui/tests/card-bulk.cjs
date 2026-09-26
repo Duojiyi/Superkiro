@@ -169,6 +169,9 @@ const server=http.createServer(async(req,res)=>{
     await page.evaluate(intent=>sessionStorage.setItem('superkiro.pending-adjustment.v1:admin',JSON.stringify(intent)),pendingAdjustment);
     // The server names the operator, so the reload needs no second sign-in to find the intent.
     await page.reload();await page.getByRole('navigation').getByRole('button',{name:'卡密资产',exact:true}).click();
+    // The reload keeps the page and its filters (全部); 当前 no longer lists a voided card.
+    assert.equal(await page.getByRole('tablist',{name:'状态筛选'}).locator('[aria-selected="true"]').getAttribute('data-value'),'ALL');
+    await statusTab('CURRENT');
     await check(5).check();
     assert(await barButton('永久作废').isVisible());
     const beforePendingVoid=statusCalls.length;

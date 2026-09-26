@@ -16,6 +16,7 @@ import ProvidersPage, {type KeyEditing} from './pages/Providers';
 import SecurityPage from './pages/Security';
 import TracesPage from './pages/Traces';
 import {publishFailure, type PublishOutcome} from './refusal';
+import {intentOf, OPEN_PARAM, parseRoute, routeHash, routeOf, type Route} from './route';
 import {brokenRoutes, modelName} from './routes';
 import {keyAlert} from './status';
 import type {ErrorAction, Intent, RefreshOptions, Row, Tab} from './types';
@@ -27,6 +28,7 @@ const NAV: Array<{group: string; items: Array<{id: Tab; label: string}>}> = [
 ];
 const TITLES = Object.fromEntries(NAV.flatMap(group => group.items.map(item => [item.id, item.label]))) as Record<Tab, string>;
 const WIDE_PAGES: Tab[] = ['cards', 'traces'];
+const DOCUMENT_TITLE = 'Superkiro · 管理工作台';
 
 export interface WorkspaceData {
   stats: AdminStats | null;
@@ -86,8 +88,17 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
   const writing = useRef(false);
   const guards = {writing, mounted};
 
-  const [activeTab, setActiveTab] = useState<Tab>('overview');
-  const [intent, setIntent] = useState<Intent>({});
+  // The address names the page and what is open on it: read once here, then kept up to date.
+  const [start] = useState(() => parseRoute(window.location.hash));
+  const [activeTab, setActiveTab] = useState<Tab>(start.tab);
+  const [intent, setIntent] = useState<Intent>(() => intentOf(start));
+  // Bumped when Back or Forward changes what the page in view shows.
+  const [intentRevision, setIntentRevision] = useState(0);
+  const route = useRef<Route>(start);
+  // The page's next report describes where it just arrived: it replaces the address, never adds a step.
+  const settle = useRef(true);
+  const activeTabRef = useRef(activeTab);
+  activeTabRef.current = activeTab;
   const commercialDirty = useRef(false), providerDirty = useRef(false), editorBusy = useRef(false), pageBusy = useRef(false);
   const [busyPage, setBusyPage] = useState(false);
   const markCommercialDirty = useCallback((dirty: boolean) => {commercialDirty.current = dirty;}, []);
@@ -120,7 +131,7 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
 
   const [modalRoot, setModalRoot] = useState<HTMLElement | null>(null);
   const [topbarSlot, setTopbarSlot] = useState<HTMLElement | null>(null);
-  const [keyEditing, setKeyEditing] = useState<KeyEditing | null>(null);
+  const [keyEditing, setKeyEditing] = useState<KeyEditing | null>(() => start.params.edit ? {keyId: start.params.edit} : null);
   // Bumped by the operator's 刷新, so pages that load on their own (the editors) reload too.
   const [refreshEpoch, setRefreshEpoch] = useState(0);
 
@@ -224,18 +235,79 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
     return () => clearInterval(timer);
   }, [autoRefresh, refreshData]);
 
+  const confirmLeaving = async () => {
+    if (providerDirty.current && !(await confirmAction({title: '有未保存的修改，确定离开？', consequence: 'Key 的修改还没有保存。', confirmLabel: '离开'}))) return false;
+    if (commercialDirty.current && !(await confirmAction({title: '有未发布的修改，确定离开？', consequence: '修改还没有发布。', confirmLabel: '离开'}))) return false;
+    return true;
+  };
+
+  const writeRoute = (next: Route, push: boolean) => {
+    const changed = routeHash(next) !== routeHash(route.current);
+    route.current = next;
+    if (changed) window.history[push ? 'pushState' : 'replaceState'](null, '', routeHash(next));
+  };
+
+  // Each page reports where it is. Opening or closing its details is a step Back undoes; a
+  // filter or ↑/↓ only updates the address, so Back leaves the page rather than every filter.
+  const reportRoute = useCallback((next: Intent) => {
+    const tab: Tab | null = next.cards ? 'cards' : next.traces ? 'traces' : next.providers ? 'providers' : null;
+    if (tab !== activeTabRef.current) return;
+    const target = routeOf(tab, next), here = route.current, open = OPEN_PARAM[tab];
+    const push = !settle.current && here.tab === tab && !!open && !!here.params[open] !== !!target.params[open];
+    settle.current = false;
+    writeRoute(target, push);
+  }, []);
+
   const navigate = async (tab: Tab, next?: Intent) => {
     if (pageBusy.current) return;
     if (tab === activeTab && !next) return;
     if (editorBusy.current) {toast.info('正在保存，请稍候'); return;}
-    if (providerDirty.current && !(await confirmAction({title: '有未保存的修改，确定离开？', consequence: 'Key 的修改还没有保存。', confirmLabel: '离开'}))) return;
-    if (commercialDirty.current && !(await confirmAction({title: '有未发布的修改，确定离开？', consequence: '修改还没有发布。', confirmLabel: '离开'}))) return;
+    if (!(await confirmLeaving())) return;
     if (!mounted.current || pageBusy.current || editorBusy.current) return;
     commercialDirty.current = false; providerDirty.current = false;
     setIntent(next ?? {});
     setActionError(null);
     setActiveTab(tab);
+    if (tab === activeTabRef.current) setIntentRevision(value => value + 1);
+    settle.current = true;
+    writeRoute(routeOf(tab, next), true);
   };
+
+  // Back and Forward (or an edited address): the same guards as the navigation. While something
+  // is being saved, a dialog is open or edits would be lost, the address first goes back to where
+  // the page is; once the operator agrees to leave, the step is taken again.
+  const followAddress = useRef<() => Promise<void>>();
+  followAddress.current = async () => {
+    // A fragment that is not a page address (an in-page anchor) leaves the page where it is.
+    if (window.location.hash && !window.location.hash.startsWith('#/')) {window.history.replaceState(null, '', routeHash(route.current)); return;}
+    const target = parseRoute(window.location.hash), here = route.current;
+    if (routeHash(target) === routeHash(here)) return;
+    const leaving = target.tab !== here.tab || (here.tab === 'providers' && target.params.edit !== here.params.edit);
+    const busy = pageBusy.current || editorBusy.current || isModalOpen();
+    if (busy || (leaving && (providerDirty.current || commercialDirty.current))) {
+      window.history.pushState(null, '', routeHash(here));
+      if (busy) {toast.info(isModalOpen() ? '先完成或关闭打开的对话框' : '正在保存，请稍候'); return;}
+      if (!(await confirmLeaving()) || !mounted.current) return;
+      commercialDirty.current = false; providerDirty.current = false;
+      window.history.back();
+      return;
+    }
+    route.current = target;
+    settle.current = true;
+    setActionError(null);
+    setIntent(intentOf(target));
+    if (target.tab === here.tab) setIntentRevision(value => value + 1);
+    else {commercialDirty.current = false; providerDirty.current = false; setActiveTab(target.tab);}
+  };
+  useEffect(() => {
+    const follow = () => void followAddress.current?.();
+    window.addEventListener('popstate', follow);
+    window.addEventListener('hashchange', follow);
+    return () => {window.removeEventListener('popstate', follow); window.removeEventListener('hashchange', follow);};
+  }, []);
+
+  useEffect(() => {document.title = `${TITLES[activeTab]} · Superkiro`;}, [activeTab]);
+  useEffect(() => () => {document.title = DOCUMENT_TITLE;}, []);
 
   const logoutAll = async () => {
     if (!(await confirmAction({title: '下线全部会话？', consequence: '所有管理员（包括你）都要重新登录。', confirmLabel: '下线全部', danger: true}))) return;
@@ -258,7 +330,8 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
 
   return <ModalRootContext.Provider value={modalRoot}><TopbarSlotContext.Provider value={topbarSlot}>
     <div className="admin-app">
-      <a className="skip-link" href="#admin-workspace">跳到工作区</a>
+      {/* The address names the page, so the skip link moves focus without changing it. */}
+      <a className="skip-link" href="#admin-workspace" onClick={event => {event.preventDefault(); document.getElementById('admin-workspace')?.focus();}}>跳到工作区</a>
       <aside className="sidebar">
         <h1 className="brand">Superkiro</h1>
         <nav aria-label="管理导航">
@@ -319,12 +392,12 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
             {activeTab === 'cards' && <CardsPage cards={data.cards} groups={data.groups} configFailed={!!failures.config} loading={loading}
               failed={!!failures.cards} operator={operator} refresh={refreshData} guards={guards} reportError={reportError}
               actionError={actionError?.text ?? ''} onBusyChange={markPageBusy} onReauthenticate={onReauthenticate}
-              selectionEpoch={selectionEpoch} intent={intent.cards}
+              selectionEpoch={selectionEpoch} intent={intent.cards} intentRevision={intentRevision} onRoute={reportRoute}
               updateCards={cards => setData(previous => ({...previous, cards}))}
-              onOpenTrace={(cardId, traceId) => void navigate('traces', {traces: {search: cardId, open: traceId}})}/>}
+              onOpenTrace={(cardId, traceId) => void navigate('traces', {traces: {search: cardId, card: cardId, open: traceId}})}/>}
             {activeTab === 'traces' && <TracesPage traces={data.traces} cards={data.cards} loading={loading} failed={!!failures.traces}
-              refresh={refreshData} guards={guards} reportError={reportError} intent={intent.traces}
-              onOpenCard={cardId => void navigate('cards', {cards: {status: 'ALL', search: cardId}})}/>}
+              refresh={refreshData} guards={guards} reportError={reportError} intent={intent.traces} intentRevision={intentRevision} onRoute={reportRoute}
+              onOpenCard={cardId => void navigate('cards', {cards: {status: 'ALL', search: cardId, open: cardId}})}/>}
             {activeTab === 'groups' && <CommercialEditor key="groups" kind="groups" onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy}
               cards={data.cards} onPublished={() => void refreshData({keepSelection: true})} refreshEpoch={refreshEpoch}/>}
             {activeTab === 'models' && <CommercialEditor key="models" kind="models" onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy}
@@ -333,6 +406,7 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
             {activeTab === 'providers' && <ProvidersPage providers={data.providers} providerKeys={data.providerKeys} models={data.models}
               loading={loading} failed={!!failures.providers} refresh={refreshData} guards={guards} reportError={reportError}
               editing={keyEditing} setEditing={setKeyEditing} providerDirty={providerDirty} editorBusy={editorBusy}
+              intent={intent.providers} intentRevision={intentRevision} onRoute={reportRoute}
               onDirtyChange={markProviderDirty} onBusyChange={markEditorBusy} groups={data.groups} onHideModels={hideModels}
               onListModel={(providerId, model) => void navigate('models', {models: {list: {providerId, model}}})}
               mergeKey={saved => setData(previous => ({...previous, providerKeys: previous.providerKeys.some(key => key.id === saved.id && key.provider_id === saved.provider_id)

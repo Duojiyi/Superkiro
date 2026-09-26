@@ -561,6 +561,10 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .provider-name h3 {margin: 0; font-size: 15px;}
 .provider-name .mono {font-size: 12px; overflow-wrap: anywhere;}
 .provider-foot {display: flex; justify-content: flex-start;}
+/* What a link (运营概览's 需要关注) points to, marked until the operator turns to something else. */
+.provider-card.is-pointed {border-color: #d4a72c; box-shadow: 0 0 0 1px #d4a72c;}
+.table tr.is-pointed td {background: var(--warning-bg);}
+.table tr.is-pointed td:first-child {box-shadow: inset 3px 0 0 #d4a72c;}
 .keys-table {min-width: 720px; table-layout: fixed;}
 /* The same column widths in every provider's card, so the tables line up. */
 .keys-table .col-key {width: 260px; overflow: hidden; text-overflow: ellipsis;}
