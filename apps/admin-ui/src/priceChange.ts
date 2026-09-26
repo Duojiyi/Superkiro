@@ -58,18 +58,21 @@ export type CostSource = 'route' | 'upstream' | 'wildcard' | 'model';
 
 /**
  * What a request served by this target costs us, found as billing finds it: the version kept for
- * this provider and upstream model (线路采购价), the upstream model's, the table's `*`, and — for
- * the model's own primary target — the model's price version.
+ * this provider and upstream model (线路采购价) first. Then, on the model's own primary target,
+ * the price version the model is charged at (which falls back to the table's `*`); on any other
+ * route, the upstream model's version, then the table's `*`.
  */
 export function routeCost(versions: Row[], rateCardId: unknown, target: {provider_id: string; target_model: string}, model: Row | null, nowSecs: number): {version: Row | null; source: CostSource | null} {
   const latest = (name: string) => versions.filter(version => version.rate_card_id === rateCardId && version.model === name && time(version) <= nowSecs)
     .sort((a, b) => time(b) - time(a))[0] ?? null;
-  const steps: Array<[CostSource, string]> = [['route', routeCostModel(target.provider_id, target.target_model)], ['upstream', target.target_model], ['wildcard', '*']];
-  for (const [source, name] of steps) {const version = latest(name); if (version) return {version, source};}
+  const route = latest(routeCostModel(target.provider_id, target.target_model));
+  if (route) return {version: route, source: 'route'};
   if (model && model.target_provider_id === target.provider_id && model.target_model === target.target_model) {
     const own = currentVersion(versions, rateCardId, [model.exposed_model_id, model.target_model], nowSecs);
-    if (own) return {version: own, source: 'model'};
+    if (own) return {version: own, source: own.model === '*' ? 'wildcard' : 'model'};
   }
+  const steps: Array<[CostSource, string]> = [['upstream', target.target_model], ['wildcard', '*']];
+  for (const [source, name] of steps) {const version = latest(name); if (version) return {version, source};}
   return {version: null, source: null};
 }
 

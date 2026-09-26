@@ -111,10 +111,23 @@ const priced = [
 const mapped = {id: 'm', exposed_model_id: 'claude-x', target_provider_id: 'a', target_model: 'claude-x'};
 const cost = (rateCard, provider, target, row = mapped) => {const found = change.routeCost(priced, rateCard, {provider_id: provider, target_model: target}, row, t); return [found.source, found.version?.id ?? null];};
 assert.deepEqual(cost('r', 'b', 'claude-x'), ['route', 'v-route'], 'a route of its own comes first');
-assert.deepEqual(cost('r', 'a', 'claude-x'), ['upstream', 'v-model'], 'then the upstream model name');
+assert.deepEqual(cost('r', 'a', 'claude-x'), ['model', 'v-model'], "then, on the model's primary route, the price it is charged at");
+assert.deepEqual(cost('r', 'a', 'claude-x', {...mapped, target_provider_id: 'z'}), ['upstream', 'v-model'], 'on a backup, the upstream model name');
 assert.deepEqual(cost('r', 'c', 'other'), [null, null], 'a cost not in force yet does not count');
 assert.deepEqual(cost('star', 'c', 'other'), ['wildcard', 'v-star']);
 assert.deepEqual(cost('r', 'a', 'upstream-y', {...mapped, exposed_model_id: 'claude-x', target_model: 'upstream-y'}), ['model', 'v-model'], "the model's own price version, for its primary route");
+// The model's own price comes before the upstream name and the table's `*` on its primary route only.
+const named = [
+  {id: 'v-own', rate_card_id: 'n', model: 'my-id', effective_from_secs: t - 50},
+  {id: 'v-up', rate_card_id: 'n', model: 'up-x', effective_from_secs: t - 50},
+  {id: 'v-any', rate_card_id: 'n', model: '*', effective_from_secs: t - 50},
+];
+const ownRow = {id: 'm2', exposed_model_id: 'my-id', target_provider_id: 'a', target_model: 'up-x'};
+const costIn = (provider, target, row) => {const found = change.routeCost(named, 'n', {provider_id: provider, target_model: target}, row, t); return [found.source, found.version?.id ?? null];};
+assert.deepEqual(costIn('a', 'up-x', ownRow), ['model', 'v-own']);
+assert.deepEqual(costIn('c', 'up-x', ownRow), ['upstream', 'v-up']);
+assert.deepEqual(costIn('c', 'other', ownRow), ['wildcard', 'v-any']);
+assert.deepEqual(costIn('a', 'none', {...ownRow, exposed_model_id: 'unpriced', target_model: 'none'}), ['wildcard', 'v-any'], "a model charged at the table's `*` costs what `*` says");
 assert.equal(change.costText(priced[1]), 'CNY 1 / 5 / 1.25 / 0.1');
 const staged = change.buildRouteCost({costs: {input_price_per_m: '1', output_price_per_m: '5', cache_creation_price_per_m: '1.25', cache_read_price_per_m: '0.1'}, currency: 'CNY'},
   {providerId: 'b', targetModel: 'claude-x', rateCardId: 'r', nowSecs: t, taken: []});
