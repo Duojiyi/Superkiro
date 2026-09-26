@@ -410,3 +410,193 @@ async fn without_a_model_named_for_it_kiros_fast_model_is_the_group_default() {
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
     assert_eq!(models_sent(&server).await, vec!["up-main", "up-named"]);
 }
+
+fn base64(bytes: &[u8]) -> String {
+    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
+}
+
+/// A document as Kiro attaches it: the name without its extension, which is the format.
+fn document(name: &str, format: &str, bytes: &[u8]) -> Value {
+    json!({"name": name, "format": format, "source": {"bytes": base64(bytes)}})
+}
+
+/// The request body the upstream received last.
+async fn upstream_body(server: &MockServer) -> Value {
+    let requests = server.received_requests().await.unwrap();
+    serde_json::from_slice(&requests.last().expect("the upstream was called").body).unwrap()
+}
+
+const PDF: &[u8] = b"%PDF-1.4 1 0 obj <</Type /Page>> endobj";
+
+#[tokio::test]
+async fn attachments_reach_the_model_as_documents_and_text() {
+    for format in [ProviderFormat::Anthropic, ProviderFormat::OpenAi] {
+        let server = upstream(match format {
+            ProviderFormat::Anthropic => ResponseTemplate::new(200)
+                .set_body_raw(anthropic_answer("read"), "text/event-stream"),
+            ProviderFormat::OpenAi => ResponseTemplate::new(200).set_body_raw(
+                [
+                    json!({"choices": [{"delta": {"content": "read"}}]}),
+                    json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+                    json!({"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11}}),
+                ]
+                .iter()
+                .map(|chunk| format!("data: {chunk}\n\n"))
+                .collect::<String>()
+                    + "data: [DONE]\n\n",
+                "text/event-stream",
+            ),
+        })
+        .await;
+        let billing = engine(
+            format,
+            &server.uri(),
+            vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+        );
+        let app = serve(&billing);
+        let reply = send(
+            &app,
+            "inv-docs",
+            body(
+                json!({"content": "summarize", "modelId": "model", "documents": [
+                    document("paper", "pdf", PDF),
+                    document("notes", "md", "# 发布说明\nv2".as_bytes()),
+                ]}),
+                vec![],
+            ),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+        let sent = upstream_body(&server).await;
+        let last = sent["messages"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(last["role"], "user");
+        let parts = last["content"].as_array().unwrap();
+        match format {
+            ProviderFormat::Anthropic => {
+                assert_eq!(parts[0]["type"], "document", "{last}");
+                assert_eq!(parts[0]["source"]["media_type"], "application/pdf");
+                assert_eq!(parts[0]["source"]["data"], base64(PDF));
+                assert_eq!(parts[0]["title"], "paper.pdf");
+            }
+            ProviderFormat::OpenAi => {
+                assert_eq!(parts[0]["type"], "file", "{last}");
+                assert_eq!(parts[0]["file"]["filename"], "paper.pdf");
+            }
+        }
+        assert!(parts[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("<document name=\"notes.md\">\n# 发布说明\nv2"));
+        assert_eq!(parts[2]["text"], "summarize");
+    }
+}
+
+/// A message carrying nothing but a file is still the user's turn. Its file was dropped,
+/// and the request ended on the assistant's turn, which current models refuse.
+#[tokio::test]
+async fn a_message_with_only_a_file_stays_the_users_turn() {
+    let server = upstream(
+        ResponseTemplate::new(200).set_body_raw(anthropic_answer("ok"), "text/event-stream"),
+    )
+    .await;
+    let billing = engine(
+        ProviderFormat::Anthropic,
+        &server.uri(),
+        vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+    );
+    let app = serve(&billing);
+    let reply = send(
+        &app,
+        "inv-only-file",
+        body(
+            json!({"content": "", "modelId": "model",
+                "documents": [document("todo", "txt", b"buy milk")]}),
+            vec![
+                json!({"userInputMessage": {"content": "hi"}}),
+                json!({"assistantResponseMessage": {"content": "hello"}}),
+            ],
+        ),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    let sent = upstream_body(&server).await;
+    let last = sent["messages"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["role"], "user", "{sent}");
+    assert!(last.to_string().contains("buy milk"), "{last}");
+}
+
+#[tokio::test]
+async fn an_attachment_no_upstream_reads_is_refused_naming_it() {
+    let server = upstream(
+        ResponseTemplate::new(200).set_body_raw(anthropic_answer("ok"), "text/event-stream"),
+    )
+    .await;
+    let mut text_only = ModelMap::new("map-text", GROUP, "text-model", "prov", "up-text");
+    text_only.supports_vision = false;
+    let billing = engine(
+        ProviderFormat::Anthropic,
+        &server.uri(),
+        vec![
+            ModelMap::new("map", GROUP, "model", "prov", "up-model"),
+            text_only,
+        ],
+    );
+    let app = serve(&billing);
+    for (invocation, model, attached, named) in [
+        (
+            "inv-docx",
+            "model",
+            document("report", "docx", b"PK\x03\x04"),
+            ".docx",
+        ),
+        (
+            "inv-pdf-text",
+            "text-model",
+            document("paper", "pdf", PDF),
+            "paper.pdf",
+        ),
+    ] {
+        let reply = send(
+            &app,
+            invocation,
+            body(
+                json!({"content": "read it", "modelId": model, "documents": [attached]}),
+                vec![],
+            ),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text());
+        let refusal = reply.json();
+        assert_eq!(refusal["__type"], "ValidationException");
+        assert_eq!(refusal["reason"], "DOCUMENT_MODEL_NOT_SUPPORTED");
+        assert!(
+            refusal["message"].as_str().unwrap().contains(named),
+            "{refusal}"
+        );
+        assert_eq!(
+            trace_class(&billing, invocation),
+            vec!["unsupported_capability"]
+        );
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+    nothing_charged(&billing);
+
+    // Attached to an earlier message, it becomes a note and the conversation goes on.
+    let reply = send(
+        &app,
+        "inv-docx-history",
+        body(
+            json!({"content": "and now?", "modelId": "model"}),
+            vec![
+                json!({"userInputMessage": {"content": "read it",
+                    "documents": [document("report", "docx", b"PK\x03\x04")]}}),
+                json!({"assistantResponseMessage": {"content": "I cannot."}}),
+            ],
+        ),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    let sent = upstream_body(&server).await.to_string();
+    assert!(sent.contains("report.docx"), "{sent}");
+    assert!(!sent.contains(&base64(b"PK\x03\x04")), "{sent}");
+}

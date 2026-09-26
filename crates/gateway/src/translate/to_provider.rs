@@ -13,7 +13,9 @@ use super::tools::{
     process_tools_for_provider, repair_orphan_tool_pairs, ConversationMessage, ToolRegistry,
 };
 use crate::provider::{ChatMessage, ChatRequest, ToolCallEntry};
-use kiro_wire::requests::conversation::{GenerateAssistantResponseRequest, KiroImage, Message};
+use kiro_wire::requests::conversation::{
+    GenerateAssistantResponseRequest, KiroDocument, KiroImage, Message,
+};
 
 use super::vision::{format_fallback_description, model_supports_vision};
 
@@ -172,18 +174,26 @@ fn omission_note(number: usize, omission: Omission) -> String {
 /// Transcriptions are used only for the current message. They are collected per request
 /// for that message alone, so indexing them from a history message would caption a past
 /// image with unrelated text.
+///
+/// Attachments come first, as providers advise, so a message with nothing but a file is
+/// still the user's turn: dropped, it left the request ending on the assistant's turn,
+/// which current models refuse as a prefill.
 fn format_user_content(
     content: &str,
     images: &[KiroImage],
+    documents: &[KiroDocument],
     ctx: &TranslationContext,
     turn: Turn,
 ) -> serde_json::Value {
-    if images.is_empty() {
+    if images.is_empty() && documents.is_empty() {
         return serde_json::Value::String(content.to_string());
     }
+    let attachments = documents
+        .iter()
+        .map(|document| super::documents::content_part(document, ctx.supports_vision));
 
     if ctx.supports_vision {
-        let mut parts = Vec::new();
+        let mut parts: Vec<serde_json::Value> = attachments.collect();
         if !content.is_empty() {
             parts.push(serde_json::json!({
                 "type": "text",
@@ -225,7 +235,11 @@ fn format_user_content(
         }
         serde_json::Value::Array(parts)
     } else {
-        let mut text = content.to_string();
+        // Without vision every attachment is text: a text file's own, or a note.
+        let mut text: String = attachments
+            .filter_map(|part| part["text"].as_str().map(|text| format!("{text}\n\n")))
+            .collect();
+        text.push_str(content);
         for (idx, img) in images.iter().enumerate() {
             let transcription = if turn == Turn::Current {
                 ctx.image_transcriptions.get(idx).and_then(|s| s.as_deref())
@@ -331,11 +345,15 @@ pub fn translate_kiro_to_chat_request(
                         });
                     }
                 }
-                // Historical user message content (with image support)
-                if !user_msg.content.is_empty() || !user_msg.images.is_empty() {
+                // Historical user message content (with image and attachment support)
+                if !user_msg.content.is_empty()
+                    || !user_msg.images.is_empty()
+                    || !user_msg.documents.is_empty()
+                {
                     let content_val = format_user_content(
                         &user_msg.content,
                         &user_msg.images,
+                        &user_msg.documents,
                         ctx,
                         Turn::History(position),
                     );
@@ -369,6 +387,7 @@ pub fn translate_kiro_to_chat_request(
     let final_current_content = format_user_content(
         &current_input.content,
         &current_input.images,
+        &current_input.documents,
         ctx,
         Turn::Current,
     );

@@ -45,6 +45,8 @@ pub struct UserInputMessage {
     pub origin: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<KiroImage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub documents: Vec<KiroDocument>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_input_message_context: Option<UserInputMessageContext>,
 }
@@ -71,6 +73,23 @@ pub struct KiroImage {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct KiroImageSource {
+    pub bytes: String,
+}
+
+/// A file attached in chat. Kiro strips the extension from `name` and gives it as `format`
+/// ("pdf", "md", "csv", "docx", ...); `source.bytes` is base64, as the SDK sends a blob.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct KiroDocument {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub format: String,
+    pub source: KiroDocumentSource,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KiroDocumentSource {
     pub bytes: String,
 }
 

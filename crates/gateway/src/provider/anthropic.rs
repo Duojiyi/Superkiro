@@ -13,6 +13,24 @@ use std::time::Duration;
 pub struct AnthropicProvider;
 
 fn normalize_content_block(val: &Value) -> Value {
+    // An attached PDF, as the translator writes it (OpenAI's `file` part).
+    if val.get("type").and_then(Value::as_str) == Some("file") {
+        let file = &val["file"];
+        if let Some((media_type, data)) = file["file_data"]
+            .as_str()
+            .and_then(|url| url.strip_prefix("data:"))
+            .and_then(|rest| rest.split_once(";base64,"))
+        {
+            let mut block = serde_json::json!({
+                "type": "document",
+                "source": {"type": "base64", "media_type": media_type, "data": data},
+            });
+            if let Some(name) = file["filename"].as_str().filter(|name| !name.is_empty()) {
+                block["title"] = serde_json::json!(name);
+            }
+            return block;
+        }
+    }
     if let Some(obj) = val.as_object() {
         if obj.get("type").and_then(|t| t.as_str()) == Some("image_url") {
             if let Some(image_url) = obj
@@ -154,6 +172,19 @@ impl ModelProvider for AnthropicProvider {
                     "content": [{"type": "text", "text": "(continue)"}]
                 }),
             );
+        }
+        // A request ending on the assistant's turn is a prefill, which current models
+        // refuse. It happens when the user's turn carried nothing that could be sent.
+        if messages
+            .last()
+            .and_then(|m| m.get("role"))
+            .and_then(Value::as_str)
+            == Some("assistant")
+        {
+            messages.push(serde_json::json!({
+                "role": "user",
+                "content": [{"type": "text", "text": "(continue)"}]
+            }));
         }
 
         let max_tokens = req.max_tokens.unwrap_or(4096);

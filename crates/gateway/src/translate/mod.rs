@@ -8,6 +8,7 @@
 //! - Image compression and resizing.
 //! - Orphan tool call / tool result pair repair.
 
+pub mod documents;
 pub mod from_provider;
 pub mod images;
 pub mod to_provider;

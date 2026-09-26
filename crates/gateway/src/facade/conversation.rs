@@ -11,7 +11,7 @@
 //! 6. Binary AWS EventStream encoding, 20s keepalive injection, and client disconnect cancellation (Spec §4.6, §6.3).
 
 use super::models::SIMPLE_TASK_MODEL;
-use super::{error_response, input_too_long, BoxFuture, FacadeHandler, Response};
+use super::{error_response, input_too_long, validation_error, BoxFuture, FacadeHandler, Response};
 use crate::auth::AuthClaims;
 use crate::guardrail::{format_kiro_throttle_response, CapacityGuardrail};
 use crate::idempotency::IdempotencyManager;
@@ -817,6 +817,27 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                     "This model is not configured for image input. Send the prompt without an image, or ask your administrator to enable image support for it.",
                 );
             }
+            // An attachment no upstream path takes is refused with the reason Kiro shows
+            // document refusals for, naming the file. An earlier message's becomes a note.
+            if let Some((reason, message)) = crate::translate::documents::refusal(
+                &kiro_req
+                    .conversation_state
+                    .current_message
+                    .user_input_message
+                    .documents,
+                vision_supported,
+            ) {
+                if has_reservation {
+                    let _ = self.billing.release(&invocation_key);
+                }
+                self.record_refusal(
+                    claims.as_ref(),
+                    &invocation_key,
+                    requested_model,
+                    "unsupported_capability",
+                );
+                return validation_error(reason, &message);
+            }
 
             // 8. Translate to provider format (Spec §4.3, §14.3 Vision Fallback)
             let mut ctx =
@@ -1595,8 +1616,38 @@ fn validate_conversation_request(
         .flatten()
         .map(|image| image.source.bytes.chars().count())
         .sum();
+    // Attachments count as what is sent: a text file as its text, never its base64.
+    let documents = request
+        .conversation_state
+        .history
+        .iter()
+        .filter_map(|message| match message {
+            kiro_wire::requests::conversation::Message::User(user) => {
+                Some(&user.user_input_message.documents)
+            }
+            kiro_wire::requests::conversation::Message::Assistant(_) => None,
+        })
+        .chain([&current.documents])
+        .flatten();
+    let (document_chars, document_text_chars) =
+        documents.fold((0usize, 0usize), |(encoded, text), document| {
+            let sent = match crate::translate::documents::document_kind(&document.format) {
+                crate::translate::documents::DocumentKind::Text => {
+                    crate::translate::documents::text_of(document)
+                        .map_or(0, |text| text.chars().count())
+                }
+                _ => 0,
+            };
+            (encoded + document.source.bytes.len(), text + sent)
+        });
     let prompt_chars = serde_json::to_string(request)
-        .map(|json| json.chars().count().saturating_sub(image_chars))
+        .map(|json| {
+            json.chars()
+                .count()
+                .saturating_sub(image_chars)
+                .saturating_sub(document_chars)
+                .saturating_add(document_text_chars)
+        })
         .unwrap_or(usize::MAX);
     let mut image_sizes = Vec::with_capacity(current.images.len());
     for image in &current.images {
