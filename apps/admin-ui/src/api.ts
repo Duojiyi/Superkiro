@@ -21,6 +21,94 @@ export interface AdminStats {
   totalPoints: number;
   usedPoints: number;
   remainingPoints: number;
+  /** Real totals over the last 24 hours and 7 days (newer servers). */
+  activity?: AdminActivity;
+}
+
+export interface AdminActivityWindow {
+  requests: number;
+  succeeded: number;
+  failed: number;
+  clientAborted: number;
+  /** Micro-credits: divide by 1,000,000 for credits. */
+  creditsCharged: number;
+  inputTokens: number;
+  outputTokens: number;
+  providerCostMicroCny: number;
+  /** Cards billed at least once in the period. */
+  activeCards: number;
+  /** Requests that recorded a time to first output, and its median and 90th percentile. */
+  timedRequests?: number;
+  ttftMedianMs?: number | null;
+  ttftP90Ms?: number | null;
+}
+
+export interface AdminActivity {
+  last24h: AdminActivityWindow;
+  last7d: AdminActivityWindow;
+  /** The last 24 clock hours, oldest first; the last is the current hour. */
+  hourly: Array<{startSecs: number; requests: number; failed: number}>;
+  /** The oldest trace kept: request counts reach back no further than this. */
+  tracesCoverFromSecs?: number | null;
+  /** The last 24 hours by provider, busiest first. */
+  providers?: Array<{providerId: string; requests: number; failed: number; ttftMedianMs: number | null}>;
+}
+
+export interface AdminTraceAttempt {
+  key_id?: string;
+  provider_id?: string;
+  success?: boolean;
+  error?: string | null;
+  latency_ms?: number;
+}
+
+export interface AdminTrace {
+  id: string;
+  card_id?: string;
+  ts: number;
+  invocation_id?: string;
+  exposed_model?: string;
+  status?: string;
+  ttft_ms?: number | null;
+  tokens_per_second?: number | null;
+  error_class?: string | null;
+  provider_id?: string | null;
+  input_tokens?: number;
+  output_tokens?: number;
+  credits_charged?: number;
+  provider_cost_micro_cny?: number;
+  attempt_chain?: AdminTraceAttempt[];
+}
+
+export interface TraceReply {
+  status: string;
+  error: string | null;
+  providerId: string;
+  targetModel: string;
+  stopReason: string | null;
+  text: string;
+  reasoning: string;
+  toolCalls: Array<{id: string; name: string; arguments: string}>;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  ttftMs: number | null;
+  tokensPerSecond: number | null;
+  truncated: boolean;
+}
+
+/** One request as it arrived and the model's reply, kept for 24 hours. */
+export interface TraceContent {
+  success: boolean;
+  invocationId: string;
+  cardId: string;
+  model: string;
+  receivedAt: number;
+  expiresAt: number;
+  request: unknown;
+  notes?: {omittedImages?: number; omittedHistoryEntries?: number; truncated?: boolean; unparsed?: boolean};
+  reply: TraceReply | null;
 }
 
 export interface AdminSessionResponse {
@@ -29,6 +117,7 @@ export interface AdminSessionResponse {
   expiresAt?: number;
   twoFactorEnabled?: boolean;
   totpRequired?: boolean;
+  username?: string;
 }
 
 export interface FinancialSettings {credit_face_value_cny:number;usd_cny_rate:number;rate_updated_at_secs:number}
@@ -47,7 +136,7 @@ export interface AdminFinancials {
     gross_profit_micro_cny: number;
     gross_margin_percentage: number;
   };
-  modelRankings: Array<Record<string, unknown>>;
+  modelRankings: Array<{model_id?: string; requests?: number; total_tokens?: number; provider_cost_micro_cny?: number; credits_charged?: number; margin_percentage?: number}>;
 }
 
 export interface AdminCardItem {
@@ -138,7 +227,8 @@ export class AdminApiClient {
     });
     if (session.success !== true) throw new Error('登录失败，请重试');
     await this.checkAuth();
-    this.authenticatedUsername=username;
+    // The server names the operator; older servers do not, and then the name typed here counts.
+    if (!this.authenticatedUsername) this.authenticatedUsername = username;
     return session;
   }
 
@@ -195,9 +285,9 @@ export class AdminApiClient {
     } catch(error){if(controller.signal.aborted&&version===this.sessionVersion)throw new Error('请求超时，结果未确认；写操作请核对后重试');throw error;} finally {clearTimeout(timer);this.requests.delete(controller);}
   }
 
-  async checkAuth(): Promise<{ success: boolean; role: string; csrfToken: string; expiresAt?: number; expiresIn?: number; twoFactorEnabled?: boolean; totpRequired?: boolean }> {
+  async checkAuth(): Promise<SessionCheck> {
     const version = this.sessionVersion;
-    const result = await this.request<{ success: boolean; role: string; csrfToken: string; expiresAt?: number; expiresIn?: number; twoFactorEnabled?: boolean; totpRequired?: boolean }>('/api/v1/admin/session');
+    const result = await this.request<SessionCheck>('/api/v1/admin/session');
     if (version !== this.sessionVersion) throw new Error('管理会话已改变，请重新加载');
     if (result.success !== true || result.role !== 'admin' || typeof result.csrfToken !== 'string' || !result.csrfToken) {
       this.clearSession(); this.onUnauthorized?.();
@@ -208,6 +298,8 @@ export class AdminApiClient {
     if (changed) this.clearSession();
     if(this.csrfToken!==result.csrfToken)this.authenticatedUsername=null;
     this.csrfToken = result.csrfToken;
+    // The operator this session belongs to, when the server says (it replaces a re-login to name them).
+    if (typeof result.username === 'string' && result.username.trim() && result.username.length <= 128) this.authenticatedUsername = result.username;
     this.twoFactorEnabled=result.twoFactorEnabled;this.totpRequired=result.totpRequired===true;
     clearTimeout(this.expiryTimer);clearTimeout(this.warningTimer);
     if(result.expiresAt!==undefined||result.expiresIn!==undefined){
@@ -222,6 +314,9 @@ export class AdminApiClient {
     if (changed) this.onSessionChanged?.();
     return result;
   }
+
+  /** When the current session ends (milliseconds since the epoch), or 0 when not known. */
+  get sessionExpiresAt(): number { return this.expiresAt; }
 
   async revealCard(cardId: string): Promise<{ success: boolean; rawCode: string }> {
     return this.request('/api/v1/admin/cards/reveal', {method: 'POST', body: JSON.stringify({cardId})});
@@ -307,8 +402,15 @@ export class AdminApiClient {
     return this.request('/api/v1/admin/financials');
   }
 
-  async getTraces(limit = 100): Promise<{ success: boolean; traces: Array<Record<string, unknown>> }> {
-    return this.request(`/api/v1/admin/traces?limit=${Math.min(500, Math.max(1, limit))}`);
+  /** The latest traces, newest first; `cardId` narrows them to one card on the server. */
+  async getTraces(limit = 500, cardId?: string): Promise<{ success: boolean; traces: AdminTrace[] }> {
+    const count = Math.min(500, Math.max(1, Math.floor(limit)));
+    return this.request(`/api/v1/admin/traces?limit=${count}${cardId ? `&card_id=${encodeURIComponent(cardId)}` : ''}`);
+  }
+
+  /** One request's content and reply. Every read is logged by the server, naming the operator. */
+  async getTraceContent(invocationId: string): Promise<TraceContent> {
+    return this.request(`/api/v1/admin/traces/content?invocation_id=${encodeURIComponent(invocationId)}`);
   }
 
   async pruneTraces(cutoffSecs: number): Promise<{ success: boolean; pruned: number }> {
@@ -353,6 +455,17 @@ export class AdminApiClient {
 }
 
 export const adminApi = new AdminApiClient();
+
+interface SessionCheck {
+  success: boolean;
+  role: string;
+  csrfToken: string;
+  expiresAt?: number;
+  expiresIn?: number;
+  twoFactorEnabled?: boolean;
+  totpRequired?: boolean;
+  username?: string;
+}
 
 export interface CommercialConfig {
   settings?: FinancialSettings;

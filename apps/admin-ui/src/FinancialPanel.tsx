@@ -1,67 +1,125 @@
-import {useEffect,useRef,useState} from 'react';
-import {adminApi,AdminApiError,type AdminFinancials,type CommercialConfig} from './api';
-import {estimatedMoney,financialEstimates,parseFinancialSettings} from './financial';
+import {useEffect, useRef, useState} from 'react';
+import {adminApi, AdminApiError, type AdminFinancials, type CommercialConfig} from './api';
+import {confirmAction} from './components/confirm';
+import {toast} from './components/toast';
+import {InfoTip} from './components/ui';
+import {parseFinancialSettings} from './financial';
+import {formatDateTime} from './format';
 
-export default function FinancialPanel({data,onPublished,onDirtyChange,onBusyChange}:{data:AdminFinancials|null;onPublished:()=>Promise<void>;onDirtyChange:(dirty:boolean)=>void;onBusyChange:(busy:boolean)=>void}){
-  const [config,setConfig]=useState<CommercialConfig|null>(null),[face,setFace]=useState(''),[rate,setRate]=useState(''),[reason,setReason]=useState(''),[message,setMessage]=useState(''),[refreshMessage,setRefreshMessage]=useState(''),[busy,setBusy]=useState(false);
-  const pending=useRef(false),alive=useRef(true);
-  const [needsReview,setNeedsReview]=useState(false);
-  const dirty=!!reason.trim() || (!!config?.settings && (face!==String(config.settings.credit_face_value_cny)||rate!==String(config.settings.usd_cny_rate)));
-  let inputError='';
-  if(config?.settings){try{parseFinancialSettings(face,rate);}catch(error){inputError=error instanceof Error?error.message:'请填写有效数值';}}
-  const reasonBytes=new TextEncoder().encode(reason.trim()).length;
-  useEffect(()=>{onBusyChange(busy);return()=>onBusyChange(false);},[busy,onBusyChange]);
-  useEffect(()=>{onDirtyChange(dirty);},[dirty,onDirtyChange]);
-  const apply=(next:CommercialConfig)=>{setConfig(next);setFace(next.settings?String(next.settings.credit_face_value_cny):'');setRate(next.settings?String(next.settings.usd_cny_rate):'');};
-  async function load(){
-    if(pending.current)return;pending.current=true;setBusy(true);setRefreshMessage('');setMessage('正在读取财务配置…');
-    try{const result=await adminApi.getCommercialConfig();if(result.success!==true||!result.config?.revision)throw new Error('配置读取未确认');if(alive.current){apply(result.config);setNeedsReview(false);setReason('');setRefreshMessage('');setMessage(result.config.settings?'当前财务配置已读取。修改数值并填写原因后发布。':'服务端未提供财务配置，暂不可发布。');}}
-    catch(error){if(alive.current){setNeedsReview(true);setMessage(`${error instanceof Error?error.message:'配置读取失败'}。原输入已保留；重新读取成功前不可发布。`);}}finally{pending.current=false;if(alive.current)setBusy(false);}
-  }
-  useEffect(()=>{alive.current=true;void load();return()=>{alive.current=false;};},[]);
-  async function publish(){
-    if(pending.current||needsReview||!config?.settings)return;
-    let submitted=false;
-    try{
-      const settings=parseFinancialSettings(face,rate);
-      if(!reason.trim()||reasonBytes>500||/[\x00-\x1f\x7f-\x9f]/.test(reason))throw new Error('请填写变更原因，不超过 500 字节且不能包含控制字符（中文通常占 3 字节）');
-      if(settings.credit_face_value_cny===config.settings.credit_face_value_cny&&settings.usd_cny_rate===config.settings.usd_cny_rate)throw new Error('数值与当前版本一致，无需重复发布');
-      if(!window.confirm(`确认发布财务配置？\n积分面值：${config.settings.credit_face_value_cny} → ${settings.credit_face_value_cny} 元 / 积分\n采购汇率：${config.settings.usd_cny_rate} → ${settings.usd_cny_rate} CNY / USD\n影响成本加成计费及估算口径，不会改变卡密余额，也不是实际收入。有未结算请求时服务端将拒绝。\n原因：${reason.trim()}`))return;
-      pending.current=true;submitted=true;setBusy(true);setRefreshMessage('');setMessage('正在发布，请勿重复提交…');
-      const result=await adminApi.publishCommercialConfig({settings,expected_revision:config.revision,reason:reason.trim()});
-      if(result.success!==true)throw new AdminApiError('服务端未确认发布',400);
-      if(!result.config?.settings||!result.config.revision)throw new Error('服务端未返回可核对的配置版本');
-      if(alive.current){
-        apply(result.config);setReason('');setNeedsReview(false);setMessage('配置已发布，正在刷新账本估算。');
-        try{await onPublished();if(alive.current)setRefreshMessage('配置写入已确认；无需重复发布。请留意估算读取提示。');}
-        catch{if(alive.current){setRefreshMessage('配置写入已确认；无需重复发布。');setMessage('配置已发布，但账本估算刷新失败。请使用页面“刷新”重新读取估算。');}}
+type Message = {tone: 'error' | 'warning' | 'info'; text: string} | null;
+
+/** 结算参数: the credit face value and the USD rate, published with a reason against the version read. */
+export default function FinancialPanel({onPublished, onDirtyChange, onBusyChange}: {data?: AdminFinancials | null; onPublished: () => Promise<void>; onDirtyChange: (dirty: boolean) => void; onBusyChange: (busy: boolean) => void}) {
+  const [config, setConfig] = useState<CommercialConfig | null>(null);
+  const [face, setFace] = useState(''), [rate, setRate] = useState(''), [reason, setReason] = useState('');
+  const [message, setMessage] = useState<Message>(null);
+  const [busy, setBusy] = useState(false);
+  const [publishing, setPublishing] = useState(false);
+  const pending = useRef(false), alive = useRef(true);
+  const [needsReview, setNeedsReview] = useState(false);
+  const dirty = !!reason.trim() || (!!config?.settings && (face !== String(config.settings.credit_face_value_cny) || rate !== String(config.settings.usd_cny_rate)));
+  let inputError = '';
+  if (config?.settings) {try {parseFinancialSettings(face, rate);} catch (error) {inputError = error instanceof Error ? error.message : '请填写有效数值';}}
+  const reasonBytes = new TextEncoder().encode(reason.trim()).length;
+  useEffect(() => {onBusyChange(busy); return () => onBusyChange(false);}, [busy, onBusyChange]);
+  useEffect(() => {onDirtyChange(dirty);}, [dirty, onDirtyChange]);
+  useEffect(() => () => onDirtyChange(false), [onDirtyChange]);
+  const apply = (next: CommercialConfig) => {
+    setConfig(next);
+    setFace(next.settings ? String(next.settings.credit_face_value_cny) : '');
+    setRate(next.settings ? String(next.settings.usd_cny_rate) : '');
+  };
+  async function load(explicit = false) {
+    if (pending.current) return;
+    pending.current = true; setBusy(true); setMessage(null);
+    try {
+      const result = await adminApi.getCommercialConfig();
+      if (result.success !== true || !result.config?.revision) throw new Error('配置读取未确认');
+      if (alive.current) {
+        apply(result.config); setNeedsReview(false); setReason('');
+        if (!result.config.settings) setMessage({tone: 'warning', text: '服务器没有返回结算参数，暂不能发布'});
+        else if (explicit) toast.success('已重新加载结算参数');
       }
-    }catch(error){
-      if(alive.current){
-        const mustReview=submitted&&!(error instanceof AdminApiError&&[400,401,403,413,422].includes(error.status));
-        if(mustReview)setNeedsReview(true);
-        setMessage(`${error instanceof Error?error.message:'发布失败'}${mustReview?'。原输入已保留，发布已暂停。请重新读取财务配置核对结果或版本冲突，不要重复提交。':''}`);
+    } catch (error) {
+      if (alive.current) {
+        setNeedsReview(true);
+        setMessage({tone: 'error', text: `加载失败（${error instanceof Error ? error.message : '配置读取失败'}），修改已保留；重新加载成功前不能发布`});
       }
-    }finally{if(submitted){pending.current=false;if(alive.current)setBusy(false);}}
+    } finally {pending.current = false; if (alive.current) setBusy(false);}
   }
-  const e=financialEstimates(data),margin=e?.faceValueMarginPercentage;
-  return <div className="two-columns"><section className="panel"><h3>财务估算配置</h3>
-    <details><summary>面值、汇率与计费影响</summary><p className="muted">积分面值不是实收单价；采购汇率用于 USD 成本换算。采购价格在模型价格版本中配置。修改会影响成本加成计费和估算口径，不会给卡密充值或调整余额；固定积分售价需在“模型与定价”另行调整。</p></details>
-    <form onSubmit={event=>{event.preventDefault();void publish();}}><fieldset disabled={busy||!config?.settings} className="field-grid">
-      <label>积分面值（元 / 积分）<input type="number" min="0" step="any" max="1000" required aria-invalid={!!inputError} aria-describedby="financial-value-help" value={face} onChange={event=>setFace(event.target.value)}/></label>
-      <label>采购汇率（CNY / USD）<input type="number" min="0" step="any" max="1000" required aria-invalid={!!inputError} aria-describedby="financial-value-help" value={rate} onChange={event=>setRate(event.target.value)}/></label>
-      <p id="financial-value-help" className="muted">两项数值均须大于 0、至多 1000。允许小数；留空不表示 0。</p>
-      <label>财务配置变更原因<input required maxLength={500} aria-describedby="financial-reason-help" value={reason} onChange={event=>setReason(event.target.value)}/></label>
-      <p id="financial-reason-help" className="muted">用于审计，已填写 {reasonBytes} / 500 字节（中文通常占 3 字节）。</p>
-      <button type="submit" disabled={needsReview || !!inputError || !reason.trim() || reasonBytes>500} className="primary">确认并发布财务配置</button></fieldset></form>
-    <button disabled={busy} onClick={()=>{if(!dirty||window.confirm('重新读取将丢弃未发布的财务编辑，继续吗？'))void load();}}>重新读取财务配置</button>
-    {inputError&&<p role="alert">{inputError}；当前输入尚未发布。</p>}
-    {needsReview&&<p role="alert">请重新读取财务配置核对，当前禁止发布；读取失败不会解除限制。</p>}
-    <p role="status">{message}</p>{refreshMessage&&<p role="status" className="muted">{refreshMessage}</p>}<p className="muted">版本：{config?.revision??'未读取'} · 更新时间：{config?.settings?.rate_updated_at_secs?new Date(config.settings.rate_updated_at_secs*1000).toLocaleString():'未提供'}（服务端记录）</p>
-  </section><section className="panel"><h3>保留账本估算</h3><p className="muted">仅覆盖当前保留的 usage 账本，不代表全历史收付款、采购发票或实际毛利。</p>
-    {!e?<p role="status">估算契约未提供或尚未读取，暂不计算。</p>:<><p>积分面值估算：{estimatedMoney(e.usageFaceValueMicroCny)}</p><p>已配置采购成本估算：{estimatedMoney(e.configuredProviderCostMicroCny)}{e.uncostedRequests>0?'（部分覆盖）':''}</p><p>已覆盖 {e.costedRequests} 笔 · 未覆盖 {e.uncostedRequests} 笔</p>
-      {e.uncostedRequests>0?<p role="status">成本覆盖不完整，差额与比例暂不计算；未定价请求不视为免费。</p>:<><p>积分面值减成本（非实际利润）：{estimatedMoney(e.faceValueLessCostMicroCny)}</p><p>面值差额比例：{typeof margin==='number'&&Number.isFinite(margin)?`${margin.toFixed(2)}%`:'暂不计算'}</p></>}
-    </>}
-    <p>实际到账收入：未关联收付款账本</p><p>实际毛利：暂不计算</p>
-  </section></div>;
+  useEffect(() => {alive.current = true; void load(); return () => {alive.current = false;};}, []);
+
+  async function publish() {
+    if (pending.current || needsReview || !config?.settings) return;
+    let settings: {credit_face_value_cny: number; usd_cny_rate: number};
+    try {
+      settings = parseFinancialSettings(face, rate);
+      if (!reason.trim() || reasonBytes > 500 || /[\x00-\x1f\x7f-\x9f]/.test(reason)) throw new Error('请填写变更原因（最多约 160 字，不含控制字符）');
+      if (settings.credit_face_value_cny === config.settings.credit_face_value_cny && settings.usd_cny_rate === config.settings.usd_cny_rate) throw new Error('数值与当前版本一致，无需发布');
+    } catch (error) {setMessage({tone: 'error', text: error instanceof Error ? error.message : '发布失败'}); return;}
+    const before = config.settings;
+    const confirmed = await confirmAction({
+      title: '发布结算参数？',
+      facts: [
+        ...(settings.credit_face_value_cny !== before.credit_face_value_cny ? [`积分面值 ${before.credit_face_value_cny} → ${settings.credit_face_value_cny} 元/积分`] : []),
+        ...(settings.usd_cny_rate !== before.usd_cny_rate ? [`美元汇率 ${before.usd_cny_rate} → ${settings.usd_cny_rate} CNY/USD`] : []),
+        `原因：${reason.trim()}`,
+      ],
+      consequence: '会影响成本加成计费和估算，不会改变卡密余额；有未结算请求时服务器会拒绝。',
+      confirmLabel: '发布',
+    });
+    if (!confirmed || pending.current || !alive.current) return;
+    let submitted = false;
+    try {
+      pending.current = true; submitted = true; setBusy(true); setPublishing(true); setMessage(null);
+      const result = await adminApi.publishCommercialConfig({settings, expected_revision: config.revision, reason: reason.trim()});
+      if (result.success !== true) throw new AdminApiError('服务端未确认发布', 400);
+      if (!result.config?.settings || !result.config.revision) throw new Error('服务端未返回可核对的配置版本');
+      if (alive.current) {
+        apply(result.config); setReason(''); setNeedsReview(false);
+        toast.success('已发布结算参数');
+        await onPublished();
+      }
+    } catch (error) {
+      if (alive.current) {
+        const mustReview = submitted && !(error instanceof AdminApiError && [400, 401, 403, 413, 422].includes(error.status));
+        if (mustReview) setNeedsReview(true);
+        const text = error instanceof Error ? error.message : '发布失败';
+        setMessage({tone: 'error', text: mustReview ? `没收到发布结果（${text}），请重新加载确认后再发布；修改已保留` : text});
+      }
+    } finally {if (submitted) {pending.current = false; if (alive.current) {setBusy(false); setPublishing(false);}}}
+  }
+
+  const blockedReason = needsReview ? '请重新加载确认后再发布' : !config?.settings ? '结算参数没有加载' : inputError ? inputError : !reason.trim() ? '填写变更原因后可发布' : reasonBytes > 500 ? '原因太长（最多约 160 字）' : undefined;
+  const updated = config?.settings?.rate_updated_at_secs;
+  return <section className="panel settings-panel">
+    <div className="panel-head">
+      <h3>结算参数</h3>
+      {updated ? <span className="muted">上次更新 {formatDateTime(updated)}</span> : null}
+    </div>
+    <form onSubmit={event => {event.preventDefault(); void publish();}}>
+      <fieldset disabled={busy || !config?.settings} className="form-grid form-grid-3">
+        <label className="field"><span className="field-label">积分面值<InfoTip text="把积分折算成人民币，用于估算"/></span>
+          <span className="input-suffix"><input aria-label="积分面值" type="number" min="0" step="any" max="1000" required aria-invalid={!!inputError} value={face} onChange={event => setFace(event.target.value)}/><span>元/积分</span></span></label>
+        <label className="field"><span className="field-label">美元汇率<InfoTip text="把 USD 采购价折成人民币"/></span>
+          <span className="input-suffix"><input aria-label="美元汇率" type="number" min="0" step="any" max="1000" required aria-invalid={!!inputError} value={rate} onChange={event => setRate(event.target.value)}/><span>CNY/USD</span></span></label>
+        <label className="field"><span className="field-label">变更原因</span>
+          <input aria-label="变更原因" required maxLength={500} placeholder="例：按 9 月汇率更新" value={reason} onChange={event => setReason(event.target.value)}/>
+          {reasonBytes > 400 && <span className={reasonBytes > 500 ? 'field-error' : 'field-hint'}>{reasonBytes} / 500 字节</span>}
+        </label>
+        {inputError && <p className="field-error field-span" role="alert">{inputError}</p>}
+      </fieldset>
+      {needsReview && <p role="alert" className="message message-warning">没收到发布结果或加载失败，请重新加载确认后再发布。</p>}
+      <div className="editor-actions">
+        {message && <p role="status" className={`message message-${message.tone}`}>{message.text}</p>}
+        <div className="button-row">
+          <button type="button" className="btn" disabled={busy} onClick={async () => {
+            if (dirty && !(await confirmAction({title: '放弃未发布的修改？', consequence: '会重新加载服务器上的结算参数。', confirmLabel: '放弃修改'}))) return;
+            void load(true);
+          }}>重新加载</button>
+          <button type="submit" className="btn btn-primary" disabled={busy || !!blockedReason} title={blockedReason}>{publishing ? '发布中…' : '发布'}</button>
+        </div>
+      </div>
+    </form>
+  </section>;
 }

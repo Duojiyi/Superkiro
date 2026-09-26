@@ -9,4 +9,4 @@ export function financialEstimates(data:AdminFinancials|null){
   if(data?.basis!=='retained_usage_ledger_estimate_not_cash_revenue'||!e||e.retainedLedgerOnly!==true||![e.costedRequests,e.uncostedRequests].every(v=>Number.isSafeInteger(v)&&v>=0))return null;
   return {...e,faceValueLessCostMicroCny:e.uncostedRequests>0?null:e.faceValueLessCostMicroCny,faceValueMarginPercentage:e.uncostedRequests>0?null:e.faceValueMarginPercentage};
 }
-export const estimatedMoney=(value:unknown)=>typeof value==='number'&&Number.isFinite(value)?`${(value/1_000_000).toLocaleString('zh-CN',{maximumFractionDigits:6})} 元`:'未提供';
+

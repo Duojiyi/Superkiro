@@ -24,6 +24,7 @@ const server=http.createServer(async(req,res)=>{
     const page=await browser.newPage();
     const origin=`http://127.0.0.1:${server.address().port}`, errors=[], posts=[];
     page.on('pageerror',error=>errors.push(error.message));
+    const nativeDialogs=[];page.on('dialog',d=>{nativeDialogs.push(d.message());void d.dismiss();});
     await page.route('**/*',route=>new URL(route.request().url()).origin===origin?route.continue():route.abort());
     // Eligibility comes only from the flag, never IDs or names (including misleading names).
     const legacy={id:'random-a',name:'PRO+',rate_card_id:'fixture-rate'};
@@ -41,6 +42,10 @@ const server=http.createServer(async(req,res)=>{
     const button=name=>page.getByRole('button',{name,exact:true});
     const select=()=>page.getByLabel('模型与计费分组',{exact:true});
     const open=async()=>{await button('卡密资产').click();await button('＋ 批量生成').click();};
+    const dialog=page.getByRole('dialog',{name:'批量生成卡密'});
+    // The generate button reads 生成 N 张; locate it by place so its label can follow the count.
+    const generate=()=>dialog.locator('.modal-actions .btn-primary');
+    const cancel=()=>dialog.getByRole('button',{name:'取消',exact:true}).click();
     await page.goto(origin+'/admin/');await page.getByLabel('密码',{exact:true}).fill('fixture-password');await button('登录').click();await open();
     assert.equal(await select().inputValue(),legacy.id);
     assert.deepEqual(await select().locator('option').evaluateAll(nodes=>nodes.map(n=>n.value)),['',legacy.id]);
@@ -49,39 +54,47 @@ const server=http.createServer(async(req,res)=>{
       assert.equal(await select().inputValue(),legacy.id);
       assert((await page.getByLabel('发卡摘要').innerText()).includes('有效期 30 天'));
     }
-    await button('取消').click();
+    await cancel();
     groups=[blocked,legacy,enabled];await page.reload();await open();
-    assert.equal(await select().inputValue(),'');assert(await button('生成并入库').isDisabled());
-    await button('生成并入库').evaluate(el=>el.click());assert.equal(posts.length,0);
+    assert.equal(await select().inputValue(),'');assert(await generate().isDisabled());
+    await generate().evaluate(el=>el.click());assert.equal(posts.length,0);assert.equal(await page.getByRole('alertdialog').count(),0);
     await select().selectOption(enabled.id);
     await page.getByLabel('积分套餐',{exact:true}).selectOption('tier-1000');assert.equal(await select().inputValue(),enabled.id);
-    page.once('dialog',async dialog=>{
-      for(const text of ['套餐：PRO','1,000 积分','有效期 30 天',enabled.name])assert(dialog.message().includes(text));
-      await dialog.accept();
-    });
-    await button('生成并入库').click();await page.getByText('TEST-ONLY',{exact:true}).first().waitFor();
+    await generate().click();
+    const confirmation=page.getByRole('alertdialog');await confirmation.waitFor();
+    for(const text of ['套餐：PRO','1,000 积分','有效期 30 天',enabled.name])assert((await confirmation.innerText()).includes(text),`confirmation mentions ${text}`);
+    await confirmation.locator('[data-confirm="accept"]').click();
+    await page.getByRole('dialog',{name:'新生成的卡密'}).getByText('TEST-ONLY',{exact:true}).first().waitFor();
     assert.equal(posts.length,1);assert.equal(posts[0].groupId,enabled.id);assert.equal(posts[0].templateId,'tier-1000');
+    // Close the one-time results as an operator would: until then, leaving the page asks first.
+    await page.getByRole('dialog',{name:'新生成的卡密'}).getByRole('button',{name:'完成',exact:true}).click();
+    await page.getByRole('alertdialog').locator('[data-confirm="accept"]').click();
+    await page.getByRole('dialog',{name:'新生成的卡密'}).waitFor({state:'detached'});
+    await page.locator('.btn-refresh:not([disabled])').waitFor();
     for(const unavailable of [[blocked],[]]){
       groups=unavailable;await page.reload();await open();
-      assert.equal(await select().inputValue(),'');assert(await select().isDisabled());assert(await button('生成并入库').isDisabled());
-      await button('生成并入库').evaluate(el=>el.click());assert.equal(posts.length,1);
-      await button('取消').click();
+      assert.equal(await select().inputValue(),'');assert(await select().isDisabled());assert(await generate().isDisabled());
+      await generate().evaluate(el=>el.click());assert.equal(posts.length,1);
+      await cancel();
     }
     groups=[legacy,blocked];await page.reload();await button('分组与权益').click();
-    const checkbox=page.getByLabel('允许发放新卡',{exact:true});await checkbox.waitFor();assert(await checkbox.isChecked());
-    await page.getByRole('button',{name:'编辑配置 →',exact:true}).nth(1).click();assert(!(await checkbox.isChecked()));
-    await page.getByRole('button',{name:'编辑配置 →',exact:true}).first().click();await checkbox.uncheck();
+    const checkbox=page.getByLabel('可发新卡',{exact:true});await checkbox.waitFor();assert(await checkbox.isChecked());
+    await page.getByRole('button',{name:'编辑',exact:true}).nth(1).click();assert(!(await checkbox.isChecked()));
+    await page.getByRole('button',{name:'编辑',exact:true}).first().click();await checkbox.uncheck();
     await page.route('**/api/v1/admin/commercial-config',async route=>{
       if(route.request().method()!=='POST')return route.fallback();
       saved=route.request().postDataJSON();groups=saved.groups;
       await route.fulfill({json:{success:true,config:{revision:'saved',groups,models:[],rate_cards:[],versions:[],audit:[]}}});
     });
     await page.getByLabel('变更原因',{exact:true}).fill('测试禁止新发卡');
-    page.once('dialog',dialog=>dialog.accept());await button('确认并发布').click();
-    await page.getByText('发布成功，配置与审计记录已保存。',{exact:true}).waitFor();
+    await button('发布').click();
+    const publishBox=page.getByRole('alertdialog');await publishBox.waitFor();
+    assert((await publishBox.innerText()).includes('测试禁止新发卡'),'the confirmation repeats the reason');
+    await publishBox.locator('[data-confirm="accept"]').click();
+    await page.locator('.toast').filter({hasText:'已发布'}).waitFor();
     assert.equal(saved.groups[0].issuance_enabled,false);assert.equal(saved.groups[1].issuance_enabled,false);
     assert.equal(saved.groups[0].rate_card_id,legacy.rate_card_id);
-    assert.deepEqual(errors,[]);
+    assert.deepEqual(errors,[]);assert.deepEqual(nativeDialogs,[],'no browser-native dialogs');
     console.log('PASS issuance: flag filtering, legacy/single auto-selection, explicit multiple selection, independent tiers, zero groups, summary, editor persistence');
   } finally {await browser.close();await new Promise(resolve=>server.close(resolve));}
 })().catch(error=>{console.error(error);process.exitCode=1;});

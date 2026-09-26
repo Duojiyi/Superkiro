@@ -2,6 +2,12 @@
 const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
 const http=require('node:http'),fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
 const fixture=require('./fixture-api.cjs')();
+// The console confirms in its own dialog (role alertdialog), never window.confirm.
+async function confirmIn(page,accept){
+  const box=page.getByRole('alertdialog');await box.waitFor();
+  await (accept?box.locator('[data-confirm="accept"]'):box.getByRole('button',{name:'取消',exact:true})).click();
+  await box.waitFor({state:'detached'});
+}
 async function waitForRoute(ready){
   const deadline=Date.now()+10000;
   while(!ready()){assert(Date.now()<deadline,'timed out waiting for intercepted request');await new Promise(r=>setTimeout(r,10));}
@@ -25,6 +31,7 @@ const server=http.createServer(async(req,res)=>{
     const origin=`http://127.0.0.1:${server.address().port}`;
     const requests=[],errors=[];let initial=true,heldSession,holdLoginSession=false,heldRevoke;
     page.on('pageerror',e=>errors.push(e.message));
+    const nativeDialogs=[];page.on('dialog',d=>{nativeDialogs.push(d.message());void d.dismiss();});
     await page.route('**/*',async route=>{
       const request=route.request(),url=new URL(request.url());
       if(url.origin!==origin)return route.abort();
@@ -45,7 +52,7 @@ const server=http.createServer(async(req,res)=>{
     await page.getByRole('heading',{name:'管理员登录',exact:true}).waitFor();
     await page.screenshot({path:path.join(screenshots,'login-unauthenticated.png'),fullPage:true,animations:'disabled'});
     for(const selector of ['.auth-card h1','.auth-card label','.auth-card input'])
-      assert.equal(await page.locator(selector).first().evaluate(el=>getComputedStyle(el).color),'rgb(35, 39, 43)');
+      assert.equal(await page.locator(selector).first().evaluate(el=>getComputedStyle(el).color),'rgb(31, 35, 40)');
     await page.keyboard.press('Escape');assert.equal(await page.getByRole('button',{name:'取消',exact:true}).count(),0);
     assert.equal(await page.locator('.sidebar,.workspace,[role=dialog]').count(),0);
     assert(requests.every(p=>p==='/api/v1/admin/session'));
@@ -69,11 +76,15 @@ const server=http.createServer(async(req,res)=>{
     await page.getByRole('button',{name:'刷新',exact:true}).waitFor();
     await page.screenshot({path:path.join(screenshots,'workspace-authenticated.png'),fullPage:true,animations:'disabled'});
     await page.getByRole('navigation').getByRole('button',{name:'财务对账',exact:true}).click();
-    await page.getByRole('heading',{name:'财务估算配置'}).waitFor();
-    await page.getByText('成本覆盖不完整，差额与比例暂不计算；未定价请求不视为免费。',{exact:true}).waitFor();
-    await page.getByLabel('积分面值（元 / 积分）').fill('0.02');await page.getByLabel('采购汇率（CNY / USD）').fill('7.3');await page.getByLabel('财务配置变更原因').fill('fixture settings');
-    page.once('dialog',dialog=>dialog.accept());await page.getByRole('button',{name:'确认并发布财务配置'}).click();
-    await page.getByText('配置已发布，正在刷新账本估算。',{exact:true}).waitFor();
+    await page.getByRole('heading',{name:'结算参数'}).waitFor();
+    // Incomplete cost coverage: no margin is computed and unpriced requests are not free.
+    await page.getByText('1 次请求未定价，毛利暂不计算',{exact:true}).waitFor();
+    await page.getByLabel('积分面值',{exact:true}).fill('0.02');await page.getByLabel('美元汇率',{exact:true}).fill('7.3');await page.getByLabel('变更原因',{exact:true}).fill('fixture settings');
+    await page.getByRole('button',{name:'发布',exact:true}).click();
+    const financeBox=page.getByRole('alertdialog');await financeBox.waitFor();
+    assert((await financeBox.innerText()).includes('0.01 → 0.02'));assert((await financeBox.innerText()).includes('7.2 → 7.3'));
+    await confirmIn(page,true);
+    await page.getByRole('status').filter({hasText:'已发布结算参数'}).waitFor();
     assert.deepEqual(fixture.writes.find(w=>w.endpoint==='commercial-config').body,{settings:{credit_face_value_cny:0.02,usd_cny_rate:7.3},expected_revision:'fixture-rev-2',reason:'fixture settings'});
     await page.screenshot({path:path.join(screenshots,'financial-settings-estimates.png'),fullPage:true});
     // A lost adjustment response keeps one intent key and immutable parameters.
@@ -87,29 +98,30 @@ const server=http.createServer(async(req,res)=>{
     await page.getByRole('textbox',{name:'调账原因说明'}).fill('fixture adjustment');
     for(const amount of ['1000001','0.0000001','-0.0000001','1.0000001']){
       await page.getByRole('spinbutton',{name:'增减积分数量'}).fill(amount);
-      await page.getByRole('button',{name:'确认调账',exact:true}).click();
+      assert(await page.getByRole('button',{name:'下一步',exact:true}).isDisabled(),`${amount} must not reach review`);
       assert.equal(adjustmentBodies.length,0);assert.equal(await page.evaluate(()=>sessionStorage.length),0);
       assert.equal(await page.getByRole('spinbutton',{name:'增减积分数量'}).isDisabled(),false);
     }
     await page.getByRole('spinbutton',{name:'增减积分数量'}).fill('10');
-    page.once('dialog',dialog=>dialog.accept());await page.getByRole('button',{name:'确认调账',exact:true}).click();
+    // The review step names card, before → after and the reason before anything is sent.
+    await page.getByRole('button',{name:'下一步',exact:true}).click();
+    assert((await page.getByLabel('调账复核').innerText()).includes('fixture adjustment'));assert.equal(adjustmentBodies.length,0);
+    await page.getByRole('button',{name:'确认入账',exact:true}).click();
     await page.getByRole('dialog').getByRole('alert').waitFor();
     assert(await page.getByRole('spinbutton',{name:'增减积分数量'}).isDisabled());
-    await page.reload();await page.getByRole('button',{name:'重新登录确认调账账户'}).click();
+    // The server names the operator, so a reload restores the same intent without a new sign-in.
+    await page.reload();await page.getByRole('navigation',{name:'管理导航'}).waitFor();
     assert.equal(adjustmentBodies.length,1);
-    await page.getByLabel('密码',{exact:true}).fill('fixture-password');
-    // The typed password lives in the input's value property only, never in markup.
-    assert(!(await page.content()).includes('fixture-password'),'password mirrored into the DOM');
-    await page.getByRole('button',{name:'登录',exact:true}).click();
     await page.getByRole('navigation').getByRole('button',{name:'卡密资产',exact:true}).click();
     await page.getByRole('button',{name:'调账',exact:true}).first().click();
     assert.equal(await page.getByRole('textbox',{name:'调账原因说明'}).inputValue(),'fixture adjustment');
+    assert(await page.getByRole('spinbutton',{name:'增减积分数量'}).isDisabled(),'a pending intent keeps its original parameters');
     await page.screenshot({path:path.join(screenshots,'adjustment-restored.png'),fullPage:true});
     assert.equal(adjustmentBodies.length,1);
-    page.once('dialog',dialog=>dialog.accept());await page.getByRole('button',{name:'确认调账',exact:true}).click();
+    await page.getByRole('button',{name:'下一步',exact:true}).click();await page.getByRole('button',{name:'确认入账',exact:true}).click();
     await page.getByRole('dialog').getByRole('alert').filter({hasText:'unclassified rejection'}).waitFor();
     assert.equal(await page.evaluate(()=>sessionStorage.length),1);assert(await page.getByRole('spinbutton',{name:'增减积分数量'}).isDisabled());
-    page.once('dialog',dialog=>dialog.accept());await page.getByRole('button',{name:'确认调账',exact:true}).click();
+    await page.getByRole('button',{name:'确认入账',exact:true}).click();
     await page.getByRole('dialog').waitFor({state:'detached'});
     assert.deepEqual(adjustmentBodies[1],adjustmentBodies[2]);
     assert.equal(adjustmentBodies.length,3);assert(adjustmentBodies[0].idempotencyKey);assert.deepEqual(adjustmentBodies[0],adjustmentBodies[1]);
@@ -118,36 +130,43 @@ const server=http.createServer(async(req,res)=>{
     await page.evaluate(()=>sessionStorage.setItem('superkiro.pending-adjustment.v1:admin',JSON.stringify({operator:'admin',cardId:'fixture-card-0',delta:0.0000001,reason:'legacy zero micro',key:'legacy-zero-micro'})));
     await page.getByRole('button',{name:'调账',exact:true}).first().click();
     await page.getByRole('button',{name:'清除零微积分意图'}).waitFor();
-    page.once('dialog',dialog=>dialog.dismiss());await page.getByRole('button',{name:'清除零微积分意图'}).click();assert.equal(await page.evaluate(()=>sessionStorage.length),1);
-    page.once('dialog',dialog=>dialog.accept());await page.getByRole('button',{name:'清除零微积分意图'}).click();assert.equal(await page.evaluate(()=>sessionStorage.length),0);assert.equal(adjustmentBodies.length,3);
+    await page.getByRole('button',{name:'清除零微积分意图'}).click();await confirmIn(page,false);assert.equal(await page.evaluate(()=>sessionStorage.length),1);
+    await page.getByRole('button',{name:'清除零微积分意图'}).click();await confirmIn(page,true);assert.equal(await page.evaluate(()=>sessionStorage.length),0);assert.equal(adjustmentBodies.length,3);
     assert.equal(await page.getByRole('spinbutton',{name:'增减积分数量'}).isDisabled(),false);
     await page.getByRole('button',{name:'取消',exact:true}).click();
     await page.getByRole('navigation').getByRole('button',{name:'模型与定价',exact:true}).click();
-    await page.getByText('高级配置 JSON · 新增条目与价格版本',{exact:true}).click();
+    await page.getByText('编辑 JSON（高级）',{exact:true}).click();
     const draft=page.locator('textarea[aria-label="配置 JSON"]');await draft.fill('{"models":[],"privateDraft":"old-sensitive-draft"}');
     holdLoginSession=true;await page.evaluate(()=>window.dispatchEvent(new Event('focus')));await waitForRoute(()=>heldSession);
     assert.equal(await draft.inputValue(),'{"models":[],"privateDraft":"old-sensitive-draft"}');
-    assert(await draft.evaluate(el=>!!el.closest('[inert]')));
+    // A re-check in progress no longer covers the workspace; writes still need the session and CSRF.
+    assert.equal(await draft.evaluate(el=>!!el.closest('[inert]')),false);
+    assert.equal(await page.getByRole('status').filter({hasText:'正在检查会话'}).count(),0);
     holdLoginSession=false;await heldSession.continue();heldSession=null;
-    await page.getByRole('status').filter({hasText:'正在检查会话'}).waitFor({state:'detached'});
     assert.equal(await draft.inputValue(),'{"models":[],"privateDraft":"old-sensitive-draft"}');
+    // A re-check that cannot complete blocks the workspace, keeping the draft, until it succeeds.
     holdLoginSession=true;await page.evaluate(()=>window.dispatchEvent(new Event('focus')));await waitForRoute(()=>heldSession);
     await heldSession.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'temporary outage'})});heldSession=null;holdLoginSession=false;
-    await page.getByRole('button',{name:'重新验证会话'}).waitFor();assert.equal(await draft.inputValue(),'{"models":[],"privateDraft":"old-sensitive-draft"}');assert(await draft.evaluate(el=>!!el.closest('[inert]')));
+    const recheck=page.getByRole('alertdialog',{name:'无法确认登录状态'});
+    await recheck.getByRole('button',{name:'重试'}).waitFor();assert.equal(await draft.inputValue(),'{"models":[],"privateDraft":"old-sensitive-draft"}');assert(await draft.evaluate(el=>!!el.closest('[inert]')));
     await page.screenshot({path:path.join(screenshots,'session-recheck-blocked.png'),fullPage:true});
-    await page.getByRole('button',{name:'重新验证会话'}).click();await page.getByRole('button',{name:'重新验证会话'}).waitFor({state:'detached'});
-    page.once('dialog',dialog=>dialog.dismiss());await page.getByRole('navigation').getByRole('button',{name:'分组与权益',exact:true}).click();assert.equal(await draft.inputValue(),'{"models":[],"privateDraft":"old-sensitive-draft"}');
+    await recheck.getByRole('button',{name:'重试'}).click();await recheck.waitFor({state:'detached'});
+    assert.equal(await draft.evaluate(el=>!!el.closest('[inert]')),false);
+    await page.getByRole('navigation').getByRole('button',{name:'分组与权益',exact:true}).click();await confirmIn(page,false);assert.equal(await draft.inputValue(),'{"models":[],"privateDraft":"old-sensitive-draft"}');
     fixture.expire();await page.getByRole('button',{name:'刷新',exact:true}).click();
     await page.getByRole('heading',{name:'管理员登录',exact:true}).waitFor();
     assert.equal(await page.locator('.workspace,.sidebar,[role=dialog],textarea').count(),0);
     assert.equal(await page.getByText('old-sensitive-draft',{exact:false}).count(),0);
-    await page.getByLabel('密码',{exact:true}).fill('fixture-password');await page.getByRole('button',{name:'登录',exact:true}).click();
+    await page.getByLabel('密码',{exact:true}).fill('fixture-password');
+    // The typed password lives in the input's value property only, never in markup.
+    assert(!(await page.content()).includes('fixture-password'),'password mirrored into the DOM');
+    await page.getByRole('button',{name:'登录',exact:true}).click();
     await page.getByRole('heading',{name:'运营概览',level:2,exact:true}).waitFor();
     await page.getByRole('navigation').getByRole('button',{name:'模型与定价',exact:true}).click();
-    await page.getByText('高级配置 JSON · 新增条目与价格版本',{exact:true}).click();
+    await page.getByText('编辑 JSON（高级）',{exact:true}).click();
     // An unpublished draft (no secrets) survives the expired session in this tab and is
     // restored after the next login onto the configuration it was made from, never before.
-    await page.getByText('已恢复会话到期前未发布的草稿，请核对后发布。',{exact:true}).waitFor();
+    await page.getByRole('status').filter({hasText:'已恢复未发布的修改'}).waitFor();
     assert((await page.getByRole('textbox',{name:'配置 JSON',exact:true}).inputValue()).includes('old-sensitive-draft'));
     // Focus revalidation must hide the old workspace and reject revoked cookies.
     fixture.expire();await page.evaluate(()=>window.dispatchEvent(new Event('focus')));
@@ -165,13 +184,24 @@ const server=http.createServer(async(req,res)=>{
     await page.unroute('**/api/v1/admin/session');
     await page.getByLabel('密码',{exact:true}).fill('fixture-password');await page.getByRole('button',{name:'登录',exact:true}).click();
     await page.getByRole('heading',{name:'运营概览',level:2,exact:true}).waitFor();
+    await page.route('**/api/v1/admin/session',async route=>{
+      if(route.request().method()!=='GET')return route.fallback();
+      const response=await route.fetch(),data=await response.json();delete data.username;
+      return route.fulfill({response,json:data});
+    });
+    await page.reload();await page.getByRole('navigation',{name:'管理导航'}).waitFor();
+    await page.getByRole('navigation').getByRole('button',{name:'卡密资产',exact:true}).click();
+    await page.getByRole('button',{name:'调账',exact:true}).first().click();
+    await page.getByRole('alert').filter({hasText:'需要重新登录以确认操作人'}).getByRole('button',{name:'重新登录'}).waitFor();
+    assert.equal(await page.getByRole('dialog',{name:'卡密调账'}).count(),0);assert.equal(adjustmentBodies.length,3);
+    await page.unroute('**/api/v1/admin/session');await page.reload();await page.getByRole('navigation',{name:'管理导航'}).waitFor();
     await page.getByRole('button',{name:'退出',exact:true}).click();
     await page.getByRole('heading',{name:'管理员登录',exact:true}).waitFor();assert.equal(await page.locator('.workspace,.sidebar,textarea').count(),0);
     await waitForRoute(()=>heldRevoke);
     const count=requests.length;await heldRevoke.fulfill({status:503,contentType:'application/json',body:'{}'});
     await page.getByRole('alert').waitFor();assert.equal(requests.length,count);assert.equal(await page.locator('.workspace,.sidebar').count(),0);
     assert.equal(await page.evaluate(()=>localStorage.length+sessionStorage.length),0);
-    assert.deepEqual(errors,[]);
+    assert.deepEqual(errors,[]);assert.deepEqual(nativeDialogs,[],'no browser-native dialogs');
     // Separate anonymous context: the server explicitly requires TOTP.
     const twoFactorPage=await browser.newPage();
     try {

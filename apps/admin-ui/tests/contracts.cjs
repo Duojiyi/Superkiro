@@ -90,12 +90,16 @@ for (const input of ['', '-1', 'NaN', 'Infinity', '1e3', '1.0000001', '900719925
  console.log('PASS adjustment storage: whitelist, operator isolation, stable retry, clear, corrupt/denied');
 }
 {
- const {parseFinancialSettings,financialEstimates,estimatedMoney}=load('financial.ts');
+ const {parseFinancialSettings,financialEstimates}=load('financial.ts');
  assert.deepEqual(JSON.parse(JSON.stringify(parseFinancialSettings('0.01','7.2'))),{credit_face_value_cny:0.01,usd_cny_rate:7.2});
  for(const value of ['', '0', '-1', 'Infinity', '1001'])assert.throws(()=>parseFinancialSettings(value,'7'));
  const data={basis:'retained_usage_ledger_estimate_not_cash_revenue',estimates:{retainedLedgerOnly:true,costedRequests:2,uncostedRequests:1,faceValueLessCostMicroCny:123,faceValueMarginPercentage:50}};
  assert.equal(financialEstimates(data).faceValueLessCostMicroCny,null);assert.equal(financialEstimates(data).faceValueMarginPercentage,null);
- assert.equal(financialEstimates({dashboard:{provider_cost_micro_cny:100}}),null);assert.equal(estimatedMoney(null),'未提供');assert.equal(estimatedMoney(1000000),'1 元');
+ assert.equal(financialEstimates({dashboard:{provider_cost_micro_cny:100}}),null);
+ // Money is micro-CNY: 1,000,000 is one yuan; a missing value is never shown as zero.
+ const display=load('format.ts');
+ assert.equal(display.formatMoney(null),'—');assert.equal(display.formatMoney(1000000),'¥1.00');assert.equal(display.formatMoney(492918),'¥0.49');
+ assert.equal(display.formatMoneyExact(492918),'¥0.492918');assert.equal(display.formatMoney(2500),'¥0.0025');assert.equal(display.formatMoney(0),'¥0.00');
  assert.equal(financialEstimates({...data,estimates:{...data.estimates,uncostedRequests:0,faceValueMarginPercentage:null}}).faceValueMarginPercentage,null);
  console.log('PASS financial settings bounds, micro-CNY units, incomplete coverage, no legacy fallback');
 }
@@ -123,3 +127,51 @@ for (const input of ['', '-1', 'NaN', 'Infinity', '1e3', '1.0000001', '900719925
  const roundedLegacy={...old,delta:0.0000009};values.set('superkiro.pending-adjustment.v1:admin',JSON.stringify(roundedLegacy));saveAdjustment(storage,roundedLegacy);assert.equal(loadAdjustment(storage,'admin').delta,0.0000009);
  console.log('PASS signed microcredit precision/bounds, legacy zero-micro recovery, narrow rejection whitelist');
 }
+
+// One formatting module for credits, charges, tokens, durations and IDs (design system 1.2.6).
+{
+ const f=load('format.ts');
+ assert.equal(f.formatCredits(2000),'2,000');assert.equal(f.formatCredits(75.93),'75.93');assert.equal(f.formatCredits(1999.999),'2,000');assert.equal(f.formatCredits(undefined),'—');
+ assert.equal(f.formatCreditsMicro(48950000),'48.95');
+ assert.equal(f.formatCharge(0),'—');assert.equal(f.formatCharge(137952),'0.1380');assert.equal(f.formatCharge(null),'—');
+ assert.equal(f.formatTokenCount(36844),'36.8K');assert.equal(f.formatTokenCount(1828),'1.8K');assert.equal(f.formatTokenCount(820),'820');assert.equal(f.formatTokenCount(2000000),'2M');
+ assert.equal(f.formatDuration(820),'820 ms');assert.equal(f.formatDuration(1240),'1.2 s');assert.equal(f.formatDuration(null),'—');
+ assert.equal(f.formatSpeed(41.6),'42 tok/s');assert.equal(f.formatSpeed(null),'—');assert.equal(f.formatPercent(97),'97.0%');
+ assert.equal(f.shortId('card-31842ac540a3d133','card'),'card-3184…d133');assert.equal(f.shortId('fixture-card-0','card'),'fixture-card-0');
+ assert.equal(f.shortId('dev_6e6b30d1cd19b117b5a349b9cbc2452f','device'),'dev_6e6b…452f');assert.equal(f.shortId('5dd2a1de5daf3b80d7','hash'),'5dd2a1d');
+ const iso='2026-09-20T15:02:58.534Z',local=new Date(iso),pad=n=>String(n).padStart(2,'0');
+ assert.equal(f.formatBatchNote(`VIP 客户 · 批次 ${iso} 48cb0b82-d772-48b6-9064-674b06a82c1d-#1`),`VIP 客户 · 批次 ${pad(local.getMonth()+1)}-${pad(local.getDate())} ${pad(local.getHours())}:${pad(local.getMinutes())} · #1`);
+ assert.equal(f.formatBatchNote('[BANNED: release smoke cleanup]'),'[BANNED: release smoke cleanup]');
+ const now=Date.UTC(2026,8,26,12,0,0);
+ assert.equal(f.formatRelative(now/1000-30,now),'刚刚');assert.equal(f.formatRelative(now/1000-180,now),'3 分钟前');assert.equal(f.formatRelative(now/1000-7200,now),'2 小时前');
+ assert.deepEqual(JSON.parse(JSON.stringify(f.formatRemaining(now/1000+24*86400+60,now))),{text:'剩 24 天',tone:'normal'});
+ assert.equal(f.formatRemaining(now/1000+3*86400,now).tone,'warning');assert.equal(f.formatRemaining(now/1000-1,now).tone,'danger');
+ assert.equal(f.formatSessionLeft(12*60000),'12 分钟');assert.equal(f.formatSessionLeft(105000),'1:45');
+ console.log('PASS display formats: credits, charges, money, tokens, durations, relative and remaining time, batch notes, short IDs');
+}
+
+// The session names the operator (so a page reload needs no second sign-in), and traces
+// are read through the same cookie/CSRF client: a card filter and on-demand content.
+(async () => {
+  const calls = [];
+  let username = 'admin', token = 'csrf-1';
+  const {AdminApiClient} = load('api.ts', {fetch: async (url, options = {}) => {
+    calls.push({url, options});
+    return {ok: true, json: async () => url.endsWith('/session') ? {success: true, role: 'admin', csrfToken: token, ...(username ? {username} : {})} : {success: true, traces: [], invocationId: 'x'}};
+  }});
+  const api = new AdminApiClient('');
+  await api.checkAuth();
+  assert.equal(api.authenticatedUsername, 'admin');
+  username = undefined; token = 'csrf-2';
+  await api.checkAuth();
+  assert.equal(api.authenticatedUsername, null, 'a new session without a name must not inherit the old operator');
+  username = 'admin'; await api.checkAuth(); assert.equal(api.authenticatedUsername, 'admin');
+  await api.getTraces(500, 'card-1');
+  assert.equal(calls.at(-1).url, '/api/v1/admin/traces?limit=500&card_id=card-1');
+  await api.getTraceContent('card-1:inv/2 x');
+  const read = calls.at(-1);
+  assert.equal(read.url, '/api/v1/admin/traces/content?invocation_id=card-1%3Ainv%2F2%20x');
+  assert.equal(read.options.method, undefined); assert.equal(read.options.body, undefined);
+  assert.equal(read.options.credentials, 'same-origin'); assert.equal(read.options.cache, 'no-store');
+  console.log('PASS session operator name, trace card filter and on-demand trace content request');
+})().catch(error => {console.error(error); process.exitCode = 1;});

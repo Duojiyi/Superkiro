@@ -1,11 +1,26 @@
-import { useEffect, useRef, useState } from 'react';
-import { adminApi, AdminApiError } from './api';
+import {useEffect, useRef, useState} from 'react';
+import {adminApi, AdminApiError} from './api';
+import {confirmAction} from './components/confirm';
+import {IconClose} from './components/icons';
+import {toast} from './components/toast';
+import {InfoTip} from './components/ui';
 
-export default function ProviderKeyEditor({ selectedKey, onSaved, onDirtyChange, onBusyChange }: {selectedKey?: Record<string, unknown>; onSaved?: (savedKey?: Record<string, unknown>) => void; onDirtyChange: (dirty: boolean) => void; onBusyChange: (busy: boolean) => void}) {
-  const [provider, setProvider] = useState('');
+type Message = {tone: 'error' | 'warning' | 'info'; text: string} | null;
+
+export default function ProviderKeyEditor({selectedKey, preset, knownModels = [], onSaved, onDirtyChange, onBusyChange, onClose}: {
+  selectedKey?: Record<string, unknown>;
+  preset?: {providerId?: string; keyId?: string; suggestedKeyId?: string};
+  /** Upstream models already listed in 模型与定价, to point out the ones that are not. */
+  knownModels?: string[];
+  onSaved?: (savedKey?: Record<string, unknown>) => void;
+  onDirtyChange: (dirty: boolean) => void;
+  onBusyChange: (busy: boolean) => void;
+  onClose?: () => void;
+}) {
+  const [provider, setProvider] = useState(preset?.providerId ?? '');
   const [baseUrl, setBaseUrl] = useState('');
   const [format, setFormat] = useState('anthropic');
-  const [keyId, setKeyId] = useState('');
+  const [keyId, setKeyId] = useState(preset?.keyId ?? preset?.suggestedKeyId ?? '');
   const [secret, setSecret] = useState('');
   // Uncontrolled so the key never lands in the input's DOM attribute.
   const secretInput = useRef<HTMLInputElement>(null);
@@ -17,23 +32,26 @@ export default function ProviderKeyEditor({ selectedKey, onSaved, onDirtyChange,
   const [dirty, setDirty] = useState(false);
   const pending = useRef(false);
   const [review, setReview] = useState<{provider: string; key: string} | null>(null);
+  const [message, setMessage] = useState<Message>(null);
   const modelIds = [...new Set(models.split(/\r?\n/).map(model => model.trim()).filter(Boolean))];
   const validText = (text: string, max: number) => !!text.trim() && new TextEncoder().encode(text).length <= max && !/[\x00-\x1f\x7f-\x9f]/.test(text);
   const validate = (importing = false) => {
-    if (!validText(provider.trim(), 256)) throw new Error('供应商 ID 不能为空，不能包含控制字符，且不能超过 256 字节');
-    if (!importing && !validText(keyId.trim(), 256)) throw new Error('Key ID 不能为空，不能包含控制字符，且不能超过 256 字节');
-    if ((secret || importing) && (!validText(secret, 4096) || secret !== secret.trim())) throw new Error('API Key 不能为空，不能包含首尾空白或控制字符，且不能超过 4096 字节');
+    if (!validText(provider.trim(), 256)) throw new Error('请填写供应商 ID（不超过 256 字节，不含控制字符）');
+    if (!importing && !validText(keyId.trim(), 256)) throw new Error('请填写 Key ID（不超过 256 字节，不含控制字符）');
+    if ((secret || importing) && (!validText(secret, 4096) || secret !== secret.trim())) throw new Error('请填写 API Key（首尾不能有空格，不超过 4096 字节）');
   };
   const validateModels = () => {
-    if (modelIds.length > 1000 || modelIds.some(model => !validText(model, 256))) throw new Error('最多允许 1000 个模型，每个 ID 不超过 256 字节且不能包含控制字符');
+    if (modelIds.length > 1000 || modelIds.some(model => !validText(model, 256))) throw new Error('最多 1000 个模型，每个 ID 不超过 256 字节');
   };
   const writeFailure = (error: unknown, target: {provider: string; key: string}) => {
     const rejected = error instanceof AdminApiError && [400, 401, 403, 404, 409, 413, 422].includes(error.status);
     if (!rejected) setReview(target);
-    setMessage(`${error instanceof Error ? error.message : String(error)}。${rejected ? '服务端拒绝了本次操作，草稿已保留，请修正后再保存。' : '写入结果未确认，已暂停保存和导入。请重新读取 Key 核对，不要重复提交。'}`);
+    const text = error instanceof Error ? error.message : String(error);
+    setMessage({tone: 'error', text: rejected ? `保存失败：${text}。修改已保留，请修正后再保存。` : `没收到保存结果（${text}），已暂停保存和导入。请重新读取确认后再操作，不要重复提交。`});
   };
   useEffect(() => {onDirtyChange(dirty);}, [dirty, onDirtyChange]);
   useEffect(() => {onBusyChange(busy); return () => onBusyChange(false);}, [busy, onBusyChange]);
+  useEffect(() => () => onDirtyChange(false), [onDirtyChange]);
   const [discovery, setDiscovery] = useState<{key: string; models: string[]; incomplete: boolean} | null>(null);
   useEffect(() => {
     if (!selectedKey) return;
@@ -41,9 +59,11 @@ export default function ProviderKeyEditor({ selectedKey, onSaved, onDirtyChange,
     setModels(Array.isArray(selectedKey.allowed_models) ? selectedKey.allowed_models.join('\n') : '');
     setWeight(String(selectedKey.weight ?? 1)); setEnabled(selectedKey.enabled !== false); setSecret(''); setDiscovery(null);
   // Refreshes must not replace an in-progress draft; remounting reads the latest saved row.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedKey?.id, selectedKey?.provider_id]);
   useEffect(() => {setDiscovery(null);}, [provider, keyId, secret]);
-  const [message, setMessage] = useState('模型目录仅供配置参考，保存授权后还需在“模型与定价”中发布。');
+
+  const savedModels = Array.isArray(selectedKey?.allowed_models) ? (selectedKey!.allowed_models as unknown[]).map(String) : null;
   const act = async (action: 'save' | 'discover') => {
     if (pending.current || (action === 'save' && review)) return;
     try {
@@ -51,9 +71,22 @@ export default function ProviderKeyEditor({ selectedKey, onSaved, onDirtyChange,
       if (action === 'save') {
         validateModels();
         if (!weight.trim() || !Number.isInteger(Number(weight)) || Number(weight) < 1 || Number(weight) > 1000) throw new Error('权重须为 1 至 1000 的整数');
-        if (!window.confirm(`确认保存供应商“${provider.trim()}”的 Key“${keyId.trim()}”？\n${modelIds.length ? `允许 ${modelIds.length} 个模型` : '空模型列表将拒绝所有模型'}；权重 ${weight}；${enabled ? '启用' : '停用'}。${secret ? '\n将写入本次填写的 API Key。' : '\n保留已有 API Key；新增 Key 必须填写密钥。'}`)) return;
       }
-    } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); return; }
+    } catch (error) {setMessage({tone: 'error', text: error instanceof Error ? error.message : String(error)}); return;}
+    if (action === 'save') {
+      const added = savedModels ? modelIds.filter(model => !savedModels.includes(model)).length : modelIds.length;
+      const confirmed = await confirmAction({
+        title: `保存 Key ${keyId.trim()}？`,
+        facts: [
+          savedModels ? `可用模型 ${savedModels.length} → ${modelIds.length}${added ? `（新增 ${added}）` : ''}` : `可用模型 ${modelIds.length} 个`,
+          `权重 ${weight} · ${enabled ? '启用' : '停用'}`,
+          secret ? '将写入这次填写的 API Key' : selectedKey ? '密钥不变' : '新增 Key 必须填写 API Key',
+        ],
+        consequence: modelIds.length ? undefined : '未选择模型：这个 Key 不会被使用。',
+        confirmLabel: '保存',
+      });
+      if (!confirmed || pending.current) return;
+    }
     pending.current = true; setBusy(true);
     if (action === 'discover') setDiscovery(null);
     try {
@@ -63,40 +96,56 @@ export default function ProviderKeyEditor({ selectedKey, onSaved, onDirtyChange,
       });
       if (result.success !== true) throw new AdminApiError('服务器未确认操作成功', 400);
       if (action === 'discover') {
-        if (!Array.isArray(result.models) || result.models.some(model => typeof model !== 'string' || !validText(model, 256))) throw new Error('候选模型格式无效，原权限草稿未更改');
+        if (!Array.isArray(result.models) || result.models.some(model => typeof model !== 'string' || !validText(model, 256))) throw new Error('候选模型格式无效，可用模型没有改动');
         const candidates = [...new Set(result.models)];
+        const fresh = candidates.filter(model => !modelIds.includes(model)).length;
         setDiscovery({key: keyId.trim(), models: candidates, incomplete: Boolean(result.has_more)});
-        setMessage(!candidates.length ? '上游未返回候选模型，原权限草稿未更改。可手动填写已确认可用的模型 ID。' : result.has_more ? '只获取到上游第一页，列表不完整。填入时会合并现有草稿，不删除原权限；请补全后保存。' : '候选模型已读取，尚未更改权限。请核对可调用性、价格与能力后保存；用户目录仍需单独发布。');
+        setMessage(!candidates.length ? {tone: 'info', text: '上游没有返回模型，可以手动添加'}
+          : result.has_more ? {tone: 'warning', text: `只取到部分模型（上游有分页，${candidates.length} 个），可手动补充`}
+          : {tone: 'info', text: `获取到 ${candidates.length} 个模型（${fresh} 个新）`});
       } else {
-        setDirty(false); setSecret('');
-        setMessage('密钥授权已保存。用户可用模型请在“模型与定价”中配置并发布。');
+        setDirty(false); setSecret(''); setMessage(null);
+        const unlisted = modelIds.filter(model => !knownModels.includes(model)).length;
+        toast.success(unlisted && knownModels.length ? `已保存 Key ${keyId.trim()}，${unlisted} 个模型还没在“模型与定价”上架` : `已保存 Key ${keyId.trim()}`);
         onSaved?.({id: keyId.trim(), provider_id: provider.trim(), allowed_models: modelIds, weight: Number(weight), enabled});
       }
     } catch (error) {
       if (action === 'save') writeFailure(error, {provider: provider.trim(), key: keyId.trim()});
-      else setMessage(`${error instanceof Error ? error.message : String(error)}。发现失败，原权限草稿未更改，可重新获取。`);
-    } finally { pending.current = false; setBusy(false); }
+      else setMessage({tone: 'error', text: `获取失败（${error instanceof Error ? error.message : String(error)}），可用模型没有改动，可以重试`});
+    } finally {pending.current = false; setBusy(false);}
   };
+
   const createProvider = async () => {
     if (pending.current || review) return;
     try {
       validate(true); validateModels();
       let url: URL;
-      try { url = new URL(baseUrl.trim()); } catch { throw new Error('请填写完整的上游地址，例如 https://api.example.com'); }
+      try {url = new URL(baseUrl.trim());} catch {throw new Error('请填写完整的上游地址，例如 https://api.example.com');}
       if (!(url.protocol === 'https:' || (url.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(url.hostname)))) throw new Error('上游地址须使用 HTTPS（本机 localhost、127.0.0.1 可用 HTTP）');
-      if (!window.confirm(`确认导入渠道“${provider.trim()}”？\n地址：${baseUrl.trim()}\n同名渠道会更新地址、格式，并启用渠道；默认 Key“${provider.trim()}-key-1”将更新密钥和 ${modelIds.length} 个模型权限，并重置为启用、权重 1。下方自定义 Key ID、权重及启用状态不参与导入。${modelIds.length ? '' : '\n空模型列表将拒绝所有模型。'}\n不会发布模型或价格。`)) return;
-    } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); return; }
+    } catch (error) {setMessage({tone: 'error', text: error instanceof Error ? error.message : String(error)}); return;}
+    const defaultKey = `${provider.trim()}-key-1`;
+    const confirmed = await confirmAction({
+      title: `添加供应商 ${provider.trim()}？`,
+      facts: [`地址 ${baseUrl.trim()} · ${format === 'openai' ? 'OpenAI' : 'Anthropic'} 接口`, `将创建 Key：${defaultKey}（${modelIds.length} 个模型）`, ...(modelIds.length ? [] : ['未选择模型：这个 Key 不会被使用'])],
+      consequence: '如果已有同名供应商，会覆盖它的地址和这把 Key，并重置为启用、权重 1。不会发布模型或价格。',
+      confirmLabel: '添加',
+    });
+    if (!confirmed || pending.current) return;
     pending.current = true; setBusy(true);
     try {
       const result = await adminApi.importProvider({providers: [{id: provider.trim(), name: provider.trim(), api_type: format, base_url: baseUrl.trim(), api_key: secret, models: modelIds}]});
       if (result.success !== true) throw new AdminApiError('服务器未确认供应商已保存', 400);
-      setDirty(false); setKeyId(provider.trim() + '-key-1'); setWeight('1'); setEnabled(true); setSecret(''); onSaved?.();
-      setMessage('渠道已导入，默认 Key ID 已填入（启用、权重 1）。模型权限已按草稿保存；用户模型与价格仍需单独发布。');
-    } catch (error) { writeFailure(error, {provider: provider.trim(), key: provider.trim() + '-key-1'}); }
-    finally { pending.current = false; setBusy(false); }
+      setDirty(false); setKeyId(defaultKey); setWeight('1'); setEnabled(true); setSecret(''); setMessage(null);
+      toast.success(`已添加供应商 ${provider.trim()}，Key ${defaultKey} 已启用`);
+      onSaved?.();
+    } catch (error) {writeFailure(error, {provider: provider.trim(), key: defaultKey});}
+    finally {pending.current = false; setBusy(false);}
   };
+
   const reviewKey = async () => {
-    if (pending.current || !review || !window.confirm('重新读取将替换当前 Key 权限草稿并清空密钥输入。请核对返回的权限；接口不返回密钥原文，无法据此确认密钥是否已更换。继续吗？')) return;
+    if (pending.current || !review) return;
+    if (!(await confirmAction({title: '重新读取这个 Key？', consequence: '会覆盖未保存的修改并清空密钥输入；密钥原文不会返回，无法据此确认密钥是否已更换。', confirmLabel: '重新读取'}))) return;
+    if (pending.current) return;
     pending.current = true; setBusy(true);
     try {
       const result = await adminApi.getProviders();
@@ -106,32 +155,65 @@ export default function ProviderKeyEditor({ selectedKey, onSaved, onDirtyChange,
       if (key) {setModels(Array.isArray(key.allowed_models) ? key.allowed_models.join('\n') : ''); setWeight(String(key.weight ?? 1)); setEnabled(key.enabled !== false);}
       setReview(null); setDirty(!key);
       if (key) onSaved?.(key);
-      setMessage(key ? '已重新读取 Key 权限，请核对后编辑。密钥原文不可读取，不能据此确认是否已更换；如需验证可重新获取候选模型。' : '服务端列表未找到该 Key。原模型草稿已保留，密钥输入已清空；请核对供应商和 Key ID 后再操作。');
-    } catch (error) { setMessage(`${error instanceof Error ? error.message : String(error)}。核对失败，仍禁止重复保存或导入。`); }
+      setMessage(key ? {tone: 'info', text: '已重新读取 Key 权限，请核对后再编辑'} : {tone: 'warning', text: '服务器上没有这个 Key。模型列表已保留，密钥输入已清空；请检查供应商和 Key ID'});
+    } catch (error) {setMessage({tone: 'error', text: `${error instanceof Error ? error.message : String(error)}。核对失败，仍禁止重复保存或导入。`});}
     finally {pending.current = false; setBusy(false);}
   };
-  const cls = 'block w-full p-2 bg-white border border-[#E5E8E5] rounded';
-  return <div className="two-columns page-supplement"><section id="key-editor" className="panel p-4 border border-[#E5E8E5] rounded space-y-3">
-    <h3>API 密钥与模型授权</h3>
-    <p className="muted">选择 Key 后调整权限；更新时密钥留空保留原值。</p><details><summary>新增、发现与发布规则</summary><p>相同 Key ID 为更新操作；手动新增时须填写密钥。发现模型、保存权限和发布用户目录是三个独立步骤。</p></details>
-    <fieldset disabled={busy} className="field-grid" onChange={() => setDirty(true)}>
-      <label className="block">供应商 ID<input className={cls} value={provider} onChange={e=>setProvider(e.target.value)} /></label>
-      <details><summary>新增或更新供应商渠道</summary><div className="space-y-2 pt-2">
-        <p className="muted">导入使用默认 Key ID：供应商 ID + -key-1，会启用渠道与默认 Key，并将权重重置为 1；下方自定义 Key ID、权重、启用状态不参与导入。</p>
-        <label className="block">上游地址<input type="url" className={cls} value={baseUrl} onChange={e=>setBaseUrl(e.target.value)} placeholder="https://api.example.com" /></label>
-        <label className="block">接口格式<select className={cls} value={format} onChange={e=>setFormat(e.target.value)}><option value="anthropic">Anthropic</option><option value="openai">OpenAI</option></select></label>
-        <button className="p-2 bg-[#EFF1EF] rounded" disabled={!!review || !provider.trim() || !secret || !baseUrl.trim()} onClick={()=>void createProvider()}>使用下方密钥与模型草稿导入渠道</button>
-      </div></details>
-      <label className="block">Key ID<input className={cls} value={keyId} onChange={e=>setKeyId(e.target.value)} /></label>
-      <label className="block">API Key（新增必填，更新可留空）<input ref={secretInput} type="password" autoComplete="new-password" className={cls} onChange={e=>setSecret(e.target.value)} /></label>
-      <label className="block">允许模型（每行一个精确 ID）<textarea rows={6} className={cls} value={models} onChange={e=>setModels(e.target.value)} /></label>
-      <p className="muted">当前草稿 {modelIds.length} 个唯一模型，保存时自动去重。空列表表示拒绝所有模型，不是允许全部。</p>
-      <label className="block">权重<input type="number" min={1} max={1000} step={1} className={cls} value={weight} aria-describedby="key-weight-help" onChange={e=>setWeight(e.target.value)} /></label>
-      <p id="key-weight-help" className="muted">1 至 1000 的整数，用于可用 Key 之间的相对分配；不会改变模型价格。停用 Key 会停止后续选用，不会删除配置。</p>
-      <label><input type="checkbox" checked={enabled} onChange={e=>setEnabled(e.target.checked)} /> 启用</label>
-      <div className="flex gap-3"><button className="p-2 bg-[#EFF1EF] rounded" disabled={!provider.trim() || !keyId.trim()} onClick={()=>void act('discover')}>获取模型草稿</button><button className="p-2 bg-[#B94B39] text-white rounded" disabled={!!review || !provider.trim() || !keyId.trim()} onClick={()=>void act('save')}>确认保存权限</button></div>
+
+  const title = selectedKey ? `编辑 Key · ${String(selectedKey.id)}` : preset?.providerId ? `添加 Key · ${preset.providerId}` : '添加供应商';
+  const adding = !selectedKey && !preset?.providerId;
+  const newFound = discovery ? discovery.models.filter(model => !modelIds.includes(model)) : [];
+  return <section id="key-editor" className="panel key-editor" aria-label={title}>
+    <div className="panel-head">
+      <h3>{title}</h3>
+      {onClose && <button type="button" className="btn-icon" aria-label="关闭编辑器" title="关闭" disabled={busy} onClick={onClose}><IconClose/></button>}
+    </div>
+    <fieldset disabled={busy} className="form-grid form-grid-2" onChange={() => setDirty(true)}>
+      <label className="field"><span className="field-label">供应商 ID</span>
+        <input aria-label="供应商 ID" value={provider} onChange={event => setProvider(event.target.value)}/></label>
+      <label className="field"><span className="field-label">Key ID</span>
+        <input aria-label="Key ID" value={keyId} onChange={event => setKeyId(event.target.value)}/></label>
+      <label className="field"><span className="field-label">API Key</span>
+        <input aria-label="API Key" ref={secretInput} type="password" autoComplete="new-password" placeholder={selectedKey ? '已保存，留空不修改' : '新增时必填'}
+          onChange={event => setSecret(event.target.value)}/></label>
+      <label className="field"><span className="field-label">权重<InfoTip text="多个 Key 时按权重分配请求（1–1000 的整数）"/></span>
+        <input aria-label="权重" type="number" min={1} max={1000} step={1} value={weight} onChange={event => setWeight(event.target.value)}/></label>
+      <label className="field field-span"><span className="field-label">可用模型（每行一个）</span>
+        <textarea aria-label="可用模型（每行一个）" rows={6} className="mono" value={models} onChange={event => setModels(event.target.value)}/>
+        {modelIds.length ? <span className="field-hint">已选 {modelIds.length} 个</span> : <span className="field-warning">未选择模型：这个 Key 不会被使用</span>}
+      </label>
+      {discovery && <div className="field-span discovery" aria-label="获取到的模型">
+        <p>获取到 {discovery.models.length} 个模型{discovery.incomplete ? '（不完整）' : ''}{newFound.length ? `，${newFound.length} 个还不在列表中` : '，都已在列表中'}</p>
+        {newFound.length > 0 && <p className="model-tags">{newFound.slice(0, 30).map(model => <span key={model} className="tag tag-info">{model}</span>)}{newFound.length > 30 && <span className="muted">+{newFound.length - 30}</span>}</p>}
+        <button type="button" className="btn btn-small" disabled={busy || !discovery.models.length || !newFound.length} onClick={() => {
+          setDirty(true); setModels([...new Set([...modelIds, ...discovery.models])].join('\n'));
+          setMessage({tone: 'info', text: '已加入列表，原有模型保留；保存后生效'});
+        }}>全部加入</button>
+      </div>}
+      <label className="check-field field-span"><input type="checkbox" checked={enabled} onChange={event => setEnabled(event.target.checked)}/> 启用</label>
+      <details className="field-span import-details" open={adding}>
+        <summary>添加或更新供应商</summary>
+        <div className="form-grid form-grid-2">
+          <label className="field"><span className="field-label">上游地址</span>
+            <input aria-label="上游地址" type="url" value={baseUrl} placeholder="https://api.example.com" onChange={event => setBaseUrl(event.target.value)}/></label>
+          <label className="field"><span className="field-label">接口格式</span>
+            <select aria-label="接口格式" value={format} onChange={event => setFormat(event.target.value)}><option value="anthropic">Anthropic</option><option value="openai">OpenAI</option></select></label>
+          <p className="field-hint field-span">将创建 Key：{provider.trim() ? `${provider.trim()}-key-1` : '供应商 ID-key-1'}（用上面的 API Key 和可用模型）</p>
+          <div className="field-span"><button type="button" className="btn" disabled={!!review || !provider.trim() || !secret || !baseUrl.trim()}
+            title={review ? '先重新读取确认上次的结果' : !provider.trim() || !secret || !baseUrl.trim() ? '填写供应商 ID、API Key 和上游地址后可保存' : undefined}
+            onClick={() => void createProvider()}>保存供应商</button></div>
+        </div>
+      </details>
     </fieldset>
-    {review && <button disabled={busy} onClick={()=>void reviewKey()}>重新读取 Key 核对</button>}
-    <p role="status" className="text-[#A87029] text-sm">{busy ? '处理中…' : message}</p>
-  </section><section className="notice-panel"><h3>发现结果{discovery ? ` · ${discovery.key}` : ''}</h3><p className="muted">发现仅生成候选列表，不证明模型可调用，不自动修改已保存权限。填入时合并并去重，保留已有模型；不自动授权，也不自动发布。</p>{discovery ? <><p>来源 Key：{discovery.key} · {discovery.models.length} 个候选模型</p><p>{discovery.incomplete ? '只取得第一页，目录完整性尚未确认。' : '已取得上游返回的模型目录。'}</p><ul>{discovery.models.map(model => <li key={model}>{model}</li>)}</ul><div className="actions"><button className="primary" disabled={busy || !discovery.models.length} onClick={() => {setDirty(true); setModels([...new Set([...modelIds, ...discovery.models])].join('\n')); setMessage('已合并到未保存的权限草稿，原有模型已保留；请核对后确认保存。');}}>填入权限草稿</button></div></> : <p className="empty-state">选择或填写 Key，再获取候选模型。</p>}</section></div>;
+    <div className="editor-actions">
+      {message && <p role="status" className={`message message-${message.tone}`}>{message.text}</p>}
+      {busy && !message && <p role="status" className="message message-info">处理中…</p>}
+      <div className="button-row">
+        {review && <button type="button" className="btn" disabled={busy} onClick={() => void reviewKey()}>重新读取</button>}
+        <button type="button" className="btn" disabled={busy || !provider.trim() || !keyId.trim()} title={!provider.trim() || !keyId.trim() ? '填写供应商 ID 和 Key ID 后可获取' : undefined} onClick={() => void act('discover')}>获取模型列表</button>
+        <button type="button" className="btn btn-primary" disabled={busy || !!review || !provider.trim() || !keyId.trim()}
+          title={review ? '先重新读取确认上次的结果' : !provider.trim() || !keyId.trim() ? '填写供应商 ID 和 Key ID 后可保存' : undefined} onClick={() => void act('save')}>保存</button>
+      </div>
+    </div>
+  </section>;
 }

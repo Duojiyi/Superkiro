@@ -42,7 +42,7 @@ const server=http.createServer(async(req,res)=>{
   await page.evaluate(()=>{const badge=document.createElement('div');badge.textContent='LOCAL FIXTURE · 本地测试数据 · 未发布';Object.assign(badge.style,{position:'fixed',right:'12px',bottom:'8px',zIndex:'9999',background:'#23272b',color:'white',padding:'8px 12px',fontSize:'12px',pointerEvents:'none'});document.body.append(badge);});
   await page.getByRole('heading',{name:'积分价格',exact:true}).evaluate(el=>el.scrollIntoView({block:'start'}));
   await page.screenshot({path:path.join(output,'pricing-editor-desktop.png')});
-  await page.getByRole('heading',{name:'客户扣费预览（当前草稿）',exact:true}).evaluate(el=>el.closest('section').scrollIntoView({block:'center'}));
+  await page.getByRole('heading',{name:'扣费示例',exact:true}).evaluate(el=>el.closest('section').scrollIntoView({block:'center'}));
   await page.screenshot({path:path.join(output,'pricing-charge-preview-desktop.png')});
   await page.getByRole('region',{name:'历史价格版本',exact:true}).evaluate(el=>el.scrollIntoView({block:'center'}));
   await page.screenshot({path:path.join(output,'pricing-history-desktop.png')});
