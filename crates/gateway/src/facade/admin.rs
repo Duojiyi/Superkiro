@@ -5,6 +5,7 @@
 //! - `GET /api/v1/admin/stats`: system overview and financial metrics
 //! - `GET /api/v1/admin/cards`: query cards with filtering
 //! - `POST /api/v1/admin/cards/status`: freeze, unfreeze, ban, void, archive, or unarchive cards (persisted)
+//! - `GET /api/v1/admin/cards/history`: what happened to one card, who did it and why
 //! - `POST /api/v1/admin/cards/adjust`: manual balance adjustment (persisted)
 //! - `POST /api/v1/admin/cards/batch`: batch generate cards from template
 //! - `GET /api/v1/admin/announcements`: list announcements
@@ -1402,9 +1403,15 @@ impl FacadeHandler for AdminCardStatusHandler {
             }
 
             let res = match req_data.action.as_str() {
-                "freeze" => self.billing.freeze_card(card_id, &reason),
-                "unfreeze" => self.billing.unfreeze_card(card_id),
-                "ban" => self.billing.ban_card(card_id, &reason),
+                "freeze" => self
+                    .billing
+                    .freeze_card(card_id, operator_id, &reason, now_secs()),
+                "unfreeze" => self
+                    .billing
+                    .unfreeze_card(card_id, operator_id, &reason, now_secs()),
+                "ban" => self
+                    .billing
+                    .ban_card(card_id, operator_id, &reason, now_secs()),
                 "void" => self
                     .billing
                     .void_card(card_id, operator_id, &reason, now_secs()),
@@ -1445,6 +1452,71 @@ impl FacadeHandler for AdminCardStatusHandler {
                 )
                     .into_response(),
             }
+        })
+    }
+}
+
+/// One card's history for the console: issued, activated, top-ups, adjustments and
+/// status changes, newest first, each with who made it and why.
+pub struct AdminCardHistoryHandler {
+    pub billing: BillingEngine,
+    pub auth: Arc<AdminAuthState>,
+}
+
+impl FacadeHandler for AdminCardHistoryHandler {
+    fn method(&self) -> Method {
+        Method::GET
+    }
+
+    fn path(&self) -> &'static str {
+        "/api/v1/admin/cards/history"
+    }
+
+    fn handle<'a>(&'a self, req: Request<Body>) -> BoxFuture<'a, Response> {
+        Box::pin(async move {
+            if !self.auth.verify(req.headers()) {
+                return unauthorized_response();
+            }
+            let Some(card_id) = parse_query(req.uri(), "card_id")
+                .and_then(|value| crate::archive::percent_decode(&value))
+                .map(|value| value.trim().to_string())
+                .filter(|value| valid_text(value, 128))
+            else {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "ValidationException",
+                    "card_id is required",
+                );
+            };
+            let Some(events) = self.billing.card_history(&card_id) else {
+                return error_response(
+                    StatusCode::NOT_FOUND,
+                    "ResourceNotFoundException",
+                    "没有这张卡密",
+                );
+            };
+            let micro = billing::MICRO_CREDITS_PER_CREDIT as f64;
+            let events: Vec<serde_json::Value> = events
+                .into_iter()
+                .map(|event| {
+                    serde_json::json!({
+                        "ts": event.ts_secs,
+                        "action": event.action,
+                        "credits": event.credits,
+                        "points": (event.credits as f64) / micro,
+                        "operator": event.operator,
+                        "reason": event.reason,
+                    })
+                })
+                .collect();
+            json_response(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "success": true,
+                    "cardId": card_id,
+                    "events": events,
+                }),
+            )
         })
     }
 }

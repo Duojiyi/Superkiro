@@ -128,19 +128,23 @@ fn test_freeze_unfreeze_and_ban_lifecycle() {
     engine.upsert_card(card);
 
     // Freeze card
-    assert!(engine.freeze_card("card-lifecycle", "test freeze").is_ok());
+    assert!(engine
+        .freeze_card("card-lifecycle", "admin", "test freeze", 1_000)
+        .is_ok());
     let card = engine.get_card("card-lifecycle").unwrap();
     assert_eq!(card.status, CardStatus::Frozen);
     assert_eq!(card.token_version, 2); // Token version incremented on freeze (from 1 to 2)!
 
     // Unfreeze card
-    assert!(engine.unfreeze_card("card-lifecycle").is_ok());
+    assert!(engine
+        .unfreeze_card("card-lifecycle", "admin", "test unfreeze", 1_100)
+        .is_ok());
     let card = engine.get_card("card-lifecycle").unwrap();
     assert_eq!(card.status, CardStatus::Active);
 
     // Ban card
     assert!(engine
-        .ban_card("card-lifecycle", "policy violation")
+        .ban_card("card-lifecycle", "admin", "policy violation", 1_200)
         .is_ok());
     let card = engine.get_card("card-lifecycle").unwrap();
     assert_eq!(card.status, CardStatus::Banned);
@@ -160,20 +164,20 @@ fn test_batch_card_status_operations() {
         "batch-card-2".to_string(),
         "batch-card-3".to_string(),
     ];
-    let results = engine.batch_freeze(&ids, "batch freeze test");
+    let results = engine.batch_freeze(&ids, "admin", "batch freeze test", 1_000);
     assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 3);
 
     for id in &ids {
         assert_eq!(engine.get_card(id).unwrap().status, CardStatus::Frozen);
     }
 
-    let results = engine.batch_unfreeze(&ids);
+    let results = engine.batch_unfreeze(&ids, "admin", "batch unfreeze test", 1_100);
     assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 3);
     for id in &ids {
         assert_eq!(engine.get_card(id).unwrap().status, CardStatus::Active);
     }
 
-    let results = engine.batch_ban(&ids, "batch ban test");
+    let results = engine.batch_ban(&ids, "admin", "batch ban test", 1_200);
     assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 3);
     for id in &ids {
         assert_eq!(engine.get_card(id).unwrap().status, CardStatus::Banned);
@@ -295,4 +299,69 @@ fn a_topup_code_that_could_not_be_saved_does_not_exist() {
     engine.upsert_topup_code(generated.topup.clone()).unwrap();
     assert!(engine.get_topup_code(&generated.topup.id).is_some());
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn card_history_names_who_changed_a_card_and_why_newest_first() {
+    let engine = BillingEngine::new();
+    let mut card = create_test_card("card-history", 2, 2, 300);
+    card.created_at = 900;
+    card.issued_credits = Some(100_000_000);
+    engine.upsert_card(card);
+
+    engine
+        .freeze_card("card-history", "admin", "客户要求暂停", 1_100)
+        .unwrap();
+    engine
+        .unfreeze_card("card-history", "admin", " ", 1_200)
+        .unwrap();
+    engine
+        .adjust_balance("card-history", 5_000_000, "admin", "补偿", 1_300)
+        .unwrap();
+    engine
+        .ban_card("card-history", "system", "滥用", 1_400)
+        .unwrap();
+
+    // A refused change leaves nothing behind, and every change names who made it.
+    assert!(engine
+        .unfreeze_card("card-history", "admin", "retry", 1_500)
+        .is_err());
+    let spare = create_test_card("card-spare", 2, 2, 300);
+    engine.upsert_card(spare.clone());
+    assert!(engine
+        .freeze_card("card-spare", " ", "no one", 1_500)
+        .is_err());
+    assert_eq!(engine.get_card("card-spare").unwrap(), spare);
+    assert_eq!(engine.card_history("card-spare").unwrap().len(), 1);
+
+    let history = engine.card_history("card-history").unwrap();
+    let summary: Vec<_> = history
+        .iter()
+        .map(|event| {
+            (
+                event.ts_secs,
+                event.action.as_str(),
+                event.credits,
+                event.operator.as_deref(),
+                event.reason.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            (1_400, "ban", 0, Some("system"), Some("滥用")),
+            (1_300, "adjust", 5_000_000, Some("admin"), Some("补偿")),
+            (1_200, "unfreeze", 0, Some("admin"), None),
+            (1_100, "freeze", 0, Some("admin"), Some("客户要求暂停")),
+            (1_000, "activated", 0, None, None),
+            (900, "issued", 100_000_000, None, None),
+        ]
+    );
+    // Status changes move no credits: only the adjustment changed the balance.
+    assert_eq!(
+        engine.get_card("card-history").unwrap().credit_total,
+        105_000_000
+    );
+    assert!(engine.card_history("no-such-card").is_none());
 }

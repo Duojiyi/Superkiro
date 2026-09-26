@@ -178,7 +178,9 @@ async fn modern_routes_enforce_immediate_card_revocation() {
     let app = FacadeRegistry::default().into_router_with_auth(auth);
     for banned in [false, true] {
         if banned {
-            billing.ban_card("modern-card", "regression").unwrap();
+            billing
+                .ban_card("modern-card", "admin", "regression", gateway::now_secs())
+                .unwrap();
         }
         for (path, target) in [
             ("/List-Available-Models", None),

@@ -23,7 +23,7 @@ fn freeze_matrix_preserves_origin_and_rejects_terminal_states() {
         card.activation_duration_secs = Some(100);
         engine.upsert_card(card.clone());
         let result = engine
-            .batch_freeze(&["card".into()], "audit")
+            .batch_freeze(&["card".into()], "admin", "audit", 100)
             .pop()
             .unwrap();
         if matches!(
@@ -35,14 +35,14 @@ fn freeze_matrix_preserves_origin_and_rejects_terminal_states() {
         } else {
             result.unwrap();
             let restored = engine
-                .batch_unfreeze(&["card".into()])
+                .batch_unfreeze(&["card".into()], "admin", "audit", 100)
                 .pop()
                 .unwrap()
                 .unwrap();
             assert_eq!(restored.status, status);
             assert_eq!(restored.activated_at, card.activated_at);
             assert_eq!(restored.valid_until, card.valid_until);
-            assert!(engine.unfreeze_card("card").is_err());
+            assert!(engine.unfreeze_card("card", "admin", "audit", 100).is_err());
             if status == CardStatus::Unactivated {
                 engine.activate_card("card", 1000, 999).unwrap();
                 let activated = engine.get_card("card").unwrap();
@@ -60,7 +60,10 @@ fn legacy_frozen_card_does_not_skip_first_activation() {
     card.status = CardStatus::Frozen;
     engine.upsert_card(card);
     assert_eq!(
-        engine.unfreeze_card("card").unwrap().status,
+        engine
+            .unfreeze_card("card", "admin", "audit", 100)
+            .unwrap()
+            .status,
         CardStatus::Unactivated
     );
 }
@@ -72,10 +75,10 @@ fn concurrent_ban_and_freeze_never_resurrect_card() {
         engine.upsert_card(Card::new("card", "group", 1000));
         let other = engine.clone();
         let worker = std::thread::spawn(move || {
-            let _ = other.freeze_card("card", "audit");
-            let _ = other.unfreeze_card("card");
+            let _ = other.freeze_card("card", "admin", "audit", 100);
+            let _ = other.unfreeze_card("card", "admin", "audit", 100);
         });
-        engine.ban_card("card", "terminal").unwrap();
+        engine.ban_card("card", "admin", "terminal", 100).unwrap();
         worker.join().unwrap();
         assert_eq!(engine.get_card("card").unwrap().status, CardStatus::Banned);
     }

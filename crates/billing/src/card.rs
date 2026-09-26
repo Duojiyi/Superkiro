@@ -12,6 +12,19 @@ use crate::template::CardTemplate;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// One thing that happened to a card, as the console shows it in the card's history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CardEvent {
+    pub ts_secs: u64,
+    /// issued, activated, topup, adjust, freeze, unfreeze, ban, void, archive or unarchive.
+    pub action: String,
+    /// Change to the balance in micro-credits; for `issued`, the credits issued.
+    pub credits: i64,
+    pub operator: Option<String>,
+    pub reason: Option<String>,
+}
+
 /// Status lifecycle of a card key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

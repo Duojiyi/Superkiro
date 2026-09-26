@@ -28,13 +28,17 @@ async fn oauth_after_freeze_unfreeze_starts_template_timer_and_rejects_terminal_
         card.activation_duration_secs = Some(3600);
         card.status = status;
         engine.upsert_card(card);
-        let frozen = engine.freeze_card("card", "test");
+        let frozen = engine.freeze_card("card", "admin", "test", gateway::now_secs());
         if status == CardStatus::Unactivated {
             frozen.unwrap();
-            engine.unfreeze_card("card").unwrap();
+            engine
+                .unfreeze_card("card", "admin", "test", gateway::now_secs())
+                .unwrap();
         } else {
             assert!(frozen.is_err());
-            assert!(engine.unfreeze_card("card").is_err());
+            assert!(engine
+                .unfreeze_card("card", "admin", "test", gateway::now_secs())
+                .is_err());
         }
         let auth =
             AuthState::with_billing("isolated-audit-test-secret-32-chars", (*engine).clone());

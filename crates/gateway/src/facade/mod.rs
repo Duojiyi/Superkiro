@@ -244,6 +244,10 @@ impl FacadeRegistry {
                 billing: billing.clone(),
                 auth: auth.clone(),
             })
+            .register(admin::AdminCardHistoryHandler {
+                billing: billing.clone(),
+                auth: auth.clone(),
+            })
             .register(admin::AdminCardAdjustHandler {
                 billing: billing.clone(),
                 auth: auth.clone(),

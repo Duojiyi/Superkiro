@@ -142,7 +142,7 @@ fn revocation_blocks_new_work_but_preserves_consumed_settlement() {
         .reserve("card", "inflight", &params, 100, 660)
         .unwrap();
     let version = engine.get_card("card").unwrap().token_version;
-    engine.ban_card("card", "audit").unwrap();
+    engine.ban_card("card", "admin", "audit", 100).unwrap();
     assert!(engine.reserve("card", "new", &params, 101, 660).is_err());
     let entry = engine
         .settle(

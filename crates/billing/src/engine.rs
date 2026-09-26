@@ -1,6 +1,6 @@
 //! Unified billing engine managing cards, reservations, settlements, and ledger (Spec §5, §6).
 
-use crate::card::{Card, CardError, CardStatus};
+use crate::card::{Card, CardError, CardEvent, CardStatus};
 use crate::ledger::{LedgerEntry, LedgerKind, PricingRates, UsageTokens};
 use crate::provider::{Provider, ProviderKey};
 use crate::reservation::{
@@ -2887,8 +2887,59 @@ impl BillingEngine {
     // Card Operations & Lifecycle (Spec §5, §14.9)
     // ==========================================
 
+    /// A status change as a zero-credit ledger entry naming who made it and why. Top-ups,
+    /// adjustments, voids and archiving are recorded the same way, so a card's history
+    /// reads from the ledger alone.
+    fn card_event_entry(
+        ledger_len: usize,
+        card_id: &str,
+        action: &str,
+        operator_id: &str,
+        reason: &str,
+        now_secs: u64,
+    ) -> LedgerEntry {
+        let event_id = format!("{action}-{card_id}-{now_secs}-{ledger_len}");
+        let reason = reason.trim();
+        LedgerEntry {
+            id: format!("ledger-{event_id}"),
+            card_id: card_id.to_string(),
+            kind: LedgerKind::Adjustment,
+            invocation_id: Some(event_id),
+            exposed_model: action.to_string(),
+            provider_id: "system".to_string(),
+            target_model: action.to_string(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            credits_charged: 0,
+            provider_cost_micro_cny: 0,
+            rate_card_version: None,
+            ts_secs: now_secs,
+            operator_id: Some(operator_id.to_string()),
+            reason: (!reason.is_empty()).then(|| reason.to_string()),
+        }
+    }
+
+    fn named_operator<'a>(operator_id: &'a str, action: &str) -> Result<&'a str, BillingError> {
+        let operator_id = operator_id.trim();
+        if operator_id.is_empty() {
+            return Err(BillingError::InvalidAdjustment(format!(
+                "Operator ID is required to {action}"
+            )));
+        }
+        Ok(operator_id)
+    }
+
     /// Freeze a card key (suspends usage, increments token_version to revoke active sessions).
-    pub fn freeze_card(&self, card_id: &str, reason: &str) -> Result<Card, BillingError> {
+    pub fn freeze_card(
+        &self,
+        card_id: &str,
+        operator_id: &str,
+        reason: &str,
+        now_secs: u64,
+    ) -> Result<Card, BillingError> {
+        let operator_id = Self::named_operator(operator_id, "freeze card")?;
         let _state_guard = self.state_lock.write().unwrap();
         let sequence = self
             .snapshot_sequence
@@ -2921,18 +2972,35 @@ impl BillingEngine {
         );
         card.token_version = card.token_version.saturating_add(1);
         let updated_card = card.clone();
+        let entry = Self::card_event_entry(
+            candidate.ledger.len(),
+            card_id,
+            "freeze_card",
+            operator_id,
+            reason,
+            now_secs,
+        );
+        candidate.ledger.push(entry.clone());
 
         self.commit_candidate_snapshot(&candidate, || {
             self.cards
                 .write()
                 .unwrap()
                 .insert(card_id.to_string(), updated_card.clone());
+            self.ledger.write().unwrap().push(entry);
             updated_card
         })
     }
 
-    /// Unfreeze a card key back to Active.
-    pub fn unfreeze_card(&self, card_id: &str) -> Result<Card, BillingError> {
+    /// Unfreeze a card key back to the status it was frozen from.
+    pub fn unfreeze_card(
+        &self,
+        card_id: &str,
+        operator_id: &str,
+        reason: &str,
+        now_secs: u64,
+    ) -> Result<Card, BillingError> {
+        let operator_id = Self::named_operator(operator_id, "unfreeze card")?;
         let _state_guard = self.state_lock.write().unwrap();
         let sequence = self
             .snapshot_sequence
@@ -2968,18 +3036,35 @@ impl BillingEngine {
         card.status = restored;
         card.frozen_from = None;
         let updated_card = card.clone();
+        let entry = Self::card_event_entry(
+            candidate.ledger.len(),
+            card_id,
+            "unfreeze_card",
+            operator_id,
+            reason,
+            now_secs,
+        );
+        candidate.ledger.push(entry.clone());
 
         self.commit_candidate_snapshot(&candidate, || {
             self.cards
                 .write()
                 .unwrap()
                 .insert(card_id.to_string(), updated_card.clone());
+            self.ledger.write().unwrap().push(entry);
             updated_card
         })
     }
 
     /// Ban a card key permanently (revokes active sessions).
-    pub fn ban_card(&self, card_id: &str, reason: &str) -> Result<Card, BillingError> {
+    pub fn ban_card(
+        &self,
+        card_id: &str,
+        operator_id: &str,
+        reason: &str,
+        now_secs: u64,
+    ) -> Result<Card, BillingError> {
+        let operator_id = Self::named_operator(operator_id, "ban card")?;
         let _state_guard = self.state_lock.write().unwrap();
         let sequence = self
             .snapshot_sequence
@@ -3007,12 +3092,22 @@ impl BillingEngine {
         );
         card.token_version = card.token_version.saturating_add(1);
         let updated_card = card.clone();
+        let entry = Self::card_event_entry(
+            candidate.ledger.len(),
+            card_id,
+            "ban_card",
+            operator_id,
+            reason,
+            now_secs,
+        );
+        candidate.ledger.push(entry.clone());
 
         self.commit_candidate_snapshot(&candidate, || {
             self.cards
                 .write()
                 .unwrap()
                 .insert(card_id.to_string(), updated_card.clone());
+            self.ledger.write().unwrap().push(entry);
             updated_card
         })
     }
@@ -3048,24 +3143,41 @@ impl BillingEngine {
     pub fn batch_freeze(
         &self,
         card_ids: &[String],
+        operator_id: &str,
         reason: &str,
+        now_secs: u64,
     ) -> Vec<Result<Card, BillingError>> {
         card_ids
             .iter()
-            .map(|id| self.freeze_card(id, reason))
+            .map(|id| self.freeze_card(id, operator_id, reason, now_secs))
             .collect()
     }
 
     /// Batch unfreeze cards.
-    pub fn batch_unfreeze(&self, card_ids: &[String]) -> Vec<Result<Card, BillingError>> {
-        card_ids.iter().map(|id| self.unfreeze_card(id)).collect()
+    pub fn batch_unfreeze(
+        &self,
+        card_ids: &[String],
+        operator_id: &str,
+        reason: &str,
+        now_secs: u64,
+    ) -> Vec<Result<Card, BillingError>> {
+        card_ids
+            .iter()
+            .map(|id| self.unfreeze_card(id, operator_id, reason, now_secs))
+            .collect()
     }
 
     /// Batch ban cards.
-    pub fn batch_ban(&self, card_ids: &[String], reason: &str) -> Vec<Result<Card, BillingError>> {
+    pub fn batch_ban(
+        &self,
+        card_ids: &[String],
+        operator_id: &str,
+        reason: &str,
+        now_secs: u64,
+    ) -> Vec<Result<Card, BillingError>> {
         card_ids
             .iter()
-            .map(|id| self.ban_card(id, reason))
+            .map(|id| self.ban_card(id, operator_id, reason, now_secs))
             .collect()
     }
 
@@ -4147,6 +4259,77 @@ impl BillingEngine {
             .collect()
     }
 
+    /// What happened to a card, newest first: when it was issued and activated, and every
+    /// top-up, adjustment and status change the ledger holds, with who made it and why.
+    pub fn card_history(&self, card_id: &str) -> Option<Vec<CardEvent>> {
+        const LIMIT: usize = 500;
+        let card = self.cards.read().unwrap().get(card_id).cloned()?;
+        let event = |entry: &LedgerEntry| {
+            let action = match (entry.kind, entry.exposed_model.as_str()) {
+                (LedgerKind::Usage, _) => return None,
+                (LedgerKind::Topup, _) => "topup",
+                (LedgerKind::Adjustment, "void_card") => "void",
+                (LedgerKind::Adjustment, "archive_card") => "archive",
+                (LedgerKind::Adjustment, "unarchive_card") => "unarchive",
+                (LedgerKind::Adjustment, "freeze_card") => "freeze",
+                (LedgerKind::Adjustment, "unfreeze_card") => "unfreeze",
+                (LedgerKind::Adjustment, "ban_card") => "ban",
+                (LedgerKind::Adjustment, _) => "adjust",
+            };
+            Some(CardEvent {
+                ts_secs: entry.ts_secs,
+                action: action.to_string(),
+                credits: entry.credits_charged,
+                operator: entry.operator_id.clone(),
+                reason: entry.reason.clone(),
+            })
+        };
+        let milestone = |ts_secs: u64, action: &str, credits: i64| CardEvent {
+            ts_secs,
+            action: action.to_string(),
+            credits,
+            operator: None,
+            reason: None,
+        };
+        let mut events = Vec::new();
+        // Cards made for tests and seeds carry no issue time.
+        if card.created_at > 0 {
+            events.push(milestone(
+                card.created_at,
+                "issued",
+                card.issued_credits.unwrap_or_default(),
+            ));
+        }
+        if let Some(activated_at) = card.activated_at {
+            events.push(milestone(activated_at, "activated", 0));
+        }
+        // Archiving the ledger keeps its adjustments, for idempotency; they stay in the history.
+        let archived: Vec<CardEvent> = self
+            .archived_ledger_summary
+            .read()
+            .unwrap()
+            .adjustments
+            .values()
+            .filter(|entry| entry.card_id == card_id)
+            .filter_map(event)
+            .collect();
+        events.extend(archived);
+        let live: Vec<CardEvent> = self
+            .ledger
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.card_id == card_id)
+            .filter_map(event)
+            .collect();
+        events.extend(live);
+        // Stable: events in the same second keep the order they happened in.
+        events.sort_by_key(|event| event.ts_secs);
+        events.reverse();
+        events.truncate(LIMIT);
+        Some(events)
+    }
+
     /// Calculate aggregate gross margin summary directly from the append-only ledger (Spec §6.8, §14.4).
     pub fn get_margin_summary(&self) -> MarginSummary {
         let _state_guard = self.state_lock.read().unwrap();
@@ -4526,7 +4709,12 @@ impl BillingEngine {
         let usage = self.get_usage_since(card_id, cutoff);
         if usage > threshold_credits {
             if action == AnomalyAction::AutoFrozen {
-                let _ = self.freeze_card(card_id, "Automated anomaly freeze: rate spike detected");
+                let _ = self.freeze_card(
+                    card_id,
+                    "system",
+                    "Automated anomaly freeze: rate spike detected",
+                    now_secs,
+                );
             }
             Some(AnomalyAlert {
                 card_id: card_id.to_string(),

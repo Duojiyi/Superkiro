@@ -671,7 +671,9 @@ async fn test_admin_void_auth_rejections_and_idempotent_audit() {
 #[tokio::test]
 async fn test_admin_archive_list_and_unarchive_preserve_status() {
     let (billing, app) = setup_admin_app();
-    billing.ban_card("card-admin-02", "test").unwrap();
+    billing
+        .ban_card("card-admin-02", "admin", "test", gateway::now_secs())
+        .unwrap();
     for (action, archived) in [
         ("archive", true),
         ("archive", true),
@@ -713,8 +715,10 @@ async fn test_admin_archive_list_and_unarchive_preserve_status() {
         assert_eq!(card["status"], "banned");
         assert_eq!(card["creditTotal"], 5_000_000);
     }
+    // The ban, then one archive and one unarchive: repeats change nothing.
     let entries = billing.ledger_entries();
-    assert_eq!(entries.len(), 2);
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0].exposed_model, "ban_card");
     assert!(entries
         .iter()
         .all(|e| e.operator_id.as_deref() == Some("admin") && e.credits_charged == 0));
@@ -1254,4 +1258,73 @@ async fn an_announcement_is_published_or_withdrawn_only_once_saved() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert!(billing.list_active_announcements(now).is_empty());
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn test_admin_card_history_names_the_operator_and_reason() {
+    let (_billing, app) = setup_admin_app();
+    for (action, reason) in [("freeze", "客户要求暂停"), ("unfreeze", "已核实")] {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/admin/cards/status")
+            .header("x-admin-key", TEST_ADMIN_KEY)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"cardId": "card-admin-02", "action": action, "reason": reason, "operatorId": "forged"})
+                    .to_string(),
+            ))
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let history = |uri: &str, authenticated: bool| {
+        let mut req = Request::builder().method(Method::GET).uri(uri);
+        if authenticated {
+            req = req.header("x-admin-key", TEST_ADMIN_KEY);
+        }
+        tower::ServiceExt::oneshot(app.clone(), req.body(Body::empty()).unwrap())
+    };
+
+    let response = history("/api/v1/admin/cards/history?card_id=card-admin-02", true)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["cardId"], "card-admin-02");
+    let events = body["events"].as_array().unwrap();
+    assert_eq!(events.len(), 2, "{body}");
+    assert_eq!(events[0]["action"], "unfreeze");
+    assert_eq!(events[0]["reason"], "已核实");
+    assert_eq!(events[1]["action"], "freeze");
+    assert_eq!(events[1]["reason"], "客户要求暂停");
+    // The signed-in operator, never one the request names.
+    assert_eq!(events[1]["operator"], "admin");
+    assert_eq!(events[1]["points"], 0.0);
+    assert!(events[1]["ts"].as_u64().unwrap() > 0);
+
+    // Only an administrator, for a card that exists.
+    for (uri, authenticated, expected) in [
+        (
+            "/api/v1/admin/cards/history?card_id=card-admin-02",
+            false,
+            StatusCode::UNAUTHORIZED,
+        ),
+        ("/api/v1/admin/cards/history", true, StatusCode::BAD_REQUEST),
+        (
+            "/api/v1/admin/cards/history?card_id=%20",
+            true,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/api/v1/admin/cards/history?card_id=no-such-card",
+            true,
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let response = history(uri, authenticated).await.unwrap();
+        assert_eq!(response.status(), expected, "{uri}");
+    }
 }

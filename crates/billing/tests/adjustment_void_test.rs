@@ -816,9 +816,15 @@ fn test_void_persists_audit_and_retry_is_noop() {
         .redeem_topup("void-retry", "unused-topup", NOW_SECS, "admin")
         .is_err());
     assert!(!restored.get_topup_code("void-topup").unwrap().is_used);
-    assert!(restored.freeze_card("void-retry", "test").is_err());
-    assert!(restored.unfreeze_card("void-retry").is_err());
-    assert!(restored.ban_card("void-retry", "test").is_err());
+    assert!(restored
+        .freeze_card("void-retry", "admin", "test", NOW_SECS)
+        .is_err());
+    assert!(restored
+        .unfreeze_card("void-retry", "admin", "test", NOW_SECS)
+        .is_err());
+    assert!(restored
+        .ban_card("void-retry", "admin", "test", NOW_SECS)
+        .is_err());
     assert!(restored.activate_card("void-retry", NOW_SECS, 100).is_err());
     for delta in [1, -1] {
         assert!(restored
@@ -1018,7 +1024,9 @@ fn activated_card_void_preserves_accounts_and_revokes_access() {
     assert_eq!(result.credit_used, 14_600_000);
     assert_eq!(result.token_version, version + 1);
     assert!(result.check_can_reserve(1, NOW_SECS).is_err());
-    assert!(engine.unfreeze_card("used-delete").is_err());
+    assert!(engine
+        .unfreeze_card("used-delete", "admin", "test", NOW_SECS)
+        .is_err());
     let entries = engine.ledger_entries();
     assert_eq!(
         entries.last().unwrap().operator_id.as_deref(),

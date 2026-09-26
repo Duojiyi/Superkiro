@@ -310,9 +310,11 @@ impl AuthState {
     pub fn set_card_active(&self, card_id: &str, active: bool) -> bool {
         if let Some(ref b) = self.billing {
             if active {
-                b.unfreeze_card(card_id).is_ok()
+                b.unfreeze_card(card_id, "admin", "admin toggle", crate::now_secs())
+                    .is_ok()
             } else {
-                b.freeze_card(card_id, "admin toggle").is_ok()
+                b.freeze_card(card_id, "admin", "admin toggle", crate::now_secs())
+                    .is_ok()
             }
         } else {
             let mut w = self.cards.write().unwrap();

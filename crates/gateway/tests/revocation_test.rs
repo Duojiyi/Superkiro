@@ -86,7 +86,9 @@ async fn test_audit_b_ban_card_triggers_instant_revocation() {
     assert_eq!(status, StatusCode::OK);
 
     // 3. Admin bans card
-    billing.ban_card("card-ban-1", "TOS violation").unwrap();
+    billing
+        .ban_card("card-ban-1", "admin", "TOS violation", gateway::now_secs())
+        .unwrap();
     let card = billing.get_card("card-ban-1").unwrap();
     assert_eq!(card.status, CardStatus::Banned);
     assert_eq!(card.token_version, 2); // Auto-incremented!
@@ -135,7 +137,12 @@ async fn test_audit_b_freeze_and_unfreeze_lifecycle_revocation() {
 
     // 1. Admin freezes card
     billing
-        .freeze_card("card-freeze-1", "unusual traffic")
+        .freeze_card(
+            "card-freeze-1",
+            "admin",
+            "unusual traffic",
+            gateway::now_secs(),
+        )
         .unwrap();
     let card = billing.get_card("card-freeze-1").unwrap();
     assert_eq!(card.status, CardStatus::Frozen);
@@ -158,7 +165,14 @@ async fn test_audit_b_freeze_and_unfreeze_lifecycle_revocation() {
         .contains("Invalid authentication credentials"));
 
     // 3. Admin unfreezes card
-    billing.unfreeze_card("card-freeze-1").unwrap();
+    billing
+        .unfreeze_card(
+            "card-freeze-1",
+            "admin",
+            "back to normal",
+            gateway::now_secs(),
+        )
+        .unwrap();
     let card = billing.get_card("card-freeze-1").unwrap();
     assert_eq!(card.status, CardStatus::Active);
     assert_eq!(card.token_version, 2); // Remains v2
