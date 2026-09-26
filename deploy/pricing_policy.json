@@ -104,5 +104,8 @@
   },
   "priced_as": {
     "claude-opus-5-5": "claude-opus-5"
+  },
+  "upstream_price_basis": {
+    "hanyue-max/claude-opus-5-5": "claude-opus-5"
   }
 }
