@@ -135,6 +135,91 @@ impl ProviderConfig {
     }
 }
 
+/// Signed thinking from an earlier assistant turn, with the upstream model that wrote it: a
+/// model accepts only its own thinking back, unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThinkingBlock {
+    pub text: String,
+    pub signature: String,
+    pub model: String,
+}
+
+/// The signature Kiro keeps with a thinking block, tagged with the upstream model that wrote
+/// it, so that it goes back to that model alone: a fallback target, or a remapped model,
+/// is sent none. Kiro treats a signature as opaque.
+pub fn tag_signature(model: &str, signature: &str) -> String {
+    format!("{model}#{signature}")
+}
+
+/// A tagged signature's model and signature; an untagged one cannot be traced to a model.
+pub fn untag_signature(tagged: &str) -> Option<(&str, &str)> {
+    tagged
+        .rsplit_once('#')
+        .filter(|(model, signature)| !model.is_empty() && !signature.is_empty())
+}
+
+/// Request options the operator sets per provider, by provider ID, read at start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ProviderOptions {
+    /// Signed thinking from earlier turns goes back to the model that wrote it. Off until
+    /// each upstream has been checked to accept it: one that edits or validates history
+    /// may refuse it.
+    pub replay_thinking: bool,
+}
+
+/// Which providers have which option on: provider IDs, or `*` for every provider,
+/// including the one configured by UPSTREAM_API_KEY.
+#[derive(Debug, Clone, Default)]
+pub struct ProviderOptionsTable {
+    replay_thinking: Vec<String>,
+}
+
+impl ProviderOptionsTable {
+    /// PROVIDER_THINKING_REPLAY: comma-separated provider IDs, or `*`.
+    pub fn from_env() -> Self {
+        let ids = |name: &str| -> Vec<String> {
+            std::env::var(name)
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .collect()
+        };
+        Self {
+            replay_thinking: ids("PROVIDER_THINKING_REPLAY"),
+        }
+    }
+
+    pub fn options_for(&self, provider_id: &str) -> ProviderOptions {
+        let on = |ids: &[String]| ids.iter().any(|id| id == "*" || id == provider_id);
+        ProviderOptions {
+            replay_thinking: on(&self.replay_thinking),
+        }
+    }
+
+    /// The providers each option is on for, as the start-up log prints them.
+    pub fn describe(&self) -> String {
+        format!("thinking replay: [{}]", self.replay_thinking.join(", "))
+    }
+}
+
+static PROVIDER_OPTIONS: std::sync::OnceLock<ProviderOptionsTable> = std::sync::OnceLock::new();
+
+/// Set the per-provider options, once, at start.
+pub fn install_provider_options(table: ProviderOptionsTable) {
+    let _ = PROVIDER_OPTIONS.set(table);
+}
+
+/// The options of the provider an upstream attempt is being made with, or those every
+/// provider has when the request is not one of a provider's attempts.
+pub(crate) fn current_provider_options() -> ProviderOptions {
+    let table = PROVIDER_OPTIONS.get_or_init(ProviderOptionsTable::default);
+    retry::ATTEMPT_KEY
+        .try_with(|(provider_id, _)| table.options_for(provider_id))
+        .unwrap_or_else(|_| table.options_for(""))
+}
+
 /// Generic assistant tool call entry (T05).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolCallEntry {
@@ -156,6 +241,9 @@ pub struct ChatMessage {
     pub tool_calls: Vec<ToolCallEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
+    /// An assistant turn's signed thinking, sent back only where replay is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingBlock>,
 }
 
 impl ChatMessage {
@@ -167,6 +255,7 @@ impl ChatMessage {
             tool_call_id: None,
             tool_calls: Vec::new(),
             is_error: None,
+            thinking: None,
         }
     }
 }
@@ -192,6 +281,9 @@ pub struct ChatRequest {
 pub enum ProviderDelta {
     Text(String),
     Reasoning(String),
+    /// The signature that closes a thinking block: the model accepts that thinking back
+    /// with it, unchanged.
+    ReasoningSignature(String),
     /// A fragment of a tool call. `index` is the call's position when the upstream says
     /// it; without one, a fragment with an id opens or continues that call, and one with
     /// neither continues the latest call.

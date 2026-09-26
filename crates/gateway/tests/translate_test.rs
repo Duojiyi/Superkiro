@@ -80,6 +80,7 @@ fn test_audit_b_orphan_tool_result_repaired() {
             tool_use_id: None,
             tool_calls: vec![],
             is_error: None,
+            thinking: None,
         },
         ConversationMessage {
             role: "tool".to_string(),
@@ -87,6 +88,7 @@ fn test_audit_b_orphan_tool_result_repaired() {
             tool_use_id: Some("orphan_call_1".to_string()),
             tool_calls: vec![],
             is_error: None,
+            thinking: None,
         },
     ];
 
@@ -474,6 +476,7 @@ fn test_t05_multi_turn_payload_translation() {
                     arguments: serde_json::json!({ "command": "ls -la" }),
                 }],
                 is_error: None,
+                thinking: None,
             },
             ChatMessage {
                 role: "tool".to_string(),
@@ -482,6 +485,7 @@ fn test_t05_multi_turn_payload_translation() {
                 tool_call_id: Some("tool_call_01".to_string()),
                 tool_calls: vec![],
                 is_error: Some(false),
+                thinking: None,
             },
             ChatMessage::new(
                 "user",

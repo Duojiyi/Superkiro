@@ -3,8 +3,8 @@
 use super::family::{ModelFamily, Reasoning};
 use super::{
     endpoint_with_suffix, process_byte_stream, sanitize_upstream_error_body, BoxFuture, BoxStream,
-    ChatRequest, ModelProvider, ProviderConfig, ProviderDelta, ProviderError, ProviderStreamEvent,
-    TokenUsage,
+    ChatRequest, ModelProvider, ProviderConfig, ProviderDelta, ProviderError, ProviderOptions,
+    ProviderStreamEvent, TokenUsage,
 };
 use futures_util::TryStreamExt;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
@@ -65,16 +65,13 @@ fn normalize_content_block(val: &Value) -> Value {
     val.clone()
 }
 
-impl ModelProvider for AnthropicProvider {
-    fn name(&self) -> &'static str {
-        "anthropic"
-    }
-
-    fn endpoint_url(&self, base_url: &str) -> String {
-        endpoint_with_suffix(base_url, "/v1", "/messages")
-    }
-
-    fn translate_request(&self, req: &ChatRequest) -> Result<Value, ProviderError> {
+impl AnthropicProvider {
+    /// The request body for `req`, with the options of the provider it goes to.
+    pub fn translate_request_with(
+        &self,
+        req: &ChatRequest,
+        options: &ProviderOptions,
+    ) -> Result<Value, ProviderError> {
         let mut system_text = String::new();
         let mut raw_messages: Vec<(&'static str, Vec<Value>)> = Vec::new();
 
@@ -90,6 +87,19 @@ impl ModelProvider for AnthropicProvider {
                 }
             } else if m.role == "assistant" {
                 let mut blocks = Vec::new();
+                // Signed thinking goes back first and unchanged, to the model that wrote it
+                // alone, and only where the operator has checked the upstream takes it.
+                if let Some(thinking) = m
+                    .thinking
+                    .as_ref()
+                    .filter(|thinking| options.replay_thinking && thinking.model == req.model)
+                {
+                    blocks.push(serde_json::json!({
+                        "type": "thinking",
+                        "thinking": thinking.text,
+                        "signature": thinking.signature,
+                    }));
+                }
                 if let Value::String(s) = &m.content {
                     if !s.is_empty() {
                         blocks.push(serde_json::json!({
@@ -323,6 +333,20 @@ impl ModelProvider for AnthropicProvider {
 
         Ok(body)
     }
+}
+
+impl ModelProvider for AnthropicProvider {
+    fn name(&self) -> &'static str {
+        "anthropic"
+    }
+
+    fn endpoint_url(&self, base_url: &str) -> String {
+        endpoint_with_suffix(base_url, "/v1", "/messages")
+    }
+
+    fn translate_request(&self, req: &ChatRequest) -> Result<Value, ProviderError> {
+        self.translate_request_with(req, &super::current_provider_options())
+    }
 
     fn parse_stream_line(&self, line: &str) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
         let line = line.trim();
@@ -401,6 +425,17 @@ impl ModelProvider for AnthropicProvider {
                                         ProviderDelta::Reasoning(thinking.to_string()),
                                     ));
                                 }
+                            }
+                        }
+                        "signature_delta" => {
+                            if let Some(signature) = delta
+                                .get("signature")
+                                .and_then(|s| s.as_str())
+                                .filter(|s| !s.is_empty())
+                            {
+                                events.push(ProviderStreamEvent::Delta(
+                                    ProviderDelta::ReasoningSignature(signature.to_string()),
+                                ));
                             }
                         }
                         "input_json_delta" => {

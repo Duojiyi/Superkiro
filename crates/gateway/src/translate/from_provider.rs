@@ -65,6 +65,9 @@ pub fn translate_provider_event_to_frames(
                     frames.push(encode_reasoning(Some(reasoning), None, None));
                 }
             }
+            ProviderDelta::ReasoningSignature(signature) => {
+                frames.push(encode_reasoning(None, Some(signature), None));
+            }
             ProviderDelta::ToolCallChunk {
                 id,
                 name,

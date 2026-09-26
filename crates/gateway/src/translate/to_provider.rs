@@ -12,7 +12,7 @@ use super::images::{inspect_image, shrink_image, Inspection, Omission, PreparedI
 use super::tools::{
     process_tools_for_provider, repair_orphan_tool_pairs, ConversationMessage, ToolRegistry,
 };
-use crate::provider::{ChatMessage, ChatRequest, ToolCallEntry};
+use crate::provider::{ChatMessage, ChatRequest, ThinkingBlock, ToolCallEntry};
 use kiro_wire::requests::conversation::{
     GenerateAssistantResponseRequest, KiroDocument, KiroImage, Message,
 };
@@ -340,12 +340,29 @@ pub fn translate_kiro_to_chat_request(
                     })
                     .collect();
 
+                // Kiro sends a turn's thinking back only with the signature it kept for it,
+                // tagged with the upstream model that wrote it; an untagged one is dropped.
+                let thinking = assistant_msg
+                    .reasoning_content
+                    .as_ref()
+                    .and_then(|reasoning| reasoning.reasoning_text.as_ref())
+                    .filter(|reasoning| !reasoning.text.is_empty())
+                    .and_then(|reasoning| {
+                        let (model, signature) =
+                            crate::provider::untag_signature(reasoning.signature.as_deref()?)?;
+                        Some(ThinkingBlock {
+                            text: reasoning.text.clone(),
+                            signature: signature.to_string(),
+                            model: model.to_string(),
+                        })
+                    });
                 raw_messages.push(ConversationMessage {
                     role: "assistant".to_string(),
                     content: serde_json::Value::String(assistant_msg.content.clone()),
                     tool_use_id: None,
                     tool_calls,
                     is_error: None,
+                    thinking,
                 });
             }
             Message::User(u) => {
@@ -361,6 +378,7 @@ pub fn translate_kiro_to_chat_request(
                             tool_use_id: Some(tr.tool_use_id.clone()),
                             tool_calls: Vec::new(),
                             is_error,
+                            thinking: None,
                         });
                     }
                 }
@@ -382,6 +400,7 @@ pub fn translate_kiro_to_chat_request(
                         tool_use_id: None,
                         tool_calls: Vec::new(),
                         is_error: None,
+                        thinking: None,
                     });
                 }
             }
@@ -399,6 +418,7 @@ pub fn translate_kiro_to_chat_request(
                 tool_use_id: Some(tr.tool_use_id.clone()),
                 tool_calls: Vec::new(),
                 is_error,
+                thinking: None,
             });
         }
     }
@@ -416,6 +436,7 @@ pub fn translate_kiro_to_chat_request(
         tool_use_id: None,
         tool_calls: Vec::new(),
         is_error: None,
+        thinking: None,
     });
 
     // 4. Run strictly chronological orphan repair on conversation messages
@@ -432,6 +453,7 @@ pub fn translate_kiro_to_chat_request(
             tool_call_id: None,
             tool_calls: Vec::new(),
             is_error: None,
+            thinking: None,
         });
     }
 
@@ -443,6 +465,7 @@ pub fn translate_kiro_to_chat_request(
             tool_call_id: rm.tool_use_id,
             tool_calls: rm.tool_calls,
             is_error: rm.is_error,
+            thinking: rm.thinking,
         });
     }
 

@@ -125,7 +125,7 @@ pub fn process_tools_for_provider(
     (processed_tools, system_append)
 }
 
-use crate::provider::ToolCallEntry;
+use crate::provider::{ThinkingBlock, ToolCallEntry};
 
 /// Generic representation of a conversation turn for orphan pairing check.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,6 +135,8 @@ pub struct ConversationMessage {
     pub tool_use_id: Option<String>,
     pub tool_calls: Vec<ToolCallEntry>, // Full tool calls emitted by assistant
     pub is_error: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingBlock>,
 }
 
 /// Sanitizes conversation turns by repairing orphan tool_use or tool_result pairs in strict
@@ -160,6 +162,7 @@ pub fn repair_orphan_tool_pairs(messages: Vec<ConversationMessage>) -> Vec<Conve
                         tool_use_id: Some(pending_id),
                         tool_calls: Vec::new(),
                         is_error: Some(true),
+                        thinking: None,
                     });
                 }
                 for tc in &msg.tool_calls {
@@ -200,6 +203,7 @@ pub fn repair_orphan_tool_pairs(messages: Vec<ConversationMessage>) -> Vec<Conve
                             tool_use_id: Some(pending_id),
                             tool_calls: Vec::new(),
                             is_error: Some(true),
+                            thinking: None,
                         });
                     }
                 }
@@ -218,6 +222,7 @@ pub fn repair_orphan_tool_pairs(messages: Vec<ConversationMessage>) -> Vec<Conve
             tool_use_id: Some(pending_id),
             tool_calls: Vec::new(),
             is_error: Some(true),
+            thinking: None,
         });
     }
 

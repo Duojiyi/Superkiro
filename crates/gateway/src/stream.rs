@@ -364,6 +364,10 @@ pub fn create_stream_guard_with_send_deadline(
             })
             .max(1);
         let mut stop_reason = None;
+        // The upstream model the response comes from, which its thinking may go back to.
+        let signing_model = billing_settler
+            .as_ref()
+            .map(|settler| settler.target_model.clone());
 
         'stream: loop {
             tokio::select! {
@@ -397,6 +401,16 @@ pub fn create_stream_guard_with_send_deadline(
                                         reply.truncated |= crate::archive::append_capped(&mut reply.reasoning, &text);
                                     }
                                     Some(kiro_wire::encoder::encode_reasoning(Some(&text), None, None))
+                                }
+                                // Kiro keeps a thinking block in its history only with a signature,
+                                // sent before the text or tool call after it; tagged, it goes back
+                                // to the model that wrote it alone.
+                                ProviderDelta::ReasoningSignature(signature) => {
+                                    let signature = match &signing_model {
+                                        Some(model) => crate::provider::tag_signature(model, &signature),
+                                        None => signature,
+                                    };
+                                    Some(kiro_wire::encoder::encode_reasoning(None, Some(&signature), None))
                                 }
                                 ProviderDelta::ToolCallChunk { index, id, name, arguments } => {
                                     // An empty id or name on a continuation names nothing; it

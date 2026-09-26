@@ -325,6 +325,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         backend => println!("[√] Web search backend: {backend:?}"),
     }
     registry.register(McpHandler::new(search));
+
+    // Per-provider request options (PROVIDER_THINKING_REPLAY: provider IDs or *).
+    let provider_options = gateway::provider::ProviderOptionsTable::from_env();
+    println!("[*] Provider options: {}", provider_options.describe());
+    gateway::provider::install_provider_options(provider_options);
     registry.register_provider_import_facade(store.clone(), billing.clone());
 
     // 8. 注册对话流式接管处理器 (P1-05, T04)

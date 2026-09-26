@@ -119,6 +119,28 @@ pub struct AssistantResponseMessage {
     pub content: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_uses: Vec<ToolUseEntry>,
+    /// The turn's thinking, which Kiro sends back only when it kept a signature for it and
+    /// the conversation is still on the model that produced it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<ReasoningContent>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReasoningContent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_text: Option<ReasoningText>,
+    /// Base64, as the SDK sends a blob.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redacted_content: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ReasoningText {
+    #[serde(default)]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 /// Only recognized inference controls cross the gateway boundary.

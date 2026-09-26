@@ -600,3 +600,102 @@ async fn an_attachment_no_upstream_reads_is_refused_naming_it() {
     assert!(sent.contains("report.docx"), "{sent}");
     assert!(!sent.contains(&base64(b"PK\x03\x04")), "{sent}");
 }
+
+/// The frames of an event-stream body, as (event type, JSON payload).
+fn frames(bytes: &[u8]) -> Vec<(String, Value)> {
+    let mut decoder = kiro_wire::decoder::EventStreamDecoder::new();
+    decoder.feed(bytes).unwrap();
+    let (frames, _) = decoder.decode_all();
+    frames
+        .iter()
+        .map(|frame| {
+            (
+                frame
+                    .event_type()
+                    .or_else(|| frame.exception_type())
+                    .unwrap_or_default()
+                    .to_string(),
+                frame.payload_as_json().unwrap_or(Value::Null),
+            )
+        })
+        .collect()
+}
+
+/// Kiro shows a thinking summary as it streams and keeps the thinking in its history only
+/// with a signature, which it sends back on the next turn.
+#[tokio::test]
+async fn thinking_streams_with_the_signature_of_the_model_that_wrote_it() {
+    let events = [
+        json!({"type": "message_start", "message": {"usage": {"input_tokens": 10, "output_tokens": 1}}}),
+        json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}}),
+        json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "Checking the file."}}),
+        json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "EqQBCgIYAh"}}),
+        json!({"type": "content_block_stop", "index": 0}),
+        json!({"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}}),
+        json!({"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "Done."}}),
+        json!({"type": "content_block_stop", "index": 1}),
+        json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 9}}),
+        json!({"type": "message_stop"}),
+    ]
+    .iter()
+    .map(|event| format!("data: {event}\n\n"))
+    .collect::<String>();
+    let server =
+        upstream(ResponseTemplate::new(200).set_body_raw(events, "text/event-stream")).await;
+    let billing = engine(
+        ProviderFormat::Anthropic,
+        &server.uri(),
+        vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+    );
+    let app = serve(&billing);
+    let reply = send(
+        &app,
+        "inv-thinking",
+        body(json!({"content": "check it", "modelId": "model"}), vec![]),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let reasoning: Vec<Value> = frames(&reply.bytes)
+        .into_iter()
+        .filter(|(kind, _)| kind == "reasoningContentEvent")
+        .map(|(_, payload)| payload)
+        .collect();
+    assert_eq!(reasoning[0]["text"], "Checking the file.");
+    assert_eq!(reasoning[1]["signature"], "up-model#EqQBCgIYAh");
+    // Before the answer's text, so Kiro seals the thinking with its signature.
+    let kinds: Vec<String> = frames(&reply.bytes)
+        .into_iter()
+        .map(|(kind, _)| kind)
+        .collect();
+    let signed = kinds
+        .iter()
+        .rposition(|kind| kind == "reasoningContentEvent")
+        .unwrap();
+    let answered = kinds
+        .iter()
+        .position(|kind| kind == "assistantResponseEvent")
+        .unwrap();
+    assert!(signed < answered, "{kinds:?}");
+
+    // Sent back, it is replayed only where the operator switched replay on: off by default.
+    let reply = send(
+        &app,
+        "inv-thinking-2",
+        body(
+            json!({"content": "and now?", "modelId": "model"}),
+            vec![
+                json!({"userInputMessage": {"content": "check it"}}),
+                json!({"assistantResponseMessage": {"content": "Done.", "reasoningContent": {
+                    "reasoningText": {"text": "Checking the file.", "signature": "up-model#EqQBCgIYAh"}
+                }}}),
+            ],
+        ),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    let sent = upstream_body(&server).await;
+    assert!(
+        !sent.to_string().contains("\"thinking\":\"Checking"),
+        "{sent}"
+    );
+}

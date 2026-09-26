@@ -467,3 +467,66 @@ fn kiro_tool_schemas_reach_the_upstream_unwrapped() {
     assert_eq!(openai["tools"][0]["function"]["parameters"], schema);
     assert_eq!(openai["tools"][1]["function"]["parameters"], schema);
 }
+
+#[test]
+fn a_thinking_signature_reaches_the_stream_and_replays_only_to_its_model() {
+    use gateway::provider::{ProviderOptions, ThinkingBlock};
+    let events = AnthropicProvider
+        .parse_stream_line(
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"EqQBCgIYAh"}}"#,
+        )
+        .unwrap();
+    assert_eq!(
+        events,
+        vec![ProviderStreamEvent::Delta(
+            ProviderDelta::ReasoningSignature("EqQBCgIYAh".into())
+        )]
+    );
+
+    let mut assistant = ChatMessage::new("assistant", serde_json::json!("Done."));
+    assistant.thinking = Some(ThinkingBlock {
+        text: "Checking the file.".into(),
+        signature: "EqQBCgIYAh".into(),
+        model: "claude-opus-5-5".into(),
+    });
+    let request = |model: &str| ChatRequest {
+        reasoning_effort: None,
+        model: model.into(),
+        messages: vec![
+            ChatMessage::new("user", serde_json::json!("check it")),
+            assistant.clone(),
+            ChatMessage::new("user", serde_json::json!("and now?")),
+        ],
+        temperature: None,
+        max_tokens: Some(8192),
+        stream: true,
+        tools: vec![],
+    };
+    let replay = ProviderOptions {
+        replay_thinking: true,
+    };
+    let first_block = |body: serde_json::Value| body["messages"][1]["content"][0].clone();
+
+    let body = AnthropicProvider
+        .translate_request_with(&request("claude-opus-5-5"), &replay)
+        .unwrap();
+    assert_eq!(
+        first_block(body),
+        serde_json::json!({"type": "thinking", "thinking": "Checking the file.", "signature": "EqQBCgIYAh"})
+    );
+    // Off by default, and never to another model.
+    for (model, options) in [
+        ("claude-opus-5-5", ProviderOptions::default()),
+        ("claude-opus-5", replay),
+    ] {
+        let body = AnthropicProvider
+            .translate_request_with(&request(model), &options)
+            .unwrap();
+        assert_eq!(first_block(body)["type"], "text", "{model}");
+    }
+    // OpenAI has no thinking blocks to take back.
+    let body = OpenAiProvider
+        .translate_request(&request("claude-opus-5-5"))
+        .unwrap();
+    assert!(!body.to_string().contains("EqQBCgIYAh"));
+}
