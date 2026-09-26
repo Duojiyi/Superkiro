@@ -58,6 +58,53 @@ pub struct BillingSettings {
     /// 成本倍率 by provider ID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_cost_multipliers: Option<BTreeMap<String, f64>>,
+    /// Official list prices by model name (an upstream model a route targets, or a customer
+    /// model): the basis for route costs and the start for new prices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub official_prices: Option<BTreeMap<String, OfficialPrice>>,
+    /// What a route, `<provider>/<upstream model>`, really bills where it differs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_costs: Option<BTreeMap<String, RouteCost>>,
+}
+
+/// An official list price in USD per 1M tokens.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OfficialPrice {
+    pub input_usd_per_m: f64,
+    pub output_usd_per_m: f64,
+    pub cache_creation_usd_per_m: f64,
+    pub cache_read_usd_per_m: f64,
+    /// Where the price comes from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// When its prices last changed; set by the server.
+    #[serde(default)]
+    pub updated_at_secs: u64,
+}
+
+impl OfficialPrice {
+    /// Input, output, cache write and cache read.
+    pub fn usd_per_m(&self) -> [f64; 4] {
+        [
+            self.input_usd_per_m,
+            self.output_usd_per_m,
+            self.cache_creation_usd_per_m,
+            self.cache_read_usd_per_m,
+        ]
+    }
+}
+
+/// What one upstream bills for one model, where that is not its provider's 成本倍率 on the
+/// model's official price.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RouteCost {
+    /// Instead of the provider's 成本倍率.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_multiplier: Option<f64>,
+    /// Input, output, cache write and cache read, when it bills other prices than the official
+    /// ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basis_usd_per_m: Option<[f64; 4]>,
 }
 
 impl Default for BillingSettings {
@@ -70,6 +117,8 @@ impl Default for BillingSettings {
             default_price_multiplier: None,
             default_cost_multiplier: None,
             provider_cost_multipliers: None,
+            official_prices: None,
+            route_costs: None,
         }
     }
 }
@@ -78,6 +127,42 @@ impl BillingSettings {
     /// CNY per official US dollar: ¥1 = $1 unless set.
     pub fn official_usd_cny(&self) -> f64 {
         self.official_usd_cny.unwrap_or(1.0)
+    }
+
+    /// What `provider` bills for `tokens` of its upstream model `target`, in micro-CNY, from
+    /// official prices: the route's own basis, else `target`'s official price, times the
+    /// route's 成本倍率, else the provider's, else the default, at `official_usd_cny`. None
+    /// when the basis or the multiplier is unknown; the cost then comes from price versions.
+    pub fn official_cost_micro_cny(
+        &self,
+        provider: &str,
+        target: &str,
+        tokens: &UsageTokens,
+    ) -> Option<i64> {
+        let route = self
+            .route_costs
+            .as_ref()
+            .and_then(|routes| routes.get(&format!("{provider}/{target}")));
+        let basis = route
+            .and_then(|route| route.basis_usd_per_m)
+            .or_else(|| Some(self.official_prices.as_ref()?.get(target)?.usd_per_m()))?;
+        let multiplier = route
+            .and_then(|route| route.cost_multiplier)
+            .or_else(|| {
+                self.provider_cost_multipliers
+                    .as_ref()?
+                    .get(provider)
+                    .copied()
+            })
+            .or(self.default_cost_multiplier)?;
+        // CNY per 1M tokens, as a version computed from the official price records them.
+        let [input, output, cache_creation, cache_read] =
+            basis.map(|usd| usd * multiplier * self.official_usd_cny());
+        let cny = (tokens.uncached_input_tokens as f64) * input / 1_000_000.0
+            + (tokens.output_tokens as f64) * output / 1_000_000.0
+            + (tokens.cache_creation_tokens as f64) * cache_creation / 1_000_000.0
+            + (tokens.cache_read_tokens as f64) * cache_read / 1_000_000.0;
+        Some(ceil_nonnegative_to_i64((cny * 1_000_000.0).round()))
     }
 }
 

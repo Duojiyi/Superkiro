@@ -2279,14 +2279,7 @@ impl BillingEngine {
             let pricing = LockedPricing {
                 group_margin,
                 model_multiplier,
-                // What settlement prices with. The rest is for the console, and would only
-                // grow every request's saved reservation.
-                settings: BillingSettings {
-                    credit_face_value_cny: settings.credit_face_value_cny,
-                    usd_cny_rate: settings.usd_cny_rate,
-                    rate_updated_at_secs: settings.rate_updated_at_secs,
-                    ..BillingSettings::default()
-                },
+                settings,
             };
             (amt, Some(rcv.id), Some(pricing))
         } else {
@@ -2545,9 +2538,13 @@ impl BillingEngine {
             (charge, cost, None)
         };
 
-        // Provider-qualified model prices take precedence over shared target-model prices.
-        // Served by its primary target, a model costs what its own price version says, the
-        // one it is charged at; a fallback costs what its target does.
+        // A request costs what the upstream that served it bills, whatever group or price
+        // table it came from: from official prices, when they give that route a basis and a
+        // multiplier, at the settings it was reserved at.
+        let official_cost = settings.official_cost_micro_cny(provider_id, target_model, tokens);
+        // Otherwise from price versions. Provider-qualified model prices take precedence over
+        // shared target-model prices. Served by its primary target, a model costs what its own
+        // price version says, the one it is charged at; a fallback costs what its target does.
         let qualified_model = format!("{provider_id}/{target_model}");
         let latest = |model: &str| {
             candidate
@@ -2570,7 +2567,10 @@ impl BillingEngine {
             })
             .or_else(|| latest(target_model))
             .or_else(|| latest("*"));
-        let cost_source = if let Some(version) = cost_version {
+        let cost_source = if let Some(cost) = official_cost {
+            cost_micro_cny = cost;
+            format!("provider_cost:official={qualified_model}")
+        } else if let Some(version) = cost_version {
             cost_micro_cny = version.calculate_cost_micro_cny(tokens, &settings);
             format!("provider_cost:rate_card_version={}", version.id)
         } else {
@@ -2767,7 +2767,7 @@ impl BillingEngine {
                 ts_secs: entry.ts_secs,
             });
         }
-        reservation.state = ReservationState::Settled;
+        reservation.finish(ReservationState::Settled);
         candidate.pending_settlements.remove(invocation_id);
         candidate.ledger.push(entry.clone());
         let mut attempt_chain = Vec::new();
@@ -2840,7 +2840,7 @@ impl BillingEngine {
         if reservation.state != ReservationState::Held {
             return Ok(());
         }
-        reservation.state = ReservationState::Released;
+        reservation.finish(ReservationState::Released);
         if let Some(card) = self.cards.write().unwrap().get_mut(&reservation.card_id) {
             card.credit_reserved = card
                 .credit_reserved
@@ -2882,7 +2882,7 @@ impl BillingEngine {
                         .saturating_sub(res.reserved_micro_credits);
                     affected_cards.insert(res.card_id.clone(), card.clone());
                 }
-                res.state = ReservationState::Released;
+                res.finish(ReservationState::Released);
                 released_reservations.push(res.invocation_id.clone());
                 reclaimed_count += 1;
             }
@@ -2918,7 +2918,7 @@ impl BillingEngine {
             let mut reservations = self.reservations.write().unwrap();
             for inv_id in released_reservations {
                 if let Some(r) = reservations.get_mut(&inv_id) {
-                    r.state = ReservationState::Released;
+                    r.finish(ReservationState::Released);
                 }
             }
             for id in &prune_ids {

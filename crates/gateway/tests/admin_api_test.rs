@@ -1508,8 +1508,14 @@ async fn official_pricing_publishes_and_reads_back_through_the_admin_api() {
         "official_usd_cny": 1.0,
         "default_price_multiplier": 0.24,
         "default_cost_multiplier": 0.08,
-        "provider_cost_multipliers": {"hanyue-max": 0.22, "kimera-primary": 0.08}
+        "provider_cost_multipliers": {"hanyue-max": 0.22, "kimera-primary": 0.08},
+        "official_prices": {"claude-opus-5-5": {
+            "input_usd_per_m": 4.0, "output_usd_per_m": 20.0,
+            "cache_creation_usd_per_m": 5.0, "cache_read_usd_per_m": 0.2, "note": "list price"
+        }},
+        "route_costs": {"hanyue-max/claude-opus-5-5": {"basis_usd_per_m": [2.0, 25.0, 6.25, 0.5]}}
     });
+    let before = gateway::now_secs();
     let (status, body) = send(Some(json!({
         "settings": settings,
         "versions": [{
@@ -1535,9 +1541,19 @@ async fn official_pricing_publishes_and_reads_back_through_the_admin_api() {
         "default_price_multiplier",
         "default_cost_multiplier",
         "provider_cost_multipliers",
+        "route_costs",
     ] {
         assert_eq!(config["settings"][field], settings[field], "{field}");
     }
+    // The server stamps when an official price changed.
+    let mut price = config["settings"]["official_prices"]["claude-opus-5-5"].clone();
+    let stamped = price
+        .as_object_mut()
+        .unwrap()
+        .remove("updated_at_secs")
+        .unwrap();
+    assert!(stamped.as_u64().unwrap() >= before, "{stamped}");
+    assert_eq!(price, settings["official_prices"]["claude-opus-5-5"]);
     assert_eq!(config["versions"][0]["official"], official);
 
     // What the console sends today: the face value alone.

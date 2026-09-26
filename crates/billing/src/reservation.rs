@@ -115,6 +115,13 @@ impl CreditReservation {
         self
     }
 
+    /// Settled or released. What it was priced with has served; the record is kept only to
+    /// refuse a replay of its invocation, and would otherwise carry every setting for a day.
+    pub(crate) fn finish(&mut self, state: ReservationState) {
+        self.state = state;
+        self.pricing = None;
+    }
+
     /// Check if this held reservation has expired and should be reclaimed by janitor.
     pub fn is_expired(&self, now_secs: u64) -> bool {
         self.state == ReservationState::Held && now_secs >= self.expires_at_secs

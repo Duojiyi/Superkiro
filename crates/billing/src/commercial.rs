@@ -219,6 +219,12 @@ impl BillingEngine {
             if settings.provider_cost_multipliers.is_none() {
                 settings.provider_cost_multipliers = current.provider_cost_multipliers.clone();
             }
+            if settings.official_prices.is_none() {
+                settings.official_prices = current.official_prices.clone();
+            }
+            if settings.route_costs.is_none() {
+                settings.route_costs = current.route_costs.clone();
+            }
             if settings
                 .official_usd_cny
                 .is_some_and(|rate| !positive(rate))
@@ -245,6 +251,47 @@ impl BillingEngine {
                 return Err(invalid(
                     "Multipliers must be positive and at most 100, for at most 200 providers",
                 ));
+            }
+            let usd = |prices: &[f64]| prices.iter().all(|p| (0.0..=10_000.0).contains(p));
+            if settings.official_prices.as_ref().is_some_and(|prices| {
+                prices.len() > 1000
+                    || prices.iter().any(|(name, price)| {
+                        !text(name, 256)
+                            || !usd(&price.usd_per_m())
+                            || price.note.as_deref().is_some_and(|note| {
+                                note.len() > 256 || note.chars().any(char::is_control)
+                            })
+                    })
+            }) {
+                return Err(invalid(
+                    "Official prices: at most 1000, named in 1-256 bytes, priced 0-10000, notes of at most 256 bytes",
+                ));
+            }
+            if settings.route_costs.as_ref().is_some_and(|routes| {
+                routes.len() > 1000
+                    || routes.iter().any(|(route, cost)| {
+                        !text(route, 256)
+                            || !route.split_once('/').is_some_and(|(provider, model)| {
+                                !provider.is_empty() && !model.is_empty()
+                            })
+                            || cost.cost_multiplier.is_some_and(|m| !multiplier(m))
+                            || cost.basis_usd_per_m.is_some_and(|basis| !usd(&basis))
+                    })
+            }) {
+                return Err(invalid(
+                    "Route costs: at most 1000, named <provider>/<upstream model> in at most 256 bytes, multipliers positive and at most 100, prices 0-10000",
+                ));
+            }
+            // An official price's time is when its prices last changed.
+            for (name, price) in settings.official_prices.iter_mut().flatten() {
+                price.updated_at_secs = match current
+                    .official_prices
+                    .as_ref()
+                    .and_then(|old| old.get(name))
+                {
+                    Some(old) if old.usd_per_m() == price.usd_per_m() => old.updated_at_secs,
+                    _ => now,
+                };
             }
             // Either one reprices every price computed from an official one (see below).
             repriced = settings.credit_face_value_cny != current.credit_face_value_cny
@@ -561,6 +608,7 @@ impl BillingEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rate_card::{OfficialPrice, RouteCost};
     fn update(e: &BillingEngine) -> CommercialUpdate {
         CommercialUpdate {
             expected_revision: e.commercial_config().revision,
@@ -1450,11 +1498,7 @@ mod tests {
         e.upsert_card(card);
         let params = ReservationEstimateParams::new(0, 1_000_000).with_model("model-a");
         let hold = e.reserve("card", "held", &params, 101, 600).unwrap();
-        // Settlement prices with the face value and the exchange rate; the console's
-        // multipliers stay out of every request's saved hold.
-        let locked = hold.pricing.unwrap().settings;
-        assert_eq!(locked.credit_face_value_cny, 0.03);
-        assert_eq!(locked.provider_cost_multipliers, None);
+        assert_eq!(hold.pricing.unwrap().settings, e.get_settings());
 
         let reprice = |versions: Vec<RateCardVersion>, cancelled: &[&str]| {
             let mut u = update(&e);
@@ -1515,6 +1559,8 @@ mod tests {
             .unwrap();
         assert_eq!(held.rate_card_version.as_deref(), Some("a-1"));
         assert_eq!(held.credits_charged, 200 * credit);
+        // Settled, its record only refuses a replay: what it was priced with is not kept.
+        assert!(e.export_snapshot().reservations["held"].pricing.is_none());
         // At 0.05 CNY a credit.
         e.reserve("card", "after", &params, 202, 600).unwrap();
         let after = e
@@ -1590,5 +1636,278 @@ mod tests {
                 "rate_updated_at_secs": 0
             })
         );
+    }
+
+    fn official_price(usd: [f64; 4], note: Option<String>) -> OfficialPrice {
+        OfficialPrice {
+            input_usd_per_m: usd[0],
+            output_usd_per_m: usd[1],
+            cache_creation_usd_per_m: usd[2],
+            cache_read_usd_per_m: usd[3],
+            note,
+            updated_at_secs: 5,
+        }
+    }
+
+    /// A request costs what the upstream that served it bills, whatever group or price table
+    /// it came from: the route's own basis or its model's official price, times the route's,
+    /// the provider's or the default 成本倍率, at the settings it was reserved at. A route
+    /// without both is costed from price versions, as before.
+    #[test]
+    fn a_request_costs_what_the_route_that_served_it_bills() {
+        use crate::card::Card;
+        use crate::reservation::ReservationEstimateParams;
+        let credit = crate::MICRO_CREDITS_PER_CREDIT;
+        let e = serving_engine();
+        for id in ["hanyue", "kimera"] {
+            e.upsert_provider(Provider::new(
+                id,
+                id,
+                crate::provider::ProviderFormat::Anthropic,
+                "https://upstream.invalid",
+            ));
+            e.upsert_provider_key(ProviderKey::new(format!("{id}-key"), id, "test"));
+        }
+        // One credit and `cny` of cost per million input tokens.
+        let version = |id: &str, model: &str, cny: f64| -> RateCardVersion {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "rate_card_id": "default", "model": model,
+                "currency": "CNY", "pricing_mode": "fixed",
+                "input_price_per_m": cny, "output_price_per_m": 0.0,
+                "cache_creation_price_per_m": 0.0, "cache_read_price_per_m": 0.0,
+                "fixed_input_credit_per_m": credit, "fixed_output_credit_per_m": 0,
+                "fixed_cache_creation_credit_per_m": 0, "fixed_cache_read_credit_per_m": 0,
+                "per_call_credit": 0, "margin_multiplier": 1.0, "effective_from_secs": 0
+            }))
+            .unwrap()
+        };
+        let mut u = update(&e);
+        // A second group on the same price table.
+        u.groups.push(Group::pro_plus("other-tier", "Other tier"));
+        u.settings = Some(BillingSettings {
+            default_cost_multiplier: Some(0.1),
+            provider_cost_multipliers: Some(
+                [("hanyue".to_string(), 0.22), ("kimera".to_string(), 0.08)].into(),
+            ),
+            official_prices: Some(
+                [
+                    (
+                        "opus".to_string(),
+                        official_price([4.0, 20.0, 5.0, 0.2], None),
+                    ),
+                    (
+                        "sonnet".to_string(),
+                        official_price([3.0, 15.0, 3.75, 0.3], None),
+                    ),
+                ]
+                .into(),
+            ),
+            route_costs: Some(
+                [
+                    (
+                        "hanyue/opus".to_string(),
+                        RouteCost {
+                            cost_multiplier: None,
+                            basis_usd_per_m: Some([2.0, 25.0, 6.25, 0.5]),
+                        },
+                    ),
+                    (
+                        "p/sonnet".to_string(),
+                        RouteCost {
+                            cost_multiplier: Some(0.5),
+                            basis_usd_per_m: None,
+                        },
+                    ),
+                ]
+                .into(),
+            ),
+            ..e.get_settings()
+        });
+        u.models = vec![
+            ModelMap::new("map-a", "new-tier", "opus", "hanyue", "opus")
+                .with_fallback("kimera", "opus"),
+            ModelMap::new("map-b", "other-tier", "opus", "kimera", "opus"),
+            ModelMap::new("map-c", "new-tier", "legacy", "kimera", "legacy"),
+        ];
+        // The price's own cost is the primary's, as it had to be typed before.
+        u.versions = vec![
+            version("v-opus", "opus", 1.1),
+            version("v-legacy", "legacy", 3.0),
+        ];
+        e.publish_commercial_config(u, 100).unwrap();
+        for (card, group) in [("card-a", "new-tier"), ("card-b", "other-tier")] {
+            let mut card = Card::new(card, group, 1_000 * credit);
+            card.activate(100, 86_400).unwrap();
+            e.upsert_card(card);
+        }
+        let tokens = UsageTokens {
+            uncached_input_tokens: 1_000_000,
+            ..UsageTokens::default()
+        };
+        let reserve = |card: &str, id: &str, model: &str, at: u64| {
+            let params = ReservationEstimateParams::new(1_000_000, 0).with_model(model);
+            e.reserve(card, id, &params, at, 600).unwrap();
+        };
+        let serve = |card: &str, id: &str, model: &str, route: (&str, &str), at: u64| {
+            reserve(card, id, model, at);
+            let entry = e
+                .settle(id, &tokens, model, route.0, route.1, at + 1)
+                .unwrap();
+            (entry.provider_cost_micro_cny, entry.reason.unwrap())
+        };
+        let official = |route: &str| format!("provider_cost:official={route}");
+        // hanyue bills its own basis ($2 input) x its 0.22.
+        assert_eq!(
+            serve("card-a", "a-1", "opus", ("hanyue", "opus"), 110),
+            (440_000, official("hanyue/opus"))
+        );
+        // The backup, and the other group's primary: opus's $4 x kimera's 0.08.
+        assert_eq!(
+            serve("card-a", "a-2", "opus", ("kimera", "opus"), 120),
+            (320_000, official("kimera/opus"))
+        );
+        assert_eq!(
+            serve("card-b", "b-1", "opus", ("kimera", "opus"), 130),
+            (320_000, official("kimera/opus"))
+        );
+        // A provider without its own multiplier, and a route's own multiplier.
+        assert_eq!(
+            serve("card-a", "a-3", "opus", ("p", "opus"), 140),
+            (400_000, official("p/opus"))
+        );
+        assert_eq!(
+            serve("card-a", "a-4", "opus", ("p", "sonnet"), 150),
+            (1_500_000, official("p/sonnet"))
+        );
+        // No official price for the upstream model: from the price versions, as before.
+        assert_eq!(
+            serve("card-a", "a-5", "legacy", ("kimera", "legacy"), 160),
+            (
+                3_000_000,
+                "provider_cost:rate_card_version=v-legacy".to_string()
+            )
+        );
+
+        // kimera's multiplier changes while a request is in flight: it keeps the one it was
+        // reserved at.
+        reserve("card-b", "held", "opus", 200);
+        let mut u = update(&e);
+        u.settings = Some(BillingSettings {
+            provider_cost_multipliers: Some(
+                [("hanyue".to_string(), 0.22), ("kimera".to_string(), 0.1)].into(),
+            ),
+            ..e.get_settings()
+        });
+        e.publish_commercial_config(u, 201).unwrap();
+        let held = e
+            .settle("held", &tokens, "opus", "kimera", "opus", 202)
+            .unwrap();
+        assert_eq!(held.provider_cost_micro_cny, 320_000);
+        assert_eq!(
+            serve("card-b", "after", "opus", ("kimera", "opus"), 203),
+            (400_000, official("kimera/opus"))
+        );
+    }
+
+    /// The official price table and the route costs are bounded like the other settings and
+    /// kept when a publication leaves them out; an official price's time is when its prices
+    /// last changed.
+    #[test]
+    fn official_prices_and_route_costs_are_bounded_and_stamped() {
+        let e = serving_engine();
+        let price =
+            |input: f64, note: Option<String>| official_price([input, 25.0, 6.25, 0.5], note);
+        let route = |multiplier: Option<f64>, basis: Option<[f64; 4]>| RouteCost {
+            cost_multiplier: multiplier,
+            basis_usd_per_m: basis,
+        };
+        let with = |prices: Option<Vec<(String, OfficialPrice)>>,
+                    routes: Option<Vec<(String, RouteCost)>>,
+                    now: u64| {
+            let mut u = update(&e);
+            u.settings = Some(BillingSettings {
+                official_prices: prices.map(|prices| prices.into_iter().collect()),
+                route_costs: routes.map(|routes| routes.into_iter().collect()),
+                ..e.get_settings()
+            });
+            publish(&e, u, now)
+        };
+        let invalid_prices = "Official prices: at most 1000, named in 1-256 bytes, priced 0-10000, notes of at most 256 bytes";
+        for prices in [
+            vec![(" ".to_string(), price(5.0, None))],
+            vec![("m".repeat(257), price(5.0, None))],
+            vec![("m".to_string(), price(f64::NAN, None))],
+            vec![("m".to_string(), price(10_000.5, None))],
+            vec![("m".to_string(), price(5.0, Some("n".repeat(257))))],
+            vec![("m".to_string(), price(5.0, Some("line\nbreak".into())))],
+            (0..1001)
+                .map(|i| (format!("m{i}"), price(5.0, None)))
+                .collect(),
+        ] {
+            assert_eq!(with(Some(prices), None, 100).unwrap_err(), invalid_prices);
+        }
+        let invalid_routes = "Route costs: at most 1000, named <provider>/<upstream model> in at most 256 bytes, multipliers positive and at most 100, prices 0-10000";
+        for routes in [
+            vec![("opus".to_string(), route(Some(0.2), None))],
+            vec![("/opus".to_string(), route(Some(0.2), None))],
+            vec![("p/".to_string(), route(Some(0.2), None))],
+            vec![("p/opus".to_string(), route(Some(0.0), None))],
+            vec![("p/opus".to_string(), route(Some(100.5), None))],
+            vec![(
+                "p/opus".to_string(),
+                route(None, Some([f64::NAN, 25.0, 6.25, 0.5])),
+            )],
+            (0..1001)
+                .map(|i| (format!("p/m{i}"), route(Some(0.2), None)))
+                .collect(),
+        ] {
+            assert_eq!(with(None, Some(routes), 100).unwrap_err(), invalid_routes);
+        }
+
+        let first = with(
+            Some(vec![("opus".into(), price(5.0, None))]),
+            Some(vec![(
+                "hanyue/opus".into(),
+                route(None, Some([2.0, 25.0, 6.25, 0.5])),
+            )]),
+            100,
+        )
+        .unwrap()
+        .settings;
+        assert_eq!(
+            first.official_prices.as_ref().unwrap()["opus"].updated_at_secs,
+            100
+        );
+        let kept = with(None, None, 150).unwrap().settings;
+        assert_eq!(
+            (kept.official_prices, kept.route_costs),
+            (first.official_prices, first.route_costs)
+        );
+        // A new note keeps the time; a new or changed price is stamped.
+        let later = with(
+            Some(vec![
+                ("opus".into(), price(5.0, Some("list price".into()))),
+                ("sonnet".into(), price(3.0, None)),
+            ]),
+            None,
+            200,
+        )
+        .unwrap()
+        .settings
+        .official_prices
+        .unwrap();
+        assert_eq!(
+            (
+                later["opus"].updated_at_secs,
+                later["sonnet"].updated_at_secs
+            ),
+            (100, 200)
+        );
+        let changed = with(Some(vec![("opus".into(), price(4.0, None))]), None, 300)
+            .unwrap()
+            .settings
+            .official_prices
+            .unwrap();
+        assert_eq!(changed["opus"].updated_at_secs, 300);
     }
 }

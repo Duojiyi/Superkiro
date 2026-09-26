@@ -51,8 +51,8 @@ pub use generator::{export_csv, export_json, generate_batch, generate_card, Gene
 pub use group::{FallbackTarget, Group, ModelMap, ProviderBindingMode};
 pub use ledger::{LedgerEntry, LedgerKind, PricingRates, UsageTokens};
 pub use rate_card::{
-    BillingSettings, Currency, MarginSummary, OfficialPricing, PricingMode, RateCard,
-    RateCardVersion,
+    BillingSettings, Currency, MarginSummary, OfficialPrice, OfficialPricing, PricingMode,
+    RateCard, RateCardVersion, RouteCost,
 };
 pub use reservation::{
     CreditReservation, LockedPricing, ReservationEstimateParams, ReservationState,
