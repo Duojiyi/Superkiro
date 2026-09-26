@@ -1451,3 +1451,389 @@ async fn publication_takes_first_prices_from_now_retirement_and_removals() {
         .collect();
     assert_eq!(ids, ["v-now"]);
 }
+
+/// An administrator's request to `uri`: its status and JSON body.
+async fn admin_call(
+    app: &axum::Router,
+    method: Method,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("x-admin-key", TEST_ADMIN_KEY)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body.map_or_else(Body::empty, |body| Body::from(body.to_string())))
+        .unwrap();
+    let response = tower::ServiceExt::oneshot(app.clone(), request)
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap_or_default())
+}
+
+/// The newest event of `action` in a card's history, as the console reads it.
+async fn newest_event(app: &axum::Router, card_id: &str, action: &str) -> serde_json::Value {
+    let (status, body) = admin_call(
+        app,
+        Method::GET,
+        &format!("/api/v1/admin/cards/history?card_id={card_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    body["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["action"] == action)
+        .cloned()
+        .unwrap_or_else(|| panic!("no {action} event: {body}"))
+}
+
+#[tokio::test]
+async fn card_support_actions_are_written_to_the_history_with_the_operator() {
+    let (billing, app) = setup_admin_app();
+    let now = gateway::now_secs();
+    let mut card = Card::new("card-support", "group-admin", 10_000_000);
+    card.status = CardStatus::Active;
+    card.activated_at = Some(now - 86_400);
+    card.valid_until = Some(now + 86_400);
+    card.max_rebinds = 2;
+    card.rebind_count = 2;
+    card.rebind_cooldown_secs = 86_400;
+    card.last_rebind_at = Some(now - 60);
+    card.bound_devices = vec!["device-old".into()];
+    billing.upsert_card(card);
+    billing.upsert_group(billing::Group::pro_plus("group-new", "New"));
+    let post = |path: &str, body: serde_json::Value| {
+        let app = app.clone();
+        let uri = format!("/api/v1/admin/cards/{path}");
+        async move { admin_call(&app, Method::POST, &uri, Some(body)).await }
+    };
+
+    let (status, body) = post(
+        "devices/unbind",
+        json!({"cardId": "card-support", "deviceId": "device-old", "reason": "换电脑"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["card"]["boundDevices"], json!([]));
+    assert_eq!(
+        body["card"]["rebindsUsed"], 2,
+        "the customer's allowance is untouched"
+    );
+    let event = newest_event(&app, "card-support", "unbind").await;
+    assert_eq!(event["operator"], "admin");
+    assert_eq!(event["reason"], "换电脑");
+    assert_eq!(event["detail"], json!({"deviceId": "device-old"}));
+
+    let (status, body) = post(
+        "rebinds/reset",
+        json!({"cardId": "card-support", "reason": "客户多次换机"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["card"]["rebindsUsed"], 0);
+    assert_eq!(body["card"]["rebindCooldownUntil"], serde_json::Value::Null);
+    let event = newest_event(&app, "card-support", "rebinds_reset").await;
+    assert_eq!(event["reason"], "客户多次换机");
+    assert_eq!(event["detail"]["previousRebinds"], 2);
+
+    let (status, body) = post(
+        "validity",
+        json!({"cardIds": ["card-support"], "days": 30, "reason": "补偿停机"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["count"], 1);
+    let until = now + 31 * 86_400;
+    assert_eq!(body["cards"][0]["validUntil"], until);
+    let event = newest_event(&app, "card-support", "extend").await;
+    assert_eq!(event["detail"], json!({"validUntil": until}));
+    let (status, body) = post(
+        "validity",
+        json!({"cardIds": ["card-support"], "validUntilSecs": until + 86_400, "reason": "续期"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["cards"][0]["validUntil"], until + 86_400);
+
+    let (status, body) = post(
+        "note",
+        json!({"cardId": "card-support", "note": "VIP 客户"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["card"]["note"], "VIP 客户");
+    let event = newest_event(&app, "card-support", "note").await;
+    assert_eq!(event["operator"], "admin");
+    assert_eq!(event["reason"], serde_json::Value::Null);
+
+    let (status, body) = post(
+        "group",
+        json!({"cardId": "card-support", "groupId": "group-new", "reason": "升级套餐"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["card"]["groupId"], "group-new");
+    let event = newest_event(&app, "card-support", "group").await;
+    assert_eq!(
+        event["detail"],
+        json!({"previousGroupId": "group-admin", "groupId": "group-new"})
+    );
+
+    // Unban through the status endpoint, with a reason, keeping the ban's revocation.
+    let (status, _) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/cards/status",
+        Some(json!({"cardId": "card-support", "action": "ban", "reason": "滥用"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let banned = billing.get_card("card-support").unwrap();
+    let (status, body) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/cards/status",
+        Some(json!({"cardId": "card-support", "action": "unban", "reason": "误封"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["newStatus"], "active");
+    assert_eq!(body["card"]["effectiveStatus"], "active");
+    assert_eq!(
+        billing.get_card("card-support").unwrap().token_version,
+        banned.token_version
+    );
+    let event = newest_event(&app, "card-support", "unban").await;
+    assert_eq!(event["reason"], "误封");
+
+    // A compensation names the request it makes up for.
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/admin/cards/adjust")
+        .header("x-admin-key", TEST_ADMIN_KEY)
+        .header("idempotency-key", "comp-support-1")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({"cardId": "card-support", "deltaPoints": 2.0, "reason": "补偿失败请求",
+                "invocationId": "card-support:inv-failed-1"})
+            .to_string(),
+        ))
+        .unwrap();
+    let response = tower::ServiceExt::oneshot(app.clone(), request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let event = newest_event(&app, "card-support", "adjust").await;
+    assert_eq!(event["invocationId"], "card-support:inv-failed-1");
+    assert_eq!(event["credits"], 2_000_000);
+
+    // The history carries the card as it now is.
+    let (_, history) = admin_call(
+        &app,
+        Method::GET,
+        "/api/v1/admin/cards/history?card_id=card-support",
+        None,
+    )
+    .await;
+    assert_eq!(history["card"]["id"], "card-support");
+    assert_eq!(history["card"]["groupId"], "group-new");
+}
+
+#[tokio::test]
+async fn card_support_actions_refuse_with_a_message_and_change_nothing() {
+    let (billing, app) = setup_admin_app();
+    let mut voided = Card::new("card-voided", "group-admin", 1_000);
+    voided.status = CardStatus::Voided;
+    billing.upsert_card(voided);
+    let mut closed = billing::Group::pro_plus("group-closed", "Acceptance");
+    closed.issuance_enabled = false;
+    billing.upsert_group(closed);
+    let long_reason = "x".repeat(201);
+    let before = billing.export_snapshot();
+    for (path, body, expected, message) in [
+        (
+            "devices/unbind",
+            json!({"cardId": "card-admin-02", "deviceId": "device-x", "reason": "换电脑"}),
+            StatusCode::NOT_FOUND,
+            "Device device-x not found for card card-admin-02",
+        ),
+        (
+            "devices/unbind",
+            json!({"cardId": "card-admin-02", "deviceId": "device-x"}),
+            StatusCode::BAD_REQUEST,
+            "A reason of 1 to 200 bytes is required",
+        ),
+        (
+            "rebinds/reset",
+            json!({"cardId": "card-admin-02", "reason": long_reason}),
+            StatusCode::BAD_REQUEST,
+            "A reason of 1 to 200 bytes is required",
+        ),
+        (
+            "rebinds/reset",
+            json!({"cardId": "no-such-card", "reason": "x"}),
+            StatusCode::NOT_FOUND,
+            "Card no-such-card not found",
+        ),
+        (
+            "validity",
+            json!({"cardIds": ["card-admin-02", "card-voided"], "days": 5, "reason": "续期"}),
+            StatusCode::CONFLICT,
+            "Voided cards cannot be extended: card-voided",
+        ),
+        (
+            "validity",
+            json!({"cardIds": ["card-admin-02"], "days": 5, "validUntilSecs": 4_000_000_000u64, "reason": "续期"}),
+            StatusCode::BAD_REQUEST,
+            "Give exactly one of days and validUntilSecs",
+        ),
+        (
+            "validity",
+            json!({"cardIds": ["card-admin-02"], "days": 3651, "reason": "续期"}),
+            StatusCode::BAD_REQUEST,
+            "days must be between 1 and 3650",
+        ),
+        (
+            "validity",
+            json!({"cardIds": [], "days": 5, "reason": "续期"}),
+            StatusCode::BAD_REQUEST,
+            "cardIds must name 1 to 500 cards",
+        ),
+        (
+            "note",
+            json!({"cardId": "card-admin-02", "note": "a\nb"}),
+            StatusCode::BAD_REQUEST,
+            "note must be at most 256 bytes, without control characters",
+        ),
+        (
+            "note",
+            json!({"cardId": "card-admin-02", "note": "字".repeat(86)}),
+            StatusCode::BAD_REQUEST,
+            "note must be at most 256 bytes, without control characters",
+        ),
+        (
+            "group",
+            json!({"cardId": "card-admin-02", "groupId": "group-missing", "reason": "x"}),
+            StatusCode::CONFLICT,
+            "Unknown group: group-missing",
+        ),
+        (
+            "group",
+            json!({"cardId": "card-admin-02", "groupId": "group-closed", "reason": "x"}),
+            StatusCode::CONFLICT,
+            "Group does not take cards: group-closed",
+        ),
+    ] {
+        let (status, body) = admin_call(
+            &app,
+            Method::POST,
+            &format!("/api/v1/admin/cards/{path}"),
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, expected, "{path}: {body}");
+        assert_eq!(body["success"], false, "{path}");
+        assert_eq!(body["error"], message, "{path}");
+    }
+    // An unknown field is refused rather than ignored.
+    let (status, body) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/cards/note",
+        Some(json!({"cardId": "card-admin-02", "note": "x", "reason": "x"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .starts_with("Invalid request body"));
+    // Unbanning needs a reason, and a banned card.
+    for (body, message) in [
+        (
+            json!({"cardId": "card-admin-02", "action": "unban"}),
+            "A reason of 1 to 200 bytes is required",
+        ),
+        (
+            json!({"cardId": "card-admin-02", "action": "unban", "reason": "误封"}),
+            "Invalid billing state: cannot unban Active",
+        ),
+    ] {
+        let (status, body) =
+            admin_call(&app, Method::POST, "/api/v1/admin/cards/status", Some(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], message);
+    }
+    let after = billing.export_snapshot();
+    assert_eq!(after.cards, before.cards);
+    assert_eq!(after.ledger.len(), before.ledger.len());
+
+    // Only an administrator.
+    for path in [
+        "devices/unbind",
+        "rebinds/reset",
+        "validity",
+        "note",
+        "group",
+    ] {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/v1/admin/cards/{path}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({"cardId": "card-admin-02"}).to_string()))
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app.clone(), request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn card_views_show_the_rebind_allowance_and_the_effective_status() {
+    let (billing, app) = setup_admin_app();
+    let now = gateway::now_secs();
+    let mut lapsed = Card::new("card-lapsed", "group-admin", 1_000);
+    lapsed.status = CardStatus::Active;
+    lapsed.activated_at = Some(now - 40 * 86_400);
+    lapsed.valid_until = Some(now - 1);
+    lapsed.rebind_count = 1;
+    lapsed.max_rebinds = 3;
+    lapsed.last_rebind_at = Some(now - 100);
+    lapsed.rebind_cooldown_secs = 3_600;
+    billing.upsert_card(lapsed);
+    let mut waiting = Card::new("card-waiting", "group-admin", 1_000);
+    waiting.activation_duration_secs = Some(30 * 86_400);
+    billing.upsert_card(waiting);
+
+    let (status, body) = admin_call(&app, Method::GET, "/api/v1/admin/cards", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let card = |id: &str| {
+        body["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|card| card["id"] == id)
+            .cloned()
+            .unwrap()
+    };
+    let lapsed = card("card-lapsed");
+    assert_eq!(lapsed["status"], "active");
+    assert_eq!(lapsed["effectiveStatus"], "expired");
+    assert_eq!(lapsed["rebindsUsed"], 1);
+    assert_eq!(lapsed["maxRebinds"], 3);
+    assert_eq!(lapsed["rebindCooldownUntil"], now - 100 + 3_600);
+    assert_eq!(lapsed["activationDurationSecs"], serde_json::Value::Null);
+    let waiting = card("card-waiting");
+    assert_eq!(waiting["effectiveStatus"], "unactivated");
+    assert_eq!(waiting["rebindCooldownUntil"], serde_json::Value::Null);
+    assert_eq!(waiting["activationDurationSecs"], 30 * 86_400);
+}
