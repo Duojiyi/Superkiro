@@ -132,7 +132,8 @@ pub struct StreamGuardConfig {
     pub keepalive_interval: Duration,
     /// Model identifier to attach to text frames.
     pub model_id: String,
-    /// Model context window size in tokens to drive contextUsageEvent percentage (Spec §4.5).
+    /// Model context window size in tokens to drive contextUsageEvent percentage, 0 to 100
+    /// (Spec §4.5).
     pub context_window: Option<u32>,
 }
 
@@ -454,9 +455,11 @@ pub fn create_stream_guard_with_send_deadline(
                                 cache_read_input_tokens: usage.cache_read_input_tokens.unwrap_or(0).min(i64::MAX as u64) as i64,
                                 cache_write_input_tokens: usage.cache_creation_input_tokens.unwrap_or(0).min(i64::MAX as u64) as i64,
                             };
+                            // Kiro reads a percentage: it summarizes the conversation at 80 and
+                            // truncates it at 95. A fraction never reached either.
                             let frames = [
                                 kiro_wire::encoder::encode_metadata(Some(wire_usage), None),
-                                kiro_wire::encoder::encode_context_usage((usage.total_tokens as f64 / context_window as f64).clamp(0.0, 1.0)),
+                                kiro_wire::encoder::encode_context_usage((usage.total_tokens as f64 * 100.0 / context_window as f64).clamp(0.0, 100.0)),
                             ];
                             for frame in frames {
                                 if !send_frame(&tx, Bytes::from(frame), send_deadline).await { break 'stream; }
