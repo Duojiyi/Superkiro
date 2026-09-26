@@ -4,8 +4,9 @@ import {useState, type ReactNode} from 'react';
 import {loadAdjustment} from '../adjustment';
 import type {AdminActivityWindow, AdminTrace} from '../api';
 import {EstimateTag, FilterTabs, StatusBadge, TableState, TopbarActions} from '../components/ui';
-import {IconCheck} from '../components/icons';
+import {IconCheck, IconWarning} from '../components/icons';
 import {formatCount, formatCredits, formatCreditsMicro, formatDuration, formatFullDateTime, formatMoney, formatPercent, formatRemaining, shortId} from '../format';
+import {brokenRoutes, modelName, nameList, targetProblem} from '../routes';
 import {keyCooldownLeft, keyStatusView, TRACE_IN_PROGRESS} from '../status';
 import type {Intent, Tab} from '../types';
 import type {Failures, WorkspaceData} from '../Workspace';
@@ -118,6 +119,10 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
     attention.push({text: `公告「${notice.title}」${formatRemaining(notice.expires_at, now).text.replace('剩 ', '')}后到期`, tone: 'info', go: () => onNavigate('announcements')});
   }
   const unknown = failures.cards || failures.providers || failures.traces;
+  // Shown models whose primary route cannot serve: those nothing can serve, and those a backup serves.
+  const broken = providersLoaded ? brokenRoutes(data.models, {providers: data.providers, keys: data.providerKeys}) : [];
+  const describe = (entries: typeof broken) => nameList(entries.map(({model, route}) => `${modelName(model, data.models, data.groups)}（${targetProblem(route.primary, data.providers)}）`), 4);
+  const down = broken.filter(entry => entry.route.down), takeover = broken.filter(entry => !entry.route.down);
 
   const providerRows = data.providers.map(provider => {
     const keys = data.providerKeys.filter(key => key.provider_id === provider.id);
@@ -138,6 +143,12 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
 
   return <div className="page-stack">
     <TopbarActions><FilterTabs label="统计范围" value={range} onChange={setRange} options={[{value: '24h', label: '近 24 小时'}, {value: '7d', label: '近 7 天'}]}/></TopbarActions>
+    {down.length > 0 && <div role="alert" className="banner banner-danger"><IconWarning/>
+      <span className="banner-text"><b>{down.length} 个在售模型无可用线路</b>，客户请求会失败：{describe(down)}</span>
+      <button type="button" className="btn btn-small" onClick={() => onNavigate('models')}>去模型与定价</button></div>}
+    {takeover.length > 0 && <div role="status" className="banner banner-warning"><IconWarning/>
+      <span className="banner-text"><b>{takeover.length} 个在售模型的主线路不可用</b>，正由备用线路服务：{describe(takeover)}</span>
+      <button type="button" className="btn btn-small" onClick={() => onNavigate('models')}>去模型与定价</button></div>}
     <div className="kpi-row">
       <Kpi label="请求" estimate={requestEstimate} value={period ? formatCount(period.requests) : '—'}
         sub={period && <>

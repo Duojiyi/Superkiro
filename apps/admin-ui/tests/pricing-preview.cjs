@@ -139,11 +139,12 @@ assert.equal(tokens.formatTokens(200000),'200K Tokens（200,000）');
 assert.equal(tokens.formatTokens(1000000),'1M Tokens（1,000,000）');
 assert.equal(display.formatTokenCount(272000),'272K');
 const model = {id: 'model-1', exposed_model_id: 'test-model', target_model: 'upstream', target_provider_id: 'p', group_id: 'g', credit_multiplier: 4};
-const Editor = load('CommercialEditor.tsx', {'./tokens': tokens, './api': {adminApi: {}}, './format': display, './priceChange': change,
+const routes = load('routes.ts');
+const Editor = load('CommercialEditor.tsx', {'./tokens': tokens, './api': {adminApi: {}}, './format': display, './priceChange': change, './routes': routes,
   // Dialogs, drawers and messages only run from event handlers; the render tree just names the components.
   './components/confirm': {confirmAction: async () => true}, './components/toast': {toast: {success() {}, info() {}, error() {}}},
   './components/modal': {Drawer: 'Drawer', Modal: 'Modal'}, './components/icons': {IconImage: 'IconImage', IconSpark: 'IconSpark', IconTool: 'IconTool'},
-  './components/ui': {InfoTip: 'InfoTip', TopbarActions: 'TopbarActions'}, './PriceDrawer': {default: 'PriceDrawer'}, './PriceVersions': {default: 'PriceVersions'}, './ListModelDrawer': {default: 'ListModelDrawer'},
+  './components/ui': {InfoTip: 'InfoTip', Tag: 'Tag', TopbarActions: 'TopbarActions'}, './PriceDrawer': {default: 'PriceDrawer'}, './PriceVersions': {default: 'PriceVersions'}, './ListModelDrawer': {default: 'ListModelDrawer'},
   react, 'react/jsx-runtime': runtime}).default;
 const providers = [{id: 'p', name: '供应商 P'}, {id: 'openai', name: 'Astra', api_type: 'openai'}];
 const providerKeys = [{id: 'k', provider_id: 'openai', allowed_models: ['gpt-6-astra', 'gpt-5.6-sol']}, {id: 'k2', provider_id: 'p', allowed_models: ['upstream']}];
@@ -197,7 +198,7 @@ assert.equal(states[1],duplicateDraft,'duplicate IDs cannot cause multiple rows 
 assert(states[4].includes('ID 重复或不存在'));
 
 // 上架模型: the rules in listing.ts, without a browser.
-const listing = load('listing.ts', {'./priceChange': change});
+const listing = load('listing.ts', {'./priceChange': change, './routes': routes});
 // Values made inside the module's context compare by content, not by prototype.
 const plain = value => JSON.parse(JSON.stringify(value));
 assert.equal(listing.displayNameFor('claude-opus-5-5'), 'Claude Opus 5.5');
@@ -221,8 +222,8 @@ const listingConfig = {groups: [{id: 'g', name: 'G', rate_card_id: 'r', margin_m
 const listingProviders = [{id: 'p', name: 'P'}, {id: 'off', name: 'Off', enabled: false}];
 const listingKeys = [{id: 'k', provider_id: 'p', enabled: true, allowed_models: ['model-a', 'model-b', 'model-c', 'new-model']},
   {id: 'k-off', provider_id: 'p', enabled: false, allowed_models: ['disabled-only']}];
-assert.deepEqual(plain(listing.authorizedModels('p', listingKeys)), ['model-a', 'model-b', 'model-c', 'new-model'], 'a disabled Key authorises nothing');
-assert(listing.canRoute('p', 'anything', [{provider_id: 'p', enabled: true}]), 'an old Key without a list may call any model');
+assert.deepEqual(plain(routes.authorizedModels('p', listingKeys)), ['model-a', 'model-b', 'model-c', 'new-model'], 'a disabled Key authorises nothing');
+assert(routes.canRoute('p', 'anything', [{provider_id: 'p', enabled: true}]), 'an old Key without a list may call any model');
 const t0 = Math.floor(Date.now() / 1000);
 const listingInput = {providerId: 'p', targetModel: 'new-model', modelId: 'new-model', displayName: '', groupId: 'g', contextWindow: 200000, maxOutput: 32000,
   tools: true, vision: true, reasoning: false, rateMultiplier: '2.2', after: 'm-a',

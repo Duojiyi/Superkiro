@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "test": "node tests/contracts.cjs && node tests/pricing-preview.cjs && node tests/auth-session.cjs && node tests/session-deadline.cjs && node tests/session-clock.cjs && node tests/cards-pagination.cjs && node tests/dev-proxy.cjs",
+    "test": "node tests/contracts.cjs && node tests/pricing-preview.cjs && node tests/model-rules.cjs && node tests/auth-session.cjs && node tests/session-deadline.cjs && node tests/session-clock.cjs && node tests/cards-pagination.cjs && node tests/dev-proxy.cjs",
     "test:issuance": "node tests/issuance.cjs",
     "test:card-bulk": "node tests/card-bulk.cjs",
     "test:iteration": "node tests/iteration.cjs",

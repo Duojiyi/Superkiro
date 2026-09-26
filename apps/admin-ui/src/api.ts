@@ -527,6 +527,11 @@ export class AdminApiClient {
     return this.request('/api/v1/admin/providers/keys' + (action === 'discover' ? '/discover' : ''), {method: 'POST', body: JSON.stringify(payload)});
   }
 
+  /** Refused (409) while it is the only route of a model customers see. */
+  async deleteKey(providerId: string, keyId: string): Promise<{success: boolean}> {
+    return this.request('/api/v1/admin/providers/keys/delete', {method: 'POST', body: JSON.stringify({provider_id: providerId, key_id: keyId})});
+  }
+
   async getProviders(): Promise<{ success: boolean; providers: Array<Record<string, unknown>>; keys: Array<Record<string, unknown>> }> {
     return this.request('/api/v1/admin/providers');
   }

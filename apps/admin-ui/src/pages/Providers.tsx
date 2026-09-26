@@ -2,10 +2,12 @@
 // when a key is being edited or added.
 import {useEffect, useState, type MutableRefObject} from 'react';
 import {adminApi} from '../api';
-import {confirmAction} from '../components/confirm';
+import {ask, confirmAction} from '../components/confirm';
 import {toast} from '../components/toast';
 import {ListState, StatusBadge, Switch, Tag, TopbarActions} from '../components/ui';
 import ProviderKeyEditor from '../ProviderKeyEditor';
+import type {PublishOutcome} from '../refusal';
+import {lossFacts, modelName, nameList, routeLosses} from '../routes';
 import {keyStatusView} from '../status';
 import type {Refresh, ReportError, Row, WriteGuards} from '../types';
 
@@ -24,10 +26,11 @@ function ModelTags({models}: {models: unknown}) {
   </span>;
 }
 
-export default function ProvidersPage({providers, providerKeys, models, loading, failed, refresh, guards, reportError, editing, setEditing, providerDirty, editorBusy, onDirtyChange, onBusyChange, mergeKey, onListModel}: {
+export default function ProvidersPage({providers, providerKeys, models, groups = [], loading, failed, refresh, guards, reportError, editing, setEditing, providerDirty, editorBusy, onDirtyChange, onBusyChange, mergeKey, onListModel, onHideModels}: {
   providers: Row[];
   providerKeys: Row[];
   models: Row[];
+  groups?: Row[];
   loading: boolean;
   failed: boolean;
   refresh: Refresh;
@@ -42,6 +45,8 @@ export default function ProvidersPage({providers, providerKeys, models, loading,
   mergeKey: (saved: Row) => void;
   /** Opens 模型与定价 › 上架模型 for this provider's upstream model. */
   onListModel?: (providerId: string, model: string) => void;
+  /** 同时隐藏这些模型: publishes these models hidden, before the change that leaves them without a route. */
+  onHideModels?: (models: Row[], reason: string) => Promise<PublishOutcome>;
 }) {
   const {writing} = guards;
   const [switching, setSwitching] = useState<string | null>(null);
@@ -65,26 +70,43 @@ export default function ProvidersPage({providers, providerKeys, models, loading,
     if (writing.current || loading || failed || switching) return;
     const name = String(provider.name || id);
     const routed = models.filter(model => model.target_provider_id === id).map(model => String(model.exposed_model_id ?? model.id));
-    const confirmed = await confirmAction(enable ? {
+    const losses = routeLosses(models, {providers, keys: providerKeys}, {providers: providers.map(item => item.id === id ? {...item, enabled: false} : item), keys: providerKeys});
+    const facts = lossFacts(losses, model => modelName(model, models, groups));
+    const hideable = !!onHideModels && losses.down.length > 0;
+    const answer = await ask(enable ? {
       title: `启用 ${name}？`,
       consequence: routed.length ? `${routed.length} 个模型会重新使用这个供应商。` : '没有模型使用这个供应商。',
       confirmLabel: '启用',
     } : {
       title: `停用 ${name}？`,
-      facts: routed.length ? [`路由到这里的模型：${routed.slice(0, 6).join('、')}${routed.length > 6 ? ` 等 ${routed.length} 个` : ''}`] : undefined,
-      consequence: routed.length ? `这 ${routed.length} 个模型将没有可用线路，客户请求会失败。` : '没有模型使用这个供应商。',
+      facts: facts.length ? facts : routed.length ? [`路由到这里的模型：${nameList(routed)}（都没有在售）`] : undefined,
+      option: hideable ? {label: `同时隐藏将无可用线路的 ${losses.down.length} 个模型（先隐藏，再停用）`} : undefined,
+      consequence: losses.down.length ? `不隐藏的话，这 ${losses.down.length} 个模型仍在客户的模型列表里，但请求会失败。`
+        : losses.takeover.length ? `${losses.takeover.length} 个模型会改由备用线路服务，其余不受影响。` : routed.length ? '在售模型不受影响。' : '没有模型使用这个供应商。',
       confirmLabel: '停用',
-      danger: routed.length > 0,
+      danger: losses.down.length > 0,
     });
-    if (!confirmed || writing.current) return;
+    if (!answer.confirmed || writing.current) return;
     writing.current = true; setSwitching(id); reportError('');
+    let hidden = '';
     try {
+      if (answer.option && onHideModels) {
+        const names = nameList(losses.down.map(model => modelName(model, models, groups)));
+        const outcome = await onHideModels(losses.down, `停用 ${name} 前隐藏将无可用线路的模型：${names}`);
+        if (!outcome.ok) {
+          reportError(outcome.uncertain ? `没收到隐藏结果（${outcome.message}），${name} 没有停用。请点“刷新”核对这些模型是否已隐藏，再重新操作，不要重复提交。`
+            : `没能隐藏这些模型：${outcome.message}。${name} 没有停用。`);
+          return;
+        }
+        hidden = names;
+      }
       const response = await adminApi.updateProviderStatus(id, enable);
       if (!response.success) throw new Error('服务端未确认状态变更');
-      toast.success(`已${enable ? '启用' : '停用'} ${name}`);
+      toast.success(hidden ? `已隐藏 ${hidden}，并停用 ${name}` : `已${enable ? '启用' : '停用'} ${name}`);
       await refresh();
     } catch (error) {
-      reportError(`切换结果未确认：${errorText(error)}。请刷新核对供应商状态后再操作。`);
+      reportError(`${hidden ? `已隐藏 ${hidden}；但` : ''}切换结果未确认：${errorText(error)}。请刷新核对供应商状态后再操作。`);
+      if (hidden) void refresh();
     } finally {writing.current = false; setSwitching(null);}
   };
 
@@ -135,6 +157,8 @@ export default function ProvidersPage({providers, providerKeys, models, loading,
     {editing && <ProviderKeyEditor key={`${editing.providerId ?? 'new'}:${editing.keyId ?? 'new'}`} selectedKey={selectedKey} preset={editing}
       knownModels={models.filter(model => model.target_provider_id === editing.providerId).map(model => String(model.target_model ?? '')).filter(Boolean)}
       modelsKnown={models.length > 0} onListModel={onListModel} knownProviders={providers.map(provider => String(provider.id))}
+      routes={{models, groups, providers, keys: providerKeys}} onHideModels={onHideModels}
+      onDeleted={() => {providerDirty.current = false; setEditing(null); void refresh();}}
       onDirtyChange={onDirtyChange} onBusyChange={onBusyChange} onClose={() => void edit(null)}
       onSaved={saved => {
         if (saved) {mergeKey(saved); setEditing({providerId: String(saved.provider_id), keyId: String(saved.id)});}

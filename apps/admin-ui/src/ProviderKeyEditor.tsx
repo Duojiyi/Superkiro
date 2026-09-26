@@ -1,13 +1,17 @@
 import {useEffect, useRef, useState} from 'react';
 import {adminApi, AdminApiError} from './api';
-import {confirmAction} from './components/confirm';
+import {ask, confirmAction} from './components/confirm';
 import {IconClose} from './components/icons';
 import {toast} from './components/toast';
 import {InfoTip} from './components/ui';
+import {explainRefusal, isRefusal, type PublishOutcome} from './refusal';
+import {lossFacts, modelName, nameList, routeLosses, type RouteLosses} from './routes';
 
+type Row = Record<string, unknown>;
 type Message = {tone: 'error' | 'warning' | 'info'; text: string} | null;
+const NO_LOSSES: RouteLosses = {down: [], takeover: [], backup: []};
 
-export default function ProviderKeyEditor({selectedKey, preset, knownModels = [], modelsKnown = knownModels.length > 0, knownProviders = [], onSaved, onDirtyChange, onBusyChange, onClose, onListModel}: {
+export default function ProviderKeyEditor({selectedKey, preset, knownModels = [], modelsKnown = knownModels.length > 0, knownProviders = [], routes, onHideModels, onSaved, onDeleted, onDirtyChange, onBusyChange, onClose, onListModel}: {
   selectedKey?: Record<string, unknown>;
   preset?: {providerId?: string; keyId?: string; suggestedKeyId?: string};
   /** This provider's upstream models already listed in 模型与定价, to point out the ones that are not. */
@@ -18,7 +22,12 @@ export default function ProviderKeyEditor({selectedKey, preset, knownModels = []
   onListModel?: (providerId: string, model: string) => void;
   /** IDs of the providers that already exist. */
   knownProviders?: string[];
+  /** Every model, group, provider and Key: to say which shown models a change leaves without a route. */
+  routes?: {models: Row[]; groups: Row[]; providers: Row[]; keys: Row[]};
+  /** 同时隐藏这些模型: publishes these models hidden, before the change that leaves them without a route. */
+  onHideModels?: (models: Row[], reason: string) => Promise<PublishOutcome>;
   onSaved?: (savedKey?: Record<string, unknown>) => void;
+  onDeleted?: () => void;
   onDirtyChange: (dirty: boolean) => void;
   onBusyChange: (busy: boolean) => void;
   onClose?: () => void;
@@ -57,11 +66,12 @@ export default function ProviderKeyEditor({selectedKey, preset, knownModels = []
   const validateModels = () => {
     if (modelIds.length > 1000 || modelIds.some(model => !validText(model, 256))) throw new Error('最多 1000 个模型，每个 ID 不超过 256 字节');
   };
-  const writeFailure = (error: unknown, target: {provider: string; key: string}) => {
-    const rejected = error instanceof AdminApiError && [400, 401, 403, 404, 409, 413, 422].includes(error.status);
+  const writeFailure = (error: unknown, target: {provider: string; key: string}, action = '保存') => {
+    const rejected = isRefusal(error);
     if (!rejected) setReview(target);
     const text = error instanceof Error ? error.message : String(error);
-    setMessage({tone: 'error', text: rejected ? `保存失败：${text}。修改已保留，请修正后再保存。` : `没收到保存结果（${text}），已暂停保存和导入。请重新读取确认后再操作，不要重复提交。`});
+    setMessage({tone: 'error', text: rejected ? `${action}失败：${explainRefusal(text, id => nameOfId(id))}。修改已保留，请修正后再${action}。`
+      : `没收到${action}结果（${text}），已暂停保存、删除和导入。请重新读取确认后再操作，不要重复提交。`});
   };
   useEffect(() => {onDirtyChange(dirty);}, [dirty, onDirtyChange]);
   useEffect(() => {onBusyChange(busy); return () => onBusyChange(false);}, [busy, onBusyChange]);
@@ -78,6 +88,24 @@ export default function ProviderKeyEditor({selectedKey, preset, knownModels = []
   useEffect(() => {setDiscovery(null);}, [provider, keyId, secret]);
 
   const savedModels = Array.isArray(selectedKey?.allowed_models) ? (selectedKey!.allowed_models as unknown[]).map(String) : null;
+  const nameOf = (model: Row) => routes ? modelName(model, routes.models, routes.groups) : String(model.exposed_model_id ?? model.id);
+  const nameOfId = (id: string) => {const model = routes?.models.find(row => row.id === id || row.exposed_model_id === id); return model ? nameOf(model) : id;};
+  /** What saving this Key as `next` (or, with null, deleting it) would take from the models customers see. */
+  const lossesIf = (next: Row | null): RouteLosses => {
+    if (!routes || mode !== 'edit') return NO_LOSSES;
+    const same = (key: Row) => key.id === keyId.trim() && key.provider_id === provider.trim();
+    const keys = next ? routes.keys.map(key => same(key) ? {...key, ...next} : key) : routes.keys.filter(key => !same(key));
+    return routeLosses(routes.models, {providers: routes.providers, keys: routes.keys}, {providers: routes.providers, keys});
+  };
+  /** Hides the models first (同时隐藏这些模型); when that fails, says so and that nothing else was done. */
+  const hideFirst = async (models: Row[], action: string): Promise<string | null> => {
+    const names = nameList(models.map(nameOf));
+    const outcome = await onHideModels!(models, `${action} Key ${keyId.trim()} 前隐藏将无可用线路的模型：${names}`);
+    if (outcome.ok) return names;
+    setMessage({tone: 'error', text: outcome.uncertain ? `没收到隐藏结果（${outcome.message}），Key 没有${action}。请点页面右上角的“刷新”核对这些模型是否已隐藏，再重新操作，不要重复提交。`
+      : `没能隐藏这些模型：${outcome.message}。Key 没有${action}。`});
+    return null;
+  };
   const act = async (action: 'save' | 'discover') => {
     if (pending.current || (action === 'save' && review)) return;
     try {
@@ -87,25 +115,34 @@ export default function ProviderKeyEditor({selectedKey, preset, knownModels = []
         if (!weight.trim() || !Number.isInteger(Number(weight)) || Number(weight) < 1 || Number(weight) > 1000) throw new Error('权重须为 1 至 1000 的整数');
       }
     } catch (error) {setMessage({tone: 'error', text: error instanceof Error ? error.message : String(error)}); return;}
+    let hide: Row[] = [];
     if (action === 'save') {
       const added = savedModels ? modelIds.filter(model => !savedModels.includes(model)).length : modelIds.length;
-      const confirmed = await confirmAction({
+      const losses = lossesIf({allowed_models: modelIds, enabled});
+      const answer = await ask({
         title: `保存 Key ${keyId.trim()}？`,
         facts: [
           savedModels ? `可用模型 ${savedModels.length} → ${modelIds.length}${added ? `（新增 ${added}）` : ''}` : `可用模型 ${modelIds.length} 个`,
           `权重 ${weight} · ${enabled ? '启用' : '停用'}`,
           secret ? '将写入这次填写的 API Key' : selectedKey ? '密钥不变' : '新增 Key 必须填写 API Key',
+          ...lossFacts(losses, nameOf),
         ],
-        consequence: modelIds.length ? undefined : '未选择模型：这个 Key 不会被使用。',
+        option: onHideModels && losses.down.length ? {label: `同时隐藏将无可用线路的 ${losses.down.length} 个模型（先隐藏，再保存）`} : undefined,
+        consequence: [modelIds.length ? '' : '未选择模型：这个 Key 不会被使用。',
+          losses.down.length ? `不隐藏的话，这 ${losses.down.length} 个模型仍在客户的模型列表里，但请求会失败。` : ''].filter(Boolean).join(' ') || undefined,
         confirmLabel: '保存',
+        danger: losses.down.length > 0,
       });
-      if (!confirmed || pending.current) return;
+      if (!answer.confirmed || pending.current) return;
+      if (answer.option) hide = losses.down;
     }
     pending.current = true; setBusy(true);
     if (action === 'discover') setDiscovery(null);
+    let hidden: string | null = null;
     try {
       // A provider that does not exist yet has no Key to save: 保存供应商 creates both.
       if (action === 'save' && mode === 'provider') throw new AdminApiError('请先保存供应商', 400);
+      if (hide.length && !(hidden = await hideFirst(hide, '保存'))) return;
       const result = await adminApi.manageKey(action, {
         provider_id: provider.trim(), key_id: workingKeyId, ...(secret ? {api_key: secret} : {}),
         ...(action === 'save' ? {allowed_models: modelIds, weight: Number(weight), enabled} : {}),
@@ -122,7 +159,7 @@ export default function ProviderKeyEditor({selectedKey, preset, knownModels = []
       } else {
         setDirty(false); setSecret(''); setMessage(null);
         const unlisted = modelIds.filter(model => !knownModels.includes(model)).length;
-        toast.success(unlisted && modelsKnown ? `已保存 Key ${keyId.trim()}，${unlisted} 个模型还没在“模型与定价”上架` : `已保存 Key ${keyId.trim()}`);
+        toast.success(hidden ? `已隐藏 ${hidden}，并保存 Key ${keyId.trim()}` : unlisted && modelsKnown ? `已保存 Key ${keyId.trim()}，${unlisted} 个模型还没在“模型与定价”上架` : `已保存 Key ${keyId.trim()}`);
         onSaved?.({id: keyId.trim(), provider_id: provider.trim(), allowed_models: modelIds, weight: Number(weight), enabled});
       }
     } catch (error) {
@@ -155,6 +192,31 @@ export default function ProviderKeyEditor({selectedKey, preset, knownModels = []
       toast.success(`已添加供应商 ${provider.trim()}，Key ${defaultKey} 已启用`);
       onSaved?.();
     } catch (error) {writeFailure(error, {provider: provider.trim(), key: defaultKey});}
+    finally {pending.current = false; setBusy(false);}
+  };
+
+  const remove = async () => {
+    if (pending.current || review || mode !== 'edit') return;
+    const target = {provider: provider.trim(), key: keyId.trim()};
+    const losses = lossesIf(null);
+    const answer = await ask({
+      title: `删除 Key ${target.key}？`,
+      facts: [`${target.provider} 的 Key · 可用模型 ${savedModels ? `${savedModels.length} 个` : '不限（旧版）'}`, ...lossFacts(losses, nameOf)],
+      option: onHideModels && losses.down.length ? {label: `同时隐藏将无可用线路的 ${losses.down.length} 个模型（先隐藏，再删除）`, checked: true} : undefined,
+      consequence: `删除后不能恢复：要再用，需重新添加 Key 并填写 API Key。${losses.down.length ? '在售模型只剩这条线路时，不隐藏它们服务器会拒绝删除。' : ''}`,
+      confirmLabel: '删除', danger: true,
+    });
+    if (!answer.confirmed || pending.current) return;
+    pending.current = true; setBusy(true);
+    let hidden: string | null = null;
+    try {
+      if (answer.option && !(hidden = await hideFirst(losses.down, '删除'))) return;
+      const result = await adminApi.deleteKey(target.provider, target.key);
+      if (result.success !== true) throw new AdminApiError('服务器未确认删除', 400);
+      setDirty(false); setMessage(null);
+      toast.success(hidden ? `已隐藏 ${hidden}，并删除 Key ${target.key}` : `已删除 Key ${target.key}`);
+      onDeleted?.();
+    } catch (error) {writeFailure(error, target, '删除');}
     finally {pending.current = false; setBusy(false);}
   };
 
@@ -251,6 +313,7 @@ export default function ProviderKeyEditor({selectedKey, preset, knownModels = []
       {message && <p role="status" className={`message message-${message.tone}`}>{message.text}</p>}
       {busy && !message && <p role="status" className="message message-info">处理中…</p>}
       <div className="button-row">
+        {mode === 'edit' && <button type="button" className="btn btn-danger" disabled={busy || !!review} title={review ? '先重新读取确认上次的结果' : undefined} onClick={() => void remove()}>删除 Key</button>}
         {review && <button type="button" className="btn" disabled={busy} onClick={() => void reviewKey()}>重新读取</button>}
         <button type="button" className="btn" disabled={busy || !!discoverBlocked} title={discoverBlocked} onClick={() => void act('discover')}>获取模型列表</button>
         {mode === 'provider'

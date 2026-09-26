@@ -1,6 +1,6 @@
 // The signed-in console: sidebar, topbar, the current page, and the data they share.
 import {useCallback, useEffect, useRef, useState} from 'react';
-import {adminApi, type AdminAnnouncement, type AdminCardItem, type AdminFinancials, type AdminStats, type AdminTrace, type FinancialSettings} from './api';
+import {adminApi, AdminApiError, type AdminAnnouncement, type AdminCardItem, type AdminFinancials, type AdminStats, type AdminTrace, type FinancialSettings} from './api';
 import CommercialEditor from './CommercialEditor';
 import {ConfirmHost, confirmAction} from './components/confirm';
 import {IconClose, IconRefresh, IconWarning} from './components/icons';
@@ -15,6 +15,8 @@ import OverviewPage from './pages/Overview';
 import ProvidersPage, {type KeyEditing} from './pages/Providers';
 import SecurityPage from './pages/Security';
 import TracesPage from './pages/Traces';
+import {publishFailure, type PublishOutcome} from './refusal';
+import {brokenRoutes, modelName} from './routes';
 import {keyCooldownLeft} from './status';
 import type {ErrorAction, Intent, RefreshOptions, Row, Tab} from './types';
 
@@ -38,6 +40,8 @@ export interface WorkspaceData {
   models: Row[];
   rateCards: Row[];
   settings?: FinancialSettings;
+  /** The configuration version the models above belong to: what a publication from outside the editors is checked against. */
+  revision?: string;
 }
 
 const EMPTY: WorkspaceData = {stats: null, cards: [], announcements: [], financials: null, traces: [], providers: [], providerKeys: [], groups: [], models: [], rateCards: []};
@@ -103,6 +107,8 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
   const [failures, setFailures] = useState<Failures>({});
   const [loadErrors, setLoadErrors] = useState<Array<{section: string; message: string; stale: boolean}>>([]);
   const loadedOnce = useRef<Partial<Record<Section, boolean>>>({});
+  // A hide (同时隐藏这些模型) whose result was not confirmed: cleared once the configuration is read again.
+  const hideUnconfirmed = useRef(false);
   const [syncedAt, setSyncedAt] = useState<number | null>(null);
   const [providersLoaded, setProvidersLoaded] = useState(false);
   // Changes whenever a refresh starts that should clear the card selection.
@@ -164,8 +170,10 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
         models: config?.success && config.config ? config.config.models : previous.models,
         rateCards: config?.success && config.config ? config.config.rate_cards : previous.rateCards,
         settings: config?.success && config.config?.settings ? config.config.settings : previous.settings,
+        revision: config?.success && config.config ? config.config.revision : previous.revision,
       }));
       if (providers?.success) setProvidersLoaded(true);
+      if (config?.success && config.config) hideUnconfirmed.current = false;
     } catch (error) {
       console.error('Failed to load admin data:', error);
       if (mounted.current && seq === refreshSeq.current) setLoadErrors([{section: '全部', message: error instanceof Error ? error.message : String(error), stale: true}]);
@@ -175,6 +183,28 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
   }, []);
 
   useEffect(() => {void refreshData();}, [refreshData]);
+
+  // 同时隐藏这些模型: models hidden on the way to a provider or Key change, published against the
+  // configuration version read, with a reason. An unconfirmed result blocks the next one until
+  // the configuration has been read again.
+  const latestData = useRef(data);
+  latestData.current = data;
+  const hideModels = useCallback(async (rows: Row[], reason: string): Promise<PublishOutcome> => {
+    const {revision, models, groups} = latestData.current;
+    if (hideUnconfirmed.current) return {ok: false, message: '上次隐藏模型的结果还没确认：请先点“刷新”核对'};
+    if (!revision) return {ok: false, message: '模型配置没有加载，不能隐藏模型：请先点“刷新”'};
+    try {
+      const result = await adminApi.publishCommercialConfig({models: rows.map(row => ({...row, visible: false})), expected_revision: revision, reason});
+      if (result.success !== true) throw new AdminApiError('服务器未确认发布成功', 400);
+      if (!result.config?.revision) throw new Error('服务器未返回可核对的配置版本');
+      if (mounted.current) setData(previous => ({...previous, models: result.config.models, revision: result.config.revision}));
+      return {ok: true};
+    } catch (error) {
+      const failure = publishFailure(error, '隐藏', id => {const model = models.find(row => row.id === id || row.exposed_model_id === id); return model ? modelName(model, models, groups) : id;});
+      if (failure.uncertain) hideUnconfirmed.current = true;
+      return failure;
+    }
+  }, []);
 
   // Overview and traces refresh themselves every minute, quietly, as background requests (they
   // do not keep the session alive). Paused while anything is open, being written or edited.
@@ -214,8 +244,12 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
   // Keys of a disabled provider serve nothing, so they raise no badge.
   const keyAlerts = data.providerKeys.filter(key => key.enabled !== false && data.providers.find(provider => provider.id === key.provider_id)?.enabled !== false
     && (keyCooldownLeft(key, nowSecs) > 0 || key.health_state === 'degraded')).length;
+  // Shown models whose primary route cannot serve (known only once the providers are loaded).
+  const broken = providersLoaded ? brokenRoutes(data.models, {providers: data.providers, keys: data.providerKeys}) : [];
+  const down = broken.filter(entry => entry.route.down).length;
   const badges: Partial<Record<Tab, {count: number; tone: 'danger' | 'warning'; text: string}>> = {
     ...(failedLastHour ? {traces: {count: failedLastHour, tone: 'danger' as const, text: `近 1 小时 ${failedLastHour} 次失败`}} : {}),
+    ...(broken.length ? {models: {count: broken.length, tone: down ? 'danger' as const : 'warning' as const, text: down ? `${down} 个在售模型无可用线路` : `${broken.length} 个在售模型的主线路不可用`}} : {}),
     ...(keyAlerts ? {providers: {count: keyAlerts, tone: 'warning' as const, text: `${keyAlerts} 个 Key 冷却中或异常`}} : {}),
   };
   const staleSections = loadErrors.filter(error => error.stale).map(error => error.section);
@@ -293,11 +327,11 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
               cards={data.cards} onPublished={() => void refreshData({keepSelection: true})} refreshEpoch={refreshEpoch}/>}
             {activeTab === 'models' && <CommercialEditor key="models" kind="models" onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy}
               onPublished={() => void refreshData({keepSelection: true})} refreshEpoch={refreshEpoch} providers={data.providers} providerKeys={data.providerKeys}
-              intent={intent.models}/>}
+              routesKnown={providersLoaded} intent={intent.models}/>}
             {activeTab === 'providers' && <ProvidersPage providers={data.providers} providerKeys={data.providerKeys} models={data.models}
               loading={loading} failed={!!failures.providers} refresh={refreshData} guards={guards} reportError={reportError}
               editing={keyEditing} setEditing={setKeyEditing} providerDirty={providerDirty} editorBusy={editorBusy}
-              onDirtyChange={markProviderDirty} onBusyChange={markEditorBusy}
+              onDirtyChange={markProviderDirty} onBusyChange={markEditorBusy} groups={data.groups} onHideModels={hideModels}
               onListModel={(providerId, model) => void navigate('models', {models: {list: {providerId, model}}})}
               mergeKey={saved => setData(previous => ({...previous, providerKeys: previous.providerKeys.some(key => key.id === saved.id && key.provider_id === saved.provider_id)
                 ? previous.providerKeys.map(key => key.id === saved.id && key.provider_id === saved.provider_id ? {...key, ...saved} : key)

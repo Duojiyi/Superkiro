@@ -5,9 +5,11 @@ module.exports = function fixtureApi() {
   const now = 1789790400;
   const writes = [];
   const groups = ['PRO', 'PRO+', 'PRO Max', 'Power'].map((name, i) => ({id: `fixture-group-${i}`, name, virtual_plan_name: name, virtual_usage_limit: [1000,2000,5000,10000][i], rate_card_id: 'fixture-rate', margin_multiplier: 1}));
-  const models = ['claude-sonnet', 'gpt-5', 'gemini-pro'].map((name, i) => ({id: `fixture-model-${i}`, exposed_model_id: name, target_provider_id: 'fixture-provider', target_model: name, group_id: groups[i].id, context_window: 200000, max_output: 8192, credit_multiplier: 1, visible: true, supports_tools: true, supports_vision: true, supports_reasoning: true}));
+  // Every field the server returns for a model entry, so drafts and publications look like production's.
+  const entry = fields => ({sort_order: 0, aliases: [], fallback_chain: [], display_name: null, description: null, rate_multiplier: null, retired: false, ...fields});
+  const models = ['claude-sonnet', 'gpt-5', 'gemini-pro'].map((name, i) => entry({id: `fixture-model-${i}`, exposed_model_id: name, target_provider_id: 'fixture-provider', target_model: name, group_id: groups[i].id, context_window: 200000, max_output: 8192, credit_multiplier: 1, visible: true, supports_tools: true, supports_vision: true, supports_reasoning: true}));
   // An OpenAI-format provider's model, as onboarded in production: 272K context, priced in USD.
-  models.push({id: 'fixture-model-3', exposed_model_id: 'gpt-6-astra', target_provider_id: 'fixture-openai', target_model: 'gpt-6-astra', group_id: groups[0].id, context_window: 272000, max_output: 128000, credit_multiplier: 1, visible: true, supports_tools: true, supports_vision: true, supports_reasoning: true});
+  models.push(entry({id: 'fixture-model-3', exposed_model_id: 'gpt-6-astra', target_provider_id: 'fixture-openai', target_model: 'gpt-6-astra', group_id: groups[0].id, context_window: 272000, max_output: 128000, credit_multiplier: 1, visible: true, supports_tools: true, supports_vision: true, supports_reasoning: true, sort_order: 1}));
   const cards = ['active', 'unactivated', 'frozen', 'banned', 'expired', 'active'].map((status, i) => ({id: `fixture-card-${i}`, codeRecoverable: i !== 1, status, creditTotal: 2000000000, creditUsed: i*100000000, availableCredits: 2000000000-i*100000000, pointsTotal: 2000, pointsAvailable: 2000-i*100, boundDevices: status === 'unactivated' ? [] : [`fixture-device-${i}`], maxDevices: 1, activatedAt: now-86400, validUntil: now+2592000, groupId: groups[i%4].id, note: '本地视觉测试数据'}));
   const cardRevision = () => crypto.createHash('sha256').update(cards.map(card => card.id).join('\n')).digest('hex');
   // Requests relative to the real clock, so "近 24 小时" and the 24-hour content archive
@@ -66,10 +68,43 @@ module.exports = function fixtureApi() {
   const config = {settings:{credit_face_value_cny:0.01,usd_cny_rate:7.2,rate_updated_at_secs:now},revision:'fixture-rev-2', groups, models, rate_cards:[{id:'fixture-rate', name:'测试价格表'}], versions: models.map((m,i) => i === 3
     ? {id:'fixture-price-astra', model:m.exposed_model_id, rate_card_id:'fixture-rate', pricing_mode:'fixed', effective_from_secs:now-86400, fixed_input_credit_per_m:1250000, fixed_output_credit_per_m:10000000, fixed_cache_read_credit_per_m:125000, fixed_cache_creation_credit_per_m:1250000, per_call_credit:0, margin_multiplier:1, currency:'USD', input_price_per_m:1.25, output_price_per_m:10, cache_read_price_per_m:0.125, cache_creation_price_per_m:1.25}
     : {id:`fixture-price-${i}`, model:m.exposed_model_id, rate_card_id:'fixture-rate', pricing_mode:'fixed', effective_from_secs:now-86400, fixed_input_credit_per_m:3000000, fixed_output_credit_per_m:15000000, fixed_cache_read_credit_per_m:300000, fixed_cache_creation_credit_per_m:3750000}), audit:[{operator:'fixture-admin', reason:'本地测试：更新模型价格', previous_revision:'fixture-rev-1', revision:'fixture-rev-2', created_at_secs:now}]};
+  const providers = [{id:'fixture-provider',name:'测试供应商 / Fixture',base_url:'https://fixture.invalid/v1',enabled:true},{id:'fixture-disabled',name:'停用的供应商 / Fixture',base_url:'https://disabled.invalid/v1',enabled:false},{id:'fixture-openai',name:'OpenAI 格式 / Fixture',base_url:'https://openai.invalid/v1',enabled:true,api_type:'openai'}];
+  const keys = [{id:'fixture-key',provider_id:'fixture-provider',allowed_models:models.map(m=>m.target_model),weight:10,enabled:true,health_state:'healthy'},{id:'fixture-backup',provider_id:'fixture-provider',allowed_models:['claude-sonnet'],weight:1,enabled:true,health_state:'cooldown',cooldown_until:4102444800},{id:'fixture-disabled-key',provider_id:'fixture-disabled',allowed_models:['gpt-5'],weight:1,enabled:true,health_state:'cooldown',cooldown_until:4102444800},{id:'fixture-openai-key-1',provider_id:'fixture-openai',allowed_models:['gpt-6-astra','gpt-5.6-sol','gpt-5.6-terra'],weight:1,enabled:true,health_state:'healthy'}];
+  // The server's rules for a publication (409 in its words when one is broken), applied as it applies them.
+  const refuse = message => ({status: 409, body: {success: false, error: `Invalid billing state: ${message}`}});
+  const serves = (providerId, model, among = keys) => providers.some(p => p.id === providerId && p.enabled !== false)
+    && among.some(k => k.provider_id === providerId && k.enabled !== false && (!Array.isArray(k.allowed_models) || k.allowed_models.includes(model)));
+  const publish = body => {
+    if (body.expected_revision !== config.revision) return refuse('Configuration changed; reload before publishing');
+    if (typeof body.reason !== 'string' || !body.reason.trim()) return refuse('Publication reason required (max 500 bytes)');
+    const t = Math.floor(Date.now() / 1000);
+    for (const m of body.models || []) for (const id of [m.exposed_model_id, ...(m.aliases || [])]) if (!/^[A-Za-z0-9._:/-]{1,128}$/.test(String(id))) return refuse(`Invalid model ID: ${id}`);
+    // Only the entries in this publication are checked: a shown, unretired one needs its primary target to serve.
+    const stranded = (body.models || []).filter(m => m.visible !== false && m.retired !== true && !serves(m.target_provider_id, m.target_model)).map(m => m.exposed_model_id);
+    if (stranded.length) return refuse(`Visible model target has no enabled compatible key: ${stranded.join(', ')}`);
+    const nextModels = [...config.models.filter(row => !(body.models || []).some(next => next.id === row.id)), ...(body.models || [])];
+    for (const id of body.removed_models || []) {const m = nextModels.find(row => row.id === id); if (!m || (m.visible !== false && m.retired !== true)) return refuse(`Only hidden or retired mappings can be removed: ${id}`);}
+    for (const id of body.cancelled_versions || []) {const v = config.versions.find(row => row.id === id); if (!v || v.effective_from_secs <= t) return refuse(`Only scheduled prices can be cancelled: ${id}`);}
+    // 0 is "now", only for a model the rate card has no version of yet; otherwise nothing may start in the past.
+    const versions = [];
+    for (const v of body.versions || []) {
+      const first = !config.versions.some(row => row.rate_card_id === v.rate_card_id && row.model === v.model);
+      if (v.effective_from_secs === 0 ? !first : !(v.effective_from_secs >= t)) return refuse('Invalid pricing; retroactive publication forbidden');
+      const at = v.effective_from_secs === 0 ? t : v.effective_from_secs;
+      if ([...config.versions, ...versions].some(row => row.id === v.id || (row.rate_card_id === v.rate_card_id && row.model === v.model && row.effective_from_secs === at))) return refuse('Published prices immutable; use new ID and timestamp');
+      versions.push({...v, effective_from_secs: at});
+    }
+    if (body.settings) config.settings = {...body.settings, rate_updated_at_secs: now + 1};
+    config.versions = [...config.versions.filter(row => !(body.cancelled_versions || []).includes(row.id)), ...versions];
+    if (body.groups) config.groups = [...config.groups.filter(row => !body.groups.some(next => next.id === row.id)), ...body.groups];
+    config.models = nextModels.filter(row => !(body.removed_models || []).includes(row.id));
+    config.revision = `fixture-rev-${Number(config.revision.split('-').pop()) + 1}`;
+    return {status: 200, body: {success: true, config}};
+  };
   let authenticated = false, deadline = 0, loginAt = 0;
   const IDLE = 1800, MAX = 8 * 3600;
   const nowSecs = () => Math.floor(Date.now() / 1000);
-  return {writes, traces, expire() {authenticated=false;}, get sessionDeadline() {return deadline;}, async handle(req,res) {
+  return {writes, traces, providers, keys, config, expire() {authenticated=false;}, get sessionDeadline() {return deadline;}, async handle(req,res) {
     const url = new URL(req.url, 'http://127.0.0.1');
     const endpoint = url.pathname.replace('/api/v1/admin/', '');
     const reply = (value, status=200) => {res.writeHead(status, {'Content-Type':'application/json'}); res.end(JSON.stringify(value));};
@@ -110,16 +145,44 @@ module.exports = function fixtureApi() {
     if(endpoint==='traces/content') {const record=traceContent(url.searchParams.get('invocation_id'));return record?reply(record):reply({__type:'ResourceNotFoundException',message:'没有这次请求的内容（只保留 24 小时）'},404);}
     if(endpoint==='commercial-config') {
       if(req.method==='POST') {
-        assert.equal(body.expected_revision,config.revision);assert.ok(typeof body.reason==='string'&&body.reason.trim());
-        if(body.settings){assert.deepEqual(Object.keys(body).sort(),['expected_revision','reason','settings']);assert.deepEqual(Object.keys(body.settings).sort(),['credit_face_value_cny','usd_cny_rate']);config.settings={...body.settings,rate_updated_at_secs:now+1};}
-        assert.ok(Object.keys(body).every(key=>['expected_revision','reason','settings','groups','models','rate_cards','versions'].includes(key)));
-        if(body.versions)config.versions=[...config.versions,...body.versions];
-        for(const section of ['groups','models'])if(body[section])config[section]=[...config[section].filter(row=>!body[section].some(next=>next.id===row.id)),...body[section]];
-        config.revision=`fixture-rev-${Number(config.revision.split('-').pop())+1}`;
+        if(body.settings){assert.deepEqual(Object.keys(body).sort(),['expected_revision','reason','settings']);assert.deepEqual(Object.keys(body.settings).sort(),['credit_face_value_cny','usd_cny_rate']);}
+        assert.ok(Object.keys(body).every(key=>['expected_revision','reason','settings','groups','models','rate_cards','versions','removed_models','cancelled_versions'].includes(key)));
+        const result=publish(body);return reply(result.body,result.status);
       }
       return reply({success:true,config});
     }
-    if(endpoint==='providers') return reply({success:true,providers:[{id:'fixture-provider',name:'测试供应商 / Fixture',base_url:'https://fixture.invalid/v1',enabled:true},{id:'fixture-disabled',name:'停用的供应商 / Fixture',base_url:'https://disabled.invalid/v1',enabled:false},{id:'fixture-openai',name:'OpenAI 格式 / Fixture',base_url:'https://openai.invalid/v1',enabled:true,api_type:'openai'}],keys:[{id:'fixture-key',provider_id:'fixture-provider',allowed_models:models.map(m=>m.target_model),weight:10,enabled:true,health_state:'healthy'},{id:'fixture-backup',provider_id:'fixture-provider',allowed_models:['claude-sonnet'],weight:1,enabled:true,health_state:'cooldown',cooldown_until:4102444800},{id:'fixture-disabled-key',provider_id:'fixture-disabled',allowed_models:['gpt-5'],weight:1,enabled:true,health_state:'cooldown',cooldown_until:4102444800},{id:'fixture-openai-key-1',provider_id:'fixture-openai',allowed_models:['gpt-6-astra','gpt-5.6-sol','gpt-5.6-terra'],weight:1,enabled:true,health_state:'healthy'}]});
+    if(endpoint==='providers') return reply({success:true,providers,keys});
+    if(endpoint==='providers/status') {const provider=providers.find(p=>p.id===body.providerId);if(!provider)return reply({success:false,error:'Unknown provider'},404);provider.enabled=body.enabled;return reply({success:true,providerId:provider.id,enabled:provider.enabled});}
+    if(endpoint==='providers/update') {const provider=providers.find(p=>p.id===body.id);if(!provider)return reply({success:false,error:'Unknown provider'},404);for(const field of ['name','base_url','format'])if(body[field]!==undefined)provider[field]=body[field];return reply({success:true,provider});}
+    if(endpoint==='providers/delete') {
+      const index=providers.findIndex(p=>p.id===body.id);if(index<0)return reply({success:false,error:'Unknown provider'},404);
+      const users=config.models.filter(m=>m.target_provider_id===body.id||(m.fallback_chain||[]).some(f=>f.provider_id===body.id)).map(m=>m.exposed_model_id);
+      if(users.length)return reply({success:false,error:`Provider still referenced by model mappings: ${users.join(', ')}`},409);
+      if(keys.some(k=>k.provider_id===body.id))return reply({success:false,error:'Provider still has keys'},409);
+      providers.splice(index,1);return reply({success:true});
+    }
+    // A Key's save, delete, health reset, and one tiny real request (测试).
+    const keyOf=()=>keys.find(k=>k.id===body.key_id&&k.provider_id===body.provider_id);
+    if(endpoint==='providers/keys') {
+      if(!providers.some(p=>p.id===body.provider_id))return reply({success:false,error:'Unknown provider'},404);
+      let key=keyOf();if(!key){if(!body.api_key)return reply({success:false,error:'API key required for new key'},400);key={id:body.key_id,provider_id:body.provider_id,weight:1,enabled:true,health_state:'healthy'};keys.push(key);}
+      Object.assign(key,{allowed_models:[...new Set(body.allowed_models)].sort(),...(body.weight!==undefined?{weight:body.weight}:{}),...(body.enabled!==undefined?{enabled:body.enabled}:{})});
+      return reply({success:true,keys:keys.filter(k=>k.provider_id===body.provider_id),published:false});
+    }
+    if(endpoint==='providers/keys/delete') {
+      const key=keyOf();if(!key)return reply({success:false,error:'Unknown key'},404);
+      const rest=keys.filter(k=>k!==key);
+      const stranded=config.models.filter(m=>m.visible!==false&&m.retired!==true&&m.target_provider_id===key.provider_id&&serves(m.target_provider_id,m.target_model)&&!serves(m.target_provider_id,m.target_model,rest)).map(m=>m.exposed_model_id);
+      if(stranded.length)return reply({success:false,error:`Key still serves visible models: ${stranded.join(', ')}`},409);
+      keys.splice(keys.indexOf(key),1);return reply({success:true});
+    }
+    if(endpoint==='providers/keys/reset') {const key=keyOf();if(!key)return reply({success:false,error:'Unknown key'},404);Object.assign(key,{health_state:'healthy',cooldown_until:null});return reply({success:true});}
+    if(endpoint==='providers/keys/probe') {
+      const key=body.key_id?keyOf():keys.find(k=>k.provider_id===body.provider_id&&k.enabled!==false&&(!Array.isArray(k.allowed_models)||k.allowed_models.includes(body.model)));
+      if(!key)return reply({success:true,ok:false,status:0,latency_ms:0,ttft_ms:null,error:'No enabled key allows this model',reply:null});
+      if(String(body.model).includes('overloaded'))return reply({success:true,ok:false,status:529,latency_ms:1840,ttft_ms:null,error:'HTTP 529 overloaded_error: Overloaded',reply:null});
+      return reply({success:true,ok:true,status:200,latency_ms:620,ttft_ms:410,error:null,reply:'OK'});
+    }
     if(endpoint==='financials') return reply({success:true,basis:'retained_usage_ledger_estimate_not_cash_revenue',settings:config.settings,actualRevenueMicroCny:null,actualGrossProfitMicroCny:null,estimates:{retainedLedgerOnly:true,usageFaceValueMicroCny:1000000,configuredProviderCostMicroCny:420000,faceValueLessCostMicroCny:null,faceValueMarginPercentage:null,costedRequests:17,uncostedRequests:1},dashboard:{total_requests:18,total_credits_charged:27000000,revenue_micro_cny:0,provider_cost_micro_cny:4200000,gross_profit_micro_cny:0,gross_margin_percentage:0},modelRankings:models.map(m=>({model_id:m.exposed_model_id,provider_cost_micro_cny:1400000}))});
     if(endpoint==='announcements') return reply({success:true,announcements:[{id:'fixture-notice',title:'本地测试：服务维护通知',content:'这是隔离的视觉测试公告，不会向真实用户发布。',level:'info',enabled:true,created_at:now}]});
     if(endpoint==='cards/batch') {

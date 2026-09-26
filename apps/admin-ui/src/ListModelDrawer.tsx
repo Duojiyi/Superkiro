@@ -11,10 +11,11 @@ import {Drawer} from './components/modal';
 import {toast} from './components/toast';
 import {InfoTip} from './components/ui';
 import {formatCount, formatTokenCount} from './format';
-import {authorizedModels, buildListing, canRoute, costFromOfficial, creditsFromOfficial, displayNameFor, groupModels, LISTING_DELAY_SECS, showListing} from './listing';
+import {buildListing, costFromOfficial, creditsFromOfficial, displayNameFor, groupModels, LISTING_DELAY_SECS, showListing} from './listing';
 import type {PublishOutcome} from './PriceDrawer';
 import {COST_FIELDS, creditsText, currentVersion, PRICE_FIELDS, sampleCost} from './priceChange';
 import {formatMicroPrice, priceToMicroPerMillion} from './pricing';
+import {authorizedModels, canRoute} from './routes';
 import {parseTokenInput} from './tokens';
 
 type Row = Record<string, unknown>;

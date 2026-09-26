@@ -15,13 +15,15 @@ export interface ConfirmOptions {
   typed?: string;
   /** A short reason; its text is returned with the answer. Required ones must be filled in first. */
   reason?: {label: string; placeholder?: string; suggestions?: string[]; maxLength?: number; required?: boolean};
+  /** A choice made together with the action (同时隐藏这些模型); whether it is ticked is returned with the answer. */
+  option?: {label: string; checked?: boolean};
 }
 
-export interface ConfirmAnswer {confirmed: boolean; reason: string}
+export interface ConfirmAnswer {confirmed: boolean; reason: string; option: boolean}
 
 interface Request {options: ConfirmOptions; resolve: (answer: ConfirmAnswer) => void}
 
-const NO: ConfirmAnswer = {confirmed: false, reason: ''};
+const NO: ConfirmAnswer = {confirmed: false, reason: '', option: false};
 let open: ((options: ConfirmOptions) => Promise<ConfirmAnswer>) | null = null;
 
 /** Asks the operator; resolves to false when cancelled or when the workspace goes away. */
@@ -62,14 +64,16 @@ export function ConfirmHost() {
 function ConfirmDialog({options, onFinish}: {options: ConfirmOptions; onFinish: (answer: ConfirmAnswer) => void}) {
   const [typed, setTyped] = useState('');
   const [reason, setReason] = useState('');
+  const [option, setOption] = useState(options.option?.checked === true);
   const typedReady = !options.typed || typed.trim() === options.typed;
   const reasonReady = !options.reason?.required || !!reason.trim();
   const ready = typedReady && reasonReady;
-  const accept = () => {if (ready) onFinish({confirmed: true, reason: reason.trim()});};
+  const accept = () => {if (ready) onFinish({confirmed: true, reason: reason.trim(), option: !!options.option && option});};
   return <Modal role="alertdialog" label={options.title} onClose={() => onFinish(NO)} className="confirm-dialog">
     <h3 className="modal-title">{options.title}</h3>
     {options.facts?.length ? <ul className="confirm-facts">{options.facts.map((fact, index) => <li key={index}>{fact}</li>)}</ul> : null}
     {options.body}
+    {options.option && <label className="check-field confirm-option"><input type="checkbox" checked={option} onChange={event => setOption(event.target.checked)}/>{options.option.label}</label>}
     {options.consequence && <p className={`confirm-consequence${options.danger ? ' is-danger' : ''}`}>{options.consequence}</p>}
     {options.reason && <div className="field">
       <label className="field-label" htmlFor="confirm-reason">{options.reason.label}{options.reason.required && <span className="required-mark">（必填）</span>}</label>

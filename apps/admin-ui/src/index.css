@@ -136,6 +136,7 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .config-table th.col-actions {z-index: 2; background: var(--bg-muted);}
 .config-table tr.is-selected td.col-actions {background: var(--brand-soft);}
 .clip-upstream {max-width: 220px;}
+.route-tags {display: flex; flex-wrap: wrap; gap: 4px; margin-top: 2px;}
 /* Below 1440 the display name moves into the model's tooltip. */
 @media (max-width: 1439px) {.config-table .col-display {display: none;}}
 @media (max-width: 1400px) {.config-table th, .config-table td {padding-left: 8px; padding-right: 8px;} .clip-upstream {max-width: 136px;} .capabilities {gap: 6px;}}
@@ -390,6 +391,8 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .confirm-facts {display: flex; flex-direction: column; gap: 4px; margin: 0; padding: 10px 12px; border-radius: 6px; background: var(--bg-muted); font-size: 13px; color: var(--text-1);}
 .confirm-consequence {margin: 0; font-size: 13px; color: var(--text-2);}
 .confirm-consequence.is-danger {color: var(--danger); font-weight: 500;}
+.confirm-option {align-items: flex-start; font-weight: 500;}
+.confirm-option input {margin-top: 2px; flex-shrink: 0;}
 .secret-block {width: 100%; min-height: 64px; padding: 12px; border-radius: 6px; background: var(--bg-muted); font-family: var(--mono); font-size: 16px; line-height: 24px; letter-spacing: .3px; resize: none;}
 .batch-summary {margin: 0; padding: 10px 12px; border-radius: 6px; background: var(--bg-muted); font-size: 13px; color: var(--text-1);}
 .adjust-balance {margin: 0; color: var(--text-2);}

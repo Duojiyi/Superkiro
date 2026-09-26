@@ -10,9 +10,10 @@ import {InfoTip, Tag} from './components/ui';
 import {formatCount, formatFullDateTime, shortHash} from './format';
 import {buildPriceVersion, COST_FIELDS, creditsText, currentVersion, percentChange, PRICE_FIELDS, sampleCost, scheduledVersions, versionIdFor} from './priceChange';
 import {formatMicroPrice, priceToMicroPerMillion} from './pricing';
+import type {PublishOutcome} from './refusal';
 
 type Row = Record<string, unknown>;
-export type PublishOutcome = {ok: true} | {ok: false; message: string; conflict?: boolean; uncertain?: boolean};
+export type {PublishOutcome};
 
 const SOON_SECS = 5 * 60;
 const soon = () => Math.ceil((Date.now() / 1000 + SOON_SECS) / 60) * 60;

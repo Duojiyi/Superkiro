@@ -4,6 +4,7 @@
 // server refuses a price that starts in the past, and a request for a model without a price in
 // force would fail, so the model is never shown before its price applies.
 import {buildPriceVersion, MAX_PRICE_MICRO, PRICE_FIELDS, versionIdFor} from './priceChange';
+import {canRoute} from './routes';
 
 type Row = Record<string, unknown>;
 
@@ -66,20 +67,6 @@ export function costFromOfficial(official: string, upstream: string): number {
   const value = Number(scaled) / 1e12;
   if (value > 1_000_000) throw new Error('采购价需在 0–1,000,000 之间');
   return value;
-}
-
-/** The Key permissions that let a Key call this upstream model (an old Key without a list may call any). */
-const keyAllows = (key: Row, model: string) => !Array.isArray(key.allowed_models) || key.allowed_models.map(String).includes(model);
-
-/** Upstream models an enabled Key of this provider is authorised for, sorted. */
-export function authorizedModels(providerId: unknown, keys: Row[]): string[] {
-  return [...new Set(keys.filter(key => key.provider_id === providerId && key.enabled !== false && Array.isArray(key.allowed_models))
-    .flatMap(key => (key.allowed_models as unknown[]).map(String)))].sort();
-}
-
-/** Whether an enabled Key of this provider may call this upstream model (what showing it requires). */
-export function canRoute(providerId: unknown, model: string, keys: Row[]): boolean {
-  return keys.some(key => key.provider_id === providerId && key.enabled !== false && keyAllows(key, model));
 }
 
 /** `<provider>-<model>`, then -2, -3… if taken; at most 128 bytes. */

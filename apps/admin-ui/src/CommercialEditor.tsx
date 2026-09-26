@@ -4,13 +4,14 @@ import { adminApi, AdminApiError, type AdminCardItem, type CommercialConfig } fr
 import { confirmAction } from './components/confirm';
 import { toast } from './components/toast';
 import { Drawer, Modal } from './components/modal';
-import { InfoTip, TopbarActions } from './components/ui';
+import { InfoTip, Tag, TopbarActions } from './components/ui';
 import { IconImage, IconSpark, IconTool } from './components/icons';
 import { formatCount, formatTokenCount, shortHash } from './format';
 import { creditsText, currentVersion } from './priceChange';
 import PriceDrawer, { type PublishOutcome } from './PriceDrawer';
 import PriceVersions from './PriceVersions';
 import ListModelDrawer from './ListModelDrawer';
+import { authorizedModels, canRoute, isLive, modelRoute, targetProblem } from './routes';
 
 type Row = Record<string, unknown>;
 
@@ -18,7 +19,7 @@ type Row = Record<string, unknown>;
 // bar at the bottom with the reason and 发布. Everything is published together against the
 // version read, with a reason; a publish without a confirmed result blocks the next one until
 // a reload. Prices change one model at a time in their own drawer (调价).
-export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, cards, onPublished, refreshEpoch = 0, providers = [], providerKeys = [], intent }: {
+export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, cards, onPublished, refreshEpoch = 0, providers = [], providerKeys = [], routesKnown = false, intent }: {
   kind: 'groups' | 'models';
   onDirtyChange: (dirty: boolean) => void;
   onBusyChange: (busy: boolean) => void;
@@ -29,6 +30,8 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
   /** For the model editor's 供应商 list and each provider's authorised models. */
   providers?: Row[];
   providerKeys?: Row[];
+  /** The providers and Keys above were read: each model's route can be judged. */
+  routesKnown?: boolean;
   /** From another page: open 上架模型 for this provider's upstream model. */
   intent?: {list?: {providerId?: string; model?: string}};
 }) {
@@ -258,7 +261,9 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
   const searchable = rows.length > 15;
   const needle = query.trim().toLowerCase();
   const listed = searchable && needle ? rows.filter(row => [row.id, row.name, row.exposed_model_id, row.display_name, row.target_model, row.target_provider_id].some(value => String(value ?? '').toLowerCase().includes(needle))) : rows;
-  const providerModels = (providerId: unknown) => [...new Set(providerKeys.filter(key => key.provider_id === providerId).flatMap(key => Array.isArray(key.allowed_models) ? key.allowed_models.map(String) : []))].sort();
+  const providerModels = (providerId: unknown) => authorizedModels(providerId, providerKeys);
+  // Whether each target of a model can serve, once providers and Keys are known; nothing for a retired model.
+  const routeOf = (row: Row) => routesKnown && kind === 'models' && row.retired !== true ? modelRoute(row, {providers, keys: providerKeys}) : null;
   const shownValue = (field: string, value: unknown) => {
     if (value === undefined || value === null || value === '') return '空';
     if (typeof value === 'boolean') return value ? '开' : '关';
@@ -312,8 +317,10 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
   // Under an edited input: what it was.
   const original = originalOf(selectedRow);
   const was = (field: string) => original && JSON.stringify(original[field]) !== JSON.stringify(selectedRow?.[field]) ? <span className="field-was">原 {shownValue(field, original[field])}</span> : null;
-  const upstreamHint = kind === 'models' && selectedRow && providers.length && selectedRow.target_model && !providerModels(selectedRow.target_provider_id).includes(String(selectedRow.target_model))
-    ? '这个供应商的 Key 还没有授权此模型' : '';
+  // Only an enabled provider with an enabled Key that allows the model can serve it.
+  const upstreamProvider = kind === 'models' && selectedRow && selectedRow.target_model ? providers.find(provider => provider.id === selectedRow.target_provider_id) : undefined;
+  const upstreamHint = !upstreamProvider ? '' : upstreamProvider.enabled === false ? '这个供应商已停用：这条线路不会被使用'
+    : canRoute(upstreamProvider.id, String(selectedRow?.target_model), providerKeys) ? '' : '这个供应商的 Key 还没有授权此模型（停用的 Key 不算）';
 
   // 新建分组: a small form; the new row goes into the draft and is published with the bar.
   const addGroup = () => {
@@ -355,6 +362,7 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
             const edited = isEdited(row);
             const price = kind === 'models' ? priceOf(row) : null;
             const published = kind === 'models' && configModels.some(model => model.id === row.id);
+            const route = routeOf(row);
             const cells = kind === 'groups'
               ? [<td key="n" className="cell-strong">{String(row.name ?? row.id)}{edited && <span className="edited-dot">{originalOf(row) ? '已修改' : '新建'}</span>}</td>,
                 <td key="i">{row.issuance_enabled === false ? <span className="muted">—</span> : '✓'}</td>,
@@ -365,7 +373,10 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
                 <td key="c" className="num">{cardCount(row.id) ?? '—'}</td>]
               : [<td key="n" className="cell-strong mono" title={row.display_name ? `显示名：${String(row.display_name)}` : undefined}>{String(row.exposed_model_id ?? row.id)}{edited && <span className="edited-dot">{originalOf(row) ? '已修改' : '新建'}</span>}</td>,
                 <td key="d" className="col-display">{String(row.display_name ?? '') || <span className="muted">—</span>}</td>,
-                <td key="t" className="mono" title={`${String(row.target_provider_id ?? '—')} / ${String(row.target_model ?? '—')}`}><span className="clip clip-upstream">{String(row.target_provider_id ?? '—')} / {String(row.target_model ?? '—')}</span></td>,
+                <td key="t" title={`${String(row.target_provider_id ?? '—')} / ${String(row.target_model ?? '—')}`}><span className="mono clip clip-upstream">{String(row.target_provider_id ?? '—')} / {String(row.target_model ?? '—')}</span>
+                  {route && !route.primary.ok && <span className="route-tags">{route.down
+                    ? <Tag tone={isLive(row) ? 'danger' : 'neutral'} title={targetProblem(route.primary, providers)}>无可用线路</Tag>
+                    : <Tag tone="warning" title={`${targetProblem(route.primary, providers)}；正由备用线路服务`}>主线路不可用</Tag>}</span>}</td>,
                 <td key="g" title={String(row.group_id ?? '')}>{groupName(row.group_id)}</td>,
                 <td key="w" className="num" title={`${formatTokens(row.context_window)} / ${formatTokens(row.max_output)}`}>{typeof row.context_window === 'number' ? formatTokenCount(row.context_window) : '—'} / {typeof row.max_output === 'number' ? formatTokenCount(row.max_output) : '—'}</td>,
                 <td key="a"><span className="capabilities">{capability(row)}</span></td>,
