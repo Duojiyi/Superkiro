@@ -1837,3 +1837,127 @@ async fn card_views_show_the_rebind_allowance_and_the_effective_status() {
     assert_eq!(waiting["rebindCooldownUntil"], serde_json::Value::Null);
     assert_eq!(waiting["activationDurationSecs"], 30 * 86_400);
 }
+
+#[tokio::test]
+async fn financials_report_a_period_by_provider_with_sales_and_liability() {
+    let (billing, app) = setup_admin_app();
+    billing.upsert_rate_card_version(billing::RateCardVersion {
+        id: "price-finance".to_string(),
+        rate_card_id: "default".to_string(),
+        model: "priced-model".to_string(),
+        currency: billing::Currency::Cny,
+        pricing_mode: billing::PricingMode::Fixed,
+        input_price_per_m: 7.0,
+        output_price_per_m: 7.0,
+        cache_creation_price_per_m: 0.0,
+        cache_read_price_per_m: 0.0,
+        fixed_input_credit_per_m: 1_000_000,
+        fixed_output_credit_per_m: 1_000_000,
+        fixed_cache_creation_credit_per_m: 0,
+        fixed_cache_read_credit_per_m: 0,
+        per_call_credit: 0,
+        margin_multiplier: 1.0,
+        effective_from_secs: 0,
+    });
+    let (start, end) = (1_000_000, 2_000_000);
+    let mut card = Card::new("card-finance", "group-admin", 1_000_000_000);
+    card.status = CardStatus::Active;
+    card.created_at = start;
+    card.activated_at = Some(start + 10);
+    billing.upsert_card(card);
+    let tokens = billing::ledger::UsageTokens {
+        uncached_input_tokens: 1_000_000,
+        output_tokens: 1_000_000,
+        cache_creation_tokens: 0,
+        cache_read_tokens: 0,
+    };
+    for (invocation, provider, at) in [
+        ("inv-in", "prov-a", start + 100),
+        ("inv-out", "prov-b", end),
+    ] {
+        let params = billing::reservation::ReservationEstimateParams::new(1_000, 1_000)
+            .with_model("priced-model");
+        billing
+            .reserve("card-finance", invocation, &params, at, 60)
+            .unwrap();
+        billing
+            .settle(invocation, &tokens, "priced-model", provider, "target", at)
+            .unwrap();
+    }
+
+    let (status, body) = admin_call(
+        &app,
+        Method::GET,
+        &format!("/api/v1/admin/financials?fromSecs={start}&toSecs={end}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        (body["fromSecs"].as_u64(), body["toSecs"].as_u64()),
+        (Some(start), Some(end))
+    );
+    assert_eq!(body["dashboard"]["total_requests"], 1);
+    let providers = body["byProvider"].as_array().unwrap();
+    assert_eq!(providers.len(), 1, "{body}");
+    assert_eq!(providers[0]["providerId"], "prov-a");
+    assert_eq!(providers[0]["requests"], 1);
+    assert_eq!(providers[0]["uncachedInputTokens"], 1_000_000);
+    // ¥7 per million tokens in and out.
+    assert_eq!(providers[0]["costMicroCny"], 14_000_000);
+    assert_eq!(body["margin"]["costedRequests"], 1);
+    assert_eq!(body["margin"]["uncostedRequests"], 0);
+    // Two credits at one fen.
+    assert_eq!(body["margin"]["revenueMicroCny"], 20_000);
+    assert_eq!(body["sales"]["issuedCards"], 1);
+    assert_eq!(body["sales"]["issuedValueMicroCny"], 30_000_000);
+    assert_eq!(body["sales"]["activatedCards"], 1);
+    assert_eq!(body["planPrices"][0]["templateId"], "tier-1000");
+    assert_eq!(body["planPrices"][3]["priceMicroCny"], 250_000_000);
+    // Now, whatever the period: the three usable cards' balances.
+    assert_eq!(body["liability"]["cards"], 3);
+    assert_eq!(
+        body["liability"]["microCredits"],
+        10_000_000 + 5_000_000 + 1_000_000_000 - 4_000_000
+    );
+
+    let (status, body) = admin_call(&app, Method::GET, "/api/v1/admin/financials", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["dashboard"]["total_requests"], 2);
+    assert_eq!(body["byProvider"].as_array().unwrap().len(), 2);
+    assert_eq!(body["fromSecs"], serde_json::Value::Null);
+    for (query, message) in [
+        ("fromSecs=soon", "fromSecs and toSecs must be whole seconds"),
+        ("fromSecs=10&toSecs=10", "fromSecs must be before toSecs"),
+    ] {
+        let (status, body) = admin_call(
+            &app,
+            Method::GET,
+            &format!("/api/v1/admin/financials?{query}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, json!({"success": false, "error": message}));
+    }
+
+    // The ledger export keeps its columns first and adds readable ones.
+    let request = Request::builder()
+        .uri("/api/v1/admin/exports/ledger.csv")
+        .header("x-admin-key", TEST_ADMIN_KEY)
+        .body(Body::empty())
+        .unwrap();
+    let response = tower::ServiceExt::oneshot(app, request).await.unwrap();
+    let csv = String::from_utf8(
+        axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(csv.starts_with(
+        "id,card_id,ts,kind,invocation_id,exposed_model,provider_id,input_tokens,output_tokens,\
+         credits_charged,provider_cost_micro_cny,time_utc,provider_name,cache_read_tokens,\
+         cache_write_tokens,credits,revenue_cny,cost_cny\n"
+    ));
+}

@@ -68,6 +68,26 @@ fn parse_query(uri: &axum::http::Uri, key: &str) -> Option<String> {
         .find_map(|(name, value)| (name == key).then(|| value.to_string()))
 }
 
+/// The period a report covers, from `fromSecs` up to but not including `toSecs`; an end
+/// not given is open.
+fn report_period(uri: &axum::http::Uri) -> Result<(Option<u64>, Option<u64>), &'static str> {
+    let bound = |key: &str| {
+        parse_query(uri, key)
+            .map(|value| value.parse::<u64>())
+            .transpose()
+            .map_err(|_| "fromSecs and toSecs must be whole seconds")
+    };
+    let (from, to) = (bound("fromSecs")?, bound("toSecs")?);
+    if from.zip(to).is_some_and(|(from, to)| from >= to) {
+        return Err("fromSecs must be before toSecs");
+    }
+    Ok((from, to))
+}
+
+fn within_period(ts: u64, (from, to): (Option<u64>, Option<u64>)) -> bool {
+    from.is_none_or(|from| ts >= from) && to.is_none_or(|to| ts < to)
+}
+
 /// A request carrying this header is the console refreshing itself: it keeps the session
 /// alive no longer, so an unattended console still signs out when idle.
 pub const BACKGROUND_HEADER: &str = "x-admin-background";
@@ -694,8 +714,15 @@ impl FacadeHandler for AdminFinancialsHandler {
             if !self.auth.verify(req.headers()) {
                 return unauthorized_response();
             }
+            let period = match report_period(req.uri()) {
+                Ok(period) => period,
+                Err(message) => return failure(StatusCode::BAD_REQUEST, message),
+            };
             // One snapshot keeps estimates, coverage and their settings consistent.
-            let snapshot = self.billing.export_snapshot();
+            let mut snapshot = self.billing.export_snapshot();
+            snapshot
+                .ledger
+                .retain(|entry| within_period(entry.ts_secs, period));
             let dashboard = billing::observability::compute_margin_dashboard(
                 &snapshot.ledger,
                 &snapshot.settings,
@@ -713,10 +740,20 @@ impl FacadeHandler for AdminFinancialsHandler {
                 })
                 .count() as u64;
             let uncosted_requests = dashboard.total_requests.saturating_sub(costed_requests);
+            let (from_secs, to_secs) = period;
             json_response(
                 StatusCode::OK,
                 &serde_json::json!({
                     "success": true,
+                    "fromSecs": from_secs,
+                    "toSecs": to_secs,
+                    // What each upstream should bill for the period.
+                    "byProvider": billing::observability::compute_provider_costs(&snapshot.ledger),
+                    "margin": billing::observability::compute_costed_margin(&snapshot.ledger, &snapshot.settings),
+                    "sales": billing::observability::compute_sales(snapshot.cards.values(), from_secs, to_secs),
+                    // Balances still owed, now, whatever the period.
+                    "liability": billing::observability::compute_liability(snapshot.cards.values(), &snapshot.settings, now_secs()),
+                    "planPrices": billing::template::PLAN_PRICES,
                     "dashboard": dashboard,
                     "modelRankings": rankings,
                     "basis": "retained_usage_ledger_estimate_not_cash_revenue",

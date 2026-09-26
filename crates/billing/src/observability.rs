@@ -463,6 +463,245 @@ pub fn compute_model_cost_rankings(
     rankings
 }
 
+/// The ¥ face value of one credit a ledger entry was sold at: today the current settings'
+/// face value, for every entry.
+pub fn entry_face_value(_entry: &LedgerEntry, settings: &BillingSettings) -> f64 {
+    settings.credit_face_value_cny
+}
+
+/// Micro-credits at a ¥ face value per credit, in micro-CNY.
+pub fn face_value_micro_cny(micro_credits: i64, face_value_cny: f64) -> i64 {
+    (micro_credits as f64 * face_value_cny).round() as i64
+}
+
+/// What one upstream served over a period, and what it should bill for it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderCost {
+    pub provider_id: String,
+    pub requests: u64,
+    pub uncached_input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cost_micro_cny: i64,
+}
+
+/// Billed requests by the provider that served them, dearest first.
+pub fn compute_provider_costs(entries: &[LedgerEntry]) -> Vec<ProviderCost> {
+    let mut providers: BTreeMap<&str, ProviderCost> = BTreeMap::new();
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.kind == crate::ledger::LedgerKind::Usage)
+    {
+        let row = providers
+            .entry(entry.provider_id.as_str())
+            .or_insert_with(|| ProviderCost {
+                provider_id: entry.provider_id.clone(),
+                ..ProviderCost::default()
+            });
+        row.requests += 1;
+        // The entry's input is the whole prompt: uncached, cache reads and cache writes.
+        row.uncached_input_tokens = row.uncached_input_tokens.saturating_add(
+            entry
+                .input_tokens
+                .saturating_sub(entry.cache_read_tokens)
+                .saturating_sub(entry.cache_creation_tokens),
+        );
+        row.output_tokens = row.output_tokens.saturating_add(entry.output_tokens);
+        row.cache_read_tokens = row
+            .cache_read_tokens
+            .saturating_add(entry.cache_read_tokens);
+        row.cache_write_tokens = row
+            .cache_write_tokens
+            .saturating_add(entry.cache_creation_tokens);
+        row.cost_micro_cny = row
+            .cost_micro_cny
+            .saturating_add(entry.provider_cost_micro_cny);
+    }
+    let mut rows: Vec<ProviderCost> = providers.into_values().collect();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.cost_micro_cny));
+    rows
+}
+
+/// Margin over the requests whose cost is known, and what is left out: one model without
+/// a cost no longer blanks the whole.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CostedMargin {
+    pub costed_requests: u64,
+    pub costed_credits: i64,
+    pub revenue_micro_cny: i64,
+    pub cost_micro_cny: i64,
+    pub gross_profit_micro_cny: i64,
+    /// Null without revenue.
+    pub margin_percentage: Option<f64>,
+    pub uncosted_requests: u64,
+    pub uncosted_credits: i64,
+}
+
+/// A billed request is costed when it was priced by a published price version.
+pub fn compute_costed_margin(entries: &[LedgerEntry], settings: &BillingSettings) -> CostedMargin {
+    let mut margin = CostedMargin::default();
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.kind == crate::ledger::LedgerKind::Usage)
+    {
+        if entry.rate_card_version.is_none() {
+            margin.uncosted_requests += 1;
+            margin.uncosted_credits = margin
+                .uncosted_credits
+                .saturating_add(entry.credits_charged);
+            continue;
+        }
+        margin.costed_requests += 1;
+        margin.costed_credits = margin.costed_credits.saturating_add(entry.credits_charged);
+        margin.revenue_micro_cny = margin
+            .revenue_micro_cny
+            .saturating_add(face_value_micro_cny(
+                entry.credits_charged,
+                entry_face_value(entry, settings),
+            ));
+        margin.cost_micro_cny = margin
+            .cost_micro_cny
+            .saturating_add(entry.provider_cost_micro_cny);
+    }
+    margin.gross_profit_micro_cny = margin
+        .revenue_micro_cny
+        .saturating_sub(margin.cost_micro_cny);
+    margin.margin_percentage = (margin.revenue_micro_cny > 0)
+        .then(|| margin.gross_profit_micro_cny as f64 / margin.revenue_micro_cny as f64 * 100.0);
+    margin
+}
+
+/// Cards of one tier issued and activated over a period.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanSales {
+    pub template_id: &'static str,
+    pub name: &'static str,
+    pub points: i64,
+    pub price_micro_cny: i64,
+    pub issued_cards: u64,
+    pub activated_cards: u64,
+}
+
+/// Cards issued and activated over a period, and their value at the tiers' list prices.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Sales {
+    pub issued_cards: u64,
+    pub issued_value_micro_cny: i64,
+    pub activated_cards: u64,
+    pub activated_value_micro_cny: i64,
+    /// Cards whose credits match no tier: counted, not valued.
+    pub unpriced_issued_cards: u64,
+    pub unpriced_activated_cards: u64,
+    pub by_plan: Vec<PlanSales>,
+}
+
+/// Issued counts cards created in `[from, to)`, less those voided without ever being
+/// activated, which were never sold; activated counts cards activated in it.
+pub fn compute_sales<'a>(
+    cards: impl IntoIterator<Item = &'a crate::card::Card>,
+    from: Option<u64>,
+    to: Option<u64>,
+) -> Sales {
+    let within = |ts: u64| from.is_none_or(|from| ts >= from) && to.is_none_or(|to| ts < to);
+    let mut sales = Sales {
+        by_plan: crate::template::PLAN_PRICES
+            .iter()
+            .map(|plan| PlanSales {
+                template_id: plan.template_id,
+                name: plan.name,
+                points: plan.points,
+                price_micro_cny: plan.price_micro_cny,
+                issued_cards: 0,
+                activated_cards: 0,
+            })
+            .collect(),
+        ..Sales::default()
+    };
+    for card in cards {
+        let plan = card.issued_credits.and_then(|credits| {
+            crate::template::PLAN_PRICES.iter().position(|plan| {
+                plan.points.saturating_mul(crate::MICRO_CREDITS_PER_CREDIT) == credits
+            })
+        });
+        let never_sold =
+            card.status == crate::card::CardStatus::Voided && card.activated_at.is_none();
+        if within(card.created_at) && !never_sold {
+            sales.issued_cards += 1;
+            match plan {
+                Some(index) => {
+                    sales.by_plan[index].issued_cards += 1;
+                    sales.issued_value_micro_cny = sales
+                        .issued_value_micro_cny
+                        .saturating_add(sales.by_plan[index].price_micro_cny);
+                }
+                None => sales.unpriced_issued_cards += 1,
+            }
+        }
+        if card.activated_at.is_some_and(within) {
+            sales.activated_cards += 1;
+            match plan {
+                Some(index) => {
+                    sales.by_plan[index].activated_cards += 1;
+                    sales.activated_value_micro_cny = sales
+                        .activated_value_micro_cny
+                        .saturating_add(sales.by_plan[index].price_micro_cny);
+                }
+                None => sales.unpriced_activated_cards += 1,
+            }
+        }
+    }
+    sales
+}
+
+/// Credits still owed to customers: the balances of cards that can still be used.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Liability {
+    pub cards: u64,
+    pub micro_credits: i64,
+    /// At the current face value.
+    pub value_micro_cny: i64,
+    /// Of those, cards not yet activated, which may not have been sold yet.
+    pub unactivated_cards: u64,
+    pub unactivated_micro_credits: i64,
+}
+
+/// Every card that is not expired, voided, banned or archived; frozen ones included.
+pub fn compute_liability<'a>(
+    cards: impl IntoIterator<Item = &'a crate::card::Card>,
+    settings: &BillingSettings,
+    now_secs: u64,
+) -> Liability {
+    use crate::card::CardStatus;
+    let mut liability = Liability::default();
+    for card in cards {
+        let usable = card.archived_at.is_none()
+            && !matches!(
+                card.effective_status(now_secs),
+                CardStatus::Expired | CardStatus::Voided | CardStatus::Banned
+            );
+        if !usable {
+            continue;
+        }
+        let balance = card.credit_total.saturating_sub(card.credit_used).max(0);
+        liability.cards += 1;
+        liability.micro_credits = liability.micro_credits.saturating_add(balance);
+        if card.status == CardStatus::Unactivated {
+            liability.unactivated_cards += 1;
+            liability.unactivated_micro_credits =
+                liability.unactivated_micro_credits.saturating_add(balance);
+        }
+    }
+    liability.value_micro_cny =
+        face_value_micro_cny(liability.micro_credits, settings.credit_face_value_cny);
+    liability
+}
+
 /// Compute provider health metrics from request traces (Spec §14.4).
 pub fn compute_provider_health(
     traces: &[RequestTrace],
@@ -529,10 +768,32 @@ pub fn compute_provider_health(
 
 /// Export ledger entries to CSV format for financial reconciliation (Spec §14.4).
 pub fn export_reconciliation_csv(entries: &[LedgerEntry]) -> String {
-    let mut csv = String::from("id,card_id,ts,kind,invocation_id,exposed_model,provider_id,input_tokens,output_tokens,credits_charged,provider_cost_micro_cny\n");
+    export_ledger_csv(
+        entries,
+        &std::collections::HashMap::new(),
+        &BillingSettings::default(),
+    )
+}
+
+/// The ledger as CSV. The original columns come first, so tools reading them keep working;
+/// readable ones follow: the time in UTC, the provider's name, cache reads and writes,
+/// credits as a decimal, and for usage its ¥ revenue at face value and ¥ cost.
+pub fn export_ledger_csv(
+    entries: &[LedgerEntry],
+    provider_names: &std::collections::HashMap<String, String>,
+    settings: &BillingSettings,
+) -> String {
+    let mut csv = String::from("id,card_id,ts,kind,invocation_id,exposed_model,provider_id,input_tokens,output_tokens,credits_charged,provider_cost_micro_cny,time_utc,provider_name,cache_read_tokens,cache_write_tokens,credits,revenue_cny,cost_cny\n");
     for e in entries {
+        let usage = e.kind == crate::ledger::LedgerKind::Usage;
+        let revenue = usage.then(|| {
+            micro_decimal(face_value_micro_cny(
+                e.credits_charged,
+                entry_face_value(e, settings),
+            ))
+        });
         csv.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             csv_text(&e.id),
             csv_text(&e.card_id),
             e.ts_secs,
@@ -543,10 +804,62 @@ pub fn export_reconciliation_csv(entries: &[LedgerEntry]) -> String {
             e.input_tokens,
             e.output_tokens,
             e.credits_charged,
-            e.provider_cost_micro_cny
+            e.provider_cost_micro_cny,
+            csv_text(&iso_utc(e.ts_secs)),
+            csv_text(provider_names.get(&e.provider_id).unwrap_or(&e.provider_id)),
+            e.cache_read_tokens,
+            e.cache_creation_tokens,
+            micro_decimal(e.credits_charged),
+            revenue.unwrap_or_default(),
+            if usage {
+                micro_decimal(e.provider_cost_micro_cny)
+            } else {
+                String::new()
+            },
         ));
     }
     csv
+}
+
+/// A micro-unit amount as a decimal of whole units, without trailing zeros: -1.5, 2, 0.000001.
+fn micro_decimal(micro: i64) -> String {
+    let sign = if micro < 0 { "-" } else { "" };
+    let (whole, fraction) = (
+        micro.unsigned_abs() / 1_000_000,
+        micro.unsigned_abs() % 1_000_000,
+    );
+    if fraction == 0 {
+        format!("{sign}{whole}")
+    } else {
+        let fraction = format!("{fraction:06}");
+        format!("{sign}{whole}.{}", fraction.trim_end_matches('0'))
+    }
+}
+
+/// Unix seconds as ISO-8601 in UTC, such as 2023-11-14T22:13:20Z.
+pub fn iso_utc(secs: u64) -> String {
+    // Days to a civil date, after Howard Hinnant's days_from_civil inverse.
+    let days = (secs / 86_400) as i64 + 719_468;
+    let era = days.div_euclid(146_097);
+    let day_of_era = days.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    let clock = secs % 86_400;
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        clock / 3600,
+        clock % 3600 / 60,
+        clock % 60
+    )
 }
 
 /// A text cell for an export an operator opens in a spreadsheet. Some text comes from

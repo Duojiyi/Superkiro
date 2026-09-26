@@ -1073,3 +1073,316 @@ fn activity_counts_a_weeks_billed_requests_and_cards_by_model() {
         [("model-a".to_string(), 3, 2), ("model-b".to_string(), 1, 1)]
     );
 }
+
+/// A billed request: the whole prompt as input, cache reads and writes within it.
+fn usage_entry(
+    id: &str,
+    provider: &str,
+    tokens: (u64, u64, u64, u64),
+    credits: i64,
+    cost: i64,
+    costed: bool,
+) -> billing::ledger::LedgerEntry {
+    let (uncached, output, read, write) = tokens;
+    billing::ledger::LedgerEntry {
+        id: format!("led-{id}"),
+        card_id: "card".into(),
+        kind: billing::ledger::LedgerKind::Usage,
+        invocation_id: Some(id.into()),
+        exposed_model: "model".into(),
+        provider_id: provider.into(),
+        target_model: "target".into(),
+        input_tokens: uncached + read + write,
+        output_tokens: output,
+        cache_creation_tokens: write,
+        cache_read_tokens: read,
+        credits_charged: credits,
+        provider_cost_micro_cny: cost,
+        rate_card_version: costed.then(|| "price-v1".to_string()),
+        ts_secs: 1_000,
+        operator_id: None,
+        reason: None,
+    }
+}
+
+#[test]
+fn finance_by_provider_and_margin_over_costed_requests_only() {
+    let entries = vec![
+        usage_entry(
+            "a1",
+            "prov-a",
+            (1_000, 200, 300, 400),
+            5_000_000,
+            20_000,
+            true,
+        ),
+        usage_entry("a2", "prov-a", (500, 100, 0, 0), 1_000_000, 5_000, true),
+        usage_entry("b1", "prov-b", (100, 10, 0, 50), 3_000_000, 90_000, true),
+        // Priced by no published version: its cost is unknown.
+        usage_entry("u1", "prov-b", (100, 10, 0, 0), 7_000_000, 1, false),
+    ];
+    let costs = billing::observability::compute_provider_costs(&entries);
+    let rows: Vec<_> = costs
+        .iter()
+        .map(|row| {
+            (
+                row.provider_id.as_str(),
+                row.requests,
+                row.uncached_input_tokens,
+                row.output_tokens,
+                row.cache_read_tokens,
+                row.cache_write_tokens,
+                row.cost_micro_cny,
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ("prov-b", 2, 200, 20, 0, 50, 90_001),
+            ("prov-a", 2, 1_500, 300, 300, 400, 25_000),
+        ]
+    );
+
+    let settings = BillingSettings {
+        credit_face_value_cny: 0.01,
+        ..BillingSettings::default()
+    };
+    let margin = billing::observability::compute_costed_margin(&entries, &settings);
+    assert_eq!(
+        (margin.costed_requests, margin.costed_credits),
+        (3, 9_000_000)
+    );
+    // Nine credits at one fen each.
+    assert_eq!(margin.revenue_micro_cny, 90_000);
+    assert_eq!(margin.cost_micro_cny, 115_000);
+    assert_eq!(margin.gross_profit_micro_cny, -25_000);
+    assert!((margin.margin_percentage.unwrap() + 27.777).abs() < 0.01);
+    assert_eq!(
+        (margin.uncosted_requests, margin.uncosted_credits),
+        (1, 7_000_000)
+    );
+    let none = billing::observability::compute_costed_margin(&[], &settings);
+    assert_eq!(none.margin_percentage, None);
+}
+
+#[test]
+fn sales_count_cards_issued_and_activated_in_the_period_at_list_price() {
+    let tier = |id: &str, points: i64, created: u64, activated: Option<u64>| {
+        let mut card = Card::new(id, "group", points * 1_000_000);
+        card.created_at = created;
+        card.activated_at = activated;
+        if activated.is_some() {
+            card.status = CardStatus::Active;
+        }
+        card
+    };
+    let mut misprint = tier("misprint", 1000, 150, None);
+    misprint.status = CardStatus::Voided;
+    let mut refunded = tier("refunded", 2000, 150, Some(160));
+    refunded.status = CardStatus::Voided;
+    let cards = [
+        tier("pro", 1000, 150, None),
+        tier("pro-plus", 2000, 120, Some(190)),
+        tier("power", 10000, 50, Some(150)),
+        tier("custom", 123, 150, Some(150)),
+        tier("later", 5000, 200, Some(250)),
+        misprint,
+        refunded,
+    ];
+    let sales = billing::observability::compute_sales(cards.iter(), Some(100), Some(200));
+    // Issued in [100, 200): pro, pro-plus, custom and the refunded card; the misprint was
+    // voided unsold, "later" is at the end of the period and "power" before it.
+    assert_eq!(sales.issued_cards, 4);
+    assert_eq!(sales.unpriced_issued_cards, 1);
+    assert_eq!(
+        sales.issued_value_micro_cny,
+        30_000_000 + 55_000_000 + 55_000_000
+    );
+    // Activated in it: pro-plus, power, custom, refunded.
+    assert_eq!(sales.activated_cards, 4);
+    assert_eq!(sales.unpriced_activated_cards, 1);
+    assert_eq!(
+        sales.activated_value_micro_cny,
+        55_000_000 + 250_000_000 + 55_000_000
+    );
+    let plans: Vec<_> = sales
+        .by_plan
+        .iter()
+        .map(|plan| (plan.template_id, plan.issued_cards, plan.activated_cards))
+        .collect();
+    assert_eq!(
+        plans,
+        [
+            ("tier-1000", 1, 0),
+            ("tier-2000", 2, 2),
+            ("tier-5000", 0, 0),
+            ("tier-10000", 0, 1)
+        ]
+    );
+    // Without a period, every card.
+    let all = billing::observability::compute_sales(cards.iter(), None, None);
+    assert_eq!((all.issued_cards, all.activated_cards), (6, 5));
+}
+
+#[test]
+fn liability_is_the_balance_of_cards_that_can_still_be_used() {
+    let now = 10_000;
+    let card = |id: &str, status: CardStatus, total: i64, used: i64| {
+        let mut card = Card::new(id, "group", total);
+        card.status = status;
+        card.credit_used = used;
+        card
+    };
+    let mut lapsed = card("lapsed", CardStatus::Active, 5_000_000, 0);
+    lapsed.valid_until = Some(now - 1);
+    let mut current = card("current", CardStatus::Active, 5_000_000, 1_000_000);
+    current.valid_until = Some(now + 1);
+    let mut archived = card("archived", CardStatus::Expired, 5_000_000, 0);
+    archived.archived_at = Some(1);
+    let cards = [
+        current,
+        lapsed,
+        archived,
+        card("waiting", CardStatus::Unactivated, 2_000_000, 0),
+        card("frozen", CardStatus::Frozen, 3_000_000, 500_000),
+        card("banned", CardStatus::Banned, 9_000_000, 0),
+        card("voided", CardStatus::Voided, 9_000_000, 0),
+        card("expired", CardStatus::Expired, 9_000_000, 0),
+        card("in-debt", CardStatus::Active, 1_000_000, 4_000_000),
+    ];
+    let settings = BillingSettings {
+        credit_face_value_cny: 0.02,
+        ..BillingSettings::default()
+    };
+    let liability = billing::observability::compute_liability(cards.iter(), &settings, now);
+    // current 4, waiting 2, frozen 2.5, in-debt 0 credits.
+    assert_eq!(liability.cards, 4);
+    assert_eq!(liability.micro_credits, 8_500_000);
+    assert_eq!(liability.value_micro_cny, 170_000);
+    assert_eq!(
+        (
+            liability.unactivated_cards,
+            liability.unactivated_micro_credits
+        ),
+        (1, 2_000_000)
+    );
+}
+
+#[test]
+fn the_ledger_csv_adds_readable_columns_after_the_original_ones() {
+    let engine = BillingEngine::new();
+    engine.upsert_provider(billing::Provider::new(
+        "prov-1",
+        "Upstream One",
+        billing::ProviderFormat::OpenAi,
+        "https://example.invalid",
+    ));
+    let mut card = Card::new("card-readable", "group-pro-plus", 100_000_000);
+    card.status = CardStatus::Active;
+    engine.upsert_card(card);
+    engine
+        .reserve(
+            "card-readable",
+            "inv-readable",
+            &ReservationEstimateParams::new(500, 100),
+            1_700_000_000,
+            60,
+        )
+        .unwrap();
+    let entry = engine
+        .settle(
+            "inv-readable",
+            &UsageTokens {
+                uncached_input_tokens: 500,
+                output_tokens: 100,
+                cache_creation_tokens: 30,
+                cache_read_tokens: 70,
+            },
+            "gpt-4o",
+            "prov-1",
+            "gpt-4o",
+            1_700_000_000,
+        )
+        .unwrap();
+    engine
+        .adjust_balance(
+            "card-readable",
+            -1_500_000,
+            "admin",
+            "correction",
+            1_700_000_100,
+        )
+        .unwrap();
+
+    let rows = csv_rows(&engine.export_ledger_csv(Some("card-readable")));
+    assert_eq!(
+        rows[0],
+        [
+            "id",
+            "card_id",
+            "ts",
+            "kind",
+            "invocation_id",
+            "exposed_model",
+            "provider_id",
+            "input_tokens",
+            "output_tokens",
+            "credits_charged",
+            "provider_cost_micro_cny",
+            "time_utc",
+            "provider_name",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "credits",
+            "revenue_cny",
+            "cost_cny"
+        ]
+    );
+    let usage = &rows[1];
+    assert_eq!(usage[11], "2023-11-14T22:13:20Z");
+    assert_eq!(usage[12], "Upstream One");
+    assert_eq!((usage[13].as_str(), usage[14].as_str()), ("70", "30"));
+    let credits = entry.credits_charged;
+    assert_eq!(
+        usage[15].parse::<f64>().unwrap(),
+        credits as f64 / 1_000_000.0
+    );
+    // At the default face value of one fen per credit.
+    assert_eq!(
+        usage[16].parse::<f64>().unwrap(),
+        (credits as f64 * 0.01).round() / 1_000_000.0
+    );
+    assert_eq!(
+        usage[17].parse::<f64>().unwrap(),
+        entry.provider_cost_micro_cny as f64 / 1_000_000.0
+    );
+    // An adjustment: credits as a signed decimal, no revenue or cost.
+    let adjustment = &rows[2];
+    assert_eq!(adjustment[15], "-1.5");
+    assert_eq!((adjustment[16].as_str(), adjustment[17].as_str()), ("", ""));
+    assert_eq!(adjustment[12], "system");
+}
+
+#[test]
+fn iso_times_are_utc_calendar_dates() {
+    for (secs, iso) in [
+        (0, "1970-01-01T00:00:00Z"),
+        (951_782_400, "2000-02-29T00:00:00Z"),
+        (1_700_000_000, "2023-11-14T22:13:20Z"),
+        (4_102_444_799, "2099-12-31T23:59:59Z"),
+    ] {
+        assert_eq!(billing::observability::iso_utc(secs), iso);
+    }
+}
+
+#[test]
+fn plan_prices_name_the_issuance_tiers() {
+    for plan in billing::template::PLAN_PRICES {
+        let template = billing::CardTemplate::tier(plan.template_id, "group").unwrap();
+        assert_eq!(template.credit_total, plan.points * 1_000_000);
+        assert_eq!(template.name, plan.name);
+        let card = Card::new("card", "group", template.credit_total);
+        assert_eq!(card.plan_name(), Some(plan.name));
+    }
+}

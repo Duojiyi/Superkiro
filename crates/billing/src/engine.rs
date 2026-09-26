@@ -124,9 +124,9 @@ use crate::workbench::{RateCardAuditLog, SimulationResult};
 
 use crate::observability::{
     compute_margin_dashboard, compute_model_cost_rankings, compute_provider_health,
-    export_reconciliation_csv, export_reconciliation_json, prune_traces_in_place, Announcement,
-    AnomalyAction, AnomalyAlert, DailyUsageSummary, MarginDashboard, ModelCostRanking,
-    ProviderHealthSummary, RequestTrace, TraceStatus,
+    export_reconciliation_json, prune_traces_in_place, Announcement, AnomalyAction, AnomalyAlert,
+    DailyUsageSummary, MarginDashboard, ModelCostRanking, ProviderHealthSummary, RequestTrace,
+    TraceStatus,
 };
 
 /// In-memory billing engine for concurrency-safe reservations and settlements.
@@ -5585,15 +5585,23 @@ impl BillingEngine {
             .collect()
     }
 
-    /// Export ledger entries to CSV (Spec §14.4).
+    /// Export ledger entries to CSV (Spec §14.4), naming providers as they are called now.
     pub fn export_ledger_csv(&self, card_id: Option<&str>) -> String {
+        let names: HashMap<String, String> = self
+            .providers
+            .read()
+            .unwrap()
+            .values()
+            .map(|provider| (provider.id.clone(), provider.name.clone()))
+            .collect();
+        let settings = self.get_settings();
         let ledger = self.ledger.read().unwrap();
         let entries: Vec<LedgerEntry> = ledger
             .iter()
             .filter(|e| card_id.is_none_or(|id| e.card_id == id))
             .cloned()
             .collect();
-        export_reconciliation_csv(&entries)
+        crate::observability::export_ledger_csv(&entries, &names, &settings)
     }
 
     /// Export ledger entries to JSON (Spec §14.4).
