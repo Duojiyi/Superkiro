@@ -23,6 +23,7 @@ const writes=endpoint=>fixture.writes.filter(write=>write.endpoint===endpoint);
     page.setDefaultTimeout(10000);
     const origin=`http://127.0.0.1:${server.address().port}`;
     page.on('pageerror',error=>{errors.push(error.message);console.error('Browser error:',error.message);});
+    const diagRequests=[],diagConsole=[],t0=Date.now();page.on('request',r=>{if(r.url().includes('/api/'))diagRequests.push([Date.now()-t0,r.method(),r.url().replace(origin,'')]);});page.on('console',m=>diagConsole.push([Date.now()-t0,m.type(),m.text().slice(0,200)]));
     const nativeDialogs=[];page.on('dialog',dialog=>{nativeDialogs.push(dialog.message());void dialog.dismiss();});
     await page.route('**/*',route=>new URL(route.request().url()).origin===origin?route.continue():route.abort());
     const button=name=>page.getByRole('button',{name,exact:true});
@@ -31,6 +32,17 @@ const writes=endpoint=>fixture.writes.filter(write=>write.endpoint===endpoint);
     // Opens the confirmation, returns its text, optionally ticks or unticks its option, then answers.
     const confirm=async({accept=true,option}={})=>{
       const box=page.getByRole('alertdialog');await box.waitFor();const text=await box.innerText();
+      if(option!==undefined&&!(await box.getByRole('checkbox').count())){
+        console.error('DIAG dialog text: '+JSON.stringify(text));
+        console.error('DIAG dialogs: '+JSON.stringify(await page.evaluate(()=>[...document.querySelectorAll('[role=alertdialog],[role=dialog]')].map(e=>({role:e.getAttribute('role'),label:e.getAttribute('aria-label'),text:e.innerText.slice(0,400),underHidden:!!e.closest('[aria-hidden=true]')})))));
+        console.error('DIAG shell aria-hidden: '+JSON.stringify(await page.evaluate(()=>document.querySelector('.workspace-shell')?.getAttribute('aria-hidden'))));
+        console.error('DIAG editor: '+JSON.stringify(await page.evaluate(()=>({title:document.querySelector('#key-editor h3')?.textContent,checks:[...document.querySelectorAll('#key-editor .model-checklist input[type=checkbox]')].map(e=>[e.getAttribute('aria-label'),e.checked])}))));
+        console.error('DIAG fixture keys: '+JSON.stringify(fixture.keys.map(k=>[k.id,k.provider_id,k.enabled,k.allowed_models])));
+        console.error('DIAG fixture models: '+JSON.stringify(fixture.config.models.map(m=>[m.id,m.exposed_model_id,m.visible,m.retired,m.target_provider_id,m.target_model])));
+        console.error('DIAG fixture providers: '+JSON.stringify(fixture.providers.map(p=>[p.id,p.enabled])));
+        console.error('DIAG requests: '+JSON.stringify(diagRequests.slice(-30)));
+        console.error('DIAG console: '+JSON.stringify(diagConsole.slice(-20)));
+      }
       if(option!==undefined)await box.getByRole('checkbox').setChecked(option);
       await (accept?box.locator('[data-confirm="accept"]'):box.getByRole('button',{name:'取消',exact:true})).click();
       await box.waitFor({state:'detached'});return text;
