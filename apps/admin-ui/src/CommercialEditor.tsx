@@ -417,7 +417,7 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
       </fieldset>
     </section>
 
-    {kind === 'models' && <PriceVersions versions={configVersions} rateCardName={rateCardName} nowSecs={nowSecs}/>}
+    {kind === 'models' && <PriceVersions versions={configVersions} rateCards={rateCards} groups={configGroups} cards={cards} faceValue={config?.settings?.credit_face_value_cny} nowSecs={nowSecs}/>}
 
     {jsonOpen && <Drawer id="config-json" label="JSON 配置" onClose={() => setJsonOpen(false)} className="json-drawer">
       <header className="drawer-head">

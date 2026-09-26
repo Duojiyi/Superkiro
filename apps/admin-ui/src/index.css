@@ -561,6 +561,11 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .pricing-editor .pricing-procurement .pricing-heading > label {min-width: 130px;}
 .pricing-editor .pricing-actions {display: flex; align-items: center; flex-wrap: wrap; gap: 8px;}
 .price-history td {white-space: normal; vertical-align: top; padding-top: 10px; padding-bottom: 10px; font-size: 13px;}
+/* One block per price table; a table no customer uses stays folded. */
+.price-table + .price-table {margin-top: 16px;}
+.price-table > h4, .price-table > summary {margin: 0 0 8px; font-weight: 400; overflow-wrap: anywhere;}
+.price-table > summary {cursor: pointer; padding: 6px 0; color: var(--text-2);}
+.price-table.is-internal:not([open]) > summary {margin-bottom: 0;}
 .json-details > summary {cursor: pointer; font-weight: 500; color: var(--text-2);}
 .json-details[open] > summary {margin-bottom: 10px;}
 .json-details > p {margin: 0 0 8px; font-size: 12px;}

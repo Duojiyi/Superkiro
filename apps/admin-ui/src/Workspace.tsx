@@ -111,6 +111,8 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
   const hideUnconfirmed = useRef(false);
   const [syncedAt, setSyncedAt] = useState<number | null>(null);
   const [providersLoaded, setProvidersLoaded] = useState(false);
+  // Until the cards have been read once, how many use a price table is not known.
+  const [cardsLoaded, setCardsLoaded] = useState(false);
   // Changes whenever a refresh starts that should clear the card selection.
   const [selectionEpoch, setSelectionEpoch] = useState(0);
   const [actionError, setActionError] = useState<{text: string; action?: ErrorAction} | null>(null);
@@ -173,6 +175,7 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
         revision: config?.success && config.config ? config.config.revision : previous.revision,
       }));
       if (providers?.success) setProvidersLoaded(true);
+      if (cards?.success) setCardsLoaded(true);
       if (config?.success && config.config) hideUnconfirmed.current = false;
     } catch (error) {
       console.error('Failed to load admin data:', error);
@@ -326,7 +329,7 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
             {activeTab === 'groups' && <CommercialEditor key="groups" kind="groups" onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy}
               cards={data.cards} onPublished={() => void refreshData({keepSelection: true})} refreshEpoch={refreshEpoch}/>}
             {activeTab === 'models' && <CommercialEditor key="models" kind="models" onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy}
-              onPublished={() => void refreshData({keepSelection: true})} refreshEpoch={refreshEpoch} providers={data.providers} providerKeys={data.providerKeys}
+              cards={cardsLoaded ? data.cards : undefined} onPublished={() => void refreshData({keepSelection: true})} refreshEpoch={refreshEpoch} providers={data.providers} providerKeys={data.providerKeys}
               routesKnown={providersLoaded} intent={intent.models}/>}
             {activeTab === 'providers' && <ProvidersPage providers={data.providers} providerKeys={data.providerKeys} models={data.models}
               loading={loading} failed={!!failures.providers} refresh={refreshData} guards={guards} reportError={reportError}

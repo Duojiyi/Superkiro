@@ -112,13 +112,13 @@ const history = [
   {id: 'cost-price', model: 'cost-model', rate_card_id: 'r', pricing_mode: 'cost_plus', effective_from_secs: now - 100},
   {id: 'no-time', model: 'odd-model', rate_card_id: 'r', pricing_mode: 'fixed', effective_from_secs: null},
 ];
-const renderVersions = () => {cursor = 0; return Versions({versions: history, rateCardName: id => `卡 ${id}`, nowSecs: now});};
+const renderVersions = () => {cursor = 0; return Versions({versions: history, rateCards: [{id: 'r', name: 'Standard Rate Card'}], groups: [{id: 'g', name: 'PRO', rate_card_id: 'r'}], nowSecs: now});};
 states = [];
 let table = renderVersions();
 const badges = tree => nodes(tree).filter(node => node.type === 'StatusBadge').map(node => node.props.view.label);
 assert(!badges(table).includes('已被替代'), 'superseded versions are hidden by default');
 assert(text(table).includes('显示历史（1）'));
-assert(text(table).includes('按次 0.25 积分'));
+assert(text(table).includes('每次调用扣 0.25 积分（不按 Tokens）'), 'a per-call price says what is charged, and per what');
 assert(text(table).includes('成本加成'));
 assert(text(table).includes('未提供有效时间'));
 assert(nodes(table).some(node => node.props?.title === '无法安全显示，请核对原始配置'), 'an unsafe number is flagged, not shown');
@@ -129,7 +129,26 @@ assert(text(table).includes('1.234567'));
 assert(text(table).includes('USD 99 / 99 / 99 / 99'));
 assert(text(table).includes(display.formatDateTime(now - 200)));
 assert.equal(nodes(table).filter(node => ['select', 'textarea'].includes(node.type)).length, 0, 'the version list is read-only');
-console.log('PASS: one row per version, 显示历史, per-call / cost-plus / unsafe / missing values shown plainly');
+// Grouped by price table: who uses each one, how many cards, and the face value to read credits in yuan.
+// A table only issuance-disabled groups use (production's acceptance table) is folded away and says so.
+const tablesConfig = {versions: [...history, {id: 'probe-star', model: '*', rate_card_id: 'probe', pricing_mode: 'per_call', per_call_credit: 1000, effective_from_secs: now - 100}],
+  rateCards: [{id: 'r', name: 'Standard Rate Card'}, {id: 'probe', name: 'Isolated acceptance rate'}],
+  groups: [{id: 'g', name: 'PRO', rate_card_id: 'r'}, {id: 'accept', name: '验收专用（禁止发卡）', rate_card_id: 'probe', issuance_enabled: false}],
+  cards: [{groupId: 'g', status: 'active'}, {groupId: 'g', status: 'unactivated'}, {groupId: 'g', status: 'voided'}, {groupId: 'accept', status: 'active', archivedAt: 1}], faceValue: 0.03, nowSecs: now};
+states = []; cursor = 0; table = Versions(tablesConfig);
+const blocks = nodes(table).filter(node => ['section', 'details'].includes(node.type) && String(node.props['aria-label'] ?? '').startsWith('价格表'));
+assert.deepEqual(blocks.map(node => [node.type, node.props['aria-label']]), [['section', '价格表 Standard Rate Card'], ['details', '价格表 Isolated acceptance rate']], 'customer tables first, the acceptance table folded');
+assert.equal(blocks[1].props.open, undefined, 'folded by default');
+assert(text(blocks[0]).includes('用于 PRO · 2 张卡'), text(blocks[0]));
+assert(text(blocks[1]).includes('验收专用价格表（客户不使用）') && text(blocks[1]).includes('用于 验收专用（禁止发卡） · 0 张卡'), text(blocks[1]));
+assert(text(blocks[1]).includes('*（其余所有模型）') && text(blocks[1]).includes('每次调用扣 0.001 积分'), text(blocks[1]));
+assert(!text(blocks[0]).includes('0.001'), 'the acceptance price is not in the customer table');
+assert(text(table).includes('1 积分 = ¥0.03（积分面值，见财务对账）'));
+const {rateCardUse} = load('PriceVersions.tsx', {'./components/ui': {}, './format': display, './priceChange': change, './status': {}, react, 'react/jsx-runtime': runtime});
+assert.equal(rateCardUse('r', tablesConfig.groups, []).internal, '客户不使用的价格表（分组还没有卡密）');
+assert.equal(rateCardUse('r', tablesConfig.groups, null).internal, false, 'unknown cards never fold a table');
+assert.equal(rateCardUse('none', tablesConfig.groups, null).internal, '没有分组使用的价格表');
+console.log('PASS: one row per version, 显示历史, per-call / cost-plus / unsafe / missing values shown plainly; grouped by price table with its groups, cards and face value, the acceptance table folded');
 
 // Token inputs are explicit decimal units, without model-name inference or a 32K cap.
 const tokens = load('tokens.ts');
