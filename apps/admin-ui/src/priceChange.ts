@@ -126,6 +126,25 @@ export function versionIdFor(model: string, effectiveSecs: number, taken: Iterab
   return id;
 }
 
+/** A signed decimal as typed ("1.2", "-10", "+5"; the minus sign shown in changes too), exactly: n / d. */
+function decimal(text: string): {n: bigint; d: bigint} | null {
+  const match = /^([+\-−]?)(\d{1,9})(?:\.(\d{1,9}))?$/.exec(text.trim());
+  if (!match) return null;
+  const fraction = match[3] ?? '', n = BigInt(match[2] + fraction);
+  return {n: match[1] && match[1] !== '+' ? -n : n, d: 10n ** BigInt(fraction.length)};
+}
+
+/** 批量调价: a price × a factor, or ± a percentage, exactly, rounded half up to one micro-credit. */
+export function scaledPrice(micro: number, how: 'factor' | 'percent', value: string): number {
+  const parsed = decimal(value);
+  if (!parsed) throw new Error(how === 'factor' ? '系数须为正数，最多 9 位小数' : '百分比须为数字，如 -10 或 5');
+  const {n, d} = how === 'factor' ? parsed : {n: 100n * parsed.d + parsed.n, d: 100n * parsed.d};
+  if (n <= 0n) throw new Error(how === 'factor' ? '系数须大于 0' : '降价不能达到或超过 100%');
+  const result = (2n * BigInt(micro) * n + d) / (2n * d);
+  if (result > BigInt(MAX_PRICE_MICRO)) throw new Error('售价最多 1,000,000 积分 / 百万 Tokens');
+  return Number(result);
+}
+
 /** "+25%", "−20%", "—" when unchanged, "新" when there was no price before. */
 export function percentChange(before: number | null, after: number | null): string {
   if (after === null) return '';

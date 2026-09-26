@@ -141,3 +141,16 @@ assert.deepEqual(placed('up', 'a'), [['a', 0], ['b', 1], ['c', 2], ['x', 0]], 'a
 assert.equal(listingRules.defaultModel(ordered, 'g').id, 'b', 'a hidden model is never the default');
 assert.equal(listingRules.defaultModel([{id: 'r', group_id: 'g', retired: true}], 'g'), undefined);
 console.log('PASS list order: up, down and to the top renumber the group; ties settled; the default is the first model customers see');
+
+// 批量调价: × a factor or ± a percentage, exactly, rounded half up to one micro-credit.
+assert.equal(change.scaledPrice(3000000, 'factor', '1.2'), 3600000);
+assert.equal(change.scaledPrice(15000000, 'percent', '-20'), 12000000);
+assert.equal(change.scaledPrice(15000000, 'percent', '+5'), 15750000);
+assert.equal(change.scaledPrice(3, 'percent', '−10'), 3, 'the minus sign the console shows is accepted; 2.7 rounds to 3');
+assert.equal(change.scaledPrice(1, 'factor', '0.5'), 1, 'half rounds up');
+assert.equal(change.scaledPrice(1250000, 'factor', '0.9'), 1125000);
+for (const [how, value, pattern] of [['percent', '-100', /100%/], ['factor', '0', /大于 0/], ['factor', 'abc', /系数/], ['factor', '1e3', /系数/], ['percent', '', /百分比/]]) {
+  assert.throws(() => change.scaledPrice(1000, how, value), pattern, `${how} ${value}`);
+}
+assert.throws(() => change.scaledPrice(change.MAX_PRICE_MICRO, 'factor', '2'), /最多 1,000,000/);
+console.log('PASS bulk prices: factors and percentages exact, half up, with their limits');

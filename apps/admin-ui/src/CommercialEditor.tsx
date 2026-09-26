@@ -11,6 +11,7 @@ import { formatClock, formatCount, formatTokenCount, shortHash } from './format'
 import { creditsText, currentVersion, timeDraftVersions } from './priceChange';
 import PriceDrawer, { type PublishOutcome } from './PriceDrawer';
 import PriceVersions from './PriceVersions';
+import BulkPriceDrawer from './BulkPriceDrawer';
 import ListModelDrawer from './ListModelDrawer';
 import { defaultModel, groupModels, reorder } from './listing';
 import RouteEditor from './RouteEditor';
@@ -70,6 +71,7 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
   const [picked, setPicked] = useState<string[]>([]);
   const [switching, setSwitching] = useState(false);
   const [lastSwitch, setLastSwitch] = useState<{provider: string; kept: boolean; routes: SwitchedRoute[]} | null>(null);
+  const [bulkPricing, setBulkPricing] = useState(false);
   const say = (text: string, tone: 'error' | 'warning' | 'info' = 'error') => {setMessage(text); setMessageTone(tone);};
   const dirty = draft !== loadedDraft || !!reason.trim();
   const validText = (value: unknown, max: number) => typeof value === 'string' && !!value.trim() && new TextEncoder().encode(value).length <= max && !/[\x00-\x1f\x7f-\x9f]/.test(value);
@@ -318,7 +320,7 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
   // 调价 and 上架 publish on their own, so only from a page with nothing else unpublished.
   const ownBlocked = (action: string) => needsReview ? '请先重新加载确认上次发布' : dirty ? `先发布或放弃未发布的修改，再${action}` : busy ? '正在处理' : undefined;
   const priceBlocked = ownBlocked('调价'), listingBlocked = ownBlocked('上架'), canListModels = kind === 'models';
-  const openListing = (preset: {providerId?: string; model?: string}) => {setJsonOpen(false); setPriceModel(null); setSwitching(false); setListing(preset);};
+  const openListing = (preset: {providerId?: string; model?: string}) => {setJsonOpen(false); setPriceModel(null); setSwitching(false); setBulkPricing(false); setListing(preset);};
   // A link from 供应商与 Key opens the drawer for that provider's model, once, when the page has loaded.
   const intentUsed = useRef(false);
   useEffect(() => {
@@ -527,7 +529,8 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
     {kind === 'models' && pickedModels.length > 0 && <div className="selection-bar" role="region" aria-label="批量模型操作">
       <span className="selection-count">已选 {pickedModels.length} 个模型</span>
       <div className="button-row">
-        <button type="button" className="btn btn-small" disabled={!!bulkBlocked} title={bulkBlocked} onClick={() => {setJsonOpen(false); setPriceModel(null); setListing(null); setSwitching(true);}}>切换线路</button>
+        <button type="button" className="btn btn-small" disabled={!!bulkBlocked} title={bulkBlocked} onClick={() => {setJsonOpen(false); setPriceModel(null); setListing(null); setBulkPricing(false); setSwitching(true);}}>切换线路</button>
+        <button type="button" className="btn btn-small" disabled={!!bulkBlocked} title={bulkBlocked} onClick={() => {setJsonOpen(false); setPriceModel(null); setListing(null); setSwitching(false); setBulkPricing(true);}}>批量调价</button>
       </div>
       <button type="button" className="btn-text" onClick={() => setPicked([])}>取消选择</button>
     </div>}
@@ -605,6 +608,9 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
     {switching && config && pickedModels.length > 0 && <RouteSwitchDrawer models={pickedModels} config={config} providers={providers} keys={providerKeys}
       onClose={() => setSwitching(false)} onPublish={(update, switchReason, check) => publishOne(update, switchReason, '切换线路', undefined, check)}
       onSwitched={(provider, kept, routes) => {setLastSwitch({provider, kept, routes}); setPicked([]);}}/>}
+
+    {bulkPricing && config && pickedModels.length > 0 && <BulkPriceDrawer models={pickedModels} config={config} onClose={() => setBulkPricing(false)}
+      onPublish={async (update, priceReason, check) => {const outcome = await publishOne(update, priceReason, '批量调价', undefined, check); if (outcome.ok) setPicked([]); return outcome;}}/>}
 
     {listing && config && <ListModelDrawer preset={listing} config={config} providers={providers} providerKeys={providerKeys}
       onClose={() => setListing(null)} onPublish={(update, listingReason, check) => publishOne(update, listingReason, '上架', undefined, check)} onReload={() => load(false, true)}/>}

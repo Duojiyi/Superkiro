@@ -1,6 +1,7 @@
-// 调价: one drawer, one step. Current and new prices side by side, what a sample request
-// costs and earns, when it takes effect, a reason, then 发布调价 (confirmed) — published on
-// its own against the configuration version read, like every other change.
+// 调价: one drawer, one step. Current and new prices side by side (typed, or computed from the
+// official price and the multipliers), what a sample request costs and earns, when it takes
+// effect, a reason, then 发布调价 (confirmed) — published on its own against the configuration
+// version read, like every other change.
 import {useEffect, useRef, useState} from 'react';
 import type {CommercialConfig} from './api';
 import {confirmAction} from './components/confirm';
@@ -8,9 +9,11 @@ import {IconClose} from './components/icons';
 import {Drawer} from './components/modal';
 import {InfoTip, Tag} from './components/ui';
 import {formatCount, formatFullDateTime, shortHash} from './format';
+import {costFromOfficial, creditsFromOfficial} from './listing';
 import {buildPriceVersion, COST_FIELDS, creditsText, currentVersion, percentChange, PRICE_FIELDS, sampleCost, scheduledVersions, versionIdFor} from './priceChange';
 import {formatMicroPrice, priceToMicroPerMillion} from './pricing';
 import type {PublishOutcome} from './refusal';
+import {loadOfficial, loadRates, saveOfficial, saveRates} from './remembered';
 
 type Row = Record<string, unknown>;
 export type {PublishOutcome};
@@ -22,6 +25,7 @@ const toLocalInput = (secs: number) => {
   return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
 };
 const yuan = (value: number | null) => value === null ? '—' : `¥${value < 0.01 ? value.toFixed(4) : value.toFixed(2)}`;
+const OFFICIAL_LABELS = ['输入', '输出', '缓存写', '缓存读'];
 const validReason = (text: string) => !!text.trim() && new TextEncoder().encode(text.trim()).length <= 500 && !/[\x00-\x1f\x7f-\x9f]/.test(text);
 
 export default function PriceDrawer({model, group, config, onClose, onPublish, onReload}: {
@@ -52,6 +56,11 @@ export default function PriceDrawer({model, group, config, onClose, onPublish, o
   const [working, setWorking] = useState(false);
   // Procurement prices are folded away unless the current version has none (then they are needed).
   const [costsOpen, setCostsOpen] = useState(() => !current || COST_FIELDS.some(([field]) => typeof current[field] !== 'number'));
+  // 按官方价计算: the model's official prices and the multipliers typed before, for this provider.
+  const providerId = String(model.target_provider_id ?? '');
+  const [official, setOfficial] = useState(() => loadOfficial(name));
+  const [rates, setRates] = useState(loadRates);
+  const upstreamRate = rates.upstream[providerId] ?? '';
   const alive = useRef(true);
   useEffect(() => () => {alive.current = false;}, []);
 
@@ -80,6 +89,17 @@ export default function PriceDrawer({model, group, config, onClose, onPublish, o
   const sampleLabel = `示例 ${formatCount(Number(tokens[0]) || 0)} 输入 + ${formatCount(Number(tokens[1]) || 0)} 输出${Number(tokens[2]) ? ` + ${formatCount(Number(tokens[2]))} 缓存写` : ''}${Number(tokens[3]) ? ` + ${formatCount(Number(tokens[3]))} 缓存读` : ''}`;
   const chain = `用量费用 × 版本 ${multiplier || '—'} × 分组 ${String(group?.margin_multiplier ?? '—')} × 模型 ${String(model.credit_multiplier ?? '—')}，向上取整到 1 微积分；¥ 按积分面值 ${String(settings?.credit_face_value_cny ?? '—')} 元，USD 采购价按汇率 ${String(settings?.usd_cny_rate ?? '—')}`;
   const blocked = !rateCardId ? '这个模型的分组没有价格表，不能调价' : !validReason(reason) ? '填写原因后可发布（最多约 160 字）' : undefined;
+  // New prices from the official ones: retail multiplier × official at the face value; costs from this upstream's multiplier.
+  const compute = () => {
+    setError('');
+    try {
+      if (official.some(value => !value.trim())) throw new Error('先填四项官方价（美元 / 百万 Tokens，免费填 0）');
+      if (!rates.retail.trim() && !upstreamRate.trim()) throw new Error('填写售价倍率或成本倍率（至少一项）');
+      if (rates.retail.trim()) setPrices(Object.fromEntries(PRICE_FIELDS.map(([field], index) => [field, formatMicroPrice(creditsFromOfficial(official[index], rates.retail, settings?.credit_face_value_cny))])));
+      if (upstreamRate.trim()) {setCosts(Object.fromEntries(COST_FIELDS.map(([field], index) => [field, String(costFromOfficial(official[index], upstreamRate))]))); setCurrency('CNY');}
+      saveRates(rates); saveOfficial(name, official);
+    } catch (cause) {setError(cause instanceof Error ? cause.message : String(cause));}
+  };
 
   const submit = async () => {
     if (working || blocked) return;
@@ -153,6 +173,18 @@ export default function PriceDrawer({model, group, config, onClose, onPublish, o
             </tbody>
           </table></div>
         </section>
+        <details className="price-advanced listing-official">
+          <summary>按官方价计算</summary>
+          <div className="listing-grid">
+            {OFFICIAL_LABELS.map((label, index) => <label key={label} className="field"><span className="field-label">官方{label} $</span>
+              <input aria-label={`官方${label}价`} inputMode="decimal" value={official[index]} onChange={event => setOfficial(values => values.map((value, i) => i === index ? event.target.value : value))}/></label>)}
+            <label className="field"><span className="field-label">售价倍率<InfoTip text="客户每用官方 1 美元，花多少元（如 0.24）；按积分面值换成积分"/></span>
+              <input aria-label="售价倍率" inputMode="decimal" placeholder="如 0.24" value={rates.retail} onChange={event => setRates({...rates, retail: event.target.value})}/></label>
+            <label className="field"><span className="field-label">成本倍率<InfoTip text="这个供应商每 1 美元官方价收多少元（如 0.08），算出采购价；按供应商分别记住"/></span>
+              <input aria-label="成本倍率" inputMode="decimal" placeholder="如 0.08" value={upstreamRate} onChange={event => setRates({...rates, upstream: {...rates.upstream, [providerId]: event.target.value}})}/></label>
+          </div>
+          <button type="button" className="btn btn-small" onClick={compute}>计算</button>
+        </details>
         <div className="form-grid form-grid-2">
           <label className="field"><span className="field-label">版本倍率<InfoTip text="1 表示不加倍；与分组、模型的倍率相乘"/></span>
             <span className="input-suffix"><input aria-label="版本倍率" inputMode="decimal" value={multiplier} onChange={event => setMultiplier(event.target.value)}/><span>×</span></span></label>

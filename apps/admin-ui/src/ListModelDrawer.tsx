@@ -16,6 +16,7 @@ import type {PublishOutcome} from './PriceDrawer';
 import {COST_FIELDS, creditsText, currentVersion, PRICE_FIELDS, sampleCost} from './priceChange';
 import {formatMicroPrice, priceToMicroPerMillion} from './pricing';
 import Probe from './Probe';
+import {loadOfficial, loadRates, saveOfficial, saveRates} from './remembered';
 import {authorizedModels, canRoute} from './routes';
 import {parseTokenInput} from './tokens';
 
@@ -23,8 +24,6 @@ type Row = Record<string, unknown>;
 /** Where the drawer starts: the provider and upstream model to list, when known. */
 export interface ListingPreset {providerId?: string; model?: string}
 
-// The retail multiplier is one rule for the business; each upstream has its own cost multiplier.
-const RATES_KEY = 'admin-listing-rates:v2';
 const FIRST = '#first';
 const blank = (fields: readonly (readonly [string, string])[]) => Object.fromEntries(fields.map(([field]) => [field, '']));
 const yuan = (value: number | null) => value === null ? '—' : `¥${value < 0.01 ? value.toFixed(4) : value.toFixed(2)}`;
@@ -67,14 +66,9 @@ export default function ListModelDrawer({preset, config, providers, providerKeys
   const [prices, setPrices] = useState<Record<string, string>>(() => blank(PRICE_FIELDS));
   const [costs, setCosts] = useState<Record<string, string>>(() => blank(COST_FIELDS));
   const [currency, setCurrency] = useState('CNY');
-  const [official, setOfficial] = useState(['', '', '', '']);
-  const [rates, setRates] = useState<{retail: string; upstream: Record<string, string>}>(() => {
-    try {
-      const saved = JSON.parse(localStorage.getItem(RATES_KEY) || '{}');
-      const upstream = saved.upstream && typeof saved.upstream === 'object' ? Object.fromEntries(Object.entries(saved.upstream).map(([id, value]) => [id, String(value)])) : {};
-      return {retail: String(saved.retail ?? ''), upstream};
-    } catch {return {retail: '', upstream: {}};}
-  });
+  const [official, setOfficial] = useState(() => loadOfficial(preset.model ?? ''));
+  // The retail multiplier is one rule for the business; each upstream has its own cost multiplier.
+  const [rates, setRates] = useState(loadRates);
   const upstreamRate = rates.upstream[providerId] ?? '';
   // When the table already prices this model ID, the existing price is kept unless the owner asks for a new one.
   const [newPrice, setNewPrice] = useState(false);
@@ -129,7 +123,7 @@ export default function ListModelDrawer({preset, config, providers, providerKeys
       if (!rates.retail.trim() && !upstreamRate.trim()) throw new Error('填写售价倍率或成本倍率（至少一项）');
       if (rates.retail.trim()) setPrices(Object.fromEntries(PRICE_FIELDS.map(([field], index) => [field, formatMicroPrice(creditsFromOfficial(official[index], rates.retail, settings?.credit_face_value_cny))])));
       if (upstreamRate.trim()) {setCosts(Object.fromEntries(COST_FIELDS.map(([field], index) => [field, String(costFromOfficial(official[index], upstreamRate))]))); setCurrency('CNY');}
-      try {localStorage.setItem(RATES_KEY, JSON.stringify(rates));} catch {/* remembered only as a convenience */}
+      saveRates(rates); if (modelId) saveOfficial(modelId, official);
     } catch (cause) {setError(cause instanceof Error ? cause.message : String(cause));}
   };
 
