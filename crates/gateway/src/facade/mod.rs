@@ -63,6 +63,29 @@ pub fn error_response(status: StatusCode, error_type: &str, message: &str) -> Re
         .into_response()
 }
 
+/// A refusal Kiro classifies by its `reason`, as it does its own service's validation
+/// errors. It does not retry one; one whose reason it does not special-case shows the
+/// message.
+pub fn validation_error(reason: &str, message: &str) -> Response {
+    crate::guardrail::format_kiro_throttle_response(
+        StatusCode::BAD_REQUEST,
+        "ValidationException",
+        reason,
+        message,
+        None,
+    )
+}
+
+/// The refusal Kiro takes for a context overflow: its ContextOverflowHandler compacts the
+/// conversation and sends it again, as when its own service refuses an over-long prompt.
+/// Kiro matches the reason, and the message's opening words where the reason is lost.
+pub fn input_too_long(detail: &str) -> Response {
+    validation_error(
+        "CONTENT_LENGTH_EXCEEDS_THRESHOLD",
+        &format!("Input is too long: {detail}"),
+    )
+}
+
 /// Structured JSON success response helper.
 pub fn json_response<T: serde::Serialize>(status: StatusCode, data: &T) -> Response {
     (

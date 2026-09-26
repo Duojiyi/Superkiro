@@ -355,8 +355,30 @@ pub enum GuardrailError {
     #[error("Prompt content too long: {actual} characters exceeds limit of {max}")]
     PromptTooLong { actual: usize, max: usize },
 
+    #[error("Conversation history too long: {actual} messages exceeds limit of {max}")]
+    HistoryTooLong { actual: usize, max: usize },
+
+    #[error("conversationId must be 1 to 256 characters")]
+    InvalidConversationId,
+
     #[error("Image is not a readable PNG, JPEG, GIF or WebP image")]
     InvalidImage,
+}
+
+impl GuardrailError {
+    /// Why the request is too long to send, when that is the refusal: Kiro compacts the
+    /// conversation for it.
+    pub fn overflow_detail(&self) -> Option<String> {
+        match self {
+            Self::PromptTooLong { actual, max } => Some(format!(
+                "请求内容共 {actual} 个字符，超过网关 {max} 个字符的上限"
+            )),
+            Self::HistoryTooLong { actual, max } => Some(format!(
+                "对话历史共 {actual} 条消息，超过网关 {max} 条的上限"
+            )),
+            _ => None,
+        }
+    }
 }
 
 impl ContentGuardrailConfig {

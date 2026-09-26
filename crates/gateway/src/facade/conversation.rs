@@ -10,7 +10,7 @@
 //! 5. Upstream provider streaming invocation (Spec §15.2).
 //! 6. Binary AWS EventStream encoding, 20s keepalive injection, and client disconnect cancellation (Spec §4.6, §6.3).
 
-use super::{error_response, BoxFuture, FacadeHandler, Response};
+use super::{error_response, input_too_long, BoxFuture, FacadeHandler, Response};
 use crate::auth::AuthClaims;
 use crate::guardrail::{format_kiro_throttle_response, CapacityGuardrail};
 use crate::idempotency::IdempotencyManager;
@@ -19,7 +19,7 @@ use crate::provider::governance::{
     execute_stream_with_model_fallback, GovernanceError, ProviderKeyPool,
 };
 use crate::provider::ProviderRuntimeRegistry;
-use crate::provider::{ModelProvider, ProviderConfig};
+use crate::provider::{ModelProvider, ProviderConfig, ProviderError};
 use crate::security::{ContentGuardrailConfig, GuardrailError};
 use crate::stream::{create_stream_guard, BillingSettler, StreamGuardConfig};
 use crate::translate::to_provider::{
@@ -322,6 +322,12 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                     .into_response();
             }
 
+            let fallback_model = self
+                .provider_config
+                .as_ref()
+                .map(|c| c.model.as_str())
+                .unwrap_or("claude-3-5-sonnet-20241022");
+
             // Parse and validate before reserving credit.  A malformed or
             // over-sized request must never consume a reservation.
             let mut parsed_request = None;
@@ -341,6 +347,20 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                     };
                 if let Err(error) = validate_conversation_request(&parsed, &self.content_guardrail)
                 {
+                    if let Some(detail) = error.overflow_detail() {
+                        self.record_refusal(
+                            claims.as_ref(),
+                            &invocation_key,
+                            &requested_model_id(
+                                &parsed,
+                                claims.as_ref(),
+                                &self.billing,
+                                fallback_model,
+                            ),
+                            "input_too_long",
+                        );
+                        return input_too_long(&detail);
+                    }
                     return error_response(
                         StatusCode::BAD_REQUEST,
                         "InvalidRequestException",
@@ -359,11 +379,6 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
             };
 
             // 5. Credit Reservation (Spec §6.2)
-            let fallback_model = self
-                .provider_config
-                .as_ref()
-                .map(|c| c.model.as_str())
-                .unwrap_or("claude-3-5-sonnet-20241022");
             let mut has_reservation = false;
             let reservation_lease = self.billing.protect_reservation(&invocation_key);
             let mut hold = HoldRelease {
@@ -442,12 +457,23 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                         )
                     });
                 let estimated_input_tokens = request_for_reservation
-                    .map(|request| {
-                        estimate_input_tokens(request)
-                            .saturating_add(prefix_tokens)
-                            .clamp(1, input_limit)
-                    })
-                    .unwrap_or(2_000);
+                    .map(|request| estimate_input_tokens(request).saturating_add(prefix_tokens))
+                    .unwrap_or(2_000)
+                    .max(1);
+                // Sent anyway, a prompt over the model's limit is refused upstream, and Kiro
+                // could not tell that refusal from an outage. Refused here, it compacts the
+                // conversation and tries again.
+                if estimated_input_tokens > input_limit {
+                    self.record_refusal(
+                        claims.as_ref(),
+                        &invocation_key,
+                        requested_model_for_reservation,
+                        "input_too_long",
+                    );
+                    return input_too_long(&format!(
+                        "本次请求估计约 {estimated_input_tokens} 个 token，超过该模型 {input_limit} 个 token 的输入上限"
+                    ));
+                }
                 reserved_estimated_input = estimated_input_tokens;
                 reserved_max_output = max_output_tokens_for_model(
                     requested_model_for_reservation,
@@ -1052,6 +1078,10 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                             idempotency_guard.fail();
                             return empty_attempts_response();
                         }
+                        Err(e) if upstream_input_too_long(&e) => {
+                            let _ = self.billing.release(&invocation_key);
+                            return input_too_long(UPSTREAM_OVERFLOW);
+                        }
                         Err(GovernanceError::AllKeysInCooldown {
                             next_recovery_secs, ..
                         }) => {
@@ -1115,6 +1145,16 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                         {
                             idempotency_guard.fail();
                             return empty_attempts_response();
+                        }
+                        Err(e) if provider_input_too_long(&e) => {
+                            let _ = self.billing.release(&invocation_key);
+                            self.record_refusal(
+                                claims.as_ref(),
+                                &invocation_key,
+                                requested_model,
+                                "input_too_long",
+                            );
+                            return input_too_long(UPSTREAM_OVERFLOW);
                         }
                         Err(e) => {
                             // Upstream initiation failed; release reservation in full
@@ -1308,8 +1348,43 @@ fn route_failure_class(
 ) -> &'static str {
     match error {
         GovernanceError::NoAvailableKeys { .. } if attempts.is_empty() => "no_route",
+        error if upstream_input_too_long(error) => "input_too_long",
         _ => "upstream_start_failed",
     }
+}
+
+/// What a request refused upstream for its length is told.
+const UPSTREAM_OVERFLOW: &str = "上游模型报告输入超过了它的上下文上限";
+
+/// Whether the upstream refused the request for a prompt longer than its model takes.
+fn upstream_input_too_long(error: &GovernanceError) -> bool {
+    match error {
+        GovernanceError::NonRetryable(error) | GovernanceError::Provider(error) => {
+            provider_input_too_long(error)
+        }
+        _ => false,
+    }
+}
+
+/// Anthropic's "prompt is too long", OpenAI's `context_length_exceeded` and "maximum
+/// context length", and a request too large to be accepted at all. Only the refusal's kind
+/// is read from the upstream's words; they never reach the client.
+fn provider_input_too_long(error: &ProviderError) -> bool {
+    let ProviderError::Http(status, body) = error else {
+        return false;
+    };
+    let body = body.to_ascii_lowercase();
+    status.as_u16() == 413
+        || status.as_u16() == 400
+            && [
+                "prompt is too long",
+                "input is too long",
+                "context_length_exceeded",
+                "maximum context length",
+                "input content length exceeds threshold",
+            ]
+            .iter()
+            .any(|phrase| body.contains(phrase))
 }
 
 /// A request whose every attempt came back empty. It was billed the input consumed, so it
@@ -1483,13 +1558,10 @@ fn validate_conversation_request(
     if request.conversation_state.conversation_id.trim().is_empty()
         || request.conversation_state.conversation_id.chars().count() > 256
     {
-        return Err(GuardrailError::PromptTooLong {
-            actual: request.conversation_state.conversation_id.chars().count(),
-            max: 256,
-        });
+        return Err(GuardrailError::InvalidConversationId);
     }
     if request.conversation_state.history.len() > 1_000 {
-        return Err(GuardrailError::PromptTooLong {
+        return Err(GuardrailError::HistoryTooLong {
             actual: request.conversation_state.history.len(),
             max: 1_000,
         });
@@ -1601,5 +1673,23 @@ mod capability_tests {
             max_output_tokens_for_model("gemini-unknown", None, &billing),
             4096
         );
+    }
+
+    #[test]
+    fn only_an_over_long_prompt_is_read_as_an_overflow() {
+        let http = |status: u16, body: &str| {
+            ProviderError::Http(reqwest::StatusCode::from_u16(status).unwrap(), body.into())
+        };
+        assert!(provider_input_too_long(&http(
+            400,
+            r#"{"error":{"message":"Prompt is too long: 201000 tokens > 200000 maximum"}}"#
+        )));
+        assert!(provider_input_too_long(&http(413, "")));
+        assert!(!provider_input_too_long(&http(
+            400,
+            r#"{"error":{"message":"temperature is not supported"}}"#
+        )));
+        assert!(!provider_input_too_long(&http(500, "prompt is too long")));
+        assert!(!provider_input_too_long(&ProviderError::Timeout));
     }
 }
