@@ -438,3 +438,32 @@ async fn a_large_single_event_does_not_abort_the_stream() {
         Some(Err(ProviderError::Parse(message))) if message.contains("exceeded limit")
     ));
 }
+
+/// Kiro sends each tool's JSON Schema wrapped as `inputSchema.json`. Both providers must hand the
+/// upstream the schema itself: given `{"json": {...}}`, a model sees no parameters and guesses
+/// its own names, and Kiro refuses the call (fs_write with file_path/content, not path/text).
+#[test]
+fn kiro_tool_schemas_reach_the_upstream_unwrapped() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {"path": {"type": "string"}, "text": {"type": "string"}},
+        "required": ["path", "text"],
+    });
+    let mut req = create_test_request("model");
+    req.tools = vec![
+        serde_json::json!({"toolSpecification": {"name": "fs_write", "description": "Write a file", "inputSchema": {"json": schema}}}),
+        serde_json::json!({"toolSpecification": {"name": "fs_read", "description": "Read a file", "inputSchema": schema}}),
+    ];
+
+    let anthropic = AnthropicProvider.translate_request(&req).unwrap();
+    assert_eq!(anthropic["tools"][0]["name"], "fs_write");
+    assert_eq!(anthropic["tools"][0]["input_schema"], schema);
+    assert_eq!(
+        anthropic["tools"][1]["input_schema"], schema,
+        "an unwrapped schema is kept as it is"
+    );
+
+    let openai = OpenAiProvider.translate_request(&req).unwrap();
+    assert_eq!(openai["tools"][0]["function"]["parameters"], schema);
+    assert_eq!(openai["tools"][1]["function"]["parameters"], schema);
+}

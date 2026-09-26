@@ -225,6 +225,13 @@ impl ModelProvider for AnthropicProvider {
                             .unwrap_or_else(
                                 || serde_json::json!({"type": "object", "properties": {}}),
                             );
+                        // Kiro wraps each schema as {"json": {...}}. Passed on wrapped, a model
+                        // sees no parameters and guesses its own (fs_write called with
+                        // file_path/content instead of path/text).
+                        let input_schema = match input_schema.get("json") {
+                            Some(inner) if inner.is_object() => inner.clone(),
+                            _ => input_schema,
+                        };
                         serde_json::json!({
                             "name": name,
                             "description": desc,
