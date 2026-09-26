@@ -1,5 +1,6 @@
 // A "⋯" menu for less frequent row actions. Dangerous items go last, in red.
 import {useEffect, useRef, useState, type KeyboardEvent, type ReactNode} from 'react';
+import {createPortal} from 'react-dom';
 import {IconMore} from './icons';
 
 export interface MenuItem {
@@ -69,7 +70,9 @@ export function Menu({label, items, disabled, title, className, children}: {
       event.preventDefault();
       nodes[(index - 1 + nodes.length) % nodes.length]?.focus();
     } else if (event.key === 'Tab') {
+      // Back on the trigger, so Tab carries on from there rather than from the page's end.
       setPlace(null);
+      trigger.current?.focus();
     }
   };
 
@@ -78,7 +81,8 @@ export function Menu({label, items, disabled, title, className, children}: {
       aria-haspopup="menu" aria-expanded={open} disabled={disabled} onClick={() => (open ? setPlace(null) : show())}>
       {children ?? <IconMore/>}
     </button>
-    {place && <div ref={menu} role="menu" aria-label={label} className="menu" style={{position: 'fixed', ...place}} onKeyDown={keydown}>
+    {/* Rendered at the top of the page: a sticky table cell would otherwise trap it beneath later rows. */}
+    {place && createPortal(<div ref={menu} role="menu" aria-label={label} className="menu" style={{position: 'fixed', ...place}} onKeyDown={keydown}>
       {items.map(item => <button key={item.label} type="button" role="menuitem" disabled={item.disabled} title={item.title}
         className={`menu-item${item.danger ? ' is-danger' : ''}`}
         onClick={() => {
@@ -87,6 +91,6 @@ export function Menu({label, items, disabled, title, className, children}: {
           setPlace(null);
           item.onSelect();
         }}>{item.label}</button>)}
-    </div>}
+    </div>, document.body)}
   </span>;
 }

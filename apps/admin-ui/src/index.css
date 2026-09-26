@@ -81,7 +81,8 @@ h4 {font-size: 14px; line-height: 20px; font-weight: 600;}
 .chip-count {color: var(--text-3); font-variant-numeric: tabular-nums;}
 
 /* ---------- Forms ---------- */
-:where(input:not([type=checkbox]):not([type=radio]), select, textarea) {min-height: 36px; padding: 7px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-surface); color: var(--text-1); max-width: 100%;}
+/* Element weight: enough to beat the reset's padding: 0, never a class rule. */
+input:where(:not([type=checkbox]):not([type=radio])), select, textarea {min-height: 36px; padding: 7px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-surface); color: var(--text-1); max-width: 100%;}
 :where(textarea) {min-height: 72px; resize: vertical;}
 :where(input, textarea)::placeholder {color: var(--text-3);}
 :where(input, select, textarea):disabled {background: var(--bg-muted); color: var(--text-2);}
@@ -217,6 +218,9 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .table .col-check {width: 40px; padding-right: 0;}
 .table .col-status {width: 1%;}
 .table .col-actions {width: 1%; text-align: right;}
+/* The card row actions stay in view when the table scrolls sideways. */
+.cards-table .col-actions {position: sticky; right: 0; background: var(--bg-surface); box-shadow: -8px 0 8px -8px rgba(0, 0, 0, .12);}
+.cards-table th.col-actions {z-index: 2; background: var(--bg-muted);}
 .table .cell-strong {font-weight: 500;}
 .clip {display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;}
 .clip-note {max-width: 220px;}
@@ -228,6 +232,8 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 @media (min-width: 1700px) {.clip-note {max-width: 360px;} .clip-group {max-width: 220px;}}
 /* Laptop widths: the card table keeps its actions on screen without sideways scrolling. */
 @media (max-width: 1400px) {.cards-table th, .cards-table td {padding-left: 8px; padding-right: 8px;} .clip-note {max-width: 130px;} .clip-group {max-width: 112px;}}
+/* Below 1440 the device column gives way (search still matches devices). */
+@media (max-width: 1439px) {.cards-table .col-device {display: none;}}
 .table .detail-row td {white-space: normal; background: var(--bg-muted);}
 .table-compact td {height: 36px;}
 .th-sort {display: inline-flex; align-items: center; gap: 4px; font-weight: 500; color: inherit;}

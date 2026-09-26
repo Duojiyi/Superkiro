@@ -612,7 +612,7 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
           <th>卡密</th><th>备注</th><th>分组</th>
           <th className="num" aria-sort={sortState('balance')}><button type="button" className="th-sort" onClick={() => toggleSort('balance')}>余额{sortIcon('balance')}</button></th>
           <th aria-sort={sortState('expiry')}><button type="button" className="th-sort" onClick={() => toggleSort('expiry')}>到期{sortIcon('expiry')}</button></th>
-          <th>设备</th><th className="col-status">状态</th><th className="col-actions"><span className="sr-only">操作</span></th>
+          <th className="col-device">设备</th><th className="col-status">状态</th><th className="col-actions"><span className="sr-only">操作</span></th>
         </tr></thead>
         <tbody>
           {pageCards.map(card => {
@@ -633,7 +633,7 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
               <td className="col-device"><Devices card={card}/></td>
               <td className="col-status"><span className="status-cell"><StatusBadge view={cardStatusView(card.status)}/>{card.archivedAt != null && <Tag>已归档</Tag>}</span></td>
               <td className="col-actions"><span className="row-actions">
-                <button type="button" className="btn-text" disabled={!card.codeRecoverable || revealing || bulkBusy} title={card.codeRecoverable ? undefined : '此卡未保存明文'} onClick={() => void reveal(card)}>查看卡密</button>
+                <button type="button" className="btn-text" disabled={!card.codeRecoverable || revealing || bulkBusy} aria-label="查看卡密" title={card.codeRecoverable ? undefined : '此卡未保存明文'} onClick={() => void reveal(card)}>查看</button>
                 <button type="button" className="btn-text" disabled={card.status === 'voided' || blocked} title={card.status === 'voided' ? '已作废，不能调账' : staleTitle} onClick={() => openAdjust(card)}>调账</button>
                 {menuItems.length ? <Menu label="更多操作" items={menuItems} disabled={blocked} title={staleTitle ?? '更多操作'}/> : <span className="menu-placeholder"/>}
               </span></td>
