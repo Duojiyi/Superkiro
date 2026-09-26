@@ -7,7 +7,7 @@ import {EstimateTag, FilterTabs, StatusBadge, TableState, TopbarActions} from '.
 import {IconCheck, IconWarning} from '../components/icons';
 import {formatCount, formatCredits, formatCreditsMicro, formatDuration, formatFullDateTime, formatMoney, formatPercent, formatRemaining, shortId} from '../format';
 import {brokenRoutes, modelName, nameList, targetProblem} from '../routes';
-import {keyCooldownLeft, keyStatusView, TRACE_IN_PROGRESS} from '../status';
+import {cooldownText, keyAlert, keyCooldownLeft, keyStatusView, TRACE_IN_PROGRESS} from '../status';
 import type {Intent, Tab} from '../types';
 import type {Failures, WorkspaceData} from '../Workspace';
 
@@ -90,13 +90,15 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
   const attention: Array<{text: string; tone: 'warning' | 'danger' | 'info'; go: () => void}> = [];
   // A Key of a disabled provider serves nothing, so its cooldown needs no attention.
   const liveKeys = data.providerKeys.filter(key => key.enabled !== false && data.providers.find(provider => provider.id === key.provider_id)?.enabled !== false);
-  const coolingKeys = liveKeys.filter(key => keyCooldownLeft(key, nowSecs) > 0);
+  const coolingKeys = liveKeys.filter(key => keyAlert(key, nowSecs) === 'cooldown');
   if (coolingKeys.length) {
-    const soonest = Math.min(...coolingKeys.map(key => keyCooldownLeft(key, nowSecs)));
-    attention.push({text: `${coolingKeys.length} 个 Key 冷却中（${Math.max(1, Math.ceil(soonest / 60))} 分钟后恢复）`, tone: 'warning', go: () => onNavigate('providers')});
+    const left = coolingKeys.map(key => keyCooldownLeft(key, nowSecs)).filter(value => value > 0);
+    attention.push({text: `${coolingKeys.length} 个 Key 冷却中${left.length ? `（${cooldownText(Math.min(...left))}后恢复）` : ''}`, tone: 'warning', go: () => onNavigate('providers')});
   }
-  const degradedKeys = liveKeys.filter(key => key.health_state === 'degraded').length;
+  const degradedKeys = liveKeys.filter(key => keyAlert(key, nowSecs) === 'degraded').length;
   if (degradedKeys) attention.push({text: `${degradedKeys} 个 Key 异常`, tone: 'danger', go: () => onNavigate('providers')});
+  const unhealthyKeys = liveKeys.filter(key => keyAlert(key, nowSecs) === 'unhealthy').length;
+  if (unhealthyKeys) attention.push({text: `${unhealthyKeys} 个 Key 不可用`, tone: 'danger', go: () => onNavigate('providers')});
   const failedLastHour = data.traces.filter(trace => trace.status === 'error' && Number(trace.ts) > nowSecs - 3600).length;
   if (failedLastHour) attention.push({text: `近 1 小时 ${failedLastHour} 次失败请求`, tone: 'danger', go: () => onNavigate('traces', {traces: {status: 'error', window: 'hour'}})});
   const frozen = currentCards.filter(card => card.status === 'frozen').length;

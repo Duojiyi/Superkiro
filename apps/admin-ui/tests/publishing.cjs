@@ -73,6 +73,32 @@ const elsewhere=change=>{change();fixture.config.revision=`fixture-rev-${Number(
     assert.deepEqual(published().at(-1).body.models.map(row=>row.id),['fixture-model-0'],'gpt-5, now without a route, is not part of this publication');
     console.log('PASS: refusals are explained in plain words and leave the draft editable; an unrelated model without a route does not block a publication');
 
+    // Shown to customers only with a price in force and a primary route that serves: refused before sending otherwise.
+    fixture.keys.find(row=>row.id==='fixture-key').allowed_models=['claude-sonnet','gpt-5','gemini-pro','gpt-6-astra'];
+    elsewhere(()=>fixture.config.models.push({...model('fixture-model-3'),id:'fixture-model-9',exposed_model_id:'unpriced-model',target_model:'gpt-5.6-sol',visible:false,sort_order:5}));
+    await button('刷新').click();await page.locator('.btn-refresh:not([disabled])').waitFor();
+    const unpriced=page.getByRole('row').filter({has:page.getByRole('button',{name:'unpriced-model 的更多操作',exact:true})});
+    await unpriced.getByRole('button',{name:'编辑',exact:true}).click();
+    await editor.getByRole('checkbox',{name:'客户可见',exact:true}).check();
+    await bar.getByLabel('变更原因',{exact:true}).fill('对客户开放');
+    const count=published().length;
+    await button('发布').click();
+    await bar.getByRole('status').filter({hasText:'这些模型还没有生效中的价格，不能对客户显示：unpriced-model。先给它们调价，或保持隐藏'}).waitFor();
+    assert.equal(await page.getByRole('alertdialog').count(),0);assert.equal(published().length,count);
+    // Priced meanwhile; then its route loses its Key.
+    elsewhere(()=>fixture.config.versions.push({...fixture.config.versions.find(version=>version.id==='fixture-price-astra'),id:'unpriced-model-price',model:'unpriced-model'}));
+    fixture.keys.find(row=>row.id==='fixture-openai-key-1').allowed_models=['gpt-6-astra'];
+    await button('刷新').click();await bar.getByText('服务器上的配置可能已更新').waitFor();
+    await button('重新加载并保留修改').click();await bar.getByRole('status').filter({hasText:'保留了你的 1 项修改'}).waitFor();
+    await button('发布').click();
+    await bar.getByRole('status').filter({hasText:'这些在售模型的主线路不能用：unpriced-model（OpenAI 格式 / Fixture 没有启用的 Key 授权 gpt-5.6-sol）'}).waitFor();
+    assert.equal(published().length,count);
+    fixture.keys.find(row=>row.id==='fixture-openai-key-1').allowed_models=['gpt-6-astra','gpt-5.6-sol'];
+    await button('刷新').click();await page.locator('.btn-refresh:not([disabled])').waitFor();
+    await button('发布').click();await accept();await page.locator('.toast').filter({hasText:'已发布'}).waitFor();
+    assert.deepEqual(published().at(-1).body.models.map(row=>[row.id,row.visible]),[['fixture-model-9',true]]);
+    console.log('PASS: a model is shown only with a price in force and a primary route that serves; each refusal names the model before anything is sent');
+
     // 结算参数: the same refusal and reload for the face value and exchange rate.
     await nav('财务对账');
     const face=page.getByLabel('积分面值',{exact:true}),reason=page.getByLabel('变更原因',{exact:true});

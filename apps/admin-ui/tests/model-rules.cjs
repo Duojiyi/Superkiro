@@ -160,3 +160,19 @@ const status = load('status.ts');
 assert.deepEqual([{}, {visible: false}, {retired: true}, {visible: false, retired: true}].map(row => status.modelStateView(row).label), ['在售', '隐藏', '已下架', '已下架']);
 assert.equal(status.errorClassLabel('model_retired'), '模型已下架');assert.equal(status.errorClassLabel('no_route'), '无可用线路');assert.equal(status.errorClassLabel('something_new'), 'something_new');
 console.log('PASS model states 在售 / 隐藏 / 已下架 and refusal classes in words');
+
+// Live Key health, the provider's format, and a 测试 result in words.
+const soon = t + 600;
+assert.deepEqual([{health_state: 'healthy'}, {health_state: 'cooldown', cooldown_until: soon}, {health_state: 'cooldown'}, {health_state: 'cooldown', cooldown_until: t - 5},
+  {health_state: 'degraded'}, {health_state: 'unhealthy'}, {health_state: 'unhealthy', enabled: false}].map(key => status.keyAlert(key, t)),
+  ['healthy' && null, 'cooldown', 'cooldown', null, 'degraded', 'unhealthy', null], 'a cooldown whose time has passed is over; a disabled Key raises nothing');
+const unhealthy = status.keyStatusView({health_state: 'unhealthy', last_error: 'HTTP 401 invalid key'}, t);
+assert.deepEqual([unhealthy.label, unhealthy.tone, unhealthy.title], ['不可用', 'danger', '最近错误：HTTP 401 invalid key']);
+assert.equal(status.keyStatusView({health_state: 'cooldown', cooldown_until: t + 120}, t).label, '冷却中 · 2 分钟');
+assert.deepEqual([45, 89 * 60, 3 * 3600, 5 * 86400].map(status.cooldownText), ['1 分钟', '89 分钟', '约 3 小时', '约 5 天'], 'long cooldowns read in hours or days');
+assert.deepEqual([{format: 'open_ai'}, {format: 'anthropic'}, {api_type: 'openai'}, {}].map(provider => status.providerFormatLabel(provider)), ['OpenAI', 'Anthropic', 'OpenAI', null], 'format first, api_type from older data');
+assert.equal(status.probeView({ok: true, ttft_ms: 410.4, latency_ms: 620}).label, '成功 · 首字 410 ms');
+assert.equal(status.probeView({ok: true, ttft_ms: null, latency_ms: 620}).label, '成功 · 耗时 620 ms');
+assert.equal(status.probeView({ok: false, status: 529, error: 'HTTP 529 overloaded_error: Overloaded'}).label, '失败：HTTP 529 overloaded_error: Overloaded');
+assert.equal(status.probeView({ok: false, status: 502, error: null}).label, '失败：HTTP 502');
+console.log('PASS Key health (cooldown, degraded, unhealthy, over), format tags with the api_type fallback, 测试 results in words');

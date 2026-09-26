@@ -4,6 +4,7 @@ import {ask, confirmAction} from './components/confirm';
 import {IconClose} from './components/icons';
 import {toast} from './components/toast';
 import {InfoTip} from './components/ui';
+import Probe from './Probe';
 import {explainRefusal, isRefusal, type PublishOutcome} from './refusal';
 import {lossFacts, modelName, nameList, routeLosses, type RouteLosses} from './routes';
 
@@ -291,7 +292,8 @@ export default function ProviderKeyEditor({selectedKey, preset, knownModels = []
             <span className="mono">{model}</span>
             {fresh && <span className="tag tag-info">新</span>}
             {unlisted && <span className="tag" title="还没在“模型与定价”上架，客户看不到">未上架</span>}
-          </label>{listable && <button type="button" className="btn-text btn-small" onClick={() => onListModel!(provider.trim(), model)}>去上架</button>}</li>;
+          </label>{listable && <button type="button" className="btn-text btn-small" onClick={() => onListModel!(provider.trim(), model)}>去上架</button>}
+            {mode === 'edit' && <Probe providerId={provider.trim()} model={model} keyId={keyId.trim()} title="用已保存的这个 Key 发一次很小的真实请求（花费不到 1 分钱），不保存任何东西"/>}</li>;
         })}</ul> : <p className="muted">{offered.length ? '没有匹配的模型' : '还没有模型：点“获取模型列表”，或手动输入'}</p>}
         {manual && <label className="field"><span className="field-label">可用模型（每行一个）</span>
           <textarea aria-label="可用模型（每行一个）" rows={6} className="mono" value={models} onChange={event => setModels(event.target.value)}/></label>}

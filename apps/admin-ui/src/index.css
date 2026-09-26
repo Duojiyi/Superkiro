@@ -172,6 +172,12 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .model-checklist li {display: flex; align-items: center; gap: 4px; min-width: 0;}
 .model-checklist li > .check-field {flex: 1; min-width: 0;}
 .model-checklist li > .btn-text {height: 24px; font-size: 12px;}
+.model-checklist li {flex-wrap: wrap;}
+.model-checklist .probe .btn-text {height: 24px; font-size: 12px;}
+.config-table .probe {margin-top: 2px;}
+.config-table .probe .btn-text {height: 22px; padding: 0 4px; font-size: 12px;}
+.config-table .probe-result {max-width: 260px;}
+.key-error {max-width: 320px; font-size: 13px;}
 /* 上架模型 */
 .listing-drawer .check-row {display: flex;}
 .listing-grid {display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px 12px; align-items: end;}
@@ -555,12 +561,12 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .provider-name h3 {margin: 0; font-size: 15px;}
 .provider-name .mono {font-size: 12px; overflow-wrap: anywhere;}
 .provider-foot {display: flex; justify-content: flex-start;}
-.keys-table {min-width: 560px; table-layout: fixed;}
+.keys-table {min-width: 720px; table-layout: fixed;}
 /* The same column widths in every provider's card, so the tables line up. */
 .keys-table .col-key {width: 260px; overflow: hidden; text-overflow: ellipsis;}
 .keys-table .col-weight {width: 72px;}
 .keys-table .col-status {width: 140px;}
-.keys-table .col-actions {width: 64px;}
+.keys-table .col-actions {width: 112px;}
 .model-tags {display: inline-flex; align-items: center; flex-wrap: wrap; gap: 4px;}
 .switch {display: inline-flex; align-items: center; gap: 8px; height: 28px; font-size: 13px; color: var(--text-2);}
 .switch-track {position: relative; width: 36px; height: 20px; border-radius: 10px; background: #c3cad3; transition: background .15s;}

@@ -22,17 +22,42 @@ type Row = Record<string, unknown>;
 /** Seconds of cooldown left for a key, or 0. */
 export const keyCooldownLeft = (key: Row, nowSecs: number) => Math.max(0, Number(key.cooldown_until ?? 0) - nowSecs);
 
+/** A cooldown's length in words: minutes, then hours, then days. */
+export function cooldownText(secs: number): string {
+  const minutes = Math.max(1, Math.ceil(secs / 60));
+  return minutes < 90 ? `${minutes} 分钟` : minutes < 48 * 60 ? `约 ${Math.round(minutes / 60)} 小时` : `约 ${Math.round(minutes / 1440)} 天`;
+}
+
+/**
+ * Why a Key needs attention now, from its live health: cooling down (until a time, or for as long
+ * as the server says so), degraded or unhealthy. A disabled Key needs none.
+ */
+export function keyAlert(key: Row, nowSecs: number): 'cooldown' | 'degraded' | 'unhealthy' | null {
+  if (key.enabled === false) return null;
+  if (key.health_state === 'unhealthy') return 'unhealthy';
+  if (key.health_state === 'degraded') return 'degraded';
+  const until = Number(key.cooldown_until ?? 0);
+  return keyCooldownLeft(key, nowSecs) > 0 || (key.health_state === 'cooldown' && !(until > 0)) ? 'cooldown' : null;
+}
+
 export function keyStatusView(key: Row, nowSecs: number): StatusView {
   if (key.enabled === false) return {label: '已停用', tone: 'neutral'};
-  const cooldown = keyCooldownLeft(key, nowSecs);
-  if (key.health_state === 'cooldown' || cooldown > 0) {
-    if (cooldown <= 0) return {label: '冷却中', tone: 'warning'};
-    const minutes = Math.max(1, Math.ceil(cooldown / 60));
-    return {label: `冷却中 · ${minutes} 分钟`, tone: 'warning', title: `约 ${minutes} 分钟后恢复`};
+  const error = typeof key.last_error === 'string' && key.last_error ? `最近错误：${key.last_error}` : undefined;
+  const alert = keyAlert(key, nowSecs), cooldown = keyCooldownLeft(key, nowSecs);
+  if (alert === 'unhealthy') return {label: '不可用', tone: 'danger', title: error};
+  if (alert === 'degraded') return {label: '异常', tone: 'danger', title: error};
+  if (alert === 'cooldown') {
+    if (cooldown <= 0) return {label: '冷却中', tone: 'warning', title: error};
+    return {label: `冷却中 · ${cooldownText(cooldown)}`, tone: 'warning', title: [`${cooldownText(cooldown)}后恢复`, error].filter(Boolean).join('\n')};
   }
-  if (key.health_state === 'degraded') return {label: '异常', tone: 'danger'};
-  if (key.health_state === 'healthy') return {label: '正常', tone: 'success'};
+  if (key.health_state === 'healthy' || key.health_state === 'cooldown') return {label: '正常', tone: 'success'};
   return {label: '未检测', tone: 'outline'};
+}
+
+/** A provider's API format as shown: the server's `format` (open_ai, anthropic), or `api_type` in older data. */
+export function providerFormatLabel(provider: Row): string | null {
+  const format = typeof provider.format === 'string' ? provider.format : typeof provider.api_type === 'string' ? provider.api_type : '';
+  return !format ? null : ['open_ai', 'openai'].includes(format) ? 'OpenAI' : format === 'anthropic' ? 'Anthropic' : format;
 }
 
 export const TRACE_IN_PROGRESS = ['pending', 'running', 'in_progress'];

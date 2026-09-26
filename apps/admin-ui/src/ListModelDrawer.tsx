@@ -18,6 +18,7 @@ import {formatMicroPrice, priceToMicroPerMillion} from './pricing';
 import Probe from './Probe';
 import {loadOfficial, loadRates, saveOfficial, saveRates} from './remembered';
 import {authorizedModels, canRoute} from './routes';
+import {providerFormatLabel} from './status';
 import {parseTokenInput} from './tokens';
 
 type Row = Record<string, unknown>;
@@ -204,7 +205,7 @@ export default function ListModelDrawer({preset, config, providers, providerKeys
             <label className="field"><span className="field-label">供应商</span>
               <select aria-label="供应商" value={providerId} onChange={event => setProviderId(event.target.value)}>
                 {!provider && <option value={providerId}>{providerId ? `${providerId}（未找到）` : '请选择'}</option>}
-                {providers.map(item => <option key={String(item.id)} value={String(item.id)}>{String(item.name ?? item.id)}{item.api_type === 'openai' ? ' · OpenAI' : ''}{item.enabled === false ? '（已停用）' : ''}</option>)}
+                {providers.map(item => <option key={String(item.id)} value={String(item.id)}>{String(item.name ?? item.id)}{providerFormatLabel(item) === 'OpenAI' ? ' · OpenAI' : ''}{item.enabled === false ? '（已停用）' : ''}</option>)}
               </select></label>
             <label className="field"><span className="field-label">上游模型<InfoTip text="只能选这个供应商的 Key 已授权的模型；也可直接输入"/></span>
               <input aria-label="上游模型" list="listing-upstream-models" placeholder={choices.length ? '选择或输入' : '这个供应商还没有授权模型'} value={targetModel} onChange={event => setTargetModel(event.target.value)}/>

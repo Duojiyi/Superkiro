@@ -544,6 +544,11 @@ export class AdminApiClient {
     return this.request('/api/v1/admin/providers/keys/probe', {method: 'POST', body: JSON.stringify(payload)});
   }
 
+  /** Clears a Key's cooldown and unhealthy state: it takes requests again at once. */
+  async resetKey(providerId: string, keyId: string): Promise<{success: boolean}> {
+    return this.request('/api/v1/admin/providers/keys/reset', {method: 'POST', body: JSON.stringify({provider_id: providerId, key_id: keyId})});
+  }
+
   /** Refused (409) while it is the only route of a model customers see. */
   async deleteKey(providerId: string, keyId: string): Promise<{success: boolean}> {
     return this.request('/api/v1/admin/providers/keys/delete', {method: 'POST', body: JSON.stringify({provider_id: providerId, key_id: keyId})});

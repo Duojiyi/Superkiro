@@ -4,6 +4,7 @@
 // group's price table; it is staged in the draft here and published with the bar.
 import {useState} from 'react';
 import {Tag} from './components/ui';
+import Probe from './Probe';
 import {buildRouteCost, COST_FIELDS, costText, routeCost, routeCostModel, type CostSource} from './priceChange';
 import {authorizedModels, targetProblem, targetsOf, targetState, type Target} from './routes';
 
@@ -74,7 +75,8 @@ export default function RouteEditor({model, rateCardId, versions, staged, provid
     rateCardId={rateCardId} versions={versions} staged={staged} nowSecs={nowSecs} taken={taken} onStage={onStage}/>;
   const check = (target: Target) => {
     const state = targetState(target, data);
-    return state.ok ? <Tag tone="success">可用</Tag> : <Tag tone="warning" title={targetProblem(state, providers)}>{targetProblem(state, providers)}</Tag>;
+    return <>{state.ok ? <Tag tone="success">可用</Tag> : <Tag tone="warning" title={targetProblem(state, providers)}>{targetProblem(state, providers)}</Tag>}
+      <Probe providerId={target.provider_id} model={target.target_model} disabled={!state.ok}/></>;
   };
   const set = (index: number, patch: Partial<Target>) => onChain(backups.map((backup, i) => i === index ? {...backup, ...patch} : backup));
   const move = (index: number, step: number) => {

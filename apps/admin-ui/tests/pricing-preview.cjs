@@ -170,7 +170,7 @@ const Editor = load('CommercialEditor.tsx', {'./tokens': tokens, './api': {admin
   './components/confirm': {confirmAction: async () => true}, './components/toast': {toast: {success() {}, info() {}, error() {}}},
   './components/modal': {Drawer: 'Drawer', Modal: 'Modal'}, './components/icons': {IconImage: 'IconImage', IconSpark: 'IconSpark', IconTool: 'IconTool'},
   './components/ui': {InfoTip: 'InfoTip', StatusBadge: 'StatusBadge', Tag: 'Tag', TopbarActions: 'TopbarActions'}, './status': load('status.ts'), './PriceDrawer': {default: 'PriceDrawer'}, './PriceVersions': {default: 'PriceVersions'}, './ListModelDrawer': {default: 'ListModelDrawer'},
-  './RouteEditor': {default: 'RouteEditor'}, './RouteSwitchDrawer': {default: 'RouteSwitchDrawer'}, './BulkPriceDrawer': {default: 'BulkPriceDrawer'}, './components/menu': {Menu: 'Menu'},
+  './RouteEditor': {default: 'RouteEditor'}, './RouteSwitchDrawer': {default: 'RouteSwitchDrawer'}, './BulkPriceDrawer': {default: 'BulkPriceDrawer'}, './Probe': {default: 'Probe'}, './components/menu': {Menu: 'Menu'},
   './listing': load('listing.ts', {'./priceChange': change, './routes': routes}),
   react, 'react/jsx-runtime': runtime}).default;
 const providers = [{id: 'p', name: '供应商 P'}, {id: 'openai', name: 'Astra', api_type: 'openai'}];

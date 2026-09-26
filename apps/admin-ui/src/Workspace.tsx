@@ -17,7 +17,7 @@ import SecurityPage from './pages/Security';
 import TracesPage from './pages/Traces';
 import {publishFailure, type PublishOutcome} from './refusal';
 import {brokenRoutes, modelName} from './routes';
-import {keyCooldownLeft} from './status';
+import {keyAlert} from './status';
 import type {ErrorAction, Intent, RefreshOptions, Row, Tab} from './types';
 
 const NAV: Array<{group: string; items: Array<{id: Tab; label: string}>}> = [
@@ -245,15 +245,14 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
   const nowSecs = Date.now() / 1000;
   const failedLastHour = data.traces.filter(trace => trace.status === 'error' && Number(trace.ts) > nowSecs - 3600).length;
   // Keys of a disabled provider serve nothing, so they raise no badge.
-  const keyAlerts = data.providerKeys.filter(key => key.enabled !== false && data.providers.find(provider => provider.id === key.provider_id)?.enabled !== false
-    && (keyCooldownLeft(key, nowSecs) > 0 || key.health_state === 'degraded')).length;
+  const keyAlerts = data.providerKeys.filter(key => data.providers.find(provider => provider.id === key.provider_id)?.enabled !== false && keyAlert(key, nowSecs)).length;
   // Shown models whose primary route cannot serve (known only once the providers are loaded).
   const broken = providersLoaded ? brokenRoutes(data.models, {providers: data.providers, keys: data.providerKeys}) : [];
   const down = broken.filter(entry => entry.route.down).length;
   const badges: Partial<Record<Tab, {count: number; tone: 'danger' | 'warning'; text: string}>> = {
     ...(failedLastHour ? {traces: {count: failedLastHour, tone: 'danger' as const, text: `近 1 小时 ${failedLastHour} 次失败`}} : {}),
     ...(broken.length ? {models: {count: broken.length, tone: down ? 'danger' as const : 'warning' as const, text: down ? `${down} 个在售模型无可用线路` : `${broken.length} 个在售模型的主线路不可用`}} : {}),
-    ...(keyAlerts ? {providers: {count: keyAlerts, tone: 'warning' as const, text: `${keyAlerts} 个 Key 冷却中或异常`}} : {}),
+    ...(keyAlerts ? {providers: {count: keyAlerts, tone: 'warning' as const, text: `${keyAlerts} 个 Key 冷却中、异常或不可用`}} : {}),
   };
   const staleSections = loadErrors.filter(error => error.stale).map(error => error.section);
 

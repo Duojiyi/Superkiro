@@ -1,14 +1,16 @@
-// 供应商与 Key: each provider with an on/off switch and its keys; the key editor opens only
-// when a key is being edited or added.
+// 供应商与 Key: each provider with an on/off switch and its keys, each Key's live health and last
+// error (恢复 puts a cooling or failing Key back to work); the key editor opens only when a key
+// is being edited or added.
 import {useEffect, useState, type MutableRefObject} from 'react';
 import {adminApi} from '../api';
 import {ask, confirmAction} from '../components/confirm';
 import {toast} from '../components/toast';
 import {ListState, StatusBadge, Switch, Tag, TopbarActions} from '../components/ui';
+import {formatFullDateTime, formatRelative} from '../format';
 import ProviderKeyEditor from '../ProviderKeyEditor';
-import type {PublishOutcome} from '../refusal';
+import {explainRefusal, isRefusal, type PublishOutcome} from '../refusal';
 import {lossFacts, modelName, nameList, routeLosses} from '../routes';
-import {keyStatusView} from '../status';
+import {keyAlert, keyStatusView, providerFormatLabel} from '../status';
 import type {Refresh, ReportError, Row, WriteGuards} from '../types';
 
 /** Which key the editor shows: none, a new provider, a new key of a provider, or an existing key. */
@@ -50,6 +52,7 @@ export default function ProvidersPage({providers, providerKeys, models, groups =
 }) {
   const {writing} = guards;
   const [switching, setSwitching] = useState<string | null>(null);
+  const [resetting, setResetting] = useState<string | null>(null);
   const [scrollToken, setScrollToken] = useState(0);
   const nowSecs = Date.now() / 1000;
   useEffect(() => {if (scrollToken) document.getElementById('key-editor')?.scrollIntoView({behavior: 'smooth', block: 'start'});}, [scrollToken]);
@@ -110,6 +113,28 @@ export default function ProvidersPage({providers, providerKeys, models, groups =
     } finally {writing.current = false; setSwitching(null);}
   };
 
+  // 恢复: clears a Key's cooldown or failure; the server puts it back into rotation at once.
+  const reset = async (key: Row) => {
+    const id = String(key.id), providerId = String(key.provider_id);
+    if (writing.current || loading || failed || resetting) return;
+    const confirmed = await confirmAction({
+      title: `恢复 Key ${id}？`,
+      facts: [`现在：${keyStatusView(key, Date.now() / 1000).label}`, ...(typeof key.last_error === 'string' && key.last_error ? [`最近错误：${key.last_error}`] : [])],
+      consequence: '清除冷却和异常状态，这个 Key 马上重新接请求；上游仍有问题的话，它会再次进入冷却。',
+      confirmLabel: '恢复',
+    });
+    if (!confirmed || writing.current) return;
+    writing.current = true; setResetting(id); reportError('');
+    try {
+      const response = await adminApi.resetKey(providerId, id);
+      if (!response.success) throw new Error('服务端未确认恢复');
+      toast.success(`已恢复 Key ${id}`);
+      await refresh();
+    } catch (error) {
+      reportError(isRefusal(error) ? `没能恢复 Key ${id}：${explainRefusal(errorText(error))}` : `恢复结果未确认：${errorText(error)}。请刷新核对 Key 状态后再操作。`);
+    } finally {writing.current = false; setResetting(null);}
+  };
+
   const nextKeyId = (providerId: string) => {
     const taken = new Set(providerKeys.filter(key => key.provider_id === providerId).map(key => String(key.id)));
     let index = 1;
@@ -129,14 +154,14 @@ export default function ProvidersPage({providers, providerKeys, models, groups =
           <div className="provider-name">
             <h3>{String(provider.name || id)}</h3>
             <span className="mono muted">{String(provider.base_url || '地址未配置')}</span>
-            {typeof provider.api_type === 'string' && <Tag>{provider.api_type === 'openai' ? 'OpenAI' : provider.api_type === 'anthropic' ? 'Anthropic' : provider.api_type}</Tag>}
+            {providerFormatLabel(provider) && <Tag>{providerFormatLabel(provider)}</Tag>}
           </div>
           <Switch checked={enabled} label={`启用 ${String(provider.name || id)}`} busy={switching === id}
             disabled={!!switching || loading || failed} title={failed ? '供应商列表没有刷新成功，暂不能操作' : undefined}
             onChange={next => void toggle(provider, next)}/>
         </div>
         {keys.length ? <div className="table-scroll"><table className="table keys-table">
-          <thead><tr><th className="col-key">Key</th><th>模型</th><th className="num col-weight">权重</th><th className="col-status">状态</th><th className="col-actions"><span className="sr-only">操作</span></th></tr></thead>
+          <thead><tr><th className="col-key">Key</th><th>模型</th><th className="num col-weight">权重</th><th className="col-status">状态</th><th>最近错误</th><th className="col-actions"><span className="sr-only">操作</span></th></tr></thead>
           <tbody>{keys.map(key => {
             const active = editing?.providerId === id && editing?.keyId === key.id;
             return <tr key={String(key.id)} className={active ? 'is-selected' : undefined}>
@@ -144,7 +169,15 @@ export default function ProvidersPage({providers, providerKeys, models, groups =
               <td><ModelTags models={key.allowed_models}/></td>
               <td className="num">{String(key.weight ?? 1)}</td>
               <td className="col-status"><StatusBadge view={keyStatusView(key, nowSecs)}/></td>
-              <td className="col-actions"><button type="button" className="btn-text" onClick={() => void edit({providerId: id, keyId: String(key.id)})}>编辑</button></td>
+              <td>{typeof key.last_error === 'string' && key.last_error
+                ? <span className="clip clip-reason key-error" title={`${key.last_error}${typeof key.last_error_at === 'number' ? `\n${formatFullDateTime(key.last_error_at)}` : ''}`}>
+                  {typeof key.last_error_at === 'number' && <span className="muted">{formatRelative(key.last_error_at)} · </span>}{key.last_error}</span>
+                : <span className="muted">—</span>}</td>
+              <td className="col-actions"><span className="row-actions">
+                {keyAlert(key, nowSecs) && <button type="button" className="btn-text" disabled={!!resetting || loading || failed} title="清除冷却或异常状态，马上重新接请求"
+                  onClick={() => void reset(key)}>{resetting === String(key.id) ? '恢复中…' : '恢复'}</button>}
+                <button type="button" className="btn-text" onClick={() => void edit({providerId: id, keyId: String(key.id)})}>编辑</button>
+              </span></td>
             </tr>;
           })}</tbody>
         </table></div> : <p className="muted">还没有 Key</p>}

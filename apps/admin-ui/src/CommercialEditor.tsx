@@ -13,13 +13,14 @@ import PriceDrawer, { type PublishOutcome } from './PriceDrawer';
 import PriceVersions from './PriceVersions';
 import BulkPriceDrawer from './BulkPriceDrawer';
 import ListModelDrawer from './ListModelDrawer';
+import Probe from './Probe';
 import { defaultModel, groupModels, reorder } from './listing';
 import RouteEditor from './RouteEditor';
 import RouteSwitchDrawer, { type SwitchedRoute } from './RouteSwitchDrawer';
 import { rebaseDraft } from './rebase';
 import { publishFailure } from './refusal';
 import { authorizedModels, canRoute, isLive, modelName, modelRoute, nameList, targetProblem, targetsOf, targetState } from './routes';
-import { modelStateView } from './status';
+import { modelStateView, providerFormatLabel } from './status';
 
 type Row = Record<string, unknown>;
 
@@ -230,6 +231,21 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
       if (Array.isArray(update.versions)) update.versions = timeDraftVersions(update.versions, config.versions, later);
       const timed: Row[] = Array.isArray(update.versions) ? update.versions : [];
       const atOnce = timed.filter(row => row.effective_from_secs === 0).length, delayed = timed.filter(row => row.effective_from_secs === later).length;
+      // What customers will see must work the moment it is published: a price in force (or one
+      // starting now in this publication), and a primary route that can serve.
+      if (kind === 'models' && Array.isArray(update.models)) {
+        const sent = (update.models as Row[]).filter(isLive), now = adminApi.serverNowMs / 1000;
+        const label = (row: Row) => modelName(row, config.models, config.groups);
+        const unpriced = sent.filter(row => {
+          const before = config.models.find(model => model.id === row.id);
+          if (before && isLive(before) && ['exposed_model_id', 'target_model', 'group_id'].every(field => before[field] === row[field])) return false;
+          const rateCardId = config.groups.find(group => group.id === row.group_id)?.rate_card_id, names = [row.exposed_model_id, row.target_model];
+          return !currentVersion(config.versions, rateCardId, names, now) && !timed.some(version => version.rate_card_id === rateCardId && names.includes(version.model) && version.effective_from_secs === 0);
+        });
+        if (unpriced.length) throw new Error(`这些模型还没有生效中的价格，不能对客户显示：${nameList(unpriced.map(label))}。先给它们调价，或保持隐藏`);
+        const stranded = routesKnown ? sent.map(row => ({row, state: targetState(targetsOf(row)[0], {providers, keys: providerKeys})})).filter(entry => !entry.state.ok) : [];
+        if (stranded.length) throw new Error(`这些在售模型的主线路不能用：${nameList(stranded.map(entry => `${label(entry.row)}（${targetProblem(entry.state, providers)}）`), 4)}。先在“供应商与 Key”里处理、在“线路”里换一条，或先隐藏`);
+      }
       const confirmed = await confirmAction({
         title: changes ? `发布 ${changes} 项修改？` : `发布${kind === 'groups' ? '分组' : '模型与价格'}配置？`,
         facts: [
@@ -374,7 +390,7 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
       const value = String(selectedRow[field] ?? '');
       return <select aria-label="供应商" value={value} onChange={event => updateField(field, event.target.value)}>
         {!providers.some(provider => provider.id === value) && <option value={value}>{value ? `${value}（未找到）` : '请选择'}</option>}
-        {providers.map(provider => <option key={String(provider.id)} value={String(provider.id)}>{String(provider.name ?? provider.id)}{provider.api_type === 'openai' ? ' · OpenAI' : ''}{provider.enabled === false ? '（已停用）' : ''}</option>)}
+        {providers.map(provider => <option key={String(provider.id)} value={String(provider.id)}>{String(provider.name ?? provider.id)}{providerFormatLabel(provider) === 'OpenAI' ? ' · OpenAI' : ''}{provider.enabled === false ? '（已停用）' : ''}</option>)}
       </select>;
     }
     if (field === 'target_model') {
@@ -474,7 +490,8 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
                     {backups.length > 0 && <Tag tone="info" title={backups.map((backup, i) => `备 ${i + 1}：${backup.provider_id} / ${backup.target_model}`).join('\n')}>主 + {backups.length} 备</Tag>}
                     {route && !route.primary.ok && (route.down
                       ? <Tag tone={isLive(row) ? 'danger' : 'neutral'} title={targetProblem(route.primary, providers)}>无可用线路</Tag>
-                      : <Tag tone="warning" title={`${targetProblem(route.primary, providers)}；正由备用线路服务`}>主线路不可用</Tag>)}</span>}</td>,
+                      : <Tag tone="warning" title={`${targetProblem(route.primary, providers)}；正由备用线路服务`}>主线路不可用</Tag>)}</span>}
+                  {published && <Probe providerId={String(row.target_provider_id ?? '')} model={String(row.target_model ?? '')} title="通过主线路发一次很小的真实请求（花费不到 1 分钱），不保存任何东西"/>}</td>,
                 <td key="w" className="num" title={`${formatTokens(row.context_window)} / ${formatTokens(row.max_output)}`}>{typeof row.context_window === 'number' ? formatTokenCount(row.context_window) : '—'} / {typeof row.max_output === 'number' ? formatTokenCount(row.max_output) : '—'}</td>,
                 <td key="a"><span className="capabilities">{capability(row)}</span></td>,
                 <td key="p" className="num" title={price ? `版本 ${String(price.id)}（积分 / 百万 Tokens）` : '没有生效中的价格'}>{price && price.pricing_mode === 'fixed'
