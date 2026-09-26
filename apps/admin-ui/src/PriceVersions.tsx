@@ -5,7 +5,7 @@
 import {useState} from 'react';
 import {IdCell, StatusBadge} from './components/ui';
 import {formatCount, formatDateTime, formatFullDateTime} from './format';
-import {COST_FIELDS, creditsText, PRICE_FIELDS} from './priceChange';
+import {costText, creditsText, PRICE_FIELDS, routeCostOf} from './priceChange';
 import {priceVersionView} from './status';
 
 type Row = Record<string, unknown>;
@@ -16,12 +16,6 @@ function priceCells(version: Row) {
   const text = version.pricing_mode === 'per_call' ? `每次调用扣 ${creditsText(version.per_call_credit) ?? '?'} 积分（不按 Tokens）`
     : version.pricing_mode === 'cost_plus' ? '成本加成（按采购价计费）' : `未知计费方式：${String(version.pricing_mode ?? '—')}`;
   return [<td key="mode" colSpan={PRICE_FIELDS.length} className="muted">{text}</td>];
-}
-
-function costText(version: Row): string {
-  if (!['USD', 'CNY'].includes(String(version.currency))) return '—';
-  const values = COST_FIELDS.map(([field]) => typeof version[field] === 'number' && Number.isFinite(version[field]) && Number(version[field]) >= 0 ? String(version[field]) : '—');
-  return `${String(version.currency)} ${values.join(' / ')}`;
 }
 
 /**
@@ -37,10 +31,12 @@ export function rateCardUse(cardId: unknown, groups: Row[], cards?: CardRow[] | 
   return {groups: users, cards: count, internal};
 }
 
-export default function PriceVersions({versions, rateCards = [], groups = [], cards, faceValue, nowSecs}: {
+export default function PriceVersions({versions, rateCards = [], groups = [], cards, faceValue, providers = [], nowSecs}: {
   versions: Row[];
   rateCards?: Row[];
   groups?: Row[];
+  /** To tell a route's procurement cost (`<provider>/<upstream model>`) from a customer price. */
+  providers?: Row[];
   /** Current cards, to say how many use each table; null or absent when they are not loaded. */
   cards?: CardRow[] | null;
   /** Yuan per credit (积分面值). */
@@ -64,16 +60,19 @@ export default function PriceVersions({versions, rateCards = [], groups = [], ca
     return <div className="table-scroll"><table className="table price-history">
       <thead><tr><th>模型</th>{PRICE_FIELDS.map(([field, label]) => <th key={field} className="num">{label}</th>)}<th className="num">倍率</th><th>采购价 / 百万</th><th>生效</th><th className="col-status">状态</th><th>版本</th></tr></thead>
       <tbody>
-        {shown.map(({version, view}) => <tr key={String(version.id)} className={view.label === '已被替代' ? 'is-muted' : undefined}>
-          <td className="mono">{version.model === '*' ? <span title="这个价格表里没有单独定价的模型都按这一行扣费">*（其余所有模型）</span> : String(version.model ?? '—')}</td>
-          {priceCells(version)}
-          <td className="num">{typeof version.margin_multiplier === 'number' && Number.isFinite(version.margin_multiplier) ? String(version.margin_multiplier) : '—'}</td>
+        {shown.map(({version, view}) => {
+          const route = routeCostOf(version, providers);
+          return <tr key={String(version.id)} className={view.label === '已被替代' ? 'is-muted' : undefined}>
+          <td className="mono">{route ? <span title="这条线路（供应商 + 上游模型）的采购成本：只用来算成本和毛利，不是客户价格"><span className="tag tag-info">线路采购价</span> {String(route.provider.name ?? route.provider.id)} / {route.target}</span>
+            : version.model === '*' ? <span title="这个价格表里没有单独定价的模型都按这一行扣费">*（其余所有模型）</span> : String(version.model ?? '—')}</td>
+          {route ? <td colSpan={PRICE_FIELDS.length} className="muted">不用于扣费</td> : priceCells(version)}
+          <td className="num">{!route && typeof version.margin_multiplier === 'number' && Number.isFinite(version.margin_multiplier) ? String(version.margin_multiplier) : '—'}</td>
           <td className="nowrap">{costText(version)}</td>
           <td title={Number.isFinite(Number(version.effective_from_secs)) && version.effective_from_secs !== null ? formatFullDateTime(Number(version.effective_from_secs)) : undefined}>
             {typeof version.effective_from_secs === 'number' && Number.isSafeInteger(version.effective_from_secs) ? formatDateTime(version.effective_from_secs) : '未提供有效时间'}</td>
           <td className="col-status"><StatusBadge view={view}/></td>
           <td><IdCell value={version.id} kind="generic"/></td>
-        </tr>)}
+        </tr>;})}
         {!shown.length && <tr><td colSpan={PRICE_FIELDS.length + 6} className="muted">没有生效中或已排期的版本</td></tr>}
       </tbody>
     </table></div>;

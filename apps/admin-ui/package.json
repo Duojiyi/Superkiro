@@ -13,7 +13,7 @@
     "test:iteration": "node tests/iteration.cjs",
     "test:browser": "node tests/auth-gate.cjs",
     "test:usability": "node tests/public-login.cjs && node tests/usability.cjs",
-    "test:experience": "node tests/admin-experience.cjs && node tests/editor-experience.cjs && node tests/model-listing.cjs && node tests/route-health.cjs && node tests/publishing.cjs"
+    "test:experience": "node tests/admin-experience.cjs && node tests/editor-experience.cjs && node tests/model-listing.cjs && node tests/route-health.cjs && node tests/publishing.cjs && node tests/model-routes.cjs"
   },
   "dependencies": {
     "react": "^18.3.1",

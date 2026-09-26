@@ -171,6 +171,31 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .listing-official[open] {display: flex; flex-direction: column; gap: 8px; align-items: flex-start;}
 .listing-official .listing-grid {width: 100%;}
 .listing-drawer .price-choice {display: flex; flex-direction: column; align-items: flex-start; gap: 8px;}
+/* 线路: the primary route and its backups, each with its Key check and procurement cost. */
+.route-editor {display: flex; flex-direction: column; gap: 10px; padding-top: 12px; border-top: 1px solid var(--border-subtle);}
+.route-editor h4 {margin: 0;}
+.route-editor h4 .muted {margin-left: 6px; font-size: 12px; font-weight: 400;}
+.route-list {display: flex; flex-direction: column; align-items: flex-start; gap: 8px; min-width: 0;}
+.route-primary, .route-row {display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; min-width: 0;}
+.route-backups {display: flex; flex-direction: column; gap: 8px; width: 100%; margin: 0; padding: 0; list-style: none;}
+.route-row {padding: 8px 10px; border: 1px solid var(--border-subtle); border-radius: 6px;}
+.route-row select {width: 180px;}
+.route-row input {width: 200px;}
+.route-index {font-size: 12px; font-weight: 600; color: var(--text-2);}
+.route-actions {display: inline-flex; align-items: center; gap: 2px; margin-left: auto;}
+.route-cost {display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; flex-basis: 100%; font-size: 12px;}
+.route-cost-form {display: flex; align-items: flex-end; flex-wrap: wrap; gap: 6px 8px; flex-basis: 100%;}
+.route-cost-form .field {width: 96px;}
+.route-cost-form input, .route-cost-form select {width: 100%; min-height: 30px;}
+/* 切换线路 and its 切回 */
+.drawer.switch-drawer {width: min(980px, 100vw);}
+.switch-preview td {white-space: normal; vertical-align: top;}
+.switch-preview .tag {height: auto; min-height: 20px; white-space: normal;}
+.switch-preview input {width: 100%; min-width: 150px;}
+.switch-cost {display: flex; flex-direction: column; align-items: flex-start; gap: 4px; font-size: 12px;}
+.switch-cost-form {display: flex; flex-wrap: wrap; gap: 4px;}
+.switch-cost-form input, .switch-cost-form select {width: 76px; min-width: 0; min-height: 30px;}
+.switch-note {display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px;}
 /* 测试: one tiny real request, and what it found. */
 .probe {display: inline-flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; min-width: 0;}
 .probe-result {font-size: 12px; white-space: normal; overflow-wrap: anywhere;}

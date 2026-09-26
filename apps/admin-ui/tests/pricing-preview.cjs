@@ -144,6 +144,12 @@ assert(text(blocks[1]).includes('验收专用价格表（客户不使用）') &&
 assert(text(blocks[1]).includes('*（其余所有模型）') && text(blocks[1]).includes('每次调用扣 0.001 积分'), text(blocks[1]));
 assert(!text(blocks[0]).includes('0.001'), 'the acceptance price is not in the customer table');
 assert(text(table).includes('1 积分 = ¥0.03（积分面值，见财务对账）'));
+// A route's procurement cost (<provider>/<upstream model>) is labelled as such, never as a price customers pay.
+states = []; cursor = 0;
+const withRoute = Versions({...tablesConfig, providers: [{id: 'openai', name: 'Astra'}], versions: [...tablesConfig.versions,
+  {id: 'route-cost', model: 'openai/gpt-6-astra', rate_card_id: 'r', pricing_mode: 'fixed', effective_from_secs: now - 10, fixed_input_credit_per_m: 0, fixed_output_credit_per_m: 0, fixed_cache_creation_credit_per_m: 0, fixed_cache_read_credit_per_m: 0, currency: 'CNY', input_price_per_m: 1, output_price_per_m: 2, cache_creation_price_per_m: 3, cache_read_price_per_m: 4, margin_multiplier: 1}]});
+const routeRow = nodes(withRoute).find(node => node.type === 'tr' && text(node).includes('线路采购价'));
+assert(routeRow && text(routeRow).includes('Astra / gpt-6-astra') && text(routeRow).includes('不用于扣费') && text(routeRow).includes('CNY 1 / 2 / 3 / 4'), routeRow && text(routeRow));
 const {rateCardUse} = load('PriceVersions.tsx', {'./components/ui': {}, './format': display, './priceChange': change, './status': {}, react, 'react/jsx-runtime': runtime});
 assert.equal(rateCardUse('r', tablesConfig.groups, []).internal, '客户不使用的价格表（分组还没有卡密）');
 assert.equal(rateCardUse('r', tablesConfig.groups, null).internal, false, 'unknown cards never fold a table');
@@ -164,6 +170,7 @@ const Editor = load('CommercialEditor.tsx', {'./tokens': tokens, './api': {admin
   './components/confirm': {confirmAction: async () => true}, './components/toast': {toast: {success() {}, info() {}, error() {}}},
   './components/modal': {Drawer: 'Drawer', Modal: 'Modal'}, './components/icons': {IconImage: 'IconImage', IconSpark: 'IconSpark', IconTool: 'IconTool'},
   './components/ui': {InfoTip: 'InfoTip', Tag: 'Tag', TopbarActions: 'TopbarActions'}, './PriceDrawer': {default: 'PriceDrawer'}, './PriceVersions': {default: 'PriceVersions'}, './ListModelDrawer': {default: 'ListModelDrawer'},
+  './RouteEditor': {default: 'RouteEditor'}, './RouteSwitchDrawer': {default: 'RouteSwitchDrawer'},
   react, 'react/jsx-runtime': runtime}).default;
 const providers = [{id: 'p', name: '供应商 P'}, {id: 'openai', name: 'Astra', api_type: 'openai'}];
 const providerKeys = [{id: 'k', provider_id: 'openai', allowed_models: ['gpt-6-astra', 'gpt-5.6-sol']}, {id: 'k2', provider_id: 'p', allowed_models: ['upstream']}];

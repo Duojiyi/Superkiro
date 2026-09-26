@@ -94,6 +94,17 @@ export function lossFacts(losses: RouteLosses, name: (model: Row) => string): st
   ];
 }
 
+/**
+ * 切换线路: the model's route fields with `target` as its primary; the old primary becomes the
+ * first backup when kept (so switching back is one step), and at most 8 backups remain.
+ */
+export function switchedRoute(model: Row, target: Target, keepOld: boolean): Row {
+  const [old, ...backups] = targetsOf(model);
+  const same = (a: Target, b: Target) => a.provider_id === b.provider_id && a.target_model === b.target_model;
+  const rest = backups.filter(backup => !same(backup, target) && !same(backup, old));
+  return {target_provider_id: target.provider_id, target_model: target.target_model, fallback_chain: (keepOld && !same(old, target) ? [old, ...rest] : rest).slice(0, 8)};
+}
+
 /** A model as lists name it: its ID, and its group when another group has the same ID. */
 export function modelName(model: Row, models: Row[], groups: Row[]): string {
   const id = String(model.exposed_model_id ?? model.id);

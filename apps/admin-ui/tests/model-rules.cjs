@@ -94,3 +94,38 @@ const whole = rebaseDraft({models: base, versions: []}, {models: edited.slice(0,
 assert.deepEqual(plain(whole.draft.versions), [{id: 'v-new'}], 'a new price version whose ID has since been used is dropped and reported');
 assert.equal(whole.skipped.at(-1).reason, 'exists');
 console.log('PASS rebase: edits reapplied onto the latest configuration where untouched, conflicts, deletions and taken IDs reported');
+
+// 线路采购价: what a route costs, found as billing finds it; a staged cost is never a customer price.
+const pricing = load('pricing.ts');
+const change = load('priceChange.ts', {'./pricing': pricing});
+const t = Math.floor(Date.now() / 1000);
+const priced = [
+  {id: 'v-model', rate_card_id: 'r', model: 'claude-x', pricing_mode: 'fixed', effective_from_secs: t - 50, currency: 'USD', input_price_per_m: 3, output_price_per_m: 15, cache_creation_price_per_m: 3.75, cache_read_price_per_m: 0.3},
+  {id: 'v-route', rate_card_id: 'r', model: 'b/claude-x', pricing_mode: 'fixed', effective_from_secs: t - 10, currency: 'CNY', input_price_per_m: 1, output_price_per_m: 5, cache_creation_price_per_m: 1.25, cache_read_price_per_m: 0.1},
+  {id: 'v-later', rate_card_id: 'r', model: 'c/other', pricing_mode: 'fixed', effective_from_secs: t + 600},
+  {id: 'v-star', rate_card_id: 'star', model: '*', pricing_mode: 'per_call', effective_from_secs: t - 10},
+];
+const mapped = {id: 'm', exposed_model_id: 'claude-x', target_provider_id: 'a', target_model: 'claude-x'};
+const cost = (rateCard, provider, target, row = mapped) => {const found = change.routeCost(priced, rateCard, {provider_id: provider, target_model: target}, row, t); return [found.source, found.version?.id ?? null];};
+assert.deepEqual(cost('r', 'b', 'claude-x'), ['route', 'v-route'], 'a route of its own comes first');
+assert.deepEqual(cost('r', 'a', 'claude-x'), ['upstream', 'v-model'], 'then the upstream model name');
+assert.deepEqual(cost('r', 'c', 'other'), [null, null], 'a cost not in force yet does not count');
+assert.deepEqual(cost('star', 'c', 'other'), ['wildcard', 'v-star']);
+assert.deepEqual(cost('r', 'a', 'upstream-y', {...mapped, exposed_model_id: 'claude-x', target_model: 'upstream-y'}), ['model', 'v-model'], "the model's own price version, for its primary route");
+assert.equal(change.costText(priced[1]), 'CNY 1 / 5 / 1.25 / 0.1');
+const staged = change.buildRouteCost({costs: {input_price_per_m: '1', output_price_per_m: '5', cache_creation_price_per_m: '1.25', cache_read_price_per_m: '0.1'}, currency: 'CNY'},
+  {providerId: 'b', targetModel: 'claude-x', rateCardId: 'r', nowSecs: t, taken: []});
+assert.equal(staged.model, 'b/claude-x');assert.equal(staged.effective_from_secs, 0);assert.equal(staged.margin_multiplier, 1);
+for (const field of ['fixed_input_credit_per_m', 'fixed_output_credit_per_m', 'fixed_cache_creation_credit_per_m', 'fixed_cache_read_credit_per_m', 'per_call_credit']) assert.equal(staged[field], 0, `${field}: never charged`);
+assert.throws(() => change.buildRouteCost({costs: {}, currency: 'CNY'}, {providerId: 'b', targetModel: 'x', rateCardId: 'r', nowSecs: t, taken: []}), /采购价需在/);
+assert.deepEqual(plain(change.routeCostOf(priced[1], [{id: 'b', name: 'B'}, {id: 'b2'}])), {provider: {id: 'b', name: 'B'}, target: 'claude-x'});
+assert.equal(change.routeCostOf(priced[0], [{id: 'b'}]), null, 'a customer price is not a route cost');
+// Marked 0: at once for a first version of that model in its table, otherwise at the later time.
+assert.deepEqual(plain(change.timeDraftVersions([{...staged}, {...staged, id: 'x', model: 'new/route'}, {id: 'timed', rate_card_id: 'r', model: 'b/claude-x', effective_from_secs: t + 99}], priced, t + 120)
+  .map(version => [version.id, version.effective_from_secs])), [[staged.id, t + 120], ['x', 0], ['timed', t + 99]]);
+// 切换线路: the new primary, the old one kept as the first backup (or not), no duplicates, at most 8.
+const switched = routes.switchedRoute({target_provider_id: 'a', target_model: 'm1', fallback_chain: [{provider_id: 'b', target_model: 'm1'}, {provider_id: 'c', target_model: 'm1'}]}, {provider_id: 'b', target_model: 'm1'}, true);
+assert.deepEqual(plain(switched), {target_provider_id: 'b', target_model: 'm1', fallback_chain: [{provider_id: 'a', target_model: 'm1'}, {provider_id: 'c', target_model: 'm1'}]}, 'the new primary leaves the backups; the old one leads them');
+assert.deepEqual(plain(routes.switchedRoute({target_provider_id: 'a', target_model: 'm1'}, {provider_id: 'b', target_model: 'm2'}, false).fallback_chain), []);
+assert.equal(routes.switchedRoute({target_provider_id: 'a', target_model: 'm', fallback_chain: Array.from({length: 8}, (_, i) => ({provider_id: `p${i}`, target_model: 'm'}))}, {provider_id: 'z', target_model: 'm'}, true).fallback_chain.length, 8);
+console.log('PASS route costs: own route first, then upstream, *, the model price; staged costs never charge; 0 made later when not first; switching keeps the old route as backup');

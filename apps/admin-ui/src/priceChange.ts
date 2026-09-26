@@ -44,6 +44,68 @@ export function currentVersion(versions: Row[], rateCardId: unknown, names: unkn
   return latest('*');
 }
 
+/** The name a provider's own procurement cost for an upstream model is kept under: `<provider>/<upstream model>`. */
+export const routeCostModel = (providerId: string, targetModel: string) => `${providerId}/${targetModel}`;
+
+/** The provider and upstream model a version records the procurement cost of, or null for a customer price. */
+export function routeCostOf(version: Row, providers: Row[]): {provider: Row; target: string} | null {
+  const model = String(version.model ?? '');
+  const provider = providers.filter(item => model.startsWith(`${String(item.id)}/`)).sort((a, b) => String(b.id).length - String(a.id).length)[0];
+  return provider ? {provider, target: model.slice(String(provider.id).length + 1)} : null;
+}
+
+export type CostSource = 'route' | 'upstream' | 'wildcard' | 'model';
+
+/**
+ * What a request served by this target costs us, found as billing finds it: the version kept for
+ * this provider and upstream model (线路采购价), the upstream model's, the table's `*`, and — for
+ * the model's own primary target — the model's price version.
+ */
+export function routeCost(versions: Row[], rateCardId: unknown, target: {provider_id: string; target_model: string}, model: Row | null, nowSecs: number): {version: Row | null; source: CostSource | null} {
+  const latest = (name: string) => versions.filter(version => version.rate_card_id === rateCardId && version.model === name && time(version) <= nowSecs)
+    .sort((a, b) => time(b) - time(a))[0] ?? null;
+  const steps: Array<[CostSource, string]> = [['route', routeCostModel(target.provider_id, target.target_model)], ['upstream', target.target_model], ['wildcard', '*']];
+  for (const [source, name] of steps) {const version = latest(name); if (version) return {version, source};}
+  if (model && model.target_provider_id === target.provider_id && model.target_model === target.target_model) {
+    const own = currentVersion(versions, rateCardId, [model.exposed_model_id, model.target_model], nowSecs);
+    if (own) return {version: own, source: 'model'};
+  }
+  return {version: null, source: null};
+}
+
+/** A version's procurement prices in one line: USD 3 / 15 / 3.75 / 0.3 (input, output, cache write, cache read). */
+export function costText(version: Row | null): string {
+  if (!version || !['USD', 'CNY'].includes(String(version.currency))) return '—';
+  const values = COST_FIELDS.map(([field]) => typeof version[field] === 'number' && Number.isFinite(version[field]) && Number(version[field]) >= 0 ? String(version[field]) : '—');
+  return `${String(version.currency)} ${values.join(' / ')}`;
+}
+
+/**
+ * 线路采购价: what one provider charges for one upstream model, kept as its own version: credit
+ * prices 0 (never used to charge), effective at once (0) — made later when published, if the
+ * table already has one (see timeDraftVersions). Throws with the reason, in the words shown.
+ */
+export function buildRouteCost(input: {costs: Record<string, string>; currency: string}, context: {providerId: string; targetModel: string; rateCardId: string; nowSecs: number; taken: unknown[]}): Row {
+  if (!['USD', 'CNY'].includes(input.currency)) throw new Error('请选择采购价币种');
+  const costs = Object.fromEntries(COST_FIELDS.map(([field, label]) => {
+    const raw = (input.costs[field] ?? '').trim(), value = Number(raw);
+    if (!raw || !Number.isFinite(value) || value < 0 || value > 1_000_000) throw new Error(`${label}采购价需在 0–1,000,000 之间（免费填 0）`);
+    return [field, value];
+  }));
+  const model = routeCostModel(context.providerId, context.targetModel);
+  return {id: versionIdFor(model, context.nowSecs, context.taken), rate_card_id: context.rateCardId, model, pricing_mode: 'fixed', currency: input.currency, ...costs,
+    ...Object.fromEntries(PRICE_FIELDS.map(([field]) => [field, 0])), per_call_credit: 0, margin_multiplier: 1, effective_from_secs: 0};
+}
+
+/**
+ * Draft versions as they are sent: one marked 0 (now) whose table already has a version of that
+ * model cannot start now (the server refuses it), so it starts at `laterSecs` instead.
+ */
+export function timeDraftVersions(draft: Row[], versions: Row[], laterSecs: number): Row[] {
+  return draft.map(version => version.effective_from_secs === 0 && versions.some(other => other.rate_card_id === version.rate_card_id && other.model === version.model)
+    ? {...version, effective_from_secs: laterSecs} : version);
+}
+
 /** Versions of these model names that start later, soonest first. */
 export function scheduledVersions(versions: Row[], rateCardId: unknown, names: unknown[], nowSecs: number): Row[] {
   return versions.filter(version => version.rate_card_id === rateCardId && names.includes(version.model) && time(version) > nowSecs)

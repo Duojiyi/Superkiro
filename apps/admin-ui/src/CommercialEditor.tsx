@@ -6,14 +6,16 @@ import { toast } from './components/toast';
 import { Drawer, Modal } from './components/modal';
 import { InfoTip, Tag, TopbarActions } from './components/ui';
 import { IconImage, IconSpark, IconTool } from './components/icons';
-import { formatCount, formatTokenCount, shortHash } from './format';
-import { creditsText, currentVersion } from './priceChange';
+import { formatClock, formatCount, formatTokenCount, shortHash } from './format';
+import { creditsText, currentVersion, timeDraftVersions } from './priceChange';
 import PriceDrawer, { type PublishOutcome } from './PriceDrawer';
 import PriceVersions from './PriceVersions';
 import ListModelDrawer from './ListModelDrawer';
+import RouteEditor from './RouteEditor';
+import RouteSwitchDrawer, { type SwitchedRoute } from './RouteSwitchDrawer';
 import { rebaseDraft } from './rebase';
 import { publishFailure } from './refusal';
-import { authorizedModels, canRoute, isLive, modelName, modelRoute, nameList, targetProblem } from './routes';
+import { authorizedModels, canRoute, isLive, modelName, modelRoute, nameList, targetProblem, targetsOf, targetState } from './routes';
 
 type Row = Record<string, unknown>;
 
@@ -62,6 +64,10 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
   const [newGroupError, setNewGroupError] = useState('');
   // The last publication was refused because the configuration changed meanwhile.
   const [conflict, setConflict] = useState(false);
+  // Models ticked in the list for a bulk action (切换线路), and the last switch, for 切回.
+  const [picked, setPicked] = useState<string[]>([]);
+  const [switching, setSwitching] = useState(false);
+  const [lastSwitch, setLastSwitch] = useState<{provider: string; kept: boolean; routes: SwitchedRoute[]} | null>(null);
   const say = (text: string, tone: 'error' | 'warning' | 'info' = 'error') => {setMessage(text); setMessageTone(tone);};
   const dirty = draft !== loadedDraft || !!reason.trim();
   const validText = (value: unknown, max: number) => typeof value === 'string' && !!value.trim() && new TextEncoder().encode(value).length <= max && !/[\x00-\x1f\x7f-\x9f]/.test(value);
@@ -84,10 +90,24 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
   const originalOf = (row: Row | undefined) => row ? originalRows.find(original => original.id === row.id) : undefined;
   const isEdited = (row: Record<string, unknown>) => JSON.stringify(row) !== JSON.stringify(originalOf(row));
   const focusEditor = () => {editorRef.current?.scrollIntoView({block: 'start'}); editorRef.current?.focus({preventScroll: true});};
-  const updateField = (field: string, value: unknown) => {
+  const updateFields = (patch: Row) => {
     if (!selectedRow || rows.filter(row => row.id === selectedRow.id).length !== 1) {say('当前条目 ID 重复或不存在，请先修正高级配置；未修改任何条目。'); return;}
-    const next = rows.map(row => row.id === selectedRow?.id ? {...row, [field]: value} : row);
+    const next = rows.map(row => row.id === selectedRow?.id ? {...row, ...patch} : row);
     setDraft(JSON.stringify({...parsedDraft, [kind]: next}, null, 2));
+  };
+  const updateField = (field: string, value: unknown) => updateFields({[field]: value});
+  // 线路: a backup becomes the primary route, and the primary takes its place among the backups.
+  const promote = (index: number) => {
+    if (!selectedRow) return;
+    const [primary, ...backups] = targetsOf(selectedRow);
+    const chosen = backups[index];
+    if (chosen) updateFields({target_provider_id: chosen.provider_id, target_model: chosen.target_model, fallback_chain: backups.map((backup, i) => i === index ? primary : backup)});
+  };
+  // A route's 线路采购价, staged among the draft's new price versions (one per route and price table).
+  const draftVersions = Array.isArray(parsedDraft.versions) ? parsedDraft.versions : [];
+  const stageCost = (version: Row | null, costModel: string, rateCardId: unknown) => {
+    const kept = draftVersions.filter(row => !(row.rate_card_id === rateCardId && row.model === costModel));
+    setDraft(JSON.stringify({...parsedDraft, versions: version ? [...kept, version] : kept}, null, 2));
   };
   const numericFields = ['virtual_usage_limit', 'margin_multiplier', 'context_window', 'max_output', 'credit_multiplier', 'rate_multiplier'];
   // Shown in the customer's model list; left empty, the server derives them.
@@ -183,10 +203,15 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
             if (!Number.isSafeInteger(row.context_window) || Number(row.context_window) < 1 || Number(row.context_window) > 10_000_000 || !Number.isSafeInteger(row.max_output) || Number(row.max_output) < 1 || Number(row.max_output) > Number(row.context_window)) throw new Error('上下文长度须为 1 至 10,000,000 的整数；最大输出须为正整数且不能超过上下文长度');
             const old = config.models.find(model => model.id === row.id);
             if (old && old.group_id !== row.group_id) throw new Error('已有模型不能改分组；请在 JSON 中用新的映射 ID 新增条目');
+            const chain = row.fallback_chain;
+            if (chain !== undefined && (!Array.isArray(chain) || chain.length > 8 || chain.some(entry => !entry || typeof entry !== 'object' || !validText((entry as Row).provider_id, 256) || !validText((entry as Row).target_model, 256)))) {
+              throw new Error(`${String(row.exposed_model_id)} 的备用线路最多 8 条，每条都要选供应商、填上游模型`);
+            }
           }
           if (section === 'versions') {
             if (config.versions.some(version => version.id === row.id)) throw new Error('版本 ID 已存在，不能覆盖历史价格');
-            if (!Number.isSafeInteger(row.effective_from_secs) || Number(row.effective_from_secs) <= Date.now() / 1000) throw new Error('价格生效时间需晚于现在，请在 JSON 中修正草稿时间');
+            // 0 is "as soon as allowed" (a 线路采购价 is staged that way); any other time must be ahead.
+            if (row.effective_from_secs !== 0 && (!Number.isSafeInteger(row.effective_from_secs) || Number(row.effective_from_secs) <= Date.now() / 1000)) throw new Error('价格生效时间需晚于现在，请在 JSON 中修正草稿时间');
             if (!positive(row.margin_multiplier)) throw new Error('版本倍率需大于 0、不超过 1000');
           }
         }
@@ -195,11 +220,16 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
       const changes = names.length + newVersions;
       const update = publication();
       if (kind === 'models' && !Object.keys(update).length) throw new Error('没有要发布的修改（只填了原因）');
+      // A version marked 0 starts at once when its table has none of that model yet; otherwise two minutes on.
+      const later = Math.ceil((adminApi.serverNowMs / 1000 + 120) / 60) * 60;
+      if (Array.isArray(update.versions)) update.versions = timeDraftVersions(update.versions, config.versions, later);
+      const timed: Row[] = Array.isArray(update.versions) ? update.versions : [];
+      const atOnce = timed.filter(row => row.effective_from_secs === 0).length, delayed = timed.filter(row => row.effective_from_secs === later).length;
       const confirmed = await confirmAction({
         title: changes ? `发布 ${changes} 项修改？` : `发布${kind === 'groups' ? '分组' : '模型与价格'}配置？`,
         facts: [
           ...(names.length ? [`修改：${names.slice(0, 5).join('、')}${names.length > 5 ? ` 等 ${names.length} 项` : ''}`] : []),
-          ...(newVersions ? [`${newVersions} 个新价格版本按指定时间生效`] : []),
+          ...(newVersions ? [`${newVersions} 个新价格版本：${[atOnce && `${atOnce} 个发布即生效`, delayed && `${delayed} 个 ${formatClock(later)} 起生效`, newVersions - atOnce - delayed && `${newVersions - atOnce - delayed} 个按指定时间生效`].filter(Boolean).join('，')}`] : []),
           `原因：${reason.trim()}`,
           `基于版本 ${shortHash(config.revision)}`,
         ],
@@ -287,7 +317,7 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
   // 调价 and 上架 publish on their own, so only from a page with nothing else unpublished.
   const ownBlocked = (action: string) => needsReview ? '请先重新加载确认上次发布' : dirty ? `先发布或放弃未发布的修改，再${action}` : busy ? '正在处理' : undefined;
   const priceBlocked = ownBlocked('调价'), listingBlocked = ownBlocked('上架'), canListModels = kind === 'models';
-  const openListing = (preset: {providerId?: string; model?: string}) => {setJsonOpen(false); setPriceModel(null); setListing(preset);};
+  const openListing = (preset: {providerId?: string; model?: string}) => {setJsonOpen(false); setPriceModel(null); setSwitching(false); setListing(preset);};
   // A link from 供应商与 Key opens the drawer for that provider's model, once, when the page has loaded.
   const intentUsed = useRef(false);
   useEffect(() => {
@@ -361,6 +391,37 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
   const upstreamHint = !upstreamProvider ? '' : upstreamProvider.enabled === false ? '这个供应商已停用：这条线路不会被使用'
     : canRoute(upstreamProvider.id, String(selectedRow?.target_model), providerKeys) ? '' : '这个供应商的 Key 还没有授权此模型（停用的 Key 不算）';
 
+  // The primary route is edited in its own block (线路), with the backups.
+  const routeFields = kind === 'models' ? ['target_provider_id', 'target_model'] : [];
+  const selectedRateCard = kind === 'models' && selectedRow ? String(configGroups.find(group => group.id === selectedRow.group_id)?.rate_card_id ?? '') || null : null;
+  const renderField = (field: string) => <label key={field} className="field">
+    <span className="field-label">{labels[field]}{tips[field] && <InfoTip text={tips[field]}/>}</span>
+    {renderInput(field)}
+    {tokenFields.includes(field) && selectedRow && <span className="field-hint" title={formatTokens(selectedRow[field])}>{typeof selectedRow[field] === 'number' && Number(selectedRow[field]) > 0 ? `${formatTokenCount(Number(selectedRow[field]))} Tokens` : '请输入正整数 Tokens'}</span>}
+    {field === 'target_model' && upstreamHint && <span className="field-warning">{upstreamHint}</span>}
+    {was(field)}
+  </label>;
+
+  // Bulk actions work on published models and publish on their own.
+  const pickedModels = configModels.filter(model => picked.includes(String(model.id)));
+  const bulkBlocked = ownBlocked('批量操作');
+  const pick = (id: string, on: boolean) => setPicked(current => on ? [...new Set([...current, id])] : current.filter(item => item !== id));
+  // 切回: each switched model's route as it was, if nothing has changed it since the switch.
+  const switchBack = async () => {
+    if (!lastSwitch || !config || bulkBlocked) return;
+    const same = (model: Row, route: Row) => ['target_provider_id', 'target_model', 'fallback_chain'].every(field => JSON.stringify(model[field] ?? []) === JSON.stringify(route[field] ?? []));
+    const back = lastSwitch.routes.map(route => ({route, model: config.models.find(model => model.id === route.id)})).filter((entry): entry is {route: SwitchedRoute; model: Row} => !!entry.model && same(entry.model, entry.route.after));
+    const names = nameList(back.map(entry => modelName(entry.model, config.models, config.groups)));
+    if (!back.length) {say('这些模型的线路在切换后又被改过，不能自动切回：请在“线路”里逐个调整', 'warning'); return;}
+    const stranded = back.filter(entry => isLive(entry.model) && !targetState({provider_id: String(entry.route.before.target_provider_id), target_model: String(entry.route.before.target_model)}, {providers, keys: providerKeys}).ok);
+    if (stranded.length) {say(`原线路现在不能用，不能切回：${nameList(stranded.map(entry => modelName(entry.model, config.models, config.groups)))}`, 'warning'); return;}
+    if (!(await confirmAction({title: `把 ${back.length} 个模型切回原线路？`, facts: back.slice(0, 8).map(entry => `${modelName(entry.model, config.models, config.groups)}：${String(entry.model.target_provider_id)} → ${String(entry.route.before.target_provider_id)} / ${String(entry.route.before.target_model)}`),
+      consequence: back.length < lastSwitch.routes.length ? `另有 ${lastSwitch.routes.length - back.length} 个模型的线路已被改过，不会切回。` : '发布后新请求立即走原线路。', confirmLabel: '切回'}))) return;
+    const outcome = await publishOne({models: back.map(entry => ({...entry.model, ...entry.route.before}))}, `切回原线路：${names}`, '切回', `已切回 ${back.length} 个模型的原线路`, `这些模型的线路是否已切回：${names}`);
+    if (outcome.ok) setLastSwitch(null);
+    else if (!outcome.uncertain) say(outcome.message);
+  };
+
   // 新建分组: a small form; the new row goes into the draft and is published with the bar.
   const addGroup = () => {
     if (!newGroup) return;
@@ -389,11 +450,26 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
         onClick={() => openListing({})}>＋ 上架模型</button>}
       <button type="button" className="btn" aria-expanded={jsonOpen} onClick={() => {setPriceModel(null); setListing(null); setJsonOpen(open => !open);}}>JSON</button>
     </TopbarActions>
+    {kind === 'models' && lastSwitch && <div className="note-info switch-note" role="status">
+      <span>已把 {nameList(lastSwitch.routes.map(route => nameOfId(route.id)))} 切换到 {String(providers.find(provider => provider.id === lastSwitch.provider)?.name ?? lastSwitch.provider)}{lastSwitch.kept ? '，原线路保留为第 1 条备用' : ''}。</span>
+      <button type="button" className="btn btn-small" disabled={!!bulkBlocked} title={bulkBlocked} onClick={() => void switchBack()}>切回原线路</button>
+      <button type="button" className="btn-text" onClick={() => setLastSwitch(null)}>知道了</button>
+    </div>}
+    {kind === 'models' && pickedModels.length > 0 && <div className="selection-bar" role="region" aria-label="批量模型操作">
+      <span className="selection-count">已选 {pickedModels.length} 个模型</span>
+      <div className="button-row">
+        <button type="button" className="btn btn-small" disabled={!!bulkBlocked} title={bulkBlocked} onClick={() => {setJsonOpen(false); setPriceModel(null); setListing(null); setSwitching(true);}}>切换线路</button>
+      </div>
+      <button type="button" className="btn-text" onClick={() => setPicked([])}>取消选择</button>
+    </div>}
     <section className="panel">
       {searchable && <div className="toolbar-row"><label className="search-field"><input aria-label={kind === 'groups' ? '搜索分组' : '搜索模型'} placeholder={kind === 'groups' ? '分组名称或 ID' : '模型、上游或供应商'} value={query} onChange={event => setQuery(event.target.value)}/></label>
         {needle && <span className="muted">匹配 {formatCount(listed.length)} 个</span>}</div>}
       <div className="table-scroll"><table className="table config-table">
-        <thead><tr>{(kind === 'groups' ? ['名称', '可发卡', '对外套餐名', '用量上限', '价格表', '倍率', '卡密数', ''] : ['模型', '显示名', '上游', '分组', '上下文 / 输出', '能力', '当前价格（入/出）', '客户可见', '']).map((label, index) =>
+        <thead><tr>{kind === 'models' && <th className="col-check"><input type="checkbox" aria-label="选择全部模型" checked={configModels.length > 0 && pickedModels.length === configModels.length}
+            ref={element => {if (element) element.indeterminate = pickedModels.length > 0 && pickedModels.length < configModels.length;}} disabled={!configModels.length}
+            onChange={event => setPicked(event.target.checked ? configModels.map(model => String(model.id)) : [])}/></th>}
+          {(kind === 'groups' ? ['名称', '可发卡', '对外套餐名', '用量上限', '价格表', '倍率', '卡密数', ''] : ['模型', '显示名', '线路', '分组', '上下文 / 输出', '能力', '当前价格（入/出）', '客户可见', '']).map((label, index) =>
           <th key={index} className={['用量上限', '倍率', '卡密数', '上下文 / 输出', '当前价格（入/出）'].includes(label) ? 'num' : label === '显示名' ? 'col-display' : label ? undefined : 'col-actions'}>{label || <span className="sr-only">操作</span>}</th>)}</tr></thead>
         <tbody>
           {listed.map((row, index) => {
@@ -401,7 +477,7 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
             const edited = isEdited(row);
             const price = kind === 'models' ? priceOf(row) : null;
             const published = kind === 'models' && configModels.some(model => model.id === row.id);
-            const route = routeOf(row);
+            const route = routeOf(row), backups = kind === 'models' ? targetsOf(row).slice(1) : [];
             const cells = kind === 'groups'
               ? [<td key="n" className="cell-strong">{String(row.name ?? row.id)}{edited && <span className="edited-dot">{originalOf(row) ? '已修改' : '新建'}</span>}</td>,
                 <td key="i">{row.issuance_enabled === false ? <span className="muted">—</span> : '✓'}</td>,
@@ -413,9 +489,11 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
               : [<td key="n" className="cell-strong mono" title={row.display_name ? `显示名：${String(row.display_name)}` : undefined}>{String(row.exposed_model_id ?? row.id)}{edited && <span className="edited-dot">{originalOf(row) ? '已修改' : '新建'}</span>}</td>,
                 <td key="d" className="col-display">{String(row.display_name ?? '') || <span className="muted">—</span>}</td>,
                 <td key="t" title={`${String(row.target_provider_id ?? '—')} / ${String(row.target_model ?? '—')}`}><span className="mono clip clip-upstream">{String(row.target_provider_id ?? '—')} / {String(row.target_model ?? '—')}</span>
-                  {route && !route.primary.ok && <span className="route-tags">{route.down
-                    ? <Tag tone={isLive(row) ? 'danger' : 'neutral'} title={targetProblem(route.primary, providers)}>无可用线路</Tag>
-                    : <Tag tone="warning" title={`${targetProblem(route.primary, providers)}；正由备用线路服务`}>主线路不可用</Tag>}</span>}</td>,
+                  {(backups.length > 0 || (route && !route.primary.ok)) && <span className="route-tags">
+                    {backups.length > 0 && <Tag tone="info" title={backups.map((backup, i) => `备 ${i + 1}：${backup.provider_id} / ${backup.target_model}`).join('\n')}>主 + {backups.length} 备</Tag>}
+                    {route && !route.primary.ok && (route.down
+                      ? <Tag tone={isLive(row) ? 'danger' : 'neutral'} title={targetProblem(route.primary, providers)}>无可用线路</Tag>
+                      : <Tag tone="warning" title={`${targetProblem(route.primary, providers)}；正由备用线路服务`}>主线路不可用</Tag>)}</span>}</td>,
                 <td key="g" title={String(row.group_id ?? '')}>{groupName(row.group_id)}</td>,
                 <td key="w" className="num" title={`${formatTokens(row.context_window)} / ${formatTokens(row.max_output)}`}>{typeof row.context_window === 'number' ? formatTokenCount(row.context_window) : '—'} / {typeof row.max_output === 'number' ? formatTokenCount(row.max_output) : '—'}</td>,
                 <td key="a"><span className="capabilities">{capability(row)}</span></td>,
@@ -423,6 +501,8 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
                   ? `${creditsText(price.fixed_input_credit_per_m) ?? '?'} / ${creditsText(price.fixed_output_credit_per_m) ?? '?'}` : price ? '非固定' : <span className="is-warning">未定价</span>}</td>,
                 <td key="v">{row.visible === false ? <span className="muted">隐藏</span> : '✓'}</td>];
             return <tr key={String(row.id ?? index)} className={active ? 'is-selected' : undefined}>
+              {kind === 'models' && <td className="col-check"><input type="checkbox" aria-label={`选择 ${String(row.exposed_model_id ?? row.id)}`} disabled={!published}
+                title={published ? undefined : '先发布这个模型'} checked={picked.includes(String(row.id))} onChange={event => pick(String(row.id), event.target.checked)}/></td>}
               {cells}
               <td className="col-actions"><span className="row-actions">
                 <button type="button" className="btn-text" disabled={busy} onClick={() => {setSelected(String(row.id)); focusEditor();}}>编辑</button>
@@ -431,7 +511,7 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
               </span></td>
             </tr>;
           })}
-          {!listed.length && <tr className="state-row"><td colSpan={9}>{busy ? <div className="skeleton" role="status" aria-label="正在加载"><span className="skeleton-bar"/><span className="skeleton-bar"/></div> : <div className="list-state"><p>{needle ? '没有匹配的条目' : '暂无数据'}</p></div>}</td></tr>}
+          {!listed.length && <tr className="state-row"><td colSpan={kind === 'models' ? 10 : 8}>{busy ? <div className="skeleton" role="status" aria-label="正在加载"><span className="skeleton-bar"/><span className="skeleton-bar"/></div> : <div className="list-state"><p>{needle ? '没有匹配的条目' : '暂无数据'}</p></div>}</td></tr>}
         </tbody>
       </table></div>
     </section>
@@ -439,13 +519,13 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
     <section ref={editorRef} tabIndex={-1} className="panel mapping-editor">
       <h3>编辑：{String(selectedRow?.name ?? selectedRow?.exposed_model_id ?? '请选择条目')}</h3>
       <fieldset disabled={busy || !selectedRow} className="form-grid form-grid-3">
-        {editorFields.filter(field => !checkFields.includes(field)).map(field => <label key={field} className="field">
-          <span className="field-label">{labels[field]}{tips[field] && <InfoTip text={tips[field]}/>}</span>
-          {renderInput(field)}
-          {tokenFields.includes(field) && selectedRow && <span className="field-hint" title={formatTokens(selectedRow[field])}>{typeof selectedRow[field] === 'number' && Number(selectedRow[field]) > 0 ? `${formatTokenCount(Number(selectedRow[field]))} Tokens` : '请输入正整数 Tokens'}</span>}
-          {field === 'target_model' && upstreamHint && <span className="field-warning">{upstreamHint}</span>}
-          {was(field)}
-        </label>)}
+        {editorFields.filter(field => !checkFields.includes(field) && !routeFields.includes(field)).map(renderField)}
+        {kind === 'models' && selectedRow && <section className="field-span route-editor" aria-label="线路">
+          <h4>线路 <span className="muted">主线路不能用时，按顺序改走备用线路</span></h4>
+          <div className="form-grid form-grid-3">{editorFields.filter(field => routeFields.includes(field)).map(renderField)}</div>
+          <RouteEditor model={selectedRow} rateCardId={selectedRateCard} versions={configVersions} staged={draftVersions} providers={providers} keys={providerKeys} nowSecs={nowSecs}
+            onChain={backups => updateField('fallback_chain', backups)} onPromote={promote} onStage={(version, costModel) => stageCost(version, costModel, selectedRateCard)}/>
+        </section>}
         {editorFields.some(field => checkFields.includes(field)) && <div className="field field-span check-row">
           {editorFields.filter(field => checkFields.includes(field)).map(field => <span key={field} className="check-field">
             <label><input type="checkbox" checked={field === 'issuance_enabled' ? selectedRow?.[field] !== false : Boolean(selectedRow?.[field])} onChange={event => updateField(field, event.target.checked)}/>{labels[field]}</label>
@@ -456,7 +536,7 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
       </fieldset>
     </section>
 
-    {kind === 'models' && <PriceVersions versions={configVersions} rateCards={rateCards} groups={configGroups} cards={cards} faceValue={config?.settings?.credit_face_value_cny} nowSecs={nowSecs}/>}
+    {kind === 'models' && <PriceVersions versions={configVersions} rateCards={rateCards} groups={configGroups} cards={cards} faceValue={config?.settings?.credit_face_value_cny} providers={providers} nowSecs={nowSecs}/>}
 
     {jsonOpen && <Drawer id="config-json" label="JSON 配置" onClose={() => setJsonOpen(false)} className="json-drawer">
       <header className="drawer-head">
@@ -483,6 +563,10 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
       return <PriceDrawer key={priceModel} model={model} group={configGroups.find(group => group.id === model.group_id) ?? null} config={config}
         onClose={() => setPriceModel(null)} onPublish={publishPrice} onReload={() => load(false, true)}/>;
     })()}
+
+    {switching && config && pickedModels.length > 0 && <RouteSwitchDrawer models={pickedModels} config={config} providers={providers} keys={providerKeys}
+      onClose={() => setSwitching(false)} onPublish={(update, switchReason, check) => publishOne(update, switchReason, '切换线路', undefined, check)}
+      onSwitched={(provider, kept, routes) => {setLastSwitch({provider, kept, routes}); setPicked([]);}}/>}
 
     {listing && config && <ListModelDrawer preset={listing} config={config} providers={providers} providerKeys={providerKeys}
       onClose={() => setListing(null)} onPublish={(update, listingReason, check) => publishOne(update, listingReason, '上架', undefined, check)} onReload={() => load(false, true)}/>}
