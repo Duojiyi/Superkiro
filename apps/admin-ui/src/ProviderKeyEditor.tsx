@@ -7,11 +7,15 @@ import {InfoTip} from './components/ui';
 
 type Message = {tone: 'error' | 'warning' | 'info'; text: string} | null;
 
-export default function ProviderKeyEditor({selectedKey, preset, knownModels = [], knownProviders = [], onSaved, onDirtyChange, onBusyChange, onClose}: {
+export default function ProviderKeyEditor({selectedKey, preset, knownModels = [], modelsKnown = knownModels.length > 0, knownProviders = [], onSaved, onDirtyChange, onBusyChange, onClose, onListModel}: {
   selectedKey?: Record<string, unknown>;
   preset?: {providerId?: string; keyId?: string; suggestedKeyId?: string};
-  /** Upstream models already listed in 模型与定价, to point out the ones that are not. */
+  /** This provider's upstream models already listed in 模型与定价, to point out the ones that are not. */
   knownModels?: string[];
+  /** Whether 模型与定价 loaded (otherwise nothing is marked 未上架). */
+  modelsKnown?: boolean;
+  /** 上架 for a model this Key is saved as authorised for. */
+  onListModel?: (providerId: string, model: string) => void;
   /** IDs of the providers that already exist. */
   knownProviders?: string[];
   onSaved?: (savedKey?: Record<string, unknown>) => void;
@@ -118,7 +122,7 @@ export default function ProviderKeyEditor({selectedKey, preset, knownModels = []
       } else {
         setDirty(false); setSecret(''); setMessage(null);
         const unlisted = modelIds.filter(model => !knownModels.includes(model)).length;
-        toast.success(unlisted && knownModels.length ? `已保存 Key ${keyId.trim()}，${unlisted} 个模型还没在“模型与定价”上架` : `已保存 Key ${keyId.trim()}`);
+        toast.success(unlisted && modelsKnown ? `已保存 Key ${keyId.trim()}，${unlisted} 个模型还没在“模型与定价”上架` : `已保存 Key ${keyId.trim()}`);
         onSaved?.({id: keyId.trim(), provider_id: provider.trim(), allowed_models: modelIds, weight: Number(weight), enabled});
       }
     } catch (error) {
@@ -217,13 +221,15 @@ export default function ProviderKeyEditor({selectedKey, preset, knownModels = []
         </div>
         {visible.length ? <ul className="model-checklist">{visible.map(model => {
           const fresh = !!discovery?.models.includes(model) && !(savedModels ?? []).includes(model);
-          const unlisted = knownModels.length > 0 && modelIds.includes(model) && !knownModels.includes(model);
+          const unlisted = modelsKnown && modelIds.includes(model) && !knownModels.includes(model);
+          // Only a saved permission can be listed: showing a model needs an enabled Key that allows it.
+          const listable = unlisted && !!onListModel && mode === 'edit' && !dirty && enabled && (savedModels ?? []).includes(model);
           return <li key={model}><label className="check-field">
             <input type="checkbox" aria-label={model} checked={modelIds.includes(model)} onChange={event => tick(model, event.target.checked)}/>
             <span className="mono">{model}</span>
             {fresh && <span className="tag tag-info">新</span>}
             {unlisted && <span className="tag" title="还没在“模型与定价”上架，客户看不到">未上架</span>}
-          </label></li>;
+          </label>{listable && <button type="button" className="btn-text btn-small" onClick={() => onListModel!(provider.trim(), model)}>去上架</button>}</li>;
         })}</ul> : <p className="muted">{offered.length ? '没有匹配的模型' : '还没有模型：点“获取模型列表”，或手动输入'}</p>}
         {manual && <label className="field"><span className="field-label">可用模型（每行一个）</span>
           <textarea aria-label="可用模型（每行一个）" rows={6} className="mono" value={models} onChange={event => setModels(event.target.value)}/></label>}

@@ -395,6 +395,8 @@ export class AdminApiClient {
 
   /** When the current session ends (milliseconds since the epoch), or 0 when not known. */
   get sessionExpiresAt(): number { return this.expiresAt; }
+  /** Now on the server's clock, as far as the session replies tell (milliseconds). */
+  get serverNowMs(): number { return Date.now() + this.serverOffset; }
 
   async revealCard(cardId: string): Promise<{ success: boolean; rawCode: string }> {
     return this.request('/api/v1/admin/cards/reveal', {method: 'POST', body: JSON.stringify({cardId})});

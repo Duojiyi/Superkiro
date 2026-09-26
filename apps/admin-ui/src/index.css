@@ -160,6 +160,16 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .model-checklist {display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 4px 16px; max-height: 280px; overflow-y: auto; margin: 0; padding: 8px 10px; list-style: none; border: 1px solid var(--border-subtle); border-radius: 6px;}
 .model-checklist .check-field {display: flex; align-items: center; gap: 6px; min-height: 28px; font-size: 13px;}
 .model-checklist .mono {overflow: hidden; text-overflow: ellipsis; white-space: nowrap;}
+.model-checklist li {display: flex; align-items: center; gap: 4px; min-width: 0;}
+.model-checklist li > .check-field {flex: 1; min-width: 0;}
+.model-checklist li > .btn-text {height: 24px; font-size: 12px;}
+/* 上架模型 */
+.listing-drawer .check-row {display: flex;}
+.listing-grid {display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px 12px; align-items: end;}
+.listing-grid input, .listing-grid select {width: 100%;}
+.listing-official[open] {display: flex; flex-direction: column; gap: 8px; align-items: flex-start;}
+.listing-official .listing-grid {width: 100%;}
+@media (max-width: 700px) {.listing-grid {grid-template-columns: repeat(2, minmax(0, 1fr));}}
 .empty-note {padding: 24px 12px; text-align: center; color: var(--text-2);}
 
 /* ---------- App frame (1.2.8) ---------- */

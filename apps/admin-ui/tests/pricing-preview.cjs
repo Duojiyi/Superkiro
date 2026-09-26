@@ -143,7 +143,7 @@ const Editor = load('CommercialEditor.tsx', {'./tokens': tokens, './api': {admin
   // Dialogs, drawers and messages only run from event handlers; the render tree just names the components.
   './components/confirm': {confirmAction: async () => true}, './components/toast': {toast: {success() {}, info() {}, error() {}}},
   './components/modal': {Drawer: 'Drawer', Modal: 'Modal'}, './components/icons': {IconImage: 'IconImage', IconSpark: 'IconSpark', IconTool: 'IconTool'},
-  './components/ui': {InfoTip: 'InfoTip', TopbarActions: 'TopbarActions'}, './PriceDrawer': {default: 'PriceDrawer'}, './PriceVersions': {default: 'PriceVersions'},
+  './components/ui': {InfoTip: 'InfoTip', TopbarActions: 'TopbarActions'}, './PriceDrawer': {default: 'PriceDrawer'}, './PriceVersions': {default: 'PriceVersions'}, './ListModelDrawer': {default: 'ListModelDrawer'},
   react, 'react/jsx-runtime': runtime}).default;
 const providers = [{id: 'p', name: '供应商 P'}, {id: 'openai', name: 'Astra', api_type: 'openai'}];
 const providerKeys = [{id: 'k', provider_id: 'openai', allowed_models: ['gpt-6-astra', 'gpt-5.6-sol']}, {id: 'k2', provider_id: 'p', allowed_models: ['upstream']}];
@@ -195,3 +195,60 @@ const duplicateDraft = states[1];
 field('上下文长度').props.onChange({target:{value:'1M'}});
 assert.equal(states[1],duplicateDraft,'duplicate IDs cannot cause multiple rows to be edited');
 assert(states[4].includes('ID 重复或不存在'));
+
+// 上架模型: the rules in listing.ts, without a browser.
+const listing = load('listing.ts', {'./priceChange': change});
+// Values made inside the module's context compare by content, not by prototype.
+const plain = value => JSON.parse(JSON.stringify(value));
+assert.equal(listing.displayNameFor('claude-opus-5-5'), 'Claude Opus 5.5');
+assert.equal(listing.displayNameFor('claude-sonnet-4-5-20250929'), 'Claude Sonnet 4.5', 'a snapshot date is left out');
+assert.equal(listing.displayNameFor('gpt-5.6-sol'), 'GPT 5.6 Sol');
+assert.equal(listing.displayNameFor('deepseek-v3'), 'DeepSeek V3');
+// Official price x multiplier, exactly: CNY 0.24 per official dollar at CNY 0.03 a credit is 8 credits a dollar.
+assert.equal(listing.creditsFromOfficial('5', '0.24', 0.03), 40000000);
+assert.equal(listing.creditsFromOfficial('0.2', '0.24', 0.03), 1600000);
+assert.equal(listing.creditsFromOfficial('4', '0.35', 0.03), 46666667, 'rounded half up to one micro-credit');
+assert.equal(listing.creditsFromOfficial('12.5', '0.24', 0.025), 120000000);
+assert.equal(listing.costFromOfficial('4', '0.22'), 0.88);
+assert.equal(listing.costFromOfficial('0.2', '0.22'), 0.044);
+assert.equal(listing.costFromOfficial('6.25', '0.08'), 0.5);
+for (const bad of ['', '-1', '1e3', 'abc', '1.0000000001']) assert.throws(() => listing.creditsFromOfficial(bad, '0.24', 0.03));
+assert.throws(() => listing.creditsFromOfficial('5', '0.24', 0), /积分面值/);
+const listingConfig = {groups: [{id: 'g', name: 'G', rate_card_id: 'r', margin_multiplier: 1}], rate_cards: [{id: 'r', name: 'R'}], versions: [],
+  models: [{id: 'm-a', group_id: 'g', exposed_model_id: 'model-a', target_provider_id: 'p', target_model: 'model-a', sort_order: 0},
+    {id: 'm-b', group_id: 'g', exposed_model_id: 'model-b', target_provider_id: 'p', target_model: 'model-b', sort_order: 1, aliases: ['b-alias']},
+    {id: 'm-c', group_id: 'g', exposed_model_id: 'model-c', target_provider_id: 'p', target_model: 'model-c', sort_order: 2}]};
+const listingProviders = [{id: 'p', name: 'P'}, {id: 'off', name: 'Off', enabled: false}];
+const listingKeys = [{id: 'k', provider_id: 'p', enabled: true, allowed_models: ['model-a', 'model-b', 'model-c', 'new-model']},
+  {id: 'k-off', provider_id: 'p', enabled: false, allowed_models: ['disabled-only']}];
+assert.deepEqual(plain(listing.authorizedModels('p', listingKeys)), ['model-a', 'model-b', 'model-c', 'new-model'], 'a disabled Key authorises nothing');
+assert(listing.canRoute('p', 'anything', [{provider_id: 'p', enabled: true}]), 'an old Key without a list may call any model');
+const t0 = Math.floor(Date.now() / 1000);
+const listingInput = {providerId: 'p', targetModel: 'new-model', modelId: 'new-model', displayName: '', groupId: 'g', contextWindow: 200000, maxOutput: 32000,
+  tools: true, vision: true, reasoning: false, rateMultiplier: '2.2', after: 'm-a',
+  prices: {fixed_input_credit_per_m: '40', fixed_output_credit_per_m: '200', fixed_cache_creation_credit_per_m: '50', fixed_cache_read_credit_per_m: '4'},
+  costs: {input_price_per_m: '0.88', output_price_per_m: '4.4', cache_creation_price_per_m: '1.1', cache_read_price_per_m: '0.044'}, currency: 'CNY'};
+const listingContext = {config: listingConfig, providers: listingProviders, keys: listingKeys, nowSecs: t0, effectiveSecs: t0 + 20};
+const listed = listing.buildListing(listingInput, listingContext);
+assert.deepEqual(plain(listed.mapping), {id: 'p-new-model', group_id: 'g', exposed_model_id: 'new-model', target_provider_id: 'p', target_model: 'new-model',
+  context_window: 200000, max_output: 32000, supports_tools: true, supports_vision: true, supports_reasoning: false, credit_multiplier: 1,
+  visible: false, sort_order: 1, aliases: [], fallback_chain: [], rate_multiplier: 2.2, display_name: null, description: null}, 'hidden, right after model-a');
+assert.match(listed.version.id, /^new-model-\d{12}$/);
+for (const [field, value] of Object.entries({model: 'new-model', rate_card_id: 'r', pricing_mode: 'fixed', currency: 'CNY', margin_multiplier: 1, effective_from_secs: t0 + 20,
+  fixed_input_credit_per_m: 40000000, fixed_output_credit_per_m: 200000000, fixed_cache_creation_credit_per_m: 50000000, fixed_cache_read_credit_per_m: 4000000,
+  input_price_per_m: 0.88, output_price_per_m: 4.4, cache_creation_price_per_m: 1.1, cache_read_price_per_m: 0.044, per_call_credit: 0})) assert.equal(listed.version[field], value, field);
+assert.equal(listing.buildListing({...listingInput, after: ''}, listingContext).mapping.sort_order, 3, 'at the end by default');
+assert.equal(listing.buildListing(listingInput, {...listingContext, config: {...listingConfig, models: [...listingConfig.models, {id: 'p-new-model', group_id: 'other', exposed_model_id: 'x', target_model: 'x', sort_order: 0}]}}).mapping.id, 'p-new-model-2');
+for (const [change_, pattern] of [[{providerId: 'off'}, /已停用/], [{targetModel: 'disabled-only'}, /还没有授权 disabled-only/], [{modelId: 'model-b'}, /已经有 model-b/],
+  [{modelId: 'b-alias'}, /已经有 b-alias/], [{contextWindow: 1000, maxOutput: 2000}, /上下文/], [{contextWindow: null}, /上下文/], [{rateMultiplier: '0'}, /显示倍率/],
+  [{prices: {...listingInput.prices, fixed_input_credit_per_m: '0', fixed_output_credit_per_m: '0'}}, /不能都是 0/], [{after: 'missing'}, /重新选择位置/],
+  [{costs: {...listingInput.costs, output_price_per_m: ''}}, /采购价/], [{groupId: 'nope'}, /请选择分组/]]) {
+  assert.throws(() => listing.buildListing({...listingInput, ...change_}, listingContext), pattern, JSON.stringify(change_));
+}
+assert.throws(() => listing.buildListing(listingInput, {...listingContext, effectiveSecs: t0}), /晚于现在/);
+const shown = listing.showListing([...listingConfig.models, listed.mapping], 'p-new-model');
+assert.deepEqual(plain(shown.map(row => [row.id, row.sort_order, row.visible === true])), [['m-b', 2, false], ['m-c', 3, false], ['p-new-model', 1, true]], 'the ones from its place move down one');
+assert.throws(() => listing.showListing(listingConfig.models, 'nope'), /没有找到/);
+setup();
+assert(text(render()).includes('＋ 上架模型'), 'the models page offers 上架模型');
+console.log('PASS: 上架模型: display names, official price x multipliers, listing validation, hidden-then-shown order');

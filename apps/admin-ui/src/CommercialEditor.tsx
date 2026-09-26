@@ -10,6 +10,7 @@ import { formatCount, formatTokenCount, shortHash } from './format';
 import { creditsText, currentVersion } from './priceChange';
 import PriceDrawer, { type PublishOutcome } from './PriceDrawer';
 import PriceVersions from './PriceVersions';
+import ListModelDrawer from './ListModelDrawer';
 
 type Row = Record<string, unknown>;
 
@@ -17,7 +18,7 @@ type Row = Record<string, unknown>;
 // bar at the bottom with the reason and 发布. Everything is published together against the
 // version read, with a reason; a publish without a confirmed result blocks the next one until
 // a reload. Prices change one model at a time in their own drawer (调价).
-export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, cards, onPublished, refreshEpoch = 0, providers = [], providerKeys = [] }: {
+export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, cards, onPublished, refreshEpoch = 0, providers = [], providerKeys = [], intent }: {
   kind: 'groups' | 'models';
   onDirtyChange: (dirty: boolean) => void;
   onBusyChange: (busy: boolean) => void;
@@ -28,6 +29,8 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
   /** For the model editor's 供应商 list and each provider's authorised models. */
   providers?: Row[];
   providerKeys?: Row[];
+  /** From another page: open 上架模型 for this provider's upstream model. */
+  intent?: {list?: {providerId?: string; model?: string}};
 }) {
   const [config, setConfig] = useState<CommercialConfig | null>(null);
   const [draft, setDraft] = useState(''), [loadedDraft, setLoadedDraft] = useState('');
@@ -44,6 +47,8 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
   // The console was refreshed while this page had unpublished edits.
   const [serverChanged, setServerChanged] = useState(false);
   const [priceModel, setPriceModel] = useState<string | null>(null);
+  // 上架模型: the drawer that lists a new model, opened on its own or from a provider's Key list.
+  const [listing, setListing] = useState<{providerId?: string; model?: string} | null>(null);
   const [jsonOpen, setJsonOpen] = useState(false);
   const [query, setQuery] = useState('');
   const [newGroup, setNewGroup] = useState<Record<string, string | boolean> | null>(null);
@@ -197,28 +202,30 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
       }
     } finally {if (submitted) {pending.current = false; if (alive.current) {setBusy(false); setPublishing(false);}}}
   };
-  // One model's new price, published on its own (only from a page with nothing else unpublished).
-  const publishPrice = async (version: Row, priceReason: string): Promise<PublishOutcome> => {
+  // One change published on its own: 调价 (a price version) or a step of 上架 (the new model).
+  // `done` is the confirmation shown on success; the listing drawer shows its own at the end.
+  const publishOne = async (update: {models?: Row[]; versions?: Row[]}, updateReason: string, action: string, done?: string): Promise<PublishOutcome> => {
     if (!config || pending.current || needsReview || dirty) return {ok: false, message: '有未完成的发布或修改，请先处理'};
     pending.current = true; setBusy(true); setMessage('');
     try {
-      const result = await adminApi.publishCommercialConfig({versions: [version], expected_revision: config.revision, reason: priceReason});
+      const result = await adminApi.publishCommercialConfig({...update, expected_revision: config.revision, reason: updateReason});
       if (result.success !== true) throw new AdminApiError('服务器未确认发布成功', 400);
       if (!result.config?.revision) throw new Error('服务器未返回可核对的配置版本');
-      if (alive.current) {apply(result.config, false); toast.success(`已发布 ${String(version.model)} 的新价格`); onPublished?.();}
+      if (alive.current) {apply(result.config, false); if (done) toast.success(done); onPublished?.();}
       return {ok: true};
     } catch (error) {
       const text = error instanceof Error ? error.message : String(error);
       // Refusals (the server says 409 for every validation) change nothing and can be corrected.
       if (error instanceof AdminApiError && error.status === 409) {
         const conflict = /configuration changed|reload/i.test(text);
-        return {ok: false, conflict, message: conflict ? '配置刚被更新，请重新加载后再发布（已填的价格会保留）' : `服务器拒绝了这次调价：${text}`};
+        return {ok: false, conflict, message: conflict ? '配置刚被更新，请重新加载后再发布（已填的内容会保留）' : `服务器拒绝了这次${action}：${text}`};
       }
       if (error instanceof AdminApiError && [400, 401, 403, 413, 422].includes(error.status)) return {ok: false, message: text};
-      if (alive.current) {setNeedsReview(true); say(`没收到调价结果（${text}）。请重新加载核对价格版本后再操作，不要重复提交。`);}
+      if (alive.current) {setNeedsReview(true); say(`没收到${action}结果（${text}）。请重新加载核对后再操作，不要重复提交。`);}
       return {ok: false, uncertain: true, message: text};
     } finally {pending.current = false; if (alive.current) setBusy(false);}
   };
+  const publishPrice = (version: Row, priceReason: string) => publishOne({versions: [version]}, priceReason, '调价', `已发布 ${String(version.model)} 的新价格`);
   const reload = async () => {
     if (dirty && !(await confirmAction({title: '放弃未发布的修改？', consequence: '会重新加载服务器上的配置。', confirmLabel: '放弃修改'}))) return;
     void load(false);
@@ -236,7 +243,18 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
     const group = configGroups.find(item => item.id === row.group_id);
     return group ? currentVersion(configVersions, group.rate_card_id, [row.exposed_model_id, row.target_model], nowSecs) : null;
   };
-  const priceBlocked = needsReview ? '请先重新加载确认上次发布' : dirty ? '先发布或放弃未发布的修改，再调价' : busy ? '正在处理' : undefined;
+  // 调价 and 上架 publish on their own, so only from a page with nothing else unpublished.
+  const ownBlocked = (action: string) => needsReview ? '请先重新加载确认上次发布' : dirty ? `先发布或放弃未发布的修改，再${action}` : busy ? '正在处理' : undefined;
+  const priceBlocked = ownBlocked('调价'), listingBlocked = ownBlocked('上架'), canListModels = kind === 'models';
+  const openListing = (preset: {providerId?: string; model?: string}) => {setJsonOpen(false); setPriceModel(null); setListing(preset);};
+  // A link from 供应商与 Key opens the drawer for that provider's model, once, when the page has loaded.
+  const intentUsed = useRef(false);
+  useEffect(() => {
+    if (kind !== 'models' || !intent?.list || intentUsed.current || !config) return;
+    intentUsed.current = true;
+    if (!listingBlocked) openListing(intent.list);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [intent, config]);
   const searchable = rows.length > 15;
   const needle = query.trim().toLowerCase();
   const listed = searchable && needle ? rows.filter(row => [row.id, row.name, row.exposed_model_id, row.display_name, row.target_model, row.target_provider_id].some(value => String(value ?? '').toLowerCase().includes(needle))) : rows;
@@ -321,7 +339,9 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
     <TopbarActions>
       {kind === 'groups' && <button type="button" className="btn" disabled={busy || !config || !!draftError} title={draftError ? 'JSON 无效，先修正' : undefined}
         onClick={() => {setNewGroupError(''); setNewGroup({id: '', name: '', rateCard: String(rateCards[0]?.id ?? ''), multiplier: '1', issuance: true});}}>＋ 新建分组</button>}
-      <button type="button" className="btn" aria-expanded={jsonOpen} onClick={() => {setPriceModel(null); setJsonOpen(open => !open);}}>JSON</button>
+      {canListModels && <button type="button" className="btn btn-primary" disabled={!config || !!listingBlocked} title={listingBlocked}
+        onClick={() => openListing({})}>＋ 上架模型</button>}
+      <button type="button" className="btn" aria-expanded={jsonOpen} onClick={() => {setPriceModel(null); setListing(null); setJsonOpen(open => !open);}}>JSON</button>
     </TopbarActions>
     <section className="panel">
       {searchable && <div className="toolbar-row"><label className="search-field"><input aria-label={kind === 'groups' ? '搜索分组' : '搜索模型'} placeholder={kind === 'groups' ? '分组名称或 ID' : '模型、上游或供应商'} value={query} onChange={event => setQuery(event.target.value)}/></label>
@@ -357,7 +377,7 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
               <td className="col-actions"><span className="row-actions">
                 <button type="button" className="btn-text" disabled={busy} onClick={() => {setSelected(String(row.id)); focusEditor();}}>编辑</button>
                 {kind === 'models' && <button type="button" className="btn-text" disabled={!!priceBlocked || !published} title={!published ? '先发布这个模型，再调价' : priceBlocked}
-                  onClick={() => {setJsonOpen(false); setPriceModel(String(row.id));}}>调价</button>}
+                  onClick={() => {setJsonOpen(false); setListing(null); setPriceModel(String(row.id));}}>调价</button>}
               </span></td>
             </tr>;
           })}
@@ -413,6 +433,9 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
       return <PriceDrawer key={priceModel} model={model} group={configGroups.find(group => group.id === model.group_id) ?? null} config={config}
         onClose={() => setPriceModel(null)} onPublish={publishPrice} onReload={() => load(false, true)}/>;
     })()}
+
+    {listing && config && <ListModelDrawer preset={listing} config={config} providers={providers} providerKeys={providerKeys}
+      onClose={() => setListing(null)} onPublish={(update, listingReason) => publishOne(update, listingReason, '上架')} onReload={() => load(false, true)}/>}
 
     {newGroup && <Modal label="新建分组" onClose={() => setNewGroup(null)} className="dialog-form">
       <h3 className="modal-title">新建分组</h3>

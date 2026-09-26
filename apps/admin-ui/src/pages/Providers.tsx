@@ -24,7 +24,7 @@ function ModelTags({models}: {models: unknown}) {
   </span>;
 }
 
-export default function ProvidersPage({providers, providerKeys, models, loading, failed, refresh, guards, reportError, editing, setEditing, providerDirty, editorBusy, onDirtyChange, onBusyChange, mergeKey}: {
+export default function ProvidersPage({providers, providerKeys, models, loading, failed, refresh, guards, reportError, editing, setEditing, providerDirty, editorBusy, onDirtyChange, onBusyChange, mergeKey, onListModel}: {
   providers: Row[];
   providerKeys: Row[];
   models: Row[];
@@ -40,6 +40,8 @@ export default function ProvidersPage({providers, providerKeys, models, loading,
   onDirtyChange: (dirty: boolean) => void;
   onBusyChange: (busy: boolean) => void;
   mergeKey: (saved: Row) => void;
+  /** Opens 模型与定价 › 上架模型 for this provider's upstream model. */
+  onListModel?: (providerId: string, model: string) => void;
 }) {
   const {writing} = guards;
   const [switching, setSwitching] = useState<string | null>(null);
@@ -131,7 +133,8 @@ export default function ProvidersPage({providers, providerKeys, models, loading,
       action={<button type="button" className="btn btn-small" onClick={() => void edit({})}>添加供应商</button>}/></section>}
 
     {editing && <ProviderKeyEditor key={`${editing.providerId ?? 'new'}:${editing.keyId ?? 'new'}`} selectedKey={selectedKey} preset={editing}
-      knownModels={models.map(model => String(model.target_model ?? '')).filter(Boolean)} knownProviders={providers.map(provider => String(provider.id))}
+      knownModels={models.filter(model => model.target_provider_id === editing.providerId).map(model => String(model.target_model ?? '')).filter(Boolean)}
+      modelsKnown={models.length > 0} onListModel={onListModel} knownProviders={providers.map(provider => String(provider.id))}
       onDirtyChange={onDirtyChange} onBusyChange={onBusyChange} onClose={() => void edit(null)}
       onSaved={saved => {
         if (saved) {mergeKey(saved); setEditing({providerId: String(saved.provider_id), keyId: String(saved.id)});}

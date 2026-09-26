@@ -292,11 +292,13 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
             {activeTab === 'groups' && <CommercialEditor key="groups" kind="groups" onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy}
               cards={data.cards} onPublished={() => void refreshData({keepSelection: true})} refreshEpoch={refreshEpoch}/>}
             {activeTab === 'models' && <CommercialEditor key="models" kind="models" onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy}
-              onPublished={() => void refreshData({keepSelection: true})} refreshEpoch={refreshEpoch} providers={data.providers} providerKeys={data.providerKeys}/>}
+              onPublished={() => void refreshData({keepSelection: true})} refreshEpoch={refreshEpoch} providers={data.providers} providerKeys={data.providerKeys}
+              intent={intent.models}/>}
             {activeTab === 'providers' && <ProvidersPage providers={data.providers} providerKeys={data.providerKeys} models={data.models}
               loading={loading} failed={!!failures.providers} refresh={refreshData} guards={guards} reportError={reportError}
               editing={keyEditing} setEditing={setKeyEditing} providerDirty={providerDirty} editorBusy={editorBusy}
               onDirtyChange={markProviderDirty} onBusyChange={markEditorBusy}
+              onListModel={(providerId, model) => void navigate('models', {models: {list: {providerId, model}}})}
               mergeKey={saved => setData(previous => ({...previous, providerKeys: previous.providerKeys.some(key => key.id === saved.id && key.provider_id === saved.provider_id)
                 ? previous.providerKeys.map(key => key.id === saved.id && key.provider_id === saved.provider_id ? {...key, ...saved} : key)
                 : [...previous.providerKeys, saved]}))}/>}
