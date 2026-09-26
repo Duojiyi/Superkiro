@@ -9,7 +9,7 @@ import {formatDateTime} from './format';
 type Message = {tone: 'error' | 'warning' | 'info'; text: string} | null;
 
 /** 结算参数: the credit face value and the USD rate, published with a reason against the version read. */
-export default function FinancialPanel({onPublished, onDirtyChange, onBusyChange}: {data?: AdminFinancials | null; onPublished: () => Promise<void>; onDirtyChange: (dirty: boolean) => void; onBusyChange: (busy: boolean) => void}) {
+export default function FinancialPanel({onPublished, onDirtyChange, onBusyChange, refreshEpoch = 0}: {data?: AdminFinancials | null; onPublished: () => Promise<void>; onDirtyChange: (dirty: boolean) => void; onBusyChange: (busy: boolean) => void; refreshEpoch?: number}) {
   const [config, setConfig] = useState<CommercialConfig | null>(null);
   const [face, setFace] = useState(''), [rate, setRate] = useState(''), [reason, setReason] = useState('');
   const [message, setMessage] = useState<Message>(null);
@@ -17,6 +17,8 @@ export default function FinancialPanel({onPublished, onDirtyChange, onBusyChange
   const [publishing, setPublishing] = useState(false);
   const pending = useRef(false), alive = useRef(true);
   const [needsReview, setNeedsReview] = useState(false);
+  // The console was refreshed while these settings had unpublished edits.
+  const [serverChanged, setServerChanged] = useState(false);
   const dirty = !!reason.trim() || (!!config?.settings && (face !== String(config.settings.credit_face_value_cny) || rate !== String(config.settings.usd_cny_rate)));
   let inputError = '';
   if (config?.settings) {try {parseFinancialSettings(face, rate);} catch (error) {inputError = error instanceof Error ? error.message : '请填写有效数值';}}
@@ -25,7 +27,7 @@ export default function FinancialPanel({onPublished, onDirtyChange, onBusyChange
   useEffect(() => {onDirtyChange(dirty);}, [dirty, onDirtyChange]);
   useEffect(() => () => onDirtyChange(false), [onDirtyChange]);
   const apply = (next: CommercialConfig) => {
-    setConfig(next);
+    setConfig(next); setServerChanged(false);
     setFace(next.settings ? String(next.settings.credit_face_value_cny) : '');
     setRate(next.settings ? String(next.settings.usd_cny_rate) : '');
   };
@@ -48,6 +50,16 @@ export default function FinancialPanel({onPublished, onDirtyChange, onBusyChange
     } finally {pending.current = false; if (alive.current) setBusy(false);}
   }
   useEffect(() => {alive.current = true; void load(); return () => {alive.current = false;};}, []);
+  // A console refresh reloads the settings too, but never over unpublished edits.
+  const seenEpoch = useRef(refreshEpoch);
+  useEffect(() => {
+    if (refreshEpoch === seenEpoch.current) return;
+    seenEpoch.current = refreshEpoch;
+    if (pending.current) return;
+    if (dirty) setServerChanged(true);
+    else void load();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshEpoch]);
 
   async function publish() {
     if (pending.current || needsReview || !config?.settings) return;
@@ -65,7 +77,7 @@ export default function FinancialPanel({onPublished, onDirtyChange, onBusyChange
         ...(settings.usd_cny_rate !== before.usd_cny_rate ? [`美元汇率 ${before.usd_cny_rate} → ${settings.usd_cny_rate} CNY/USD`] : []),
         `原因：${reason.trim()}`,
       ],
-      consequence: '会影响成本加成计费和估算，不会改变卡密余额；有未结算请求时服务器会拒绝。',
+      consequence: '影响成本加成计费和财务估算，不改卡内余额。',
       confirmLabel: '发布',
     });
     if (!confirmed || pending.current || !alive.current) return;
@@ -110,13 +122,14 @@ export default function FinancialPanel({onPublished, onDirtyChange, onBusyChange
         {inputError && <p className="field-error field-span" role="alert">{inputError}</p>}
       </fieldset>
       {needsReview && <p role="alert" className="message message-warning">没收到发布结果或加载失败，请重新加载确认后再发布。</p>}
+      {serverChanged && !needsReview && dirty && <p className="message message-warning">服务器上的结算参数可能已更新</p>}
       <div className="editor-actions">
         {message && <p role="status" className={`message message-${message.tone}`}>{message.text}</p>}
         <div className="button-row">
-          <button type="button" className="btn" disabled={busy} onClick={async () => {
+          {(dirty || needsReview || serverChanged || !config?.settings) && <button type="button" className="btn" disabled={busy} onClick={async () => {
             if (dirty && !(await confirmAction({title: '放弃未发布的修改？', consequence: '会重新加载服务器上的结算参数。', confirmLabel: '放弃修改'}))) return;
             void load(true);
-          }}>重新加载</button>
+          }}>{dirty ? (serverChanged && !needsReview ? '放弃修改并加载' : '放弃修改') : '重新加载'}</button>}
           <button type="submit" className="btn btn-primary" disabled={busy || !!blockedReason} title={blockedReason}>{publishing ? '发布中…' : '发布'}</button>
         </div>
       </div>

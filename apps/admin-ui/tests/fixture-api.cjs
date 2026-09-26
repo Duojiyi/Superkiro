@@ -62,30 +62,53 @@ module.exports = function fixtureApi() {
         inputTokens: trace.input_tokens, outputTokens: trace.output_tokens, cacheReadTokens: 800, cacheWriteTokens: 0, ttftMs: trace.ttft_ms, tokensPerSecond: trace.tokens_per_second, truncated: false}};
   };
   const config = {settings:{credit_face_value_cny:0.01,usd_cny_rate:7.2,rate_updated_at_secs:now},revision:'fixture-rev-2', groups, models, rate_cards:[{id:'fixture-rate', name:'测试价格表'}], versions: models.map((m,i) => ({id:`fixture-price-${i}`, model:m.exposed_model_id, rate_card_id:'fixture-rate', pricing_mode:'fixed', effective_from_secs:now-86400, fixed_input_credit_per_m:3000000, fixed_output_credit_per_m:15000000, fixed_cache_read_credit_per_m:300000, fixed_cache_creation_credit_per_m:3750000})), audit:[{operator:'fixture-admin', reason:'本地测试：更新模型价格', previous_revision:'fixture-rev-1', revision:'fixture-rev-2', created_at_secs:now}]};
-  let authenticated = false;
-  return {writes, traces, expire() {authenticated=false;}, async handle(req,res) {
+  let authenticated = false, deadline = 0, loginAt = 0;
+  const IDLE = 1800, MAX = 8 * 3600;
+  const nowSecs = () => Math.floor(Date.now() / 1000);
+  return {writes, traces, expire() {authenticated=false;}, get sessionDeadline() {return deadline;}, async handle(req,res) {
     const url = new URL(req.url, 'http://127.0.0.1');
     const endpoint = url.pathname.replace('/api/v1/admin/', '');
     const reply = (value, status=200) => {res.writeHead(status, {'Content-Type':'application/json'}); res.end(JSON.stringify(value));};
     if (endpoint==='session' && req.method==='POST') {
       let raw=''; for await(const chunk of req) raw+=chunk; assert.deepEqual(JSON.parse(raw),{username:'admin',password:'fixture-password'}); authenticated=true; res.setHeader('Set-Cookie','fixture_session=valid; HttpOnly; SameSite=Strict; Path=/');
-      return reply({success:true,expiresIn:900});
+      loginAt = nowSecs(); deadline = loginAt + IDLE;
+      return reply({success:true,expiresIn:IDLE,expiresAt:deadline});
     }
+    if (authenticated && deadline && nowSecs() >= deadline) authenticated = false;
     if (!authenticated || !req.headers.cookie?.includes('fixture_session=valid')) return reply({error:'Fixture authentication required'},401);
+    // Use moves the idle deadline; a background request (automatic refresh) does not.
+    if (req.headers['x-admin-background'] !== '1') deadline = Math.min(nowSecs() + IDLE, loginAt + MAX);
+    res.setHeader('x-admin-session-expires', String(deadline));
     let body={};
     if(req.method==='POST') {assert.equal(req.headers['x-csrf-token'],'fixture-csrf'); let raw=''; for await(const chunk of req) raw+=chunk; body=JSON.parse(raw||'{}'); writes.push({endpoint,body});}
-    if(endpoint==='me' || (endpoint==='session' && req.method==='GET')) return reply({success:true,role:'admin',username:'admin',csrfToken:'fixture-csrf',expiresAt:Math.floor(Date.now()/1000)+900,twoFactorEnabled:false,totpRequired:false});
+    if(endpoint==='me' || (endpoint==='session' && req.method==='GET')) return reply({success:true,role:'admin',username:'admin',csrfToken:'fixture-csrf',expiresAt:deadline,expiresIn:deadline-nowSecs(),twoFactorEnabled:false,totpRequired:false});
     if(endpoint==='cards/reveal') return reply({success:true,rawCode:'FIXTURE-RECOVERED-CODE'});
     if(endpoint==='session/revoke') {authenticated=false; res.setHeader('Set-Cookie','fixture_session=; Max-Age=0; Path=/'); return reply({success:true});}
     if(endpoint==='stats') return reply({success:true,totalCards:cards.length,activeCards:2,unactivatedCards:1,frozenCards:1,bannedCards:1,totalCredits:12000000000,usedCredits:1500000000,remainingCredits:10500000000,totalPoints:12000,usedPoints:1500,remainingPoints:10500,activity:activity()});
     if(endpoint==='cards') return reply({success:true,count:cards.length,cards,revision:cardRevision()});
+    // One card's history, newest first: this session's changes, then realistic older events.
+    if(endpoint==='cards/history') {
+      const cardId=url.searchParams.get('card_id'); const card=cards.find(c=>c.id===cardId);
+      if(!card) return reply({__type:'ResourceNotFoundException',message:'没有这张卡密'},404);
+      const t=Math.floor(Date.now()/1000);
+      const recent=writes.filter(w=>['cards/status','cards/adjust'].includes(w.endpoint)&&w.body.cardId===cardId).reverse().map((w,i)=>w.endpoint==='cards/adjust'
+        ?{ts:t-i,action:'adjust',credits:Math.round(w.body.deltaPoints*1e6),points:w.body.deltaPoints,operator:'admin',reason:w.body.reason??null}
+        :{ts:t-i,action:w.body.action,credits:0,points:0,operator:'admin',reason:w.body.reason??null});
+      const older=[];
+      if(card.status==='banned') older.push({ts:t-3600,action:'ban',credits:0,points:0,operator:'admin',reason:'滥用'});
+      if(card.status==='frozen') older.push({ts:t-5400,action:'freeze',credits:0,points:0,operator:'admin',reason:'客户要求'});
+      if(card.activatedAt) older.push({ts:t-7200,action:'adjust',credits:50000000,points:50,operator:'admin',reason:'补偿 9/25 上游中断'});
+      if(card.activatedAt) older.push({ts:card.activatedAt,action:'activated',credits:0,points:0,operator:'system',reason:null});
+      older.push({ts:(card.activatedAt??t)-86400,action:'issued',credits:card.creditTotal,points:card.pointsTotal,operator:'admin',reason:null});
+      return reply({success:true,cardId,events:[...recent,...older]});
+    }
     if(endpoint==='traces') {const cardId=url.searchParams.get('card_id'),limit=Number(url.searchParams.get('limit')||100);return reply({success:true,traces:traces.filter(t=>!cardId||t.card_id===cardId).slice(0,limit)});}
     if(endpoint==='traces/content') {const record=traceContent(url.searchParams.get('invocation_id'));return record?reply(record):reply({__type:'ResourceNotFoundException',message:'没有这次请求的内容（只保留 24 小时）'},404);}
     if(endpoint==='commercial-config') {
       if(req.method==='POST') {assert.deepEqual(Object.keys(body).sort(),['expected_revision','reason','settings']);assert.equal(body.expected_revision,config.revision);assert.deepEqual(Object.keys(body.settings).sort(),['credit_face_value_cny','usd_cny_rate']);config.settings={...body.settings,rate_updated_at_secs:now+1};config.revision='fixture-rev-3';}
       return reply({success:true,config});
     }
-    if(endpoint==='providers') return reply({success:true,providers:[{id:'fixture-provider',name:'测试供应商 / Fixture',base_url:'https://fixture.invalid/v1',enabled:true}],keys:[{id:'fixture-key',provider_id:'fixture-provider',allowed_models:models.map(m=>m.target_model),weight:10,enabled:true,health_state:'healthy'},{id:'fixture-backup',provider_id:'fixture-provider',allowed_models:['claude-sonnet'],weight:1,enabled:true,health_state:'cooldown',cooldown_until:4102444800}]});
+    if(endpoint==='providers') return reply({success:true,providers:[{id:'fixture-provider',name:'测试供应商 / Fixture',base_url:'https://fixture.invalid/v1',enabled:true},{id:'fixture-disabled',name:'停用的供应商 / Fixture',base_url:'https://disabled.invalid/v1',enabled:false}],keys:[{id:'fixture-key',provider_id:'fixture-provider',allowed_models:models.map(m=>m.target_model),weight:10,enabled:true,health_state:'healthy'},{id:'fixture-backup',provider_id:'fixture-provider',allowed_models:['claude-sonnet'],weight:1,enabled:true,health_state:'cooldown',cooldown_until:4102444800},{id:'fixture-disabled-key',provider_id:'fixture-disabled',allowed_models:['gpt-5'],weight:1,enabled:true,health_state:'cooldown',cooldown_until:4102444800}]});
     if(endpoint==='financials') return reply({success:true,basis:'retained_usage_ledger_estimate_not_cash_revenue',settings:config.settings,actualRevenueMicroCny:null,actualGrossProfitMicroCny:null,estimates:{retainedLedgerOnly:true,usageFaceValueMicroCny:1000000,configuredProviderCostMicroCny:420000,faceValueLessCostMicroCny:null,faceValueMarginPercentage:null,costedRequests:17,uncostedRequests:1},dashboard:{total_requests:18,total_credits_charged:27000000,revenue_micro_cny:0,provider_cost_micro_cny:4200000,gross_profit_micro_cny:0,gross_margin_percentage:0},modelRankings:models.map(m=>({model_id:m.exposed_model_id,provider_cost_micro_cny:1400000}))});
     if(endpoint==='announcements') return reply({success:true,announcements:[{id:'fixture-notice',title:'本地测试：服务维护通知',content:'这是隔离的视觉测试公告，不会向真实用户发布。',level:'info',enabled:true,created_at:now}]});
     if(endpoint==='cards/batch') {

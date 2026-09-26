@@ -12,13 +12,14 @@ import type {Refresh, ReportError} from '../types';
 
 const ESTIMATE = '基于保留的用量账本估算，不含实际收款与发票';
 
-export default function FinancePage({financials, loading, failed, refresh, reportError, onDirtyChange, onBusyChange}: {
+export default function FinancePage({financials, loading, failed, refresh, reportError, onDirtyChange, onBusyChange, refreshEpoch}: {
   financials: AdminFinancials | null;
   loading: boolean;
   failed: boolean;
   refresh: Refresh;
   reportError: ReportError;
   onDirtyChange: (dirty: boolean) => void;
+  refreshEpoch?: number;
   onBusyChange: (busy: boolean) => void;
 }) {
   const exporting = useRef(false);
@@ -56,6 +57,8 @@ export default function FinancePage({financials, loading, failed, refresh, repor
       <Menu label="更多导出" className="btn btn-icon-only" items={[{label: '导出 JSON', onSelect: () => void exportLedger('json')}]}/>
     </TopbarActions>
 
+    {/* Not the overview's 24 hours / 7 days: these totals cover the whole kept ledger. */}
+    <p className="range-line">统计区间：{estimates?.retainedLedgerOnly ? '累计（全部保留账本）' : '累计'}</p>
     <div className="kpi-row">
       <section className="panel kpi"><p className="kpi-label">消耗积分</p>
         <strong className="kpi-value">{dashboard ? formatCreditsMicro(dashboard.total_credits_charged) : '—'}</strong>
@@ -103,6 +106,6 @@ export default function FinancePage({financials, loading, failed, refresh, repor
       </table></div>
     </section>
 
-    <FinancialPanel onPublished={() => refresh({keepSelection: true})} onDirtyChange={onDirtyChange} onBusyChange={onBusyChange}/>
+    <FinancialPanel onPublished={() => refresh({keepSelection: true})} onDirtyChange={onDirtyChange} onBusyChange={onBusyChange} refreshEpoch={refreshEpoch}/>
   </div>;
 }

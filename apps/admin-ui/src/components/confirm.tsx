@@ -13,8 +13,8 @@ export interface ConfirmOptions {
   danger?: boolean;
   /** The operator types this exactly before the button works. */
   typed?: string;
-  /** An optional short reason; its text is returned with the answer. */
-  reason?: {label: string; placeholder?: string; suggestions?: string[]; maxLength?: number};
+  /** A short reason; its text is returned with the answer. Required ones must be filled in first. */
+  reason?: {label: string; placeholder?: string; suggestions?: string[]; maxLength?: number; required?: boolean};
 }
 
 export interface ConfirmAnswer {confirmed: boolean; reason: string}
@@ -62,7 +62,9 @@ export function ConfirmHost() {
 function ConfirmDialog({options, onFinish}: {options: ConfirmOptions; onFinish: (answer: ConfirmAnswer) => void}) {
   const [typed, setTyped] = useState('');
   const [reason, setReason] = useState('');
-  const ready = !options.typed || typed.trim() === options.typed;
+  const typedReady = !options.typed || typed.trim() === options.typed;
+  const reasonReady = !options.reason?.required || !!reason.trim();
+  const ready = typedReady && reasonReady;
   const accept = () => {if (ready) onFinish({confirmed: true, reason: reason.trim()});};
   return <Modal role="alertdialog" label={options.title} onClose={() => onFinish(NO)} className="confirm-dialog">
     <h3 className="modal-title">{options.title}</h3>
@@ -70,7 +72,7 @@ function ConfirmDialog({options, onFinish}: {options: ConfirmOptions; onFinish: 
     {options.body}
     {options.consequence && <p className={`confirm-consequence${options.danger ? ' is-danger' : ''}`}>{options.consequence}</p>}
     {options.reason && <div className="field">
-      <label className="field-label" htmlFor="confirm-reason">{options.reason.label}</label>
+      <label className="field-label" htmlFor="confirm-reason">{options.reason.label}{options.reason.required && <span className="required-mark">（必填）</span>}</label>
       <input id="confirm-reason" value={reason} maxLength={options.reason.maxLength ?? 200} placeholder={options.reason.placeholder}
         onChange={event => setReason(event.target.value)} onKeyDown={event => {if (event.key === 'Enter') accept();}}/>
       {!!options.reason.suggestions?.length && <div className="chips">
@@ -85,7 +87,7 @@ function ConfirmDialog({options, onFinish}: {options: ConfirmOptions; onFinish: 
     <div className="modal-actions">
       <button type="button" className="btn" data-autofocus onClick={() => onFinish(NO)}>取消</button>
       <button type="button" className={options.danger ? 'btn btn-danger-solid' : 'btn btn-primary'} data-confirm="accept"
-        disabled={!ready} title={ready ? undefined : `输入 ${options.typed} 后可以${options.confirmLabel}`} onClick={accept}>{options.confirmLabel}</button>
+        disabled={!ready} title={ready ? undefined : !reasonReady ? `填写原因后可以${options.confirmLabel}` : `输入 ${options.typed} 后可以${options.confirmLabel}`} onClick={accept}>{options.confirmLabel}</button>
     </div>
   </Modal>;
 }

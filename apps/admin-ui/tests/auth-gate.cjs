@@ -151,7 +151,9 @@ const server=http.createServer(async(req,res)=>{
     await waitForRoute(()=>heldSession);
     await heldSession.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'temporary outage'})});heldSession=null;holdLoginSession=false;
     const recheck=page.getByRole('alertdialog',{name:'无法确认登录状态'});
-    await recheck.getByRole('button',{name:'重试'}).waitFor();assert.equal(await draft.inputValue(),'{"models":[],"privateDraft":"old-sensitive-draft"}');assert(await draft.evaluate(el=>!!el.closest('[inert]')));
+    await recheck.getByRole('button',{name:'重试'}).waitFor();
+    // When the network stays down there is a way out: sign in again (drafts kept).
+    assert.equal(await recheck.getByRole('button',{name:'重新登录'}).count(),1);assert.equal(await draft.inputValue(),'{"models":[],"privateDraft":"old-sensitive-draft"}');assert(await draft.evaluate(el=>!!el.closest('[inert]')));
     await page.screenshot({path:path.join(screenshots,'session-recheck-blocked.png'),fullPage:true});
     await recheck.getByRole('button',{name:'重试'}).click();await recheck.waitFor({state:'detached'});
     assert.equal(await draft.evaluate(el=>!!el.closest('[inert]')),false);
@@ -176,14 +178,21 @@ const server=http.createServer(async(req,res)=>{
     await page.getByRole('heading',{name:'管理员登录',exact:true}).waitFor();assert.equal(await page.locator('.workspace,textarea').count(),0);
     await page.getByLabel('密码',{exact:true}).fill('fixture-password');await page.getByRole('button',{name:'登录',exact:true}).click();
     await page.getByRole('heading',{name:'运营概览',level:2,exact:true}).waitFor();
-    // Absolute expiry must remove the workspace even without further user activity.
+    // Expiry must remove the workspace even without further user activity. The server's idle
+    // deadline is 2 seconds away; at the deadline the console asks once, in the background (not
+    // counted as use), and the server says the session is over.
+    const idleDeadline=Date.now()/1000+2;let backgroundChecks=0;
     await page.route('**/api/v1/admin/session',async route=>{
-      if(route.request().method()==='GET')return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({success:true,role:'admin',csrfToken:'fixture-csrf',expiresAt:Date.now()/1000+2,twoFactorEnabled:false,totpRequired:false})});
-      return route.fallback();
+      if(route.request().method()!=='GET')return route.fallback();
+      if(route.request().headers()['x-admin-background']==='1')backgroundChecks++;
+      if(Date.now()/1000>=idleDeadline)return route.fulfill({status:401,contentType:'application/json',body:JSON.stringify({error:'expired'})});
+      return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({success:true,role:'admin',csrfToken:'fixture-csrf',expiresAt:idleDeadline,twoFactorEnabled:false,totpRequired:false})});
     });
     await page.evaluate(()=>window.dispatchEvent(new Event('focus')));
     await page.getByRole('navigation',{name:'管理导航'}).waitFor();
     await page.getByRole('heading',{name:'管理员登录',exact:true}).waitFor();assert.equal(await page.locator('.workspace,.sidebar,textarea').count(),0);
+    assert(backgroundChecks>=1,'the deadline check does not count as use');
+    await page.getByText('会话已到期，请重新登录（草稿已保留）').waitFor();
     await page.unroute('**/api/v1/admin/session');
     await page.getByLabel('密码',{exact:true}).fill('fixture-password');await page.getByRole('button',{name:'登录',exact:true}).click();
     await page.getByRole('heading',{name:'运营概览',level:2,exact:true}).waitFor();

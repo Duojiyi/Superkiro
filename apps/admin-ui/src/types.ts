@@ -13,7 +13,7 @@ export type TraceWindow = 'hour' | 'day' | 'all';
 /** Where a link from another page wants a list to start. */
 export interface Intent {
   cards?: {status?: CardTab; quick?: CardQuickFilter; search?: string};
-  traces?: {status?: TraceTab; window?: TraceWindow};
+  traces?: {status?: TraceTab; window?: TraceWindow; search?: string; open?: string};
 }
 
 export interface ErrorAction {label: string; run: () => void}

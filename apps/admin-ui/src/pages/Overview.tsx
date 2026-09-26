@@ -87,12 +87,14 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
 
   // Only what someone can act on, each a link to the filtered list. Nothing at zero.
   const attention: Array<{text: string; tone: 'warning' | 'danger' | 'info'; go: () => void}> = [];
-  const coolingKeys = data.providerKeys.filter(key => key.enabled !== false && keyCooldownLeft(key, nowSecs) > 0);
+  // A Key of a disabled provider serves nothing, so its cooldown needs no attention.
+  const liveKeys = data.providerKeys.filter(key => key.enabled !== false && data.providers.find(provider => provider.id === key.provider_id)?.enabled !== false);
+  const coolingKeys = liveKeys.filter(key => keyCooldownLeft(key, nowSecs) > 0);
   if (coolingKeys.length) {
     const soonest = Math.min(...coolingKeys.map(key => keyCooldownLeft(key, nowSecs)));
     attention.push({text: `${coolingKeys.length} 个 Key 冷却中（${Math.max(1, Math.ceil(soonest / 60))} 分钟后恢复）`, tone: 'warning', go: () => onNavigate('providers')});
   }
-  const degradedKeys = data.providerKeys.filter(key => key.enabled !== false && key.health_state === 'degraded').length;
+  const degradedKeys = liveKeys.filter(key => key.health_state === 'degraded').length;
   if (degradedKeys) attention.push({text: `${degradedKeys} 个 Key 异常`, tone: 'danger', go: () => onNavigate('providers')});
   const failedLastHour = data.traces.filter(trace => trace.status === 'error' && Number(trace.ts) > nowSecs - 3600).length;
   if (failedLastHour) attention.push({text: `近 1 小时 ${failedLastHour} 次失败请求`, tone: 'danger', go: () => onNavigate('traces', {traces: {status: 'error', window: 'hour'}})});
@@ -192,7 +194,7 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
           {providerRows.map(({provider, keys, counts, requests, failed, median}) => <tr key={String(provider.id)}>
             <td className="cell-strong">{String(provider.name || provider.id)}</td>
             <td className="col-status"><StatusBadge view={provider.enabled === false ? {label: '已停用', tone: 'neutral'} : {label: '启用', tone: 'success'}}/></td>
-            <td>{keys.length ? <span className="key-summary">{keys.length} 个：{[...counts.entries()].map(([label, value]) => <span key={label} className={`dot-label dot-${value.tone}`}>{value.count} {label}</span>)}</span> : <span className="muted">没有 Key</span>}</td>
+            <td>{keys.length ? <span className="key-summary">{[...counts.entries()].map(([label, value]) => <span key={label} className={`dot-label dot-${value.tone}`}>{value.count} {label}</span>)}</span> : <span className="muted">没有 Key</span>}</td>
             <td className="num">{requests ? formatPercent((requests - failed) / requests * 100) : '—'}</td>
             <td className="num">{formatDuration(median)}</td>
             <td className="col-actions"><button type="button" className="btn-text" onClick={() => onNavigate('providers')}>查看</button></td>

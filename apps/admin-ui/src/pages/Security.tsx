@@ -38,7 +38,7 @@ export default function SecurityPage({operator, keyCount, onLogout, onLogoutAll}
           {twoFactor === true ? <li className="is-ok"><IconCheck/>双因素验证已启用</li>
             : twoFactor === false ? <li className="is-warning"><IconWarning/>双因素验证未启用（在服务器配置中开启）</li>
             : <li className="is-unknown"><IconWarning/>双因素验证状态未知</li>}
-          <li className="is-ok"><IconCheck/>会话 15 分钟自动失效</li>
+          <li className="is-ok"><IconCheck/>30 分钟未操作自动退出（最长 8 小时）</li>
         </ul>
       </section>
       <section className="panel">

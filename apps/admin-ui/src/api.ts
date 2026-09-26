@@ -99,6 +99,16 @@ export interface TraceReply {
 }
 
 /** One request as it arrived and the model's reply, kept for 24 hours. */
+/** One entry of a card's history. `credits` is micro-credits; for `issued`, the credits issued. */
+export interface CardEvent {
+  ts: number;
+  action: string;
+  credits: number;
+  points: number;
+  operator: string | null;
+  reason: string | null;
+}
+
 export interface TraceContent {
   success: boolean;
   invocationId: string;
@@ -217,6 +227,16 @@ export class AdminApiClient {
   private expiryTimer?: ReturnType<typeof setTimeout>;
   private warningTimer?: ReturnType<typeof setTimeout>;
   private expiresAt = 0;
+  // The server's clock minus this one (ms), learned when the session is checked.
+  private serverOffset = 0;
+  // Requests started inside `inBackground` are automatic: they do not count as use of the session.
+  private backgroundCalls = 0;
+
+  /** Starts requests that the operator did not ask for (automatic refresh). */
+  inBackground<T>(start: () => Promise<T>): Promise<T> {
+    this.backgroundCalls++;
+    try {return start();} finally {this.backgroundCalls--;}
+  }
 
   constructor(baseUrl: string = '') { this.baseUrl = baseUrl; }
 
@@ -251,12 +271,68 @@ export class AdminApiClient {
     }finally{clearTimeout(timer);}
   }
 
-  private async request<T>(path: string, options: RequestInit = {}, blob = false): Promise<T> {
-    if(this.expiresAt && Date.now()>=this.expiresAt){this.clearSession();this.onUnauthorized?.('expired');}
+  /**
+   * The session ends after 30 idle minutes, so its deadline moves with every use. Each reply
+   * names the current deadline (server clock); timers follow it, a little debounced.
+   */
+  private followDeadline(deadlineSecs: number, serverNowMs?: number) {
+    const serverNow = serverNowMs ?? Date.now() + this.serverOffset;
+    const remaining = deadlineSecs * 1000 - serverNow;
+    if (!Number.isFinite(remaining) || remaining <= 0) return;
+    if (this.expiresAt && Math.abs(Date.now() + remaining - this.expiresAt) < 1000) return;
+    this.schedule(remaining);
+  }
+
+  private schedule(remaining: number) {
+    clearTimeout(this.expiryTimer);clearTimeout(this.warningTimer);
+    this.expiresAt=Date.now()+remaining;
+    this.expiryTimer=setTimeout(()=>this.deadlineReached(),Math.min(2147483647,remaining));
+    if(remaining>SESSION_WARNING_MS)this.warningTimer=setTimeout(()=>this.onExpiring?.(),Math.min(2147483647,remaining-SESSION_WARNING_MS));
+    else this.onExpiring?.();
+  }
+
+  /** Remaining session time from a session reply (its lifetime, not its clock), or null. */
+  private remainingFrom(result: {expiresAt?: number; expiresIn?: number}): number | null {
+    if(result.expiresAt===undefined&&result.expiresIn===undefined)return null;
+    if(typeof result.expiresAt==='number'&&typeof result.expiresIn==='number')this.serverOffset=(result.expiresAt-result.expiresIn)*1000-Date.now();
+    // The server's remaining lifetime, not its clock: an operator's clock ahead of the
+    // server's by more than the lifetime otherwise ended every new session at once.
+    return typeof result.expiresIn==='number'?result.expiresIn*1000:Number(result.expiresAt)*1000-Date.now();
+  }
+
+  /**
+   * The local deadline passed. Use elsewhere (another tab) may have moved it, so ask the
+   * server once, as a background request that does not itself count as use, before ending.
+   */
+  private deadlineCheck?: Promise<void>;
+  private deadlineReached(): Promise<void> {
+    // One check at a time, however many requests are waiting on it.
+    this.deadlineCheck ??= this.checkDeadline().finally(()=>{this.deadlineCheck=undefined;});
+    return this.deadlineCheck;
+  }
+
+  private async checkDeadline(): Promise<void> {
+    const version=this.sessionVersion;
+    if(!this.csrfToken)return;
+    try {
+      const result=await this.request<SessionCheck>('/api/v1/admin/session',{headers:{'x-admin-background':'1'}},false,true);
+      if(version!==this.sessionVersion)return;
+      const remaining=result.success===true&&result.role==='admin'&&result.csrfToken===this.csrfToken?this.remainingFrom(result):null;
+      if(remaining!==null&&Number.isFinite(remaining)&&remaining>0){this.schedule(remaining);return;}
+    } catch {/* Unconfirmed: the session is treated as ended. */}
+    if(version!==this.sessionVersion)return;
+    this.clearSession();this.onUnauthorized?.('expired');
+  }
+
+  private async request<T>(path: string, options: RequestInit = {}, blob = false, internal = false): Promise<T> {
+    const background = this.backgroundCalls > 0;
+    // Past the deadline this tab knows: confirm with the server before sending anything.
+    if(!internal&&this.expiresAt&&Date.now()>=this.expiresAt){await this.deadlineReached();if(!this.csrfToken)throw new Error('请先登录');}
     if (path !== '/api/v1/admin/session' && !this.csrfToken) throw new Error('请先登录');
     const headers = new Headers(options.headers || {});
     if (options.method && !['GET', 'HEAD', 'OPTIONS'].includes(options.method)) headers.set('x-csrf-token', this.csrfToken);
     if (!headers.has('Accept')) headers.set('Accept', 'application/json');
+    if (background) headers.set('x-admin-background', '1');
     if (options.body !== undefined) headers.set('Content-Type', 'application/json');
     const version = this.sessionVersion;
     const controller = new AbortController();
@@ -268,8 +344,14 @@ export class AdminApiClient {
         ...options, headers, signal: controller.signal, credentials: 'same-origin', cache: 'no-store',
       });
       if (version !== this.sessionVersion) throw new Error('管理会话已改变，请重新加载');
+      if (res.status !== 401 && this.csrfToken) {
+        const deadline = Number(res.headers?.get?.('x-admin-session-expires'));
+        const serverNow = Date.parse(res.headers?.get?.('date') ?? '');
+        if (Number.isFinite(deadline) && deadline > 0) this.followDeadline(deadline, Number.isFinite(serverNow) ? serverNow : undefined);
+      }
       if (!res.ok) {
-        if (res.status === 401 && !(path === '/api/v1/admin/session' && options.method === 'POST')) {
+        // The deadline check reports its own ending, with the reason.
+        if (res.status === 401 && !internal && !(path === '/api/v1/admin/session' && options.method === 'POST')) {
           this.clearSession(); this.onUnauthorized?.();
         }
         const errorVersion=this.sessionVersion;
@@ -302,14 +384,10 @@ export class AdminApiClient {
     if (typeof result.username === 'string' && result.username.trim() && result.username.length <= 128) this.authenticatedUsername = result.username;
     this.twoFactorEnabled=result.twoFactorEnabled;this.totpRequired=result.totpRequired===true;
     clearTimeout(this.expiryTimer);clearTimeout(this.warningTimer);
-    if(result.expiresAt!==undefined||result.expiresIn!==undefined){
-      // The server's remaining lifetime, not its clock: an operator's clock ahead of the
-      // server's by more than the lifetime otherwise ended every new session at once.
-      const remaining=typeof result.expiresIn==='number'?result.expiresIn*1000:Number(result.expiresAt)*1000-Date.now();
+    const remaining=this.remainingFrom(result);
+    if(remaining!==null){
       if(!Number.isFinite(remaining)||remaining<=0){this.clearSession();this.onUnauthorized?.('expired');throw new Error('管理会话已到期');}
-      this.expiresAt=Date.now()+remaining;
-      this.expiryTimer=setTimeout(()=>{this.clearSession();this.onUnauthorized?.('expired');},Math.min(2147483647,remaining));
-      if(remaining>SESSION_WARNING_MS)this.warningTimer=setTimeout(()=>this.onExpiring?.(),Math.min(2147483647,remaining-SESSION_WARNING_MS));
+      this.schedule(remaining);
     }
     if (changed) this.onSessionChanged?.();
     return result;
@@ -411,6 +489,11 @@ export class AdminApiClient {
   /** One request's content and reply. Every read is logged by the server, naming the operator. */
   async getTraceContent(invocationId: string): Promise<TraceContent> {
     return this.request(`/api/v1/admin/traces/content?invocation_id=${encodeURIComponent(invocationId)}`);
+  }
+
+  /** What happened to one card, newest first: who did it and why. */
+  async getCardHistory(cardId: string): Promise<{success: boolean; cardId: string; events: CardEvent[]}> {
+    return this.request(`/api/v1/admin/cards/history?card_id=${encodeURIComponent(cardId)}`);
   }
 
   async pruneTraces(cutoffSecs: number): Promise<{ success: boolean; pruned: number }> {

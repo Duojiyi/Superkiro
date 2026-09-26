@@ -113,6 +113,12 @@ export default function App() {
     finally {pending.current = false; setBusy(false);}
   }
 
+  /** When the session cannot be confirmed for long (network down): sign in again, drafts kept. */
+  const signInAgain = () => {
+    ++attempt.current; adminApi.clearSession(); setRecheckError(''); setExpiring(false); setAuthState('unauthenticated');
+    setError('请重新登录（草稿已保留）');
+  };
+
   /** Only when the server does not name the operator: sign in again so adjustments have one. */
   const reauthenticate = () => {
     ++attempt.current; adminApi.clearSession(); setAuthState('unauthenticated');
@@ -127,7 +133,10 @@ export default function App() {
     {recheckError && <div className="session-overlay" role="alertdialog" aria-label="无法确认登录状态">
       <section className="session-overlay-card">
         <p>{recheckError}</p>
-        <button type="button" className="btn btn-primary" disabled={rechecking} onClick={recheck}>{rechecking ? '正在确认…' : '重试'}</button>
+        <div className="button-row">
+          <button type="button" className="btn" disabled={rechecking} onClick={signInAgain}>重新登录</button>
+          <button type="button" className="btn btn-primary" disabled={rechecking} onClick={recheck}>{rechecking ? '正在确认…' : '重试'}</button>
+        </div>
       </section>
     </div>}
   </>;

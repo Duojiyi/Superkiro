@@ -112,11 +112,11 @@ export default function ProvidersPage({providers, providerKeys, models, loading,
             onChange={next => void toggle(provider, next)}/>
         </div>
         {keys.length ? <div className="table-scroll"><table className="table keys-table">
-          <thead><tr><th>Key</th><th>模型</th><th className="num">权重</th><th className="col-status">状态</th><th className="col-actions"><span className="sr-only">操作</span></th></tr></thead>
+          <thead><tr><th className="col-key">Key</th><th>模型</th><th className="num col-weight">权重</th><th className="col-status">状态</th><th className="col-actions"><span className="sr-only">操作</span></th></tr></thead>
           <tbody>{keys.map(key => {
             const active = editing?.providerId === id && editing?.keyId === key.id;
             return <tr key={String(key.id)} className={active ? 'is-selected' : undefined}>
-              <td className="mono nowrap">{String(key.id)}</td>
+              <td className="mono nowrap col-key" title={String(key.id)}>{String(key.id)}</td>
               <td><ModelTags models={key.allowed_models}/></td>
               <td className="num">{String(key.weight ?? 1)}</td>
               <td className="col-status"><StatusBadge view={keyStatusView(key, nowSecs)}/></td>
@@ -131,10 +131,12 @@ export default function ProvidersPage({providers, providerKeys, models, loading,
       action={<button type="button" className="btn btn-small" onClick={() => void edit({})}>添加供应商</button>}/></section>}
 
     {editing && <ProviderKeyEditor key={`${editing.providerId ?? 'new'}:${editing.keyId ?? 'new'}`} selectedKey={selectedKey} preset={editing}
-      knownModels={models.map(model => String(model.target_model ?? '')).filter(Boolean)}
+      knownModels={models.map(model => String(model.target_model ?? '')).filter(Boolean)} knownProviders={providers.map(provider => String(provider.id))}
       onDirtyChange={onDirtyChange} onBusyChange={onBusyChange} onClose={() => void edit(null)}
       onSaved={saved => {
         if (saved) {mergeKey(saved); setEditing({providerId: String(saved.provider_id), keyId: String(saved.id)});}
+        // A new provider was saved: its card (with its first Key) appears after the refresh.
+        else {providerDirty.current = false; setEditing(null);}
         void refresh();
       }}/>}
   </div>;

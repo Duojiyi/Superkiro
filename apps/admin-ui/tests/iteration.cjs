@@ -43,7 +43,9 @@ const server=http.createServer(async(req,res)=>{
     await page.getByRole('region',{name:'制卡结果核对'}).waitFor();assert.equal(posts,1);
     await page.reload();await nav('卡密资产');
     await page.getByRole('region',{name:'制卡结果核对'}).waitFor();
-    await nav('＋ 批量生成');assert(await generate.isDisabled());await batchDialog.getByRole('button',{name:'取消',exact:true}).click();
+    // While that result is unconfirmed, 批量生成 says why instead of opening a form that cannot be sent.
+    const openBatch=page.getByRole('button',{name:'＋ 批量生成',exact:true});assert(await openBatch.isDisabled());
+    assert.equal(await openBatch.getAttribute('title'),'上次批量生成的结果未确认，请先在列表上方核对');
     await nav('查看这批卡');
     assert((await page.getByRole('textbox',{name:'搜索卡密',exact:true}).inputValue()).startsWith('批次 '));
     assert.equal(await page.locator('tbody tr').count(),3);
@@ -82,18 +84,23 @@ const server=http.createServer(async(req,res)=>{
     await nav('财务对账');
     const face=page.getByLabel('积分面值',{exact:true});await face.fill('0.8');
     await nav('运营概览');await answer(false);assert.equal(await face.inputValue(),'0.8');
-    await nav('重新加载');await answer(true);
+    await nav('放弃修改');await answer(true);
     await page.waitForFunction(()=>!document.querySelector('fieldset')?.disabled);
     await nav('运营概览');await page.getByRole('heading',{name:'运营概览',exact:true}).waitFor();
     // A known pre-commit insufficient-balance rejection must not lock unrelated cards.
     await nav('安全与审计');await nav('退出登录');await login();
     let adjustments=0;
-    await page.route('**/api/v1/admin/cards/adjust',route=>{adjustments++;return route.fulfill({status:409,json:{success:false,error:'Card error: Insufficient credit: available 2000000000 micro-credits, needed 3000000000'}});});
+    // The balance shown is 2000, but it dropped to 500 in the meantime: the server refuses before any commit.
+    await page.route('**/api/v1/admin/cards/adjust',route=>{adjustments++;return route.fulfill({status:409,json:{success:false,error:'Card error: Insufficient credit: available 500000000 micro-credits, needed 1000000000'}});});
     await page.getByRole('button',{name:'调账',exact:true}).first().click();
     await page.getByRole('radio',{name:'扣减',exact:true}).click();
+    // Deducting past the balance shown is stopped before review: the server would only refuse it.
     await page.getByLabel('增减积分数量').fill('3000');await page.getByLabel('调账原因说明').fill('test rejection');
+    const next=page.getByRole('button',{name:'下一步',exact:true});assert(await next.isDisabled());assert.equal(await next.getAttribute('title'),'余额不足');
+    assert.equal(adjustments,0);
+    await page.getByLabel('增减积分数量').fill('1000');
     await nav('下一步');await nav('确认入账');
-    await page.getByRole('dialog').getByRole('alert').filter({hasText:'服务端明确拒绝调账'}).waitFor();
+    await page.getByRole('dialog').getByRole('alert').filter({hasText:'服务器拒绝了这笔调账'}).waitFor();
     assert.equal(await page.getByLabel('增减积分数量').isDisabled(),false);assert.equal(adjustments,1);
     assert.equal(await page.evaluate(()=>Object.keys(sessionStorage).filter(k=>k.includes('pending-adjustment')).length),0);
     await nav('取消');await page.getByRole('button',{name:'调账',exact:true}).nth(1).click();

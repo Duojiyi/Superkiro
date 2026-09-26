@@ -11,7 +11,7 @@ import {FilterTabs, IdCell, Pager, StatusBadge, TableState, TopbarActions, copyT
 import {formatCharge, formatClock, formatCount, formatDateTime, formatDuration, formatFullDateTime, formatListTime, formatMoney, formatRelative, formatShortDate, formatSpeed, formatTokenCount} from '../format';
 import {errorClassLabel, TRACE_IN_PROGRESS, traceStatusView} from '../status';
 import type {Refresh, ReportError, TraceTab, TraceWindow, WriteGuards} from '../types';
-import {RawView, ReplyView, RequestView} from './TraceContent';
+import {ConversationView, RawView, ReplyView} from './TraceContent';
 
 const PAGE_SIZE = 50;
 const RETENTION = 86400;
@@ -31,20 +31,25 @@ export default function TracesPage({traces, cards, loading, failed, refresh, gua
   refresh: Refresh;
   guards: WriteGuards;
   reportError: ReportError;
-  intent?: {status?: TraceTab; window?: TraceWindow};
+  intent?: {status?: TraceTab; window?: TraceWindow; search?: string; open?: string};
   onOpenCard: (cardId: string) => void;
 }) {
   const {writing} = guards;
   const alive = useRef(true);
   useEffect(() => {alive.current = true; return () => {alive.current = false;};}, []);
-  const [query, setQuery] = useState('');
+  // Arriving from a card's details: that card's requests, with the one clicked already open.
+  const [query, setQuery] = useState(intent?.search ?? '');
   const [status, setStatus] = useState<TraceTab>(intent?.status ?? 'ALL');
   const [model, setModel] = useState('ALL');
+  const [provider, setProvider] = useState('ALL');
+  // Under 失败: one failure reason at a time.
+  const [reason, setReason] = useState<string | null>(null);
   const [range, setRange] = useState<TraceWindow>(intent?.window ?? 'all');
   const [sort, setSort] = useState<{key: SortKey; direction: 1 | -1}>({key: 'time', direction: -1});
   const [page, setPage] = useState(0);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(intent?.open ?? null);
   const [focusToken, setFocusToken] = useState(0);
+  const [followToken, setFollowToken] = useState(0);
   const [pruning, setPruning] = useState(false);
 
   // A full card ID in the search box asks the server for that card's own latest requests,
@@ -65,15 +70,22 @@ export default function TracesPage({traces, cards, loading, failed, refresh, gua
   const scopedToCard = !!cardScope && cardScope.cardId === exactCard && !!cardScope.traces;
   const source = scopedToCard ? cardScope!.traces! : traces;
 
-  useEffect(() => {setPage(0);}, [query, status, model, range, sort]);
+  useEffect(() => {setPage(0);}, [query, status, model, provider, reason, range, sort]);
+  useEffect(() => {if (status !== 'error') setReason(null);}, [status]);
 
   const nowSecs = Date.now() / 1000;
   const text = query.trim().toLowerCase();
   const scoped = source.filter(trace =>
     (range === 'all' || Number(trace.ts) > nowSecs - (range === 'hour' ? 3600 : RETENTION)) &&
     (model === 'ALL' || trace.exposed_model === model) &&
+    (provider === 'ALL' || trace.provider_id === provider) &&
     (!text || [trace.id, trace.invocation_id, trace.card_id, trace.exposed_model].some(value => String(value ?? '').toLowerCase().includes(text))));
-  const filtered = scoped.filter(trace => statusMatches(trace, status));
+  const filtered = scoped.filter(trace => statusMatches(trace, status) && (reason === null || String(trace.error_class ?? '') === reason));
+  // Failure reasons among the failed requests in view, most frequent first.
+  const reasonCounts = [...scoped.filter(trace => trace.status === 'error').reduce((counts, trace) => {
+    const key = String(trace.error_class ?? '');
+    return counts.set(key, (counts.get(key) ?? 0) + 1);
+  }, new Map<string, number>())].sort((a, b) => b[1] - a[1]);
   const sortValue = (trace: AdminTrace): number | null => sort.key === 'time' ? Number(trace.ts)
     : sort.key === 'ttft' ? (typeof trace.ttft_ms === 'number' ? trace.ttft_ms : null)
     : Number(trace.credits_charged ?? 0);
@@ -87,8 +99,9 @@ export default function TracesPage({traces, cards, loading, failed, refresh, gua
   const rows = filtered.slice(currentPage * PAGE_SIZE, (currentPage + 1) * PAGE_SIZE);
   const selectedIndex = selectedId ? filtered.findIndex(trace => trace.id === selectedId) : -1;
   const selected = selectedIndex >= 0 ? filtered[selectedIndex] : selectedId ? source.find(trace => trace.id === selectedId) ?? null : null;
-  const filtersActive = !!text || status !== 'ALL' || model !== 'ALL' || range !== 'all';
-  const resetFilters = () => {setQuery(''); setStatus('ALL'); setModel('ALL'); setRange('all'); setPage(0);};
+  const filtersActive = !!text || status !== 'ALL' || model !== 'ALL' || provider !== 'ALL' || reason !== null || range !== 'all';
+  const resetFilters = () => {setQuery(''); setStatus('ALL'); setModel('ALL'); setProvider('ALL'); setReason(null); setRange('all'); setPage(0);};
+  const providers = Array.from(new Set(source.map(trace => String(trace.provider_id ?? '')).filter(Boolean))).sort();
   const models = Array.from(new Set(source.map(trace => String(trace.exposed_model ?? '')).filter(Boolean))).sort();
   const oldest = source.length ? Math.min(...source.map(trace => Number(trace.ts))) : null;
   const tabs: TabOption<TraceTab>[] = ([['ALL', '全部'], ['error', '失败'], ['client_aborted', '中断'], ['in_progress', '进行中'], ['success', '成功']] as Array<[TraceTab, string]>)
@@ -101,7 +114,10 @@ export default function TracesPage({traces, cards, loading, failed, refresh, gua
     if (!next) return;
     setSelectedId(next.id);
     setPage(Math.floor((selectedIndex + step) / PAGE_SIZE));
+    setFollowToken(token => token + 1);
   };
+  // The selected row stays in view while ↑/↓ move through the list.
+  useEffect(() => {if (followToken) document.querySelector('.traces-table tr.is-selected')?.scrollIntoView({block: 'nearest'});}, [followToken]);
   useEffect(() => {if (focusToken) document.getElementById('trace-detail')?.focus({preventScroll: true});}, [focusToken]);
   useEffect(() => {
     if (!selectedId) return;
@@ -158,12 +174,22 @@ export default function TracesPage({traces, cards, loading, failed, refresh, gua
             {models.map(name => <option key={name} value={name}>{name}</option>)}
           </select>
         </label>
+        {providers.length > 1 && <label className="inline-field"><span>供应商</span>
+          <select aria-label="供应商筛选" value={provider} onChange={event => setProvider(event.target.value)}>
+            <option value="ALL">全部</option>
+            {providers.map(name => <option key={name} value={name}>{name}</option>)}
+          </select>
+        </label>}
         <div className="chips" role="group" aria-label="时间范围">
           {([['hour', '近 1 小时'], ['day', '近 24 小时'], ['all', '全部']] as Array<[TraceWindow, string]>).map(([value, label]) =>
             <button key={value} type="button" className="chip" aria-pressed={range === value} onClick={() => setRange(value)}>{label}</button>)}
         </div>
       </div>
       <FilterTabs label="追踪状态筛选" value={status} options={tabs} onChange={setStatus}/>
+      {status === 'error' && reasonCounts.length > 0 && <div className="chips reason-chips" role="group" aria-label="失败原因">
+        {reasonCounts.map(([key, count]) => <button key={key || 'none'} type="button" className="chip" aria-pressed={reason === key}
+          onClick={() => setReason(current => current === key ? null : key)}>{key ? errorClassLabel(key) : '未分类'} <span className="chip-count">{count}</span></button>)}
+      </div>}
     </div>
 
     <p className="filter-summary">
@@ -179,7 +205,7 @@ export default function TracesPage({traces, cards, loading, failed, refresh, gua
           <th aria-sort={ariaSort('time')}><button type="button" className="th-sort" onClick={() => toggleSort('time')}>时间{sortIcon('time')}</button></th>
           <th>卡密</th><th>模型</th><th>结果</th>
           <th className="num" aria-sort={ariaSort('ttft')}><button type="button" className="th-sort" onClick={() => toggleSort('ttft')}>首字{sortIcon('ttft')}</button></th>
-          <th className="num">速度</th><th className="num">Tokens 入 / 出</th><th className="num">耗时</th>
+          <th className="num col-speed">速度</th><th className="num col-tokens">Tokens 入 / 出</th><th className="num">耗时</th>
           <th className="num" aria-sort={ariaSort('charge')}><button type="button" className="th-sort" onClick={() => toggleSort('charge')}>扣费{sortIcon('charge')}</button></th>
           <th className="col-actions"><span className="sr-only">操作</span></th>
         </tr></thead>
@@ -198,8 +224,8 @@ export default function TracesPage({traces, cards, loading, failed, refresh, gua
                 {attempts > 1 && <span className="retry-count" title={`共尝试 ${attempts} 次`}>↻{attempts - 1}</span>}
               </span></td>
               <td className={`num ${ttftTone(trace.ttft_ms)}`} title={trace.ttft_ms == null ? '此请求没有计时（旧记录或非流式输出）' : undefined}>{formatDuration(trace.ttft_ms)}</td>
-              <td className={`num${typeof trace.tokens_per_second === 'number' && trace.tokens_per_second < 10 ? ' is-warning' : ''}`}>{formatSpeed(trace.tokens_per_second)}</td>
-              <td className="num" title={`输入 ${formatCount(trace.input_tokens ?? 0)} · 输出 ${formatCount(trace.output_tokens ?? 0)}`}>{formatTokenCount(trace.input_tokens ?? 0)} / {formatTokenCount(trace.output_tokens ?? 0)}</td>
+              <td className={`num col-speed${typeof trace.tokens_per_second === 'number' && trace.tokens_per_second < 10 ? ' is-warning' : ''}`}>{formatSpeed(trace.tokens_per_second)}</td>
+              <td className="num col-tokens" title={`输入 ${formatCount(trace.input_tokens ?? 0)} · 输出 ${formatCount(trace.output_tokens ?? 0)}`}>{formatTokenCount(trace.input_tokens ?? 0)} / {formatTokenCount(trace.output_tokens ?? 0)}</td>
               <td className="num">{attempts ? formatDuration(latency(trace)) : '—'}</td>
               <td className="num">{formatCharge(trace.credits_charged)}</td>
               <td className="col-actions"><span className="row-actions">
@@ -290,11 +316,11 @@ function TraceDrawer({trace, hasPrev, hasNext, onMove, onClose, onFilterCard, ca
 }
 
 type ContentState = {status: 'idle' | 'loading'} | {status: 'loaded'; data: TraceContent} | {status: 'missing' | 'error'; message: string};
-type ContentTab = 'request' | 'reply' | 'raw';
+type ContentTab = 'conversation' | 'reply' | 'raw';
 
 /** Loads the request content only when a tab is opened; every read is logged by the server. */
 function ContentSection({trace, onReply}: {trace: AdminTrace; onReply: (reply: TraceReply | null) => void}) {
-  const [tab, setTab] = useState<ContentTab | null>(null);
+  const [tab, setTab] = useState<ContentTab>('conversation');
   const [content, setContent] = useState<ContentState>({status: 'idle'});
   const alive = useRef(true);
   useEffect(() => {alive.current = true; return () => {alive.current = false;};}, []);
@@ -317,33 +343,33 @@ function ContentSection({trace, onReply}: {trace: AdminTrace; onReply: (reply: T
       setContent(error instanceof AdminApiError && error.status === 404 ? {status: 'missing', message: error.message} : {status: 'error', message: errorText(error)});
     }
   };
-  const openTab = (next: ContentTab) => {
-    setTab(next);
-    if (content.status === 'idle') void load();
-  };
+
   const until = new Date(expiresAt * 1000);
   const untilText = until.toDateString() === new Date().toDateString() ? formatClock(expiresAt) : `${formatShortDate(expiresAt)} ${formatClock(expiresAt)}`;
   const hoursLeft = Math.max(0, Math.ceil((expiresAt - nowSecs) / 3600));
 
+  const labels: Record<ContentTab, string> = {conversation: '对话', reply: '模型回复', raw: '原始 JSON'};
   return <section className="content-section">
     <div className="content-head">
-      <h4>请求内容</h4>
+      <h4>内容</h4>
       {expired ? <span className="muted">内容只保留 24 小时，已过期</span>
-        : <span className="muted">保留至 {untilText}（剩 {hoursLeft} 小时）· 查看会被记录</span>}
+        : content.status === 'missing' ? null
+        : <span className="muted">保留至 {untilText}（剩 {hoursLeft} 小时）</span>}
     </div>
-    {!expired && <>
-      <div className="content-tabs" role="tablist" aria-label="请求内容">
-        {([['request', '请求内容'], ['reply', '模型回复'], ['raw', '原始 JSON']] as Array<[ContentTab, string]>).map(([value, label]) =>
-          <button key={value} type="button" role="tab" aria-selected={tab === value} className={`content-tab${tab === value ? ' is-active' : ''}`} onClick={() => openTab(value)}>{label}</button>)}
+    {!expired && content.status === 'idle' && <p><button type="button" className="btn btn-small" onClick={() => void load()}>查看内容（会记录）</button></p>}
+    {!expired && content.status === 'loading' && <div className="skeleton" role="status" aria-label="正在加载"><span className="skeleton-bar"/><span className="skeleton-bar"/><span className="skeleton-bar"/></div>}
+    {content.status === 'missing' && <p className="empty-note">{content.message}</p>}
+    {content.status === 'error' && <div className="list-state" role="status"><p>读取失败：{content.message}</p><button type="button" className="btn btn-small" onClick={() => void load()}>重试</button></div>}
+    {content.status === 'loaded' && <>
+      <div className="content-tabs" role="tablist" aria-label="内容">
+        {(Object.keys(labels) as ContentTab[]).map(value =>
+          <button key={value} type="button" role="tab" aria-selected={tab === value} className={`content-tab${tab === value ? ' is-active' : ''}`} onClick={() => setTab(value)}>{labels[value]}</button>)}
       </div>
-      {tab && <div className="drawer-content" role="tabpanel" tabIndex={0} aria-label={{request: '请求内容', reply: '模型回复', raw: '原始 JSON'}[tab]}>
-        {content.status === 'loading' && <div className="skeleton" role="status" aria-label="正在加载"><span className="skeleton-bar"/><span className="skeleton-bar"/><span className="skeleton-bar"/></div>}
-        {content.status === 'missing' && <p className="empty-note">{content.message}</p>}
-        {content.status === 'error' && <div className="list-state" role="status"><p>读取失败：{content.message}</p><button type="button" className="btn btn-small" onClick={() => void load()}>重试</button></div>}
-        {content.status === 'loaded' && tab === 'request' && <RequestView content={content.data}/>}
-        {content.status === 'loaded' && tab === 'reply' && <ReplyView reply={content.data.reply}/>}
-        {content.status === 'loaded' && tab === 'raw' && <RawView content={content.data}/>}
-      </div>}
+      <div className="drawer-content" role="tabpanel" tabIndex={0} aria-label={labels[tab]}>
+        {tab === 'conversation' && <ConversationView content={content.data}/>}
+        {tab === 'reply' && <ReplyView reply={content.data.reply}/>}
+        {tab === 'raw' && <RawView content={content.data}/>}
+      </div>
     </>}
   </section>;
 }

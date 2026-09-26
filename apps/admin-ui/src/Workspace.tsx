@@ -4,7 +4,7 @@ import {adminApi, type AdminAnnouncement, type AdminCardItem, type AdminFinancia
 import CommercialEditor from './CommercialEditor';
 import {ConfirmHost, confirmAction} from './components/confirm';
 import {IconClose, IconRefresh, IconWarning} from './components/icons';
-import {ModalRootContext} from './components/modal';
+import {isModalOpen, ModalRootContext} from './components/modal';
 import {ToastHost, toast} from './components/toast';
 import {TopbarSlotContext} from './components/ui';
 import {formatClock, formatFullDateTime, formatSessionLeft} from './format';
@@ -65,7 +65,9 @@ function SessionWarning() {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {const timer = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(timer);}, []);
   const left = adminApi.sessionExpiresAt - now;
-  return <span className="session-warning" role="status">会话 {formatSessionLeft(left)} 后到期（草稿会保留）</span>;
+  // Only in the last two minutes; a session renewed in another tab makes it go away.
+  if (!(left > 0 && left <= 120_000)) return null;
+  return <span className="session-warning" role="status">{`会话 ${formatSessionLeft(left)}后到期（草稿会保留）`}</span>;
 }
 
 export default function AdminWorkspace({onLogout, operator, expiring, onReauthenticate}: {
@@ -111,6 +113,8 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
   const [modalRoot, setModalRoot] = useState<HTMLElement | null>(null);
   const [topbarSlot, setTopbarSlot] = useState<HTMLElement | null>(null);
   const [keyEditing, setKeyEditing] = useState<KeyEditing | null>(null);
+  // Bumped by the operator's 刷新, so pages that load on their own (the editors) reload too.
+  const [refreshEpoch, setRefreshEpoch] = useState(0);
 
   // Refreshes can overlap; only the latest may write, so a slow older one never undoes newer data.
   const refreshSeq = useRef(0);
@@ -172,6 +176,21 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
 
   useEffect(() => {void refreshData();}, [refreshData]);
 
+  // Overview and traces refresh themselves every minute, quietly, as background requests (they
+  // do not keep the session alive). Paused while anything is open, being written or edited.
+  const autoRefresh = activeTab === 'overview' || activeTab === 'traces';
+  const loadingRef = useRef(loading);
+  loadingRef.current = loading;
+  useEffect(() => {
+    if (!autoRefresh) return;
+    const timer = setInterval(() => {
+      if (document.hidden || loadingRef.current || writing.current || pageBusy.current || editorBusy.current || commercialDirty.current || providerDirty.current) return;
+      if (isModalOpen() || document.querySelector('.drawer, [role="menu"], [role="alertdialog"]')) return;
+      void adminApi.inBackground(() => refreshData({keepSelection: true}));
+    }, 60_000);
+    return () => clearInterval(timer);
+  }, [autoRefresh, refreshData]);
+
   const navigate = async (tab: Tab, next?: Intent) => {
     if (pageBusy.current) return;
     if (tab === activeTab && !next) return;
@@ -192,7 +211,9 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
 
   const nowSecs = Date.now() / 1000;
   const failedLastHour = data.traces.filter(trace => trace.status === 'error' && Number(trace.ts) > nowSecs - 3600).length;
-  const keyAlerts = data.providerKeys.filter(key => key.enabled !== false && (keyCooldownLeft(key, nowSecs) > 0 || key.health_state === 'degraded')).length;
+  // Keys of a disabled provider serve nothing, so they raise no badge.
+  const keyAlerts = data.providerKeys.filter(key => key.enabled !== false && data.providers.find(provider => provider.id === key.provider_id)?.enabled !== false
+    && (keyCooldownLeft(key, nowSecs) > 0 || key.health_state === 'degraded')).length;
   const badges: Partial<Record<Tab, {count: number; tone: 'danger' | 'warning'; text: string}>> = {
     ...(failedLastHour ? {traces: {count: failedLastHour, tone: 'danger' as const, text: `近 1 小时 ${failedLastHour} 次失败`}} : {}),
     ...(keyAlerts ? {providers: {count: keyAlerts, tone: 'warning' as const, text: `${keyAlerts} 个 Key 冷却中或异常`}} : {}),
@@ -231,9 +252,9 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
             <div className="topbar-slot" ref={setTopbarSlot}/>
             {expiring && <SessionWarning/>}
             <span className="sync-time" title={syncedAt ? `上次完整加载：${formatFullDateTime(syncedAt / 1000)}` : undefined}>
-              {syncedAt ? `${formatClock(syncedAt / 1000)} 更新` : '未加载'}
+              {syncedAt ? `${formatClock(syncedAt / 1000)} 更新${autoRefresh ? ' · 自动' : ''}` : '未加载'}
             </span>
-            <button type="button" className="btn btn-refresh" disabled={loading || busyPage} onClick={() => void refreshData()}>
+            <button type="button" className="btn btn-refresh" disabled={loading || busyPage} onClick={() => {setRefreshEpoch(value => value + 1); void refreshData();}}>
               <IconRefresh/>{loading ? '刷新中…' : '刷新'}
             </button>
           </div>
@@ -263,14 +284,15 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
               failed={!!failures.cards} operator={operator} refresh={refreshData} guards={guards} reportError={reportError}
               actionError={actionError?.text ?? ''} onBusyChange={markPageBusy} onReauthenticate={onReauthenticate}
               selectionEpoch={selectionEpoch} intent={intent.cards}
-              updateCards={cards => setData(previous => ({...previous, cards}))}/>}
+              updateCards={cards => setData(previous => ({...previous, cards}))}
+              onOpenTrace={(cardId, traceId) => void navigate('traces', {traces: {search: cardId, open: traceId}})}/>}
             {activeTab === 'traces' && <TracesPage traces={data.traces} cards={data.cards} loading={loading} failed={!!failures.traces}
               refresh={refreshData} guards={guards} reportError={reportError} intent={intent.traces}
               onOpenCard={cardId => void navigate('cards', {cards: {status: 'ALL', search: cardId}})}/>}
             {activeTab === 'groups' && <CommercialEditor key="groups" kind="groups" onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy}
-              cards={data.cards} onPublished={() => void refreshData({keepSelection: true})}/>}
+              cards={data.cards} onPublished={() => void refreshData({keepSelection: true})} refreshEpoch={refreshEpoch}/>}
             {activeTab === 'models' && <CommercialEditor key="models" kind="models" onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy}
-              onPublished={() => void refreshData({keepSelection: true})}/>}
+              onPublished={() => void refreshData({keepSelection: true})} refreshEpoch={refreshEpoch}/>}
             {activeTab === 'providers' && <ProvidersPage providers={data.providers} providerKeys={data.providerKeys} models={data.models}
               loading={loading} failed={!!failures.providers} refresh={refreshData} guards={guards} reportError={reportError}
               editing={keyEditing} setEditing={setKeyEditing} providerDirty={providerDirty} editorBusy={editorBusy}
@@ -282,7 +304,7 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
               refresh={refreshData} guards={guards} reportError={reportError}
               updateAnnouncements={announcements => setData(previous => ({...previous, announcements}))}/>}
             {activeTab === 'reconciliation' && <FinancePage financials={data.financials} loading={loading} failed={!!failures.financials}
-              refresh={refreshData} reportError={reportError} onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy}/>}
+              refresh={refreshData} reportError={reportError} onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy} refreshEpoch={refreshEpoch}/>}
             {activeTab === 'security' && <SecurityPage operator={operator} keyCount={providersLoaded ? data.providerKeys.length : null}
               onLogout={() => void onLogout(false)} onLogoutAll={() => void logoutAll()}/>}
           </div>

@@ -101,7 +101,43 @@ function toolName(tool: unknown): {name: string; description: string} {
   return {name: text(spec.name) || '未命名', description: text(spec.description)};
 }
 
-export function RequestView({content}: {content: TraceContent}) {
+/** The request, parsed; `null` when it is not a Kiro conversation we can read. */
+function parseRequest(content: TraceContent) {
+  const notes = content.notes ?? {};
+  const request = isObject(content.request) ? content.request : {};
+  if (notes.unparsed || typeof request.unparsed === 'string' || notes.truncated || request.tooLarge) return null;
+  const state = isObject(request.conversationState) ? request.conversationState : null;
+  if (!state) return null;
+  const history = list(state.history).filter(isObject);
+  const currentMessage = isObject(state.currentMessage) && isObject(state.currentMessage.userInputMessage) ? state.currentMessage.userInputMessage : null;
+  const omitted = [
+    notes.omittedHistoryEntries ? `${formatCount(notes.omittedHistoryEntries)} 条较早的历史` : '',
+    notes.omittedImages ? `${formatCount(notes.omittedImages)} 张图片的内容` : '',
+  ].filter(Boolean);
+  return {history, currentMessage, omitted};
+}
+
+/** This turn first: what the customer asked, then what the model answered; earlier turns folded. */
+export function ConversationView({content}: {content: TraceContent}) {
+  const parsed = parseRequest(content);
+  if (!parsed) return <RequestView content={content}/>;
+  const {history, currentMessage, omitted} = parsed;
+  const rounds = history.filter(entry => isObject(entry.userInputMessage)).length;
+  return <div className="conversation">
+    {currentMessage ? <Turn entry={{userInputMessage: currentMessage}} current/> : <p className="muted">没有本次输入</p>}
+    <article className="turn turn-model is-reply">
+      <header className="turn-head">模型回复</header>
+      <ReplyView reply={content.reply ?? null} compact/>
+    </article>
+    {omitted.length > 0 && <p className="muted">已省略 {omitted.join('、')}</p>}
+    {rounds > 0 && <details className="history-block">
+      <summary>展开 {formatCount(rounds)} 轮历史</summary>
+      <RequestView content={content} hideCurrent/>
+    </details>}
+  </div>;
+}
+
+export function RequestView({content, hideCurrent}: {content: TraceContent; hideCurrent?: boolean}) {
   const notes = content.notes ?? {};
   const request = isObject(content.request) ? content.request : {};
   const omitted = [
@@ -122,7 +158,7 @@ export function RequestView({content}: {content: TraceContent}) {
   const contexts = [currentMessage, ...history.map(entry => entry.userInputMessage)].filter(isObject).map(message => message.userInputMessageContext).filter(isObject);
   const tools = contexts.map(context => list(context.tools)).find(entries => entries.length) ?? [];
   return <div className="conversation">
-    {omitted.length > 0 && <p className="muted">已省略 {omitted.join('、')}</p>}
+    {omitted.length > 0 && !hideCurrent && <p className="muted">已省略 {omitted.join('、')}</p>}
     {text(request.systemPrompt) && <details className="tool-block"><summary>系统提示词</summary><LongText value={text(request.systemPrompt)}/></details>}
     {tools.length > 0 && <details className="tool-block">
       <summary>{tools.length} 个可用工具</summary>
@@ -133,16 +169,16 @@ export function RequestView({content}: {content: TraceContent}) {
       <details className="tool-block"><summary>工具定义 JSON</summary><pre className="code-block">{prettyJson(tools)}</pre></details>
     </details>}
     {history.map((entry, index) => <Turn key={index} entry={entry}/>)}
-    {currentMessage && <Turn entry={{userInputMessage: currentMessage}} current/>}
+    {currentMessage && !hideCurrent && <Turn entry={{userInputMessage: currentMessage}} current/>}
   </div>;
 }
 
-export function ReplyView({reply}: {reply: TraceReply | null}) {
+export function ReplyView({reply, compact}: {reply: TraceReply | null; compact?: boolean}) {
   if (!reply) return <p className="empty-note">没有记录到回复（请求未完成，或在开始输出前失败）</p>;
   const stop = stopReasonView(reply.stopReason);
   const calls = list(reply.toolCalls).filter(isObject) as TraceReply['toolCalls'];
   return <div className="reply">
-    <p className="reply-meta">{stop && <StatusBadge view={stop}/>}<span className="mono muted">{[reply.providerId, reply.targetModel].filter(Boolean).join(' / ')}</span></p>
+    {!compact && <p className="reply-meta">{stop && <StatusBadge view={stop}/>}<span className="mono muted">{[reply.providerId, reply.targetModel].filter(Boolean).join(' / ')}</span></p>}
     {reply.error && <p className="form-error">{reply.error}</p>}
     {reply.truncated && <p className="note-warning">回复超长，只保留了前 1 MB</p>}
     {reply.text ? <section className="text-section">
@@ -161,14 +197,15 @@ export function ReplyView({reply}: {reply: TraceReply | null}) {
         <CopyButton text={prettyJson(call.arguments)} label="复制参数"/>
       </details>)}
     </section>}
-    <dl className="usage-grid">
+    {!compact && <dl className="usage-grid">
       <div><dt>输入</dt><dd>{formatCount(reply.inputTokens)}</dd></div>
       <div><dt>输出</dt><dd>{formatCount(reply.outputTokens)}</dd></div>
       <div><dt>缓存读</dt><dd>{formatCount(reply.cacheReadTokens)}</dd></div>
       <div><dt>缓存写</dt><dd>{formatCount(reply.cacheWriteTokens)}</dd></div>
       <div><dt>首字</dt><dd>{formatDuration(reply.ttftMs)}</dd></div>
       <div><dt>速度</dt><dd>{formatSpeed(reply.tokensPerSecond)}</dd></div>
-    </dl>
+    </dl>}
+    {compact && stop && <p className="reply-meta"><StatusBadge view={stop}/></p>}
   </div>;
 }
 

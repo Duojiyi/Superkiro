@@ -57,8 +57,10 @@ const server=http.createServer(async(req,res)=>{
     await page.route('**/api/v1/admin/providers/keys/discover',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({success:true,models:['fixture-discovered']})}));
     await page.getByRole('button',{name:'获取模型列表',exact:true}).click();
     await page.getByRole('button',{name:'全部加入',exact:true}).waitFor();
-    // Models found for one key are never offered for another.
-    await page.getByLabel('Key ID',{exact:true}).fill('another-key');
+    // Models found with one credential are never offered for another (an existing Key's ID is fixed;
+    // changing its secret drops the list).
+    assert(await page.getByLabel('Key ID',{exact:true}).evaluate(el=>el.readOnly));
+    await page.getByLabel('API Key',{exact:true}).fill('another-secret');
     assert.equal(await page.getByRole('button',{name:'全部加入',exact:true}).count(),0);
     await page.route('**/api/v1/admin/providers/keys',route=>route.fulfill({status:200,contentType:'application/json',body:'{"success":false}'}));
     await page.getByRole('button',{name:'保存',exact:true}).click();await answer(page,true);

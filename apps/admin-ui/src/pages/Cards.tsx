@@ -1,17 +1,18 @@
 // 卡密资产: one line per card, status tabs with counts, a selection bar that appears only
 // when cards are selected, and the dialogs to issue, view and adjust cards.
-import {useEffect, useRef, useState} from 'react';
+import {useEffect, useRef, useState, type MouseEvent as ReactMouseEvent} from 'react';
 import {clearAdjustment, isUnsubmittedAdjustmentRejection, isZeroMicroAdjustment, loadAdjustment, saveAdjustment, type Adjustment} from '../adjustment';
 import {adminApi, AdminApiError, type AdminCardItem, type GeneratedCard} from '../api';
 import {ask, confirmAction} from '../components/confirm';
 import {IconChevronDown, IconClose, IconSearch, IconSortDown, IconSortUp} from '../components/icons';
 import {Menu, type MenuItem} from '../components/menu';
-import {Modal} from '../components/modal';
+import {isModalOpen, Modal} from '../components/modal';
 import {toast} from '../components/toast';
 import {FilterTabs, IdCell, Pager, StatusBadge, TableState, Tag, TopbarActions, type TabOption} from '../components/ui';
 import {formatBatchNote, formatCount, formatCredits, formatFullDateTime, formatMoney, formatRemaining, shortId} from '../format';
 import {adjustmentPointsToMicro} from '../pricing';
 import {cardStatusView} from '../status';
+import CardDrawer from './CardDrawer';
 import type {CardQuickFilter, CardTab, ErrorAction, Refresh, ReportError, Row, WriteGuards} from '../types';
 
 const TIERS = [
@@ -31,11 +32,29 @@ const BULK_CONSEQUENCE: Record<BulkAction, string> = {
   freeze: '客户将暂时无法使用，可随时解冻。',
   unfreeze: '恢复使用，仍受有效期和余额限制。',
   ban: '封禁后不能恢复，也不会自动退款。',
-  void: '不能恢复，余额作废且不退款（财务与审计记录保留）；有进行中请求的卡会被拒绝，请先冻结再作废。',
-  archive: '只从列表中隐藏，卡的状态和余额不变（只能归档已封禁、已到期或已作废的卡）。',
+  void: '不能恢复，余额作废不退款。正在使用的卡请先冻结。',
+  archive: '只从列表隐藏，不改状态和余额。',
   unarchive: '重新显示在当前列表中，不会恢复使用权限。',
   export: '文件含明文卡密，请妥善保管。',
 };
+
+// A CSV cell a spreadsheet will not run as a formula.
+function csvCell(value: string | number): string {
+  const text = String(value);
+  return `"${(/^[=+@\-\t\r]/.test(text) ? "'" + text : text).replace(/"/g, '""')}"`;
+}
+
+function downloadCsv(name: string, rows: Array<Array<string | number>>) {
+  const csv = rows.map(row => row.map(csvCell).join(',')).join('\r\n');
+  const url = URL.createObjectURL(new Blob(['\uFEFF' + csv], {type: 'text/csv;charset=utf-8'}));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = name;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
 
 // Refused by the server's validation or policy: nothing was written, so no review is needed.
 const refused = (error: unknown) => error instanceof AdminApiError && [400, 403, 404, 409, 413, 422].includes(error.status);
@@ -93,7 +112,7 @@ function Devices({card}: {card: AdminCardItem}) {
 
 interface Generated {cards: GeneratedCard[]; tier: string; points: number; groupName: string}
 
-export default function CardsPage({cards, groups, configFailed, loading, failed, operator, refresh, guards, reportError, actionError, onBusyChange, onReauthenticate, selectionEpoch, intent, updateCards}: {
+export default function CardsPage({cards, groups, configFailed, loading, failed, operator, refresh, guards, reportError, actionError, onBusyChange, onReauthenticate, selectionEpoch, intent, updateCards, onOpenTrace}: {
   cards: AdminCardItem[];
   groups: Row[];
   configFailed: boolean;
@@ -109,6 +128,8 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
   selectionEpoch: number;
   intent?: {status?: CardTab; quick?: CardQuickFilter; search?: string};
   updateCards: (cards: AdminCardItem[]) => void;
+  /** Opens 调用追踪 for one card, with one request's details open when given. */
+  onOpenTrace: (cardId: string, traceId?: string) => void;
 }) {
   const {writing, mounted} = guards;
   const alive = useRef(true);
@@ -125,7 +146,8 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [bulkBusy, setBulkBusy] = useState(false);
   const [progress, setProgress] = useState<{done: number; total: number} | null>(null);
-  const [report, setReport] = useState<{summary: string; failures: Array<{id: string; result: string}>} | null>(null);
+  // Skipped cards (not applicable) and real failures are reported apart: only failures are red.
+  const [report, setReport] = useState<{summary: string; failures: Array<{id: string; result: string}>; skipped: Array<{id: string; result: string}>} | null>(null);
   const [mutationBusy, setMutationBusy] = useState(false);
   const [revealing, setRevealing] = useState(false);
   const [revealed, setRevealed] = useState<{cardId: string; rawCode: string} | null>(null);
@@ -133,7 +155,7 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
 
   // Issuing.
   const [showBatch, setShowBatch] = useState(false);
-  const [batchCount, setBatchCount] = useState('50');
+  const [batchCount, setBatchCount] = useState('10');
   const [batchGroup, setBatchGroup] = useState('');
   const [batchTemplate, setBatchTemplate] = useState('tier-2000');
   const [batchNote, setBatchNote] = useState('');
@@ -193,6 +215,38 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
   const currentPage = Math.min(page, pageCount - 1);
   const pageCards = filtered.slice(currentPage * PAGE_SIZE, (currentPage + 1) * PAGE_SIZE);
   const pageCardIds = JSON.stringify(pageCards.map(card => card.id));
+
+  // ---- Card details: a row click opens them; ↑/↓ move through the rows in view ----
+  const [detailId, setDetailId] = useState<string | null>(null);
+  const detailCard = detailId ? cards.find(card => card.id === detailId) ?? null : null;
+  const detailIndex = detailId ? filtered.findIndex(card => card.id === detailId) : -1;
+  const moveDetail = (step: number) => {
+    const next = detailIndex >= 0 ? filtered[detailIndex + step] : undefined;
+    if (!next) return;
+    setDetailId(next.id);
+    setPage(Math.floor((detailIndex + step) / PAGE_SIZE));
+    setDetailFollow(token => token + 1);
+  };
+  const [detailFollow, setDetailFollow] = useState(0);
+  useEffect(() => {if (detailFollow) document.querySelector('.cards-table tr.is-open')?.scrollIntoView({block: 'nearest'});}, [detailFollow]);
+  useEffect(() => {
+    if (!detailId) return;
+    const keydown = (event: KeyboardEvent) => {
+      if ((event.key !== 'ArrowDown' && event.key !== 'ArrowUp') || event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || isModalOpen()) return;
+      const target = event.target instanceof HTMLElement ? event.target : null;
+      if (target?.closest('input, textarea, select, [contenteditable="true"], [role="tablist"], [role="menu"]')) return;
+      event.preventDefault();
+      moveDetail(event.key === 'ArrowDown' ? 1 : -1);
+    };
+    document.addEventListener('keydown', keydown);
+    return () => document.removeEventListener('keydown', keydown);
+  });
+  const openDetail = (event: ReactMouseEvent, card: AdminCardItem) => {
+    // Ticking the box or using a row button is not a request for details.
+    // (An icon inside a button is an SVG element, so this checks Element, not HTMLElement.)
+    if (event.target instanceof Element && event.target.closest('input, button, a, label, select, [role="menu"]')) return;
+    setDetailId(card.id);
+  };
   useEffect(() => {
     const visible: string[] = JSON.parse(pageCardIds);
     setSelectedIds(ids => ids.filter(id => visible.includes(id)));
@@ -221,7 +275,7 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
       consequence: {freeze: '客户将暂时无法使用，可随时解冻。', unfreeze: '恢复使用，仍受有效期和余额限制。', ban: '封禁后不能恢复，也不会自动退款。'}[action],
       confirmLabel: verb,
       danger: action === 'ban',
-      reason: {label: '原因（可选）', placeholder: `不填写时记为“管理员手动操作：${verb}”`, suggestions: action === 'unfreeze' ? ['核实无误', '客户要求'] : REASONS, maxLength: 100},
+      reason: {label: '原因', placeholder: '可不填', suggestions: action === 'unfreeze' ? ['核实无误', '客户要求'] : REASONS, maxLength: 100},
     });
     if (!answer.confirmed || !alive.current || writing.current) return;
     try {
@@ -250,46 +304,64 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
       } catch {reportError('调账恢复记录无法读取，请先核对账本；本次未发送作废请求。'); return;}
     }
     const verb = VERB[action];
+    const nowSecs = Date.now() / 1000;
+    const skipReason = (card: AdminCardItem): string | null => {
+      if (action === 'export') return card.codeRecoverable ? null : '历史卡密不可恢复';
+      const expired = card.validUntil != null && card.validUntil <= nowSecs;
+      if (action === 'archive') return card.archivedAt == null && (['banned', 'expired', 'voided'].includes(card.status) || expired) ? null : '不符合归档条件或已归档';
+      if (action === 'unarchive') return card.archivedAt != null ? null : '未归档';
+      if ((action === 'freeze' && card.status !== 'active') || (action === 'unfreeze' && card.status !== 'frozen')
+        || (action === 'ban' && ['banned', 'voided'].includes(card.status)) || (action === 'void' && card.status === 'voided')) return `${cardStatusView(card.status).label}，状态不适用`;
+      return null;
+    };
+    const skipped = targets.filter(card => skipReason(card)).map(card => ({id: card.id, result: `跳过（${skipReason(card)}）`}));
+    const eligible = targets.filter(card => !skipReason(card));
+    if (!eligible.length) {
+      reportError('');
+      setReport({summary: `选中的 ${targets.length} 张都不能${verb}，已跳过`, failures: [], skipped});
+      return;
+    }
     // Name what is about to change: a count alone let a mis-ticked page be voided.
-    const named = targets.slice(0, 8).map(card => shortId(card.id, 'card')).join('、') + (targets.length > 8 ? ` 等 ${targets.length} 张` : '');
-    const activated = targets.filter(card => card.status !== 'unactivated').length;
-    const withBalance = targets.filter(card => card.creditTotal > card.creditUsed).length;
+    const named = eligible.slice(0, 8).map(card => shortId(card.id, 'card')).join('、') + (eligible.length > 8 ? ` 等 ${eligible.length} 张` : '');
+    const activated = eligible.filter(card => card.status !== 'unactivated').length;
+    const withBalance = eligible.filter(card => card.creditTotal > card.creditUsed).length;
     const irreversible = action === 'ban' || action === 'void';
-    const confirmed = await confirmAction({
-      title: `${verb} ${targets.length} 张卡密？`,
-      facts: [named, `其中 ${activated} 张已激活、${withBalance} 张有剩余额度`],
+    const answer = await ask({
+      title: `${verb} ${eligible.length} 张卡密？`,
+      facts: [named, `其中 ${activated} 张已激活、${withBalance} 张有剩余额度`, ...(skipped.length ? [`另有 ${skipped.length} 张状态不适用，将跳过`] : [])],
       consequence: BULK_CONSEQUENCE[action],
-      confirmLabel: verb,
+      confirmLabel: `${verb} ${eligible.length} 张`,
       danger: irreversible,
-      typed: irreversible ? String(targets.length) : undefined,
+      typed: irreversible ? String(eligible.length) : undefined,
+      // The reason is kept in each card's history; voiding needs one.
+      reason: ['freeze', 'unfreeze', 'ban', 'void'].includes(action)
+        ? {label: '原因', placeholder: action === 'void' ? '例：测试卡清理' : '可不填', suggestions: action === 'unfreeze' ? ['核实无误', '客户要求'] : REASONS, maxLength: 100, required: action === 'void'}
+        : undefined,
     });
-    if (!confirmed || !alive.current || writing.current || !mounted.current) return;
+    if (!answer.confirmed || !alive.current || writing.current || !mounted.current) return;
+    if (action === 'void' && !answer.reason) return;
+    const statusReason = answer.reason || `管理员批量操作：${verb}`;
     writing.current = true; setBulkBusy(true); setReport(null); reportError('');
-    setProgress({done: 0, total: targets.length});
+    setProgress({done: 0, total: eligible.length});
     const failures: Array<{id: string; result: string}> = [];
     const keepSelected = new Set<string>();
     const codes: string[] = [];
     let succeeded = 0;
     try {
-      for (let index = 0; index < targets.length; index++) {
-        const card = targets[index];
+      for (let index = 0; index < eligible.length; index++) {
+        const card = eligible[index];
         if (!alive.current) break;
         try {
+          // The state may have changed since the confirmation: check again, never send what does not apply.
+          const late = skipReason(card);
+          if (late) {skipped.push({id: card.id, result: `跳过（${late}）`}); continue;}
           if (action === 'export') {
-            if (!card.codeRecoverable) {failures.push({id: card.id, result: '失败：历史卡密不可恢复'}); continue;}
             const response = await adminApi.revealCard(card.id);
             if (!alive.current) break;
             if (!response.success || !response.rawCode) throw new Error('reveal failed');
             codes.push(response.rawCode);
           } else {
-            const expired = card.validUntil != null && card.validUntil <= Date.now() / 1000;
-            if ((action === 'archive' && (card.archivedAt != null || !(['banned', 'expired', 'voided'].includes(card.status) || expired))) || (action === 'unarchive' && card.archivedAt == null)) {
-              failures.push({id: card.id, result: '未执行：不符合归档条件或已是目标状态'}); continue;
-            }
-            if ((action === 'freeze' && card.status !== 'active') || (action === 'unfreeze' && card.status !== 'frozen') || (action === 'ban' && ['banned', 'voided'].includes(card.status)) || (action === 'void' && card.status === 'voided')) {
-              failures.push({id: card.id, result: '未执行：当前状态不适用该操作'}); continue;
-            }
-            const response = await adminApi.updateCardStatus(card.id, action, `管理员批量操作：${verb}`);
+            const response = await adminApi.updateCardStatus(card.id, action, statusReason);
             if (!response.success) throw new Error('status failed');
             succeeded++;
           }
@@ -297,14 +369,14 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
           // Do not retain server error bodies in a secret-bearing operation.
           failures.push({id: card.id, result: action === 'export' ? '读取失败，请核对会话或卡密可恢复性' : '失败或结果未确认，请刷新核对后再操作'});
           if (error instanceof AdminApiError && (error.status === 401 || error.status === 403)) {
-            for (const pending of targets.slice(index + 1)) failures.push({id: pending.id, result: '未执行：管理会话或权限失效'});
+            for (const pending of eligible.slice(index + 1)) failures.push({id: pending.id, result: '未执行：管理会话或权限失效'});
             // No file from a session that was just rejected: every card stays selected.
             if (action === 'export') for (const target of targets) keepSelected.add(target.id);
             codes.length = 0;
             break;
           }
         } finally {
-          if (alive.current) setProgress({done: index + 1, total: targets.length});
+          if (alive.current) setProgress({done: index + 1, total: eligible.length});
         }
       }
       if (alive.current && action === 'export' && codes.length) {
@@ -324,9 +396,11 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
     } finally {
       codes.length = 0;
       if (alive.current) {
-        for (const item of failures) keepSelected.add(item.id);
+        for (const item of [...failures, ...skipped]) keepSelected.add(item.id);
         const summary = action === 'export' ? `已开始下载 ${succeeded} 张卡密` : `${succeeded} 张已${verb}`;
-        if (failures.length) setReport({summary: `${succeeded ? `${summary} · ` : ''}${failures.length} 张未完成`, failures});
+        if (failures.length || skipped.length) {
+          setReport({summary: [succeeded ? summary : '', failures.length ? `${failures.length} 张未完成` : '', skipped.length ? `${skipped.length} 张跳过（状态不适用）` : ''].filter(Boolean).join(' · '), failures, skipped});
+        }
         if (succeeded) toast.success(action === 'export' ? `${summary}，请核对下载文件` : summary);
         setSelectedIds([...keepSelected]);
         setProgress(null);
@@ -398,7 +472,10 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
   const adjustDelta = 'delta' in parsedAdjust ? parsedAdjust.delta : null;
   const reasonText = adjustReason.trim();
   const reasonValid = !!reasonText && reasonText.length <= 500;
-  const adjustReady = adjustDelta !== null && reasonValid;
+  // A new deduction past the balance would only be refused by the server. A pending intent is
+  // replayed as it was (its effect may already be in the balance), so it is never blocked here.
+  const overdrawn = !pendingIntent && adjustCard !== null && adjustDelta !== null && adjustCard.pointsAvailable + adjustDelta < 0;
+  const adjustReady = adjustDelta !== null && reasonValid && !overdrawn;
   const adjustAfter = adjustCard && adjustDelta !== null ? adjustCard.pointsAvailable + adjustDelta : null;
   const signed = (value: number) => `${value > 0 ? '+' : ''}${formatCredits(value)}`;
 
@@ -426,7 +503,7 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
       if (sent && adjustment.current && error instanceof AdminApiError && isUnsubmittedAdjustmentRejection(error.status, error.message, adjustment.current)) {
         try {
           clearAdjustment(sessionStorage, adjustment.current); setIntent(null); setAdjustStep('form');
-          reportError('服务端明确拒绝调账，未入账；已清除该无效意图，请检查卡密状态、账面余额与调账金额。');
+          reportError('服务器拒绝了这笔调账，未入账。请检查卡的状态和余额。');
         } catch {reportError('该调账未入账，但本地记录未能清除，请检查浏览器存储。');}
         return;
       }
@@ -503,12 +580,9 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
 
   const downloadGenerated = () => {
     if (!generated?.cards.length) return;
-    const cell = (value: string | number) => {
-      const text = String(value);
-      return `"${(/^[=+@\-\t\r]/.test(text) ? "'" + text : text).replace(/"/g, '""')}"`;
-    };
+    // Header kept unquoted, as before.
     const csv = ['cardId,rawCode,groupId,creditTotal', ...generated.cards.map(card =>
-      [card.cardId, card.rawCode, card.groupId, card.creditTotal].map(cell).join(','))].join('\r\n');
+      [card.cardId, card.rawCode, card.groupId, card.creditTotal].map(csvCell).join(','))].join('\r\n');
     const url = URL.createObjectURL(new Blob(['\uFEFF' + csv], {type: 'text/csv;charset=utf-8'}));
     const link = document.createElement('a');
     link.href = url;
@@ -517,6 +591,18 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
     link.click();
     link.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+  // The list as filtered (every page), for reconciling with orders. Never any plaintext code.
+  const exportList = () => {
+    if (!filtered.length) {toast.info('当前筛选下没有卡密'); return;}
+    downloadCsv(`cards-${new Date().toISOString().slice(0, 10)}.csv`, [
+      ['卡号', '备注', '分组', '余额', '总额', '到期', '状态', '激活时间'],
+      ...filtered.map(card => [card.id, card.note ?? '', groupName(card.groupId), card.pointsAvailable, card.pointsTotal,
+        card.validUntil ? formatFullDateTime(card.validUntil) : '激活后起算',
+        cardStatusView(card.status).label + (card.archivedAt != null ? '（已归档）' : ''),
+        card.activatedAt ? formatFullDateTime(card.activatedAt) : '']),
+    ]);
+    toast.success(`已导出 ${formatCount(filtered.length)} 张卡的列表`);
   };
   const copyGenerated = async (text: string, done: string) => {
     try {await navigator.clipboard.writeText(text); setGeneratedError(''); toast.success(done);}
@@ -536,7 +622,9 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
   const bulkDisabled = bulkBusy || failed || loading || mutationBusy || revealing;
 
   return <div className="page-stack">
-    <TopbarActions><button type="button" className="btn btn-primary" onClick={() => {reportError(''); setShowBatch(true);}}>＋ 批量生成</button></TopbarActions>
+    <TopbarActions><Menu label="卡密更多操作" className="btn btn-icon-only" items={[{label: '导出列表（不含明文）', onSelect: exportList}]}/>
+      <button type="button" className="btn btn-primary" disabled={!!issuanceRecovery} title={issuanceRecovery ? '上次批量生成的结果未确认，请先在列表上方核对' : undefined}
+      onClick={() => {reportError(''); setShowBatch(true);}}>＋ 批量生成</button></TopbarActions>
 
     {issuanceRecovery && <section className="recovery-panel" aria-label="制卡结果核对">
       <div>
@@ -597,10 +685,11 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
       <button type="button" className="btn-text" disabled={bulkBusy} onClick={() => setSelectedIds([])}>取消选择</button>
     </div>}
 
-    {report && <div className="bulk-report" role="status" aria-label="批量操作结果">
+    {report && <div className={`bulk-report${report.failures.length ? '' : ' is-skipped'}`} role="status" aria-label="批量操作结果">
       <div className="bulk-report-head"><b>{report.summary}</b>
         <button type="button" className="btn-icon" aria-label="关闭结果" title="关闭" onClick={() => setReport(null)}><IconClose/></button></div>
-      <ul>{report.failures.map(item => <li key={item.id}>{item.id}：{item.result}</li>)}</ul>
+      {report.failures.length > 0 && <ul className="report-failures">{report.failures.map(item => <li key={item.id}>{item.id}：{item.result}</li>)}</ul>}
+      {report.skipped.length > 0 && <ul className="report-skipped">{report.skipped.map(item => <li key={item.id}>{item.id}：{item.result}</li>)}</ul>}
     </div>}
 
     <div className="table-card">
@@ -609,7 +698,7 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
           <th className="col-check"><input type="checkbox" aria-label="全选本页" checked={allSelected} disabled={bulkBusy || failed || loading || !pageCards.length}
             ref={element => {if (element) element.indeterminate = someSelected && !allSelected;}}
             onChange={event => setSelectedIds(event.target.checked ? pageCards.map(card => card.id) : [])}/></th>
-          <th>卡密</th><th>备注</th><th>分组</th>
+          <th>卡密</th><th className="col-note">备注</th><th className="col-group">分组</th>
           <th className="num" aria-sort={sortState('balance')}><button type="button" className="th-sort" onClick={() => toggleSort('balance')}>余额{sortIcon('balance')}</button></th>
           <th aria-sort={sortState('expiry')}><button type="button" className="th-sort" onClick={() => toggleSort('expiry')}>到期{sortIcon('expiry')}</button></th>
           <th className="col-device">设备</th><th className="col-status">状态</th><th className="col-actions"><span className="sr-only">操作</span></th>
@@ -622,10 +711,10 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
               ...(card.status === 'frozen' ? [{label: '解冻', onSelect: () => void changeStatus(card, 'unfreeze')}] : []),
               ...(!['banned', 'voided'].includes(card.status) ? [{label: '封禁', danger: true, onSelect: () => void changeStatus(card, 'ban')}] : []),
             ];
-            return <tr key={card.id} className={selected ? 'is-selected' : undefined}>
+            return <tr key={card.id} className={`is-clickable${selected ? ' is-selected' : ''}${card.id === detailId ? ' is-open' : ''}`} onClick={event => openDetail(event, card)}>
               <td className="col-check"><input type="checkbox" aria-label={`选择卡密 ${card.id}`} disabled={bulkBusy || failed || loading} checked={selected}
                 onChange={event => {const checked = event.currentTarget.checked; setSelectedIds(ids => checked ? [...ids, card.id] : ids.filter(id => id !== card.id));}}/></td>
-              <td className="col-id"><IdCell value={card.id} kind="card"/></td>
+              <td className="col-id"><IdCell value={card.id} kind="card" onOpen={() => setDetailId(card.id)} openTitle="查看详情"/></td>
               <td className="col-note" title={card.note || undefined}>{card.note ? <span className="clip clip-note">{formatBatchNote(card.note)}</span> : <span className="muted">—</span>}</td>
               <td className="col-group" title={card.groupId}><span className="clip clip-group">{groupName(card.groupId)}</span></td>
               <td className="num"><Balance card={card}/></td>
@@ -710,6 +799,11 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
       </div>
     </Modal>}
 
+    {detailCard && <CardDrawer card={detailCard} groupName={id => groupName(id)} hasPrev={detailIndex > 0} hasNext={detailIndex >= 0 && detailIndex < filtered.length - 1}
+      onMove={moveDetail} onClose={() => setDetailId(null)} onReveal={card => void reveal(card)} onAdjust={openAdjust}
+      onStatus={(card, action) => void changeStatus(card, action)} onOpenTrace={onOpenTrace}
+      revealDisabled={revealing || bulkBusy} blocked={blocked} blockedTitle={staleTitle}/>}
+
     {adjustCard && <Modal label="卡密调账" onClose={closeAdjust} busy={mutationBusy} className="dialog-form">
       <h3 className="modal-title">调整积分 · <span className="mono">{shortId(adjustCard.id, 'card')}</span></h3>
       {actionError && <p role="alert" className="form-error">{actionError}</p>}
@@ -729,7 +823,7 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
         <span className="adjust-result">→ 调整后 <b>{adjustAfter === null ? '—' : formatCredits(adjustAfter)}</b> 积分</span>
       </div>
       {'error' in parsedAdjust && parsedAdjust.error && !zeroMicro && <p className="field-error">{parsedAdjust.error}</p>}
-      {adjustAfter !== null && adjustAfter < 0 && <p className="field-warning">余额不足：调整后为负数，服务器会拒绝</p>}
+      {overdrawn && <p className="field-warning">余额不足，最多可扣 {formatCredits(adjustCard.pointsAvailable)} 积分</p>}
       <label className="field"><span className="field-label">原因</span>
         <input type="text" aria-label="调账原因说明" maxLength={500} placeholder="例：补偿 9/25 上游中断"
           disabled={mutationBusy || locked || adjustStep === 'review'} value={adjustReason} onChange={event => setAdjustReason(event.target.value)}/></label>
@@ -741,7 +835,7 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
         {adjustStep === 'form' ? <>
           <button type="button" className="btn" disabled={mutationBusy} onClick={closeAdjust}>取消</button>
           <button type="button" className="btn btn-primary" disabled={!adjustReady || mutationBusy || zeroMicro}
-            title={adjustReady ? undefined : !reasonValid && adjustDelta !== null ? '填写原因后继续' : '填写数量和原因后继续'} onClick={() => setAdjustStep('review')}>下一步</button>
+            title={adjustReady ? undefined : overdrawn ? '余额不足' : !reasonValid && adjustDelta !== null ? '填写原因后继续' : '填写数量和原因后继续'} onClick={() => setAdjustStep('review')}>下一步</button>
         </> : <>
           <button type="button" className="btn" disabled={mutationBusy} onClick={() => setAdjustStep('form')}>返回修改</button>
           <button type="button" className="btn btn-primary" disabled={mutationBusy} onClick={() => void submitAdjust()}>{mutationBusy ? '提交中…' : '确认入账'}</button>

@@ -16,7 +16,7 @@ for (const input of ['', '-1', 'NaN', 'Infinity', '1e3', '1.0000001', '900719925
   const calls = [];
   const {AdminApiClient} = load('api.ts', {fetch: async (url, options = {}) => {
     calls.push({url, options});
-    return {ok: true, json: async () => url.endsWith('/session') && options.method === 'POST' ? {success: true, expiresIn: 900} : {success: true, role: 'admin', csrfToken: 'test-csrf', cards: [], rawCode: 'recovered-code'}};
+    return {ok: true, json: async () => url.endsWith('/session') && options.method === 'POST' ? {success: true, expiresIn: 1800} : {success: true, role: 'admin', csrfToken: 'test-csrf', cards: [], rawCode: 'recovered-code'}};
   }});
   const api = new AdminApiClient('');
   await api.establishSession('admin', 'test-password');

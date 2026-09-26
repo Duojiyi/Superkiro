@@ -5,13 +5,13 @@ import { adminApi, AdminApiError, type AdminCardItem, type CommercialConfig } fr
 import { confirmAction } from './components/confirm';
 import { toast } from './components/toast';
 import { InfoTip, StatusBadge } from './components/ui';
-import { formatCount, formatFullDateTime, shortHash } from './format';
+import { formatCount, formatFullDateTime, formatTokenCount, shortHash } from './format';
 import { priceVersionView } from './status';
 
 // 分组与权益 / 模型与定价: a list, the row being edited, and a bar at the bottom with the
 // change reason and 发布. Everything is published together against the version read, with
 // a reason; a publish without a confirmed result blocks the next one until a reload.
-export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, cards, onPublished }: {kind: 'groups' | 'models'; onDirtyChange: (dirty: boolean) => void; onBusyChange: (busy: boolean) => void; cards?: AdminCardItem[]; onPublished?: () => void}) {
+export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, cards, onPublished, refreshEpoch = 0 }: {kind: 'groups' | 'models'; onDirtyChange: (dirty: boolean) => void; onBusyChange: (busy: boolean) => void; cards?: AdminCardItem[]; onPublished?: () => void; /** Changes when the operator asks the whole console to refresh. */ refreshEpoch?: number}) {
   const [config, setConfig] = useState<CommercialConfig | null>(null);
   const [draft, setDraft] = useState(''), [loadedDraft, setLoadedDraft] = useState('');
   const [reason, setReason] = useState('');
@@ -28,6 +28,8 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
   const [needsReview, setNeedsReview] = useState(false);
   const [messageTone, setMessageTone] = useState<'error' | 'warning' | 'info'>('error');
   const [publishing, setPublishing] = useState(false);
+  // The console was refreshed while this page had unpublished edits.
+  const [serverChanged, setServerChanged] = useState(false);
   const say = (text: string, tone: 'error' | 'warning' | 'info' = 'error') => {setMessage(text); setMessageTone(tone);};
   const dirty = draft !== loadedDraft || !!reason.trim() || !!priceDraft;
   const validText = (value: unknown, max: number) => typeof value === 'string' && !!value.trim() && new TextEncoder().encode(value).length <= max && !/[\x00-\x1f\x7f-\x9f]/.test(value);
@@ -130,7 +132,8 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
     if (keepSaved) {try {saved = JSON.parse(sessionStorage.getItem(draftKey) || '{}') ?? {};} catch {/* nothing to restore */}}
     else {try {sessionStorage.removeItem(draftKey);} catch {/* nothing kept */}}
     const restore = saved.base === value && typeof saved.draft === 'string' && typeof saved.reason === 'string';
-    setConfig(next); setSelected(String(next[kind][0]?.id ?? '')); setPriceDraft(null); setPriceInputs({}); setReason(restore ? String(saved.reason) : ''); setLoadedDraft(value); setDraft(restore ? String(saved.draft) : value); setNeedsReview(false);
+    setConfig(next); setServerChanged(false);
+    setSelected(current => next[kind].some(row => String(row.id) === current) ? current : String(next[kind][0]?.id ?? '')); setPriceDraft(null); setPriceInputs({}); setReason(restore ? String(saved.reason) : ''); setLoadedDraft(value); setDraft(restore ? String(saved.draft) : value); setNeedsReview(false);
     return restore ? 'restored' : typeof saved.draft === 'string' ? 'stale' : 'none';
   };
   useEffect(() => {
@@ -140,7 +143,7 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
       else sessionStorage.removeItem(draftKey);
     } catch {/* A draft that cannot be kept is only lost at a session end. */}
   }, [draft, loadedDraft, reason, draftKey]);
-  const load = async (keepSaved = true) => {
+  const load = async (keepSaved = true, quiet = false) => {
     if (pending.current) return;
     pending.current = true; setBusy(true); setMessage('');
     try {
@@ -150,13 +153,23 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
         const draftState = apply(result.config, keepSaved);
         if (draftState === 'restored') say('已恢复未发布的修改，请核对后发布', 'info');
         else if (draftState === 'stale') say('配置已被更新，之前未发布的修改已作废', 'warning');
-        else if (!keepSaved) toast.success('已重新加载配置');
+        else if (!keepSaved && !quiet) toast.success('已重新加载配置');
       }
     } catch (error) {
       if (alive.current) {setNeedsReview(true); say(`加载失败（${error instanceof Error ? error.message : String(error)}），修改已保留；重新加载成功前不能发布`);}
     } finally {pending.current = false; if (alive.current) setBusy(false);}
   };
   useEffect(() => {alive.current = true; void load(); return () => {alive.current = false;};}, [kind]);
+  // A console refresh reloads this page too, but never over unpublished edits.
+  const seenEpoch = useRef(refreshEpoch);
+  useEffect(() => {
+    if (refreshEpoch === seenEpoch.current) return;
+    seenEpoch.current = refreshEpoch;
+    if (pending.current) return;
+    if (dirty) setServerChanged(true);
+    else void load(false, true);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshEpoch]);
   const editedRows = rows.filter(isEdited);
   const newVersions = Array.isArray(parsedDraft.versions) ? parsedDraft.versions.length : 0;
   const publish = async () => {
@@ -201,7 +214,7 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
           `原因：${reason.trim()}`,
           `基于版本 ${shortHash(config.revision)}`,
         ],
-        consequence: '新请求立即使用新配置；有未结算请求或版本冲突时服务器会拒绝。',
+        consequence: '发布后新请求立即生效。',
         confirmLabel: '发布',
       });
       if (!confirmed || !alive.current || pending.current) return;
@@ -310,7 +323,7 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
         {editorFields.filter(field => !checkFields.includes(field)).map(field => <label key={field} className="field">
           <span className="field-label">{labels[field]}{tips[field] && <InfoTip text={tips[field]}/>}</span>
           {renderInput(field)}
-          {tokenFields.includes(field) && selectedRow && <span className="field-hint">{formatTokens(selectedRow[field])}</span>}
+          {tokenFields.includes(field) && selectedRow && <span className="field-hint" title={formatTokens(selectedRow[field])}>{typeof selectedRow[field] === 'number' && Number(selectedRow[field]) > 0 ? `${formatTokenCount(Number(selectedRow[field]))} Tokens` : '请输入正整数 Tokens'}</span>}
         </label>)}
         {editorFields.some(field => checkFields.includes(field)) && <div className="field field-span check-row">
           {editorFields.filter(field => checkFields.includes(field)).map(field => <span key={field} className="check-field">
@@ -365,7 +378,7 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
 
     <details className="panel json-details">
       <summary>编辑 JSON（高级）</summary>
-      <p className="muted">可在这里新增条目、首个价格版本或成本加成价格。发布按 ID 新增或更新；删除一行不会删除服务器上的条目。</p>
+      <p className="muted">按 ID 新增或更新；删掉一行不会删除服务器上的条目。</p>
       <textarea aria-label="配置 JSON" value={draft} disabled={busy} onChange={e => setDraft(e.target.value)} spellCheck={false} className="code-input"/>
       {config && draftError && <p role="alert" className="form-error">{draftError} 修正后才能加入价格或发布。</p>}
     </details>
@@ -380,9 +393,12 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
           {editedRows.length > 0 && <span className="dirty-dot">{editedRows.length} 项修改未发布</span>}
           {newVersions > 0 && <span className="dirty-dot">{newVersions} 个新价格版本</span>}
           {needsReview && <span className="is-warning">请重新加载确认后再发布</span>}
+          {serverChanged && !needsReview && <span className="is-warning">服务器上的配置可能已更新</span>}
         </span>
         <input className="action-bar-reason" aria-label="变更原因" placeholder="变更原因（必填）" value={reason} maxLength={500} disabled={busy} onChange={e => setReason(e.target.value)}/>
-        <button type="button" className="btn" disabled={busy} onClick={() => void reload()}>重新加载</button>
+        {/* Discarding is offered only when there is something to discard (or to review). */}
+        {(dirty || needsReview || serverChanged || !config) && <button type="button" className="btn" disabled={busy} onClick={() => void reload()}>
+          {dirty ? (serverChanged && !needsReview ? '放弃修改并加载' : '放弃修改') : '重新加载'}</button>}
         <button type="button" className="btn btn-primary" disabled={busy || !!publishBlocked} title={publishBlocked} onClick={() => void publish()}>{publishing ? '发布中…' : '发布'}</button>
       </div>
       {message && <p role="status" className={`message message-${messageTone}`}>{message}</p>}

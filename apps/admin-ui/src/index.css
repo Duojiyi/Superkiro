@@ -140,7 +140,7 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .nav-item[aria-current="page"] {background: var(--brand-soft); color: var(--brand); font-weight: 600; box-shadow: inset 3px 0 0 var(--brand);}
 .nav-badge {display: inline-flex; align-items: center; justify-content: center; min-width: 20px; height: 18px; padding: 0 6px; border-radius: 9px; font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums;}
 .nav-badge-danger {background: var(--danger); color: #fff;}
-.nav-badge-warning {background: #d4a72c; color: #fff;}
+.nav-badge-warning {background: #9a6700; color: #fff;}
 .sidebar-footer {display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-top: auto; padding: 12px 6px 0 10px; border-top: 1px solid var(--border-subtle);}
 .session-clock {min-width: 0; font-size: 12px; color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;}
 .session-user {color: var(--text-1); font-weight: 500;}
@@ -214,6 +214,7 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .table tr.is-selected td {background: var(--brand-soft);}
 .table tr.is-selected td:first-child {box-shadow: inset 3px 0 0 var(--brand);}
 .table tr.is-clickable {cursor: pointer;}
+.cards-table tr.is-open td {background: var(--info-bg, #ddf4ff);}
 .table .num {text-align: right; font-variant-numeric: tabular-nums;}
 .table .col-check {width: 40px; padding-right: 0;}
 .table .col-status {width: 1%;}
@@ -295,6 +296,21 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .bulk-report {padding: 10px 12px; border-radius: var(--radius); border: 1px solid #f5b5b0; background: var(--danger-bg); color: #a40e26; font-size: 13px;}
 .bulk-report-head {display: flex; align-items: center; justify-content: space-between; gap: 8px;}
 .bulk-report ul {margin: 4px 0 0; padding-left: 18px; list-style: disc; font-family: var(--mono); font-size: 12px;}
+/* Skipped cards are not failures: amber, never red. */
+/* Card details drawer */
+.drawer-section {display: flex; flex-direction: column; gap: 8px;}
+.drawer-section h4 {margin: 0;}
+.section-head {display: flex; align-items: baseline; justify-content: space-between; gap: 8px;}
+.inline-state {display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-2);}
+.drawer-foot {display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 10px 16px; border-top: 1px solid var(--border-subtle); background: var(--bg-surface);}
+.drawer-foot-id {margin-left: auto; font-family: var(--mono); font-size: 12px;}
+.device-list {display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 10px;}
+.history-table td.num.is-negative {color: var(--danger);}
+.reason-chips {margin-top: 8px;}
+.range-line {margin: 0 0 -4px; font-size: 12px; color: var(--text-3);}
+.bulk-report.is-skipped {border-color: #e9c46a; background: var(--warning-bg); color: #7a4d00;}
+.bulk-report .report-skipped {color: #7a4d00;}
+.required-mark {color: var(--danger); font-weight: 400; margin-left: 2px;}
 
 /* ---------- Menu ---------- */
 .menu-anchor {position: relative; display: inline-flex;}
@@ -377,6 +393,10 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .drawer-content {min-width: 0;}
 .drawer-content:focus-visible {outline-offset: 4px;}
 .page-stack.has-drawer {padding-right: 0;}
+/* With the drawer open, speed and tokens give way so the result column stays readable. */
+.has-drawer .traces-table .col-speed, .has-drawer .traces-table .col-tokens {display: none;}
+.history-block > summary {cursor: pointer; color: var(--brand); font-size: 13px; padding: 4px 0;}
+.history-block[open] > summary {margin-bottom: 8px;}
 
 /* Request content */
 .conversation, .reply, .raw-json {display: flex; flex-direction: column; gap: 10px; min-width: 0;}
@@ -443,7 +463,12 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .provider-name h3 {margin: 0; font-size: 15px;}
 .provider-name .mono {font-size: 12px; overflow-wrap: anywhere;}
 .provider-foot {display: flex; justify-content: flex-start;}
-.keys-table {min-width: 560px;}
+.keys-table {min-width: 560px; table-layout: fixed;}
+/* The same column widths in every provider's card, so the tables line up. */
+.keys-table .col-key {width: 260px; overflow: hidden; text-overflow: ellipsis;}
+.keys-table .col-weight {width: 72px;}
+.keys-table .col-status {width: 140px;}
+.keys-table .col-actions {width: 64px;}
 .model-tags {display: inline-flex; align-items: center; flex-wrap: wrap; gap: 4px;}
 .switch {display: inline-flex; align-items: center; gap: 8px; height: 28px; font-size: 13px; color: var(--text-2);}
 .switch-track {position: relative; width: 36px; height: 20px; border-radius: 10px; background: #c3cad3; transition: background .15s;}
@@ -486,7 +511,8 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .json-details > summary {cursor: pointer; font-weight: 500; color: var(--text-2);}
 .json-details[open] > summary {margin-bottom: 10px;}
 .json-details > p {margin: 0 0 8px; font-size: 12px;}
-.action-bar {position: sticky; bottom: 0; z-index: 5; display: flex; flex-direction: column; gap: 6px; padding: 10px 16px; background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius); box-shadow: 0 -6px 16px rgba(31, 35, 40, .08);}
+/* Flush with the window's bottom edge: it reaches into the page's bottom padding. */
+.action-bar {position: sticky; bottom: -32px; z-index: 5; display: flex; flex-direction: column; gap: 6px; margin-bottom: -32px; padding: 10px 16px 42px; background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: 8px 8px 0 0; box-shadow: 0 -6px 16px rgba(31, 35, 40, .08);}
 .action-bar.is-dirty {border-top: 2px solid #d4a72c;}
 .action-bar-main {display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px;}
 .action-bar-status {display: inline-flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; font-size: 13px;}
@@ -543,6 +569,7 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
   .sidebar-footer {order: 2; margin: 0 0 0 auto; padding: 0; border: 0;}
   .topbar {flex-wrap: wrap; padding: 10px 12px; min-height: 0;}
   .page-content {overflow: visible; padding: 16px 12px 24px;}
+  .action-bar {bottom: -24px; margin-bottom: -24px; padding-bottom: 34px;}
   .form-grid-2, .form-grid-3, .pricing-editor .pricing-grid {grid-template-columns: minmax(0, 1fr);}
   .pricing-editor .pricing-template > label {min-width: 0; width: 100%;}
   .search-field {flex-basis: 100%; max-width: none;}
@@ -551,5 +578,8 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
   .panel {padding: 14px;}
   .modal {padding: 16px;}
   .keys-table {min-width: 520px;}
+  .kpi-row {grid-template-columns: repeat(2, minmax(0, 1fr));}
+  /* Phones: card, balance, status and actions; the rest is one tap away in the card's details. */
+  .cards-table .col-note, .cards-table .col-group, .cards-table .col-device {display: none;}
 }
 @media (prefers-reduced-motion: reduce) {* {transition: none !important; animation: none !important; scroll-behavior: auto !important;}}

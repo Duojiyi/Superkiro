@@ -7,11 +7,13 @@ import {InfoTip} from './components/ui';
 
 type Message = {tone: 'error' | 'warning' | 'info'; text: string} | null;
 
-export default function ProviderKeyEditor({selectedKey, preset, knownModels = [], onSaved, onDirtyChange, onBusyChange, onClose}: {
+export default function ProviderKeyEditor({selectedKey, preset, knownModels = [], knownProviders = [], onSaved, onDirtyChange, onBusyChange, onClose}: {
   selectedKey?: Record<string, unknown>;
   preset?: {providerId?: string; keyId?: string; suggestedKeyId?: string};
   /** Upstream models already listed in 模型与定价, to point out the ones that are not. */
   knownModels?: string[];
+  /** IDs of the providers that already exist. */
+  knownProviders?: string[];
   onSaved?: (savedKey?: Record<string, unknown>) => void;
   onDirtyChange: (dirty: boolean) => void;
   onBusyChange: (busy: boolean) => void;
@@ -33,11 +35,15 @@ export default function ProviderKeyEditor({selectedKey, preset, knownModels = []
   const pending = useRef(false);
   const [review, setReview] = useState<{provider: string; key: string} | null>(null);
   const [message, setMessage] = useState<Message>(null);
+  const mode: 'provider' | 'add-key' | 'edit' = selectedKey ? 'edit' : preset?.providerId ? 'add-key' : 'provider';
+  const providerExists = knownProviders.includes(provider.trim());
+  // A new provider gets <provider>-key-1 (the Key the import creates); discovery uses that Key.
+  const workingKeyId = mode === 'provider' ? (provider.trim() ? `${provider.trim()}-key-1` : '') : keyId.trim();
   const modelIds = [...new Set(models.split(/\r?\n/).map(model => model.trim()).filter(Boolean))];
   const validText = (text: string, max: number) => !!text.trim() && new TextEncoder().encode(text).length <= max && !/[\x00-\x1f\x7f-\x9f]/.test(text);
   const validate = (importing = false) => {
     if (!validText(provider.trim(), 256)) throw new Error('请填写供应商 ID（不超过 256 字节，不含控制字符）');
-    if (!importing && !validText(keyId.trim(), 256)) throw new Error('请填写 Key ID（不超过 256 字节，不含控制字符）');
+    if (!importing && !validText(workingKeyId, 256)) throw new Error('请填写 Key ID（不超过 256 字节，不含控制字符）');
     if ((secret || importing) && (!validText(secret, 4096) || secret !== secret.trim())) throw new Error('请填写 API Key（首尾不能有空格，不超过 4096 字节）');
   };
   const validateModels = () => {
@@ -90,8 +96,10 @@ export default function ProviderKeyEditor({selectedKey, preset, knownModels = []
     pending.current = true; setBusy(true);
     if (action === 'discover') setDiscovery(null);
     try {
+      // A provider that does not exist yet has no Key to save: 保存供应商 creates both.
+      if (action === 'save' && mode === 'provider') throw new AdminApiError('请先保存供应商', 400);
       const result = await adminApi.manageKey(action, {
-        provider_id: provider.trim(), key_id: keyId.trim(), ...(secret ? {api_key: secret} : {}),
+        provider_id: provider.trim(), key_id: workingKeyId, ...(secret ? {api_key: secret} : {}),
         ...(action === 'save' ? {allowed_models: modelIds, weight: Number(weight), enabled} : {}),
       });
       if (result.success !== true) throw new AdminApiError('服务器未确认操作成功', 400);
@@ -99,7 +107,7 @@ export default function ProviderKeyEditor({selectedKey, preset, knownModels = []
         if (!Array.isArray(result.models) || result.models.some(model => typeof model !== 'string' || !validText(model, 256))) throw new Error('候选模型格式无效，可用模型没有改动');
         const candidates = [...new Set(result.models)];
         const fresh = candidates.filter(model => !modelIds.includes(model)).length;
-        setDiscovery({key: keyId.trim(), models: candidates, incomplete: Boolean(result.has_more)});
+        setDiscovery({key: workingKeyId, models: candidates, incomplete: Boolean(result.has_more)});
         setMessage(!candidates.length ? {tone: 'info', text: '上游没有返回模型，可以手动添加'}
           : result.has_more ? {tone: 'warning', text: `只取到部分模型（上游有分页，${candidates.length} 个），可手动补充`}
           : {tone: 'info', text: `获取到 ${candidates.length} 个模型（${fresh} 个新）`});
@@ -127,7 +135,7 @@ export default function ProviderKeyEditor({selectedKey, preset, knownModels = []
     const confirmed = await confirmAction({
       title: `添加供应商 ${provider.trim()}？`,
       facts: [`地址 ${baseUrl.trim()} · ${format === 'openai' ? 'OpenAI' : 'Anthropic'} 接口`, `将创建 Key：${defaultKey}（${modelIds.length} 个模型）`, ...(modelIds.length ? [] : ['未选择模型：这个 Key 不会被使用'])],
-      consequence: '如果已有同名供应商，会覆盖它的地址和这把 Key，并重置为启用、权重 1。不会发布模型或价格。',
+      consequence: providerExists ? `将覆盖 ${provider.trim()} 的地址和 ${defaultKey}，并重置为启用、权重 1。` : undefined,
       confirmLabel: '添加',
     });
     if (!confirmed || pending.current) return;
@@ -144,7 +152,7 @@ export default function ProviderKeyEditor({selectedKey, preset, knownModels = []
 
   const reviewKey = async () => {
     if (pending.current || !review) return;
-    if (!(await confirmAction({title: '重新读取这个 Key？', consequence: '会覆盖未保存的修改并清空密钥输入；密钥原文不会返回，无法据此确认密钥是否已更换。', confirmLabel: '重新读取'}))) return;
+    if (!(await confirmAction({title: '重新读取这个 Key？', consequence: '会覆盖未保存的修改并清空密钥输入。', confirmLabel: '重新读取'}))) return;
     if (pending.current) return;
     pending.current = true; setBusy(true);
     try {
@@ -160,24 +168,33 @@ export default function ProviderKeyEditor({selectedKey, preset, knownModels = []
     finally {pending.current = false; setBusy(false);}
   };
 
-  const title = selectedKey ? `编辑 Key · ${String(selectedKey.id)}` : preset?.providerId ? `添加 Key · ${preset.providerId}` : '添加供应商';
-  const adding = !selectedKey && !preset?.providerId;
+  const title = mode === 'edit' ? `编辑 Key · ${String(selectedKey!.id)}` : mode === 'add-key' ? `添加 Key · ${preset!.providerId}` : '添加供应商';
   const newFound = discovery ? discovery.models.filter(model => !modelIds.includes(model)) : [];
+  const discoverBlocked = !provider.trim() ? '填写供应商 ID 后可获取' : mode === 'provider' && !providerExists ? '先保存供应商，再获取模型列表'
+    : mode === 'provider' && !secret ? '填写 API Key 后可获取' : !workingKeyId ? '填写 Key ID 后可获取' : undefined;
+  const providerBlocked = review ? '先重新读取确认上次的结果' : !provider.trim() || !secret || !baseUrl.trim() ? '填写供应商 ID、上游地址和 API Key 后可保存' : undefined;
+  const saveBlocked = review ? '先重新读取确认上次的结果' : !provider.trim() || !keyId.trim() ? '填写 Key ID 后可保存' : undefined;
   return <section id="key-editor" className="panel key-editor" aria-label={title}>
     <div className="panel-head">
       <h3>{title}</h3>
       {onClose && <button type="button" className="btn-icon" aria-label="关闭编辑器" title="关闭" disabled={busy} onClick={onClose}><IconClose/></button>}
     </div>
     <fieldset disabled={busy} className="form-grid form-grid-2" onChange={() => setDirty(true)}>
+      {/* Changing the provider or Key of an existing Key would make another Key: both stay fixed. */}
       <label className="field"><span className="field-label">供应商 ID</span>
-        <input aria-label="供应商 ID" value={provider} onChange={event => setProvider(event.target.value)}/></label>
-      <label className="field"><span className="field-label">Key ID</span>
-        <input aria-label="Key ID" value={keyId} onChange={event => setKeyId(event.target.value)}/></label>
+        <input aria-label="供应商 ID" value={provider} readOnly={mode !== 'provider'} onChange={event => setProvider(event.target.value)}/></label>
+      {mode === 'provider' ? <>
+        <label className="field"><span className="field-label">上游地址</span>
+          <input aria-label="上游地址" type="url" value={baseUrl} placeholder="https://api.example.com" onChange={event => setBaseUrl(event.target.value)}/></label>
+        <label className="field"><span className="field-label">接口格式</span>
+          <select aria-label="接口格式" value={format} onChange={event => setFormat(event.target.value)}><option value="anthropic">Anthropic</option><option value="openai">OpenAI</option></select></label>
+      </> : <label className="field"><span className="field-label">Key ID</span>
+        <input aria-label="Key ID" value={keyId} readOnly={mode === 'edit'} onChange={event => setKeyId(event.target.value)}/></label>}
       <label className="field"><span className="field-label">API Key</span>
-        <input aria-label="API Key" ref={secretInput} type="password" autoComplete="new-password" placeholder={selectedKey ? '已保存，留空不修改' : '新增时必填'}
+        <input aria-label="API Key" ref={secretInput} type="password" autoComplete="new-password" placeholder={mode === 'edit' ? '已保存，留空不修改' : '必填'}
           onChange={event => setSecret(event.target.value)}/></label>
-      <label className="field"><span className="field-label">权重<InfoTip text="多个 Key 时按权重分配请求（1–1000 的整数）"/></span>
-        <input aria-label="权重" type="number" min={1} max={1000} step={1} value={weight} onChange={event => setWeight(event.target.value)}/></label>
+      {mode !== 'provider' && <label className="field"><span className="field-label">权重<InfoTip text="多个 Key 时按权重分配请求（1–1000 的整数）"/></span>
+        <input aria-label="权重" type="number" min={1} max={1000} step={1} value={weight} onChange={event => setWeight(event.target.value)}/></label>}
       <label className="field field-span"><span className="field-label">可用模型（每行一个）</span>
         <textarea aria-label="可用模型（每行一个）" rows={6} className="mono" value={models} onChange={event => setModels(event.target.value)}/>
         {modelIds.length ? <span className="field-hint">已选 {modelIds.length} 个</span> : <span className="field-warning">未选择模型：这个 Key 不会被使用</span>}
@@ -190,29 +207,19 @@ export default function ProviderKeyEditor({selectedKey, preset, knownModels = []
           setMessage({tone: 'info', text: '已加入列表，原有模型保留；保存后生效'});
         }}>全部加入</button>
       </div>}
-      <label className="check-field field-span"><input type="checkbox" checked={enabled} onChange={event => setEnabled(event.target.checked)}/> 启用</label>
-      <details className="field-span import-details" open={adding}>
-        <summary>添加或更新供应商</summary>
-        <div className="form-grid form-grid-2">
-          <label className="field"><span className="field-label">上游地址</span>
-            <input aria-label="上游地址" type="url" value={baseUrl} placeholder="https://api.example.com" onChange={event => setBaseUrl(event.target.value)}/></label>
-          <label className="field"><span className="field-label">接口格式</span>
-            <select aria-label="接口格式" value={format} onChange={event => setFormat(event.target.value)}><option value="anthropic">Anthropic</option><option value="openai">OpenAI</option></select></label>
-          <p className="field-hint field-span">将创建 Key：{provider.trim() ? `${provider.trim()}-key-1` : '供应商 ID-key-1'}（用上面的 API Key 和可用模型）</p>
-          <div className="field-span"><button type="button" className="btn" disabled={!!review || !provider.trim() || !secret || !baseUrl.trim()}
-            title={review ? '先重新读取确认上次的结果' : !provider.trim() || !secret || !baseUrl.trim() ? '填写供应商 ID、API Key 和上游地址后可保存' : undefined}
-            onClick={() => void createProvider()}>保存供应商</button></div>
-        </div>
-      </details>
+      {mode === 'provider'
+        ? <p className="field-hint field-span">将创建 Key：{workingKeyId || '供应商 ID-key-1'}（启用，权重 1）</p>
+        : <label className="check-field field-span"><input type="checkbox" checked={enabled} onChange={event => setEnabled(event.target.checked)}/> 启用</label>}
     </fieldset>
     <div className="editor-actions">
       {message && <p role="status" className={`message message-${message.tone}`}>{message.text}</p>}
       {busy && !message && <p role="status" className="message message-info">处理中…</p>}
       <div className="button-row">
         {review && <button type="button" className="btn" disabled={busy} onClick={() => void reviewKey()}>重新读取</button>}
-        <button type="button" className="btn" disabled={busy || !provider.trim() || !keyId.trim()} title={!provider.trim() || !keyId.trim() ? '填写供应商 ID 和 Key ID 后可获取' : undefined} onClick={() => void act('discover')}>获取模型列表</button>
-        <button type="button" className="btn btn-primary" disabled={busy || !!review || !provider.trim() || !keyId.trim()}
-          title={review ? '先重新读取确认上次的结果' : !provider.trim() || !keyId.trim() ? '填写供应商 ID 和 Key ID 后可保存' : undefined} onClick={() => void act('save')}>保存</button>
+        <button type="button" className="btn" disabled={busy || !!discoverBlocked} title={discoverBlocked} onClick={() => void act('discover')}>获取模型列表</button>
+        {mode === 'provider'
+          ? <button type="button" className="btn btn-primary" disabled={busy || !!providerBlocked} title={providerBlocked} onClick={() => void createProvider()}>保存供应商</button>
+          : <button type="button" className="btn btn-primary" disabled={busy || !!saveBlocked} title={saveBlocked} onClick={() => void act('save')}>保存</button>}
       </div>
     </div>
   </section>;

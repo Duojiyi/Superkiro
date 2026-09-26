@@ -69,17 +69,14 @@ const until=async ready=>{const end=Date.now()+10000;while(!ready()){assert(Date
     const weight=page.getByLabel('权重',{exact:true});
     for(const value of ['','0','1.5','1001']){await weight.fill(value);await button('保存').click();await status('权重须为 1 至 1000 的整数');assert.equal(keyPosts.length,0);assert.equal(await page.getByRole('alertdialog').count(),0);}
     await weight.fill('3');
-    await page.getByText('添加或更新供应商',{exact:true}).click();
+    // An existing Key keeps its provider and Key ID (changing them would make another Key),
+    // and the provider form is not part of it.
+    assert(await page.getByLabel('供应商 ID',{exact:true}).evaluate(el=>el.readOnly));assert(await page.getByLabel('Key ID',{exact:true}).evaluate(el=>el.readOnly));
+    assert.equal(await page.getByLabel('上游地址',{exact:true}).count(),0);assert.equal(await button('保存供应商').count(),0);
     await page.getByLabel('API Key',{exact:true}).fill('fixture-not-a-real-secret');
-    await page.getByLabel('上游地址',{exact:true}).fill('http://upstream.invalid');
-    await button('保存供应商').click();await status('上游地址须使用 HTTPS');assert.equal(importPosts,0);
-    await page.getByLabel('上游地址',{exact:true}).fill('https://upstream.invalid');
-    await button('保存供应商').click();
-    const importBox=page.getByRole('alertdialog');await importBox.waitFor();const importConfirmation=await importBox.innerText();await answer(false);
-    assert(importConfirmation.includes('fixture-provider-key-1'));assert(importConfirmation.includes('重置为启用、权重 1'));assert.equal(importPosts,0);
     // A lost save acknowledgement locks mutations; failed review cannot clear that lock.
     await button('保存').click();await answer(true);await status('没收到保存结果');
-    assert.equal(keyPosts.length,1);assert(await button('保存').isDisabled());assert(await button('保存供应商').isDisabled());
+    assert.equal(keyPosts.length,1);assert(await button('保存').isDisabled());
     failKeysRead=true;await button('重新读取').click();await answer(true);await status('核对失败');
     assert(await button('保存').isDisabled());assert((await models.inputValue()).includes('private-model'));
     failKeysRead=false;await button('重新读取').click();await answer(true);await status('已重新读取 Key 权限');
@@ -90,6 +87,28 @@ const until=async ready=>{const end=Date.now()+10000;while(!ready()){assert(Date
     await nav('运营概览');await nav('供应商与 Key');
     await page.waitForFunction(()=>document.querySelector('#key-editor textarea')?.value.includes('private-model'));
     assert.equal(await weight.inputValue(),'3');
+    // Adding a provider: only the provider form, saved by 保存供应商; the Key API is never called.
+    await button('＋ 添加供应商').click();
+    const editor=page.locator('#key-editor');await editor.getByRole('heading',{name:'添加供应商'}).waitFor();
+    assert.equal(await editor.getByLabel('Key ID',{exact:true}).count(),0);assert.equal(await editor.getByLabel('权重',{exact:true}).count(),0);
+    assert.equal(await editor.getByRole('button',{name:'保存',exact:true}).count(),0);
+    const keyPostsBefore=keyPosts.length;
+    await editor.getByLabel('供应商 ID',{exact:true}).fill('fixture-provider');
+    await editor.getByLabel('API Key',{exact:true}).fill('fixture-not-a-real-secret');
+    await editor.getByLabel('上游地址',{exact:true}).fill('http://upstream.invalid');
+    await button('保存供应商').click();await status('上游地址须使用 HTTPS');assert.equal(importPosts,0);
+    await editor.getByLabel('上游地址',{exact:true}).fill('https://upstream.invalid');
+    // Same name as an existing provider: the confirmation says what is overwritten and reset.
+    await button('保存供应商').click();
+    const importBox=page.getByRole('alertdialog');await importBox.waitFor();const importConfirmation=await importBox.innerText();await answer(false);
+    assert(importConfirmation.includes('fixture-provider-key-1'));assert(importConfirmation.includes('重置为启用、权重 1'));assert.equal(importPosts,0);
+    // A provider that does not exist yet: discovery waits until it is saved; saving creates it.
+    await editor.getByLabel('供应商 ID',{exact:true}).fill('fixture-new');
+    assert(await button('获取模型列表').isDisabled());assert.equal(await button('获取模型列表').getAttribute('title'),'先保存供应商，再获取模型列表');
+    await button('保存供应商').click();
+    const newBox=page.getByRole('alertdialog');await newBox.waitFor();assert(!(await newBox.innerText()).includes('将覆盖'));await answer(true);
+    await until(()=>importPosts===1);await editor.waitFor({state:'detached'});
+    assert.equal(keyPosts.length,keyPostsBefore,'the new-provider form never calls the Key API');
     // Price template changes and malformed advanced JSON cannot erase price inputs.
     await nav('模型与定价');
     const tokenContext=page.getByLabel('上下文长度',{exact:true}),tokenOutput=page.getByLabel('最大输出',{exact:true});
@@ -97,7 +116,8 @@ const until=async ready=>{const end=Date.now()+10000;while(!ready()){assert(Date
     const originalContext=await tokenContext.inputValue(),originalOutput=await tokenOutput.inputValue();
     await tokenContext.fill('1M');await tokenOutput.fill('128K');
     assert.equal(await tokenContext.inputValue(),'1000000');assert.equal(await tokenOutput.inputValue(),'128000');
-    assert(await page.getByText('1M Tokens（1,000,000）',{exact:false}).isVisible());
+    const tokenHint=page.locator('.mapping-editor .field-hint').filter({hasText:'1M Tokens'});
+    assert(await tokenHint.isVisible());assert.equal(await tokenHint.getAttribute('title'),'1M Tokens（1,000,000）');
     await tokenContext.fill(originalContext);await tokenOutput.fill(originalOutput);
     await page.getByRole('button',{name:'编辑',exact:true}).first().click();
     assert(await page.locator('.mapping-editor').evaluate(element=>element===document.activeElement));
@@ -132,9 +152,20 @@ const until=async ready=>{const end=Date.now()+10000;while(!ready()){assert(Date
     await button('发布中…').evaluate(element=>{element.click();element.click();});
     assert.equal(posts.length,1);assert(await button('发布中…').isDisabled());
     await held.abort('failed');held=null;await status('没收到发布结果');assert(await button('发布').isDisabled());
-    const beforeReload=await json.inputValue();failRead=true;await button('重新加载').click();await answer(true);await status('修改已保留');
+    const beforeReload=await json.inputValue();failRead=true;await button('放弃修改').click();await answer(true);await status('修改已保留');
     assert.equal(await json.inputValue(),beforeReload);assert(await button('发布').isDisabled());assert.equal(posts.length,1);
-    failRead=false;await button('重新加载').click();await answer(true);await toast('已重新加载配置');assert.deepEqual(JSON.parse(await json.inputValue()).versions,[]);
+    failRead=false;await button('放弃修改').click();await answer(true);await toast('已重新加载配置');assert.deepEqual(JSON.parse(await json.inputValue()).versions,[]);
+    // With nothing unpublished, 放弃修改 is not offered, and the console's 刷新 reloads this page too.
+    assert.equal(await button('放弃修改').count(),0);
+    config={...config,models:config.models.map((row,index)=>index===0?{...row,display_name:'刷新后的显示名'}:row),revision:'fixture-editor-refreshed'};
+    await button('刷新').click();await page.locator('.mapping-table, table').getByText('刷新后的显示名').first().waitFor();
+    // …but never over unpublished edits: it says the server may have changed and offers to discard.
+    const contextInput=page.getByLabel('上下文长度',{exact:true});const keptContext=await contextInput.inputValue();await contextInput.fill('150000');
+    config={...config,models:config.models.map((row,index)=>index===0?{...row,display_name:'又一次更新'}:row),revision:'fixture-editor-refreshed-2'};
+    await button('刷新').click();await page.getByText('服务器上的配置可能已更新').waitFor();
+    assert.equal(await contextInput.inputValue(),'150000');assert.equal(await page.getByText('又一次更新').count(),0);
+    await button('放弃修改并加载').click();await answer(true);await page.getByText('又一次更新').first().waitFor();
+    assert.equal(await contextInput.inputValue(),keptContext);assert.equal(posts.length,1);
     console.log('PASS: one in-flight publication; lost acknowledgement locks publish until a successful, confirmed reread');
     // Financials reject invalid values and retain drafts when review itself fails.
     await nav('财务对账');const face=page.getByLabel('积分面值',{exact:true}),financialReason=page.getByLabel('变更原因',{exact:true});
@@ -145,9 +176,9 @@ const until=async ready=>{const end=Date.now()+10000;while(!ready()){assert(Date
     const financeBox=page.getByRole('alertdialog');await financeBox.waitFor();const financeConfirmation=await financeBox.innerText();
     await answer(true);await until(()=>held);assert(financeConfirmation.includes('0.01 → 0.02'));assert(financeConfirmation.includes('7.2 → 7.3'));
     await held.abort('failed');held=null;await status('没收到发布结果');assert.equal(posts.length,2);assert(await button('发布').isDisabled());
-    failRead=true;await button('重新加载').click();await answer(true);await status('修改已保留；重新加载成功前不能发布');
+    failRead=true;await button('放弃修改').click();await answer(true);await status('修改已保留；重新加载成功前不能发布');
     assert.equal(await face.inputValue(),'0.02');assert.equal(await financialReason.inputValue(),'fixture finance write');assert(await button('发布').isDisabled());
-    failRead=false;await button('重新加载').click();await answer(true);await toast('已重新加载结算参数');assert.equal(await face.inputValue(),'0.02');
+    failRead=false;await button('放弃修改').click();await answer(true);await toast('已重新加载结算参数');assert.equal(await face.inputValue(),'0.02');
     // Success followed by a read failure must never be reported as an uncertain publication.
     postMode='success';await page.route('**/api/v1/admin/financials',route=>route.fulfill({status:503,json:{error:'fixture estimates unavailable'}}));
     await face.fill('0.03');await financialReason.fill('fixture successful publish');await button('发布').click();await answer(true);await toast('已发布结算参数');

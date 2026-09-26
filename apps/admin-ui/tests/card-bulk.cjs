@@ -57,7 +57,11 @@ const server=http.createServer(async(req,res)=>{
     const confirmation=async(accept,expect=[])=>{
       const box=page.getByRole('alertdialog');await box.waitFor();
       const text=await box.innerText();for(const part of expect)assert(text.includes(part),`confirmation mentions ${part}: ${text}`);
-      if(accept){const typed=box.getByLabel('确认输入');if(await typed.count())await typed.fill(await box.locator('.field-label b').innerText());await box.locator('[data-confirm="accept"]').click();}
+      if(accept){
+        const typed=box.getByLabel('确认输入');if(await typed.count())await typed.fill(await box.locator('.field-label b').innerText());
+        if(await box.locator('.required-mark').count())await box.locator('#confirm-reason').fill('测试卡清理');
+        await box.locator('[data-confirm="accept"]').click();
+      }
       else await box.getByRole('button',{name:'取消',exact:true}).click();
       await box.waitFor({state:'detached'});
     };
@@ -106,8 +110,9 @@ const server=http.createServer(async(req,res)=>{
     assert.equal(await checked().count(),0);
     // Ineligible states must never be sent; failed selections must not escape a new filter.
     cards[0].status='banned';await button('刷新').click();await idle();
-    await check(0).check();const before=statusCalls.length;await barButton('冻结').click();await confirmation(true);
-    await idle();
+    await check(0).check();const before=statusCalls.length;await barButton('冻结').click();
+    await results.filter({hasText:'都不能冻结，已跳过'}).waitFor();assert.equal(await page.getByRole('alertdialog').count(),0);
+    assert((await results.innerText()).includes('bulk-0：跳过'));assert((await results.getAttribute('class')).includes('is-skipped'),'skipped cards are amber, not red');
     assert.equal(statusCalls.length,before);assert(await check(0).isChecked());
     await page.getByLabel('搜索卡密',{exact:true}).fill('bulk-4');assert.equal(await checked().count(),0);
     await check(4).check();await more('封禁');await confirmation(true,['1 张']);await idle();
@@ -121,15 +126,20 @@ const server=http.createServer(async(req,res)=>{
     await check(0).check();await check(1).check();await check(2).check();
     const beforeVoid=statusCalls.length;
     await barButton('永久作废').click();await confirmation(false);assert.equal(statusCalls.length,beforeVoid);
-    // The count must be typed before the button works.
+    // The count (of the cards that will change) must be typed, and a reason given, before the button works.
     await barButton('永久作废').click();
-    const voidBox=page.getByRole('alertdialog');await voidBox.waitFor();
-    assert(await voidBox.locator('[data-confirm="accept"]').isDisabled());await voidBox.getByLabel('确认输入').fill('2');
-    assert(await voidBox.locator('[data-confirm="accept"]').isDisabled());await voidBox.getByRole('button',{name:'取消',exact:true}).click();
+    const voidBox=page.getByRole('alertdialog');await voidBox.waitFor();const accept=voidBox.locator('[data-confirm="accept"]');
+    assert(await accept.isDisabled());await voidBox.getByLabel('确认输入').fill('3');assert(await accept.isDisabled(),'a wrong count keeps it disabled');
+    await voidBox.getByLabel('确认输入').fill('2');assert(await accept.isDisabled(),'voiding needs a reason');
+    await voidBox.locator('#confirm-reason').fill('  ');assert(await accept.isDisabled(),'a blank reason is no reason');
+    await voidBox.locator('#confirm-reason').fill('测试卡清理');assert(!(await accept.isDisabled()));
+    await voidBox.getByRole('button',{name:'取消',exact:true}).click();
     assert.equal(statusCalls.length,beforeVoid);
-    await barButton('永久作废').click();await confirmation(true,['3 张','不能恢复','财务与审计记录保留']);
+    await barButton('永久作废').click();await confirmation(true,['2 张','1 张状态不适用，将跳过','不能恢复']);
     await idle();
     assert.equal(statusCalls.length,beforeVoid+2);assert.equal(statusCalls.at(-1).action,'void');assert.equal(statusCalls.at(-1).cardId,'bulk-1');
+    assert.equal(statusCalls.at(-1).reason,'测试卡清理','the reason typed is sent with each card');
+    assert(!statusCalls.slice(beforeVoid).some(call=>call.cardId==='bulk-2'),'the already voided card is not sent');
     assert((await results.innerText()).includes('1 张已永久作废'));
     assert.equal(await checked().count(),2);
     await button('取消选择').click();
