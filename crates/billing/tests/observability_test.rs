@@ -1386,3 +1386,118 @@ fn plan_prices_name_the_issuance_tiers() {
         assert_eq!(card.plan_name(), Some(plan.name));
     }
 }
+
+#[test]
+fn trace_search_filters_the_retained_traces_and_totals_every_match() {
+    let engine = BillingEngine::new();
+    let trace = |id: &str, card: &str, model: &str, ts: u64, status: TraceStatus| RequestTrace {
+        id: id.into(),
+        card_id: card.into(),
+        ts,
+        invocation_id: id.into(),
+        exposed_model: model.into(),
+        status,
+        ..RequestTrace::default()
+    };
+    engine.record_trace(RequestTrace {
+        provider_id: Some("backup".into()),
+        credits_charged: 5,
+        provider_cost_micro_cny: 50,
+        attempt_chain: vec![
+            attempt("primary", "key-a", Some("http_429")),
+            attempt("backup", "key-b", None),
+        ],
+        ..trace("t1", "card-a", "model-a", 100, TraceStatus::Success)
+    });
+    engine.record_trace(RequestTrace {
+        provider_id: Some("primary".into()),
+        ..trace("t2", "card-a", "model-b", 200, TraceStatus::Error)
+    });
+    engine.record_trace(RequestTrace {
+        provider_id: Some("primary".into()),
+        credits_charged: 7,
+        provider_cost_micro_cny: 70,
+        ..trace("t3", "card-b", "model-a", 300, TraceStatus::Success)
+    });
+    engine.record_trace(RequestTrace {
+        provider_id: Some("backup".into()),
+        credits_charged: 2,
+        provider_cost_micro_cny: 20,
+        ..trace("t4", "card-a", "model-a", 400, TraceStatus::ClientAborted)
+    });
+    let search = |filter: billing::observability::TraceFilter, limit: usize| {
+        let (traces, totals) = engine.search_traces(&filter, limit);
+        let ids: Vec<String> = traces.into_iter().map(|trace| trace.id).collect();
+        (
+            ids,
+            (
+                totals.count,
+                totals.failures,
+                totals.credits_charged,
+                totals.cost_micro_cny,
+            ),
+        )
+    };
+    use billing::observability::TraceFilter;
+    // Newest first, at most the limit; the totals count every match.
+    assert_eq!(
+        search(TraceFilter::default(), 2),
+        (vec!["t4".into(), "t3".into()], (4, 1, 14, 140))
+    );
+    assert_eq!(
+        search(
+            TraceFilter {
+                card_id: Some("card-a".into()),
+                ..TraceFilter::default()
+            },
+            10
+        ),
+        (vec!["t4".into(), "t2".into(), "t1".into()], (3, 1, 7, 70))
+    );
+    assert_eq!(
+        search(
+            TraceFilter {
+                model: Some("model-a".into()),
+                from_secs: Some(150),
+                ..TraceFilter::default()
+            },
+            10
+        )
+        .0,
+        ["t4", "t3"]
+    );
+    // A provider matches the requests it answered and those it was tried for.
+    assert_eq!(
+        search(
+            TraceFilter {
+                provider: Some("primary".into()),
+                ..TraceFilter::default()
+            },
+            10
+        )
+        .0,
+        ["t3", "t2", "t1"]
+    );
+    assert_eq!(
+        search(
+            TraceFilter {
+                status: Some(TraceStatus::Error),
+                ..TraceFilter::default()
+            },
+            10
+        ),
+        (vec!["t2".into()], (1, 1, 0, 0))
+    );
+    // Up to, not including, the end.
+    assert_eq!(
+        search(
+            TraceFilter {
+                to_secs: Some(300),
+                ..TraceFilter::default()
+            },
+            10
+        )
+        .0,
+        ["t2", "t1"]
+    );
+}

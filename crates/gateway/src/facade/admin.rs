@@ -792,18 +792,49 @@ impl FacadeHandler for AdminTracesHandler {
             if !self.auth.verify(req.headers()) {
                 return unauthorized_response();
             }
-            let card_id = parse_query(req.uri(), "card_id");
+            let (from_secs, to_secs) = match report_period(req.uri()) {
+                Ok(period) => period,
+                Err(message) => return failure(StatusCode::BAD_REQUEST, message),
+            };
+            let text = |key: &str| {
+                parse_query(req.uri(), key)
+                    .and_then(|value| crate::archive::percent_decode(&value))
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            };
+            let status = match text("status") {
+                None => None,
+                Some(status) => match serde_json::from_value(serde_json::json!(status)) {
+                    Ok(status) => Some(status),
+                    Err(_) => {
+                        return failure(
+                            StatusCode::BAD_REQUEST,
+                            "status must be success, error, client_aborted or in_progress",
+                        )
+                    }
+                },
+            };
+            let filter = billing::observability::TraceFilter {
+                from_secs,
+                to_secs,
+                card_id: text("cardId").or_else(|| text("card_id")),
+                model: text("model"),
+                provider: text("provider"),
+                status,
+            };
             let limit = parse_query(req.uri(), "limit")
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(100)
                 .clamp(1, 500);
-            let traces = self.billing.list_traces(card_id.as_deref(), limit);
+            let (traces, totals) = self.billing.search_traces(&filter, limit);
             json_response(
                 StatusCode::OK,
                 &serde_json::json!({
                     "success": true,
                     "count": traces.len(),
                     "traces": traces,
+                    // Over every retained trace that matched, not only those returned.
+                    "totals": totals,
                 }),
             )
         })

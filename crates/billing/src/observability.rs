@@ -237,6 +237,51 @@ pub struct RequestTrace {
     pub attempt_chain: Vec<AttemptRecord>,
 }
 
+/// Which traces a search keeps; all of them when nothing is set.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TraceFilter {
+    /// From this time on.
+    pub from_secs: Option<u64>,
+    /// Before this time.
+    pub to_secs: Option<u64>,
+    pub card_id: Option<String>,
+    /// The model the customer asked for.
+    pub model: Option<String>,
+    /// The provider that answered, or any provider an attempt was made to.
+    pub provider: Option<String>,
+    pub status: Option<TraceStatus>,
+}
+
+impl TraceFilter {
+    pub fn matches(&self, trace: &RequestTrace) -> bool {
+        self.from_secs.is_none_or(|from| trace.ts >= from)
+            && self.to_secs.is_none_or(|to| trace.ts < to)
+            && self.card_id.as_ref().is_none_or(|id| trace.card_id == *id)
+            && self
+                .model
+                .as_ref()
+                .is_none_or(|model| trace.exposed_model == *model)
+            && self.provider.as_ref().is_none_or(|provider| {
+                trace.provider_id.as_ref() == Some(provider)
+                    || trace
+                        .attempt_chain
+                        .iter()
+                        .any(|attempt| attempt.provider_id == *provider)
+            })
+            && self.status.is_none_or(|status| trace.status == status)
+    }
+}
+
+/// Totals over every trace a search matched, not only those returned.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TraceTotals {
+    pub count: u64,
+    pub failures: u64,
+    pub credits_charged: i64,
+    pub cost_micro_cny: i64,
+}
+
 /// Daily aggregated usage summary (Spec §14.4).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct DailyUsageSummary {

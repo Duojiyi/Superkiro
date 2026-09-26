@@ -1961,3 +1961,123 @@ async fn financials_report_a_period_by_provider_with_sales_and_liability() {
          cache_write_tokens,credits,revenue_cny,cost_cny\n"
     ));
 }
+
+#[tokio::test]
+async fn traces_are_filtered_on_the_server_with_totals_for_the_whole_match() {
+    let (billing, app) = setup_admin_app();
+    for (id, card, model, ts, status, provider, credits) in [
+        (
+            "t1",
+            "card-a",
+            "claude:opus",
+            100,
+            billing::TraceStatus::Success,
+            "prov-a",
+            5,
+        ),
+        (
+            "t2",
+            "card-a",
+            "claude:opus",
+            200,
+            billing::TraceStatus::Error,
+            "prov-b",
+            0,
+        ),
+        (
+            "t3",
+            "card-a",
+            "claude:opus",
+            300,
+            billing::TraceStatus::Error,
+            "prov-b",
+            0,
+        ),
+        (
+            "t4",
+            "card-b",
+            "claude:opus",
+            400,
+            billing::TraceStatus::Error,
+            "prov-b",
+            0,
+        ),
+        (
+            "t5",
+            "card-a",
+            "other-model",
+            500,
+            billing::TraceStatus::Error,
+            "prov-b",
+            0,
+        ),
+    ] {
+        billing.record_trace(billing::RequestTrace {
+            id: id.into(),
+            card_id: card.into(),
+            ts,
+            invocation_id: format!("{card}:{id}"),
+            exposed_model: model.into(),
+            status,
+            provider_id: Some(provider.into()),
+            credits_charged: credits,
+            provider_cost_micro_cny: credits * 10,
+            ..billing::RequestTrace::default()
+        });
+    }
+    let (status, body) = admin_call(
+        &app,
+        Method::GET,
+        "/api/v1/admin/traces?cardId=card-a&model=claude%3Aopus&fromSecs=100&toSecs=400&limit=1",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["count"], 1);
+    assert_eq!(body["traces"][0]["id"], "t3");
+    assert_eq!(
+        body["totals"],
+        json!({"count": 3, "failures": 2, "creditsCharged": 5, "costMicroCny": 50})
+    );
+    let (_, body) = admin_call(
+        &app,
+        Method::GET,
+        "/api/v1/admin/traces?provider=prov-b&status=error",
+        None,
+    )
+    .await;
+    let ids: Vec<_> = body["traces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|trace| trace["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["t5", "t4", "t3", "t2"]);
+    assert_eq!(body["totals"]["failures"], 4);
+    // The console's card filter keeps working.
+    let (_, body) = admin_call(
+        &app,
+        Method::GET,
+        "/api/v1/admin/traces?card_id=card-b",
+        None,
+    )
+    .await;
+    assert_eq!(body["count"], 1);
+    for (query, message) in [
+        (
+            "status=lost",
+            "status must be success, error, client_aborted or in_progress",
+        ),
+        ("toSecs=-1", "fromSecs and toSecs must be whole seconds"),
+    ] {
+        let (status, body) = admin_call(
+            &app,
+            Method::GET,
+            &format!("/api/v1/admin/traces?{query}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], message);
+    }
+}

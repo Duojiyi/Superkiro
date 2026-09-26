@@ -5394,6 +5394,30 @@ impl BillingEngine {
         });
     }
 
+    /// The retained traces a filter matches, newest first and at most `limit` of them, and
+    /// totals over every one it matches.
+    pub fn search_traces(
+        &self,
+        filter: &crate::observability::TraceFilter,
+        limit: usize,
+    ) -> (Vec<RequestTrace>, crate::observability::TraceTotals) {
+        let traces = self.traces.read().unwrap();
+        let mut totals = crate::observability::TraceTotals::default();
+        let mut found = Vec::new();
+        for trace in traces.iter().rev().filter(|trace| filter.matches(trace)) {
+            totals.count += 1;
+            totals.failures += u64::from(trace.status == TraceStatus::Error);
+            totals.credits_charged = totals.credits_charged.saturating_add(trace.credits_charged);
+            totals.cost_micro_cny = totals
+                .cost_micro_cny
+                .saturating_add(trace.provider_cost_micro_cny);
+            if found.len() < limit {
+                found.push(trace.clone());
+            }
+        }
+        (found, totals)
+    }
+
     /// List recorded request execution traces.
     pub fn list_traces(&self, card_id: Option<&str>, limit: usize) -> Vec<RequestTrace> {
         let traces = self.traces.read().unwrap();
