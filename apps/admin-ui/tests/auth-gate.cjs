@@ -145,7 +145,10 @@ const server=http.createServer(async(req,res)=>{
     holdLoginSession=false;await heldSession.continue();heldSession=null;
     assert.equal(await draft.inputValue(),'{"models":[],"privateDraft":"old-sensitive-draft"}');
     // A re-check that cannot complete blocks the workspace, keeping the draft, until it succeeds.
-    holdLoginSession=true;await page.evaluate(()=>window.dispatchEvent(new Event('focus')));await waitForRoute(()=>heldSession);
+    // Only one re-check runs at a time: keep returning to the window until the previous one has finished.
+    holdLoginSession=true;
+    for(let tries=0;!heldSession&&tries<50;tries++){await page.evaluate(()=>window.dispatchEvent(new Event('focus')));await page.waitForTimeout(100);}
+    await waitForRoute(()=>heldSession);
     await heldSession.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'temporary outage'})});heldSession=null;holdLoginSession=false;
     const recheck=page.getByRole('alertdialog',{name:'无法确认登录状态'});
     await recheck.getByRole('button',{name:'重试'}).waitFor();assert.equal(await draft.inputValue(),'{"models":[],"privateDraft":"old-sensitive-draft"}');assert(await draft.evaluate(el=>!!el.closest('[inert]')));
