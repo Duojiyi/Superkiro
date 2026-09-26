@@ -136,6 +136,14 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .config-table th.col-actions {z-index: 2; background: var(--bg-muted);}
 .config-table tr.is-selected td.col-actions {background: var(--brand-soft);}
 .clip-upstream {max-width: 220px;}
+/* 模型与定价: one section per group, in Kiro's order. */
+.config-table tbody th {position: static; height: 34px;}
+.config-table .group-row th {padding-top: 10px; background: var(--bg-surface); color: var(--text-1); font-weight: 400; text-align: left; white-space: normal; border-bottom: 1px solid var(--border);}
+.group-row-name {font-weight: 600;}
+.config-table .col-order {width: 52px; padding-right: 0;}
+.order-buttons {display: inline-flex; gap: 2px;}
+.order-buttons .btn-icon {width: 22px; height: 22px; font-size: 10px;}
+.config-table .cell-strong .tag {margin-left: 6px;}
 .route-tags {display: flex; flex-wrap: wrap; gap: 4px; margin-top: 2px;}
 /* Below 1440 the display name moves into the model's tooltip. */
 @media (max-width: 1439px) {.config-table .col-display {display: none;}}

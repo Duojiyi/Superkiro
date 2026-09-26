@@ -170,7 +170,8 @@ const Editor = load('CommercialEditor.tsx', {'./tokens': tokens, './api': {admin
   './components/confirm': {confirmAction: async () => true}, './components/toast': {toast: {success() {}, info() {}, error() {}}},
   './components/modal': {Drawer: 'Drawer', Modal: 'Modal'}, './components/icons': {IconImage: 'IconImage', IconSpark: 'IconSpark', IconTool: 'IconTool'},
   './components/ui': {InfoTip: 'InfoTip', Tag: 'Tag', TopbarActions: 'TopbarActions'}, './PriceDrawer': {default: 'PriceDrawer'}, './PriceVersions': {default: 'PriceVersions'}, './ListModelDrawer': {default: 'ListModelDrawer'},
-  './RouteEditor': {default: 'RouteEditor'}, './RouteSwitchDrawer': {default: 'RouteSwitchDrawer'},
+  './RouteEditor': {default: 'RouteEditor'}, './RouteSwitchDrawer': {default: 'RouteSwitchDrawer'}, './components/menu': {Menu: 'Menu'},
+  './listing': load('listing.ts', {'./priceChange': change, './routes': routes}),
   react, 'react/jsx-runtime': runtime}).default;
 const providers = [{id: 'p', name: '供应商 P'}, {id: 'openai', name: 'Astra', api_type: 'openai'}];
 const providerKeys = [{id: 'k', provider_id: 'openai', allowed_models: ['gpt-6-astra', 'gpt-5.6-sol']}, {id: 'k2', provider_id: 'p', allowed_models: ['upstream']}];

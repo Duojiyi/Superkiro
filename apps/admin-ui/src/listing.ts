@@ -88,6 +88,23 @@ export function groupModels(models: Row[], groupId: unknown): Row[] {
   return models.filter(model => model.group_id === groupId).sort((a, b) => order(a) - order(b));
 }
 
+/**
+ * Every model, with this one moved one place up, one down, or to the top of its group, and the
+ * group numbered 0, 1, 2… in the new order: no tie is left for the server to settle.
+ */
+export function reorder(models: Row[], id: unknown, to: 'up' | 'down' | 'first'): Row[] {
+  const target = models.find(model => model.id === id);
+  if (!target) return models;
+  const ordered = groupModels(models, target.group_id), from = ordered.indexOf(target);
+  const next = ordered.filter(model => model !== target);
+  next.splice(to === 'first' ? 0 : to === 'up' ? Math.max(0, from - 1) : Math.min(next.length, from + 1), 0, target);
+  const place = new Map(next.map((model, index) => [model, index]));
+  return models.map(model => place.has(model) ? {...model, sort_order: place.get(model)} : model);
+}
+
+/** The model Kiro uses when a request names none: the first one of the group customers see. */
+export const defaultModel = (models: Row[], groupId: unknown) => groupModels(models, groupId).find(model => model.visible !== false && model.retired !== true);
+
 /** A group's models numbered 0, 1, 2… in the order given, so no two share a place: the ones whose number changes. */
 export function renumbered(ordered: Row[]): Row[] {
   return ordered.map((model, index) => ({model, index})).filter(({model, index}) => order(model) !== index || model.sort_order === undefined)

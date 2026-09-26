@@ -129,3 +129,15 @@ assert.deepEqual(plain(switched), {target_provider_id: 'b', target_model: 'm1', 
 assert.deepEqual(plain(routes.switchedRoute({target_provider_id: 'a', target_model: 'm1'}, {provider_id: 'b', target_model: 'm2'}, false).fallback_chain), []);
 assert.equal(routes.switchedRoute({target_provider_id: 'a', target_model: 'm', fallback_chain: Array.from({length: 8}, (_, i) => ({provider_id: `p${i}`, target_model: 'm'}))}, {provider_id: 'z', target_model: 'm'}, true).fallback_chain.length, 8);
 console.log('PASS route costs: own route first, then upstream, *, the model price; staged costs never charge; 0 made later when not first; switching keeps the old route as backup');
+
+// List order: moving a model numbers its whole group again, so no tie remains; the default is the first shown model.
+const listingRules = load('listing.ts', {'./priceChange': change, './routes': routes});
+const ordered = [{id: 'a', group_id: 'g', sort_order: 0, visible: false}, {id: 'b', group_id: 'g', sort_order: 0}, {id: 'c', group_id: 'g', sort_order: 5}, {id: 'x', group_id: 'h', sort_order: 0}];
+const placed = (to, id) => plain(listingRules.reorder(ordered, id, to).map(row => [row.id, row.sort_order]));
+assert.deepEqual(placed('first', 'c'), [['a', 1], ['b', 2], ['c', 0], ['x', 0]], 'to the top; another group is untouched');
+assert.deepEqual(placed('down', 'a'), [['a', 1], ['b', 0], ['c', 2], ['x', 0]]);
+assert.deepEqual(placed('up', 'b'), [['a', 1], ['b', 0], ['c', 2], ['x', 0]], 'ties are settled in the order shown');
+assert.deepEqual(placed('up', 'a'), [['a', 0], ['b', 1], ['c', 2], ['x', 0]], 'already first: only renumbered');
+assert.equal(listingRules.defaultModel(ordered, 'g').id, 'b', 'a hidden model is never the default');
+assert.equal(listingRules.defaultModel([{id: 'r', group_id: 'g', retired: true}], 'g'), undefined);
+console.log('PASS list order: up, down and to the top renumber the group; ties settled; the default is the first model customers see');

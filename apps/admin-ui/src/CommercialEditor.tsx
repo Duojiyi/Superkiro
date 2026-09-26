@@ -4,6 +4,7 @@ import { adminApi, AdminApiError, type AdminCardItem, type CommercialConfig } fr
 import { confirmAction } from './components/confirm';
 import { toast } from './components/toast';
 import { Drawer, Modal } from './components/modal';
+import { Menu } from './components/menu';
 import { InfoTip, Tag, TopbarActions } from './components/ui';
 import { IconImage, IconSpark, IconTool } from './components/icons';
 import { formatClock, formatCount, formatTokenCount, shortHash } from './format';
@@ -11,6 +12,7 @@ import { creditsText, currentVersion, timeDraftVersions } from './priceChange';
 import PriceDrawer, { type PublishOutcome } from './PriceDrawer';
 import PriceVersions from './PriceVersions';
 import ListModelDrawer from './ListModelDrawer';
+import { defaultModel, groupModels, reorder } from './listing';
 import RouteEditor from './RouteEditor';
 import RouteSwitchDrawer, { type SwitchedRoute } from './RouteSwitchDrawer';
 import { rebaseDraft } from './rebase';
@@ -303,7 +305,6 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
   };
   const rateCards = config?.rate_cards ?? [], configGroups = config?.groups ?? [], configModels = config?.models ?? [], configVersions = config?.versions ?? [];
   const rateCardName = (id: unknown) => String(rateCards.find(card => card.id === id)?.name ?? id ?? '—');
-  const groupName = (id: unknown) => String(configGroups.find(group => group.id === id)?.name ?? id ?? '—');
   const cardCount = (groupId: unknown) => cards ? cards.filter(card => card.groupId === groupId && card.status !== 'voided' && card.archivedAt == null).length : null;
   const existingModel = kind === 'models' && !!selectedRow && configModels.some(model => model.id === selectedRow.id);
   const nowSecs = Date.now() / 1000;
@@ -422,6 +423,74 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
     else if (!outcome.uncertain) say(outcome.message);
   };
 
+  // Each group's models in Kiro's order (sort_order, ties as the server lists them); ▲▼ and
+  // 设为默认 number the whole group again in the draft, published with the bar.
+  const move = (row: Row, to: 'up' | 'down' | 'first') => setDraft(JSON.stringify({...parsedDraft, models: reorder(rows, row.id, to)}, null, 2));
+  // Shown models sharing the first place: which of them Kiro takes as the default is the server's order.
+  const defaultCandidates = (groupId: unknown) => {
+    const first = defaultModel(rows, groupId);
+    return first ? rows.filter(row => row.group_id === groupId && isLive(row) && Number(row.sort_order ?? 0) === Number(first.sort_order ?? 0)) : [];
+  };
+  const known = new Set(configGroups.map(group => group.id));
+  const sections = kind !== 'models' ? [] : [...configGroups.map(group => ({id: group.id, name: String(group.name ?? group.id)})),
+    ...[...new Set(listed.filter(row => !known.has(row.group_id)).map(row => row.group_id))].map(id => ({id, name: `${String(id ?? '（无分组）')}（分组不存在）`}))]
+    .map(section => {
+      const all = groupModels(rows, section.id), shown = all.filter(row => listed.includes(row));
+      const live = all.filter(row => row.visible !== false && row.retired !== true);
+      const ties = live.filter(row => live.some(other => other !== row && Number(other.sort_order ?? 0) === Number(row.sort_order ?? 0))).map(row => String(row.exposed_model_id ?? row.id));
+      return {...section, rows: shown, count: all.length, fallback: defaultModel(rows, section.id), ties, candidates: defaultCandidates(section.id)};
+    }).filter(section => section.rows.length);
+  const renderRow = (row: Row, index: number) => {
+            const active = selectedRow?.id === row.id;
+            const edited = isEdited(row);
+            const price = kind === 'models' ? priceOf(row) : null;
+            const published = kind === 'models' && configModels.some(model => model.id === row.id);
+            const route = routeOf(row), backups = kind === 'models' ? targetsOf(row).slice(1) : [];
+            const name = String(row.exposed_model_id ?? row.id), peers = kind === 'models' ? groupModels(rows, row.group_id) : [];
+            const place = peers.indexOf(row), isDefault = kind === 'models' && defaultModel(rows, row.group_id) === row;
+            const tiedCandidates = kind === 'models' ? defaultCandidates(row.group_id) : [], tiedDefault = tiedCandidates.length > 1 && tiedCandidates.includes(row);
+            const cells = kind === 'groups'
+              ? [<td key="n" className="cell-strong">{String(row.name ?? row.id)}{edited && <span className="edited-dot">{originalOf(row) ? '已修改' : '新建'}</span>}</td>,
+                <td key="i">{row.issuance_enabled === false ? <span className="muted">—</span> : '✓'}</td>,
+                <td key="p">{String(row.virtual_plan_name ?? '—')}</td>,
+                <td key="u" className="num">{typeof row.virtual_usage_limit === 'number' ? formatCount(row.virtual_usage_limit) : '—'}</td>,
+                <td key="r" title={String(row.rate_card_id ?? '')}>{rateCardName(row.rate_card_id)}</td>,
+                <td key="m" className="num">{String(row.margin_multiplier ?? '—')}</td>,
+                <td key="c" className="num">{cardCount(row.id) ?? '—'}</td>]
+              : [<td key="n" className="cell-strong mono" title={row.display_name ? `显示名：${String(row.display_name)}` : undefined}>{String(row.exposed_model_id ?? row.id)}
+                  {tiedDefault ? <Tag tone="warning" title="和别的模型排在同一位置：谁是默认以服务器为准，上移或下移一次即可固定">默认待定</Tag>
+                    : isDefault && <Tag tone="info" title="Kiro 列表里的第一个模型：请求没指定模型时用它">默认</Tag>}{edited && <span className="edited-dot">{originalOf(row) ? '已修改' : '新建'}</span>}</td>,
+                <td key="d" className="col-display">{String(row.display_name ?? '') || <span className="muted">—</span>}</td>,
+                <td key="t" title={`${String(row.target_provider_id ?? '—')} / ${String(row.target_model ?? '—')}`}><span className="mono clip clip-upstream">{String(row.target_provider_id ?? '—')} / {String(row.target_model ?? '—')}</span>
+                  {(backups.length > 0 || (route && !route.primary.ok)) && <span className="route-tags">
+                    {backups.length > 0 && <Tag tone="info" title={backups.map((backup, i) => `备 ${i + 1}：${backup.provider_id} / ${backup.target_model}`).join('\n')}>主 + {backups.length} 备</Tag>}
+                    {route && !route.primary.ok && (route.down
+                      ? <Tag tone={isLive(row) ? 'danger' : 'neutral'} title={targetProblem(route.primary, providers)}>无可用线路</Tag>
+                      : <Tag tone="warning" title={`${targetProblem(route.primary, providers)}；正由备用线路服务`}>主线路不可用</Tag>)}</span>}</td>,
+                <td key="w" className="num" title={`${formatTokens(row.context_window)} / ${formatTokens(row.max_output)}`}>{typeof row.context_window === 'number' ? formatTokenCount(row.context_window) : '—'} / {typeof row.max_output === 'number' ? formatTokenCount(row.max_output) : '—'}</td>,
+                <td key="a"><span className="capabilities">{capability(row)}</span></td>,
+                <td key="p" className="num" title={price ? `版本 ${String(price.id)}（积分 / 百万 Tokens）` : '没有生效中的价格'}>{price && price.pricing_mode === 'fixed'
+                  ? `${creditsText(price.fixed_input_credit_per_m) ?? '?'} / ${creditsText(price.fixed_output_credit_per_m) ?? '?'}` : price ? '非固定' : <span className="is-warning">未定价</span>}</td>,
+                <td key="v">{row.visible === false ? <span className="muted">隐藏</span> : '✓'}</td>];
+            return <tr key={String(row.id ?? index)} className={active ? 'is-selected' : undefined}>
+              {kind === 'models' && <td className="col-check"><input type="checkbox" aria-label={`选择 ${String(row.exposed_model_id ?? row.id)}`} disabled={!published}
+                title={published ? undefined : '先发布这个模型'} checked={picked.includes(String(row.id))} onChange={event => pick(String(row.id), event.target.checked)}/></td>}
+              {kind === 'models' && <td className="col-order"><span className="order-buttons">
+                <button type="button" className="btn-icon" aria-label={`上移 ${name}`} title="上移一位" disabled={busy || place === 0} onClick={() => move(row, 'up')}>▲</button>
+                <button type="button" className="btn-icon" aria-label={`下移 ${name}`} title="下移一位" disabled={busy || place === peers.length - 1} onClick={() => move(row, 'down')}>▼</button>
+              </span></td>}
+              {cells}
+              <td className="col-actions"><span className="row-actions">
+                <button type="button" className="btn-text" disabled={busy} onClick={() => {setSelected(String(row.id)); focusEditor();}}>编辑</button>
+                {kind === 'models' && <button type="button" className="btn-text" disabled={!!priceBlocked || !published} title={!published ? '先发布这个模型，再调价' : priceBlocked}
+                  onClick={() => {setJsonOpen(false); setListing(null); setPriceModel(String(row.id));}}>调价</button>}
+                {kind === 'models' && <Menu label={`${name} 的更多操作`} disabled={busy} items={[
+                  {label: '设为默认（排到最前）', disabled: (isDefault && !tiedDefault) || !isLive(row), title: isDefault && !tiedDefault ? '已经是默认模型' : !isLive(row) ? '客户看不到的模型不能做默认' : undefined, onSelect: () => move(row, 'first')},
+                ]}/>}
+              </span></td>
+            </tr>;
+  };
+
   // 新建分组: a small form; the new row goes into the draft and is published with the bar.
   const addGroup = () => {
     if (!newGroup) return;
@@ -469,50 +538,19 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
         <thead><tr>{kind === 'models' && <th className="col-check"><input type="checkbox" aria-label="选择全部模型" checked={configModels.length > 0 && pickedModels.length === configModels.length}
             ref={element => {if (element) element.indeterminate = pickedModels.length > 0 && pickedModels.length < configModels.length;}} disabled={!configModels.length}
             onChange={event => setPicked(event.target.checked ? configModels.map(model => String(model.id)) : [])}/></th>}
-          {(kind === 'groups' ? ['名称', '可发卡', '对外套餐名', '用量上限', '价格表', '倍率', '卡密数', ''] : ['模型', '显示名', '线路', '分组', '上下文 / 输出', '能力', '当前价格（入/出）', '客户可见', '']).map((label, index) =>
+          {kind === 'models' && <th className="col-order">顺序</th>}
+          {(kind === 'groups' ? ['名称', '可发卡', '对外套餐名', '用量上限', '价格表', '倍率', '卡密数', ''] : ['模型', '显示名', '线路', '上下文 / 输出', '能力', '当前价格（入/出）', '客户可见', '']).map((label, index) =>
           <th key={index} className={['用量上限', '倍率', '卡密数', '上下文 / 输出', '当前价格（入/出）'].includes(label) ? 'num' : label === '显示名' ? 'col-display' : label ? undefined : 'col-actions'}>{label || <span className="sr-only">操作</span>}</th>)}</tr></thead>
-        <tbody>
-          {listed.map((row, index) => {
-            const active = selectedRow?.id === row.id;
-            const edited = isEdited(row);
-            const price = kind === 'models' ? priceOf(row) : null;
-            const published = kind === 'models' && configModels.some(model => model.id === row.id);
-            const route = routeOf(row), backups = kind === 'models' ? targetsOf(row).slice(1) : [];
-            const cells = kind === 'groups'
-              ? [<td key="n" className="cell-strong">{String(row.name ?? row.id)}{edited && <span className="edited-dot">{originalOf(row) ? '已修改' : '新建'}</span>}</td>,
-                <td key="i">{row.issuance_enabled === false ? <span className="muted">—</span> : '✓'}</td>,
-                <td key="p">{String(row.virtual_plan_name ?? '—')}</td>,
-                <td key="u" className="num">{typeof row.virtual_usage_limit === 'number' ? formatCount(row.virtual_usage_limit) : '—'}</td>,
-                <td key="r" title={String(row.rate_card_id ?? '')}>{rateCardName(row.rate_card_id)}</td>,
-                <td key="m" className="num">{String(row.margin_multiplier ?? '—')}</td>,
-                <td key="c" className="num">{cardCount(row.id) ?? '—'}</td>]
-              : [<td key="n" className="cell-strong mono" title={row.display_name ? `显示名：${String(row.display_name)}` : undefined}>{String(row.exposed_model_id ?? row.id)}{edited && <span className="edited-dot">{originalOf(row) ? '已修改' : '新建'}</span>}</td>,
-                <td key="d" className="col-display">{String(row.display_name ?? '') || <span className="muted">—</span>}</td>,
-                <td key="t" title={`${String(row.target_provider_id ?? '—')} / ${String(row.target_model ?? '—')}`}><span className="mono clip clip-upstream">{String(row.target_provider_id ?? '—')} / {String(row.target_model ?? '—')}</span>
-                  {(backups.length > 0 || (route && !route.primary.ok)) && <span className="route-tags">
-                    {backups.length > 0 && <Tag tone="info" title={backups.map((backup, i) => `备 ${i + 1}：${backup.provider_id} / ${backup.target_model}`).join('\n')}>主 + {backups.length} 备</Tag>}
-                    {route && !route.primary.ok && (route.down
-                      ? <Tag tone={isLive(row) ? 'danger' : 'neutral'} title={targetProblem(route.primary, providers)}>无可用线路</Tag>
-                      : <Tag tone="warning" title={`${targetProblem(route.primary, providers)}；正由备用线路服务`}>主线路不可用</Tag>)}</span>}</td>,
-                <td key="g" title={String(row.group_id ?? '')}>{groupName(row.group_id)}</td>,
-                <td key="w" className="num" title={`${formatTokens(row.context_window)} / ${formatTokens(row.max_output)}`}>{typeof row.context_window === 'number' ? formatTokenCount(row.context_window) : '—'} / {typeof row.max_output === 'number' ? formatTokenCount(row.max_output) : '—'}</td>,
-                <td key="a"><span className="capabilities">{capability(row)}</span></td>,
-                <td key="p" className="num" title={price ? `版本 ${String(price.id)}（积分 / 百万 Tokens）` : '没有生效中的价格'}>{price && price.pricing_mode === 'fixed'
-                  ? `${creditsText(price.fixed_input_credit_per_m) ?? '?'} / ${creditsText(price.fixed_output_credit_per_m) ?? '?'}` : price ? '非固定' : <span className="is-warning">未定价</span>}</td>,
-                <td key="v">{row.visible === false ? <span className="muted">隐藏</span> : '✓'}</td>];
-            return <tr key={String(row.id ?? index)} className={active ? 'is-selected' : undefined}>
-              {kind === 'models' && <td className="col-check"><input type="checkbox" aria-label={`选择 ${String(row.exposed_model_id ?? row.id)}`} disabled={!published}
-                title={published ? undefined : '先发布这个模型'} checked={picked.includes(String(row.id))} onChange={event => pick(String(row.id), event.target.checked)}/></td>}
-              {cells}
-              <td className="col-actions"><span className="row-actions">
-                <button type="button" className="btn-text" disabled={busy} onClick={() => {setSelected(String(row.id)); focusEditor();}}>编辑</button>
-                {kind === 'models' && <button type="button" className="btn-text" disabled={!!priceBlocked || !published} title={!published ? '先发布这个模型，再调价' : priceBlocked}
-                  onClick={() => {setJsonOpen(false); setListing(null); setPriceModel(String(row.id));}}>调价</button>}
-              </span></td>
-            </tr>;
-          })}
-          {!listed.length && <tr className="state-row"><td colSpan={kind === 'models' ? 10 : 8}>{busy ? <div className="skeleton" role="status" aria-label="正在加载"><span className="skeleton-bar"/><span className="skeleton-bar"/></div> : <div className="list-state"><p>{needle ? '没有匹配的条目' : '暂无数据'}</p></div>}</td></tr>}
-        </tbody>
+        {kind === 'groups' ? <tbody>{listed.map(renderRow)}</tbody> : sections.map(section => <tbody key={String(section.id)} aria-label={section.name}>
+          <tr className="group-row"><th colSpan={10} scope="colgroup">
+            <span className="group-row-name">{section.name}</span>
+            <span className="muted"> · {section.count} 个模型 · {section.candidates.length > 1 ? `Kiro 默认：${section.candidates.map(row => String(row.exposed_model_id)).join(' 或 ')}（谁在前以服务器为准）`
+              : section.fallback ? `Kiro 默认：${String(section.fallback.exposed_model_id)}` : '没有对客户可见的模型'}</span>
+            {section.ties.length > 0 && <span className="is-warning"> · {nameList(section.ties, 4)} 排在同一位置，Kiro 里它们的先后以服务器为准；上移或下移一次即可固定</span>}
+          </th></tr>
+          {section.rows.map(renderRow)}
+        </tbody>)}
+        {!listed.length && <tbody><tr className="state-row"><td colSpan={kind === 'models' ? 10 : 8}>{busy ? <div className="skeleton" role="status" aria-label="正在加载"><span className="skeleton-bar"/><span className="skeleton-bar"/></div> : <div className="list-state"><p>{needle ? '没有匹配的条目' : '暂无数据'}</p></div>}</td></tr></tbody>}
       </table></div>
     </section>
 
