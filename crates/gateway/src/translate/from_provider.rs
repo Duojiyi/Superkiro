@@ -97,6 +97,8 @@ pub fn translate_provider_event_to_frames(
         },
         ProviderStreamEvent::Started
         | ProviderStreamEvent::Heartbeat
+        | ProviderStreamEvent::Served { .. }
+        | ProviderStreamEvent::Failed(_)
         | ProviderStreamEvent::Refusal { .. } => {}
         ProviderStreamEvent::StopReason(reason) => {
             let mapped = StreamTranslationState::map_stop_reason(reason);

@@ -19,10 +19,11 @@ use crate::ops::{CardRateLimiter, RateLimitError};
 use crate::provider::governance::{
     execute_stream_with_model_fallback, GovernanceError, ProviderKeyPool,
 };
+use crate::provider::retry::UpstreamLimits;
 use crate::provider::ProviderRuntimeRegistry;
 use crate::provider::{ModelProvider, ProviderConfig, ProviderError};
 use crate::security::{ContentGuardrailConfig, GuardrailError};
-use crate::stream::{create_stream_guard, BillingSettler, StreamGuardConfig};
+use crate::stream::{create_stream_guard, BillingSettler, KiroError, StreamGuardConfig};
 use crate::translate::to_provider::{
     prepare_images, translate_kiro_to_chat_request, TranslationContext,
 };
@@ -65,6 +66,9 @@ pub struct GenerateAssistantResponseHandler {
     pub content_guardrail: ContentGuardrailConfig,
     /// Shared by every clone: the places for bodies over 10 MB across the gateway.
     pub large_bodies: LargeBodyGate,
+    /// Limits for every upstream attempt in place of each target model's own (tests use
+    /// short ones).
+    pub upstream_limits: Option<UpstreamLimits>,
 }
 
 impl Default for GenerateAssistantResponseHandler {
@@ -85,6 +89,7 @@ impl Default for GenerateAssistantResponseHandler {
             vision_cache: crate::translate::VisionFallbackCache::default(),
             content_guardrail: ContentGuardrailConfig::default(),
             large_bodies: LargeBodyGate::default(),
+            upstream_limits: None,
         }
     }
 }
@@ -113,6 +118,7 @@ impl GenerateAssistantResponseHandler {
             vision_cache: crate::translate::VisionFallbackCache::default(),
             content_guardrail: ContentGuardrailConfig::default(),
             large_bodies: LargeBodyGate::default(),
+            upstream_limits: None,
         }
     }
 
@@ -1053,101 +1059,122 @@ impl GenerateAssistantResponseHandler {
                     "Request upstream attempt budget exhausted; submit a new request to retry",
                 );
             }
-            let (upstream_stream, actual_provider_id, actual_target_model) =
+            // The route primes an attempt through the model's first content, retrying and
+            // failing over within the attempt budget. Kiro gives up on a request that sends it
+            // nothing for 60 seconds, so a route still going at `commit` (after the request
+            // arrived) begins the answer: headers, then keepalives while the route finishes
+            // behind them, and a failure ends it with the exception frame Kiro reads as it
+            // would the error response. A route that ends sooner is answered as before.
+            let limits = self
+                .upstream_limits
+                .unwrap_or_else(|| crate::provider::retry::UpstreamLimits::for_request(&chat_req));
+            let route = match self.upstream_limits {
+                Some(limits) => crate::provider::retry::Route::with_limits(limits),
+                None => crate::provider::retry::Route::new(limits.total),
+            };
+            let commit_at = tokio::time::Instant::from_std(received_at) + limits.commit;
+            let (upstream_stream, actual_provider_id, actual_target_model, committed) =
                 if !candidates.is_empty() {
-                    let ((route_result, attempts), empty_attempt) =
-                        with_empty_attempt(crate::provider::retry::ATTEMPTS.scope(
-                            std::sync::Mutex::new(Vec::new()),
-                            async {
-                                let result = execute_stream_with_model_fallback(
-                                    &candidates,
-                                    &self.client,
-                                    &chat_req,
-                                    Duration::from_secs(60),
-                                    remaining_attempts,
-                                    now_secs,
-                                )
+                    let routing = {
+                        let candidates = candidates.clone();
+                        let client = self.client.clone();
+                        let chat_req = chat_req.clone();
+                        let billing = self.billing.clone();
+                        let invocation_key = invocation_key.clone();
+                        let requested_model = requested_model.to_string();
+                        let card_id = claims
+                            .as_ref()
+                            .map(|c| c.card_id.clone())
+                            .unwrap_or_default();
+                        async move {
+                            let ((route_result, attempts), empty_attempt) =
+                                with_empty_attempt(crate::provider::retry::ATTEMPTS.scope(
+                                    std::sync::Mutex::new(Vec::new()),
+                                    async {
+                                        let result = execute_stream_with_model_fallback(
+                                            &candidates,
+                                            &client,
+                                            &chat_req,
+                                            Duration::from_secs(60),
+                                            remaining_attempts,
+                                            now_secs,
+                                        )
+                                        .await;
+                                        let attempts = crate::provider::retry::ATTEMPTS
+                                            .with(|records| records.lock().unwrap().clone());
+                                        (result, attempts)
+                                    },
+                                ))
                                 .await;
-                                let attempts = crate::provider::retry::ATTEMPTS
-                                    .with(|records| records.lock().unwrap().clone());
-                                (result, attempts)
-                            },
-                        ))
-                        .await;
-                    self.billing
-                        .record_trace(billing::observability::RequestTrace {
-                            id: format!(
-                                "attempt-{}-{}",
-                                invocation_key,
-                                SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_nanos()
-                            ),
-                            card_id: claims
-                                .as_ref()
-                                .map(|c| c.card_id.clone())
-                                .unwrap_or_default(),
-                            ts: crate::now_secs(),
-                            invocation_id: invocation_key.clone(),
-                            exposed_model: requested_model.to_string(),
-                            status: if route_result.is_ok() {
-                                billing::observability::TraceStatus::InProgress
-                            } else {
-                                billing::observability::TraceStatus::Error
-                            },
-                            ttft_ms: None,
-                            tokens_per_second: None,
-                            error_class: route_result
-                                .as_ref()
-                                .err()
-                                .map(|error| route_failure_class(error, &attempts).into()),
-                            provider_id: attempts.last().map(|a| a.provider_id.clone()),
-                            input_tokens: 0,
-                            output_tokens: 0,
-                            credits_charged: 0,
-                            provider_cost_micro_cny: 0,
-                            attempt_chain: attempts,
-                        });
-                    match route_result {
-                        Ok(res) => (res.stream, res.provider.id, res.target_model),
-                        // Whatever stopped the last attempt, an empty one consumed input.
-                        Err(_)
-                            if self.bill_empty_attempt(
-                                &invocation_key,
-                                requested_model,
-                                translated_input_estimate,
-                                empty_attempt,
-                            ) =>
-                        {
-                            idempotency_guard.fail();
-                            return empty_attempts_response();
+                            billing.record_trace(billing::observability::RequestTrace {
+                                id: format!(
+                                    "attempt-{}-{}",
+                                    invocation_key,
+                                    SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_nanos()
+                                ),
+                                card_id,
+                                ts: crate::now_secs(),
+                                invocation_id: invocation_key,
+                                exposed_model: requested_model,
+                                status: if route_result.is_ok() {
+                                    billing::observability::TraceStatus::InProgress
+                                } else {
+                                    billing::observability::TraceStatus::Error
+                                },
+                                ttft_ms: None,
+                                tokens_per_second: None,
+                                error_class: route_result
+                                    .as_ref()
+                                    .err()
+                                    .map(|error| route_failure_class(error, &attempts).into()),
+                                provider_id: attempts.last().map(|a| a.provider_id.clone()),
+                                input_tokens: 0,
+                                output_tokens: 0,
+                                credits_charged: 0,
+                                provider_cost_micro_cny: 0,
+                                attempt_chain: attempts,
+                            });
+                            (route_result, empty_attempt)
                         }
-                        Err(e) if upstream_input_too_long(&e) => {
-                            let _ = self.billing.release(&invocation_key);
-                            return input_too_long(UPSTREAM_OVERFLOW);
-                        }
-                        Err(GovernanceError::AllKeysInCooldown {
-                            next_recovery_secs, ..
-                        }) => {
-                            let _ = self.billing.release(&invocation_key);
-                            return format_kiro_throttle_response(
-                                StatusCode::TOO_MANY_REQUESTS,
-                                "ThrottlingException",
-                                "ALL_KEYS_IN_COOLDOWN",
-                                "All upstream provider keys are currently in cooldown",
-                                Some(next_recovery_secs.max(1)),
-                            );
-                        }
-                        Err(e) => {
-                            let _ = self.billing.release(&invocation_key);
-                            return governance_upstream_refusal(&e).unwrap_or_else(|| {
-                                error_response(
-                                    StatusCode::BAD_GATEWAY,
-                                    "InternalServerException",
-                                    &crate::stream::safe_governance_error(&e),
+                    };
+                    let mut routing =
+                        Box::pin(crate::provider::retry::ROUTE.scope(route.clone(), routing));
+                    match until_committed(&mut routing, commit_at).await {
+                        Some((route_result, empty_attempt)) => match route_result {
+                            Ok(res) => (res.stream, res.provider.id, res.target_model, false),
+                            // Only when every attempt ended empty: their input was consumed.
+                            Err(_)
+                                if self.bill_empty_attempt(
+                                    &invocation_key,
+                                    requested_model,
+                                    translated_input_estimate,
+                                    empty_attempt,
+                                ) =>
+                            {
+                                idempotency_guard.fail();
+                                return empty_attempts_response();
+                            }
+                            Err(e) => {
+                                let _ = self.billing.release(&invocation_key);
+                                return route_error(&e).into_response();
+                            }
+                        },
+                        None => {
+                            // Named until the route says which attempt serves the answer.
+                            let (pool, target_model) = &candidates[0];
+                            let answer = deferred_answer(async move {
+                                let (route_result, empty_attempt) = routing.await;
+                                (
+                                    route_result
+                                        .map(|res| (res.stream, res.provider.id, res.target_model))
+                                        .map_err(|error| route_error(&error)),
+                                    empty_attempt,
                                 )
                             });
+                            (answer, pool.provider().id, target_model.clone(), true)
                         }
                     }
                 } else if let (Some(ref provider), Some(ref provider_config)) =
@@ -1167,48 +1194,67 @@ impl GenerateAssistantResponseHandler {
                     }
                     let mut direct_config = provider_config.clone();
                     direct_config.model = target_model.clone();
-                    let (started, empty_attempt) =
-                        with_empty_attempt(crate::provider::retry::start_stream(
-                            provider.as_ref(),
-                            &self.client,
-                            &direct_config,
-                            &chat_req,
-                            3,
-                        ))
-                        .await;
-                    match started {
-                        Ok(s) => (s, provider.name().to_string(), target_model.clone()),
-                        Err(_)
-                            if self.bill_empty_attempt(
-                                &invocation_key,
-                                requested_model,
-                                translated_input_estimate,
-                                empty_attempt,
-                            ) =>
-                        {
-                            idempotency_guard.fail();
-                            return empty_attempts_response();
+                    let routing = {
+                        let provider = provider.clone();
+                        let client = self.client.clone();
+                        let chat_req = chat_req.clone();
+                        async move {
+                            with_empty_attempt(crate::provider::retry::start_stream(
+                                provider.as_ref(),
+                                &client,
+                                &direct_config,
+                                &chat_req,
+                                3,
+                            ))
+                            .await
                         }
-                        Err(e) if provider_input_too_long(&e) => {
-                            let _ = self.billing.release(&invocation_key);
-                            self.record_refusal(
-                                claims.as_ref(),
-                                &invocation_key,
-                                requested_model,
-                                "input_too_long",
-                            );
-                            return input_too_long(UPSTREAM_OVERFLOW);
-                        }
-                        Err(e) => {
-                            // Upstream initiation failed; release reservation in full
-                            let _ = self.billing.release(&invocation_key);
-                            return upstream_refusal(&e).unwrap_or_else(|| {
-                                error_response(
-                                    StatusCode::BAD_GATEWAY,
-                                    "InternalServerException",
-                                    &crate::stream::safe_provider_error(&e),
-                                )
-                            });
+                    };
+                    let mut routing =
+                        Box::pin(crate::provider::retry::ROUTE.scope(route.clone(), routing));
+                    let provider_id = provider.name().to_string();
+                    match until_committed(&mut routing, commit_at).await {
+                        Some((started, empty_attempt)) => match started {
+                            Ok(s) => (s, provider_id, target_model.clone(), false),
+                            Err(_)
+                                if self.bill_empty_attempt(
+                                    &invocation_key,
+                                    requested_model,
+                                    translated_input_estimate,
+                                    empty_attempt,
+                                ) =>
+                            {
+                                idempotency_guard.fail();
+                                return empty_attempts_response();
+                            }
+                            Err(e) => {
+                                // Upstream initiation failed; release reservation in full
+                                let _ = self.billing.release(&invocation_key);
+                                if provider_input_too_long(&e) {
+                                    self.record_refusal(
+                                        claims.as_ref(),
+                                        &invocation_key,
+                                        requested_model,
+                                        "input_too_long",
+                                    );
+                                }
+                                return start_error(&e).into_response();
+                            }
+                        },
+                        None => {
+                            let answer = {
+                                let (provider_id, target_model) =
+                                    (provider_id.clone(), target_model.clone());
+                                deferred_answer(async move {
+                                    let (started, empty_attempt) = routing.await;
+                                    (
+                                        started
+                                            .map(|stream| (stream, provider_id, target_model))
+                                            .map_err(|error| start_error(&error)),
+                                        empty_attempt,
+                                    )
+                                })
+                            };
+                            (answer, provider_id, target_model.clone(), true)
                         }
                     }
                 } else {
@@ -1236,11 +1282,15 @@ impl GenerateAssistantResponseHandler {
 
             // Pings and empty deltas count as liveness; a model that reasons first may go
             // silent longer.
-            let watchdog = crate::provider::retry::UpstreamLimits::for_model(
-                &actual_target_model,
-                chat_req.reasoning_effort,
-            )
-            .watchdog();
+            let watchdog = self
+                .upstream_limits
+                .unwrap_or_else(|| {
+                    crate::provider::retry::UpstreamLimits::for_model(
+                        &actual_target_model,
+                        chat_req.reasoning_effort,
+                    )
+                })
+                .watchdog();
 
             // The stream's settler bills or returns the hold from here on.
             hold.armed = false;
@@ -1262,9 +1312,15 @@ impl GenerateAssistantResponseHandler {
             .with_estimated_input(translated_input_estimate)
             .with_reservation_lease(reservation_lease);
 
-            let watchdog_stream = WatchdogStream::new(upstream_stream, watchdog);
+            // A route still finishing is watched by its attempts' own watchdogs: the wait for
+            // its first content is not a silence of the answer.
+            let upstream_stream: UpstreamStream = if committed {
+                upstream_stream
+            } else {
+                Box::pin(WatchdogStream::new(upstream_stream, watchdog))
+            };
             let guarded_stream = create_stream_guard(
-                watchdog_stream,
+                upstream_stream,
                 guard_config,
                 Some(ctx.tool_registry),
                 Some(idempotency_guard),
@@ -1372,13 +1428,130 @@ impl GenerateAssistantResponseHandler {
     }
 }
 
+type UpstreamStream = futures_util::stream::BoxStream<
+    'static,
+    Result<crate::provider::ProviderStreamEvent, ProviderError>,
+>;
+
+/// `routing` to its end, or `None` at `commit_at` if it is still going, with `routing` left
+/// to finish.
+async fn until_committed<F>(routing: &mut F, commit_at: tokio::time::Instant) -> Option<F::Output>
+where
+    F: std::future::Future + Unpin,
+{
+    tokio::select! {
+        biased;
+        outcome = routing => Some(outcome),
+        _ = tokio::time::sleep_until(commit_at) => None,
+    }
+}
+
+/// The answer of a request whose route was still going when the answer had to begin. Kiro
+/// hears keepalives while `routing` finishes; then comes the answer, after the attempt that
+/// serves it, or how the route failed, as the error response would have told Kiro. A route
+/// whose every attempt ended empty ends as that empty turn: its input billed once, as when
+/// the answer had not begun.
+fn deferred_answer(
+    routing: impl std::future::Future<
+            Output = (
+                Result<(UpstreamStream, String, String), KiroError>,
+                Option<crate::provider::retry::EmptyAttempt>,
+            ),
+        > + Send
+        + 'static,
+) -> UpstreamStream {
+    use crate::provider::ProviderStreamEvent;
+    use futures_util::StreamExt;
+    futures_util::stream::once(routing)
+        .flat_map(|(result, empty_attempt)| match (result, empty_attempt) {
+            (Ok((answer, provider_id, target_model)), _) => {
+                futures_util::stream::iter([Ok(ProviderStreamEvent::Served {
+                    provider_id,
+                    target_model,
+                })])
+                .chain(answer)
+                .boxed()
+            }
+            (Err(_), Some(empty)) => {
+                let mut usage = empty.usage;
+                usage.output_tokens_final = true;
+                futures_util::stream::iter([
+                    Ok(ProviderStreamEvent::Served {
+                        provider_id: empty.provider_id,
+                        target_model: empty.target_model,
+                    }),
+                    Ok(ProviderStreamEvent::Usage(usage)),
+                    Ok(ProviderStreamEvent::StopReason("end_turn".into())),
+                    Ok(ProviderStreamEvent::Done),
+                ])
+                .boxed()
+            }
+            (Err(error), None) => {
+                futures_util::stream::iter([Ok(ProviderStreamEvent::Failed(error))]).boxed()
+            }
+        })
+        .boxed()
+}
+
+/// How Kiro is told a route failed: the overflow it compacts for, a throttle it waits out,
+/// the upstream's refusal of the request, or a temporary error it retries.
+fn route_error(error: &GovernanceError) -> KiroError {
+    if upstream_input_too_long(error) {
+        return overflow_error();
+    }
+    if let GovernanceError::AllKeysInCooldown {
+        next_recovery_secs, ..
+    } = error
+    {
+        return KiroError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "ThrottlingException",
+            "All upstream provider keys are currently in cooldown",
+        )
+        .with_reason("ALL_KEYS_IN_COOLDOWN")
+        .with_retry_after((*next_recovery_secs).max(1));
+    }
+    governance_upstream_refusal(error).unwrap_or_else(|| {
+        KiroError::new(
+            StatusCode::BAD_GATEWAY,
+            "InternalServerException",
+            crate::stream::safe_governance_error(error),
+        )
+    })
+}
+
+/// How Kiro is told the configured upstream failed to answer.
+fn start_error(error: &ProviderError) -> KiroError {
+    if provider_input_too_long(error) {
+        return overflow_error();
+    }
+    upstream_refusal(error).unwrap_or_else(|| {
+        KiroError::new(
+            StatusCode::BAD_GATEWAY,
+            "InternalServerException",
+            crate::stream::safe_provider_error(error),
+        )
+    })
+}
+
+/// The upstream's report of a prompt over its model's context, as the overflow Kiro
+/// compacts the conversation for.
+fn overflow_error() -> KiroError {
+    KiroError::new(
+        StatusCode::BAD_REQUEST,
+        "ValidationException",
+        format!("Input is too long: {UPSTREAM_OVERFLOW}"),
+    )
+    .with_reason("CONTENT_LENGTH_EXCEEDS_THRESHOLD")
+}
+
 /// Run `attempts` with an [`crate::provider::retry::EMPTY_ATTEMPT`] slot, and take what it
 /// holds at the end.
 async fn with_empty_attempt<T>(
     attempts: impl std::future::Future<Output = T>,
 ) -> (T, Option<crate::provider::retry::EmptyAttempt>) {
     crate::provider::retry::EMPTY_ATTEMPT
-        .scope(std::sync::Mutex::new(None), async {
+        .scope(std::sync::Mutex::new(Default::default()), async {
             let result = attempts.await;
             let empty =
                 crate::provider::retry::EMPTY_ATTEMPT.with(|slot| slot.lock().unwrap().take());
@@ -1452,7 +1625,7 @@ fn no_route_for_group() -> Response {
 /// An upstream's refusal of the request itself, which a retry would meet again, in words
 /// Kiro shows as they are; never the upstream's own text. Its rate limits, an invalid key
 /// and a request timeout are the gateway's to handle.
-fn upstream_refusal(error: &ProviderError) -> Option<Response> {
+fn upstream_refusal(error: &ProviderError) -> Option<KiroError> {
     let ProviderError::Http(status, _) = error else {
         return None;
     };
@@ -1466,16 +1639,16 @@ fn upstream_refusal(error: &ProviderError) -> Option<Response> {
         404 => "该上游找不到这个模型",
         _ => "该上游拒绝了本次请求",
     };
-    Some(error_response(
+    Some(KiroError::new(
         StatusCode::BAD_REQUEST,
         "ValidationException",
-        &format!(
+        format!(
             "上游模型服务拒绝了本次请求（HTTP {status}：{why}），重试不会改变结果。可以调整请求、换一个模型，或联系管理员。"
         ),
     ))
 }
 
-fn governance_upstream_refusal(error: &GovernanceError) -> Option<Response> {
+fn governance_upstream_refusal(error: &GovernanceError) -> Option<KiroError> {
     match error {
         GovernanceError::NonRetryable(error) | GovernanceError::Provider(error) => {
             upstream_refusal(error)

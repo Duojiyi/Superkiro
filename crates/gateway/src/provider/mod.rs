@@ -54,6 +54,11 @@ pub enum ProviderError {
     #[error("Upstream request timed out")]
     Timeout,
 
+    /// No connection, or no response headers in time: the relay did not answer at all.
+    /// Unlike a slow model, that is the key's failure, so the key is cooled for it.
+    #[error("Upstream did not answer")]
+    NoAnswer,
+
     #[error("Stream disconnected prematurely")]
     StreamDisconnected,
 
@@ -416,9 +421,18 @@ pub enum ProviderStreamEvent {
     Usage(TokenUsage),
     StopReason(String),
     /// The model has begun its answer (Anthropic `message_start` / `content_block_start`,
-    /// OpenAI's opening chunk). The upstream is working on the request and may be billing
-    /// it, so it is no longer retried.
+    /// OpenAI's opening chunk). From here only the model's silence is watched, and until
+    /// its first content the attempt is still retried if it fails.
     Started,
+    /// The attempt that serves the answer, named when the answer to Kiro had begun before
+    /// the route found it: billing and the thinking it signs follow it. Never sent to Kiro.
+    Served {
+        provider_id: String,
+        target_model: String,
+    },
+    /// The route ended without an answer after the answer to Kiro had begun: how Kiro is
+    /// told, as the error response would have. Never produced by an upstream.
+    Failed(crate::stream::KiroError),
     /// A line that carried nothing to forward (a ping, a block boundary, an empty thinking
     /// delta): proof the upstream is alive, for the watchdogs.
     Heartbeat,

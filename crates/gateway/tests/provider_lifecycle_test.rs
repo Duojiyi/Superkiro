@@ -122,6 +122,7 @@ async fn test_provider_import_to_real_request_and_lifecycle_loop() {
         vision_cache: Default::default(),
         content_guardrail: Default::default(),
         large_bodies: Default::default(),
+        upstream_limits: None,
     };
     registry.register(conv_handler);
 

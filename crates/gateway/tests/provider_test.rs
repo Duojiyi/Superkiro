@@ -257,10 +257,11 @@ async fn test_audit_b_upstream_timeout() {
     let req = create_test_request("m");
     let res = OpenAiProvider.chat_stream(&client, &config, &req).await;
 
+    // No response headers in time: the relay did not answer, which cools its key.
     match res {
-        Err(ProviderError::Timeout) => {}
-        Err(e) => panic!("Expected Timeout error, got different error: {:?}", e),
-        Ok(_) => panic!("Expected Timeout error, but got Ok stream"),
+        Err(ProviderError::NoAnswer) => {}
+        Err(e) => panic!("Expected NoAnswer error, got different error: {:?}", e),
+        Ok(_) => panic!("Expected NoAnswer error, but got Ok stream"),
     }
 }
 

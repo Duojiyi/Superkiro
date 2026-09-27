@@ -38,9 +38,11 @@ struct Outcome {
     billing: BillingEngine,
 }
 
+/// An OpenAI stream as it is sent: an opening chunk naming the role, then `frames`.
 fn sse(frames: &[Value]) -> String {
-    let mut sse: Vec<String> = frames
-        .iter()
+    let opening = json!({"id": "0", "choices": [{"delta": {"role": "assistant", "content": ""}}]});
+    let mut sse: Vec<String> = std::iter::once(&opening)
+        .chain(frames)
         .map(|frame| format!("data: {frame}"))
         .collect();
     sse.push("data: [DONE]".into());

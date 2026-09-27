@@ -209,12 +209,66 @@ async fn send_terminal_frame(
     )
 }
 
+/// An error as Kiro is told it: as an error response, or, once the answer has begun, as the
+/// exception frame that ends it, which Kiro reads the same way (the reason included).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KiroError {
+    pub status: axum::http::StatusCode,
+    pub exception: &'static str,
+    pub message: String,
+    pub reason: Option<&'static str>,
+    pub retry_after_secs: Option<u64>,
+}
+
+impl KiroError {
+    pub fn new(
+        status: axum::http::StatusCode,
+        exception: &'static str,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            status,
+            exception,
+            message: message.into(),
+            reason: None,
+            retry_after_secs: None,
+        }
+    }
+
+    pub fn with_reason(mut self, reason: &'static str) -> Self {
+        self.reason = Some(reason);
+        self
+    }
+
+    pub fn with_retry_after(mut self, secs: u64) -> Self {
+        self.retry_after_secs = Some(secs);
+        self
+    }
+
+    /// The error response.
+    pub fn into_response(self) -> axum::response::Response {
+        match self.reason {
+            Some(reason) => crate::guardrail::format_kiro_throttle_response(
+                self.status,
+                self.exception,
+                reason,
+                &self.message,
+                self.retry_after_secs,
+            ),
+            None => crate::facade::error_response(self.status, self.exception, &self.message),
+        }
+    }
+}
+
 /// Why a response ended before completing, as the client is told at its end.
 struct Failure {
     /// Shown in the conversation, where Kiro renders it.
     note: Option<String>,
     /// The exception that ends the stream.
     error: String,
+    exception: &'static str,
+    reason: Option<&'static str>,
+    retry_after_secs: Option<u64>,
 }
 
 impl Failure {
@@ -222,6 +276,21 @@ impl Failure {
         Self {
             note,
             error: error.into(),
+            exception: "InternalServerException",
+            reason: None,
+            retry_after_secs: None,
+        }
+    }
+
+    /// A route that failed after the answer had begun, as the error response would have
+    /// told Kiro.
+    fn told(error: KiroError) -> Self {
+        Self {
+            note: None,
+            error: error.message,
+            exception: error.exception,
+            reason: error.reason,
+            retry_after_secs: error.retry_after_secs,
         }
     }
 
@@ -466,7 +535,7 @@ pub fn create_stream_guard_with_send_deadline(
         let mut stop_reason = None;
         let mut refusal = None;
         // The upstream model the response comes from, which its thinking may go back to.
-        let signing_model = billing_settler
+        let mut signing_model = billing_settler
             .as_ref()
             .map(|settler| settler.target_model.clone());
         // What the gateway estimates the request holds, which the context Kiro is told of
@@ -577,6 +646,22 @@ pub fn create_stream_guard_with_send_deadline(
                         }
                         // Liveness for the watchdog; nothing for Kiro, which keepalives serve.
                         Some(Ok(ProviderStreamEvent::Started | ProviderStreamEvent::Heartbeat)) => {}
+                        // Another attempt took over before any content: it is the one billed,
+                        // and the one its thinking goes back to.
+                        Some(Ok(ProviderStreamEvent::Served { provider_id, target_model })) => {
+                            if let Some(settler) = billing_settler.as_mut() {
+                                settler.provider_id = provider_id;
+                                settler.target_model = target_model;
+                            }
+                            signing_model = billing_settler
+                                .as_ref()
+                                .map(|settler| settler.target_model.clone());
+                        }
+                        // The route ended without an answer after the answer had begun.
+                        Some(Ok(ProviderStreamEvent::Failed(error))) => {
+                            failure = Some(Failure::told(error));
+                            break;
+                        }
                         Some(Ok(ProviderStreamEvent::Refusal { category, explanation })) => {
                             refusal = Some(kiro_wire::events::Refusal {
                                 category,
@@ -721,7 +806,12 @@ pub fn create_stream_guard_with_send_deadline(
                 settler.estimated_input_tokens,
             );
             let output_tokens = resolved.as_ref().map_or(0, |tokens| tokens.output_tokens);
-            if let Some(tokens) = resolved.filter(|_| !rejected_empty) {
+            // What delivered nothing is never billed, whatever the upstream reported: Kiro
+            // sends its retry of a failed turn as a new request, so a bill for the failure
+            // would be one more. An answer that genuinely ended empty, with a stop reason,
+            // consumed its input and is billed.
+            let billable = saw_output || completed || (empty_turn && stop_reason.is_some());
+            if let Some(tokens) = resolved.filter(|_| billable && !rejected_empty) {
                 billable_attempt = true;
                 match settler.settle(&tokens) {
                     Ok(charged) => credits_charged = Some(charged),
@@ -844,7 +934,14 @@ pub fn create_stream_guard_with_send_deadline(
                 return;
             }
         }
-        let frame = kiro_wire::encoder::encode_exception("InternalServerException", &failure.error);
+        let frame = kiro_wire::encoder::encode_exception_with(
+            failure.exception,
+            &failure.error,
+            failure.reason,
+            failure
+                .retry_after_secs
+                .map(|secs| secs.saturating_mul(1000)),
+        );
         let _ = send_terminal_frame(&tx, frame).await;
     });
     FrameStream { inner: rx }
@@ -980,6 +1077,7 @@ pub(crate) fn safe_provider_error(error: &ProviderError) -> String {
         ProviderError::Http(status, _) => format!("upstream HTTP status {}", status.as_u16()),
         ProviderError::Network(_) => "upstream network error".to_string(),
         ProviderError::Timeout => "upstream request timed out".to_string(),
+        ProviderError::NoAnswer => "upstream did not answer".to_string(),
         ProviderError::StreamDisconnected => "upstream stream disconnected".to_string(),
         ProviderError::Parse(_) => "upstream response parse error".to_string(),
         ProviderError::Unavailable => "upstream reported a temporary failure".to_string(),

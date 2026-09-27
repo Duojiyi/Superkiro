@@ -339,7 +339,10 @@ pub fn is_cooldown_error(err: &ProviderError) -> bool {
         ProviderError::Http(status, _) => {
             status.as_u16() == 429 || status.is_server_error() || status.as_u16() == 401
         }
-        ProviderError::Network(_) | ProviderError::StreamDisconnected => true,
+        // No connection or no response headers: the relay is not answering at all.
+        ProviderError::Network(_) | ProviderError::StreamDisconnected | ProviderError::NoAnswer => {
+            true
+        }
         ProviderError::Parse(_) | ProviderError::Serialization(_) => false,
         // A relay's passing failure (kimera-primary sends one for about one request in
         // twenty) says nothing about the key.
@@ -542,8 +545,34 @@ pub async fn execute_stream_with_model_fallback(
     max_attempts: usize,
     now_secs: u64,
 ) -> Result<ModelFallbackResult, GovernanceError> {
-    let deadline =
-        tokio::time::Instant::now() + super::retry::UpstreamLimits::for_request(chat_req).total;
+    // Every attempt shares the request's wait for a model to start; a model that has
+    // started is bounded by its own limits, not by that wait.
+    let route = super::retry::Route::current(chat_req);
+    super::retry::ROUTE
+        .scope(
+            route.clone(),
+            fallback_on_route(
+                candidates,
+                client,
+                chat_req,
+                default_cooldown,
+                max_attempts,
+                now_secs,
+                &route,
+            ),
+        )
+        .await
+}
+
+async fn fallback_on_route(
+    candidates: &[(ProviderKeyPool, String)],
+    client: &reqwest::Client,
+    chat_req: &ChatRequest,
+    default_cooldown: Duration,
+    max_attempts: usize,
+    now_secs: u64,
+    route: &super::retry::Route,
+) -> Result<ModelFallbackResult, GovernanceError> {
     let (pool, target_model) = match candidates {
         [] => return Err(GovernanceError::AllCandidatesExhausted),
         [only] => only,
@@ -555,26 +584,22 @@ pub async fn execute_stream_with_model_fallback(
                 default_cooldown,
                 max_attempts,
                 now_secs,
-                deadline,
+                route,
             )
             .await
         }
     };
     // A single target spends every attempt on its own keys.
-    let (key, stream) = tokio::time::timeout_at(
-        deadline,
-        execute_stream_with_failover(
-            pool,
-            client,
-            target_model,
-            chat_req,
-            default_cooldown,
-            max_attempts,
-            now_secs,
-        ),
+    let (key, stream) = execute_stream_with_failover(
+        pool,
+        client,
+        target_model,
+        chat_req,
+        default_cooldown,
+        max_attempts,
+        now_secs,
     )
-    .await
-    .unwrap_or(Err(GovernanceError::NonRetryable(ProviderError::Timeout)))?;
+    .await?;
     Ok(ModelFallbackResult {
         provider: pool.provider(),
         key,
@@ -592,7 +617,7 @@ async fn execute_chain(
     default_cooldown: Duration,
     max_attempts: usize,
     now_secs: u64,
-    deadline: tokio::time::Instant,
+    route: &super::retry::Route,
 ) -> Result<ModelFallbackResult, GovernanceError> {
     let mut attempts_left = max_attempts.clamp(1, 3);
     let mut tried: Vec<Vec<String>> = vec![Vec::new(); chain.len()];
@@ -622,22 +647,18 @@ async fn execute_chain(
                 attempts_left -= 1;
                 attempted = true;
                 let provider = pool.provider();
-                let outcome = tokio::time::timeout_at(
-                    deadline,
-                    attempt_with_key(
-                        pool,
-                        &provider,
-                        &key,
-                        client,
-                        target_model,
-                        chat_req,
-                        default_cooldown,
-                        1,
-                        now_secs,
-                    ),
+                let outcome = attempt_with_key(
+                    pool,
+                    &provider,
+                    &key,
+                    client,
+                    target_model,
+                    chat_req,
+                    default_cooldown,
+                    1,
+                    now_secs,
                 )
-                .await
-                .unwrap_or(Err(ProviderError::Timeout));
+                .await;
                 match outcome {
                     Ok(stream) => {
                         return Ok(ModelFallbackResult {
@@ -650,7 +671,8 @@ async fn execute_chain(
                         })
                     }
                     Err(e)
-                        if worth_another_attempt(&e) && tokio::time::Instant::now() < deadline =>
+                        if worth_another_attempt(&e)
+                            && tokio::time::Instant::now() < route.deadline() =>
                     {
                         let own_key_problem = matches!(
                             &e,
