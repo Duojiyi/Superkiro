@@ -94,6 +94,18 @@ impl DesktopSession {
     pub fn authenticated(&self) -> bool {
         self.load().is_ok_and(|s| s.authenticated) && self.storage.exists()
     }
+    /// The card's access token for a read that can do without it (the announcements meant
+    /// for its group), when signed in to `gateway` with a token good for another minute.
+    /// Never refreshed or reported here: without one the read is simply anonymous.
+    pub fn access_token_for(&self, gateway: &str) -> Option<String> {
+        let _lock = self.lock_now().ok()?;
+        let session = self.load().ok()?;
+        let same_gateway = session.gateway.trim_end_matches('/') == gateway.trim_end_matches('/');
+        if !session.authenticated || !same_gateway || self.storage.is_expired(60) {
+            return None;
+        }
+        self.storage.load().ok().map(|token| token.access_token)
+    }
     /// Fetch account usage without exposing credentials to the webview.
     pub async fn usage(&self) -> Result<serde_json::Value, String> {
         let _lock = self.lock_now()?;
@@ -905,6 +917,37 @@ mod tests {
         std::fs::remove_file(path).unwrap();
         assert!(!session.recovery_pending());
         std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn access_token_only_for_the_signed_in_gateway_while_fresh() {
+        let root = std::env::temp_dir().join(format!("kiro-token-for-{}", std::process::id()));
+        let storage = TokenStorage::at(root.join("token.json"));
+        let desktop = DesktopSession::new(storage.clone(), root.join("session.json"));
+        assert_eq!(desktop.access_token_for("https://kiro.rent"), None);
+        let session = |authenticated| Session {
+            gateway: "https://kiro.rent".into(),
+            device: "test".into(),
+            previous_token: None,
+            authenticated,
+            ca_path: None,
+        };
+        let token = |expires| KiroAuthToken::new("card-access", "refresh", "profile", expires);
+        storage.save(&token("2099-01-01T00:00:00Z")).unwrap();
+        desktop.save(&session(true)).unwrap();
+        assert_eq!(
+            desktop.access_token_for("https://kiro.rent/").as_deref(),
+            Some("card-access")
+        );
+        assert_eq!(desktop.access_token_for("https://elsewhere.example"), None);
+        desktop.save(&session(false)).unwrap();
+        assert_eq!(desktop.access_token_for("https://kiro.rent"), None);
+        desktop.save(&session(true)).unwrap();
+        storage.save(&token("2020-01-01T00:00:00Z")).unwrap();
+        assert_eq!(desktop.access_token_for("https://kiro.rent"), None);
+        let _ = std::fs::remove_file(root.join("token.json"));
+        let _ = std::fs::remove_file(root.join("session.json"));
+        let _ = std::fs::remove_dir(root);
     }
 
     #[tokio::test]
