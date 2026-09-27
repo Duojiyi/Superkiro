@@ -86,13 +86,60 @@ async fn only_the_most_recent_images_are_sent() {
 
     let (sent_images, notes) = sent(&req, &mut prepared(&req).await);
 
-    let expected: Vec<String> = images[6..]
+    // Past the limit the oldest half of the window goes at once: the prompt a provider
+    // cached changes once every ten new images, not on every one.
+    let expected: Vec<String> = images[10..]
         .iter()
         .map(|image| format!("data:image/png;base64,{image}"))
         .collect();
-    assert_eq!(sent_images, expected, "the {LIMIT} most recent, in order");
-    assert_eq!(notes.len(), 6);
+    assert_eq!(sent_images, expected, "the most recent, in order");
+    assert_eq!(notes.len(), 10);
     assert!(notes.iter().all(|note| note.contains("not resent")));
+}
+
+#[test]
+fn the_image_window_moves_ten_images_at_a_time() {
+    use gateway::translate::to_provider::images_left_as_notes;
+    let notes: Vec<usize> = [0, 20, 21, 25, 30, 31, 40, 41]
+        .iter()
+        .map(|total| images_left_as_notes(*total, LIMIT))
+        .collect();
+    assert_eq!(notes, vec![0, 0, 10, 10, 10, 20, 20, 30]);
+    assert_eq!(images_left_as_notes(5, 0), 5);
+    assert_eq!(images_left_as_notes(3, 1), 2);
+}
+
+/// An image left out because it could not be shrunk in time stays out on the
+/// conversation's next steps, so each step sends what the step before sent: shown on the
+/// next step, it rewrote the provider's cached prompt from its message on. The same image
+/// sent again in a new message is judged afresh.
+#[tokio::test]
+async fn an_image_left_out_as_busy_stays_out_on_the_next_steps() {
+    let large = png(2600, 40);
+    let step = request(vec![], vec![("png", large.clone())]);
+    // Past its budget before it starts, the image is left out.
+    let busy = prepare_images(&step, LIMIT, Duration::ZERO).await;
+    let (images, notes) = sent(
+        &step,
+        &mut TranslationContext::new("claude-sonnet-4.5")
+            .with_vision_support(true)
+            .with_prepared_images(busy),
+    );
+    assert!(images.is_empty());
+    assert!(notes[0].contains("could not process"));
+
+    // The next step: the message is history now, and time is no object.
+    let next = request(vec![vec![("png", large.clone())]], vec![]);
+    let (images, notes) = sent(&next, &mut prepared(&next).await);
+    assert!(images.is_empty(), "the next step sends what this one sent");
+    assert!(notes[0].contains("could not process"));
+
+    // Sent again as a new message, it is shrunk.
+    let again = request(vec![vec![("png", large.clone())]], vec![("png", large)]);
+    let (images, notes) = sent(&again, &mut prepared(&again).await);
+    assert_eq!(images.len(), 1);
+    assert!(images[0].starts_with("data:image/jpeg;base64,"));
+    assert_eq!(notes.len(), 1);
 }
 
 #[tokio::test]

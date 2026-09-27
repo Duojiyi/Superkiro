@@ -54,14 +54,23 @@ pub enum ProviderError {
     #[error("Upstream request timed out")]
     Timeout,
 
+    /// No connection, or no response headers in time: the relay did not answer at all.
+    /// Unlike a slow model, that is the key's failure, so the key is cooled for it.
+    #[error("Upstream did not answer")]
+    NoAnswer,
+
     #[error("Stream disconnected prematurely")]
     StreamDisconnected,
 
     #[error("Failed to parse provider response or stream chunk: {0}")]
     Parse(String),
 
-    #[error("Upstream reported a service error")]
-    Service,
+    /// The upstream's stream reported a failure of its own, such as a relay's
+    /// `upstream_error` ("当前模型暂时不可用"), or a type the gateway does not know. Before
+    /// the model has started it is retried, on the same key and then another, and the key
+    /// is not cooled for it.
+    #[error("Upstream reported a temporary failure")]
+    Unavailable,
 
     #[error("Serialization error: {0}")]
     Serialization(String),
@@ -74,6 +83,52 @@ pub enum ProviderError {
     /// same thing. The key did answer, so this is retried without cooling the key down.
     #[error("Upstream completed without producing any output")]
     EmptyCompletion,
+
+    /// Thinking within a budget was asked for, and the model's output limit leaves no room
+    /// for one: the request cannot be sent as the model is configured, by any key.
+    #[error("Thinking needs a max output of at least {needed} tokens; the model allows {allowed}")]
+    ThinkingNeedsOutput { needed: u32, allowed: u32 },
+}
+
+/// Whether an upstream's words say the prompt is longer than the model takes: Anthropic's
+/// "prompt is too long" and "input length and `max_tokens` exceed context limit", OpenAI's
+/// `context_length_exceeded` and "maximum context length", other vendors' and Chinese
+/// relays' wordings, and the phrasing of Kiro's own service. Only this is read from them;
+/// they never reach a client.
+pub(crate) fn says_input_too_long(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    [
+        "prompt is too long",
+        "prompt too long",
+        "input is too long",
+        "input too long",
+        "context_length_exceeded",
+        "context length exceeded",
+        "maximum context length",
+        "input content length exceeds threshold",
+        "exceed context limit",
+        "exceeds the context window",
+        "exceeded model token limit",
+        "input length exceeds",
+        "range of input length should be",
+        "上下文长度超",
+        "超出上下文",
+        "超过上下文",
+        "最大上下文长度",
+        "上下文超限",
+        "上下文超长",
+        "上下文过长",
+        "输入过长",
+        "输入长度超",
+        "输入内容过长",
+        "提示词过长",
+        "prompt过长",
+        "prompt 过长",
+        "prompt超长",
+        "prompt 超长",
+    ]
+    .iter()
+    .any(|phrase| text.contains(phrase))
 }
 
 /// Bound and normalize vendor error bodies before they enter logs or error
@@ -256,8 +311,9 @@ pub fn install_provider_options(table: ProviderOptionsTable) {
     let _ = PROVIDER_OPTIONS.set(table);
 }
 
-/// The options of `provider_id`, outside its attempts: which providers a request with PDFs
-/// may go to is decided before any is tried.
+/// The options of `provider_id`, outside its attempts too: which providers a request with
+/// PDFs may go to is decided before any is tried, and the answer's stream reads whether
+/// its thinking goes back to the provider.
 pub fn provider_options(provider_id: &str) -> ProviderOptions {
     PROVIDER_OPTIONS
         .get_or_init(ProviderOptionsTable::default)
@@ -265,12 +321,19 @@ pub fn provider_options(provider_id: &str) -> ProviderOptions {
 }
 
 /// The options of the provider an upstream attempt is being made with, or those every
-/// provider has when the request is not one of a provider's attempts.
+/// provider has when the request is not one of a provider's attempts. A request whose
+/// prompt nothing reads again writes no prompt cache on any provider.
 pub(crate) fn current_provider_options() -> ProviderOptions {
-    let table = PROVIDER_OPTIONS.get_or_init(ProviderOptionsTable::default);
-    retry::ATTEMPT_KEY
-        .try_with(|(provider_id, _)| table.options_for(provider_id))
-        .unwrap_or_else(|_| table.options_for(""))
+    let options = retry::ATTEMPT_KEY
+        .try_with(|(provider_id, _)| provider_options(provider_id))
+        .unwrap_or_else(|_| provider_options(""));
+    let read_again = retry::ROUTE
+        .try_with(|route| route.read_again())
+        .unwrap_or(true);
+    ProviderOptions {
+        prompt_cache: options.prompt_cache && read_again,
+        ..options
+    }
 }
 
 /// Generic assistant tool call entry (T05).
@@ -418,9 +481,18 @@ pub enum ProviderStreamEvent {
     Usage(TokenUsage),
     StopReason(String),
     /// The model has begun its answer (Anthropic `message_start` / `content_block_start`,
-    /// OpenAI's opening chunk). The upstream is working on the request and may be billing
-    /// it, so it is no longer retried.
+    /// OpenAI's opening chunk). From here only the model's silence is watched, and until
+    /// its first content the attempt is still retried if it fails.
     Started,
+    /// The attempt that serves the answer, named when the answer to Kiro had begun before
+    /// the route found it: billing and the thinking it signs follow it. Never sent to Kiro.
+    Served {
+        provider_id: String,
+        target_model: String,
+    },
+    /// The route ended without an answer after the answer to Kiro had begun: how Kiro is
+    /// told, as the error response would have. Never produced by an upstream.
+    Failed(crate::stream::KiroError),
     /// A line that carried nothing to forward (a ping, a block boundary, an empty thinking
     /// delta): proof the upstream is alive, for the watchdogs.
     Heartbeat,
@@ -483,6 +555,33 @@ impl<T> Stream for ReceiverStream<T> {
     }
 }
 
+/// `data:` lines of one stream that did not parse. A relay's own keepalive (`data:
+/// keep-alive`) is passed over as the liveness it is, and one garbled event is too; ended at
+/// the first such line, a whole turn failed with "upstream response parse error". Garbled
+/// events that keep coming are an upstream that is not speaking the format, and end it.
+#[derive(Default)]
+struct UnparseableLines {
+    garbled: usize,
+}
+
+impl UnparseableLines {
+    /// Garbled events a stream may carry before it is ended.
+    const TOLERATED: usize = 2;
+
+    /// Whether the unparseable `line` is passed over rather than ending the stream.
+    fn passes_over(&mut self, line: &str) -> bool {
+        let Some(payload) = line.strip_prefix("data:").map(str::trim) else {
+            return false;
+        };
+        if !payload.starts_with('{') && !payload.starts_with('[') {
+            return true;
+        }
+        self.garbled += 1;
+        eprintln!("sse_line_garbled count={}", self.garbled);
+        self.garbled <= Self::TOLERATED
+    }
+}
+
 /// Helper function to transform a byte stream into line-delimited SSE event stream.
 pub fn process_byte_stream<F>(
     byte_stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
@@ -503,6 +602,7 @@ where
         let mut buffer = String::new();
         let mut stream = Box::pin(byte_stream);
         let mut emitted_done = false;
+        let mut unparseable = UnparseableLines::default();
 
         loop {
             let chunk_res = tokio::select! {
@@ -582,6 +682,10 @@ where
                 } else {
                     parse_line(line)
                 };
+                let parsed = match parsed {
+                    Err(ProviderError::Parse(_)) if unparseable.passes_over(line) => Ok(Vec::new()),
+                    parsed => parsed,
+                };
                 match parsed {
                     Ok(events) if events.is_empty() && !line.starts_with("event:") => {
                         if tx.send(Ok(ProviderStreamEvent::Heartbeat)).await.is_err() {
@@ -626,7 +730,13 @@ where
             return;
         }
         if !remaining.is_empty() && !remaining.starts_with(':') {
-            match parse_line(remaining) {
+            let parsed = match parse_line(remaining) {
+                Err(ProviderError::Parse(_)) if unparseable.passes_over(remaining) => {
+                    Ok(Vec::new())
+                }
+                parsed => parsed,
+            };
+            match parsed {
                 Ok(events) => {
                     for ev in events {
                         if ev == ProviderStreamEvent::Done {
@@ -676,6 +786,117 @@ mod endpoint_tests {
         assert_eq!(
             endpoint_with_suffix("https://provider.example/v1/", "/v1", "/chat/completions"),
             "https://provider.example/v1/chat/completions"
+        );
+    }
+}
+
+#[cfg(test)]
+mod overflow_tests {
+    use super::says_input_too_long;
+
+    #[test]
+    fn overflow_wordings_are_recognised() {
+        for text in [
+            "prompt is too long: 250000 tokens > 200000 maximum",
+            "input length and `max_tokens` exceed context limit: 188240 + 21333 > 200000, decrease input length or `max_tokens` and try again",
+            "This model's maximum context length is 128000 tokens.",
+            "Invalid request: Your request exceeded model token limit: 262144",
+            "Range of input length should be [1, 129024]",
+            "请求的上下文长度超过模型限制",
+            "输入超出上下文窗口",
+            "输入内容超过模型最大上下文长度",
+            "输入过长，请缩短后重试",
+            "Prompt 超长",
+        ] {
+            assert!(says_input_too_long(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn other_refusals_are_not_overflows() {
+        for text in [
+            "max_tokens: 200000 > 128000, which is the maximum allowed number of output tokens",
+            "Request too large for gpt-4o on tokens per min (TPM): Limit 30000",
+            "tools.0.custom.input_schema: JSON schema is invalid",
+            "当前分组上游负载已饱和，请稍后再试",
+            "该令牌额度已用尽",
+        ] {
+            assert!(!says_input_too_long(text), "{text}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod sse_line_tests {
+    use super::*;
+
+    /// The events and the error, if any, that `body` streams as, parsed as Anthropic lines.
+    async fn events_of(body: &str) -> (Vec<ProviderStreamEvent>, Option<ProviderError>) {
+        let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> =
+            vec![Ok(bytes::Bytes::from(body.to_string()))];
+        let mut stream = process_byte_stream(futures_util::stream::iter(chunks), |line| {
+            anthropic::AnthropicProvider.parse_stream_line(line)
+        });
+        let (mut events, mut error) = (Vec::new(), None);
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(event) => events.push(event),
+                Err(failure) => {
+                    error = Some(failure);
+                    break;
+                }
+            }
+        }
+        (events, error)
+    }
+
+    fn delta(text: &str) -> String {
+        format!(
+            "data: {}\n\n",
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": text}})
+        )
+    }
+
+    // A relay's own keepalive line, and a garbled event now and then, are passed over:
+    // ended at the first, a whole turn failed with "upstream response parse error".
+    #[tokio::test]
+    async fn an_unparseable_line_is_passed_over() {
+        let body = [
+            delta("Hello"),
+            "data: keep-alive\n\n".to_string(),
+            "data: {\"type\": \"content_block_delta\", \"ind\n\n".to_string(),
+            "data: keep-alive\n\n".to_string(),
+            "data: keep-alive\n\n".to_string(),
+            delta(" world"),
+            "data: {\"type\": \"message_stop\"}\n\n".to_string(),
+        ]
+        .concat();
+        let (events, error) = events_of(&body).await;
+        assert!(error.is_none(), "{error:?}");
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderStreamEvent::Delta(ProviderDelta::Text(text)) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Hello world");
+        assert!(events.contains(&ProviderStreamEvent::Heartbeat));
+        assert_eq!(events.last(), Some(&ProviderStreamEvent::Done));
+    }
+
+    // Garbled events that keep coming are an upstream not speaking the format.
+    #[tokio::test]
+    async fn garbled_events_that_keep_coming_end_the_stream() {
+        let garbled = "data: {\"type\": \"content_block_delta\", \"ind\n\n";
+        let body = [delta("Hello"), garbled.repeat(3), delta(" world")].concat();
+        let (events, error) = events_of(&body).await;
+        assert!(matches!(error, Some(ProviderError::Parse(_))), "{error:?}");
+        assert!(
+            !events.contains(&ProviderStreamEvent::Delta(ProviderDelta::Text(
+                " world".into()
+            )))
         );
     }
 }

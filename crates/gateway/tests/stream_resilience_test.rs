@@ -886,9 +886,17 @@ async fn empty_completed_stream_releases_credits_and_allows_retry() {
             Some(settler),
         ))
         .await;
-        assert!(frames
-            .iter()
-            .any(|(name, _)| name == "InternalServerException"));
+        // Billed, it ends in words Kiro shows and does not retry: its retry would be a new
+        // request, billed again. Unbilled, it is a temporary error Kiro may retry.
+        let ending = if input_usage {
+            "ValidationException"
+        } else {
+            "InternalServerException"
+        };
+        assert!(
+            frames.iter().any(|(name, _)| name == ending),
+            "{input_usage}"
+        );
         assert!(!frames.iter().any(|(name, payload)| name == "metadataEvent"
             && serde_json::from_slice::<serde_json::Value>(payload).unwrap()["stopReason"]
                 .is_string()));
@@ -1156,12 +1164,18 @@ async fn a_response_cut_off_by_the_deadline_ends_with_an_exception() {
     );
     let frames = collect_and_decode_frames(stream).await;
 
+    // Kiro shows a ValidationException without a reason as written, and does not retry it
+    // into the same limit; a note added to the answer stayed in the conversation.
     let message = exception_message(&frames).expect("the stream ends with an exception");
-    assert!(message.contains("time limit"), "{message}");
-    assert_eq!(frames.last().unwrap().0, "InternalServerException");
-    assert!(frames
+    assert!(message.contains("时间上限"), "{message}");
+    assert_eq!(frames.last().unwrap().0, "ValidationException");
+    let answer: Vec<String> = frames
         .iter()
-        .any(|(_, payload)| String::from_utf8_lossy(payload).contains("截断")));
+        .filter(|(name, _)| name == "assistantResponseEvent")
+        .map(|(_, payload)| String::from_utf8_lossy(payload).into_owned())
+        .collect();
+    assert_eq!(answer.len(), 1, "{answer:?}");
+    assert!(answer[0].contains("partial"));
     // What was streamed is billed.
     assert_eq!(
         billing.list_ledger_entries_for_card(&card_id, None).len(),
@@ -1246,10 +1260,12 @@ async fn an_oversized_tool_call_ends_the_response_and_is_billed() {
             }
         }
         let message = exception_message(&frames).expect("the stream ends with an exception");
-        assert!(
-            message.to_lowercase().contains("tool call"),
-            "{inv_id}: {message}"
-        );
+        assert!(message.contains("工具调用"), "{inv_id}: {message}");
+        // Shown as written and not retried: the same call would be as large again.
+        assert_eq!(frames.last().unwrap().0, "ValidationException", "{inv_id}");
+        assert!(!frames
+            .iter()
+            .any(|(name, _)| name == "assistantResponseEvent"));
         assert_eq!(
             billing.list_ledger_entries_for_card(&card_id, None).len(),
             1,
@@ -1484,7 +1500,8 @@ async fn an_empty_response_the_model_started_bills_the_input_it_reported() {
         let message = exception_message(&frames).expect("the stream ends with an exception");
         let entries = billing.list_ledger_entries_for_card(&card_id, None);
         if reported {
-            assert!(message.contains("billed"), "{message}");
+            assert!(message.contains("已按它读取的输入计费一次"), "{message}");
+            assert_eq!(frames.last().unwrap().0, "ValidationException");
             assert_eq!(entries.len(), 1);
             assert_eq!((entries[0].input_tokens, entries[0].output_tokens), (50, 0));
         } else {

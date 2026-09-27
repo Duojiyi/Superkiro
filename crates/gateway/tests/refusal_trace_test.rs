@@ -418,8 +418,9 @@ async fn each_refusal_before_routing_is_traced_and_charged_nothing() {
 
 /// A request the card's own limits refuse — its balance, its concurrency, its daily or
 /// monthly limit — leaves a trace too, with what it needed for want of balance. The
-/// customer gets the form Kiro shows in words: a balance refusal is a ValidationException
-/// (402 read as "Something went wrong"), the limits carry the reasons Kiro knows.
+/// customer gets the form Kiro shows in words: a balance refusal and a limit reached by
+/// settled usage are ValidationExceptions Kiro shows as written (its own limit reasons
+/// read "return tomorrow"), the card's concurrency a throttle Kiro retries.
 #[tokio::test]
 async fn refusals_for_the_cards_own_limits_are_traced_and_charged_nothing() {
     let upstream = upstream(200).await;
@@ -465,15 +466,15 @@ async fn refusals_for_the_cards_own_limits_are_traced_and_charged_nothing() {
         (
             "inv-daily",
             |card| card.daily_credit_limit = Some(0),
-            StatusCode::TOO_MANY_REQUESTS,
-            "DAILY_REQUEST_COUNT",
+            StatusCode::BAD_REQUEST,
+            "今日积分用量已达上限",
             "usage_limit",
         ),
         (
             "inv-monthly",
             |card| card.monthly_credit_limit = Some(0),
-            StatusCode::TOO_MANY_REQUESTS,
-            "MONTHLY_REQUEST_COUNT",
+            StatusCode::BAD_REQUEST,
+            "近 30 天积分用量已达上限",
             "usage_limit",
         ),
     ];

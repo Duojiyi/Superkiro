@@ -54,6 +54,24 @@ fn add_cache_breakpoints(body: &mut Value) {
     }
 }
 
+/// Whether a request's prompt may be read again soon, which a cache write (a quarter over
+/// the input price) pays for. An agent step always carries its tools and is followed by the
+/// next step within seconds, and a conversation that goes on has answers in it. One with
+/// neither is a one-shot: a commit message, a session title, a recap, a single question.
+fn read_again(body: &Value) -> bool {
+    body.get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty())
+        || body
+            .get("messages")
+            .and_then(Value::as_array)
+            .is_some_and(|messages| {
+                messages
+                    .iter()
+                    .any(|message| message["role"] == "assistant")
+            })
+}
+
 fn adaptive_thinking(summarized: bool) -> Value {
     if summarized {
         serde_json::json!({"type": "adaptive", "display": "summarized"})
@@ -300,9 +318,10 @@ impl AnthropicProvider {
                 };
                 let budget = wanted.min(max_tokens.saturating_sub((max_tokens / 4).max(1024)));
                 if budget < 1024 {
-                    return Err(ProviderError::Serialization(
-                        "Thinking needs a max output of at least 2048 tokens".into(),
-                    ));
+                    return Err(ProviderError::ThinkingNeedsOutput {
+                        needed: 2048,
+                        allowed: max_tokens,
+                    });
                 }
                 body["thinking"] = serde_json::json!({"type": "enabled", "budget_tokens": budget});
                 thinking = true;
@@ -380,7 +399,7 @@ impl AnthropicProvider {
             body["tools"] = serde_json::json!(normalized_tools);
         }
 
-        if options.prompt_cache {
+        if options.prompt_cache && read_again(&body) {
             add_cache_breakpoints(&mut body);
         }
 
@@ -602,54 +621,125 @@ impl ModelProvider for AnthropicProvider {
         'a,
         Result<BoxStream<'static, Result<ProviderStreamEvent, ProviderError>>, ProviderError>,
     > {
+        self.chat_stream_with(client, config, request, super::current_provider_options())
+    }
+}
+
+impl AnthropicProvider {
+    /// The answer to `request`, with the options of the provider it goes to. Preserved
+    /// thinking binds each replayed block to the conversation it was written in: once Kiro's
+    /// compaction or the gateway has rebuilt an earlier part of it differently, the upstream
+    /// refuses the request (400, "Invalid `signature` in `thinking` block"), and the attempt
+    /// goes once more without any thinking in its history.
+    pub fn chat_stream_with<'a>(
+        &'a self,
+        client: &'a reqwest::Client,
+        config: &'a ProviderConfig,
+        request: &'a ChatRequest,
+        options: ProviderOptions,
+    ) -> BoxFuture<
+        'a,
+        Result<BoxStream<'static, Result<ProviderStreamEvent, ProviderError>>, ProviderError>,
+    > {
         Box::pin(async move {
-            let url = self.endpoint_url(&config.base_url);
-            let body = self.translate_request(request)?;
-
-            let mut headers = HeaderMap::new();
-            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-            headers.insert(
-                "x-api-key",
-                HeaderValue::from_str(&config.api_key)
-                    .map_err(|e| ProviderError::Serialization(e.to_string()))?,
-            );
-            headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
-
-            // Bound connection and response-header wait separately from the
-            // long-lived streaming body timeout: longer for a model that reasons first.
-            let resp = tokio::time::timeout(
-                super::retry::UpstreamLimits::for_request(request)
-                    .headers
-                    .min(config.timeout),
-                client
-                    .post(&url)
-                    .headers(headers)
-                    .json(&body)
-                    .timeout(config.timeout)
-                    .send(),
-            )
-            .await
-            .map_err(|_| ProviderError::Timeout)?
-            .map_err(|e| {
-                if e.is_timeout() {
-                    ProviderError::Timeout
-                } else {
-                    ProviderError::Network(e.to_string())
+            let body = self.translate_request_with(request, &options)?;
+            match self.send(client, config, request, &body).await {
+                Err(ProviderError::Http(status, text))
+                    if status == reqwest::StatusCode::BAD_REQUEST
+                        && carries_thinking(&body)
+                        && names_thinking(&text) =>
+                {
+                    // No body or content is logged.
+                    eprintln!(
+                        "upstream_thinking_refused model={} retry=without_thinking",
+                        config.model
+                    );
+                    let options = ProviderOptions {
+                        replay_thinking: false,
+                        ..options
+                    };
+                    let body = self.translate_request_with(request, &options)?;
+                    self.send(client, config, request, &body).await
                 }
-            })?;
-
-            let status = resp.status();
-            if !status.is_success() {
-                let err_text = sanitize_upstream_error_body(resp.text().await.unwrap_or_default());
-                return Err(ProviderError::Http(status, err_text));
+                result => result,
             }
-
-            let byte_stream = resp.bytes_stream().map_err(reqwest::Error::from);
-            let event_stream = process_byte_stream(byte_stream, |line| {
-                AnthropicProvider.parse_stream_line(line)
-            });
-
-            Ok(event_stream)
         })
     }
+
+    /// Sends `body` for `request`: the stream of the answer, or the upstream's refusal.
+    async fn send(
+        &self,
+        client: &reqwest::Client,
+        config: &ProviderConfig,
+        request: &ChatRequest,
+        body: &Value,
+    ) -> Result<BoxStream<'static, Result<ProviderStreamEvent, ProviderError>>, ProviderError> {
+        let url = self.endpoint_url(&config.base_url);
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(
+            "x-api-key",
+            HeaderValue::from_str(&config.api_key)
+                .map_err(|e| ProviderError::Serialization(e.to_string()))?,
+        );
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+
+        // Bound connection and response-header wait separately from the
+        // long-lived streaming body timeout: longer for a model that reasons first.
+        // A relay that gives no headers in time did not answer at all.
+        let resp = tokio::time::timeout(
+            super::retry::limits_for(request)
+                .headers
+                .min(config.timeout),
+            client
+                .post(&url)
+                .headers(headers)
+                .json(body)
+                .timeout(config.timeout)
+                .send(),
+        )
+        .await
+        .map_err(|_| ProviderError::NoAnswer)?
+        .map_err(|e| {
+            if e.is_timeout() {
+                ProviderError::NoAnswer
+            } else {
+                ProviderError::Network(e.to_string())
+            }
+        })?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let err_text = sanitize_upstream_error_body(resp.text().await.unwrap_or_default());
+            return Err(ProviderError::Http(status, err_text));
+        }
+
+        let byte_stream = resp.bytes_stream().map_err(reqwest::Error::from);
+        Ok(process_byte_stream(byte_stream, |line| {
+            AnthropicProvider.parse_stream_line(line)
+        }))
+    }
+}
+
+/// Whether a request body sends thinking back in its history.
+fn carries_thinking(body: &Value) -> bool {
+    body["messages"].as_array().is_some_and(|messages| {
+        messages
+            .iter()
+            .filter_map(|message| message["content"].as_array())
+            .flatten()
+            .any(|block| {
+                matches!(
+                    block["type"].as_str(),
+                    Some("thinking" | "redacted_thinking")
+                )
+            })
+    })
+}
+
+/// Whether an upstream's refusal is about a thinking block or its signature. Only that is
+/// read from the upstream's words.
+fn names_thinking(refusal: &str) -> bool {
+    let refusal = refusal.to_ascii_lowercase();
+    refusal.contains("thinking") || refusal.contains("signature")
 }

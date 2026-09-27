@@ -355,8 +355,9 @@ impl ModelProvider for OpenAiProvider {
 
             // Bound connection and response-header wait separately from the
             // long-lived streaming body timeout: longer for a model that reasons first.
+            // A relay that gives no headers in time did not answer at all.
             let resp = tokio::time::timeout(
-                super::retry::UpstreamLimits::for_request(request)
+                super::retry::limits_for(request)
                     .headers
                     .min(config.timeout),
                 client
@@ -367,10 +368,10 @@ impl ModelProvider for OpenAiProvider {
                     .send(),
             )
             .await
-            .map_err(|_| ProviderError::Timeout)?
+            .map_err(|_| ProviderError::NoAnswer)?
             .map_err(|e| {
                 if e.is_timeout() {
-                    ProviderError::Timeout
+                    ProviderError::NoAnswer
                 } else {
                     ProviderError::Network(e.to_string())
                 }

@@ -69,19 +69,24 @@ pub enum BillingError {
     #[error("Card concurrency limit exceeded ({current}/{max})")]
     ConcurrencyLimitExceeded { current: u32, max: u32 },
 
+    /// `current` is the day's settled usage plus every hold still open, `held` the holds'
+    /// part of it: a refusal the holds alone cause passes once they settle.
     #[error(
-        "Daily credit limit exceeded (limit: {limit}, used today: {current}, needed: {needed})"
+        "Daily credit limit exceeded (limit: {limit}, used today: {current}, of it held: {held}, needed: {needed})"
     )]
     DailyLimitExceeded {
         limit: i64,
         current: i64,
+        held: i64,
         needed: i64,
     },
 
-    #[error("Monthly credit limit exceeded (limit: {limit}, used this month: {current}, needed: {needed})")]
+    /// Over the rolling 30 days; `current` and `held` as for the daily limit.
+    #[error("Monthly credit limit exceeded (limit: {limit}, used in 30 days: {current}, of it held: {held}, needed: {needed})")]
     MonthlyLimitExceeded {
         limit: i64,
         current: i64,
+        held: i64,
         needed: i64,
     },
 
@@ -493,6 +498,7 @@ fn check_quota(
             return Err(BillingError::DailyLimitExceeded {
                 limit,
                 current,
+                held,
                 needed: additional,
             });
         }
@@ -509,6 +515,7 @@ fn check_quota(
             return Err(BillingError::MonthlyLimitExceeded {
                 limit,
                 current,
+                held,
                 needed: additional,
             });
         }

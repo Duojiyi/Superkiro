@@ -269,6 +269,33 @@ async fn a_call_continued_after_the_next_began_ends_the_response() {
     assert!(String::from_utf8_lossy(payload).contains("continued a tool call"));
 }
 
+// Relays repeat an empty fragment of a call after the next has begun, sometimes naming the
+// call again. It tells Kiro nothing, so it is passed over; read as the call continued after
+// its end, it failed every response with parallel tools.
+#[tokio::test]
+async fn an_empty_fragment_of_an_ended_call_is_passed_over() {
+    let frames = tool_frames(vec![
+        chunk(0, Some("call-a"), Some("readFile"), "{\"path\":\"a.py\"}"),
+        chunk(1, Some("call-b"), Some("listDir"), ""),
+        chunk(0, None, None, ""),
+        chunk(0, Some("call-a"), Some("readFile"), ""),
+        chunk(1, None, None, "{}"),
+        ProviderStreamEvent::Done,
+    ])
+    .await;
+    let frame = |id: &str, input: &str, stop: bool| (id.to_string(), input.to_string(), stop);
+    assert_eq!(
+        frames,
+        vec![
+            frame("call-a", "{\"path\":\"a.py\"}", false),
+            frame("call-a", "", true),
+            frame("call-b", "", false),
+            frame("call-b", "{}", false),
+            frame("call-b", "", true),
+        ]
+    );
+}
+
 /// The tool calls Kiro receives when an OpenAI-compatible upstream streams `lines`,
 /// as (toolUseId, name, input).
 async fn tool_calls_from_openai(lines: &[&str]) -> Vec<(String, String, String)> {

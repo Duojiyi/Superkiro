@@ -257,6 +257,28 @@ impl ProviderKeyPool {
         Ok(guard.keys[best_idx].key.clone())
     }
 
+    /// Whether a key not in `exclude_key_ids` could be selected for `model` now, without
+    /// selecting it.
+    pub fn has_eligible_key(
+        &self,
+        now_secs: u64,
+        exclude_key_ids: &[String],
+        model: Option<&str>,
+    ) -> bool {
+        let guard = self.inner.lock().unwrap();
+        guard.provider.enabled
+            && guard.keys.iter().any(|entry| {
+                model.is_none_or(|m| entry.key.supports_model(m))
+                    && !exclude_key_ids.contains(&entry.key.id)
+                    && entry.key.enabled
+                    && entry.key.health_state != HealthState::Unhealthy
+                    && entry
+                        .key
+                        .cooldown_until
+                        .is_none_or(|until| now_secs >= until)
+            })
+    }
+
     /// Mark a key failure and apply cooldown (Spec §14.3).
     ///
     /// Failures from a fifth in a row on double the cooldown each time, up to
@@ -336,12 +358,21 @@ impl ProviderKeyPool {
 /// Check whether an upstream error warrants key cooldown and failover (Spec §14.3).
 pub fn is_cooldown_error(err: &ProviderError) -> bool {
     match err {
+        // 402 and 403 are how relays report a key out of balance or not allowed the
+        // model: the key's problem, which its other keys and targets do not share.
         ProviderError::Http(status, _) => {
-            status.as_u16() == 429 || status.is_server_error() || status.as_u16() == 401
+            matches!(status.as_u16(), 401 | 402 | 403 | 429) || status.is_server_error()
         }
-        ProviderError::Network(_) | ProviderError::StreamDisconnected => true,
-        ProviderError::Parse(_) | ProviderError::Serialization(_) => false,
-        ProviderError::Service => false,
+        // No connection or no response headers: the relay is not answering at all.
+        ProviderError::Network(_) | ProviderError::StreamDisconnected | ProviderError::NoAnswer => {
+            true
+        }
+        ProviderError::Parse(_)
+        | ProviderError::Serialization(_)
+        | ProviderError::ThinkingNeedsOutput { .. } => false,
+        // A relay's passing failure (kimera-primary sends one for about one request in
+        // twenty) says nothing about the key.
+        ProviderError::Unavailable => false,
         // A request that took too long says more about the request (a long prompt, a model
         // thinking before it answers) than about the key; cooling a lone key for it refused
         // every other customer of its route for a minute.
@@ -363,8 +394,63 @@ fn provider_adapter(provider: &Provider) -> Box<dyn ModelProvider> {
 fn worth_another_attempt(error: &ProviderError) -> bool {
     matches!(
         error,
-        ProviderError::EmptyCompletion | ProviderError::Timeout | ProviderError::Watchdog(_)
+        ProviderError::EmptyCompletion
+            | ProviderError::Timeout
+            | ProviderError::Watchdog(_)
+            | ProviderError::Unavailable
     ) || is_cooldown_error(error)
+}
+
+/// A key that cannot serve for now: rate-limited, invalid, out of balance or not allowed
+/// the model. Its target's other keys may, and they keep the model asked for.
+fn own_key_problem(error: &ProviderError) -> bool {
+    matches!(error, ProviderError::Http(status, _) if matches!(status.as_u16(), 401 | 402 | 403 | 429))
+}
+
+/// A key out of balance or not allowed the model: the operator's to fix, not the request's.
+fn account_problem(error: &ProviderError) -> bool {
+    matches!(error, ProviderError::Http(status, _) if matches!(status.as_u16(), 402 | 403))
+}
+
+/// A target that cannot serve this request, while another target may: it does not know the
+/// model (404), or it refuses the request as it stands (400, 422 and the like), which
+/// another provider may accept and the target's other keys would not. A prompt over the
+/// model's context is not one: every target of a chain serves the same model, and the
+/// client compacts the conversation for it.
+fn target_refusal(error: &ProviderError) -> bool {
+    let ProviderError::Http(status, body) = error else {
+        return false;
+    };
+    let status = status.as_u16();
+    (400..500).contains(&status)
+        && !matches!(status, 401 | 402 | 403 | 408 | 413 | 429)
+        && !(status == 400 && super::says_input_too_long(body))
+}
+
+/// What a request every candidate failed is told, when no failure was one a retry could
+/// outlast: the request refused as it stands (400, 422), a key out of balance or not allowed
+/// the model (402, 403), or the model unknown upstream (404), in that order. `None` when
+/// some failure may pass. A retired key (401) says nothing to the customer.
+fn final_refusal(mut failures: Vec<ProviderError>) -> Option<ProviderError> {
+    let status = |error: &ProviderError| match error {
+        ProviderError::Http(status, _) => status.as_u16(),
+        _ => 0,
+    };
+    let lasting = |error: &ProviderError| {
+        target_refusal(error) || account_problem(error) || status(error) == 401
+    };
+    if !failures.iter().all(lasting) {
+        return None;
+    }
+    let rank = |error: &ProviderError| match status(error) {
+        404 => 0,
+        402 | 403 => 1,
+        _ => 2,
+    };
+    let chosen = (0..failures.len())
+        .filter(|&i| status(&failures[i]) != 401)
+        .max_by_key(|&i| rank(&failures[i]))?;
+    Some(failures.swap_remove(chosen))
 }
 
 /// Start the stream with one key of `pool`, making up to `retries` attempts with it, and
@@ -450,6 +536,7 @@ pub async fn execute_stream_with_failover(
     let provider = pool.provider();
     let mut attempted_keys = Vec::new();
     let mut failure_records = Vec::new();
+    let mut failures = Vec::new();
 
     let attempts_limit = max_attempts.clamp(1, 3);
 
@@ -460,7 +547,9 @@ pub async fn execute_stream_with_failover(
             Some(model),
         ) {
             Ok(k) => k,
-            Err(GovernanceError::AllCandidatesExhausted) => break,
+            // Every key tried, or the rest cooling down: the failures so far say why. A
+            // lone key's failure read "no upstream key is available".
+            Err(_) if !attempted_keys.is_empty() => break,
             Err(e) => return Err(e),
         };
         attempted_keys.push(key.id.clone());
@@ -487,11 +576,23 @@ pub async fn execute_stream_with_failover(
             Ok(stream) => return Ok((key, stream)),
             Err(e) if worth_another_attempt(&e) => {
                 failure_records.push((key.id.clone(), e.to_string()));
+                failures.push(e);
             }
             Err(e) => return Err(GovernanceError::NonRetryable(e)),
         }
     }
 
+    // Every key out of balance or not allowed the model, and none left to try: a retry
+    // would meet the same keys cooling down.
+    if !pool.has_eligible_key(
+        crate::now_secs().max(now_secs),
+        &attempted_keys,
+        Some(model),
+    ) {
+        if let Some(error) = final_refusal(failures) {
+            return Err(GovernanceError::NonRetryable(error));
+        }
+    }
     Err(GovernanceError::AllCandidatesFailed {
         attempts: failure_records,
     })
@@ -537,8 +638,34 @@ pub async fn execute_stream_with_model_fallback(
     max_attempts: usize,
     now_secs: u64,
 ) -> Result<ModelFallbackResult, GovernanceError> {
-    let deadline =
-        tokio::time::Instant::now() + super::retry::UpstreamLimits::for_request(chat_req).total;
+    // Every attempt shares the request's wait for a model to start; a model that has
+    // started is bounded by its own limits, not by that wait.
+    let route = super::retry::Route::current(chat_req);
+    super::retry::ROUTE
+        .scope(
+            route.clone(),
+            fallback_on_route(
+                candidates,
+                client,
+                chat_req,
+                default_cooldown,
+                max_attempts,
+                now_secs,
+                &route,
+            ),
+        )
+        .await
+}
+
+async fn fallback_on_route(
+    candidates: &[(ProviderKeyPool, String)],
+    client: &reqwest::Client,
+    chat_req: &ChatRequest,
+    default_cooldown: Duration,
+    max_attempts: usize,
+    now_secs: u64,
+    route: &super::retry::Route,
+) -> Result<ModelFallbackResult, GovernanceError> {
     let (pool, target_model) = match candidates {
         [] => return Err(GovernanceError::AllCandidatesExhausted),
         [only] => only,
@@ -550,26 +677,22 @@ pub async fn execute_stream_with_model_fallback(
                 default_cooldown,
                 max_attempts,
                 now_secs,
-                deadline,
+                route,
             )
             .await
         }
     };
     // A single target spends every attempt on its own keys.
-    let (key, stream) = tokio::time::timeout_at(
-        deadline,
-        execute_stream_with_failover(
-            pool,
-            client,
-            target_model,
-            chat_req,
-            default_cooldown,
-            max_attempts,
-            now_secs,
-        ),
+    let (key, stream) = execute_stream_with_failover(
+        pool,
+        client,
+        target_model,
+        chat_req,
+        default_cooldown,
+        max_attempts,
+        now_secs,
     )
-    .await
-    .unwrap_or(Err(GovernanceError::NonRetryable(ProviderError::Timeout)))?;
+    .await?;
     Ok(ModelFallbackResult {
         provider: pool.provider(),
         key,
@@ -587,11 +710,14 @@ async fn execute_chain(
     default_cooldown: Duration,
     max_attempts: usize,
     now_secs: u64,
-    deadline: tokio::time::Instant,
+    route: &super::retry::Route,
 ) -> Result<ModelFallbackResult, GovernanceError> {
     let mut attempts_left = max_attempts.clamp(1, 3);
     let mut tried: Vec<Vec<String>> = vec![Vec::new(); chain.len()];
+    // Targets that refused this request: their other keys would too.
+    let mut refused = vec![false; chain.len()];
     let mut failures = Vec::new();
+    let mut errors = Vec::new();
     // Why the last target could not serve, if not a failed attempt, as each target was
     // first considered. Later passes only spend attempts left on untried keys.
     let mut unavailable = None;
@@ -599,7 +725,7 @@ async fn execute_chain(
     while attempts_left > 0 {
         let mut attempted = false;
         for (idx, (pool, target_model)) in chain.iter().enumerate() {
-            while attempts_left > 0 {
+            while attempts_left > 0 && !refused[idx] {
                 let key = match pool.select_key_for_model(
                     crate::now_secs().max(now_secs),
                     &tried[idx],
@@ -617,22 +743,18 @@ async fn execute_chain(
                 attempts_left -= 1;
                 attempted = true;
                 let provider = pool.provider();
-                let outcome = tokio::time::timeout_at(
-                    deadline,
-                    attempt_with_key(
-                        pool,
-                        &provider,
-                        &key,
-                        client,
-                        target_model,
-                        chat_req,
-                        default_cooldown,
-                        1,
-                        now_secs,
-                    ),
+                let outcome = attempt_with_key(
+                    pool,
+                    &provider,
+                    &key,
+                    client,
+                    target_model,
+                    chat_req,
+                    default_cooldown,
+                    1,
+                    now_secs,
                 )
-                .await
-                .unwrap_or(Err(ProviderError::Timeout));
+                .await;
                 match outcome {
                     Ok(stream) => {
                         return Ok(ModelFallbackResult {
@@ -645,19 +767,19 @@ async fn execute_chain(
                         })
                     }
                     Err(e)
-                        if worth_another_attempt(&e) && tokio::time::Instant::now() < deadline =>
+                        if (worth_another_attempt(&e) || target_refusal(&e))
+                            && tokio::time::Instant::now() < route.deadline() =>
                     {
-                        let own_key_problem = matches!(
-                            &e,
-                            ProviderError::Http(status, _) if matches!(status.as_u16(), 401 | 429)
-                        );
+                        let own_key_problem = own_key_problem(&e);
+                        refused[idx] = target_refusal(&e);
                         failures.push((key.id.clone(), e.to_string()));
+                        errors.push(e);
                         if first_pass {
                             unavailable = None;
                         }
-                        // A rate-limited or invalid key says nothing about its target's
-                        // other keys, which keep the model asked for. Anything else may
-                        // be the provider failing, so the next target goes first.
+                        // A key that cannot serve says nothing about its target's other
+                        // keys, which keep the model asked for. Anything else may be the
+                        // provider failing, so the next target goes first.
                         if !own_key_problem {
                             break;
                         }
@@ -669,6 +791,17 @@ async fn execute_chain(
         first_pass = false;
         if !attempted {
             break;
+        }
+    }
+    // Every candidate refused the request or cannot serve it for reasons a retry would meet
+    // again, and none is left to try: the refusal, not a temporary error to retry.
+    let now = crate::now_secs().max(now_secs);
+    let untried = chain.iter().enumerate().any(|(idx, (pool, target_model))| {
+        !refused[idx] && pool.has_eligible_key(now, &tried[idx], Some(target_model))
+    });
+    if !untried {
+        if let Some(error) = final_refusal(errors) {
+            return Err(GovernanceError::NonRetryable(error));
         }
     }
     Err(match unavailable {

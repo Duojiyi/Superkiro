@@ -320,7 +320,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let search = web_search_config()?;
     match search.effective_backend() {
         SearchBackend::None => println!(
-            "[*] Notice: no web search backend (WEB_SEARCH_BACKEND); Kiro web_search calls fail as tool errors"
+            "[*] Notice: no web search backend (WEB_SEARCH_BACKEND); Kiro is offered no web search"
         ),
         backend => println!("[√] Web search backend: {backend:?}"),
     }
@@ -398,6 +398,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             vision_cache: Default::default(),
             content_guardrail: Default::default(),
             large_bodies: Default::default(),
+            upstream_limits: None,
+            card_slot_wait: gateway::facade::conversation::CARD_SLOT_WAIT,
         };
         registry.register(handler);
     } else if env_flag("ALLOW_STUB_MODE", false) {

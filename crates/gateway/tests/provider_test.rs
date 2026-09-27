@@ -257,10 +257,11 @@ async fn test_audit_b_upstream_timeout() {
     let req = create_test_request("m");
     let res = OpenAiProvider.chat_stream(&client, &config, &req).await;
 
+    // No response headers in time: the relay did not answer, which cools its key.
     match res {
-        Err(ProviderError::Timeout) => {}
-        Err(e) => panic!("Expected Timeout error, got different error: {:?}", e),
-        Ok(_) => panic!("Expected Timeout error, but got Ok stream"),
+        Err(ProviderError::NoAnswer) => {}
+        Err(e) => panic!("Expected NoAnswer error, got different error: {:?}", e),
+        Ok(_) => panic!("Expected NoAnswer error, but got Ok stream"),
     }
 }
 
@@ -370,7 +371,7 @@ fn upstream_in_band_errors_are_not_silently_ignored() {
             let error = provider.parse_stream_line(line).unwrap_err();
             assert!(matches!(
                 error,
-                ProviderError::Http(_, _) | ProviderError::Service
+                ProviderError::Http(_, _) | ProviderError::Unavailable
             ));
             assert!(!error.to_string().contains("private upstream diagnostic"));
         }
@@ -717,6 +718,161 @@ fn prompt_cache_breakpoints_follow_the_request_shape() {
         marked(&OpenAiProvider.translate_request(&step(2)).unwrap()),
         0
     );
+
+    // A first agent step is read by the next one within seconds.
+    assert_eq!(
+        marked(&AnthropicProvider.translate_request(&step(0)).unwrap()),
+        3
+    );
+    // A request with neither tools nor an earlier answer is a one-shot: nothing reads its
+    // prompt again, and a cache write costs a quarter over the input price.
+    let mut single = step(0);
+    single.tools.clear();
+    let body = AnthropicProvider.translate_request(&single).unwrap();
+    assert_eq!(marked(&body), 0);
+    assert_eq!(body["system"], "Workspace rules.");
+}
+
+/// A turn after one whose thinking claude-opus-5-5 signed.
+fn after_signed_thinking(thinking: bool) -> ChatRequest {
+    let mut earlier = ChatMessage::new("assistant", serde_json::json!("Checked."));
+    if thinking {
+        earlier.thinking = Some(gateway::provider::ThinkingBlock {
+            text: "Checking the file.".into(),
+            signature: "EqQBCgIYAh".into(),
+            model: "claude-opus-5-5".into(),
+        });
+    }
+    ChatRequest {
+        messages: vec![
+            ChatMessage::new("system", serde_json::json!("Workspace rules.")),
+            ChatMessage::new("user", serde_json::json!("check it")),
+            earlier,
+            ChatMessage::new("user", serde_json::json!("and now?")),
+        ],
+        ..create_test_request("claude-opus-5-5")
+    }
+}
+
+/// An upstream that refuses the first request as preserved thinking does when the
+/// conversation before a replayed block changed, and answers the next.
+async fn refusing_a_replay_once() -> MockServer {
+    let server = MockServer::start().await;
+    let refusal = serde_json::json!({"type": "error", "error": {"type": "invalid_request_error",
+        "message": "messages.2.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation."}});
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(refusal))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let answer = [
+        serde_json::json!({"type": "message_start", "message": {"usage": {"input_tokens": 10, "output_tokens": 1}}}),
+        serde_json::json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        serde_json::json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Still fine."}}),
+        serde_json::json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 3}}),
+        serde_json::json!({"type": "message_stop"}),
+    ]
+    .iter()
+    .map(|event| format!("data: {event}\n\n"))
+    .collect::<String>();
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(answer, "text/event-stream"))
+        .mount(&server)
+        .await;
+    server
+}
+
+fn config_for(server: &MockServer) -> ProviderConfig {
+    ProviderConfig {
+        base_url: server.uri(),
+        api_key: "key".to_string(),
+        model: "claude-opus-5-5".to_string(),
+        timeout: Duration::from_secs(5),
+        group_id: None,
+    }
+}
+
+/// The thinking blocks a request `received` sends back.
+fn thinking_sent(received: &wiremock::Request) -> usize {
+    let body: serde_json::Value = serde_json::from_slice(&received.body).unwrap();
+    body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|message| message["content"].as_array())
+        .flatten()
+        .filter(|block| block["type"] == "thinking" || block["type"] == "redacted_thinking")
+        .count()
+}
+
+/// Kiro's compaction, or the gateway's own injections, can rebuild the conversation before
+/// a replayed thinking block, and preserved thinking then refuses the whole request. The
+/// attempt goes once more without thinking, keeping the rest of the history, and is served.
+#[tokio::test]
+async fn a_refused_thinking_replay_goes_again_without_thinking() {
+    let server = refusing_a_replay_once().await;
+    let replay = gateway::provider::ProviderOptions {
+        replay_thinking: true,
+        ..Default::default()
+    };
+    let mut stream = AnthropicProvider
+        .chat_stream_with(
+            &reqwest::Client::new(),
+            &config_for(&server),
+            &after_signed_thinking(true),
+            replay,
+        )
+        .await
+        .expect("served without the thinking");
+    let mut text = String::new();
+    while let Some(event) = stream.next().await {
+        if let ProviderStreamEvent::Delta(ProviderDelta::Text(delta)) = event.unwrap() {
+            text.push_str(&delta);
+        }
+    }
+    assert_eq!(text, "Still fine.");
+
+    let received = server.received_requests().await.unwrap();
+    assert_eq!(received.len(), 2);
+    assert_eq!(thinking_sent(&received[0]), 1);
+    assert_eq!(thinking_sent(&received[1]), 0);
+    let again: serde_json::Value = serde_json::from_slice(&received[1].body).unwrap();
+    assert_eq!(again["messages"][1]["content"][0]["text"], "Checked.");
+    assert_eq!(again["messages"].as_array().unwrap().len(), 3);
+}
+
+/// Without thinking in the request there is nothing to take out, and with replay off
+/// (the default) no thinking is ever sent: the refusal stands, after one request.
+#[tokio::test]
+async fn a_refusal_without_replayed_thinking_is_not_retried() {
+    let replay = gateway::provider::ProviderOptions {
+        replay_thinking: true,
+        ..Default::default()
+    };
+    let refused = |result: Result<_, ProviderError>| matches!(result, Err(ProviderError::Http(status, _)) if status == StatusCode::BAD_REQUEST);
+    let client = reqwest::Client::new();
+
+    let server = refusing_a_replay_once().await;
+    let result = AnthropicProvider
+        .chat_stream_with(
+            &client,
+            &config_for(&server),
+            &after_signed_thinking(false),
+            replay,
+        )
+        .await;
+    assert!(refused(result.map(|_| ())));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+    let server = refusing_a_replay_once().await;
+    let result = AnthropicProvider
+        .chat_stream(&client, &config_for(&server), &after_signed_thinking(true))
+        .await;
+    assert!(refused(result.map(|_| ())));
+    let received = server.received_requests().await.unwrap();
+    assert_eq!(received.len(), 1);
+    assert_eq!(thinking_sent(&received[0]), 0);
 }
 
 /// Kiro's turn that carries tool results has no text of its own. The OpenAI format has no

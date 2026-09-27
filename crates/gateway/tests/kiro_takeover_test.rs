@@ -13,8 +13,11 @@ use gateway::auth::AuthClaims;
 use gateway::facade::conversation::GenerateAssistantResponseHandler;
 use gateway::facade::FacadeRegistry;
 use gateway::guardrail::LargeBodyGate;
+use gateway::provider::retry::UpstreamLimits;
 use gateway::provider::ProviderRuntimeRegistry;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
 use wiremock::matchers::method;
@@ -92,17 +95,43 @@ fn serve(billing: &BillingEngine) -> axum::Router {
 
 /// The conversation route, with `gate` for its large bodies.
 fn serve_gated(billing: &BillingEngine, gate: &LargeBodyGate) -> axum::Router {
+    routed(billing, gate).0
+}
+
+/// The conversation route, and the key pools it routes through.
+fn routed(
+    billing: &BillingEngine,
+    gate: &LargeBodyGate,
+) -> (axum::Router, ProviderRuntimeRegistry) {
+    routed_on(billing, gate, None)
+}
+
+/// The conversation route with `limits` for its upstream attempts.
+fn routed_with(
+    billing: &BillingEngine,
+    limits: Option<UpstreamLimits>,
+) -> (axum::Router, ProviderRuntimeRegistry) {
+    routed_on(billing, &LargeBodyGate::default(), limits)
+}
+
+fn routed_on(
+    billing: &BillingEngine,
+    gate: &LargeBodyGate,
+    limits: Option<UpstreamLimits>,
+) -> (axum::Router, ProviderRuntimeRegistry) {
     let runtime = ProviderRuntimeRegistry::new();
     runtime.sync_from_billing(billing);
     let mut registry = FacadeRegistry::new().with_runtime(runtime.clone());
     registry.register(GenerateAssistantResponseHandler {
         billing: billing.clone(),
-        runtime: Some(runtime),
+        runtime: Some(runtime.clone()),
         intercept_intent: false,
         large_bodies: gate.clone(),
+        upstream_limits: limits,
+        card_slot_wait: gateway::facade::conversation::CARD_SLOT_WAIT,
         ..Default::default()
     });
-    registry.into_router()
+    (registry.into_router(), runtime)
 }
 
 fn claims() -> AuthClaims {
@@ -214,16 +243,6 @@ fn trace_class(billing: &BillingEngine, invocation: &str) -> Vec<String> {
         .collect()
 }
 
-/// How many more times the same refusal as `invocation`'s was counted on its trace.
-fn repeats(billing: &BillingEngine, invocation: &str) -> u64 {
-    let invocation_id = format!("{CARD}:{invocation}");
-    billing
-        .list_traces(Some(CARD), 100)
-        .into_iter()
-        .find(|trace| trace.invocation_id == invocation_id)
-        .map_or(0, |trace| trace.repeats)
-}
-
 fn nothing_charged(billing: &BillingEngine) {
     let card = billing.get_card(CARD).unwrap();
     assert_eq!((card.credit_reserved, card.credit_used), (0, 0));
@@ -262,6 +281,17 @@ async fn an_upstream_prompt_too_long_is_the_overflow_kiro_compacts_for() {
             json!({"error": {"code": "context_length_exceeded", "type": "invalid_request_error",
                 "message": "This model's maximum context length is 128000 tokens."}}),
         ),
+        // Input under the window, but not with room for the output as well.
+        (
+            ProviderFormat::Anthropic,
+            json!({"type": "error", "error": {"type": "invalid_request_error",
+                "message": "input length and `max_tokens` exceed context limit: 188240 + 21333 > 200000, decrease input length or `max_tokens` and try again"}}),
+        ),
+        // A relay's own wording.
+        (
+            ProviderFormat::OpenAi,
+            json!({"error": {"type": "invalid_request_error", "message": "请求的上下文长度超过模型限制"}}),
+        ),
     ] {
         let server = upstream(ResponseTemplate::new(400).set_body_json(refusal)).await;
         let billing = engine(
@@ -279,6 +309,7 @@ async fn an_upstream_prompt_too_long_is_the_overflow_kiro_compacts_for() {
         assert_overflow(&reply);
         // Its message is the gateway's, never the upstream's.
         assert!(!reply.text().contains("250000") && !reply.text().contains("128000"));
+        assert!(!reply.text().contains("188240") && !reply.text().contains("超过模型限制"));
         // Refused, not retried: the same prompt is as long the next time.
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
         nothing_charged(&billing);
@@ -320,6 +351,83 @@ async fn a_prompt_over_the_models_limit_is_refused_before_it_is_sent() {
     )
     .await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+}
+
+/// A 1x1 PNG.
+const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+/// The estimate overcounts (CJK and deep indentation up to about twofold), so a prompt
+/// estimated over the limit but within that error is sent, and the upstream's report of an
+/// overflow is what Kiro compacts for. Refused on the estimate alone, conversations that
+/// fit were compacted, and each compaction is billed.
+#[tokio::test]
+async fn a_prompt_within_the_estimates_error_is_left_to_the_upstream() {
+    let server = upstream(ResponseTemplate::new(400).set_body_json(json!({
+        "type": "error",
+        "error": {"type": "invalid_request_error", "message": "prompt is too long: 1200 tokens > 1000 maximum"}
+    })))
+    .await;
+    let mut small = ModelMap::new("map", GROUP, "model", "prov", "up-model");
+    small.context_window = 1_000;
+    small.max_output = 500;
+    let billing = engine(ProviderFormat::Anthropic, &server.uri(), vec![small]);
+    let app = serve(&billing);
+
+    // About 1,300 tokens by the estimate.
+    let reply = send(
+        &app,
+        "inv-near",
+        body(
+            json!({"content": "word ".repeat(1_000), "modelId": "model"}),
+            vec![],
+        ),
+    )
+    .await;
+    assert_overflow(&reply);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    nothing_charged(&billing);
+    assert_eq!(trace_class(&billing, "inv-near"), vec!["input_too_long"]);
+}
+
+/// Kiro resends every image of a conversation on each turn, and only the most recent 20
+/// are sent; older ones go as a note. The pre-flight counts what is sent: counting every
+/// image refused a long UI session as too long, and Kiro compacted it early.
+#[tokio::test]
+async fn only_the_images_sent_count_toward_the_models_limit() {
+    let server = upstream(
+        ResponseTemplate::new(200).set_body_raw(anthropic_answer("hi"), "text/event-stream"),
+    )
+    .await;
+    let mut map = ModelMap::new("map", GROUP, "model", "prov", "up-model");
+    map.context_window = 100_000;
+    map.max_output = 1_000;
+    let billing = engine(ProviderFormat::Anthropic, &server.uri(), vec![map]);
+    let app = serve(&billing);
+    let image = json!({"format": "png", "source": {"bytes": PNG}});
+    // 130 screenshots: 208,000 tokens counted as images, over twice the limit; 32,000 sent.
+    let history: Vec<Value> = (0..130)
+        .flat_map(|turn| {
+            [
+                json!({"userInputMessage": {"content": format!("screenshot {turn}"),
+                    "images": [image.clone()]}}),
+                json!({"assistantResponseMessage": {"content": "noted"}}),
+            ]
+        })
+        .collect();
+    let reply = send(
+        &app,
+        "inv-screenshots",
+        body(
+            json!({"content": "what changed?", "modelId": "model"}),
+            history,
+        ),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let sent = String::from_utf8_lossy(&requests[0].body).into_owned();
+    assert_eq!(sent.matches("\"type\":\"image\"").count(), 20);
 }
 
 #[tokio::test]
@@ -426,6 +534,9 @@ async fn kiros_fast_model_is_the_model_named_for_it_and_billed_as_it() {
     .await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
     assert_eq!(models_sent(&server).await, vec!["up-cheap"]);
+    // A one-shot: nothing reads its prompt again, so it writes no prompt cache.
+    let sent = upstream_body(&server).await;
+    assert!(!sent.to_string().contains("cache_control"), "{sent}");
     let usage = usage_entries(&billing);
     assert_eq!(usage.len(), 1);
     assert_eq!(usage[0].exposed_model, "cheap-model");
@@ -433,51 +544,49 @@ async fn kiros_fast_model_is_the_model_named_for_it_and_billed_as_it() {
     assert_eq!(listed(&billing), vec!["main-model"]);
 }
 
-/// Without an alias, the fast model is the group's cheapest listed model at the price in
-/// force, the first in the group's order among equals: sent to the group's first model it
-/// was often the flagship, at the flagship's price.
+/// Kiro's fast model writes one-shots: commit messages, recaps, spec sub-intents. Tools and
+/// a history or not, nothing reads their prompt again, so they write no prompt cache, which
+/// costs a quarter over the input price. A conversation's steps do write it.
 #[tokio::test]
-async fn without_a_model_named_for_it_kiros_fast_model_is_the_cheapest_listed() {
+async fn a_fast_model_request_writes_no_prompt_cache() {
     let server = upstream(
-        ResponseTemplate::new(200).set_body_raw(anthropic_answer("fix: typo"), "text/event-stream"),
+        ResponseTemplate::new(200).set_body_raw(anthropic_answer("ok"), "text/event-stream"),
     )
     .await;
-    let main = ModelMap::new("map-main", GROUP, "main-model", "prov", "up-main");
-    let mut other = ModelMap::new("map-other", GROUP, "other-model", "prov", "up-other");
-    other.sort_order = 1;
-    // Exposed under the name itself, it is still never listed.
-    let mut named = ModelMap::new("map-named", GROUP, "simple-task", "prov", "up-named");
-    named.sort_order = 2;
-    let billing = engine(ProviderFormat::Anthropic, &server.uri(), vec![main, other]);
+    let billing = engine(
+        ProviderFormat::Anthropic,
+        &server.uri(),
+        vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+    );
     let app = serve(&billing);
-
-    let reply = send(
-        &app,
-        "inv-default",
-        body(
-            json!({"content": "Summarize", "modelId": "simple-task"}),
-            vec![],
-        ),
-    )
-    .await;
-    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
-    assert_eq!(models_sent(&server).await, vec!["up-main"]);
-    assert_eq!(usage_entries(&billing)[0].exposed_model, "main-model");
-
-    billing.upsert_rate_card_version(price("simple-task"));
-    billing.upsert_model_map(named);
-    assert_eq!(listed(&billing), vec!["main-model", "other-model"]);
-    let reply = send(
-        &app,
-        "inv-named",
-        body(
-            json!({"content": "Summarize", "modelId": "simple-task"}),
-            vec![],
-        ),
-    )
-    .await;
-    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
-    assert_eq!(models_sent(&server).await, vec!["up-main", "up-named"]);
+    let tools = json!([{"toolSpecification": {
+        "name": "readFile",
+        "description": "Read a file",
+        "inputSchema": {"json": {"type": "object"}}
+    }}]);
+    let history = vec![
+        json!({"userInputMessage": {"content": "You are Kiro, working in the user's IDE."}}),
+        json!({"assistantResponseMessage": {"content": "I will follow these instructions."}}),
+    ];
+    for (model, cached) in [("simple-task", false), ("model", true)] {
+        let reply = send(
+            &app,
+            &format!("inv-cache-{model}"),
+            body(
+                json!({"content": "Write a commit message", "modelId": model,
+                    "userInputMessageContext": {"tools": tools}}),
+                history.clone(),
+            ),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+        let sent = upstream_body(&server).await;
+        assert_eq!(
+            sent.to_string().contains("cache_control"),
+            cached,
+            "{model}: {sent}"
+        );
+    }
 }
 
 fn base64(bytes: &[u8]) -> String {
@@ -1006,62 +1115,6 @@ async fn usage_reports_the_cards_expiry_not_a_monthly_reset() {
     );
 }
 
-/// Kiro's "Manage Plan" opens the address CreateSubscriptionToken gives: the gateway's
-/// customer portal, at the host and scheme the client reached it by.
-#[tokio::test]
-async fn manage_plan_opens_the_customer_portal() {
-    let mut registry = FacadeRegistry::new();
-    registry.register(gateway::facade::subscriptions::CreateSubscriptionTokenHandler);
-    let app = registry.into_router();
-    let token = |headers: &'static [(&'static str, &'static str)]| {
-        let app = app.clone();
-        async move {
-            let mut request = Request::builder()
-                .method(Method::POST)
-                .uri("/CreateSubscriptionToken")
-                .header(header::CONTENT_TYPE, "application/json");
-            for (name, value) in headers {
-                request = request.header(*name, *value);
-            }
-            let response = app
-                .oneshot(
-                    request
-                        .body(Body::from(r#"{"provider":"STRIPE"}"#))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            serde_json::from_slice::<Value>(&bytes).unwrap()
-        }
-    };
-
-    let behind_proxy = token(&[
-        ("host", "gateway:19820"),
-        ("x-forwarded-host", "kiro.example"),
-        ("x-forwarded-proto", "https"),
-    ])
-    .await;
-    assert_eq!(
-        behind_proxy["encodedVerificationUrl"],
-        "https://kiro.example/portal"
-    );
-    assert_eq!(behind_proxy["status"], "ACTIVE");
-    assert_eq!(behind_proxy["token"], behind_proxy["subscriptionToken"]);
-    assert!(!behind_proxy["token"].as_str().unwrap().is_empty());
-
-    let direct = token(&[("host", "127.0.0.1:19820")]).await;
-    assert_eq!(
-        direct["encodedVerificationUrl"],
-        "http://127.0.0.1:19820/portal"
-    );
-    let forged = token(&[("x-forwarded-host", "evil.example/phish?x=")]).await;
-    assert!(forged.get("encodedVerificationUrl").is_none(), "{forged}");
-}
-
 /// Kiro sends every image in a conversation again with each turn, so a long session with
 /// screenshots outgrew the 10 MB the gateway read, and then every turn failed with
 /// "Failed to read request body". Up to 32 MB is read now; a larger body, whether its
@@ -1262,6 +1315,1008 @@ async fn a_large_conversations_place_is_given_back_on_every_path() {
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
     assert_eq!(gate.in_use(), 0);
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+/// kimera-primary leaves the system prompt and tool definitions out of its usage: a
+/// 9K-token system prompt reported 3 input tokens, so Kiro heard of almost no context and
+/// compacted late, then overflowed. The context Kiro compacts on is never below what the
+/// gateway estimates the request holds; billing still follows the upstream's report.
+#[tokio::test]
+async fn the_context_kiro_compacts_on_is_never_below_the_gateways_estimate() {
+    let answer = [
+        json!({"type": "message_start", "message": {"usage": {"input_tokens": 100, "output_tokens": 1}}}),
+        json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hi"}}),
+        json!({"type": "content_block_stop", "index": 0}),
+        json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 3}}),
+        json!({"type": "message_stop"}),
+    ]
+    .iter()
+    .map(|event| format!("data: {event}\n\n"))
+    .collect::<String>();
+    let server =
+        upstream(ResponseTemplate::new(200).set_body_raw(answer, "text/event-stream")).await;
+    // A 200K window.
+    let billing = engine(
+        ProviderFormat::Anthropic,
+        &server.uri(),
+        vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+    );
+    let app = serve(&billing);
+    // About 60K tokens of system prompt, which the upstream reports as 100.
+    let mut request = body(json!({"content": "hello", "modelId": "model"}), vec![]);
+    request["systemPrompt"] = json!("rule ".repeat(48_000));
+    let reply = send(&app, "inv-context", request).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+
+    let percentages: Vec<f64> = frames(&reply.bytes)
+        .into_iter()
+        .filter(|(kind, _)| kind == "contextUsageEvent")
+        .map(|(_, payload)| payload["contextUsagePercentage"].as_f64().unwrap())
+        .collect();
+    assert!(!percentages.is_empty());
+    assert!(
+        percentages
+            .iter()
+            .all(|percent| (25.0..50.0).contains(percent)),
+        "{percentages:?}"
+    );
+    assert_eq!(usage_entries(&billing)[0].input_tokens, 100);
+}
+
+/// With every key cooling down, a short cooldown is a throttle Kiro waits out. A longer one
+/// is said at once, with when the keys come back: Kiro waits out a throttle's Retry-After on
+/// each of its retries and reads it as "<model> is experiencing high load", so a two-minute
+/// cooldown hung the turn for minutes before it failed.
+#[tokio::test]
+async fn keys_cooling_down_are_waited_out_briefly_or_said_at_once() {
+    for cooldown in [5, 3_600] {
+        let server = upstream(
+            ResponseTemplate::new(200).set_body_raw(anthropic_answer("hi"), "text/event-stream"),
+        )
+        .await;
+        let billing = engine(
+            ProviderFormat::Anthropic,
+            &server.uri(),
+            vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+        );
+        let (app, runtime) = routed(&billing, &LargeBodyGate::default());
+        runtime.pool_for("prov").unwrap().mark_key_failure(
+            "key",
+            gateway::now_secs(),
+            Duration::from_secs(cooldown),
+        );
+        let reply = send(
+            &app,
+            "inv-cooling",
+            body(json!({"content": "hello", "modelId": "model"}), vec![]),
+        )
+        .await;
+        let told = reply.json();
+        if cooldown == 5 {
+            assert_eq!(reply.status, StatusCode::TOO_MANY_REQUESTS, "{told}");
+            assert_eq!(told["reason"], "ALL_KEYS_IN_COOLDOWN");
+            let wait: u64 = reply.headers["retry-after"]
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!((1..=5).contains(&wait), "{wait}");
+        } else {
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{told}");
+            assert_eq!(told["__type"], "ValidationException");
+            assert!(told.get("reason").is_none(), "{told}");
+            assert!(
+                told["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("约 60 分钟后恢复"),
+                "{told}"
+            );
+            assert!(reply.headers.get("retry-after").is_none());
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+        nothing_charged(&billing);
+    }
+}
+
+/// An `error` frame of `kind`. With `upstream_error` it is the frame kimera-primary answers
+/// about one request in twenty with, as HTTP 200, 0.7 to 7 seconds in, before the model has
+/// started.
+fn error_frame(kind: &str) -> String {
+    error_event(json!({"type": kind, "code": kind,
+        "message": "当前模型暂时不可用，请稍后重试或切换模型。"}))
+}
+
+/// An Anthropic-style `error` frame carrying `error`.
+fn error_event(error: Value) -> String {
+    let event = json!({"type": "error", "error": error});
+    format!("event: error\ndata: {event}\n\n")
+}
+
+/// No key of the provider was cooled down, retired or given a failure.
+fn keys_untouched(runtime: &ProviderRuntimeRegistry) {
+    let health = runtime.key_health(gateway::now_secs());
+    assert!(!health.is_empty());
+    for (key, health) in health {
+        assert_eq!(health.health_state, "healthy", "{key}");
+        assert_eq!(health.cooldown_until, None, "{key}");
+        assert_eq!(health.last_error, None, "{key}");
+    }
+}
+
+/// A relay's own failure before the model has started is retried, and the next attempt
+/// serves the turn; the key did nothing wrong and is not cooled.
+#[tokio::test]
+async fn a_relays_error_before_the_model_starts_is_retried_without_cooling_the_key() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(error_frame("upstream_error"), "text/event-stream"),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(anthropic_answer("hi"), "text/event-stream"),
+        )
+        .mount(&server)
+        .await;
+    let billing = engine(
+        ProviderFormat::Anthropic,
+        &server.uri(),
+        vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+    );
+    let (app, runtime) = routed(&billing, &LargeBodyGate::default());
+    let reply = send(
+        &app,
+        "inv-unavailable",
+        body(json!({"content": "hello", "modelId": "model"}), vec![]),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert!(frames(&reply.bytes)
+        .iter()
+        .any(|(kind, payload)| kind == "assistantResponseEvent" && payload["content"] == "hi"));
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    keys_untouched(&runtime);
+}
+
+/// One that keeps failing moves on to the provider's other key and still cools neither;
+/// Kiro gets the temporary error its SDK retries.
+#[tokio::test]
+async fn a_relays_repeated_error_moves_to_another_key_and_cools_none() {
+    let server = upstream(
+        ResponseTemplate::new(200).set_body_raw(error_frame("upstream_error"), "text/event-stream"),
+    )
+    .await;
+    let billing = engine(
+        ProviderFormat::Anthropic,
+        &server.uri(),
+        vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+    );
+    billing.upsert_provider_key(ProviderKey::new("key-2", "prov", "sk-test-2"));
+    let (app, runtime) = routed(&billing, &LargeBodyGate::default());
+    let reply = send(
+        &app,
+        "inv-unavailable-twice",
+        body(json!({"content": "hello", "modelId": "model"}), vec![]),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_GATEWAY, "{}", reply.text());
+    assert_eq!(reply.json()["__type"], "InternalServerException");
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    assert_eq!(runtime.key_health(gateway::now_secs()).len(), 2);
+    keys_untouched(&runtime);
+    nothing_charged(&billing);
+}
+
+/// An error in the stream that a retry would meet again reaches Kiro as the same refusal
+/// from an upstream's HTTP status would: a ValidationException in the gateway's words,
+/// sent once, uncharged and traced. Too large a request is the overflow Kiro compacts for.
+/// As a 502 it read "temporary error" and Kiro retried it unchanged. A key not allowed the
+/// model is the key's problem: it cools down, and the customer is told the operator has to
+/// fix it, as for a model the upstream does not know.
+#[tokio::test]
+async fn an_error_blaming_the_request_is_refused_as_a_validation_error() {
+    for (kind, class, told) in [
+        (
+            "invalid_request_error",
+            "upstream_refused",
+            "上游模型服务拒绝了本次请求（HTTP 400",
+        ),
+        (
+            "permission_error",
+            "upstream_refused",
+            "上游模型服务的账户余额或权限出了问题（HTTP 403），不是本次请求的问题",
+        ),
+        (
+            "not_found_error",
+            "upstream_refused",
+            "上游模型服务找不到这个模型（HTTP 404），是模型配置的问题，不是本次请求的问题",
+        ),
+        ("request_too_large", "input_too_long", ""),
+    ] {
+        let server = upstream(
+            ResponseTemplate::new(200).set_body_raw(error_frame(kind), "text/event-stream"),
+        )
+        .await;
+        let billing = engine(
+            ProviderFormat::Anthropic,
+            &server.uri(),
+            vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+        );
+        let (app, runtime) = routed(&billing, &LargeBodyGate::default());
+        let reply = send(
+            &app,
+            "inv-request-fault",
+            body(json!({"content": "hello", "modelId": "model"}), vec![]),
+        )
+        .await;
+        assert_eq!(
+            reply.status,
+            StatusCode::BAD_REQUEST,
+            "{kind}: {}",
+            reply.text()
+        );
+        let refusal = reply.json();
+        assert_eq!(refusal["__type"], "ValidationException", "{kind}");
+        if kind == "request_too_large" {
+            assert_overflow(&reply);
+        } else {
+            assert!(
+                refusal["message"].as_str().unwrap().starts_with(told),
+                "{kind}: {refusal}"
+            );
+        }
+        // The vendor's words never reach the customer.
+        assert!(!reply.text().contains("当前模型暂时不可用"), "{kind}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1, "{kind}");
+        nothing_charged(&billing);
+        assert_eq!(trace_class(&billing, "inv-request-fault"), vec![class]);
+        if kind == "permission_error" {
+            let health = runtime.key_health(gateway::now_secs());
+            assert_eq!(health["key"].health_state, "cooldown");
+            assert_eq!(health["key"].last_error.as_deref(), Some("http_403"));
+        } else {
+            keys_untouched(&runtime);
+        }
+    }
+}
+
+/// An `authentication_error` in the stream is the key's problem, as an HTTP 401 is: the key
+/// is set aside, and the customer is not told their request was at fault.
+#[tokio::test]
+async fn an_authentication_error_in_the_stream_retires_the_key_like_a_401() {
+    let server = upstream(
+        ResponseTemplate::new(200)
+            .set_body_raw(error_frame("authentication_error"), "text/event-stream"),
+    )
+    .await;
+    let billing = engine(
+        ProviderFormat::Anthropic,
+        &server.uri(),
+        vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+    );
+    let (app, runtime) = routed(&billing, &LargeBodyGate::default());
+    let reply = send(
+        &app,
+        "inv-auth-fault",
+        body(json!({"content": "hello", "modelId": "model"}), vec![]),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_GATEWAY, "{}", reply.text());
+    assert_eq!(reply.json()["__type"], "InternalServerException");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    let health = runtime.key_health(gateway::now_secs());
+    assert_eq!(health["key"].health_state, "unhealthy");
+    assert_eq!(health["key"].last_error.as_deref(), Some("http_401"));
+    nothing_charged(&billing);
+}
+
+/// A relay may report a prompt over the model's context in the stream rather than as an
+/// HTTP 400: Anthropic's "prompt is too long" in an `error` frame, OpenAI's
+/// `context_length_exceeded` in an error chunk. Only that classification is kept from the
+/// vendor's words, and it is the overflow Kiro compacts for, uncharged.
+#[tokio::test]
+async fn an_overflow_reported_in_the_stream_is_the_overflow_kiro_compacts_for() {
+    let anthropic = error_event(json!({"type": "invalid_request_error",
+        "message": "prompt is too long: 250000 tokens > 200000 maximum"}));
+    let openai = format!(
+        "data: {}\n\n",
+        json!({"error": {"message": "This model's maximum context length is 128000 tokens.",
+            "type": "invalid_request_error", "param": "messages", "code": "context_length_exceeded"}})
+    );
+    for (format, events) in [
+        (ProviderFormat::Anthropic, anthropic),
+        (ProviderFormat::OpenAi, openai),
+    ] {
+        let server =
+            upstream(ResponseTemplate::new(200).set_body_raw(events, "text/event-stream")).await;
+        let billing = engine(
+            format,
+            &server.uri(),
+            vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+        );
+        let (app, runtime) = routed(&billing, &LargeBodyGate::default());
+        let reply = send(
+            &app,
+            "inv-overflow-in-stream",
+            body(json!({"content": "hello", "modelId": "model"}), vec![]),
+        )
+        .await;
+        assert_overflow(&reply);
+        assert!(!reply.text().contains("250000") && !reply.text().contains("128000"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        nothing_charged(&billing);
+        assert_eq!(
+            trace_class(&billing, "inv-overflow-in-stream"),
+            vec!["input_too_long"]
+        );
+        keys_untouched(&runtime);
+    }
+}
+
+/// An SSE data line.
+fn sse(event: Value) -> String {
+    format!("data: {event}\n\n")
+}
+
+/// Anthropic's `message_start`, reporting `input` tokens: the model has started, and has
+/// delivered nothing.
+fn message_start(input: u64) -> String {
+    sse(json!({"type": "message_start",
+        "message": {"usage": {"input_tokens": input, "output_tokens": 1}}}))
+}
+
+/// The rest of an Anthropic answer after its `message_start`.
+fn anthropic_rest(text: &str) -> String {
+    [
+        json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}}),
+        json!({"type": "content_block_stop", "index": 0}),
+        json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 3}}),
+        json!({"type": "message_stop"}),
+    ]
+    .into_iter()
+    .map(sse)
+    .collect()
+}
+
+/// An OpenAI stream's opening chunk, naming the role: the model has started.
+fn openai_opening() -> String {
+    sse(json!({"choices": [{"delta": {"role": "assistant", "content": ""}}]}))
+}
+
+/// The rest of an OpenAI answer after its opening chunk.
+fn openai_rest(text: &str) -> String {
+    [
+        json!({"choices": [{"delta": {"content": text}}]}),
+        json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+        json!({"choices": [], "usage": {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15}}),
+    ]
+    .into_iter()
+    .map(sse)
+    .chain(["data: [DONE]\n\n".to_string()])
+    .collect()
+}
+
+/// An upstream answering its first call with `first`, and every later one with `rest`.
+async fn upstream_then(first: String, rest: String) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(first, "text/event-stream"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(rest, "text/event-stream"))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// What an upstream answers one call with: SSE text, each part after a pause in ms.
+type Paced = Vec<(u64, String)>;
+
+/// An upstream that answers call `n` with `script(n)`, at its pace, which wiremock cannot:
+/// its headers at once, then each part after its pause. The URL, and its call count.
+async fn paced_upstream(script: fn(usize) -> Paced) -> (String, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = axum::Router::new().fallback({
+        let calls = calls.clone();
+        move || {
+            let parts = script(calls.fetch_add(1, Ordering::SeqCst));
+            async move {
+                let body = futures_util::stream::iter(parts).then(|(pause, part)| async move {
+                    tokio::time::sleep(Duration::from_millis(pause)).await;
+                    Ok::<_, std::io::Error>(bytes::Bytes::from(part))
+                });
+                axum::response::Response::builder()
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(body))
+                    .unwrap()
+            }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, calls)
+}
+
+/// Limits short enough to pass in a test: the answer to Kiro begins 200 ms after the
+/// request arrives, and an attempt may wait 400 ms for its model to start.
+fn brief_limits() -> UpstreamLimits {
+    UpstreamLimits {
+        headers: Duration::from_millis(300),
+        attempt: Duration::from_millis(400),
+        total: Duration::from_secs(10),
+        commit: Duration::from_millis(200),
+        started: Duration::from_secs(10),
+        idle: Duration::from_millis(600),
+    }
+}
+
+fn text_of(reply: &Reply) -> String {
+    frames(&reply.bytes)
+        .into_iter()
+        .filter(|(kind, _)| kind == "assistantResponseEvent")
+        .filter_map(|(_, payload)| payload["content"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// A failure after the model has started but before it produced anything (an error frame,
+/// a dropped stream) is retried: nothing reached Kiro. The answer that follows is the only
+/// thing billed; the failed attempt's opening report of 80,000 input tokens is not.
+#[tokio::test]
+async fn a_failure_after_the_start_is_retried_and_only_the_answer_is_billed() {
+    let overloaded =
+        sse(json!({"type": "error", "error": {"type": "overloaded_error", "message": "busy"}}));
+    let server_error = sse(json!({"error": {"type": "server_error", "message": "busy"}}));
+    for (format, failed, answered) in [
+        (
+            ProviderFormat::Anthropic,
+            message_start(80_000) + &overloaded,
+            message_start(10) + &anthropic_rest("hi"),
+        ),
+        (
+            ProviderFormat::Anthropic,
+            message_start(80_000),
+            message_start(10) + &anthropic_rest("hi"),
+        ),
+        (
+            ProviderFormat::OpenAi,
+            openai_opening() + &server_error,
+            openai_opening() + &openai_rest("hi"),
+        ),
+        (
+            ProviderFormat::OpenAi,
+            openai_opening(),
+            openai_opening() + &openai_rest("hi"),
+        ),
+    ] {
+        let server = upstream_then(failed, answered).await;
+        let billing = engine(
+            format,
+            &server.uri(),
+            vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+        );
+        let app = serve(&billing);
+        let reply = send(
+            &app,
+            "inv-retried",
+            body(json!({"content": "hello", "modelId": "model"}), vec![]),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK, "{format:?}: {}", reply.text());
+        assert_eq!(text_of(&reply), "hi", "{format:?}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        let entries = usage_entries(&billing);
+        assert_eq!(entries.len(), 1, "{format:?}");
+        assert!(entries[0].input_tokens < 80_000, "{format:?}");
+    }
+}
+
+/// When every attempt fails that way, nothing is billed, and the invocation is left free
+/// for Kiro to send again.
+#[tokio::test]
+async fn a_request_whose_every_attempt_fails_after_the_start_is_not_billed() {
+    let server = upstream(ResponseTemplate::new(200).set_body_raw(
+        message_start(80_000) + &error_frame("upstream_error"),
+        "text/event-stream",
+    ))
+    .await;
+    let billing = engine(
+        ProviderFormat::Anthropic,
+        &server.uri(),
+        vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+    );
+    let (app, runtime) = routed(&billing, &LargeBodyGate::default());
+    let reply = send(
+        &app,
+        "inv-unavailable-late",
+        body(json!({"content": "hello", "modelId": "model"}), vec![]),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_GATEWAY, "{}", reply.text());
+    assert_eq!(reply.json()["__type"], "InternalServerException");
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    nothing_charged(&billing);
+    keys_untouched(&runtime);
+    // The same invocation may be sent again.
+    let reply = send(
+        &app,
+        "inv-unavailable-late",
+        body(json!({"content": "hello", "modelId": "model"}), vec![]),
+    )
+    .await;
+    assert_ne!(reply.json()["__type"], "PriorInvocationFailedException");
+}
+
+/// A model that has started may think silently past the wait for a start, for as long as
+/// it stays alive (pings count), and past the moment the answer to Kiro has to begin: it
+/// is not retried, and the turn is billed once.
+#[tokio::test]
+async fn a_started_model_may_think_past_the_wait_for_a_start() {
+    for format in [ProviderFormat::Anthropic, ProviderFormat::OpenAi] {
+        let (url, calls) = match format {
+            ProviderFormat::Anthropic => {
+                paced_upstream(|_| {
+                    let mut parts = vec![(0, message_start(10))];
+                    parts.extend((0..8).map(|_| (100, sse(json!({"type": "ping"})))));
+                    parts.push((0, anthropic_rest("thought")));
+                    parts
+                })
+                .await
+            }
+            ProviderFormat::OpenAi => {
+                paced_upstream(|_| {
+                    let mut parts = vec![(0, openai_opening())];
+                    parts.extend((0..8).map(|_| (100, ": keep-alive\n\n".to_string())));
+                    parts.push((0, openai_rest("thought")));
+                    parts
+                })
+                .await
+            }
+        };
+        let billing = engine(
+            format,
+            &url,
+            vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+        );
+        let (app, _) = routed_with(&billing, Some(brief_limits()));
+        let reply = send(
+            &app,
+            "inv-thinking",
+            body(json!({"content": "hello", "modelId": "model"}), vec![]),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK, "{format:?}: {}", reply.text());
+        assert_eq!(text_of(&reply), "thought", "{format:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "{format:?}");
+        assert_eq!(usage_entries(&billing).len(), 1, "{format:?}");
+    }
+}
+
+/// An answer that genuinely ends empty, with a stop reason, is retried like a failed relay;
+/// when every attempt ends so, the input the upstream consumed is billed once. That holds
+/// whether the route ended before the answer to Kiro began or after.
+#[tokio::test]
+async fn an_answer_that_ends_empty_every_time_is_billed_once() {
+    let empty = message_start(50)
+        + &sse(
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 0}}),
+        )
+        + &sse(json!({"type": "message_stop"}));
+    let server =
+        upstream(ResponseTemplate::new(200).set_body_raw(empty, "text/event-stream")).await;
+    for limits in [None, Some(brief_limits())] {
+        let billing = engine(
+            ProviderFormat::Anthropic,
+            &server.uri(),
+            vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+        );
+        let (app, runtime) = routed_with(&billing, limits);
+        let before = server.received_requests().await.unwrap().len();
+        let reply = send(
+            &app,
+            "inv-empty",
+            body(json!({"content": "hello", "modelId": "model"}), vec![]),
+        )
+        .await;
+        assert_eq!(server.received_requests().await.unwrap().len() - before, 3);
+        // Billed once, it ends in words Kiro shows and does not retry: a retry would be
+        // billed again. As a 502, Kiro's SDK sent the same invocation again, and the answer
+        // read "Something went wrong: [PriorInvocationFailedException]".
+        let told = if limits.is_some() {
+            // The answer had begun: it ends with the exception.
+            assert_eq!(reply.status, StatusCode::OK);
+            error_frame_of(&reply.bytes, "ValidationException")
+        } else {
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text());
+            assert_eq!(reply.json()["__type"], "ValidationException");
+            reply.json()
+        };
+        assert!(told.get("reason").is_none(), "{told}");
+        assert!(
+            told["message"]
+                .as_str()
+                .unwrap()
+                .contains("已按它读取的输入计费一次"),
+            "{told}"
+        );
+        let entries = usage_entries(&billing);
+        assert_eq!(entries.len(), 1, "{limits:?}");
+        assert_eq!(entries[0].input_tokens, 50);
+        assert!(entries[0].output_tokens <= 1);
+        keys_untouched(&runtime);
+
+        // The same invocation again is refused as one that failed, readably.
+        let again = send(
+            &app,
+            "inv-empty",
+            body(json!({"content": "hello", "modelId": "model"}), vec![]),
+        )
+        .await;
+        assert_eq!(again.status, StatusCode::BAD_REQUEST, "{}", again.text());
+        assert_eq!(again.json()["__type"], "ValidationException");
+        assert!(again.json()["message"]
+            .as_str()
+            .unwrap()
+            .contains("此前已经失败"));
+        assert_eq!(server.received_requests().await.unwrap().len() - before, 3);
+        assert_eq!(usage_entries(&billing).len(), 1);
+    }
+}
+
+/// The payload of the `kind` exception frame in an answer.
+fn error_frame_of(bytes: &[u8], kind: &str) -> Value {
+    frames(bytes)
+        .into_iter()
+        .find(|(frame, _)| frame == kind)
+        .map(|(_, payload)| payload)
+        .unwrap_or_else(|| panic!("no {kind} frame"))
+}
+
+/// Budget thinking needs room for a budget and for the answer after it. A model configured
+/// with less output than that cannot take it: a configuration refusal Kiro shows as
+/// written, not a 502 "temporary error" its SDK retried unchanged.
+#[tokio::test]
+async fn thinking_a_model_has_no_output_room_for_is_a_configuration_refusal() {
+    let server = upstream(
+        ResponseTemplate::new(200).set_body_raw(anthropic_answer("hi"), "text/event-stream"),
+    )
+    .await;
+    let mut map = ModelMap::new("map", GROUP, "model", "prov", "up-model");
+    map.max_output = 1_500;
+    map.supports_reasoning = true;
+    let billing = engine(ProviderFormat::Anthropic, &server.uri(), vec![map]);
+    let (app, runtime) = routed(&billing, &LargeBodyGate::default());
+    let reply = send(
+        &app,
+        "inv-thinking-room",
+        body(
+            json!({"content": "hello", "modelId": "model",
+                "additionalModelRequestFields": {"output_config": {"effort": "high"}}}),
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text());
+    let refusal = reply.json();
+    assert_eq!(refusal["__type"], "ValidationException");
+    assert!(refusal.get("reason").is_none(), "{refusal}");
+    assert!(
+        refusal["message"]
+            .as_str()
+            .unwrap()
+            .contains("最大输出只有 1500 个 token，开启思考至少需要 2048 个"),
+        "{refusal}"
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+    nothing_charged(&billing);
+    keys_untouched(&runtime);
+}
+
+/// A primary that fails after its model has started, and after the answer to Kiro has
+/// begun, falls back to the next target, which serves and is billed for the turn.
+#[tokio::test]
+async fn a_primary_that_fails_after_the_start_falls_back() {
+    let (primary, primary_calls) = paced_upstream(|_| {
+        vec![
+            (0, message_start(80_000)),
+            (300, sse(json!({"type": "error", "error": {"type": "overloaded_error", "message": "busy"}}))),
+        ]
+    })
+    .await;
+    let fallback = upstream(ResponseTemplate::new(200).set_body_raw(
+        message_start(10) + &anthropic_rest("from the fallback"),
+        "text/event-stream",
+    ))
+    .await;
+    let mut map = ModelMap::new("map", GROUP, "model", "prov", "up-model");
+    map.fallback_chain = vec![billing::group::FallbackTarget {
+        provider_id: "prov-b".into(),
+        target_model: "up-model-b".into(),
+    }];
+    let billing = engine(ProviderFormat::Anthropic, &primary, vec![map]);
+    billing.upsert_provider(Provider::new(
+        "prov-b",
+        "Fallback",
+        ProviderFormat::Anthropic,
+        fallback.uri(),
+    ));
+    billing.upsert_provider_key(ProviderKey::new("key-b", "prov-b", "sk-test-b"));
+    let (app, _) = routed_with(&billing, Some(brief_limits()));
+    let reply = send(
+        &app,
+        "inv-fallback",
+        body(json!({"content": "hello", "modelId": "model"}), vec![]),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(text_of(&reply), "from the fallback");
+    assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fallback.received_requests().await.unwrap().len(), 1);
+    let entries = usage_entries(&billing);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        (
+            entries[0].provider_id.as_str(),
+            entries[0].target_model.as_str()
+        ),
+        ("prov-b", "up-model-b")
+    );
+    assert_eq!(entries[0].input_tokens, 10);
+}
+
+/// After the first content a failure reaches the answer: it is not retried, and the turn
+/// is billed for what it delivered.
+#[tokio::test]
+async fn a_failure_after_content_is_not_retried_and_bills_what_was_delivered() {
+    let events = message_start(10)
+        + &sse(
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        )
+        + &sse(
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hello there"}}),
+        )
+        + &sse(json!({"type": "error", "error": {"type": "overloaded_error", "message": "busy"}}));
+    let server =
+        upstream(ResponseTemplate::new(200).set_body_raw(events, "text/event-stream")).await;
+    let billing = engine(
+        ProviderFormat::Anthropic,
+        &server.uri(),
+        vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+    );
+    let app = serve(&billing);
+    let reply = send(
+        &app,
+        "inv-after-content",
+        body(json!({"content": "hello", "modelId": "model"}), vec![]),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(text_of(&reply), "Hello there");
+    assert!(frames(&reply.bytes)
+        .iter()
+        .any(|(kind, _)| kind == "InternalServerException"));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    let entries = usage_entries(&billing);
+    assert_eq!(entries.len(), 1);
+    assert!(entries[0].output_tokens > 0);
+}
+
+/// Kiro gives up on a request that sends it nothing for 60 seconds, so a route still going
+/// when the answer has to begin goes on behind it. A refusal found after that point ends
+/// the answer as the exception frame Kiro reads as it does the error response, its reason
+/// included: an overflow it compacts for, the upstream's refusal of the request. Nothing
+/// is billed.
+#[tokio::test]
+async fn a_refusal_after_the_answer_has_begun_keeps_its_form() {
+    let refusals: [fn(usize) -> Paced; 2] = [
+        |_| {
+            vec![
+                (0, message_start(10)),
+                (
+                    400,
+                    error_event(json!({"type": "invalid_request_error",
+                    "message": "prompt is too long: 250000 tokens > 200000 maximum"})),
+                ),
+            ]
+        },
+        |_| {
+            vec![
+                (0, message_start(10)),
+                (
+                    400,
+                    error_event(json!({"type": "invalid_request_error", "message": "bad tools"})),
+                ),
+            ]
+        },
+    ];
+    for (script, reason) in refusals
+        .into_iter()
+        .zip([Some("CONTENT_LENGTH_EXCEEDS_THRESHOLD"), None])
+    {
+        let (url, calls) = paced_upstream(script).await;
+        let billing = engine(
+            ProviderFormat::Anthropic,
+            &url,
+            vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+        );
+        let (app, _) = routed_with(&billing, Some(brief_limits()));
+        let reply = send(
+            &app,
+            "inv-late-refusal",
+            body(json!({"content": "hello", "modelId": "model"}), vec![]),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+        let (kind, payload) = frames(&reply.bytes).pop().unwrap();
+        assert_eq!(kind, "ValidationException", "{payload}");
+        assert_eq!(payload["reason"].as_str(), reason, "{payload}");
+        assert!(!reply.text().contains("250000") && !reply.text().contains("bad tools"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        nothing_charged(&billing);
+    }
+}
+
+/// A relay that gives no response headers in time did not answer at all, so its key is
+/// cooled; one that answers but whose model is slow to start is a slow model, and is not.
+#[tokio::test]
+async fn a_relay_that_does_not_answer_is_cooled_and_a_slow_model_is_not() {
+    let silent = upstream(
+        ResponseTemplate::new(200)
+            .set_delay(Duration::from_secs(2))
+            .set_body_raw(anthropic_answer("late"), "text/event-stream"),
+    )
+    .await;
+    let (slow, _) = paced_upstream(|_| vec![(1_000, anthropic_answer("late"))]).await;
+    for (url, cooled) in [(silent.uri(), true), (slow, false)] {
+        let billing = engine(
+            ProviderFormat::Anthropic,
+            &url,
+            vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+        );
+        billing.upsert_provider_key(ProviderKey::new("key-2", "prov", "sk-test-2"));
+        let (app, runtime) = routed_with(&billing, Some(brief_limits()));
+        let reply = send(
+            &app,
+            "inv-no-answer",
+            body(json!({"content": "hello", "modelId": "model"}), vec![]),
+        )
+        .await;
+        assert!(text_of(&reply).is_empty(), "{}", reply.text());
+        let health = runtime.key_health(gateway::now_secs());
+        assert_eq!(health.len(), 2);
+        for (key, health) in health {
+            assert_eq!(
+                health.health_state == "cooldown",
+                cooled,
+                "{key}: {health:?}"
+            );
+        }
+        nothing_charged(&billing);
+    }
+}
+
+/// How many more times the same refusal as `invocation`'s was counted on its trace.
+fn repeats(billing: &BillingEngine, invocation: &str) -> u64 {
+    let invocation_id = format!("{CARD}:{invocation}");
+    billing
+        .list_traces(Some(CARD), 100)
+        .into_iter()
+        .find(|trace| trace.invocation_id == invocation_id)
+        .map_or(0, |trace| trace.repeats)
+}
+
+/// Without an alias, the fast model is the group's cheapest listed model at the price in
+/// force, the first in the group's order among equals: sent to the group's first model it
+/// was often the flagship, at the flagship's price.
+#[tokio::test]
+async fn without_a_model_named_for_it_kiros_fast_model_is_the_cheapest_listed() {
+    let server = upstream(
+        ResponseTemplate::new(200).set_body_raw(anthropic_answer("fix: typo"), "text/event-stream"),
+    )
+    .await;
+    let main = ModelMap::new("map-main", GROUP, "main-model", "prov", "up-main");
+    let mut other = ModelMap::new("map-other", GROUP, "other-model", "prov", "up-other");
+    other.sort_order = 1;
+    // Exposed under the name itself, it is still never listed.
+    let mut named = ModelMap::new("map-named", GROUP, "simple-task", "prov", "up-named");
+    named.sort_order = 2;
+    let billing = engine(ProviderFormat::Anthropic, &server.uri(), vec![main, other]);
+    let app = serve(&billing);
+
+    let reply = send(
+        &app,
+        "inv-default",
+        body(
+            json!({"content": "Summarize", "modelId": "simple-task"}),
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(models_sent(&server).await, vec!["up-main"]);
+    assert_eq!(usage_entries(&billing)[0].exposed_model, "main-model");
+
+    billing.upsert_rate_card_version(price("simple-task"));
+    billing.upsert_model_map(named);
+    assert_eq!(listed(&billing), vec!["main-model", "other-model"]);
+    let reply = send(
+        &app,
+        "inv-named",
+        body(
+            json!({"content": "Summarize", "modelId": "simple-task"}),
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(models_sent(&server).await, vec!["up-main", "up-named"]);
+}
+
+/// Kiro's "Manage Plan" opens the address CreateSubscriptionToken gives: the gateway's
+/// customer portal, at the host and scheme the client reached it by.
+#[tokio::test]
+async fn manage_plan_opens_the_customer_portal() {
+    let mut registry = FacadeRegistry::new();
+    registry.register(gateway::facade::subscriptions::CreateSubscriptionTokenHandler);
+    let app = registry.into_router();
+    let token = |headers: &'static [(&'static str, &'static str)]| {
+        let app = app.clone();
+        async move {
+            let mut request = Request::builder()
+                .method(Method::POST)
+                .uri("/CreateSubscriptionToken")
+                .header(header::CONTENT_TYPE, "application/json");
+            for (name, value) in headers {
+                request = request.header(*name, *value);
+            }
+            let response = app
+                .oneshot(
+                    request
+                        .body(Body::from(r#"{"provider":"STRIPE"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<Value>(&bytes).unwrap()
+        }
+    };
+
+    let behind_proxy = token(&[
+        ("host", "gateway:19820"),
+        ("x-forwarded-host", "kiro.example"),
+        ("x-forwarded-proto", "https"),
+    ])
+    .await;
+    assert_eq!(
+        behind_proxy["encodedVerificationUrl"],
+        "https://kiro.example/portal"
+    );
+    assert_eq!(behind_proxy["status"], "ACTIVE");
+    assert_eq!(behind_proxy["token"], behind_proxy["subscriptionToken"]);
+    assert!(!behind_proxy["token"].as_str().unwrap().is_empty());
+
+    let direct = token(&[("host", "127.0.0.1:19820")]).await;
+    assert_eq!(
+        direct["encodedVerificationUrl"],
+        "http://127.0.0.1:19820/portal"
+    );
+    let forged = token(&[("x-forwarded-host", "evil.example/phish?x=")]).await;
+    assert!(forged.get("encodedVerificationUrl").is_none(), "{forged}");
 }
 
 /// Kiro's calls outside the conversation, at the paths and methods it uses, answered in

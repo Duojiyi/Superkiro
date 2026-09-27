@@ -209,44 +209,115 @@ async fn send_terminal_frame(
     )
 }
 
-/// Why a response ended before completing, as the client is told at its end.
+/// An error as Kiro is told it: as an error response, or, once the answer has begun, as the
+/// exception frame that ends it, which Kiro reads the same way (the reason included).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KiroError {
+    pub status: axum::http::StatusCode,
+    pub exception: &'static str,
+    pub message: String,
+    pub reason: Option<&'static str>,
+    pub retry_after_secs: Option<u64>,
+}
+
+impl KiroError {
+    pub fn new(
+        status: axum::http::StatusCode,
+        exception: &'static str,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            status,
+            exception,
+            message: message.into(),
+            reason: None,
+            retry_after_secs: None,
+        }
+    }
+
+    pub fn with_reason(mut self, reason: &'static str) -> Self {
+        self.reason = Some(reason);
+        self
+    }
+
+    pub fn with_retry_after(mut self, secs: u64) -> Self {
+        self.retry_after_secs = Some(secs);
+        self
+    }
+
+    /// The error response.
+    pub fn into_response(self) -> axum::response::Response {
+        match self.reason {
+            Some(reason) => crate::guardrail::format_kiro_throttle_response(
+                self.status,
+                self.exception,
+                reason,
+                &self.message,
+                self.retry_after_secs,
+            ),
+            None => crate::facade::error_response(self.status, self.exception, &self.message),
+        }
+    }
+}
+
+/// Why a response ended before completing, as the client is told at its end: by an
+/// exception frame alone. Text added to the answer to explain it stayed in the conversation
+/// the model reads from then on.
 struct Failure {
-    /// Shown in the conversation, where Kiro renders it.
-    note: Option<String>,
     /// The exception that ends the stream.
     error: String,
+    exception: &'static str,
+    reason: Option<&'static str>,
+    retry_after_secs: Option<u64>,
 }
 
 impl Failure {
-    fn new(note: Option<String>, error: impl Into<String>) -> Self {
+    /// A temporary failure, which Kiro retries when nothing it cannot take back (a tool
+    /// call) has been shown, and otherwise reports as a temporary error.
+    fn new(error: impl Into<String>) -> Self {
         Self {
-            note,
             error: error.into(),
+            exception: "InternalServerException",
+            reason: None,
+            retry_after_secs: None,
+        }
+    }
+
+    /// An ending a retry would meet again: a ValidationException without a reason, which
+    /// Kiro shows as written and does not retry.
+    fn shown(message: impl Into<String>) -> Self {
+        Self {
+            exception: "ValidationException",
+            ..Self::new(message)
+        }
+    }
+
+    /// A route that failed after the answer had begun, as the error response would have
+    /// told Kiro.
+    fn told(error: KiroError) -> Self {
+        Self {
+            error: error.message,
+            exception: error.exception,
+            reason: error.reason,
+            retry_after_secs: error.retry_after_secs,
         }
     }
 
     fn deadline() -> Self {
-        Self::new(
-            Some(
-                "\n\n**响应超过时间上限，已被截断。**可以让模型从这里继续，或缩短本次请求。\n"
-                    .into(),
-            ),
-            "Response exceeded the time limit and was cut off",
+        Self::shown(
+            "响应超过了网关的时间上限，已被截断。可以让模型从中断处继续，或把任务拆小后重试。",
         )
     }
 
+    /// The next gateway serves Kiro's retry.
     fn restarting() -> Self {
-        Self::new(
-            Some("\n\n**网关正在重启，本次响应已被截断。**可以让模型从这里继续。\n".into()),
-            "The gateway is restarting; the response was cut off",
-        )
+        Self::new("The gateway is restarting; the response was cut off")
     }
 
-    fn oversized_tool_call(error: &str) -> Self {
-        Self::new(
-            Some("\n\n**模型生成的工具调用超出网关上限，本次响应已中止。**\n".into()),
-            error,
-        )
+    fn oversized_tool_call(what: &str) -> Self {
+        Self::shown(format!(
+            "模型生成的工具调用超出了网关的上限（{what}），本次响应已中止。可以让模型分几步完成，或把任务拆小后重试。"
+        ))
     }
 }
 
@@ -297,6 +368,25 @@ impl ToolCalls {
             (None, Some(id)) => self.by_id.get(id).copied(),
             (None, None) => self.calls.len().checked_sub(1),
         }
+    }
+
+    /// Whether a fragment for call `position` (`None`: one not yet open) carries nothing
+    /// the call lacks: no arguments, and no id or name other than the call's own.
+    fn adds_nothing(
+        &self,
+        position: Option<usize>,
+        id: Option<&str>,
+        name: Option<&str>,
+        arguments: &str,
+    ) -> bool {
+        arguments.is_empty()
+            && match position {
+                Some(position) => {
+                    let call = &self.calls[position];
+                    id.is_none_or(|id| id == call.id) && name.is_none_or(|name| name == call.name)
+                }
+                None => id.is_none() && name.is_none(),
+            }
     }
 
     fn open(&mut self, index: Option<usize>) -> usize {
@@ -449,7 +539,12 @@ pub fn create_stream_guard_with_send_deadline(
         let mut has_input_usage = false;
         let mut saw_usage_frame = false;
         let mut output_units = 0u64;
+        // The part of the output that is text or a tool call: what the next request sends
+        // back, where thinking goes back only to a provider that replays it.
+        let mut answer_units = 0u64;
         let mut saw_output = false;
+        // Text or a tool call: output that answers, which thinking alone does not.
+        let mut saw_answer = false;
         let mut first_output_at: Option<std::time::Instant> = None;
         // Kept 24 hours for tracing when the archive is on: what the model sent back.
         let archiving = crate::archive::active().is_some();
@@ -466,9 +561,14 @@ pub fn create_stream_guard_with_send_deadline(
         let mut stop_reason = None;
         let mut refusal = None;
         // The upstream model the response comes from, which its thinking may go back to.
-        let signing_model = billing_settler
+        let mut signing_model = billing_settler
             .as_ref()
             .map(|settler| settler.target_model.clone());
+        // What the gateway estimates the request holds, which the context Kiro is told of
+        // never falls below.
+        let estimated_input = billing_settler
+            .as_ref()
+            .map_or(0, |settler| settler.estimated_input_tokens);
 
         'stream: loop {
             tokio::select! {
@@ -489,7 +589,10 @@ pub fn create_stream_guard_with_send_deadline(
                             let frames = match delta {
                                 ProviderDelta::Text(text) => {
                                     saw_output |= !text.is_empty();
-                                    output_units = output_units.saturating_add(crate::usage_estimate::token_units(&text));
+                                    saw_answer |= !text.is_empty();
+                                    let units = crate::usage_estimate::token_units(&text);
+                                    output_units = output_units.saturating_add(units);
+                                    answer_units = answer_units.saturating_add(units);
                                     if archiving {
                                         reply.truncated |= crate::archive::append_capped(&mut reply.text, &text);
                                     }
@@ -517,25 +620,37 @@ pub fn create_stream_guard_with_send_deadline(
                                     // An empty id or name on a continuation names nothing; it
                                     // must not blank the call it continues.
                                     let id = id.filter(|value| !value.is_empty());
-                                    let name = name.filter(|value| !value.is_empty());
+                                    let name = name
+                                        .filter(|value| !value.is_empty())
+                                        .map(|name| tool_registry.as_ref().map_or_else(|| name.clone(), |r| r.restore(&name)));
+                                    let position = tool_calls.find(index, id.as_deref());
+                                    // Relays repeat an empty fragment of a call after the next
+                                    // has begun; it tells Kiro nothing, and read as a call
+                                    // continued after its end it failed the whole response.
+                                    if tool_calls.adds_nothing(position, id.as_deref(), name.as_deref(), &arguments) {
+                                        continue 'stream;
+                                    }
                                     saw_output |= !arguments.is_empty() || id.is_some() || name.is_some();
-                                    output_units = output_units.saturating_add(crate::usage_estimate::token_units(&arguments))
+                                    saw_answer |= !arguments.is_empty() || id.is_some() || name.is_some();
+                                    let units = crate::usage_estimate::token_units(&arguments)
                                         .saturating_add(name.as_ref().map_or(0, |n| crate::usage_estimate::token_units(n)));
+                                    output_units = output_units.saturating_add(units);
+                                    answer_units = answer_units.saturating_add(units);
                                     // Truncated arguments would reach Kiro as a malformed tool
                                     // call, so a response over the limits ends instead, billed
                                     // for what it produced.
-                                    let position = tool_calls.find(index, id.as_deref());
                                     if position.is_none() && tool_calls.calls.len() >= MAX_TOOL_CALLS {
-                                        failure = Some(Failure::oversized_tool_call(
-                                            "Response opened more tool calls than the gateway accepts",
-                                        ));
+                                        failure = Some(Failure::oversized_tool_call(&format!(
+                                            "一次最多 {MAX_TOOL_CALLS} 个调用"
+                                        )));
                                         break 'stream;
                                     }
                                     tool_argument_bytes = tool_argument_bytes.saturating_add(arguments.len());
                                     if tool_argument_bytes > MAX_TOOL_ARGUMENT_BYTES {
-                                        failure = Some(Failure::oversized_tool_call(
-                                            "Tool call arguments exceeded the gateway limit",
-                                        ));
+                                        failure = Some(Failure::oversized_tool_call(&format!(
+                                            "参数合计最多 {} MB",
+                                            MAX_TOOL_ARGUMENT_BYTES / (1024 * 1024)
+                                        )));
                                         break 'stream;
                                     }
                                     let position = position.unwrap_or_else(|| tool_calls.open(index));
@@ -545,14 +660,13 @@ pub fn create_stream_guard_with_send_deadline(
                                     }
                                     let buf = &mut tool_calls.calls[position];
                                     if let Some(name) = name {
-                                        buf.name = tool_registry.as_ref().map_or_else(|| name.clone(), |r| r.restore(&name));
+                                        buf.name = name;
                                     }
                                     buf.arguments.push_str(&arguments);
                                     match tool_calls.advance(position) {
                                         Ok(frames) => frames,
                                         Err(ContinuedAfterEnd) => {
                                             failure = Some(Failure::new(
-                                                None,
                                                 "Upstream continued a tool call after starting the next one",
                                             ));
                                             break 'stream;
@@ -572,6 +686,22 @@ pub fn create_stream_guard_with_send_deadline(
                         }
                         // Liveness for the watchdog; nothing for Kiro, which keepalives serve.
                         Some(Ok(ProviderStreamEvent::Started | ProviderStreamEvent::Heartbeat)) => {}
+                        // Another attempt took over before any content: it is the one billed,
+                        // and the one its thinking goes back to.
+                        Some(Ok(ProviderStreamEvent::Served { provider_id, target_model })) => {
+                            if let Some(settler) = billing_settler.as_mut() {
+                                settler.provider_id = provider_id;
+                                settler.target_model = target_model;
+                            }
+                            signing_model = billing_settler
+                                .as_ref()
+                                .map(|settler| settler.target_model.clone());
+                        }
+                        // The route ended without an answer after the answer had begun.
+                        Some(Ok(ProviderStreamEvent::Failed(error))) => {
+                            failure = Some(Failure::told(error));
+                            break;
+                        }
                         Some(Ok(ProviderStreamEvent::Refusal { category, explanation })) => {
                             refusal = Some(kiro_wire::events::Refusal {
                                 category,
@@ -591,10 +721,25 @@ pub fn create_stream_guard_with_send_deadline(
                                 cache_write_input_tokens: usage.cache_creation_input_tokens.unwrap_or(0).min(i64::MAX as u64) as i64,
                             };
                             // Kiro reads a percentage: it summarizes the conversation at 80 and
-                            // truncates it at 95. A fraction never reached either.
+                            // truncates it at 95. A fraction never reached either. The next
+                            // request holds this prompt and what of the answer goes back: its
+                            // text and tool calls, and its thinking only where the provider is
+                            // sent it again; counted, thinking had Kiro compact early after a
+                            // long think. An upstream that leaves the system prompt and tool
+                            // definitions out of its usage (kimera-primary reports 3 input
+                            // tokens for a 9K-token system prompt) would have Kiro compact late
+                            // and then overflow, so the gateway's own estimate of the prompt is
+                            // the floor. Billing still follows the upstream's report.
+                            let thinking_resent = billing_settler.as_ref().is_some_and(|settler| {
+                                crate::provider::provider_options(&settler.provider_id).replay_thinking
+                            });
+                            let resent_units = if thinking_resent { output_units } else { answer_units };
+                            let context_tokens = usage.prompt_tokens.max(estimated_input).saturating_add(
+                                crate::usage_estimate::tokens_from_units(resent_units),
+                            );
                             let frames = [
                                 kiro_wire::encoder::encode_metadata(Some(wire_usage), None),
-                                kiro_wire::encoder::encode_context_usage((usage.total_tokens as f64 * 100.0 / context_window as f64).clamp(0.0, 100.0)),
+                                kiro_wire::encoder::encode_context_usage((context_tokens as f64 * 100.0 / context_window as f64).clamp(0.0, 100.0)),
                             ];
                             for frame in frames {
                                 if !send_frame(&tx, Bytes::from(frame), send_deadline).await { break 'stream; }
@@ -606,17 +751,18 @@ pub fn create_stream_guard_with_send_deadline(
                         }
                         Some(Ok(ProviderStreamEvent::Done)) => {
                             // An empty turn with an explicit reason — the output limit, or a
-                            // content filter — was reported in full, so it ends like any other,
-                            // bills its usage, and says why it is empty. An empty turn ending
+                            // content filter — was reported in full, so it ends like any other
+                            // and bills its usage; out of output room, it says why it is empty
+                            // (Kiro shows its own refusal for a filter). An empty turn ending
                             // with an ordinary stop looks exactly like a failed relay and gives
                             // the user nothing, so it stays an unbilled, retryable error below.
-                            if !saw_output && saw_usage_frame {
+                            if !saw_output && saw_usage_frame && stop_reason.as_deref().is_some_and(ends_empty_turn) {
                                 if let Some(notice) = empty_turn_notice(stop_reason.as_deref()) {
                                     let frame = kiro_wire::encoder::encode_assistant_response(notice, Some(&config.model_id));
                                     if !send_frame(&tx, Bytes::from(frame), send_deadline).await { break 'stream; }
-                                    completed = true;
-                                    break;
                                 }
+                                completed = true;
+                                break;
                             }
                             // A terminal marker alone does not constitute a response, and is
                             // never cached as a successful invocation. The model had started,
@@ -627,15 +773,22 @@ pub fn create_stream_guard_with_send_deadline(
                             if !saw_output {
                                 rejected_empty = !has_input_usage;
                                 empty_turn = true;
-                                failure = Some(Failure::new(
-                                    None,
-                                    if has_input_usage {
-                                        "The upstream model returned an empty response; the input it read has been billed"
-                                    } else {
-                                        "Upstream completed without producing any output"
-                                    },
-                                ));
+                                // Billed, it ends with a refusal Kiro shows and does not
+                                // retry: its retry would be a new request, billed again.
+                                failure = Some(if has_input_usage && stop_reason.is_some() {
+                                    Failure::shown(EMPTY_ANSWER_BILLED)
+                                } else {
+                                    Failure::new("Upstream completed without producing any output")
+                                });
                                 break;
+                            }
+                            // Thinking that used up the output limit left no answer: said so,
+                            // or the turn ends on its thinking alone and Kiro completes it.
+                            if !saw_answer {
+                                if let Some(notice) = empty_turn_notice(stop_reason.as_deref()) {
+                                    let frame = kiro_wire::encoder::encode_assistant_response(notice, Some(&config.model_id));
+                                    if !send_frame(&tx, Bytes::from(frame), send_deadline).await { break 'stream; }
+                                }
                             }
                             for frame in tool_calls.finish() {
                                 if !send_frame(&tx, Bytes::from(frame), send_deadline).await { break 'stream; }
@@ -659,7 +812,7 @@ pub fn create_stream_guard_with_send_deadline(
                             };
                             // The exception ends the turn; text in the answer would stay in the
                             // conversation the model reads from then on.
-                            failure = Some(Failure::new(None, error));
+                            failure = Some(Failure::new(error));
                             break;
                         }
                     }
@@ -708,7 +861,12 @@ pub fn create_stream_guard_with_send_deadline(
                 settler.estimated_input_tokens,
             );
             let output_tokens = resolved.as_ref().map_or(0, |tokens| tokens.output_tokens);
-            if let Some(tokens) = resolved.filter(|_| !rejected_empty) {
+            // What delivered nothing is never billed, whatever the upstream reported: Kiro
+            // sends its retry of a failed turn as a new request, so a bill for the failure
+            // would be one more. An answer that genuinely ended empty, with a stop reason,
+            // consumed its input and is billed.
+            let billable = saw_output || completed || (empty_turn && stop_reason.is_some());
+            if let Some(tokens) = resolved.filter(|_| billable && !rejected_empty) {
                 billable_attempt = true;
                 match settler.settle(&tokens) {
                     Ok(charged) => credits_charged = Some(charged),
@@ -817,41 +975,52 @@ pub fn create_stream_guard_with_send_deadline(
         }
         let failure = match failure {
             Some(failure) => failure,
-            None if !settlement_ok => Failure::new(
-                None,
-                "Billing settlement failed; request retained for reconciliation",
-            ),
+            None if !settlement_ok => {
+                Failure::new("Billing settlement failed; request retained for reconciliation")
+            }
             // The client left; there is no one to tell.
             None => return,
         };
-        if let Some(note) = failure.note {
-            let frame =
-                kiro_wire::encoder::encode_assistant_response(&note, Some(&config.model_id));
-            if !send_terminal_frame(&tx, frame).await {
-                return;
-            }
-        }
-        let frame = kiro_wire::encoder::encode_exception("InternalServerException", &failure.error);
+        let frame = kiro_wire::encoder::encode_exception_with(
+            failure.exception,
+            &failure.error,
+            failure.reason,
+            failure
+                .retry_after_secs
+                .map(|secs| secs.saturating_mul(1000)),
+        );
         let _ = send_terminal_frame(&tx, frame).await;
     });
     FrameStream { inner: rx }
 }
 
-/// What to show when a turn ends with no visible output, so it is not simply blank.
-/// Stop reasons arrive mapped to Kiro's vocabulary.
+/// What a request whose every attempt ended empty is told: the input the upstream read is
+/// billed once.
+pub(crate) const EMPTY_ANSWER_BILLED: &str =
+    "上游模型每次都返回了空回答，已按它读取的输入计费一次。请重新发送，或换一个模型。";
+
+/// What to show when a turn ends without an answer, neither text nor a tool call, so it is
+/// not simply blank. Stop reasons arrive mapped to Kiro's vocabulary. A content filter has
+/// none: Kiro shows its own refusal for `content_filtered`, and a second message beside it
+/// stayed in the conversation.
 fn empty_turn_notice(stop_reason: Option<&str>) -> Option<&'static str> {
     match stop_reason? {
         "max_tokens" => Some("（模型在给出可见回答前已达到输出上限。请重试，或缩短本次请求。）"),
-        "content_filtered" => Some("（上游模型未返回内容：本次请求被其内容安全策略拦截。）"),
         _ => None,
     }
 }
 
+/// Whether a stop reason, in Kiro's vocabulary, makes a response with no output final: the
+/// output limit, or a content filter.
+fn ends_empty_turn(stop_reason: &str) -> bool {
+    matches!(stop_reason, "max_tokens" | "content_filtered")
+}
+
 /// Whether a provider stop reason makes an empty response final: it was reported in full,
-/// so it is billed and explained rather than retried. `retry.rs` and the stream agree on
-/// this through here.
+/// so it is billed rather than retried. `retry.rs` and the stream agree on this through
+/// here.
 pub(crate) fn is_explicit_empty_stop(raw_reason: &str) -> bool {
-    empty_turn_notice(Some(&StreamTranslationState::map_stop_reason(raw_reason))).is_some()
+    ends_empty_turn(&StreamTranslationState::map_stop_reason(raw_reason))
 }
 
 /// Whether a usage report counts the input. A present-but-zero cache field does not: the
@@ -967,13 +1136,17 @@ pub(crate) fn safe_provider_error(error: &ProviderError) -> String {
         ProviderError::Http(status, _) => format!("upstream HTTP status {}", status.as_u16()),
         ProviderError::Network(_) => "upstream network error".to_string(),
         ProviderError::Timeout => "upstream request timed out".to_string(),
+        ProviderError::NoAnswer => "upstream did not answer".to_string(),
         ProviderError::StreamDisconnected => "upstream stream disconnected".to_string(),
         ProviderError::Parse(_) => "upstream response parse error".to_string(),
-        ProviderError::Service => "upstream reported a service error".to_string(),
+        ProviderError::Unavailable => "upstream reported a temporary failure".to_string(),
         ProviderError::Serialization(_) => "upstream request serialization error".to_string(),
         ProviderError::Watchdog(_) => "upstream watchdog timeout".to_string(),
         ProviderError::EmptyCompletion => {
             "upstream completed without producing any output".to_string()
+        }
+        ProviderError::ThinkingNeedsOutput { .. } => {
+            "the model's output limit leaves no room for thinking".to_string()
         }
     }
 }

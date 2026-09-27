@@ -144,8 +144,9 @@ fn independent_system_prompt_survives_translation() {
     value["systemPrompt"] = json!("Use the supplied workspace instructions.");
     let request = translated(value, "model");
     assert_eq!(request.messages[0].role, "system");
+    // A one-shot writes no prompt cache, so the system prompt goes as plain text.
     assert_eq!(
-        AnthropicProvider.translate_request(&request).unwrap()["system"][0]["text"],
+        AnthropicProvider.translate_request(&request).unwrap()["system"],
         "Use the supplied workspace instructions."
     );
     assert_eq!(

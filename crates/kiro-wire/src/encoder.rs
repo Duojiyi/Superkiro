@@ -139,7 +139,24 @@ pub fn encode_event<T: Serialize>(
 
 /// Encode an exception into an event-stream frame.
 pub fn encode_exception(exception_type: &str, message: &str) -> Vec<u8> {
-    let payload_obj = serde_json::json!({ "message": message });
+    encode_exception_with(exception_type, message, None, None)
+}
+
+/// An exception frame carrying the `reason` and retry hint an error response would: Kiro
+/// builds the same ValidationException or ThrottlingException from either.
+pub fn encode_exception_with(
+    exception_type: &str,
+    message: &str,
+    reason: Option<&str>,
+    retry_after_ms: Option<u64>,
+) -> Vec<u8> {
+    let mut payload_obj = serde_json::json!({ "message": message });
+    if let Some(reason) = reason {
+        payload_obj["reason"] = serde_json::json!(reason);
+    }
+    if let Some(retry_after_ms) = retry_after_ms {
+        payload_obj["retryAfterMilliseconds"] = serde_json::json!(retry_after_ms);
+    }
     let payload_bytes = serde_json::to_vec(&payload_obj).unwrap_or_default();
 
     let mut headers = Headers::new();

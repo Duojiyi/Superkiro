@@ -8,7 +8,9 @@
 //! - Chronological orphan tool pairing repair without future foresight.
 //! - Preservation of tool call names, arguments, and execution statuses in history.
 
-use super::images::{inspect_image, shrink_image, Inspection, Omission, PreparedImage};
+use super::images::{
+    image_key, inspect_image, shrink_image_keyed, Inspection, Omission, PreparedImage,
+};
 use super::tools::{
     process_tools_for_provider, repair_orphan_tool_pairs, ConversationMessage, ToolRegistry,
 };
@@ -81,8 +83,8 @@ impl PreparedImages {
     }
 }
 
-/// Every image of the request, oldest first.
-fn images_in_order(req: &GenerateAssistantResponseRequest) -> Vec<(Turn, &KiroImage)> {
+/// Every image of the request, oldest first, with its place in its message.
+fn images_in_order(req: &GenerateAssistantResponseRequest) -> Vec<(Turn, usize, &KiroImage)> {
     let history = req
         .conversation_state
         .history
@@ -98,26 +100,115 @@ fn images_in_order(req: &GenerateAssistantResponseRequest) -> Vec<(Turn, &KiroIm
     ));
     history
         .chain(current)
-        .flat_map(|(turn, input)| input.images.iter().map(move |image| (turn, image)))
+        .flat_map(|(turn, input)| {
+            input
+                .images
+                .iter()
+                .enumerate()
+                .map(move |(place, image)| (turn, place, image))
+        })
         .collect()
+}
+
+/// How long an image left out as busy stays out on its conversation's later steps, from
+/// the last step that sent its message: each step then sends what the step before sent.
+/// Shown on the next step, it rewrote the prompt a provider had cached from its message
+/// on; a conversation resting this long finds that cache expired anyway, and the image is
+/// shown then.
+const BUSY_KEPT_FOR: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// At most this many images are kept out as busy at once.
+const BUSY_PLACES: usize = 4_096;
+
+/// An image by its conversation, the message it is in (its place in the history, which the
+/// current message takes next), its place in that message, and its bytes.
+type BusyPlace = (String, usize, usize, [u8; 32]);
+
+fn busy_places(
+) -> &'static std::sync::Mutex<std::collections::HashMap<BusyPlace, tokio::time::Instant>> {
+    static PLACES: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<BusyPlace, tokio::time::Instant>>,
+    > = std::sync::LazyLock::new(Default::default);
+    &PLACES
+}
+
+/// Whether the image at `place` was left out as busy on a recent step; if so it stays out
+/// for another [`BUSY_KEPT_FOR`].
+fn still_busy(place: &BusyPlace, now: tokio::time::Instant) -> bool {
+    let Ok(mut places) = busy_places().lock() else {
+        return false;
+    };
+    match places.get_mut(place) {
+        Some(until) if *until > now => {
+            *until = now + BUSY_KEPT_FOR;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn keep_busy(place: BusyPlace, now: tokio::time::Instant) {
+    let Ok(mut places) = busy_places().lock() else {
+        return;
+    };
+    places.retain(|_, until| *until > now);
+    if places.len() >= BUSY_PLACES {
+        if let Some(soonest) = places
+            .iter()
+            .min_by_key(|(_, until)| **until)
+            .map(|(place, _)| place.clone())
+        {
+            places.remove(&soonest);
+        }
+    }
+    places.insert(place, now + BUSY_KEPT_FOR);
+}
+
+/// How many images a request carries, in its history and its current message.
+pub fn image_count(req: &GenerateAssistantResponseRequest) -> usize {
+    images_in_order(req).len()
+}
+
+/// Of `total` images, oldest first, how many a request for a vision model sends as notes
+/// instead. It sends at most the most recent `max_images`, and past that leaves out the
+/// oldest half of them at once: the prompt a provider cached changes where the first image
+/// becomes a note, and one image at a time that was on every new image.
+pub fn images_left_as_notes(total: usize, max_images: usize) -> usize {
+    if total <= max_images {
+        return 0;
+    }
+    let block = (max_images / 2).max(1);
+    (total - max_images).div_ceil(block) * block
+}
+
+/// The tokens of the note a vision model reads in place of an image left out for its age.
+pub fn older_image_note_tokens() -> u64 {
+    crate::usage_estimate::tokens_from_units(crate::usage_estimate::token_units(&omission_note(
+        1,
+        Omission::OverCount,
+    )))
 }
 
 /// Decide how each image of a request for a vision model reaches the provider.
 ///
-/// Only the most recent `max_images` go as images: a conversation resends every earlier
-/// image on every turn, and older ones become notes without being read at all. Of those
-/// kept, images too large to forward are shrunk under the process-wide decode limit,
-/// newest first, and any not done within `budget` become notes for this turn.
+/// Only the most recent images go as images (see [`images_left_as_notes`]): a
+/// conversation resends every earlier image on every turn, and older ones become notes
+/// without being read at all. Of those kept, images too large to forward are shrunk under
+/// the process-wide decode limit, newest first, and any not done within `budget` become
+/// notes, on this step and on the conversation's next ones while it keeps going.
 pub async fn prepare_images(
     req: &GenerateAssistantResponseRequest,
     max_images: usize,
     budget: std::time::Duration,
 ) -> PreparedImages {
     let images = images_in_order(req);
-    let keep_from = images.len().saturating_sub(max_images);
+    let keep_from = images_left_as_notes(images.len(), max_images);
+    let conversation = &req.conversation_state.conversation_id;
+    let history_len = req.conversation_state.history.len();
+    let now = tokio::time::Instant::now();
     let mut decided = Vec::with_capacity(images.len());
     let mut to_shrink = Vec::new();
-    for (position, (_, image)) in images.iter().enumerate() {
+    for (position, (turn, place, image)) in images.iter().enumerate() {
         if position < keep_from {
             decided.push(PreparedImage::Omitted(Omission::OverCount));
             continue;
@@ -126,20 +217,31 @@ pub async fn prepare_images(
             Inspection::Ready(prepared) => decided.push(prepared),
             Inspection::NeedsShrink(raw_bytes) => {
                 decided.push(PreparedImage::Omitted(Omission::Busy));
-                to_shrink.push((position, raw_bytes));
+                let message = match turn {
+                    Turn::History(message) => *message,
+                    Turn::Current => history_len,
+                };
+                let key = image_key(&raw_bytes);
+                let busy_place = (conversation.clone(), message, *place, key);
+                if !still_busy(&busy_place, now) {
+                    to_shrink.push((position, raw_bytes, key, busy_place));
+                }
             }
         }
     }
-    let deadline = tokio::time::Instant::now() + budget;
-    for (position, raw_bytes) in to_shrink.into_iter().rev() {
-        decided[position] = shrink_image(raw_bytes, deadline).await;
+    let deadline = now + budget;
+    for (position, raw_bytes, key, busy_place) in to_shrink.into_iter().rev() {
+        decided[position] = shrink_image_keyed(raw_bytes, key, deadline).await;
+        if decided[position] == PreparedImage::Omitted(Omission::Busy) {
+            keep_busy(busy_place, tokio::time::Instant::now());
+        }
     }
 
     let mut prepared = PreparedImages {
         history: vec![Vec::new(); req.conversation_state.history.len()],
         current: Vec::new(),
     };
-    for ((turn, _), image) in images.into_iter().zip(decided) {
+    for ((turn, _, _), image) in images.into_iter().zip(decided) {
         match turn {
             Turn::History(position) => prepared.history[position].push(image),
             Turn::Current => prepared.current.push(image),
