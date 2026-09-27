@@ -40,13 +40,14 @@ for (const [fields, field] of [[{id: 'Trial'}, 'id'], [{id: 'trial_7d'}, 'id'], 
   [{name: ' '}, 'name'], [{name: '体验卡'.repeat(4)}, 'name'], [{name: 'line\nbreak'}, 'name'],
   [{points: '0'}, 'points'], [{points: '10000001'}, 'points'], [{points: '1.5'}, 'points'],
   [{price: '-0.01'}, 'price'], [{price: '100000.01'}, 'price'], [{price: '9.999'}, 'price'], [{price: ''}, 'price'],
-  [{validityDays: '0'}, 'validityDays'], [{validityDays: '3651'}, 'validityDays'], [{maxDevices: '0'}, 'maxDevices'], [{maxDevices: '11'}, 'maxDevices'],
+  [{validityDays: '0'}, 'validityDays'], [{validityDays: '3651'}, 'validityDays'], [{maxDevices: '0'}, 'maxDevices'], [{maxDevices: '2'}, 'maxDevices'], [{maxDevices: '11'}, 'maxDevices'],
   [{concurrency: '0'}, 'concurrency'], [{concurrency: '21'}, 'concurrency'], [{defaultGroupId: 'ghost'}, 'defaultGroupId'], [{kiroPlanType: 'PRO_ULTRA'}, 'kiroPlanType'],
   [{sortOrder: '1.5'}, 'sortOrder'], [{sortOrder: '2147483648'}, 'sortOrder']])
   assert(errorOf(fields)[field], `${JSON.stringify(fields)} is refused on ${field}`);
 assert.equal(errorOf({}, {groupIds: ['basic'], takenIds: ['trial-7d']}).id, '已经有这个 ID 的套餐');
 // At the bounds.
-assert.deepEqual(errorOf({id: 'f'.repeat(64), name: 'x'.repeat(32), points: '10000000', price: '100000', validityDays: '3650', maxDevices: '10', concurrency: '20', sortOrder: '-5'}), {});
+assert.deepEqual(errorOf({id: 'f'.repeat(64), name: 'x'.repeat(32), points: '10000000', price: '100000', validityDays: '3650', maxDevices: '1', concurrency: '20', sortOrder: '-5'}), {});
+assert.equal(errorOf({maxDevices: '3'}).maxDevices, '每张卡只绑定 1 台设备：设备数只能是 1', 'a plan is for one device, as a card binds one');
 assert.deepEqual(errorOf({points: '1', price: '0', validityDays: '1'}), {});
 console.log('PASS: every field is held to the server\'s bounds (ID, 32-byte name, points, price to the fen, days, devices, concurrency, group, Kiro type, order), a taken ID too');
 
@@ -68,6 +69,7 @@ assert.equal(words('Invalid billing state: At most 100 plans'), '最多只能有
 assert.equal(words('plan is not on sale'), '这个套餐已下架，不能再发卡：在“套餐”里重新上架，或换一个套餐');
 assert.equal(words('cards have one device; issue from a plan with max_devices 1'), '每张卡只能绑定 1 台设备：请换一个设备数为 1 的套餐');
 assert.equal(words('unknown plan'), '这个套餐不存在（可能刚被删除），请刷新');
+assert.equal(words('Invalid billing state: Plans allow exactly 1 device, as cards bind one: family-3'), '每张卡只绑定 1 台设备，套餐的设备数只能是 1：family-3');
 for (const text of ['Plan IDs are 1-64 of a-z, 0-9 and -', 'Plan names are 1-32 bytes', 'Plan points must be 1-10000000', 'Plan validity must be 1-3650 days', 'Plans allow 1-10 devices',
   'Plan concurrency must be 1-20', 'Plan Kiro types are PRO, PRO_PLUS, PRO_MAX, POWER or CUSTOM', 'Duplicate plan', 'planId and templateId name different plans',
   "issuance requires an enabled group, the plan's credits, and maxDevices=1"]) assert.notEqual(words(`Invalid billing state: ${text}: x`), `Invalid billing state: ${text}: x`, text);

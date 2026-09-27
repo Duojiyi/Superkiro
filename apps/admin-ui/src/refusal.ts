@@ -44,6 +44,7 @@ const REFUSALS: Array<[RegExp, (ids: string) => string]> = [
   [/Plan points must be 1-10000000/i, ids => `套餐积分要在 1–10,000,000 之间${ids ? `：${ids}` : ''}`],
   [/Plan prices must be 0-100000 yuan, to the fen/i, ids => `套餐售价要在 0–100,000 元之间，精确到分${ids ? `：${ids}` : ''}`],
   [/Plan validity must be 1-3650 days/i, ids => `套餐有效期要在 1–3650 天之间${ids ? `：${ids}` : ''}`],
+  [/Plans allow exactly 1 device, as cards bind one/i, ids => `每张卡只绑定 1 台设备，套餐的设备数只能是 1${ids ? `：${ids}` : ''}`],
   [/Plans allow 1-10 devices/i, ids => `套餐设备数要在 1–10 台之间${ids ? `：${ids}` : ''}`],
   [/Plan concurrency must be 1-20/i, ids => `套餐并发要在 1–20 之间${ids ? `：${ids}` : ''}`],
   [/Plan Kiro types are PRO, PRO_PLUS, PRO_MAX, POWER or CUSTOM/i, ids => `Kiro 显示的档位只能是 PRO、PRO_PLUS、PRO_MAX、POWER 或 CUSTOM${ids ? `：${ids}` : ''}`],

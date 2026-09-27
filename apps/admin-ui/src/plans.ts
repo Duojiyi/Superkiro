@@ -13,7 +13,9 @@ export const MAX_PLANS = 100;
 /** A plan publication whose result was not confirmed: editing waits until the list is checked. */
 export const PLAN_CHANGE_KEY = 'admin-pending-plan-change:v1';
 /** A card binds one device: the server issues no card from a plan of more. */
-export const MULTI_DEVICE_NOTE = '每张卡只能绑定 1 台设备：设备数大于 1 的套餐可以保存，但还不能发卡';
+export const MULTI_DEVICE_NOTE = '每张卡只能绑定 1 台设备：这个套餐的设备数大于 1（之前保存的），不能发卡，改成 1 台后才能发卡';
+/** What the server takes for a plan's devices: exactly one, as a card binds one. */
+export const ONE_DEVICE = '每张卡只绑定 1 台设备：设备数只能是 1';
 
 // The tiers cards were issued from before the catalog (template.rs PLAN_PRICES and seed_plans).
 const TIERS: Array<[string, string, number, number, string, number]> = [
@@ -64,7 +66,7 @@ const whole = (text: string, min: number, max: number) => /^-?\d+$/.test(text.tr
 /**
  * The plan the fields describe, or what is wrong with each, by the server's bounds: ID 1–64 of
  * a-z, 0-9 and - (a new one not already taken), name 1–32 bytes, 1–10,000,000 points, 0–100,000
- * yuan to the fen, 1–3650 days, 1–10 devices, 1–20 at once, a group the configuration has.
+ * yuan to the fen, 1–3650 days, one device (a card binds one), 1–20 at once, a group the configuration has.
  */
 export function parsePlan(draft: PlanDraft, {groupIds, takenIds = []}: {groupIds: string[]; takenIds?: string[]}):
   {plan: Plan; errors?: undefined} | {plan?: undefined; errors: Partial<Record<keyof PlanDraft, string>>} {
@@ -76,7 +78,7 @@ export function parsePlan(draft: PlanDraft, {groupIds, takenIds = []}: {groupIds
   if (!whole(draft.points, 1, 10_000_000)) errors.points = '1–10,000,000 的整数';
   if (!/^\d+(\.\d{1,2})?$/.test(price) || Number(price) > 100_000) errors.price = '0–100,000 元，最多两位小数';
   if (!whole(draft.validityDays, 1, 3650)) errors.validityDays = '1–3650 的整数';
-  if (!whole(draft.maxDevices, 1, 10)) errors.maxDevices = '1–10 的整数';
+  if (!whole(draft.maxDevices, 1, 1)) errors.maxDevices = ONE_DEVICE;
   if (!whole(draft.concurrency, 1, 20)) errors.concurrency = '1–20 的整数';
   if (!groupIds.includes(draft.defaultGroupId)) errors.defaultGroupId = '请选择分组';
   if (!(KIRO_PLAN_TYPES as readonly string[]).includes(draft.kiroPlanType)) errors.kiroPlanType = '请选择';

@@ -9,7 +9,7 @@ import {Modal} from '../components/modal';
 import {toast} from '../components/toast';
 import {StatusBadge, TableState, TopbarActions} from '../components/ui';
 import {formatCount, formatMoney} from '../format';
-import {customerView, draftOf, KIRO_PLAN_TYPES, kiroLabel, MAX_PLANS, MULTI_DEVICE_NOTE, newDraft, parsePlan, PLAN_CHANGE_KEY, planChanges, priceMicro, type PlanDraft} from '../plans';
+import {customerView, draftOf, KIRO_PLAN_TYPES, kiroLabel, MAX_PLANS, MULTI_DEVICE_NOTE, newDraft, ONE_DEVICE, parsePlan, PLAN_CHANGE_KEY, planChanges, priceMicro, type PlanDraft} from '../plans';
 import {publishFailure} from '../refusal';
 import type {Refresh, ReportError, Row, WriteGuards} from '../types';
 
@@ -184,7 +184,7 @@ export default function PlansPage({plans, editable, cardsByPlan, groups, revisio
           {!plans.length && <TableState colSpan={12} loading={loading} failed={failed} empty="还没有套餐" onRetry={() => void refresh()}/>}
         </tbody>
       </table></div>
-      <p className="muted plans-note">{MULTI_DEVICE_NOTE}（服务器会拒绝）。下架的套餐不能再发卡，已发出的卡照常使用；发过卡的套餐不能删除。</p>
+      <p className="muted plans-note">{ONE_DEVICE}。下架的套餐不能再发卡，已发出的卡照常使用；发过卡的套餐不能删除。</p>
     </section>
 
     {editing && <Modal label={editing.original ? '编辑套餐' : '新建套餐'} onClose={() => setEditing(null)} busy={busy} className="dialog-form plan-editor">
@@ -197,7 +197,7 @@ export default function PlansPage({plans, editable, cardsByPlan, groups, revisio
         {field('points', '积分', numberInput('points', '套餐积分'))}
         {field('price', '售价（元）', numberInput('price', '套餐售价', {inputMode: 'decimal'}), '财务对账按这个价格计算销售额')}
         {field('validityDays', '有效期（天）', numberInput('validityDays', '有效期天数'), '从激活起算')}
-        {field('maxDevices', '设备数', numberInput('maxDevices', '设备数'), Number(editing.draft.maxDevices) > 1 ? MULTI_DEVICE_NOTE : undefined)}
+        {field('maxDevices', '设备数', numberInput('maxDevices', '设备数'))}
         {field('concurrency', '并发', numberInput('concurrency', '并发请求数'), '同时进行的请求数')}
         {field('defaultGroupId', '默认分组', <select aria-label="默认分组" aria-invalid={!!errors.defaultGroupId} value={editing.draft.defaultGroupId} disabled={busy} onChange={event => set('defaultGroupId', event.target.value)}>
           <option value="" disabled>请选择分组</option>

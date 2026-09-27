@@ -73,22 +73,26 @@ const server=http.createServer(async(req,res)=>{
     assert.equal(await table.locator('tbody .cell-strong').first().innerText(),'体验卡','sort order 5 comes first');
     console.log('PASS: 新建套餐 checks each field as the server does, shows what the customer will see, and publishes the plan with the revision and a reason');
 
-    // A refusal is said in words and the form stays; a plan of three devices is kept, marked as not issuable yet.
+    // A plan is for one device (a card binds one): three are refused before sending. A refusal is said in words and the form stays.
     let refuseNext=true;
     await page.route('**/api/v1/admin/commercial-config',route=>{if(route.request().method()!=='POST'||!refuseNext)return route.fallback();refuseNext=false;
       return route.fulfill({status:409,json:{success:false,error:'Invalid billing state: Unknown default group of plan: family-3'}});});
     await button('＋ 新建套餐').click();await editor.waitFor();
     await fill('套餐 ID','family-3');await fill('套餐名称','家庭');await fill('套餐积分','6000');await fill('套餐售价','120');await fill('设备数','3');
-    await editor.getByText('每张卡只能绑定 1 台设备：设备数大于 1 的套餐可以保存，但还不能发卡',{exact:true}).waitFor();
-    await fill('变更原因','家庭三台设备');
-    await editor.getByRole('button',{name:'发布',exact:true}).click();box=await confirmBox();
-    assert((await words(box)).includes('每张卡只能绑定 1 台设备'));await accept(box);
+    await fill('变更原因','家庭套餐');
+    await editor.getByRole('button',{name:'发布',exact:true}).click();await editor.getByRole('alert').getByText('请先改正标出的项',{exact:true}).waitFor();
+    await editor.getByText('每张卡只绑定 1 台设备：设备数只能是 1',{exact:true}).waitFor();
+    assert.equal(published().filter(post=>post.body.plans?.some(plan=>plan.id==='family-3')).length,0,'nothing sent');
+    await fill('设备数','1');
+    await editor.getByRole('button',{name:'发布',exact:true}).click();box=await confirmBox();await accept(box);
     await editor.getByRole('alert').getByText('服务器拒绝了这次发布：套餐的默认分组不存在（可能刚被改动），请刷新后重选：family-3',{exact:true}).waitFor();
     assert.equal(await editor.getByLabel('套餐 ID',{exact:true}).inputValue(),'family-3','the form is kept');
     await editor.getByRole('button',{name:'发布',exact:true}).click();await accept(await confirmBox());await editor.waitFor({state:'detached'});
-    await row('家庭').waitFor();
-    assert.equal((await cells('家庭'))[4],'3 台暂不能发卡');
-    console.log('PASS: a refusal is said in words with the form kept; a plan of three devices is published and marked 暂不能发卡');
+    await row('家庭').waitFor();assert.equal((await cells('家庭'))[4],'1 台');
+    // A plan stored for three devices before that bound is kept, marked, and not issued from.
+    fixture.config.plans.find(plan=>plan.id==='family-3').max_devices=3;await button('刷新').click();
+    await row('家庭').getByText('暂不能发卡',{exact:true}).waitFor();assert.equal((await cells('家庭'))[4],'3 台暂不能发卡');
+    console.log('PASS: a plan of three devices is refused before sending; a refusal is said in words with the form kept; a plan stored for three devices is marked 暂不能发卡');
 
     // 下架: a reason is asked; the plan stays, off sale.
     await row('PRO').getByRole('button',{name:'下架',exact:true}).click();box=await confirmBox();

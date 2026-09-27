@@ -279,7 +279,7 @@ module.exports = function fixtureApi() {
     if (!whole(plan.points, 1, 10000000)) return 'Plan points must be 1-10000000';
     if (typeof plan.price_cny !== 'number' || !(plan.price_cny >= 0 && plan.price_cny <= 100000) || Math.abs(Math.round(fen) - fen) > 1e-6) return 'Plan prices must be 0-100000 yuan, to the fen';
     if (!whole(plan.validity_days, 1, 3650)) return 'Plan validity must be 1-3650 days';
-    if (!whole(plan.max_devices, 1, 10)) return 'Plans allow 1-10 devices';
+    if (plan.max_devices !== 1) return 'Plans allow exactly 1 device, as cards bind one';
     if (!whole(plan.concurrency, 1, 20)) return 'Plan concurrency must be 1-20';
     if (!['PRO', 'PRO_PLUS', 'PRO_MAX', 'POWER', 'CUSTOM'].includes(plan.kiro_plan_type)) return 'Plan Kiro types are PRO, PRO_PLUS, PRO_MAX, POWER or CUSTOM';
     return null;
