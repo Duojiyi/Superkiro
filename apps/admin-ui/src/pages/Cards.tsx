@@ -14,6 +14,7 @@ import {cardCodeOf, cardIdForCode} from '../cardCode';
 import {adjustmentPointsToMicro} from '../pricing';
 import {cardState, cardStatusView} from '../status';
 import CardDrawer from './CardDrawer';
+import {useCardSupport} from './CardSupport';
 import type {CardQuickFilter, CardTab, ErrorAction, Intent, Refresh, ReportError, ReportRoute, Row, WriteGuards} from '../types';
 
 const TIERS = [
@@ -32,10 +33,11 @@ const REASONS = ['测试卡清理', '退款', '滥用', '客户要求'];
 
 type BulkAction = 'freeze' | 'unfreeze' | 'ban' | 'void' | 'archive' | 'unarchive' | 'export';
 const VERB: Record<BulkAction, string> = {freeze: '冻结', unfreeze: '解冻', ban: '封禁', void: '永久作废', archive: '归档', unarchive: '取消归档', export: '导出明文'};
+const BAN_CONSEQUENCE = '客户马上不能使用，也不会自动退款；之后可以解封（要填原因）。';
 const BULK_CONSEQUENCE: Record<BulkAction, string> = {
   freeze: '客户将暂时无法使用，可随时解冻。',
   unfreeze: '恢复使用，仍受有效期和余额限制。',
-  ban: '封禁后不能恢复，也不会自动退款。',
+  ban: BAN_CONSEQUENCE,
   void: '不能恢复，余额作废不退款。正在使用的卡请先冻结。',
   archive: '只从列表隐藏，不改状态和余额。',
   unarchive: '重新显示在当前列表中，不会恢复使用权限。',
@@ -314,6 +316,10 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
   const blocked = bulkBusy || loading || failed || mutationBusy;
   const staleTitle = failed ? '卡密列表没有刷新成功，暂不能操作' : undefined;
   const reauthenticate: ErrorAction = {label: '重新登录', run: onReauthenticate};
+  // 解封, 解绑设备, 重置换绑次数, 延长有效期, 备注 and 换分组, from the drawer, the row menu and the selection bar.
+  const support = useCardSupport({cards, groups, groupName: id => groupName(id), guards, refresh, reportError, updateCards, blocked: blocked || revealing,
+    onShowCards: ids => {setSearch(ids[0]); setCodeLookup(null); setGroupFilter('ALL'); setStatusTab('ALL'); setQuick(null); setDetailId(ids[0]);}});
+  const supportBlocked = blocked || !!support.blockedTitle;
 
   // ---- Single-card status changes ----
   const changeStatus = async (card: AdminCardItem, action: 'freeze' | 'unfreeze' | 'ban') => {
@@ -323,7 +329,7 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
       title: `${verb}卡密 ${shortId(card.id, 'card')}？`,
       facts: [`余额 ${formatCredits(card.pointsAvailable)} / ${formatCredits(card.pointsTotal)} 积分 · ${cardStatusView(state).label}`, ...(card.note ? [`备注：${formatBatchNote(card.note)}`] : [])],
       body: action === 'ban' && state === 'active' ? <p className="confirm-hint">只想暂停？用冻结，可随时解冻。</p> : undefined,
-      consequence: {freeze: '客户将暂时无法使用，可随时解冻。', unfreeze: '恢复使用，仍受有效期和余额限制。', ban: '封禁后不能恢复，也不会自动退款。'}[action],
+      consequence: {freeze: '客户将暂时无法使用，可随时解冻。', unfreeze: '恢复使用，仍受有效期和余额限制。', ban: BAN_CONSEQUENCE}[action],
       confirmLabel: verb,
       danger: action === 'ban',
       // Irreversible: its short ID is typed first; of a shortened one, the end after the ….
@@ -685,6 +691,8 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
       </div>
     </section>}
 
+    {support.view}
+
     {pendingIntent && <section className="recovery-panel" aria-label="未确认调账恢复">
       <p>卡 <IdCell value={pendingIntent.cardId} kind="card"/> 有一笔调账结果未确认</p>
       <button type="button" className="btn btn-small" disabled={bulkBusy || mutationBusy || loading} onClick={reviewPending}>核对</button>
@@ -729,6 +737,8 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
         <button type="button" className="btn btn-small" disabled={bulkDisabled} onClick={() => void runBulk('freeze')}>冻结</button>
         <button type="button" className="btn btn-small" disabled={bulkDisabled} onClick={() => void runBulk('unfreeze')}>解冻</button>
         <button type="button" className="btn btn-small" disabled={bulkDisabled} onClick={() => void runBulk('export')}>导出明文</button>
+        <button type="button" className="btn btn-small" disabled={bulkDisabled || !!support.blockedTitle} title={support.blockedTitle}
+          onClick={() => support.extend(allFiltered ? [...filtered] : pageCards.filter(card => selectedIds.includes(card.id)), allFiltered)}>延长有效期</button>
         <Menu label="更多批量操作" className="btn btn-small" disabled={bulkDisabled} items={[
           {label: '归档', onSelect: () => void runBulk('archive')},
           {label: '取消归档', onSelect: () => void runBulk('unarchive')},
@@ -763,6 +773,7 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
             const menuItems: MenuItem[] = [
               ...(state === 'active' ? [{label: '冻结', onSelect: () => void changeStatus(card, 'freeze')}] : []),
               ...(state === 'frozen' ? [{label: '解冻', onSelect: () => void changeStatus(card, 'unfreeze')}] : []),
+              ...(card.status === 'banned' && card.archivedAt == null ? [{label: '解封', disabled: supportBlocked, title: support.blockedTitle, onSelect: () => support.unban(card)}] : []),
               ...(!['banned', 'voided'].includes(state) ? [{label: '封禁', danger: true, onSelect: () => void changeStatus(card, 'ban')}] : []),
             ];
             return <tr key={card.id} className={`is-clickable${selected ? ' is-selected' : ''}${card.id === detailId ? ' is-open' : ''}`} onClick={event => openDetail(event, card)}>
@@ -862,7 +873,7 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
     {detailCard && <CardDrawer card={detailCard} state={cardState(detailCard, nowSecs)} groupName={id => groupName(id)} hasPrev={detailIndex > 0} hasNext={detailIndex >= 0 && detailIndex < filtered.length - 1}
       onMove={moveDetail} onClose={() => setDetailId(null)} onReveal={card => void reveal(card)} onAdjust={openAdjust}
       onStatus={(card, action) => void changeStatus(card, action)} onOpenTrace={onOpenTrace}
-      revealDisabled={revealing || bulkBusy} blocked={blocked} blockedTitle={staleTitle}/>}
+      revealDisabled={revealing || bulkBusy} blocked={blocked} blockedTitle={staleTitle} support={support}/>}
 
     {adjustCard && <Modal label="卡密调账" onClose={closeAdjust} busy={mutationBusy} className="dialog-form">
       <h3 className="modal-title">调整积分 · <span className="mono">{shortId(adjustCard.id, 'card')}</span></h3>

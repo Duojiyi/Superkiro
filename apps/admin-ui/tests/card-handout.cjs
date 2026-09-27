@@ -62,7 +62,7 @@ fixture.cards.push({id:LONG,codeRecoverable:true,status:'active',creditTotal:100
     await menu(LONG);await page.getByRole('menuitem',{name:'封禁',exact:true}).click();
     let box=page.getByRole('alertdialog');await box.waitFor();
     const text=await box.innerText();
-    for(const part of ['封禁卡密 card-74f4…bdeb？','只想暂停？用冻结，可随时解冻。','封禁后不能恢复，也不会自动退款。'])assert(text.includes(part),`ban confirmation mentions ${part}: ${text}`);
+    for(const part of ['封禁卡密 card-74f4…bdeb？','只想暂停？用冻结，可随时解冻。','客户马上不能使用，也不会自动退款；之后可以解封（要填原因）。'])assert(text.includes(part),`ban confirmation mentions ${part}: ${text}`);
     assert.equal(await box.locator('.field-label b').innerText(),'bdeb');
     const accept=box.locator('[data-confirm="accept"]');
     assert(await accept.isDisabled());await box.getByLabel('确认输入').fill('74f4');assert(await accept.isDisabled(),'the wrong part of the ID keeps it disabled');

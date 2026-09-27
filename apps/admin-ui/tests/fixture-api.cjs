@@ -12,7 +12,17 @@ module.exports = function fixtureApi() {
   models.push(entry({id: 'fixture-model-3', exposed_model_id: 'gpt-6-astra', target_provider_id: 'fixture-openai', target_model: 'gpt-6-astra', group_id: groups[0].id, context_window: 272000, max_output: 128000, credit_multiplier: 1, visible: true, supports_tools: true, supports_vision: true, supports_reasoning: true, sort_order: 1}));
   // Card dates follow the clock (activated a day ago, 29 days left), so no card runs out as the calendar moves on.
   const realNow = Math.floor(Date.now() / 1000);
-  const cards = ['active', 'unactivated', 'frozen', 'banned', 'expired', 'active'].map((status, i) => ({id: `fixture-card-${i}`, codeRecoverable: i !== 1, status, creditTotal: 2000000000, creditUsed: i*100000000, availableCredits: 2000000000-i*100000000, pointsTotal: 2000, pointsAvailable: 2000-i*100, boundDevices: status === 'unactivated' ? [] : [`fixture-device-${i}`], maxDevices: 1, activatedAt: realNow-86400, validUntil: realNow+2592000-86400, groupId: groups[i%4].id, note: '本地视觉测试数据'}));
+  const cards = ['active', 'unactivated', 'frozen', 'banned', 'expired', 'active'].map((status, i) => ({id: `fixture-card-${i}`, codeRecoverable: i !== 1, status, creditTotal: 2000000000, creditUsed: i*100000000, availableCredits: 2000000000-i*100000000, pointsTotal: 2000, pointsAvailable: 2000-i*100, boundDevices: status === 'unactivated' ? [] : [`fixture-device-${i}`], maxDevices: 1, activatedAt: realNow-86400, validUntil: realNow+2592000-86400, groupId: groups[i%4].id, note: '本地视觉测试数据', rebindsUsed: 0, maxRebinds: 5}));
+  // A card as the server's card views show it: its status as the customer meets it (an active card
+  // past its date is expired), its rebind allowance, and for a card not yet activated its validity.
+  const view = card => {
+    const t = Math.floor(Date.now() / 1000);
+    return {...card, effectiveStatus: card.status === 'active' && card.validUntil != null && t >= card.validUntil ? 'expired' : card.status,
+      rebindsUsed: card.rebindsUsed ?? 0, maxRebinds: card.maxRebinds ?? 5, rebindCooldownUntil: card.rebindCooldownUntil > t ? card.rebindCooldownUntil : null,
+      activationDurationSecs: card.activatedAt == null ? card.activationDurationSecs ?? 2592000 : null};
+  };
+  // What the support actions and adjustments wrote to each card's history, oldest first.
+  const log = [];
   // The saved billing state's size, as GET /stats reports it (billing's warning level and ceiling),
   // and how far back the ledger has been archived.
   const storage = {bytes: 13212876, warning: 33554432, ceiling: 268435456, archivedBefore: 0};
@@ -129,22 +139,20 @@ module.exports = function fixtureApi() {
     if(endpoint==='cards/reveal') return reply({success:true,rawCode:'FIXTURE-RECOVERED-CODE'});
     if(endpoint==='session/revoke') {authenticated=false; res.setHeader('Set-Cookie','fixture_session=; Max-Age=0; Path=/'); return reply({success:true});}
     if(endpoint==='stats') return reply({success:true,stateBytes:storage.bytes,stateWarningBytes:storage.warning,stateCeilingBytes:storage.ceiling,totalCards:cards.length,activeCards:2,unactivatedCards:1,frozenCards:1,bannedCards:1,totalCredits:12000000000,usedCredits:1500000000,remainingCredits:10500000000,totalPoints:12000,usedPoints:1500,remainingPoints:10500,activity:activity()});
-    if(endpoint==='cards') return reply({success:true,count:cards.length,cards,revision:cardRevision()});
+    if(endpoint==='cards') return reply({success:true,count:cards.length,cards:cards.map(view),revision:cardRevision()});
     // One card's history, newest first: this session's changes, then realistic older events.
     if(endpoint==='cards/history') {
       const cardId=url.searchParams.get('card_id'); const card=cards.find(c=>c.id===cardId);
       if(!card) return reply({__type:'ResourceNotFoundException',message:'没有这张卡密'},404);
       const t=Math.floor(Date.now()/1000);
-      const recent=writes.filter(w=>['cards/status','cards/adjust'].includes(w.endpoint)&&w.body.cardId===cardId).reverse().map((w,i)=>w.endpoint==='cards/adjust'
-        ?{ts:t-i,action:'adjust',credits:Math.round(w.body.deltaPoints*1e6),points:w.body.deltaPoints,operator:'admin',reason:w.body.reason??null}
-        :{ts:t-i,action:w.body.action,credits:0,points:0,operator:'admin',reason:w.body.reason??null});
+      const recent=log.filter(event=>event.cardId===cardId).reverse().map(({cardId:_,...event})=>({invocationId:null,detail:null,...event}));
       const older=[];
       if(card.status==='banned') older.push({ts:t-3600,action:'ban',credits:0,points:0,operator:'admin',reason:'滥用'});
       if(card.status==='frozen') older.push({ts:t-5400,action:'freeze',credits:0,points:0,operator:'admin',reason:'客户要求'});
       if(card.activatedAt) older.push({ts:t-7200,action:'adjust',credits:50000000,points:50,operator:'admin',reason:'补偿 9/25 上游中断'});
       if(card.activatedAt) older.push({ts:card.activatedAt,action:'activated',credits:0,points:0,operator:'system',reason:null});
       older.push({ts:(card.activatedAt??t)-86400,action:'issued',credits:card.creditTotal,points:card.pointsTotal,operator:'admin',reason:null});
-      return reply({success:true,cardId,events:[...recent,...older]});
+      return reply({success:true,cardId,card:view(card),events:[...recent,...older.map(event=>({invocationId:null,detail:null,...event}))]});
     }
     if(endpoint==='traces') {const cardId=url.searchParams.get('card_id'),limit=Number(url.searchParams.get('limit')||100);return reply({success:true,traces:traces.filter(t=>!cardId||t.card_id===cardId).slice(0,limit)});}
     if(endpoint==='traces/content') {const record=traceContent(url.searchParams.get('invocation_id'));return record?reply(record):reply({__type:'ResourceNotFoundException',message:'没有这次请求的内容（只保留 24 小时）'},404);}
@@ -198,7 +206,89 @@ module.exports = function fixtureApi() {
       generated.forEach(c=>cards.push({id:c.cardId,codeRecoverable:true,status:c.status,creditTotal:c.creditTotal,creditUsed:0,availableCredits:c.creditTotal,pointsTotal:points,pointsAvailable:points,boundDevices:[],maxDevices:1,groupId:c.groupId,note:body.note}));
       return reply({success:true,cards:generated});
     }
-    if(endpoint==='cards/status') {const card=cards.find(c=>c.id===body.cardId); assert.ok(card); card.status=body.action==='freeze'?'frozen':body.action==='unfreeze'?'active':'banned'; return reply({success:true,cardId:card.id,newStatus:card.status});}
+    // Card support, as the admin API answers: refusals are {success:false, error} in the server's words
+    // (400 malformed, 404 unknown card or device, 409 a rule refused), each change is written to the
+    // card's history with the operator and the reason, and the reply shows the card as it now is.
+    const cardFail=(status,error)=>reply({success:false,error},status);
+    const support=reason=>typeof reason==='string'&&!!reason.trim()&&Buffer.byteLength(reason.trim())<=200;
+    const record=(cardId,action,reason,extra={})=>log.push({cardId,ts:Math.floor(Date.now()/1000),action,credits:0,points:0,operator:'admin',reason:reason?.trim()||null,...extra});
+    // The action endpoints refuse fields they do not know, as the server's deny_unknown_fields does.
+    const unknownField=allowed=>Object.keys(body).find(key=>!allowed.includes(key));
+    if(endpoint==='cards/status') {
+      if(body.action==='unban'&&!support(body.reason))return cardFail(400,'A reason of 1 to 200 bytes is required');
+      const card=cards.find(c=>c.id===body.cardId); if(!card)return cardFail(400,`Card ${body.cardId} not found`);
+      const debug={active:'Active',unactivated:'Unactivated',frozen:'Frozen',banned:'Banned',voided:'Voided',expired:'Expired'}[card.status];
+      if(body.action==='unban'){
+        if(card.status!=='banned')return cardFail(400,`Invalid billing state: cannot unban ${debug}`);
+        if(card.archivedAt!=null)return cardFail(400,'Invalid billing state: Archived cards must be unarchived before they are unbanned');
+        card.status=card.activatedAt!=null?'active':'unactivated';
+      } else if(body.action==='archive'||body.action==='unarchive')card.archivedAt=body.action==='archive'?Math.floor(Date.now()/1000):null;
+      else card.status=body.action==='freeze'?'frozen':body.action==='unfreeze'?'active':body.action==='void'?'voided':'banned';
+      record(card.id,body.action,body.reason);
+      return reply({success:true,cardId:card.id,newStatus:card.status,archivedAt:card.archivedAt??null,card:view(card)});
+    }
+    if(endpoint==='cards/devices/unbind') {
+      const field=unknownField(['cardId','deviceId','reason']);if(field)return cardFail(400,`Invalid request body: unknown field \`${field}\``);
+      if(!body.cardId||!String(body.deviceId??'').trim())return cardFail(400,'cardId and deviceId are required');
+      if(!support(body.reason))return cardFail(400,'A reason of 1 to 200 bytes is required');
+      const card=cards.find(c=>c.id===body.cardId);if(!card)return cardFail(404,`Card ${body.cardId} not found`);
+      if(!card.boundDevices.includes(body.deviceId))return cardFail(404,`Device ${body.deviceId} not found for card ${card.id}`);
+      card.boundDevices=card.boundDevices.filter(device=>device!==body.deviceId);
+      record(card.id,'unbind',body.reason,{detail:{deviceId:body.deviceId}});
+      return reply({success:true,card:view(card)});
+    }
+    if(endpoint==='cards/rebinds/reset') {
+      const field=unknownField(['cardId','reason']);if(field)return cardFail(400,`Invalid request body: unknown field \`${field}\``);
+      if(!support(body.reason))return cardFail(400,'A reason of 1 to 200 bytes is required');
+      const card=cards.find(c=>c.id===body.cardId);if(!card)return cardFail(404,`Card ${body.cardId} not found`);
+      const until=view(card).rebindCooldownUntil;
+      // Already as asked: nothing is written.
+      if((card.rebindsUsed??0)>0||until){record(card.id,'rebinds_reset',body.reason,{detail:{previousRebinds:card.rebindsUsed??0,previousCooldownUntil:until}});card.rebindsUsed=0;card.rebindCooldownUntil=null;}
+      return reply({success:true,card:view(card)});
+    }
+    if(endpoint==='cards/validity') {
+      const field=unknownField(['cardIds','days','validUntilSecs','reason']);if(field)return cardFail(400,`Invalid request body: unknown field \`${field}\``);
+      const ids=Array.isArray(body.cardIds)?body.cardIds:[];
+      if(!ids.length||ids.length>500)return cardFail(400,'cardIds must name 1 to 500 cards');
+      const t=Math.floor(Date.now()/1000),{days,validUntilSecs:until}=body;
+      if(days!==undefined&&until===undefined){if(!(Number.isInteger(days)&&days>=1&&days<=3650))return cardFail(400,'days must be between 1 and 3650');}
+      else if(until!==undefined&&days===undefined){if(!(Number.isInteger(until)&&until>t&&until<=t+3650*86400))return cardFail(400,'validUntilSecs must be in the future and within 3650 days');}
+      else return cardFail(400,'Give exactly one of days and validUntilSecs');
+      if(!support(body.reason))return cardFail(400,'A reason of 1 to 200 bytes is required');
+      const unique=[...new Set(ids.map(id=>String(id).trim()))],found=unique.map(id=>cards.find(c=>c.id===id));
+      const missing=unique.filter((_,i)=>!found[i]);if(missing.length)return cardFail(404,`Card ${missing.join(', ')} not found`);
+      const waiting=card=>card.activatedAt==null&&card.validUntil==null&&!['active','expired'].includes(card.status);
+      const named=(test,message)=>{const hit=found.filter(test).map(card=>card.id);return hit.length?`${message}: ${hit.join(', ')}`:null;};
+      const refusal=named(card=>card.status==='voided','Voided cards cannot be extended')??named(card=>card.archivedAt!=null,'Archived cards must be unarchived before they are extended')
+        ??named(card=>waiting(card)?card.activationDurationSecs===0:card.validUntil==null,'Cards that never expire cannot be extended')
+        ??(until!==undefined?named(waiting,'An expiry date applies only to activated cards')??named(card=>card.validUntil>until,'The new expiry is earlier than the current one of'):null);
+      if(refusal)return cardFail(409,refusal);
+      for(const card of found){
+        if(waiting(card)){card.activationDurationSecs=(card.activationDurationSecs??2592000)+days*86400;record(card.id,'extend',body.reason,{detail:{activationDurationSecs:card.activationDurationSecs}});}
+        else{card.validUntil=until??Math.max(card.validUntil,t)+days*86400;if(card.status==='expired')card.status='active';record(card.id,'extend',body.reason,{detail:{validUntil:card.validUntil}});}
+      }
+      return reply({success:true,count:found.length,cards:found.map(view)});
+    }
+    if(endpoint==='cards/note') {
+      const field=unknownField(['cardId','note']);if(field)return cardFail(400,`Invalid request body: unknown field \`${field}\``);
+      if(!String(body.cardId??'').trim())return cardFail(400,'cardId is required');
+      const note=String(body.note??'').trim();
+      if(Buffer.byteLength(note)>256||/[\x00-\x1f\x7f-\x9f]/.test(note))return cardFail(400,'note must be at most 256 bytes, without control characters');
+      const card=cards.find(c=>c.id===body.cardId);if(!card)return cardFail(404,`Card ${body.cardId} not found`);
+      if((card.note??'')!==note){if(note)card.note=note;else delete card.note;record(card.id,'note','');}
+      return reply({success:true,card:view(card)});
+    }
+    if(endpoint==='cards/group') {
+      const field=unknownField(['cardId','groupId','reason']);if(field)return cardFail(400,`Invalid request body: unknown field \`${field}\``);
+      if(!String(body.cardId??'').trim()||!String(body.groupId??'').trim())return cardFail(400,'cardId and groupId are required');
+      if(!support(body.reason))return cardFail(400,'A reason of 1 to 200 bytes is required');
+      const card=cards.find(c=>c.id===body.cardId);if(!card)return cardFail(404,`Card ${body.cardId} not found`);
+      const group=config.groups.find(g=>g.id===body.groupId);
+      if(!group)return cardFail(409,`Unknown group: ${body.groupId}`);
+      if(group.issuance_enabled===false)return cardFail(409,`Group does not take cards: ${body.groupId}`);
+      if(card.groupId!==group.id){record(card.id,'group',body.reason,{detail:{previousGroupId:card.groupId,groupId:group.id}});card.groupId=group.id;}
+      return reply({success:true,card:view(card)});
+    }
     // Archiving the ledger, as its handler answers: a receipt, and the saved size before and after.
     if(endpoint==='ledger/archive') {
       const t=Math.floor(Date.now()/1000),before=body.beforeTsSecs;

@@ -171,7 +171,7 @@ async function waitFor(ready) {
     await page.keyboard.press('Escape'); await page.getByRole('dialog', {name: '卡密调账'}).waitFor({state: 'detached'});
     await button('更多操作').first().click(); await page.getByRole('menuitem', {name: '封禁', exact: true}).click();
     const banConfirm = page.getByRole('alertdialog'); await banConfirm.waitFor();
-    assert((await banConfirm.innerText()).includes('封禁后不能恢复')); await answer(false);
+    assert((await banConfirm.innerText()).includes('之后可以解封（要填原因）')); await answer(false);
     assert.equal(fixture.writes.filter(w => w.endpoint === 'cards/status').length, 0);
     console.log('PASS: quantity validation without coercion, confirmation context, cancellation without writes, dialog focus and Escape');
 

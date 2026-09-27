@@ -120,6 +120,13 @@ export interface CardEvent {
   points: number;
   operator: string | null;
   reason: string | null;
+  /** For an adjustment: the request it makes up for (a trace's invocation_id). */
+  invocationId?: string | null;
+  /**
+   * What else the change recorded: unbind {deviceId}; rebinds_reset {previousRebinds,
+   * previousCooldownUntil}; extend {validUntil} or {activationDurationSecs}; group {previousGroupId, groupId}.
+   */
+  detail?: Record<string, unknown> | null;
 }
 
 export interface TraceContent {
@@ -180,7 +187,19 @@ export interface AdminCardItem {
   note?: string;
   /** The status as it works now (an expired card is `expired`), from servers that send it. */
   effectiveStatus?: AdminCardItem['status'];
+  /** Unbindings the customer has used of `maxRebinds`, and, while a cooldown runs, when they may unbind again (seconds). */
+  rebindsUsed?: number;
+  maxRebinds?: number;
+  rebindCooldownUntil?: number | null;
+  /** For a card not yet activated: how long it is valid from its activation (seconds). */
+  activationDurationSecs?: number | null;
 }
+
+/** What a card support action (解封, 解绑设备, 重置换绑次数, 备注, 换分组) answers: the card as it now is. */
+export interface AdminCardReply {success: boolean; card?: AdminCardItem}
+
+/** 延长有效期: by a number of days, or to a time (seconds). */
+export type ValidityChange = {days: number} | {validUntilSecs: number};
 
 export interface GeneratedCard {
   cardId: string;
@@ -203,6 +222,8 @@ export interface AdminCardStatusResponse {
   success: boolean;
   cardId: string;
   newStatus: string;
+  /** The card as it now is, from servers that send it. */
+  card?: AdminCardItem;
 }
 
 export interface AdminCardAdjustResponse {
@@ -461,15 +482,41 @@ export class AdminApiClient {
     }
   }
 
+  /** `unban` needs a reason of 1–200 bytes; the sessions the ban ended stay ended. */
   async updateCardStatus(
     cardId: string,
-    action: 'freeze' | 'unfreeze' | 'ban' | 'void' | 'archive' | 'unarchive',
+    action: 'freeze' | 'unfreeze' | 'ban' | 'unban' | 'void' | 'archive' | 'unarchive',
     reason?: string
   ): Promise<AdminCardStatusResponse> {
     return this.request('/api/v1/admin/cards/status', {
       method: 'POST',
       body: JSON.stringify({ cardId, action, reason }),
     });
+  }
+
+  /** 解绑设备: frees the device's seat and ends the card's sessions; the customer's rebind allowance is untouched. */
+  async unbindDevice(cardId: string, deviceId: string, reason: string): Promise<AdminCardReply> {
+    return this.request('/api/v1/admin/cards/devices/unbind', {method: 'POST', body: JSON.stringify({cardId, deviceId, reason})});
+  }
+
+  /** 重置换绑次数: no unbindings used, no cooldown. */
+  async resetRebinds(cardId: string, reason: string): Promise<AdminCardReply> {
+    return this.request('/api/v1/admin/cards/rebinds/reset', {method: 'POST', body: JSON.stringify({cardId, reason})});
+  }
+
+  /** 延长有效期 of 1–500 cards: all of them or none; a refusal names the cards it refuses. */
+  async extendValidity(cardIds: string[], change: ValidityChange, reason: string): Promise<{success: boolean; count?: number; cards?: AdminCardItem[]}> {
+    return this.request('/api/v1/admin/cards/validity', {method: 'POST', body: JSON.stringify({cardIds, ...change, reason})});
+  }
+
+  /** Replaces a card's note (at most 256 bytes); an empty one clears it. */
+  async setCardNote(cardId: string, note: string): Promise<AdminCardReply> {
+    return this.request('/api/v1/admin/cards/note', {method: 'POST', body: JSON.stringify({cardId, note})});
+  }
+
+  /** 换分组: into a group that takes cards; the card's sessions end, so the customer signs in again. */
+  async changeCardGroup(cardId: string, groupId: string, reason: string): Promise<AdminCardReply> {
+    return this.request('/api/v1/admin/cards/group', {method: 'POST', body: JSON.stringify({cardId, groupId, reason})});
   }
 
   async adjustBalance(
@@ -522,8 +569,8 @@ export class AdminApiClient {
     return this.request(`/api/v1/admin/traces/content?invocation_id=${encodeURIComponent(invocationId)}`);
   }
 
-  /** What happened to one card, newest first: who did it and why. */
-  async getCardHistory(cardId: string): Promise<{success: boolean; cardId: string; events: CardEvent[]}> {
+  /** What happened to one card, newest first: who did it and why; newer servers add the card as it is. */
+  async getCardHistory(cardId: string): Promise<{success: boolean; cardId: string; card?: AdminCardItem | null; events: CardEvent[]}> {
     return this.request(`/api/v1/admin/cards/history?card_id=${encodeURIComponent(cardId)}`);
   }
 

@@ -2,6 +2,7 @@
 // needs someone's attention, and each provider's health.
 import {useState, type ReactNode} from 'react';
 import {loadAdjustment} from '../adjustment';
+import {CARD_CHANGE_KEY} from '../cardSupport';
 import type {AdminActivityWindow, AdminTrace} from '../api';
 import {EstimateTag, FilterTabs, StatusBadge, TableState, TopbarActions} from '../components/ui';
 import {IconCheck, IconWarning} from '../components/icons';
@@ -147,6 +148,7 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
   }
   const stored = (key: string) => {try {return !!sessionStorage.getItem(key);} catch {return false;}};
   if (stored('admin-pending-issuance:v1')) attention.push({text: '上次批量生成的结果未确认', tone: 'danger', go: () => onNavigate('cards')});
+  if (stored(CARD_CHANGE_KEY)) attention.push({text: '上次的卡密修改结果未确认', tone: 'danger', go: () => onNavigate('cards')});
   if (stored('admin-pending-announcement:v1')) attention.push({text: '上次公告发布的结果未确认', tone: 'danger', go: () => onNavigate('announcements')});
   for (const notice of data.announcements) {
     if (!notice.enabled || !notice.expires_at || notice.expires_at <= nowSecs || notice.expires_at > nowSecs + DAY) continue;

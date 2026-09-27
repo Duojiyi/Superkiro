@@ -400,7 +400,16 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .drawer-foot {display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 10px 16px; border-top: 1px solid var(--border-subtle); background: var(--bg-surface);}
 .drawer-foot-id {margin-left: auto; font-family: var(--mono); font-size: 12px;}
 .device-list {display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 10px;}
+.device-item {display: inline-flex; align-items: center; gap: 6px;}
+/* The device allowance under the devices: 已换绑 2/5 次 · 冷却剩 5 小时 [重置换绑次数]. */
+.detail-list dd.device-block {flex-direction: column; align-items: flex-start; gap: 4px;}
+.rebind-line {display: inline-flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; font-size: 12px;}
+.note-editor {display: flex; flex-wrap: wrap; align-items: center; gap: 6px; width: 100%;}
+.note-editor input {flex: 1 1 200px; min-width: 0; height: 32px; padding: 0 8px; border: 1px solid var(--border); border-radius: 6px;}
+.note-editor .field-error {flex-basis: 100%;}
 .history-table td.num.is-negative {color: var(--danger);}
+/* What a change recorded (the device, the new expiry, the groups), under its action. */
+.history-detail {display: block; font-size: 12px; color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 220px;}
 .reason-chips {margin-top: 8px;}
 .range-line {margin: 0 0 -4px; font-size: 12px; color: var(--text-3);}
 .bulk-report.is-skipped {border-color: #e9c46a; background: var(--warning-bg); color: #7a4d00;}
@@ -433,6 +442,8 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .modal-actions {display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; margin-top: 4px;}
 .dialog-narrow {width: 480px;}
 .dialog-form {width: 520px;}
+/* A choice of a few (延长多久) keeps its own width in a dialog. */
+.modal > .segmented {align-self: flex-start;}
 .dialog-wide {width: 720px;}
 .confirm-dialog {width: 460px;}
 .confirm-facts {display: flex; flex-direction: column; gap: 4px; margin: 0; padding: 10px 12px; border-radius: 6px; background: var(--bg-muted); font-size: 13px; color: var(--text-1);}
