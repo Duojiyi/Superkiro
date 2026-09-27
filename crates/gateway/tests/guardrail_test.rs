@@ -280,7 +280,7 @@ async fn test_gateway_daily_and_monthly_quota_rejection() {
         (
             true,
             "今日积分用量已达上限",
-            "额度按 UTC 自然日计算，每天北京时间 8:00 重置",
+            "每日用量按 UTC 日统计，北京时间每天 08:00 重置",
         ),
         (
             false,
@@ -398,7 +398,7 @@ async fn test_gateway_quota_refusal_of_a_hold_larger_than_what_is_left() {
         message.contains("（按该模型的最大输出估算）：上限 0.10，已用 0.00。"),
         "{message}"
     );
-    assert!(message.contains("每天北京时间 8:00 重置"), "{message}");
+    assert!(message.contains("北京时间每天 08:00 重置"), "{message}");
     assert!(message.chars().count() <= 200, "{message}");
 }
 

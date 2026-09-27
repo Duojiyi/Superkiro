@@ -623,14 +623,18 @@ async fn verify_card(gateway: &str, card: &str) -> Result<Value, String> {
 // Dispatch only passes the host-configured gateway, never IPC input.
 async fn fetch_announcements(gateway: &str) -> Result<Value, String> {
     const MAX_BYTES: usize = 1024 * 1024;
-    let mut response = gateway_client(gateway)?
-        .get(format!(
-            "{}/api/v1/announcements",
-            gateway.trim_end_matches('/')
-        ))
-        .send()
-        .await
-        .map_err(network_error)?;
+    let mut request = gateway_client(gateway)?.get(format!(
+        "{}/api/v1/announcements",
+        gateway.trim_end_matches('/')
+    ));
+    // Signed in, the card also sees the announcements meant for its group.
+    if let Some(token) = DesktopSession::system()
+        .ok()
+        .and_then(|session| session.access_token_for(gateway))
+    {
+        request = request.bearer_auth(token);
+    }
+    let mut response = request.send().await.map_err(network_error)?;
     if response.status() != reqwest::StatusCode::OK {
         return Err(format!("Announcements HTTP {}", response.status().as_u16()));
     }

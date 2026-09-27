@@ -24,5 +24,6 @@ pub fn wildcard_price(rate_card_id: &str) -> RateCardVersion {
         per_call_credit: 0,
         margin_multiplier: 1.0,
         effective_from_secs: 0,
+        official: None,
     }
 }

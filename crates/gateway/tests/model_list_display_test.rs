@@ -33,6 +33,7 @@ fn price(model: &str, input: i64, output: i64) -> RateCardVersion {
         per_call_credit: 0,
         margin_multiplier: 1.0,
         effective_from_secs: 0,
+        official: None,
     }
 }
 
@@ -151,4 +152,75 @@ fn model_ids_read_as_names() {
     ] {
         assert_eq!(display_name(id), name, "{id}");
     }
+}
+
+/// What Kiro's registry makes of a model's effort schema: its levels from the `enum` of the
+/// first effort path it knows (`cOl`), and its default from that enum's `default`, else the
+/// first level (`Rgd`: `defaultEffortLevel ?? effortLevels[0]`).
+fn kiro_effort(listed: &Value) -> Option<(Vec<String>, String)> {
+    let schema = &listed["additionalModelRequestFieldsSchema"];
+    let effort = ["output_config", "reasoning"]
+        .iter()
+        .map(|path| &schema["properties"][path]["properties"]["effort"])
+        .find(|effort| {
+            effort["enum"]
+                .as_array()
+                .is_some_and(|levels| !levels.is_empty())
+        })?;
+    let levels: Vec<String> = effort["enum"]
+        .as_array()?
+        .iter()
+        .map(|level| level.as_str().unwrap().to_string())
+        .collect();
+    let default = effort["default"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| levels[0].clone());
+    Some((levels, default))
+}
+
+#[tokio::test]
+async fn kiro_starts_each_reasoning_model_at_the_upstream_models_own_default() {
+    let billing = engine();
+    for (order, exposed, target) in [
+        (0, "opus", "claude-opus-5-5"),
+        (1, "opus-classic", "claude-opus-4-6"),
+        (2, "sonnet", "claude-sonnet-5"),
+        (3, "codex", "gpt-5.6"),
+        (4, "plain", "claude-sonnet-5"),
+    ] {
+        let mut map = model(exposed, order, None);
+        map.target_model = target.into();
+        map.supports_reasoning = exposed != "plain";
+        billing.upsert_model_map(map);
+    }
+
+    let models = list(&billing).await;
+    let effort = |id: &str| {
+        kiro_effort(models.iter().find(|m| m["modelId"] == id).unwrap())
+            .map(|(levels, default)| (levels.join(","), default))
+    };
+    // Named after the exposed model, a list was chosen for "opus"; the target decides.
+    assert_eq!(
+        effort("opus"),
+        Some(("low,medium,high,xhigh,max".into(), "medium".into()))
+    );
+    // Opus 4.6 has no xhigh, so Kiro never offers it.
+    assert_eq!(
+        effort("opus-classic"),
+        Some(("low,medium,high,max".into(), "high".into()))
+    );
+    assert_eq!(
+        effort("sonnet"),
+        Some(("low,medium,high,xhigh,max".into(), "high".into()))
+    );
+    // OpenAI's reasoning models take at most "high".
+    assert_eq!(
+        effort("codex"),
+        Some(("low,medium,high".into(), "medium".into()))
+    );
+    assert_eq!(effort("plain"), None);
+    // The top-level field agrees with the schema for clients that read it.
+    let opus = models.iter().find(|m| m["modelId"] == "opus").unwrap();
+    assert_eq!(opus["defaultEffortLevel"], "medium");
 }
