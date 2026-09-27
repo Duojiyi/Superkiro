@@ -81,6 +81,11 @@ pub const MAX_CLIENT_INVOCATION_ID_BYTES: usize = 128;
 /// the client's invocation ID.
 pub const MAX_INVOCATION_KEY_BYTES: usize = MAX_CARD_ID_BYTES + 1 + MAX_CLIENT_INVOCATION_ID_BYTES;
 
+/// Whether `id` can be an ID of at most `max` bytes: not blank, without control characters.
+pub fn valid_id(id: &str, max: usize) -> bool {
+    !id.trim().is_empty() && id.len() <= max && !id.chars().any(char::is_control)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

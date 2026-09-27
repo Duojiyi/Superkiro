@@ -1753,7 +1753,7 @@ fn generated_invocation_id() -> String {
 /// and is copied into the saved billing state. SDKs send a UUID. Anything else is
 /// refused before it is used: an unbounded id would be stored in every snapshot.
 fn valid_invocation_id(id: &str) -> bool {
-    (1..=128).contains(&id.len())
+    (1..=billing::MAX_CLIENT_INVOCATION_ID_BYTES).contains(&id.len())
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))

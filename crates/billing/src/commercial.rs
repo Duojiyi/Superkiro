@@ -99,8 +99,19 @@ fn view(s: &BillingSnapshot) -> CommercialConfig {
     }
 }
 fn text(s: &str, max: usize) -> bool {
-    !s.trim().is_empty() && s.len() <= max && !s.chars().any(char::is_control)
+    crate::valid_id(s, max)
 }
+
+/// The most providers the settings give a 成本倍率 of their own.
+pub const MAX_PROVIDER_MULTIPLIERS: usize = 200;
+/// The most official prices the settings hold.
+pub const MAX_OFFICIAL_PRICES: usize = 200;
+/// The most routes the settings give a cost of their own.
+pub const MAX_ROUTE_COSTS: usize = 200;
+/// The largest publication body the admin API reads. The largest settings the counts above
+/// allow, every character of every name and note escaped, take under half of it, leaving
+/// the rest for the groups, models and prices a publication carries.
+pub const MAX_COMMERCIAL_UPDATE_BYTES: usize = 1024 * 1024;
 fn positive(n: f64) -> bool {
     n.is_finite() && n > 0.0 && n <= 1000.0
 }
@@ -274,19 +285,19 @@ impl BillingEngine {
                     .provider_cost_multipliers
                     .as_ref()
                     .is_some_and(|by_provider| {
-                        by_provider.len() > 200
+                        by_provider.len() > MAX_PROVIDER_MULTIPLIERS
                             || by_provider
                                 .iter()
                                 .any(|(id, m)| !text(id, 128) || !multiplier(*m))
                     })
             {
-                return Err(invalid(
-                    "Multipliers must be positive and at most 100, for at most 200 providers",
-                ));
+                return Err(invalid(&format!(
+                    "Multipliers must be positive and at most 100, for at most {MAX_PROVIDER_MULTIPLIERS} providers"
+                )));
             }
             let usd = |prices: &[f64]| prices.iter().all(|p| (0.0..=10_000.0).contains(p));
             if settings.official_prices.as_ref().is_some_and(|prices| {
-                prices.len() > 1000
+                prices.len() > MAX_OFFICIAL_PRICES
                     || prices.iter().any(|(name, price)| {
                         !text(name, 256)
                             || !usd(&price.usd_per_m())
@@ -295,12 +306,12 @@ impl BillingEngine {
                             })
                     })
             }) {
-                return Err(invalid(
-                    "Official prices: at most 1000, named in 1-256 bytes, priced 0-10000, notes of at most 256 bytes",
-                ));
+                return Err(invalid(&format!(
+                    "Official prices: at most {MAX_OFFICIAL_PRICES}, named in 1-256 bytes, priced 0-10000, notes of at most 256 bytes"
+                )));
             }
             if settings.route_costs.as_ref().is_some_and(|routes| {
-                routes.len() > 1000
+                routes.len() > MAX_ROUTE_COSTS
                     || routes.iter().any(|(route, cost)| {
                         !text(route, 256)
                             || !route.split_once('/').is_some_and(|(provider, model)| {
@@ -310,9 +321,9 @@ impl BillingEngine {
                             || cost.basis_usd_per_m.is_some_and(|basis| !usd(&basis))
                     })
             }) {
-                return Err(invalid(
-                    "Route costs: at most 1000, named <provider>/<upstream model> in at most 256 bytes, multipliers positive and at most 100, prices 0-10000",
-                ));
+                return Err(invalid(&format!(
+                    "Route costs: at most {MAX_ROUTE_COSTS}, named <provider>/<upstream model> in at most 256 bytes, multipliers positive and at most 100, prices 0-10000"
+                )));
             }
             // An official price's time is when its prices last changed.
             for (name, price) in settings.official_prices.iter_mut().flatten() {
@@ -339,7 +350,7 @@ impl BillingEngine {
             c.rate_cards.insert(r.id.clone(), r);
         }
         for g in u.groups {
-            if !text(&g.id, 128)
+            if !text(&g.id, crate::MAX_GROUP_ID_BYTES)
                 || !text(&g.name, 256)
                 || !text(&g.virtual_plan_name, 256)
                 || !positive(g.margin_multiplier)
@@ -1718,6 +1729,56 @@ mod tests {
         );
     }
 
+    /// The largest settings the validation allows: every count at its most, every name and
+    /// note at its longest and made of quotes, which JSON escapes to two bytes each, and
+    /// prices of the longest digits. They fit in half the publication body limit, and are
+    /// published.
+    #[test]
+    fn largest_settings_are_published_within_the_body_limit() {
+        let e = serving_engine();
+        // `n` bytes of quotes, told apart by a numbered end, such as `"""…"/7`.
+        let quotes = |n: usize, tail: String| format!("{}{tail}", "\"".repeat(n - tail.len()));
+        let long = 1_234.567_890_123_457;
+        let settings = BillingSettings {
+            default_price_multiplier: Some(0.123_456_789_012_345_67),
+            default_cost_multiplier: Some(0.123_456_789_012_345_67),
+            provider_cost_multipliers: Some(
+                (0..MAX_PROVIDER_MULTIPLIERS)
+                    .map(|i| (quotes(128, format!("-{i}")), 0.123_456_789_012_345_67))
+                    .collect(),
+            ),
+            official_prices: Some(
+                (0..MAX_OFFICIAL_PRICES)
+                    .map(|i| {
+                        let mut price = official_price([long; 4], Some(quotes(256, String::new())));
+                        price.updated_at_secs = u64::MAX;
+                        (quotes(256, format!("-{i}")), price)
+                    })
+                    .collect(),
+            ),
+            route_costs: Some(
+                (0..MAX_ROUTE_COSTS)
+                    .map(|i| {
+                        let cost = RouteCost {
+                            cost_multiplier: Some(0.123_456_789_012_345_67),
+                            basis_usd_per_m: Some([long; 4]),
+                        };
+                        (quotes(256, format!("/{i}")), cost)
+                    })
+                    .collect(),
+            ),
+            ..e.get_settings()
+        };
+        let mut u = update(&e);
+        u.settings = Some(settings);
+        let size = serde_json::to_vec(&u).unwrap().len();
+        assert!(
+            size < MAX_COMMERCIAL_UPDATE_BYTES / 2,
+            "the largest settings take {size} bytes"
+        );
+        e.publish_commercial_config(u, 100).unwrap();
+    }
+
     fn official_price(usd: [f64; 4], note: Option<String>) -> OfficialPrice {
         OfficialPrice {
             input_usd_per_m: usd[0],
@@ -1912,7 +1973,7 @@ mod tests {
             });
             publish(&e, u, now)
         };
-        let invalid_prices = "Official prices: at most 1000, named in 1-256 bytes, priced 0-10000, notes of at most 256 bytes";
+        let invalid_prices = "Official prices: at most 200, named in 1-256 bytes, priced 0-10000, notes of at most 256 bytes";
         for prices in [
             vec![(" ".to_string(), price(5.0, None))],
             vec![("m".repeat(257), price(5.0, None))],
@@ -1920,13 +1981,13 @@ mod tests {
             vec![("m".to_string(), price(10_000.5, None))],
             vec![("m".to_string(), price(5.0, Some("n".repeat(257))))],
             vec![("m".to_string(), price(5.0, Some("line\nbreak".into())))],
-            (0..1001)
+            (0..=MAX_OFFICIAL_PRICES)
                 .map(|i| (format!("m{i}"), price(5.0, None)))
                 .collect(),
         ] {
             assert_eq!(with(Some(prices), None, 100).unwrap_err(), invalid_prices);
         }
-        let invalid_routes = "Route costs: at most 1000, named <provider>/<upstream model> in at most 256 bytes, multipliers positive and at most 100, prices 0-10000";
+        let invalid_routes = "Route costs: at most 200, named <provider>/<upstream model> in at most 256 bytes, multipliers positive and at most 100, prices 0-10000";
         for routes in [
             vec![("opus".to_string(), route(Some(0.2), None))],
             vec![("/opus".to_string(), route(Some(0.2), None))],
@@ -1937,7 +1998,7 @@ mod tests {
                 "p/opus".to_string(),
                 route(None, Some([f64::NAN, 25.0, 6.25, 0.5])),
             )],
-            (0..1001)
+            (0..=MAX_ROUTE_COSTS)
                 .map(|i| (format!("p/m{i}"), route(Some(0.2), None)))
                 .collect(),
         ] {

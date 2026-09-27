@@ -35,7 +35,12 @@ impl FacadeHandler for CommercialHandler {
                     &serde_json::json!({"success":true,"config":self.billing.commercial_config()}),
                 );
             }
-            let bytes = match axum::body::to_bytes(req.into_body(), 256 * 1024).await {
+            let bytes = match axum::body::to_bytes(
+                req.into_body(),
+                billing::engine::MAX_COMMERCIAL_UPDATE_BYTES,
+            )
+            .await
+            {
                 Ok(b) => b,
                 Err(_) => {
                     return json_response(

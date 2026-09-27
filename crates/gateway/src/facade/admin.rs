@@ -45,6 +45,16 @@ fn valid_text(value: &str, max: usize) -> bool {
     !trimmed.is_empty() && trimmed.chars().count() <= max
 }
 
+/// A card ID, bounded as everywhere: see [`billing::MAX_CARD_ID_BYTES`].
+fn valid_card_id(id: &str) -> bool {
+    billing::valid_id(id.trim(), billing::MAX_CARD_ID_BYTES)
+}
+
+/// A group ID, bounded as a publication bounds it: see [`billing::MAX_GROUP_ID_BYTES`].
+fn valid_group_id(id: &str) -> bool {
+    billing::valid_id(id.trim(), billing::MAX_GROUP_ID_BYTES)
+}
+
 /// The reason a support action is taken for, as the card's history keeps it: 1 to 200
 /// bytes once trimmed.
 fn support_reason(reason: Option<&str>) -> Option<&str> {
@@ -921,7 +931,9 @@ impl FacadeHandler for AdminTraceContentHandler {
             }
             let Some(invocation_id) = parse_query(req.uri(), "invocation_id")
                 .and_then(|value| crate::archive::percent_decode(&value))
-                .filter(|value| !value.is_empty() && value.len() <= 512)
+                .filter(|value| {
+                    !value.is_empty() && value.len() <= billing::MAX_INVOCATION_KEY_BYTES
+                })
             else {
                 return error_response(
                     StatusCode::BAD_REQUEST,
@@ -1237,7 +1249,7 @@ impl FacadeHandler for AdminBatchCardsHandler {
                     "Select an issuance group explicitly",
                 );
             };
-            if !valid_text(&group_id, 64) {
+            if !valid_group_id(&group_id) {
                 return error_response(
                     StatusCode::BAD_REQUEST,
                     "InvalidRequestException",
@@ -1485,7 +1497,7 @@ impl FacadeHandler for AdminCardRevealHandler {
                     Ok(bytes) => serde_json::from_slice::<RevealRequest>(&bytes).ok(),
                     Err(_) => None,
                 };
-                let Some(body) = body.filter(|b| valid_text(&b.card_id, 128)) else {
+                let Some(body) = body.filter(|b| valid_card_id(&b.card_id)) else {
                     return error_response(StatusCode::BAD_REQUEST, "InvalidRequestException", "invalid cardId");
                 };
                 let result = self.billing.reveal_card_code(&body.card_id);
@@ -1746,7 +1758,7 @@ impl FacadeHandler for AdminCardStatusHandler {
                 .reason
                 .unwrap_or_else(|| "admin-action".to_string());
             let card_id = req_data.card_id.trim();
-            if !valid_text(card_id, 128) || !valid_text(&reason, 512) {
+            if !valid_card_id(card_id) || !valid_text(&reason, 512) {
                 return error_response(
                     StatusCode::BAD_REQUEST,
                     "InvalidRequestException",
@@ -1836,7 +1848,7 @@ impl FacadeHandler for AdminCardHistoryHandler {
             let Some(card_id) = parse_query(req.uri(), "card_id")
                 .and_then(|value| crate::archive::percent_decode(&value))
                 .map(|value| value.trim().to_string())
-                .filter(|value| valid_text(value, 128))
+                .filter(|value| valid_card_id(value))
             else {
                 return error_response(
                     StatusCode::BAD_REQUEST,
@@ -1990,7 +2002,7 @@ impl FacadeHandler for AdminCardAdjustHandler {
             if !req_data.delta_points.is_finite()
                 || req_data.delta_points == 0.0
                 || req_data.delta_points.abs() > 1_000_000.0
-                || !valid_text(req_data.card_id.trim(), 128)
+                || !valid_card_id(&req_data.card_id)
             {
                 return error_response(
                     StatusCode::BAD_REQUEST,
@@ -2205,7 +2217,7 @@ impl AdminCardActionHandler {
 
     fn unbind(&self, operator: &str, body: UnbindRequest) -> Response {
         let device_id = body.device_id.trim();
-        if !valid_text(&body.card_id, 128) || device_id.is_empty() || device_id.len() > 256 {
+        if !valid_card_id(&body.card_id) || device_id.is_empty() || device_id.len() > 256 {
             return failure(StatusCode::BAD_REQUEST, "cardId and deviceId are required");
         }
         let Some(reason) = support_reason(body.reason.as_deref()) else {
@@ -2224,7 +2236,7 @@ impl AdminCardActionHandler {
     }
 
     fn reset_rebinds(&self, operator: &str, body: ResetRebindsRequest) -> Response {
-        if !valid_text(&body.card_id, 128) {
+        if !valid_card_id(&body.card_id) {
             return failure(StatusCode::BAD_REQUEST, "cardId is required");
         }
         let Some(reason) = support_reason(body.reason.as_deref()) else {
@@ -2245,7 +2257,7 @@ impl AdminCardActionHandler {
         if body.card_ids.is_empty() || body.card_ids.len() > 500 {
             return failure(StatusCode::BAD_REQUEST, "cardIds must name 1 to 500 cards");
         }
-        if !body.card_ids.iter().all(|id| valid_text(id, 128)) {
+        if !body.card_ids.iter().all(|id| valid_card_id(id)) {
             return failure(StatusCode::BAD_REQUEST, "Invalid card ID in cardIds");
         }
         let now = now_secs();
@@ -2302,7 +2314,7 @@ impl AdminCardActionHandler {
     }
 
     fn note(&self, operator: &str, body: NoteRequest) -> Response {
-        if !valid_text(&body.card_id, 128) {
+        if !valid_card_id(&body.card_id) {
             return failure(StatusCode::BAD_REQUEST, "cardId is required");
         }
         let note = body.note.as_deref().map(str::trim).unwrap_or_default();
@@ -2321,7 +2333,7 @@ impl AdminCardActionHandler {
     }
 
     fn change_group(&self, operator: &str, body: GroupRequest) -> Response {
-        if !valid_text(&body.card_id, 128) || !valid_text(&body.group_id, 64) {
+        if !valid_card_id(&body.card_id) || !valid_group_id(&body.group_id) {
             return failure(StatusCode::BAD_REQUEST, "cardId and groupId are required");
         }
         let Some(reason) = support_reason(body.reason.as_deref()) else {

@@ -14,7 +14,10 @@ use thiserror::Error;
 
 #[path = "commercial.rs"]
 mod commercial;
-pub use commercial::{CommercialAudit, CommercialConfig, CommercialUpdate};
+pub use commercial::{
+    CommercialAudit, CommercialConfig, CommercialUpdate, MAX_COMMERCIAL_UPDATE_BYTES,
+    MAX_OFFICIAL_PRICES, MAX_PROVIDER_MULTIPLIERS, MAX_ROUTE_COSTS,
+};
 
 #[cfg(test)]
 type SnapshotSaveHook = (Arc<std::sync::Barrier>, Arc<std::sync::Barrier>);

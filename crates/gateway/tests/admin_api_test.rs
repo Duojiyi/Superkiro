@@ -1663,6 +1663,93 @@ fn charged_request(billing: &BillingEngine, card_id: &str, invocation_id: &str, 
     });
 }
 
+/// A publication as large as the largest settings the validation allows is read; one over
+/// the limit is refused unread.
+#[tokio::test]
+async fn a_publication_the_size_of_the_largest_settings_is_read() {
+    use tower::ServiceExt;
+    let (billing, app) = setup_admin_app();
+    let update = json!({
+        "expected_revision": billing.commercial_config().revision,
+        "reason": "large publication",
+        "groups": [billing::Group::pro_plus("new-tier", "New tier")],
+        "rate_cards": [billing::RateCard::new("default", "Default", 100)],
+    });
+    let publish = |padding: usize| {
+        // Whitespace, which JSON allows anywhere between values.
+        let body = format!("{}{update}", " ".repeat(padding));
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/admin/commercial-config")
+            .header("x-admin-key", TEST_ADMIN_KEY)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        app.clone().oneshot(request)
+    };
+    let response = publish(430 * 1024).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = publish(billing::engine::MAX_COMMERCIAL_UPDATE_BYTES)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// A group or card ID has one bound, in bytes, wherever it is named: a group a publication
+/// may create can receive cards and be issued from.
+#[tokio::test]
+async fn a_group_or_card_id_has_one_bound_everywhere() {
+    let (billing, app) = setup_admin_app();
+    billing.set_master_kek(billing::MasterKek::from_bytes([37; 32]));
+    let longest = "g".repeat(billing::MAX_GROUP_ID_BYTES);
+    billing.upsert_group(billing::Group::pro_plus(&longest, "Longest"));
+    let (status, body) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/cards/group",
+        Some(json!({"cardId": "card-admin-02", "groupId": longest, "reason": "升级"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["card"]["groupId"], longest.as_str());
+    let (status, body) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/cards/batch",
+        Some(json!({"count": 1, "groupId": longest})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["count"], 1);
+
+    let too_long = "g".repeat(billing::MAX_GROUP_ID_BYTES + 1);
+    let (status, _) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/cards/group",
+        Some(json!({"cardId": "card-admin-02", "groupId": too_long, "reason": "升级"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/cards/batch",
+        Some(json!({"count": 1, "groupId": too_long})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // Bytes, not characters: 43 three-byte characters are 129 bytes.
+    let (status, _) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/cards/note",
+        Some(json!({"cardId": "卡".repeat(43), "note": "VIP"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn a_compensation_names_a_request_of_the_card_and_is_paid_once() {
     let (billing, app) = setup_admin_app();
