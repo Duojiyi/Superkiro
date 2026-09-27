@@ -293,7 +293,7 @@ pub fn translate_kiro_to_chat_request(
     kiro_req: &GenerateAssistantResponseRequest,
     ctx: &mut TranslationContext,
 ) -> ChatRequest {
-    let mut system_prompts: Vec<String> = kiro_req
+    let system_prompts: Vec<String> = kiro_req
         .system_prompt
         .iter()
         .filter(|s| !s.trim().is_empty())
@@ -306,7 +306,7 @@ pub fn translate_kiro_to_chat_request(
         .current_message
         .user_input_message;
 
-    // 1. Process tools and extract long descriptions
+    // 1. Process tools (provider-safe names; descriptions stay whole)
     let mut processed_tools = Vec::new();
     if let Some(ref ctx_data) = current_input.user_input_message_context {
         if !ctx_data.tools.is_empty() {
@@ -316,12 +316,7 @@ pub fn translate_kiro_to_chat_request(
                 .map(|t| serde_json::to_value(t).unwrap_or_default())
                 .collect();
 
-            let (tools, doc_append) =
-                process_tools_for_provider(&tools_value, &mut ctx.tool_registry);
-            processed_tools = tools;
-            if let Some(doc) = doc_append {
-                system_prompts.push(doc);
-            }
+            processed_tools = process_tools_for_provider(&tools_value, &mut ctx.tool_registry);
         }
     }
 

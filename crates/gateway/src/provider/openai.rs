@@ -11,6 +11,80 @@ use serde_json::Value;
 
 pub struct OpenAiProvider;
 
+/// The longest description an OpenAI function takes.
+const MAX_FUNCTION_DESCRIPTION_LEN: usize = 1024;
+
+/// The tools as OpenAI functions, and the documentation of those whose description is
+/// longer than a function takes (several of Kiro's are). That documentation goes into the
+/// system prompt, with a pointer left in the function; Anthropic takes descriptions whole,
+/// so only this request moves them.
+fn function_tools(tools: &[Value]) -> (Vec<Value>, Option<String>) {
+    let mut relocated = Vec::new();
+    let functions = tools
+        .iter()
+        .map(|t| {
+            let spec = if let Some(s) = t.get("toolSpecification") {
+                s
+            } else {
+                t
+            };
+            let name = spec.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            let mut desc = spec
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("")
+                .to_string();
+            if desc.len() > MAX_FUNCTION_DESCRIPTION_LEN {
+                relocated.push(format!("### Tool: {name}\n{desc}"));
+                desc = format!("Documentation for {name} is provided in the system prompt.");
+            }
+            let schema = spec
+                .get("inputSchema")
+                .or_else(|| spec.get("input_schema"))
+                .or_else(|| spec.get("parameters"))
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+            let parameters = if let Some(inner) = schema.get("json") {
+                inner.clone()
+            } else {
+                schema
+            };
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": desc,
+                    "parameters": parameters
+                }
+            })
+        })
+        .collect();
+    let docs = (!relocated.is_empty()).then(|| {
+        format!(
+            "\n\n## Extended Tool Documentation\n{}",
+            relocated.join("\n\n")
+        )
+    });
+    (functions, docs)
+}
+
+/// Appends `text` to the request's system prompt, or starts one with it.
+fn append_to_system_prompt(messages: &mut Vec<Value>, text: &str) {
+    match messages.iter_mut().find(|m| m["role"] == "system") {
+        Some(system) => match &mut system["content"] {
+            Value::String(prompt) => prompt.push_str(text),
+            Value::Array(parts) => {
+                parts.push(serde_json::json!({"type": "text", "text": text.trim_start()}))
+            }
+            content => *content = Value::String(text.trim_start().to_string()),
+        },
+        None => messages.insert(
+            0,
+            serde_json::json!({"role": "system", "content": text.trim_start()}),
+        ),
+    }
+}
+
 impl ModelProvider for OpenAiProvider {
     fn name(&self) -> &'static str {
         "openai"
@@ -21,7 +95,8 @@ impl ModelProvider for OpenAiProvider {
     }
 
     fn translate_request(&self, req: &ChatRequest) -> Result<Value, ProviderError> {
-        let messages: Vec<Value> = req
+        let (tools, tool_docs) = function_tools(&req.tools);
+        let mut messages: Vec<Value> = req
             .messages
             .iter()
             .map(|m| {
@@ -64,6 +139,9 @@ impl ModelProvider for OpenAiProvider {
                 obj
             })
             .collect();
+        if let Some(docs) = tool_docs {
+            append_to_system_prompt(&mut messages, &docs);
+        }
 
         let mut body = serde_json::json!({
             "model": req.model,
@@ -98,43 +176,8 @@ impl ModelProvider for OpenAiProvider {
             };
             body[field] = serde_json::json!(max_tokens);
         }
-        if !req.tools.is_empty() {
-            let tools: Vec<Value> = req
-                .tools
-                .iter()
-                .map(|t| {
-                    let spec = if let Some(s) = t.get("toolSpecification") {
-                        s
-                    } else {
-                        t
-                    };
-                    let name = spec.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                    let desc = spec
-                        .get("description")
-                        .and_then(|d| d.as_str())
-                        .unwrap_or("");
-                    let schema = spec
-                        .get("inputSchema")
-                        .or_else(|| spec.get("input_schema"))
-                        .or_else(|| spec.get("parameters"))
-                        .cloned()
-                        .unwrap_or_else(|| serde_json::json!({"type": "object"}));
-                    let parameters = if let Some(inner) = schema.get("json") {
-                        inner.clone()
-                    } else {
-                        schema
-                    };
-                    serde_json::json!({
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "description": desc,
-                            "parameters": parameters
-                        }
-                    })
-                })
-                .collect();
-            body["tools"] = serde_json::json!(tools);
+        if !tools.is_empty() {
+            body["tools"] = Value::Array(tools);
         }
 
         Ok(body)

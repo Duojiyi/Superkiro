@@ -157,29 +157,77 @@ fn test_audit_b_ultra_long_tool_name_shortening_and_restoration() {
 }
 
 // --------------------------------------------------------------------------
-// 4. Audit B - Counterexample 3: 超长工具文档挪入 system prompt
+// 4. Audit B - Counterexample 3: 超长工具文档只在 OpenAI 请求中挪入 system prompt
 // --------------------------------------------------------------------------
+/// An OpenAI function takes a description of at most 1024 characters, so a longer one goes
+/// into that request's system prompt. Anthropic takes it whole: Kiro's grep_search, memory
+/// and other tools reached Claude as "Documentation for … is provided in the system prompt."
 #[test]
 fn test_audit_b_ultra_long_tool_description_relocation() {
     let long_desc = "A".repeat(1500); // 1500 chars > 1024
-    let tool = serde_json::json!({
-        "name": "super_tool",
-        "description": long_desc,
-        "inputSchema": { "type": "object" }
-    });
+    let tools = serde_json::json!([
+        {"toolSpecification": {"name": "super_tool", "description": long_desc,
+            "inputSchema": {"json": {"type": "object"}}}},
+        {"toolSpecification": {"name": "small_tool", "description": "Short.",
+            "inputSchema": {"json": {"type": "object"}}}}
+    ]);
+    let request = |system_prompt: Option<&str>| -> GenerateAssistantResponseRequest {
+        serde_json::from_value(serde_json::json!({
+            "systemPrompt": system_prompt,
+            "conversationState": {
+                "conversationId": "long-tool-docs",
+                "history": [],
+                "currentMessage": {"userInputMessage": {"content": "search",
+                    "userInputMessageContext": {"tools": tools}}}
+            }
+        }))
+        .unwrap()
+    };
 
     let mut registry = ToolRegistry::new();
-    let (tools, doc_append) = process_tools_for_provider(&[tool], &mut registry);
+    let shared = process_tools_for_provider(tools.as_array().unwrap(), &mut registry);
+    assert_eq!(
+        shared[0]["toolSpecification"]["description"],
+        long_desc.as_str()
+    );
 
-    assert_eq!(tools.len(), 1);
-    let desc = tools[0]["description"].as_str().unwrap();
-    assert!(desc.contains("Documentation for super_tool is provided in the system prompt."));
-    assert!(desc.len() < 100);
+    let chat = translate_kiro_to_chat_request(
+        &request(Some("Be brief.")),
+        &mut TranslationContext::new("claude-sonnet-4-6"),
+    );
+    let anthropic = AnthropicProvider.translate_request(&chat).unwrap();
+    assert_eq!(anthropic["tools"][0]["description"], long_desc.as_str());
+    assert_eq!(anthropic["tools"][1]["description"], "Short.");
+    assert!(!anthropic["system"]
+        .to_string()
+        .contains("Extended Tool Documentation"));
 
-    let doc = doc_append.expect("Must produce system documentation append");
-    assert!(doc.contains("## Extended Tool Documentation"));
-    assert!(doc.contains("super_tool"));
-    assert!(doc.contains(&"A".repeat(100)));
+    let openai = OpenAiProvider.translate_request(&chat).unwrap();
+    let function = |index: usize| &openai["tools"][index]["function"];
+    assert_eq!(
+        function(0)["description"],
+        "Documentation for super_tool is provided in the system prompt."
+    );
+    assert_eq!(function(1)["description"], "Short.");
+    let messages = openai["messages"].as_array().unwrap();
+    assert_eq!(messages.iter().filter(|m| m["role"] == "system").count(), 1);
+    let system = messages[0]["content"].as_str().unwrap();
+    assert!(system.starts_with("Be brief."), "{system}");
+    assert!(system.contains("## Extended Tool Documentation\n### Tool: super_tool\n"));
+    assert!(system.ends_with(&long_desc));
+    assert!(!system.contains("small_tool"));
+
+    // Without a system prompt of its own the OpenAI request gets one for the documentation.
+    let chat =
+        translate_kiro_to_chat_request(&request(None), &mut TranslationContext::new("gpt-4o"));
+    let openai = OpenAiProvider.translate_request(&chat).unwrap();
+    assert_eq!(openai["messages"][0]["role"], "system");
+    let system = openai["messages"][0]["content"].as_str().unwrap();
+    assert!(
+        system.starts_with("## Extended Tool Documentation"),
+        "{system}"
+    );
+    assert_eq!(openai["messages"][1]["role"], "user");
 }
 
 // --------------------------------------------------------------------------
