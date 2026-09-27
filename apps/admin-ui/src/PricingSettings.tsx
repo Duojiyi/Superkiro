@@ -5,10 +5,11 @@
 // official price in the same publication; a cost multiplier changes costs only, with keeping each
 // margin offered separately. 美元汇率 stays, under 高级, for older cost-plus prices only.
 import {useEffect, useState} from 'react';
+import {pricingNow} from './clock';
 import {adminApi, type AdminCardItem, type CommercialConfig} from './api';
 import {confirmAction} from './components/confirm';
 import {InfoTip} from './components/ui';
-import {formatCount, formatDateTime} from './format';
+import {formatClock, formatCount, formatDateTime} from './format';
 import {faceValuePlan, keepMarginPlan, multiplierOk, PLANS, pricingImpact, readSettings, type Four} from './officialPricing';
 import PricingPreview, {type PreviewPlan} from './PricingPreview';
 import {timesText, typedNumber, usdText, yuanText} from './pricingText';
@@ -22,7 +23,7 @@ export type Publish = (update: Record<string, unknown>, reason: string, action: 
 const text = (value: unknown) => typeof value === 'number' && Number.isFinite(value) ? String(value) : '';
 const validReason = (value: string) => !!value.trim() && new TextEncoder().encode(value.trim()).length <= 500 && !/[\x00-\x1f\x7f-\x9f]/.test(value);
 // Settings take effect for requests reserved after publishing; prices it adds start then too.
-const serverNow = () => Math.floor(adminApi.serverNowMs / 1000);
+const serverNow = pricingNow;
 const soon = () => Math.ceil((serverNow() + 60) / 60) * 60;
 
 function formOf(settings: Row | undefined, providers: Row[]): Form {
@@ -74,8 +75,10 @@ export function settingsChange(form: Form, settings: Row): {payload: Row; change
   return {payload, changes};
 }
 
-export default function PricingSettings({config, providers, cards, sample, blocked, onPublish, onReload, onDirtyChange, onOpenOfficial, onEditRoute}: {
+export default function PricingSettings({config, readAt, providers, cards, sample, blocked, onPublish, onReload, onDirtyChange, onOpenOfficial, onEditRoute}: {
   config: CommercialConfig;
+  /** When the configuration was read (server seconds). */
+  readAt?: number;
   providers: Row[];
   cards?: AdminCardItem[];
   sample: (model: string) => Four;
@@ -147,7 +150,7 @@ export default function PricingSettings({config, providers, cards, sample, block
         {plan.versions.length > 0 && <p className="muted">一起重算 {plan.versions.length} 个官方价版本{plan.cancelled.length ? `，其中 ${plan.cancelled.length} 个已排期的撤回后在原时间重新排期` : ''}；进行中的请求按原价格结算。</p>}
       </div>;
     }
-    const facts = [...change.changes, `原因：${reason.trim()}`, `基于 ${formatDateTime(now)} 读取的配置`];
+    const facts = [...change.changes, `原因：${reason.trim()}`, `基于 ${formatClock(readAt ?? now)} 读取的配置`];
     setPreview({
       plan: {title: '发布定价设置？', facts, rows, creditsMove: repricing, extra,
         option: keep.length ? {label: `同时把计费倍率调到保持毛利（${nameList(keep.map(entry => `${entry.model} ${timesText(entry.from)} → ${timesText(entry.to)}`), 4)}，约 1 分钟后生效）`, rows: keepRows} : undefined,

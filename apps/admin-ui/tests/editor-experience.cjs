@@ -198,8 +198,8 @@ const until=async ready=>{const end=Date.now()+10000;while(!ready()){assert(Date
     // 调价: one drawer, previewed, published on its own against the version read. This configuration
     // has no official prices: the credits are typed under 高级 (a legacy price, costs in CNY).
     postMode='success';
-    const priced=page.getByRole('row').filter({hasText:'claude-sonnet'}).filter({has:page.getByRole('button',{name:'调价'})});
-    await priced.getByRole('button',{name:'调价',exact:true}).click();
+    // Below 1440 a row's 调价 sits in its ⋯ menu.
+    await page.getByRole('button',{name:'claude-sonnet 的更多操作',exact:true}).click();await page.getByRole('menuitem',{name:'调价',exact:true}).click();
     const drawer=page.locator('#price-drawer');await drawer.waitFor();
     await drawer.getByText('没有官方价：填四项官方价，或按其他模型定价').waitFor();
     await drawer.getByRole('checkbox',{name:/高级：直接填积分/}).check();

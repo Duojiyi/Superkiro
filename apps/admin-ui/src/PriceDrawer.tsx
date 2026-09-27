@@ -7,7 +7,8 @@
 // price's inputs brought back as a new version. Every change ends in the preview, then one
 // publication against the configuration read.
 import {useEffect, useRef, useState} from 'react';
-import {adminApi, type CommercialConfig} from './api';
+import {type CommercialConfig} from './api';
+import {pricingNow} from './clock';
 import {ask} from './components/confirm';
 import {IconClose} from './components/icons';
 import {Drawer} from './components/modal';
@@ -26,7 +27,7 @@ type Row = Record<string, unknown>;
 export type {PublishOutcome};
 export type PricePublish = (update: {versions?: Row[]; cancelled_versions?: string[]}, reason: string, done: string, check: string) => Promise<PublishOutcome>;
 
-const serverNow = () => Math.floor(adminApi.serverNowMs / 1000);
+const serverNow = pricingNow;
 /** 尽快: the next whole minute at least a minute away, so it is still ahead when the publication arrives. */
 export const soonSecs = () => Math.ceil((serverNow() + 60) / 60) * 60;
 const toLocalInput = (secs: number) => {

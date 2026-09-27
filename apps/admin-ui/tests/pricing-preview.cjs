@@ -165,7 +165,7 @@ assert.equal(tokens.formatTokens(1000000),'1M Tokens（1,000,000）');
 assert.equal(display.formatTokenCount(272000),'272K');
 const model = {id: 'model-1', exposed_model_id: 'test-model', target_model: 'upstream', target_provider_id: 'p', group_id: 'g', credit_multiplier: 4};
 const routes = load('routes.ts');
-const Editor = load('CommercialEditor.tsx', {'./tokens': tokens, './api': {adminApi: {}}, './format': display, './priceChange': change, './routes': routes,
+const Editor = load('CommercialEditor.tsx', {'./tokens': tokens, './api': {adminApi: {}}, './clock': {pricingNow: () => 0}, './format': display, './priceChange': change, './routes': routes,
   // Dialogs, drawers and messages only run from event handlers; the render tree just names the components.
   './components/confirm': {confirmAction: async () => true}, './components/toast': {toast: {success() {}, info() {}, error() {}}},
   './components/modal': {Drawer: 'Drawer', Modal: 'Modal'}, './components/icons': {IconImage: 'IconImage', IconSpark: 'IconSpark', IconTool: 'IconTool'},
@@ -173,6 +173,8 @@ const Editor = load('CommercialEditor.tsx', {'./tokens': tokens, './api': {admin
   './RouteEditor': {default: 'RouteEditor'}, './RouteSwitchDrawer': {default: 'RouteSwitchDrawer'}, './BulkPriceDrawer': {default: 'BulkPriceDrawer'}, './Probe': {default: 'Probe'}, './components/menu': {Menu: 'Menu'},
   './officialPricing': load('officialPricing.ts', {'./priceChange': change, './routes': routes}), './OfficialPriceTable': {default: 'OfficialPriceTable'}, './PricingSettings': {default: 'PricingSettings'}, './RouteCostDrawer': {default: 'RouteCostDrawer'},
   './listing': load('listing.ts', {'./priceChange': change, './routes': routes, './officialPricing': load('officialPricing.ts', {'./priceChange': change, './routes': routes})}),
+  './ModelSheet': {default: 'ModelSheet'}, './ModelStateDialog': {default: 'ModelStateDialog'},
+  './sheetRules': load('sheetRules.ts', {'./officialPricing': load('officialPricing.ts', {'./priceChange': change, './routes': routes}), './priceChange': change, './routes': routes}),
   react, 'react/jsx-runtime': runtime}).default;
 const providers = [{id: 'p', name: '供应商 P'}, {id: 'openai', name: 'Astra', api_type: 'openai'}];
 const providerKeys = [{id: 'k', provider_id: 'openai', allowed_models: ['gpt-6-astra', 'gpt-5.6-sol']}, {id: 'k2', provider_id: 'p', allowed_models: ['upstream']}];

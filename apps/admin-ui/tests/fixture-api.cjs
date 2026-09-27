@@ -43,7 +43,10 @@ module.exports = function fixtureApi() {
     const last24h = window(now - 86400);
     return {last24h, last7d: window(now - 7 * 86400), tracesCoverFromSecs: Math.min(...traces.map(t => t.ts)),
       hourly: Array.from({length: 24}, (_, i) => {const hour = done.filter(t => t.ts >= first + i * 3600 && t.ts < first + (i + 1) * 3600); return {startSecs: first + i * 3600, requests: hour.length, failed: hour.filter(t => t.status === 'error').length};}),
-      providers: [{providerId: 'fixture-provider', requests: last24h.requests, failed: last24h.failed, ttftMedianMs: last24h.ttftMedianMs}]};
+      providers: [{providerId: 'fixture-provider', requests: last24h.requests, failed: last24h.failed, ttftMedianMs: last24h.ttftMedianMs}],
+      // Charged requests and distinct cards by customer model over the last 7 days, busiest first.
+      modelUsage7d: Object.entries(done.filter(t => t.ts > now - 7 * 86400 && t.credits_charged > 0).reduce((usage, t) => ({...usage, [t.exposed_model]: [...(usage[t.exposed_model] || []), t]}), {}))
+        .map(([model, list]) => ({model, requests: list.length, cards: new Set(list.map(t => t.card_id)).size})).sort((a, b) => b.requests - a.requests || a.model.localeCompare(b.model))};
   };
   // Request content is kept for some requests only; the rest answer like an expired archive.
   const traceContent = invocationId => {

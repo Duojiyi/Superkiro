@@ -61,3 +61,25 @@
 .listing-drawer .listing-group {display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px; min-height: 34px;}
 .listing-drawer .listing-group .check-field {min-width: 104px;}
 .listing-drawer .listing-group select {width: 260px; max-width: 100%;}
+
+/* 模型与定价's list: one row per customer model, its groups as chips. */
+.model-sheet .sheet-toolbar {flex-wrap: wrap; gap: 8px 12px;}
+.model-sheet .sheet-group, .model-sheet .chip-with-input {display: inline-flex; align-items: center; gap: 6px; font-size: 13px;}
+.model-sheet .sheet-filters {display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px;}
+.model-sheet .chip-with-input input {width: 48px; min-height: 30px; text-align: right;}
+.admin-app .sheet-table td {vertical-align: top; padding-top: 8px; padding-bottom: 8px;}
+.admin-app .sheet-table .cell-sub {display: block; margin-top: 2px; font-size: 12px; font-weight: 400; color: var(--text-3); white-space: nowrap;}
+.admin-app .sheet-table .cell-sub.is-warning {color: var(--warning);}
+.admin-app .sheet-table .col-model .capabilities {margin-left: 8px;}
+.admin-app .sheet-table .capability {font-size: 12px; color: var(--text-3);}
+.sheet-table .group-chips {display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px;}
+.sheet-table .group-chip {font-size: 11px; line-height: 18px; padding: 0 6px; border-radius: 9px; background: var(--neutral-bg); color: var(--text-2); font-weight: 400; white-space: nowrap;}
+.sheet-table .group-chip.is-off {background: transparent; border: 1px dashed var(--border); color: var(--text-3);}
+.sheet-table .route-line {display: block; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;}
+.sheet-table .route-line.mono {font-size: 12px; color: var(--text-2);}
+.admin-app .sheet-table .col-status {white-space: nowrap;}
+.admin-app .sheet-table tr.is-marked td {background: var(--warning-bg);}
+@media (max-width: 1439px) {.admin-app .sheet-table .row-action-wide, .admin-app .sheet-table .capability-label {display: none;} .sheet-table .route-line {max-width: 150px;}}
+/* The editor: which of the model's groups an edit goes to. */
+.mapping-editor .edit-scope {display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; margin: 0 0 12px; padding: 8px 12px; border: 1px solid var(--border-subtle); border-radius: 6px; background: var(--bg-muted);}
+.state-dialog .state-groups {display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 0; padding: 0; border: 0;}

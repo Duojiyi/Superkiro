@@ -176,6 +176,36 @@ assert.equal(listing.listingWarnings({targetModel: 'gpt-6-astra', modelId: 'x', 
 assert.match(listing.listingWarnings({targetModel: 'claude-sonnet', modelId: 'x', reasoning: false, contextWindow: 1000000, maxOutput: 8000})[0], /^上下文 1000K 超过 200K：价格没有长上下文档/);
 console.log('PASS 上架 from an official price into two groups, hidden first: an entry per group at its place, one price per price table, the existing one kept or renewed a minute on, the warnings');
 
+// The list, one row per customer model: its tables, lowest margin, start credits, filters, and the
+// field-level changes confirmations show.
+const sheet = load('sheetRules.ts', {'./officialPricing': official, './priceChange': change, './routes': routes});
+const sheetSettings = official.readSettings({credit_face_value_cny: 0.03, usd_cny_rate: 7.25, default_cost_multiplier: 0.08, provider_cost_multipliers: {fast: 0.3},
+  official_prices: {'model-x': {input_usd_per_m: 3, output_usd_per_m: 15, cache_creation_usd_per_m: 3.75, cache_read_usd_per_m: 0.3}}});
+const sheetGroups = [{id: 'std', name: '标准', rate_card_id: 'r'}, {id: 'power', name: 'Power', rate_card_id: 'r'}, {id: 'vip', name: 'VIP', rate_card_id: 'r2'}];
+const priced3 = official.officialVersion({official: [3, 15, 3.75, 0.3], priceMultiplier: 0.24, costMultiplier: 0.08, basis: null, usdCny: 1, face: 0.03}, {id: 'x-1', rateCardId: 'r', model: 'model-x', effectiveSecs: now - 10});
+const sheetModels = [{id: 'x-std', group_id: 'std', exposed_model_id: 'model-x', target_provider_id: 'slow', target_model: 'model-x', max_output: 8000, context_window: 200000, fallback_chain: [{provider_id: 'fast', target_model: 'model-x'}]},
+  {id: 'x-power', group_id: 'power', exposed_model_id: 'model-x', target_provider_id: 'slow', target_model: 'model-x', max_output: 8000, context_window: 200000, visible: false},
+  {id: 'y-vip', group_id: 'vip', exposed_model_id: 'model-y', target_provider_id: 'slow', target_model: 'model-y', max_output: 8000, context_window: 200000}];
+const rowsOf = official => sheet.sheetFacts(sheetModels, {groups: sheetGroups, versions: [priced3, {...priced3, id: 'x-2', effective_from_secs: now + 600}], settings: official, nowSecs: now, sample: () => [1000, 1000, 0, 0]});
+const [xRow, yRow] = rowsOf(sheetSettings);
+assert.deepEqual(plain([xRow.id, xRow.mappings.map(m => m.id), xRow.tables.length, xRow.tables[0].mappings.length]), ['model-x', ['x-std', 'x-power'], 1, 2], 'one row, one table for both groups');
+close(xRow.worst, (24 * 1000 + 120 * 1000) / 1e6 * 0.03 > 0 ? 1 - (15 * 0.3 + 3 * 0.3) / 1000 / ((24 + 120) / 1000 * 0.03) : 0, 'the lowest margin is the backup route at ×0.3');
+assert.equal(xRow.official.priceMultiplier, 0.24); assert.equal(xRow.scheduled, true); assert.equal(xRow.unofficial, false); assert.equal(xRow.noCost, false);
+assert.equal(xRow.start, Math.ceil(1000 * 30 + 8000 * 120), 'input at the dearest input-side price, the full output');
+assert.deepEqual(plain([yRow.unofficial, yRow.worst, yRow.start]), [true, null, null], 'a model with no price');
+assert.deepEqual(plain(rowsOf({...sheetSettings, defaultCost: null}).map(entry => entry.noCost)), [true, true], 'no 成本倍率 for the slow provider');
+const none = {loss: false, below: null, unofficial: false, noCost: false, scheduled: false};
+assert.deepEqual(plain([xRow, yRow].filter(entry => sheet.passes(entry, {...none, unofficial: true})).map(entry => entry.id)), ['model-y']);
+assert.deepEqual(plain([xRow, yRow].filter(entry => sheet.passes(entry, {...none, below: 0.99, scheduled: true})).map(entry => entry.id)), ['model-x']);
+assert.deepEqual(plain([xRow, yRow].filter(entry => sheet.passes(entry, {...none, loss: true})).map(entry => entry.id)), ['model-x'], 'the backup at ×0.3 loses money');
+assert.deepEqual(plain(['live', 'mixed'].map((_, index) => sheet.combinedState(index ? sheetModels.slice(0, 2) : [sheetModels[0]]))), ['live', 'mixed']);
+const serves = target => target.provider_id !== 'fast';
+const change_ = sheet.entryChanges(sheetModels[0], {...sheetModels[0], context_window: 300000, aliases: ['model-x-latest'], fallback_chain: [{provider_id: 'fast', target_model: 'model-x'}, {provider_id: 'fast', target_model: 'model-x-5'}]},
+  {serves, provider: id => ({fast: '快线', slow: '慢线'})[id] ?? id});
+assert.deepEqual(plain(change_), {lines: ['上下文 200K → 300K', '新增备用 快线 / model-x-5（不能服务）', '新增别名 model-x-latest'], unservable: ['快线 / model-x-5']});
+assert.deepEqual(plain(sheet.entryChanges(sheetModels[0], {...sheetModels[0], target_provider_id: 'fast', fallback_chain: []}, {serves, provider: id => id}).lines), ['主线路 slow / model-x → fast / model-x（不能服务）'], 'a backup made the primary is not a removed backup');
+console.log('PASS model sheet: one row per customer model across groups, lowest margin over every route, start credits, filters, combined state, field-level changes with routes that cannot serve');
+
 // The fixture refuses what the server refuses, in its words (crates/billing/src/commercial.rs).
 const fixture = require('./fixture-api.cjs')();
 const reason = 'official pricing';

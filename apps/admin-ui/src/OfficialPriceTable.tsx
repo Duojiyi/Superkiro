@@ -4,11 +4,12 @@
 // or pasted from CSV, and exported. Routes to a listed model are costed from its row; the preview
 // shows the margins that moves and offers to re-derive the customer prices set from a changed row.
 import {useEffect, useState} from 'react';
-import {adminApi, type CommercialConfig} from './api';
+import {pricingNow} from './clock';
+import {type CommercialConfig} from './api';
 import {confirmAction} from './components/confirm';
 import {toast} from './components/toast';
 import {InfoTip} from './components/ui';
-import {formatDateTime} from './format';
+import {formatClock, formatDateTime} from './format';
 import {currentVersion, versionIdFor} from './priceChange';
 import {freeTime, KINDS, modelEntries, officialOf, officialVersion, OFFICIAL_FIELDS, pricingImpact, primaryCost, readSettings, usdOk, type Four} from './officialPricing';
 import PricingPreview, {type PreviewPlan} from './PricingPreview';
@@ -21,7 +22,7 @@ interface Entry {usd: string[]; note: string}
 const bytes = (value: string) => new TextEncoder().encode(value).length;
 const plainText = (value: string, max: number) => !!value.trim() && bytes(value) <= max && !/[\x00-\x1f\x7f-\x9f]/.test(value);
 const validReason = (value: string) => plainText(value.trim(), 500);
-const serverNow = () => Math.floor(adminApi.serverNowMs / 1000);
+const serverNow = pricingNow;
 const soon = () => Math.ceil((serverNow() + 60) / 60) * 60;
 /** An entry as compared: its prices as numbers, and its note. */
 const keyOf = (entry: Entry | undefined | null) => entry ? JSON.stringify({usd: entry.usd.map(value => typedNumber(value)), note: entry.note.trim()}) : 'null';
@@ -54,8 +55,10 @@ export function parseOfficialCsv(text: string): {rows: Array<{name: string; usd:
   return {rows, errors};
 }
 
-export default function OfficialPriceTable({config, providers, sample, blocked, focus, onPublish, onReload, onDirtyChange}: {
+export default function OfficialPriceTable({config, readAt, providers, sample, blocked, focus, onPublish, onReload, onDirtyChange}: {
   config: CommercialConfig;
+  /** When the configuration was read (server seconds). */
+  readAt?: number;
   providers: Row[];
   sample: (model: string) => Four;
   blocked?: string;
@@ -162,7 +165,7 @@ export default function OfficialPriceTable({config, providers, sample, blocked, 
       : `${name}：${published[name].usd.map(usd => usdText(usd)).join(' / ')} → ${draft[name].usd.map(value => usdText(Number(value))).join(' / ')}${draft[name].note !== (published[name].note ?? '') ? '（备注已改）' : ''}`;
     const zeros = changed.filter(name => draft[name]).flatMap(name => draft[name].usd.map((value, index) => Number(value) === 0 ? `${name} 的${KINDS[index]}` : '').filter(Boolean));
     setPreview({
-      plan: {title: `发布 ${changed.length} 项官方价修改？`, facts: [...changed.slice(0, 8).map(describe), ...(changed.length > 8 ? [`等 ${changed.length} 项`] : []), `原因：${reason.trim()}`, `基于 ${formatDateTime(now)} 读取的配置`], rows, zeros,
+      plan: {title: `发布 ${changed.length} 项官方价修改？`, facts: [...changed.slice(0, 8).map(describe), ...(changed.length > 8 ? [`等 ${changed.length} 项`] : []), `原因：${reason.trim()}`, `基于 ${formatClock(readAt ?? now)} 读取的配置`], rows, zeros,
         option: rederive.length ? {label: `同时按新官方价重算这些模型的售价（约 1 分钟后生效）：${nameList([...new Set(rederive.map(entry => entry.model))])}`, rows: optionRows} : undefined,
         consequence: '发布后，线路到这些上游模型的请求按新官方价计算成本；客户价格只在勾选重算时改变。', confirmLabel: '发布', empty: '没有线路或模型的成本因此改变。'},
       publish: async option => {

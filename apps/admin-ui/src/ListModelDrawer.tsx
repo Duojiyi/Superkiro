@@ -5,7 +5,8 @@
 // the preview and 上架: one publication with the entries and their first price in force at once
 // (listing.ts), so a customer never sees a model that cannot be charged for.
 import {useEffect, useRef, useState} from 'react';
-import {adminApi, type CommercialConfig} from './api';
+import {type CommercialConfig} from './api';
+import {pricingNow} from './clock';
 import {IconClose} from './components/icons';
 import {Drawer} from './components/modal';
 import {toast} from './components/toast';
@@ -35,7 +36,7 @@ const validReason = (text: string) => !!text.trim() && new TextEncoder().encode(
 const tokenValue = (text: string) => {const value = parseTokenInput(text); return typeof value === 'number' ? value : null;};
 const four = (values: Array<number | null>) => values.every(value => value !== null && Number.isFinite(value)) ? values as Four : null;
 // Prices start on the server's clock: they are timed by it, not by this computer's.
-const serverNow = () => adminApi.serverNowMs / 1000;
+const serverNow = pricingNow;
 const priceSummary = (version: Row | null) => version?.pricing_mode === 'fixed'
   ? `${PRICE_FIELDS.map(([field, label]) => `${label} ${creditsText(version[field]) ?? '—'}`).join(' / ')} 积分/百万` : version ? '非固定价格' : '—';
 const placeOf = (value: string): Place => value === FIRST ? {at: 'first'} : value ? {at: 'after', id: value} : {at: 'last'};

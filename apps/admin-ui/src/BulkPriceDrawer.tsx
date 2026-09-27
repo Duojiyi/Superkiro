@@ -5,7 +5,8 @@
 // typed, no official price) is priced from the official price table when it has an entry, and
 // named; without one it is left out. Every change ends in the preview, then one publication.
 import {useState} from 'react';
-import {adminApi, type CommercialConfig} from './api';
+import {type CommercialConfig} from './api';
+import {pricingNow} from './clock';
 import {IconClose} from './components/icons';
 import {Drawer} from './components/modal';
 import {toast} from './components/toast';
@@ -55,7 +56,7 @@ export default function BulkPriceDrawer({models, config, providers, sampleOf, on
   const [error, setError] = useState('');
   const [working, setWorking] = useState(false);
   const [preview, setPreview] = useState<PreviewPlan | null>(null);
-  const nowSecs = adminApi.serverNowMs / 1000;
+  const nowSecs = pricingNow();
   const name = (model: Row) => modelName(model, config.models, config.groups);
   const typedMultiplier = typedNumber(multiplierText), typedPercent = /^[+\-−]?\d+(\.\d+)?$/.test(percent.trim()) ? Number(percent.trim().replace('−', '-')) : null;
 
@@ -110,7 +111,7 @@ export default function BulkPriceDrawer({models, config, providers, sampleOf, on
   };
   // Every model the change touches, and each route's margin, at the sample requests.
   const impact = (versions: Row[], at: number) => {
-    const now = adminApi.serverNowMs / 1000;
+    const now = pricingNow();
     return pricingImpact({settings, versions: config.versions}, {settings, versions: [...config.versions, ...versions.map(version => version.effective_from_secs === 0 ? {...version, effective_from_secs: now} : version)]},
       {models: config.models, groups: config.groups, nowSecs: now, effectiveSecs: at || now, sample: sampleOf});
   };
@@ -121,7 +122,7 @@ export default function BulkPriceDrawer({models, config, providers, sampleOf, on
     if (blocked) return;
     setError('');
     const at = when();
-    if (!Number.isSafeInteger(at) || at <= adminApi.serverNowMs / 1000) {setError('生效时间需晚于现在'); return;}
+    if (!Number.isSafeInteger(at) || at <= pricingNow()) {setError('生效时间需晚于现在'); return;}
     if (freeTime(config.versions, keys(), at) !== at) {setError('这一时刻已有其中某个模型的价格版本，请换一个生效时间'); return;}
     const versions = build(at), legacy = ready.filter(entry => entry.legacy);
     const others = ready.flatMap(entry => config.groups.filter(group => group.rate_card_id === entry.rateCardId && !entry.mappings.some(mapping => mapping.group_id === group.id)
@@ -137,7 +138,7 @@ export default function BulkPriceDrawer({models, config, providers, sampleOf, on
   const confirm = async () => {
     setPreview(null);
     const at = when();
-    if (at <= adminApi.serverNowMs / 1000) {setError('生效时间已过，请重新选择'); return;}
+    if (at <= pricingNow()) {setError('生效时间已过，请重新选择'); return;}
     const versions = build(at);
     setWorking(true);
     const outcome = await onPublish({versions}, reason.trim(), `“价格版本”里这些模型有没有 ${formatFullDateTime(at)} 起的新价格：${nameList(ready.map(entry => entry.model))}`);

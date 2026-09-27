@@ -4,7 +4,8 @@
 // 设置线路成本, not here). The confirmation offers to keep the old route as the first backup, so
 // 切回 is one step.
 import {useState} from 'react';
-import {adminApi, type CommercialConfig} from './api';
+import {pricingNow} from './clock';
+import {type CommercialConfig} from './api';
 import {ask} from './components/confirm';
 import {IconClose} from './components/icons';
 import {Drawer} from './components/modal';
@@ -40,7 +41,7 @@ export default function RouteSwitchDrawer({models, config, providers, keys, onCl
   const [working, setWorking] = useState(false);
   const provider = providers.find(item => item.id === providerId);
   const providerName = String(provider?.name ?? providerId);
-  const nowSecs = adminApi.serverNowMs / 1000, settings = readSettings(config.settings);
+  const nowSecs = pricingNow(), settings = readSettings(config.settings);
   const name = (model: Row) => modelName(model, config.models, config.groups);
   const rows = models.map(model => {
     const id = String(model.id), target = {provider_id: providerId, target_model: (targets[id] ?? '').trim()};

@@ -15,7 +15,7 @@ export interface Intent {
   cards?: {status?: CardTab; quick?: CardQuickFilter; search?: string};
   traces?: {status?: TraceTab; window?: TraceWindow; search?: string; open?: string};
   /** 上架模型 for this provider's upstream model (from 供应商与 Key). */
-  models?: {list?: {providerId?: string; model?: string}};
+  models?: {list?: {providerId?: string; model?: string}; /** A model to show in the list (a link naming it). */ model?: string};
 }
 
 export interface ErrorAction {label: string; run: () => void}

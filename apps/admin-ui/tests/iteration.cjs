@@ -110,14 +110,15 @@ const server=http.createServer(async(req,res)=>{
     assert.equal(await page.getByLabel('增减积分数量').isDisabled(),false);await nav('取消');
     // A price changes in its own drawer, published on its own; unpublished page edits come first.
     await nav('模型与定价');
-    const priced=page.getByRole('row').filter({hasText:'claude-sonnet'}).filter({has:page.getByRole('button',{name:'调价'})});
+    // Below 1440 a row's 调价 sits in its ⋯ menu.
+    const priceItem=async()=>{await page.getByRole('button',{name:'claude-sonnet 的更多操作',exact:true}).click();const item=page.getByRole('menuitem',{name:'调价',exact:true});await item.waitFor();return item;};
     await page.getByLabel('上下文长度',{exact:true}).fill('150000');
-    const priceButton=priced.getByRole('button',{name:'调价',exact:true});
-    assert(await priceButton.isDisabled());assert.equal(await priceButton.getAttribute('title'),'先发布或放弃未发布的修改，再调价');
+    const priceButton=await priceItem();
+    assert(await priceButton.isDisabled());assert.equal(await priceButton.getAttribute('title'),'先发布或放弃未发布的修改，再调价');await page.keyboard.press('Escape');
     await nav('放弃修改');await answer(true);await page.waitForFunction(()=>![...document.querySelectorAll('button')].some(b=>b.textContent==='放弃修改'));
     const config=(await (await page.request.get(origin+'/api/v1/admin/commercial-config')).json()).config;let publishBodies=[];
     await page.route('**/api/v1/admin/commercial-config',route=>{if(route.request().method()!=='POST')return route.continue();const body=route.request().postDataJSON();publishBodies.push(body);return route.fulfill({json:{success:true,config:{...config,revision:'fixture-after-price',versions:[...config.versions,...body.versions]}}});});
-    await priceButton.click();
+    await (await priceItem()).click();
     const drawer=page.locator('#price-drawer');await drawer.waitFor();
     // No official price in this configuration: the credits are typed under 高级.
     await drawer.getByRole('checkbox',{name:/高级：直接填积分/}).check();

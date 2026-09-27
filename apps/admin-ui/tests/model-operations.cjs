@@ -42,12 +42,16 @@ const model=id=>fixture.config.models.find(row=>row.id===id);
     await page.goto(origin+'/admin/');await page.getByLabel('密码',{exact:true}).fill('fixture-password');await button('登录').click();
     await button('刷新').waitFor();
     await nav('模型与定价');
+    // The list has one row per model across groups; picking a group lists it in Kiro's order to reorder it.
+    const byGroup=async name=>{await page.getByLabel('按分组看',{exact:true}).selectOption(name?{label:`${name}（排序）`}:'');if(name)await group(name).waitFor();};
+    assert.equal(await page.getByRole('rowgroup',{name:'全部分组',exact:true}).getByRole('row').count(),4,'one row per customer model');
+    await byGroup('PRO+');assert.deepEqual(await names('PRO+'),['gpt-5'],'each group lists its own models');
+    await byGroup('PRO');
     const header=group('PRO').locator('tr.group-row');
     await header.getByText('Kiro 默认：claude-sonnet 或 gpt-6-astra（谁在前以服务器为准）').waitFor();
     await header.getByText('claude-sonnet、gpt-6-astra 排在同一位置').waitFor();
     assert.equal(await group('PRO').getByText('默认待定',{exact:true}).count(),2);
     assert.deepEqual(await names('PRO'),['claude-sonnet','gpt-6-astra']);
-    assert.deepEqual(await names('PRO+'),['gpt-5'],'each group lists its own models');
     // 设为默认: to the top, the group numbered again; only the entries whose place changed are sent.
     await button('gpt-6-astra 的更多操作').click();await page.getByRole('menuitem',{name:'设为默认（排到最前）',exact:true}).click();
     assert.deepEqual(await names('PRO'),['gpt-6-astra','claude-sonnet']);
@@ -101,7 +105,7 @@ const model=id=>fixture.config.models.find(row=>row.id===id);
     assert.deepEqual(await page.evaluate(()=>Object.keys(localStorage).filter(key=>/price|rate|official|listing/i.test(key))),[],'nothing about pricing is kept in the browser');
     console.log('PASS: 批量调价: without official prices it says so and sends nothing; with an official price table, −10% on the official prices for two legacy models, previewed and published as one version each at one time');
 
-    // 隐藏 / 下架 / 恢复 / 删除, each confirmed with what it does, a reason, and the state shown.
+    // 隐藏 / 下架 / 重新上架 / 删除, each confirmed with what it does, a reason, and the state shown.
     const menu=async(name,item)=>{await button(`${name} 的更多操作`).click();const entry=page.getByRole('menuitem',{name:item,exact:true});await entry.waitFor();return entry;};
     const state=name=>page.getByRole('row').filter({has:page.getByRole('button',{name:`${name} 的更多操作`,exact:true})}).locator('td.col-status');
     assert.equal(await state('claude-sonnet').innerText(),'在售');
@@ -128,19 +132,20 @@ const model=id=>fixture.config.models.find(row=>row.id===id);
       for(const row of body.config.models)delete row.retired;
       return route.fulfill({response,json:body});
     });
+    await byGroup('');
     await (await menu('gemini-pro','下架（停止服务）')).click();await confirm({reason:'试下架'});
     await page.getByRole('status').filter({hasText:'服务器没有记下“已下架”（可能还不支持）：gemini-pro 已隐藏，但已经在用它的客户仍能调用'}).waitFor();
     await button('刷新').click();await page.locator('.btn-refresh:not([disabled])').waitFor();
-    // 恢复 needs a route that serves and a price in force.
-    await (await menu('claude-sonnet','恢复')).click();await confirm({reason:'恢复供应'});
-    await page.locator('.toast').filter({hasText:'已恢复 claude-sonnet'}).waitFor();
+    // 重新上架 needs a route that serves and a price in force.
+    await (await menu('claude-sonnet','重新上架')).click();await confirm({reason:'恢复供应'});
+    await page.locator('.toast').filter({hasText:'已重新上架 claude-sonnet'}).waitFor();
     assert.deepEqual(published().at(-1).body.models.map(row=>[row.id,row.visible,row.retired]),[['fixture-model-0',true,false]]);
     assert.equal(await state('claude-sonnet').innerText(),'在售');
     const key=fixture.keys.find(row=>row.id==='fixture-key'),allowed=key.allowed_models;key.allowed_models=allowed.filter(name=>name!=='gemini-pro');
     await button('刷新').click();await page.locator('.btn-refresh:not([disabled])').waitFor();
     const count=published().length;
-    await (await menu('gemini-pro','恢复')).click();
-    await page.getByRole('status').filter({hasText:'不能恢复 gemini-pro：主线路不能用（测试供应商 / Fixture 没有启用的 Key 授权 gemini-pro）'}).waitFor();
+    await (await menu('gemini-pro','重新上架')).click();
+    await page.getByRole('status').filter({hasText:'不能重新上架 gemini-pro：主线路不能用（测试供应商 / Fixture 没有启用的 Key 授权 gemini-pro）'}).waitFor();
     assert.equal(published().length,count,'nothing is sent');
     key.allowed_models=allowed;
     // 删除: only hidden or retired entries, the word typed, and a reason.
@@ -149,8 +154,8 @@ const model=id=>fixture.config.models.find(row=>row.id===id);
     await page.locator('.toast').filter({hasText:'已删除 gemini-pro'}).waitFor();
     assert.deepEqual(Object.keys(published().at(-1).body).sort(),['expected_revision','reason','removed_models']);
     assert.deepEqual(published().at(-1).body.removed_models,['fixture-model-2']);
-    assert.equal(await page.getByRole('rowgroup',{name:'PRO Max',exact:true}).count(),0,'the group without models is no longer listed');
-    console.log('PASS: 隐藏 / 下架 / 恢复 / 删除: consequences and the next default stated, reasons required, state column, a server not keeping 已下架 called out, 恢复 refused without a route, 删除 only when not on sale');
+    await page.getByRole('rowgroup',{name:'全部分组',exact:true}).getByRole('row').filter({hasText:'gemini-pro'}).waitFor({state:'detached'});
+    console.log('PASS: 隐藏 / 下架 / 重新上架 / 删除: consequences and the next default stated, reasons required, state column, a server not keeping 已下架 called out, 重新上架 refused without a route, 删除 only when not on sale');
   }finally{
     await browser?.close();server.close();
   }

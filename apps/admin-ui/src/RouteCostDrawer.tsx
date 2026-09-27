@@ -4,11 +4,12 @@
 // pricing settings, so it holds in every group and price table; published with a reason after the
 // preview of the margins it moves.
 import {useState} from 'react';
-import {adminApi, type CommercialConfig} from './api';
+import {pricingNow} from './clock';
+import {type CommercialConfig} from './api';
 import {IconClose} from './components/icons';
 import {Drawer} from './components/modal';
 import {InfoTip} from './components/ui';
-import {formatDateTime} from './format';
+import {formatClock} from './format';
 import {costFor, KINDS, multiplierOk, pricingImpact, readSettings, routeKey, routeMultiplier, usdOk, type Four} from './officialPricing';
 import PricingPreview, {type PreviewPlan} from './PricingPreview';
 import type {Publish} from './PricingSettings';
@@ -18,9 +19,11 @@ import type {Target} from './routes';
 type Row = Record<string, unknown>;
 const validReason = (value: string) => !!value.trim() && new TextEncoder().encode(value.trim()).length <= 500 && !/[\x00-\x1f\x7f-\x9f]/.test(value);
 
-export default function RouteCostDrawer({target, config, providers, sample, blocked, onPublish, onClose}: {
+export default function RouteCostDrawer({target, config, readAt, providers, sample, blocked, onPublish, onClose}: {
   target: Target;
   config: CommercialConfig;
+  /** When the configuration was read (server seconds). */
+  readAt?: number;
   providers: Row[];
   sample: (model: string) => Four;
   blocked?: string;
@@ -58,10 +61,10 @@ export default function RouteCostDrawer({target, config, providers, sample, bloc
       facts.push(`${name}：成本倍率 ${timesText(current?.costMultiplier ?? null)} → ${typedMultiplier === null ? `按供应商 ${timesText(inherited?.value ?? null)}` : timesText(typedMultiplier)}`,
         `上游计费基准 ${current?.basis ? current.basis.map(usd => usdText(usd)).join(' / ') : '官方价'} → ${typedBasis.every(value => value !== null) ? (typedBasis as number[]).map(usd => usdText(usd)).join(' / ') : '官方价'}`);
     } else facts.push(`删除 ${name} 的单独设置：按供应商成本倍率 ${timesText(inherited?.value ?? null)} 和官方价计算`);
-    const now = Math.floor(adminApi.serverNowMs / 1000), after = readSettings({...raw, route_costs: next});
+    const now = pricingNow(), after = readSettings({...raw, route_costs: next});
     const rows = pricingImpact({settings, versions: config.versions}, {settings: after, versions: config.versions}, {models: config.models, groups: config.groups, nowSecs: now, effectiveSecs: now, sample});
     setPreview({
-      plan: {title: remove ? `删除 ${name} 的线路成本设置？` : `发布 ${name} 的线路成本？`, facts: [...facts, `原因：${reason.trim()}`, `基于 ${formatDateTime(now)} 读取的配置`], rows,
+      plan: {title: remove ? `删除 ${name} 的线路成本设置？` : `发布 ${name} 的线路成本？`, facts: [...facts, `原因：${reason.trim()}`, `基于 ${formatClock(readAt ?? now)} 读取的配置`], rows,
         consequence: '只改成本：发布后，这条线路服务的请求按新成本计算，所有分组都一样；客户价格不变。', confirmLabel: '发布',
         empty: official || typedBasis.every(value => value !== null) ? '没有模型的毛利因此改变。' : `${target.target_model} 还没有官方价，也没填计费基准：这条线路的成本仍按旧版采购价算。`},
       publish: async () => {
