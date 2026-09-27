@@ -9,7 +9,7 @@ import {EstimateTag, FilterTabs, StatusBadge, TableState, TopbarActions} from '.
 import {IconCheck, IconWarning} from '../components/icons';
 import {formatBytes, formatCount, formatCredits, formatCreditsMicro, formatDuration, formatFullDateTime, formatMoney, formatMoneyExact, formatPercent, formatRemaining, shortId} from '../format';
 import {brokenRoutes, modelName, nameList, targetProblem} from '../routes';
-import {cardState, cooldownText, failureLabel, keyAlert, keyCooldownLeft, keyStatusView, storageLevel, TRACE_IN_PROGRESS} from '../status';
+import {cardState, cooldownText, failureLabel, keyAlert, keyCooldownLeft, keyStatusView, persistence, storageLevel, TRACE_IN_PROGRESS} from '../status';
 import type {Intent, Row, Tab} from '../types';
 import type {Failures, WorkspaceData} from '../Workspace';
 
@@ -100,6 +100,9 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
   const providerName = (id: unknown) => String(data.providers.find(provider => provider.id === id)?.name ?? id);
   const toKey = (key: Row) => () => onNavigate('providers', {providers: {key: String(key.id)}});
   const toProvider = (id: unknown) => () => onNavigate('providers', {providers: {provider: String(id)}});
+  // A save failed: until one succeeds the server refuses every change and every request.
+  const saving = persistence(data.stats);
+  if (saving?.problem) attention.push({text: `保存失败：${saving.problem.text}，服务器现在拒绝所有修改和客户请求`, tone: 'danger', go: () => onNavigate('security')});
   // The saved state nears the size at which every request is refused: archive the ledger.
   const storage = storageLevel(data.stats);
   if (storage && storage.level !== 'ok') attention.push({text: `账本存储 ${formatBytes(storage.bytes)} / ${formatBytes(storage.ceiling)}，${storage.level === 'now'

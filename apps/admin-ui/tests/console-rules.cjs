@@ -85,8 +85,20 @@ const plain = value => JSON.parse(JSON.stringify(value));
   assert.equal(status.storageLevel(stats(1)).urgent, 64 * MB);
   assert.equal(status.storageLevel({}), null, 'an older server that reports no size raises nothing');
   assert.equal(status.storageLevel(null), null);
+  // Whether the latest change is saved: each of the server's reasons in the console's words, with what fixes it.
+  const saved = stats => plain(status.persistence(stats));
+  assert.deepEqual(saved({persistenceReady: true, persistenceError: null, lastSavedAtSecs: 1790000000}), {ready: true, problem: null, savedAt: 1790000000});
+  assert.deepEqual(saved({persistenceReady: true, lastSavedAtSecs: null}), {ready: true, problem: null, savedAt: null}, 'not saved yet since the start');
+  for (const [said, text] of [['The saved state has reached its size ceiling; archive old ledger entries', '保存的数据到了大小上限'], ['The disk holding the saved state is full', '保存数据的磁盘满了'],
+    ['The saved state cannot be written: permission denied', '没有写入保存文件的权限'], ['Saving this state needs the master key, which is not configured', '保存这些数据需要主密钥，服务器没有配置'],
+    ['The saved state could not be written', '保存的数据写不进去'], ['a newer reason', 'a newer reason']])
+    assert.equal(saved({persistenceReady: false, persistenceError: said}).problem.text, text, said);
+  assert.equal(saved({persistenceReady: false, persistenceError: 'The disk holding the saved state is full'}).problem.fix, '请清理服务器上保存数据的磁盘');
+  assert.equal(saved({persistenceReady: false}).problem.text, '保存失败');
+  assert.equal(status.persistence({stateBytes: 1}), null, 'an older server that reports neither raises nothing');
+  assert.deepEqual(saved({lastSavedAtSecs: 1790000000}), {ready: null, problem: null, savedAt: 1790000000});
   assert.deepEqual([0, 900, 820 * 1024, 71.25 * MB, 256 * MB, undefined].map(display.formatBytes), ['0 KB', '1 KB', '820 KB', '71.3 MB', '256 MB', '—']);
-  console.log('PASS ledger storage: levels at 32 MB and 64 MB of 256 MB, sizes in KB and MB');
+  console.log('PASS ledger storage: levels at 32 MB and 64 MB of 256 MB, sizes in KB and MB; each reason a save failed in words, with its fix');
 
   // A card past its date is 已到期 whatever status the server keeps for it (the server checks the
   // date only when the card is used); the server's own effectiveStatus wins when it sends one.

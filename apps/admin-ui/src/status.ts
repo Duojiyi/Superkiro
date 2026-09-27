@@ -109,6 +109,30 @@ export function storageLevel(stats: {stateBytes?: unknown; stateWarningBytes?: u
   return {bytes, warning, urgent, ceiling, level: bytes >= urgent ? 'now' : bytes >= warning ? 'soon' : 'ok'};
 }
 
+// Why the server could not save, in its words (admin.rs persistence_problem), and what fixes it.
+const PERSISTENCE_PROBLEMS: Record<string, {text: string; fix: string}> = {
+  'The saved state has reached its size ceiling; archive old ledger entries': {text: '保存的数据到了大小上限', fix: '请现在归档旧账本（下方“归档账本…”）'},
+  'The disk holding the saved state is full': {text: '保存数据的磁盘满了', fix: '请清理服务器上保存数据的磁盘'},
+  'The saved state cannot be written: permission denied': {text: '没有写入保存文件的权限', fix: '请检查服务器进程对保存文件所在目录的写权限'},
+  'Saving this state needs the master key, which is not configured': {text: '保存这些数据需要主密钥，服务器没有配置', fix: '请在服务器上配置主密钥后重启'},
+  'The saved state could not be written': {text: '保存的数据写不进去', fix: '请查看服务器日志'},
+};
+
+/**
+ * Whether the server's latest change is saved, and when it last saved. While a save has failed the
+ * server refuses every change and every request, so a problem is the most urgent thing to fix.
+ * Null when the server reports neither.
+ */
+export function persistence(stats: {persistenceReady?: unknown; persistenceError?: unknown; lastSavedAtSecs?: unknown} | null | undefined):
+  {ready: boolean | null; problem: {text: string; fix: string} | null; savedAt: number | null} | null {
+  const ready = typeof stats?.persistenceReady === 'boolean' ? stats.persistenceReady : null;
+  const savedAt = typeof stats?.lastSavedAtSecs === 'number' && stats.lastSavedAtSecs > 0 ? stats.lastSavedAtSecs : null;
+  if (ready === null && savedAt === null) return null;
+  const said = typeof stats?.persistenceError === 'string' ? stats.persistenceError : '';
+  const problem = ready === false ? PERSISTENCE_PROBLEMS[said] ?? {text: said || '保存失败', fix: '请查看服务器日志'} : null;
+  return {ready, problem, savedAt};
+}
+
 export const TRACE_IN_PROGRESS = ['pending', 'running', 'in_progress'];
 
 /** 进行中 for longer than this: no request runs that long, so it was most likely cut off (a restart, a lost connection). */

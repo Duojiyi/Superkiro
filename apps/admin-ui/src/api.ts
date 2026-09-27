@@ -28,6 +28,10 @@ export interface AdminStats {
   stateBytes?: number;
   stateWarningBytes?: number;
   stateCeilingBytes?: number;
+  /** When the state was last saved (seconds), null before the first save; whether the latest change is saved, and if not, why (newer servers). */
+  lastSavedAtSecs?: number | null;
+  persistenceReady?: boolean;
+  persistenceError?: string | null;
 }
 
 /** What POST /ledger/archive did: the entries moved into an archive file beside the saved state, and its size before and after. */

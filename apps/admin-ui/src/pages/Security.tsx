@@ -6,9 +6,9 @@ import {ask} from '../components/confirm';
 import {IconCheck, IconInfo, IconWarning} from '../components/icons';
 import {toast} from '../components/toast';
 import {IdCell, TableState} from '../components/ui';
-import {formatBytes, formatCount, formatDateTime, formatFullDateTime, formatSessionLeft} from '../format';
+import {formatBytes, formatCount, formatDateTime, formatFullDateTime, formatRelative, formatSessionLeft} from '../format';
 import {explainRefusal, isRefusal} from '../refusal';
-import {storageLevel} from '../status';
+import {persistence, storageLevel} from '../status';
 import type {Refresh, Row, WriteGuards} from '../types';
 
 const DAY_MS = 86_400_000;
@@ -17,12 +17,15 @@ const dateText = (ms: number) => {const date = new Date(ms); return `${date.getF
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
 /**
- * 存储与账本: the saved billing state against the size at which every save, and so every request,
- * fails; and 归档账本, which moves ledger entries before a date into an archive file beside it,
- * keeping every card's balance and quotas.
+ * 存储与账本: whether the latest change is saved and when the state last was; the saved billing
+ * state against the size at which every save, and so every request, fails; and 归档账本, which
+ * moves ledger entries before a date into an archive file beside it, keeping every card's balance
+ * and quotas.
  */
 function StoragePanel({stats, refresh, guards}: {stats: AdminStats | null; refresh: Refresh; guards: WriteGuards}) {
   const storage = storageLevel(stats);
+  const saving = persistence(stats);
+  const savedAt = saving?.savedAt ? `${formatDateTime(saving.savedAt)}（${formatRelative(saving.savedAt)}）` : null;
   const alive = useRef(true);
   useEffect(() => {alive.current = true; return () => {alive.current = false;};}, []);
   const today = dateText(Date.now());
@@ -58,6 +61,11 @@ function StoragePanel({stats, refresh, guards}: {stats: AdminStats | null; refre
   const share = (bytes: number) => `${storage ? Math.min(100, bytes / storage.ceiling * 100) : 0}%`;
   return <section className="panel" aria-label="存储与账本">
     <h3>存储与账本</h3>
+    {saving?.problem ? <div className="storage-failure" role="alert">
+      <p><b>保存失败：{saving.problem.text}</b></p>
+      <p>在下一次保存成功之前，服务器拒绝所有修改和客户的每个请求。{saving.problem.fix}。</p>
+      {savedAt && <p>最近一次保存成功：{savedAt}</p>}
+    </div> : saving && <p className="storage-saved">{saving.ready && <span className="is-ok">已保存</span>}{savedAt && <span className="muted">最近保存 {savedAt}</span>}</p>}
     {storage ? <>
       <p className="storage-line"><b>{formatBytes(storage.bytes)}</b><span className="muted">/ {formatBytes(storage.ceiling)}</span>
         {storage.level === 'now' ? <span className="is-danger">已过请现在归档的 {formatBytes(storage.urgent)}：到上限时所有请求都会被拒绝</span>

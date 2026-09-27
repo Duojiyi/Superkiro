@@ -25,7 +25,8 @@ module.exports = function fixtureApi() {
   const log = [];
   // The saved billing state's size, as GET /stats reports it (billing's warning level and ceiling),
   // and how far back the ledger has been archived.
-  const storage = {bytes: 13212876, warning: 33554432, ceiling: 268435456, archivedBefore: 0};
+  // The saved state: its size, when it was last saved, and why the latest save failed (null: it did not).
+  const storage = {bytes: 13212876, warning: 33554432, ceiling: 268435456, archivedBefore: 0, savedAt: realNow - 180, persistenceError: null};
   const cardRevision = () => crypto.createHash('sha256').update(cards.map(card => card.id).join('\n')).digest('hex');
   // Requests relative to the real clock, so "近 24 小时" and the 24-hour content archive
   // behave as in production: one every 30 minutes, the newest a minute ago.
@@ -251,7 +252,8 @@ module.exports = function fixtureApi() {
     if(endpoint==='me' || (endpoint==='session' && req.method==='GET')) return reply({success:true,role:'admin',username:'admin',csrfToken:'fixture-csrf',expiresAt:deadline,expiresIn:deadline-nowSecs(),twoFactorEnabled:false,totpRequired:false});
     if(endpoint==='cards/reveal') return reply({success:true,rawCode:'FIXTURE-RECOVERED-CODE'});
     if(endpoint==='session/revoke') {authenticated=false; res.setHeader('Set-Cookie','fixture_session=; Max-Age=0; Path=/'); return reply({success:true});}
-    if(endpoint==='stats') return reply({success:true,stateBytes:storage.bytes,stateWarningBytes:storage.warning,stateCeilingBytes:storage.ceiling,totalCards:cards.length,activeCards:2,unactivatedCards:1,frozenCards:1,bannedCards:1,totalCredits:12000000000,usedCredits:1500000000,remainingCredits:10500000000,totalPoints:12000,usedPoints:1500,remainingPoints:10500,activity:activity()});
+    if(endpoint==='stats') return reply({success:true,stateBytes:storage.bytes,stateWarningBytes:storage.warning,stateCeilingBytes:storage.ceiling,
+      lastSavedAtSecs:storage.savedAt,persistenceReady:!storage.persistenceError,persistenceError:storage.persistenceError,totalCards:cards.length,activeCards:2,unactivatedCards:1,frozenCards:1,bannedCards:1,totalCredits:12000000000,usedCredits:1500000000,remainingCredits:10500000000,totalPoints:12000,usedPoints:1500,remainingPoints:10500,activity:activity()});
     if(endpoint==='cards') return reply({success:true,count:cards.length,cards:cards.map(view),revision:cardRevision()});
     // One card's history, newest first: this session's changes, then realistic older events.
     if(endpoint==='cards/history') {

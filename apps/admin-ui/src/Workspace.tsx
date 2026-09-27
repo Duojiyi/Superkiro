@@ -19,7 +19,7 @@ import {periodRange} from './period';
 import {publishFailure, type PublishOutcome} from './refusal';
 import {intentOf, OPEN_PARAM, parseRoute, routeHash, routeOf, type Route} from './route';
 import {brokenRoutes, modelName} from './routes';
-import {keyAlert, storageLevel} from './status';
+import {keyAlert, persistence, storageLevel} from './status';
 import type {ErrorAction, Intent, RefreshOptions, Row, Tab} from './types';
 
 const NAV: Array<{group: string; items: Array<{id: Tab; label: string}>}> = [
@@ -347,11 +347,13 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
   const broken = providersLoaded ? brokenRoutes(data.models, {providers: data.providers, keys: data.providerKeys}) : [];
   const down = broken.filter(entry => entry.route.down).length;
   const storage = storageLevel(data.stats);
+  const saving = persistence(data.stats);
   const badges: Partial<Record<Tab, {count: number; tone: 'danger' | 'warning'; text: string}>> = {
     ...(failedLastHour ? {traces: {count: failedLastHour, tone: 'danger' as const, text: `近 1 小时 ${failedLastHour} 次失败`}} : {}),
     ...(broken.length ? {models: {count: broken.length, tone: down ? 'danger' as const : 'warning' as const, text: down ? `${down} 个在售模型无可用线路` : `${broken.length} 个在售模型的主线路不可用`}} : {}),
     ...(keyAlerts ? {providers: {count: keyAlerts, tone: 'warning' as const, text: `${keyAlerts} 个 Key 冷却中、冷却后试用中或不可用`}} : {}),
-    ...(storage && storage.level !== 'ok' ? {security: {count: 1, tone: storage.level === 'now' ? 'danger' as const : 'warning' as const,
+    ...(saving?.problem ? {security: {count: 1, tone: 'danger' as const, text: `保存失败：${saving.problem.text}`}}
+      : storage && storage.level !== 'ok' ? {security: {count: 1, tone: storage.level === 'now' ? 'danger' as const : 'warning' as const,
       text: `账本存储 ${formatBytes(storage.bytes)} / ${formatBytes(storage.ceiling)}，${storage.level === 'now' ? '请现在归档' : '建议归档'}`}} : {}),
   };
   const staleSections = loadErrors.filter(error => error.stale).map(error => error.section);
