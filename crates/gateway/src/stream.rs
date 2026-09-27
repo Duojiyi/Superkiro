@@ -87,9 +87,10 @@ impl BillingSettler {
         self
     }
 
-    pub fn settle(&mut self, tokens: &UsageTokens) -> Result<(), BillingError> {
+    /// Bill `tokens`; the micro-credits charged.
+    pub fn settle(&mut self, tokens: &UsageTokens) -> Result<i64, BillingError> {
         if self.settled {
-            return Ok(());
+            return Ok(0);
         }
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -112,7 +113,7 @@ impl BillingSettler {
         } else if let Some(metrics) = &self.metrics {
             metrics.mark_error();
         }
-        result.map(|_| ())
+        result.map(|entry| entry.credits_charged)
     }
 }
 
@@ -675,6 +676,7 @@ pub fn create_stream_guard_with_send_deadline(
         }
         let mut settlement_ok = true;
         let mut billable_attempt = false;
+        let mut credits_charged = None;
         // A stream cut short never completed its calls; they still show what they carried.
         if archiving {
             for buf in std::mem::take(&mut tool_calls.calls) {
@@ -708,9 +710,12 @@ pub fn create_stream_guard_with_send_deadline(
             let output_tokens = resolved.as_ref().map_or(0, |tokens| tokens.output_tokens);
             if let Some(tokens) = resolved.filter(|_| !rejected_empty) {
                 billable_attempt = true;
-                if let Err(error) = settler.settle(&tokens) {
-                    settlement_ok = false;
-                    eprintln!("[kiro-gateway] settlement failed: {error}");
+                match settler.settle(&tokens) {
+                    Ok(charged) => credits_charged = Some(charged),
+                    Err(error) => {
+                        settlement_ok = false;
+                        eprintln!("[kiro-gateway] settlement failed: {error}");
+                    }
                 }
             }
             let status = if !settlement_ok {
@@ -766,6 +771,16 @@ pub fn create_stream_guard_with_send_deadline(
             }
         }
         if completed && settlement_ok {
+            // What the turn cost, which Kiro shows as the prompt's usage summary, in the unit
+            // its model list shows beside each model.
+            if let Some(charged) = credits_charged.filter(|_| !tx.is_closed()) {
+                let frame = kiro_wire::encoder::encode_metering(
+                    charged as f64 / billing::MICRO_CREDITS_PER_CREDIT as f64,
+                    crate::facade::models::RATE_UNIT,
+                    crate::facade::models::RATE_UNIT_PLURAL,
+                );
+                let _ = send_terminal_frame(&tx, frame).await;
+            }
             if !tx.is_closed() {
                 // A refusal says why, and Kiro shows it with its refusal.
                 let stop = stop_reason.as_deref().unwrap_or("end_turn");

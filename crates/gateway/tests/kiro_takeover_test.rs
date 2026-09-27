@@ -781,3 +781,45 @@ async fn a_refusal_ends_as_content_filtered_with_its_category() {
     assert_eq!(end["stopDetails"]["refusal"]["category"], "cyber");
     assert_eq!(end["stopDetails"]["refusal"]["explanation"], "Declined.");
 }
+
+/// Kiro shows each prompt's credits from a meteringEvent; none was sent, so its usage
+/// summary was always empty. It comes once the turn is billed, before the final metadata.
+#[tokio::test]
+async fn a_billed_turn_reports_its_credits_before_it_ends() {
+    let server = upstream(
+        ResponseTemplate::new(200).set_body_raw(anthropic_answer("hi"), "text/event-stream"),
+    )
+    .await;
+    let billing = engine(
+        ProviderFormat::Anthropic,
+        &server.uri(),
+        vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+    );
+    let app = serve(&billing);
+    let reply = send(
+        &app,
+        "inv-metering",
+        body(json!({"content": "hello", "modelId": "model"}), vec![]),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let frames = frames(&reply.bytes);
+    let metering = frames
+        .iter()
+        .position(|(kind, _)| kind == "meteringEvent")
+        .expect("a meteringEvent");
+    let charged = usage_entries(&billing)[0].credits_charged;
+    assert!(charged > 0);
+    let event = &frames[metering].1;
+    assert_eq!(event["unit"], "Credit");
+    assert_eq!(event["unitPlural"], "Credits");
+    assert!(
+        (event["usage"].as_f64().unwrap() - charged as f64 / 1_000_000.0).abs() < 1e-9,
+        "{event}"
+    );
+    let end = frames
+        .iter()
+        .rposition(|(kind, payload)| kind == "metadataEvent" && payload.get("stopReason").is_some())
+        .unwrap();
+    assert!(metering < end, "{frames:?}");
+}

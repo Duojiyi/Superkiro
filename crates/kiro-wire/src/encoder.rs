@@ -218,3 +218,13 @@ pub fn encode_stop(
     };
     encode_event("metadataEvent", &evt).unwrap_or_default()
 }
+
+/// Helper: Encode a turn's credit use, which Kiro shows as the prompt's usage summary.
+pub fn encode_metering(usage: f64, unit: &str, unit_plural: &str) -> Vec<u8> {
+    let evt = MeteringEvent {
+        usage,
+        unit: Some(unit.to_string()),
+        unit_plural: Some(unit_plural.to_string()),
+    };
+    encode_event("meteringEvent", &evt).unwrap_or_default()
+}
