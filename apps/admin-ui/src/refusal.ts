@@ -35,9 +35,9 @@ const REFUSALS: Array<[RegExp, (ids: string) => string]> = [
   [/Invalid official pricing/i, ids => `官方价无效${ids ? `：${ids}` : ''}（四项都要在 0–10,000 美元之间且不能都是 0，倍率大于 0、不超过 100，按官方价定价的版本不能再设版本倍率）`],
   [/The official dollar rate must be positive/i, () => '官方价 $1 折合的人民币需大于 0、不超过 1000'],
   [/Multipliers must be positive and at most 100/i, () => '计费倍率和成本倍率需大于 0、不超过 100；单独设成本倍率的供应商最多 200 个'],
-  [/Official prices: at most/i, () => '官方价表最多 1000 项：模型名 1–256 字节，价格 0–10,000 美元，备注最多 256 字节'],
-  [/Route costs: at most/i, () => '线路成本最多 1000 条：名称是“供应商/上游模型”，成本倍率大于 0、不超过 100，计费基准 0–10,000 美元'],
-  [/Invalid or oversized body/i, () => '提交的内容无效或太大'],
+  [/Official prices: at most/i, () => '官方价表最多 200 项：模型名 1–256 字节，价格 0–10,000 美元，备注最多 256 字节。先删掉不再用的行，再发布'],
+  [/Route costs: at most/i, () => '单独设成本的线路最多 200 条：名称是“供应商/上游模型”，成本倍率大于 0、不超过 100，计费基准 0–10,000 美元。先删掉不再需要的线路设置，再发布'],
+  [/Invalid or oversized body/i, () => '这次发布的内容太大（最多 1 MB）或格式无效：内容太多时分几次发布'],
   // 套餐: each bound a plan is held to, the catalog's rules, and issuing from one; `ids` are the plans.
   [/Plan IDs are 1-64 of a-z, 0-9 and -/i, ids => `套餐 ID 只能用 1–64 个小写字母、数字和 -${ids ? `：${ids}` : ''}`],
   [/Plan names are 1-32 bytes/i, ids => `套餐名称要 1–32 字节（约 10 个汉字），不能有换行${ids ? `：${ids}` : ''}`],

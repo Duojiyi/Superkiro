@@ -227,7 +227,11 @@ assert.equal(send({settings: {...kept, usd_cny_rate: 7.3}}).status, 200, 'what t
 assert.deepEqual([fixture.config.settings.default_price_multiplier, fixture.config.settings.provider_cost_multipliers, fixture.config.settings.usd_cny_rate], [0.24, {'fixture-provider': 0.08}, 7.3]);
 assert(fixture.config.settings.official_prices['claude-sonnet'].updated_at_secs > 0, 'stamped by the server');
 for (const [patch, message] of [[{official_usd_cny: 0}, 'The official dollar rate must be positive and at most 1000'], [{default_cost_multiplier: 100.5}, 'Multipliers must be positive and at most 100, for at most 200 providers'],
-  [{route_costs: {'/claude': {cost_multiplier: 0.1}}}, /^Route costs/], [{route_costs: {'p/': {cost_multiplier: 0.1}}}, /^Route costs/], [{official_prices: {x: {input_usd_per_m: 10001, output_usd_per_m: 1, cache_creation_usd_per_m: 1, cache_read_usd_per_m: 1}}}, /^Official prices/]])
+  [{route_costs: {'/claude': {cost_multiplier: 0.1}}}, /^Route costs/], [{route_costs: {'p/': {cost_multiplier: 0.1}}}, /^Route costs/], [{official_prices: {x: {input_usd_per_m: 10001, output_usd_per_m: 1, cache_creation_usd_per_m: 1, cache_read_usd_per_m: 1}}}, /^Official prices/],
+  // At most 200 official prices, 200 routes with a cost of their own and 200 providers with a 成本倍率.
+  [{official_prices: Object.fromEntries(Array.from({length: 201}, (_, i) => [`m-${i}`, {input_usd_per_m: 1, output_usd_per_m: 1, cache_creation_usd_per_m: 1, cache_read_usd_per_m: 1}]))}, /^Official prices: at most 200,/],
+  [{route_costs: Object.fromEntries(Array.from({length: 201}, (_, i) => [`p/m-${i}`, {cost_multiplier: 0.1}]))}, /^Route costs: at most 200,/],
+  [{provider_cost_multipliers: Object.fromEntries(Array.from({length: 201}, (_, i) => [`p-${i}`, 0.1]))}, 'Multipliers must be positive and at most 100, for at most 200 providers']])
   assert.match(refusal(send({settings: {credit_face_value_cny: 0.01, usd_cny_rate: 7.3, ...patch}})), message instanceof RegExp ? message : new RegExp(`^${message.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`));
 // A face value change: every official price in force or scheduled at the new value, repriced from now; a scheduled one withdrawn and re-added.
 const t = Math.floor(Date.now() / 1000);

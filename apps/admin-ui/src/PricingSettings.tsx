@@ -10,7 +10,7 @@ import {adminApi, type AdminCardItem, type CommercialConfig} from './api';
 import {confirmAction} from './components/confirm';
 import {InfoTip} from './components/ui';
 import {formatClock, formatCount, formatDateTime} from './format';
-import {faceValuePlan, keepMarginPlan, multiplierOk, PLANS, pricingImpact, readSettings, type Four} from './officialPricing';
+import {faceValuePlan, keepMarginPlan, MAX_PROVIDER_MULTIPLIERS, multiplierOk, PLANS, pricingImpact, readSettings, type Four} from './officialPricing';
 import PricingPreview, {type PreviewPlan} from './PricingPreview';
 import {timesText, typedNumber, usdText, yuanText} from './pricingText';
 import type {PublishOutcome} from './refusal';
@@ -71,6 +71,7 @@ export function settingsChange(form: Form, settings: Row): {payload: Row; change
     const was = current.providers[id] ?? null;
     if (number !== was) moved.push(`${id} ${was === null ? '默认' : timesText(was)} → ${number === null ? '默认' : timesText(number)}`);
   }
+  if (Object.keys(providers).length > MAX_PROVIDER_MULTIPLIERS) throw new Error(`最多给 ${MAX_PROVIDER_MULTIPLIERS} 个供应商单独设成本倍率（现在填了 ${Object.keys(providers).length} 个）：不需要的留空，按默认成本倍率算`);
   if (moved.length) {payload.provider_cost_multipliers = providers; changes.push(`供应商成本倍率：${nameList(moved, 4)}`);}
   if (legacyRate !== current.legacyRate) changes.push(`旧版成本加成汇率 ${current.legacyRate ?? '—'} → ${legacyRate}（只影响用美元填采购价的旧版本）`);
   return {payload, changes};

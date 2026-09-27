@@ -10,7 +10,7 @@ import {IconClose} from './components/icons';
 import {Drawer} from './components/modal';
 import {InfoTip} from './components/ui';
 import {formatClock} from './format';
-import {costFor, KINDS, multiplierOk, pricingImpact, readSettings, routeKey, routeMultiplier, usdOk, type Four} from './officialPricing';
+import {costFor, KINDS, MAX_ROUTE_COSTS, multiplierOk, pricingImpact, readSettings, routeKey, routeMultiplier, usdOk, type Four} from './officialPricing';
 import PricingPreview, {type PreviewPlan} from './PricingPreview';
 import type {Publish} from './PricingSettings';
 import {providerName, timesText, typedNumber, usdText, yuanText} from './pricingText';
@@ -61,6 +61,7 @@ export default function RouteCostDrawer({target, config, readAt, providers, samp
       facts.push(`${name}：成本倍率 ${timesText(current?.costMultiplier ?? null)} → ${typedMultiplier === null ? `按供应商 ${timesText(inherited?.value ?? null)}` : timesText(typedMultiplier)}`,
         `上游计费基准 ${current?.basis ? current.basis.map(usd => usdText(usd)).join(' / ') : '官方价'} → ${typedBasis.every(value => value !== null) ? (typedBasis as number[]).map(usd => usdText(usd)).join(' / ') : '官方价'}`);
     } else facts.push(`删除 ${name} 的单独设置：按供应商成本倍率 ${timesText(inherited?.value ?? null)} 和官方价计算`);
+    if (Object.keys(next).length > MAX_ROUTE_COSTS) {setError(`单独设成本的线路最多 ${MAX_ROUTE_COSTS} 条，这次发布后会有 ${Object.keys(next).length} 条：先在“定价设置”里删掉不再需要的线路设置`); return;}
     const now = pricingNow(), after = readSettings({...raw, route_costs: next});
     const rows = pricingImpact({settings, versions: config.versions}, {settings: after, versions: config.versions}, {models: config.models, groups: config.groups, nowSecs: now, effectiveSecs: now, sample});
     setPreview({

@@ -11,7 +11,7 @@ import {toast} from './components/toast';
 import {InfoTip} from './components/ui';
 import {formatClock, formatDateTime} from './format';
 import {currentVersion, versionIdFor} from './priceChange';
-import {freeTime, KINDS, modelEntries, officialOf, officialVersion, OFFICIAL_FIELDS, pricingImpact, primaryCost, readSettings, usdOk, type Four} from './officialPricing';
+import {freeTime, KINDS, MAX_OFFICIAL_PRICES, modelEntries, officialOf, officialVersion, OFFICIAL_FIELDS, pricingImpact, primaryCost, readSettings, usdOk, type Four} from './officialPricing';
 import PricingPreview, {type PreviewPlan} from './PricingPreview';
 import type {Publish} from './PricingSettings';
 import {typedNumber, usdText} from './pricingText';
@@ -139,6 +139,7 @@ export default function OfficialPriceTable({config, readAt, providers, sample, b
     try {
       map = Object.fromEntries(Object.entries(draft).map(([name, entry]) => [name, {...Object.fromEntries(OFFICIAL_FIELDS.map((field, index) => [field, pricesOf(name, entry)[index]])), ...(entry.note ? {note: entry.note} : {})}]));
     } catch (cause) {setError(cause instanceof Error ? cause.message : String(cause)); return;}
+    if (Object.keys(map).length > MAX_OFFICIAL_PRICES) {setError(`官方价表最多 ${MAX_OFFICIAL_PRICES} 项，这次发布后会有 ${Object.keys(map).length} 项：先删掉不再用的行，再发布`); return;}
     const now = serverNow(), later = soon(), before = readSettings(settings);
     const payload = {credit_face_value_cny: settings.credit_face_value_cny, usd_cny_rate: settings.usd_cny_rate, official_prices: map};
     const after = readSettings({...settings, official_prices: map});
@@ -188,7 +189,7 @@ export default function OfficialPriceTable({config, readAt, providers, sample, b
   return <section className="panel official-table" aria-label="官方价表">
     <div className="panel-head">
       <h3>官方价表</h3>
-      <span className="muted">美元 / 百万 Tokens · 缓存写按 5 分钟缓存 · 线路到这些上游模型的请求按它计算成本</span>
+      <span className="muted">美元 / 百万 Tokens · 缓存写按 5 分钟缓存 · 线路到这些上游模型的请求按它计算成本 · {Object.keys(draft).length} / {MAX_OFFICIAL_PRICES} 项</span>
       <span className="drawer-foot-spacer"/>
       <button type="button" className="btn btn-small" disabled={working || !!adding} onClick={() => {setAdding({name: '', entry: {usd: ['', '', '', ''], note: ''}}); setEditing(null);}}>＋ 新增</button>
       <button type="button" className="btn btn-small" disabled={!Object.keys(published).length} onClick={exportCsv}>导出 CSV</button>

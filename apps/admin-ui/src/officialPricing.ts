@@ -25,6 +25,8 @@ const object = (value: unknown): Row => value && typeof value === 'object' && !A
 /** Four finite numbers, or null. */
 export const four = (value: unknown): Four | null => Array.isArray(value) && value.length === 4 && value.every(finite) ? [value[0], value[1], value[2], value[3]] : null;
 export const multiplierOk = (value: number) => Number.isFinite(value) && value > 0 && value <= 100;
+/** What the settings hold at most (billing's MAX_OFFICIAL_PRICES, MAX_ROUTE_COSTS, MAX_PROVIDER_MULTIPLIERS). */
+export const MAX_OFFICIAL_PRICES = 200, MAX_ROUTE_COSTS = 200, MAX_PROVIDER_MULTIPLIERS = 200;
 export const usdOk = (value: number) => Number.isFinite(value) && value >= 0 && value <= 10_000;
 
 export interface OfficialPrice {usd: Four; note?: string; updatedAt: number}

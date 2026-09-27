@@ -118,6 +118,11 @@ assert.match(refusal.explainRefusal('No enabled Key of this provider may call th
 assert.equal(refusal.explainRefusal('Unknown key'), '这个 Key 已不存在（可能刚被删除），请刷新');
 assert.equal(refusal.explainRefusal('Invalid billing state: Unknown target provider'), '线路指向的供应商不存在', 'the provider a route names is not the provider that is gone');
 assert.equal(refusal.publishFailure(refused('Invalid body', 400), '发布').uncertain, undefined, 'a malformed request was refused, not applied');
+// The pricing settings' bounds: 200 official prices, 200 route costs, 200 providers, a 1 MiB publication.
+assert.match(refusal.explainRefusal('Invalid billing state: Official prices: at most 200, named in 1-256 bytes, priced 0-10000, notes of at most 256 bytes'), /^官方价表最多 200 项.*先删掉不再用的行/);
+assert.match(refusal.explainRefusal('Invalid billing state: Route costs: at most 200, named <provider>/<upstream model> in at most 256 bytes, multipliers positive and at most 100, prices 0-10000'), /^单独设成本的线路最多 200 条/);
+assert.match(refusal.explainRefusal('Invalid billing state: Multipliers must be positive and at most 100, for at most 200 providers'), /供应商最多 200 个/);
+assert.match(refusal.explainRefusal('Invalid or oversized body'), /最多 1 MB/);
 for (const error of [refused('Billing persistence failed: disk', 503), new Error('请求超时，结果未确认；写操作请核对后重试'), refused('bad gateway', 502)]) {
   assert.equal(refusal.publishFailure(error, '发布').uncertain, true, error.message);
 }

@@ -348,11 +348,11 @@ module.exports = function fixtureApi() {
       if ([settings.default_price_multiplier, settings.default_cost_multiplier].some(value => value !== undefined && !multiplier(value)) || byProvider.length > 200 || byProvider.some(([id, value]) => !text(id, 128) || !multiplier(value)))
         return refuse('Multipliers must be positive and at most 100, for at most 200 providers');
       const prices = Object.entries(settings.official_prices ?? {});
-      if (prices.length > 1000 || prices.some(([name, price]) => !text(name, 256) || !OFFICIAL.every(field => usd(price[field])) || (price.note != null && (typeof price.note !== 'string' || Buffer.byteLength(price.note) > 256 || /[\u0000-\u001f\u007f-\u009f]/.test(price.note)))))
-        return refuse('Official prices: at most 1000, named in 1-256 bytes, priced 0-10000, notes of at most 256 bytes');
+      if (prices.length > 200 || prices.some(([name, price]) => !text(name, 256) || !OFFICIAL.every(field => usd(price[field])) || (price.note != null && (typeof price.note !== 'string' || Buffer.byteLength(price.note) > 256 || /[\u0000-\u001f\u007f-\u009f]/.test(price.note)))))
+        return refuse('Official prices: at most 200, named in 1-256 bytes, priced 0-10000, notes of at most 256 bytes');
       const routes = Object.entries(settings.route_costs ?? {});
-      if (routes.length > 1000 || routes.some(([route, cost]) => {const cut = route.indexOf('/'); return !text(route, 256) || cut < 1 || cut === route.length - 1 || (cost.cost_multiplier != null && !multiplier(cost.cost_multiplier)) || (cost.basis_usd_per_m != null && !(Array.isArray(cost.basis_usd_per_m) && cost.basis_usd_per_m.length === 4 && cost.basis_usd_per_m.every(usd)));}))
-        return refuse('Route costs: at most 1000, named <provider>/<upstream model> in at most 256 bytes, multipliers positive and at most 100, prices 0-10000');
+      if (routes.length > 200 || routes.some(([route, cost]) => {const cut = route.indexOf('/'); return !text(route, 256) || cut < 1 || cut === route.length - 1 || (cost.cost_multiplier != null && !multiplier(cost.cost_multiplier)) || (cost.basis_usd_per_m != null && !(Array.isArray(cost.basis_usd_per_m) && cost.basis_usd_per_m.length === 4 && cost.basis_usd_per_m.every(usd)));}))
+        return refuse('Route costs: at most 200, named <provider>/<upstream model> in at most 256 bytes, multipliers positive and at most 100, prices 0-10000');
       // An official price's time is when its prices last changed; the server stamps it.
       if (settings.official_prices) settings.official_prices = Object.fromEntries(prices.map(([name, price]) => {
         const old = config.settings.official_prices?.[name];
@@ -470,7 +470,10 @@ module.exports = function fixtureApi() {
     if (req.headers['x-admin-background'] !== '1') deadline = Math.min(nowSecs() + IDLE, loginAt + MAX);
     res.setHeader('x-admin-session-expires', String(deadline));
     let body={};
-    if(req.method==='POST') {assert.equal(req.headers['x-csrf-token'],'fixture-csrf'); let raw=''; for await(const chunk of req) raw+=chunk; body=JSON.parse(raw||'{}'); writes.push({endpoint,body});}
+    if(req.method==='POST') {assert.equal(req.headers['x-csrf-token'],'fixture-csrf'); let raw=''; for await(const chunk of req) raw+=chunk;
+      // A publication is read up to 1 MiB (billing's MAX_COMMERCIAL_UPDATE_BYTES).
+      if(endpoint==='commercial-config'&&Buffer.byteLength(raw)>1048576)return reply({success:false,error:'Invalid or oversized body'},400);
+      body=JSON.parse(raw||'{}'); writes.push({endpoint,body});}
     if(endpoint==='me' || (endpoint==='session' && req.method==='GET')) return reply({success:true,role:'admin',username:'admin',csrfToken:'fixture-csrf',expiresAt:deadline,expiresIn:deadline-nowSecs(),twoFactorEnabled:false,totpRequired:false});
     // The code a card has now: the one it was issued with, or its latest from 更换卡密.
     if(endpoint==='cards/reveal') return reply({success:true,rawCode:cards.find(c=>c.id===body.cardId)?.rawCode??'FIXTURE-RECOVERED-CODE'});
