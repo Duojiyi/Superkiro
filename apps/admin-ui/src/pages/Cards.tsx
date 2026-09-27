@@ -2,7 +2,7 @@
 // when cards are selected, and the dialogs to issue, view and adjust cards.
 import {useEffect, useRef, useState, type MouseEvent as ReactMouseEvent} from 'react';
 import {clearAdjustment, isUnsubmittedAdjustmentRejection, isZeroMicroAdjustment, loadAdjustment, saveAdjustment, type Adjustment} from '../adjustment';
-import {adminApi, AdminApiError, type AdminCardItem, type GeneratedCard} from '../api';
+import {adminApi, AdminApiError, type AdminCardItem, type GeneratedCard, type Plan} from '../api';
 import {ask, confirmAction} from '../components/confirm';
 import {IconChevronDown, IconClose, IconSearch, IconSortDown, IconSortUp} from '../components/icons';
 import {Menu, type MenuItem} from '../components/menu';
@@ -12,23 +12,20 @@ import {FilterTabs, IdCell, Pager, StatusBadge, TableState, Tag, TopbarActions, 
 import {formatBatchNote, formatCount, formatCredits, formatFullDateTime, formatMoney, formatRemaining, shortId} from '../format';
 import {cardCodeOf, cardIdForCode} from '../cardCode';
 import {compensation, type Compensation} from '../compensation';
+import {customerView, issuable as planIssuable, MULTI_DEVICE_NOTE, priceMicro} from '../plans';
 import {adjustmentPointsToMicro} from '../pricing';
+import {explainRefusal} from '../refusal';
 import {cardState, cardStatusView} from '../status';
 import CardDrawer from './CardDrawer';
 import {useCardSupport} from './CardSupport';
 import type {CardQuickFilter, CardTab, ErrorAction, Intent, Refresh, ReportError, ReportRoute, Row, WriteGuards} from '../types';
 
-const TIERS = [
-  {id: 'tier-1000', name: 'PRO', points: 1000, price_cny: 30},
-  {id: 'tier-2000', name: 'PRO+', points: 2000, price_cny: 55},
-  {id: 'tier-5000', name: 'PRO Max', points: 5000, price_cny: 130},
-  {id: 'tier-10000', name: 'Power', points: 10000, price_cny: 250},
-];
 const PAGE_SIZE = 50;
 const DAY = 86400;
 // Where a customer downloads the client: in the text 复制发货文本 copies.
 const DOWNLOAD_URL = 'https://kiro.rent';
-const VALIDITY = '激活后 30 天';
+/** A plan's validity as the handout words it: 激活后 30 天. */
+const validity = (days: number) => `激活后 ${days} 天`;
 const ISSUANCE_KEY = 'admin-pending-issuance:v1';
 const REASONS = ['测试卡清理', '退款', '滥用', '客户要求'];
 
@@ -121,12 +118,14 @@ function Devices({card}: {card: AdminCardItem}) {
   </span>;
 }
 
-/** A batch just issued, with what its handout needs: plan, points, group and the note as typed. */
-interface Generated {cards: GeneratedCard[]; tier: string; points: number; groupName: string; note: string}
+/** A batch just issued, with what its handout needs: plan, points, validity, group and the note as typed. */
+interface Generated {cards: GeneratedCard[]; tier: string; points: number; days: number; groupName: string; note: string}
 
-export default function CardsPage({cards, groups, configFailed, loading, failed, operator, refresh, guards, reportError, actionError, onBusyChange, onReauthenticate, selectionEpoch, intent, intentRevision = 0, onRoute, updateCards, onOpenTrace}: {
+export default function CardsPage({cards, groups, plans, configFailed, loading, failed, operator, refresh, guards, reportError, actionError, onBusyChange, onReauthenticate, selectionEpoch, intent, intentRevision = 0, onRoute, updateCards, onOpenTrace}: {
   cards: AdminCardItem[];
   groups: Row[];
+  /** The plan catalog in its order: issuance offers those on sale. */
+  plans: Plan[];
   configFailed: boolean;
   loading: boolean;
   failed: boolean;
@@ -172,7 +171,9 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
   const [showBatch, setShowBatch] = useState(false);
   const [batchCount, setBatchCount] = useState('10');
   const [batchGroup, setBatchGroup] = useState('');
-  const [batchTemplate, setBatchTemplate] = useState('tier-2000');
+  const [batchPlan, setBatchPlan] = useState('tier-2000');
+  // A group the operator picked stays when the plan changes; until then the plan's default is taken.
+  const groupChosen = useRef(false);
   const [batchNote, setBatchNote] = useState('');
   const [generating, setGenerating] = useState(false);
   const [generated, setGenerated] = useState<Generated | null>(null);
@@ -608,10 +609,26 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
   }, [issuableKey]);
   const countValue = Number(batchCount);
   const validCount = /^\d+$/.test(batchCount) && Number.isInteger(countValue) && countValue >= 1 && countValue <= 500;
-  const tier = TIERS.find(item => item.id === batchTemplate);
+  // Plans on sale are offered; one of more than one device is shown but cannot be chosen.
+  const offered = plans.filter(plan => plan.on_sale);
+  const tier = offered.find(plan => plan.id === batchPlan && planIssuable(plan));
+  const offeredKey = offered.filter(planIssuable).map(plan => plan.id).join('\n');
+  useEffect(() => {
+    const ids = offeredKey ? offeredKey.split('\n') : [];
+    setBatchPlan(current => ids.includes(current) ? current : ids.includes('tier-2000') ? 'tier-2000' : ids[0] ?? '');
+  }, [offeredKey]);
+  // The plan's own group, when cards can be issued into it.
+  const presetGroup = (plan: Plan | undefined) => {
+    if (!plan || groupChosen.current || !issuable.some(group => group.id === plan.default_group_id)) return;
+    setBatchGroup(plan.default_group_id);
+  };
+  const choosePlan = (id: string) => {setBatchPlan(id); presetGroup(offered.find(plan => plan.id === id));};
+  const openBatch = () => {reportError(''); groupChosen.current = false; presetGroup(tier); setShowBatch(true);};
   const selectedGroup = issuable.find(group => group.id === batchGroup);
+  const defaultGroup = tier ? groups.find(group => group.id === tier.default_group_id) : undefined;
+  const mismatch = !!tier && !!selectedGroup && tier.default_group_id !== selectedGroup.id;
   const note = batchNote.trim();
-  const generateBlocked = !!issuanceRecovery ? '上次批量生成的结果未确认，请先核对' : !selectedGroup ? '请选择分组' : !validCount ? '请输入 1–500 的整数' : undefined;
+  const generateBlocked = !!issuanceRecovery ? '上次批量生成的结果未确认，请先核对' : !tier ? '没有在售的套餐' : !selectedGroup ? '请选择分组' : !validCount ? '请输入 1–500 的整数' : undefined;
 
   const refreshIssuanceForReview = async () => {
     if (issuanceChecking || writing.current) return;
@@ -634,8 +651,9 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
     if (issuanceRecovery || writing.current || loading || generating || !tier || !selectedGroup || !validCount) return;
     const confirmed = await confirmAction({
       title: `生成 ${countValue} 张 ${tier.name}（${formatCount(tier.points)} 积分）卡密？`,
-      facts: [`套餐：${tier.name} · ${formatCount(tier.points)} 积分`, `分组：${String(selectedGroup.name ?? selectedGroup.id)}`,
-        `合计 ${formatCount(tier.points * countValue)} 积分 · 有效期 30 天（激活起算）· 每张 1 台设备`, ...(note ? [`备注：${note}`] : [])],
+      facts: [`套餐：${tier.name} · ${formatCount(tier.points)} 积分 · 每张 ${formatMoney(priceMicro(tier))}`,
+        `分组：${String(selectedGroup.name ?? selectedGroup.id)}${mismatch ? `（套餐默认是 ${String(defaultGroup?.name ?? tier.default_group_id)}）` : ''}`,
+        `合计 ${formatCount(tier.points * countValue)} 积分 · 有效期 ${tier.validity_days} 天（激活起算）· 每张 1 台设备`, `客户看到：${customerView(tier)}`, ...(note ? [`备注：${note}`] : [])],
       confirmLabel: `生成 ${countValue} 张`,
     });
     if (!confirmed || !alive.current || writing.current || issuanceRecovery) return;
@@ -643,17 +661,20 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
       writing.current = true; setGenerating(true);
       const reference = `批次 ${new Date().toISOString()} ${crypto.randomUUID()}`;
       setIssuanceReference(reference);
-      sessionStorage.setItem(ISSUANCE_KEY, JSON.stringify({reference, count: countValue, group: batchGroup, template: batchTemplate, startedAt: new Date().toISOString()}));
+      sessionStorage.setItem(ISSUANCE_KEY, JSON.stringify({reference, count: countValue, group: batchGroup, template: tier.id, startedAt: new Date().toISOString()}));
       // The batch reference stays in the note, so an unconfirmed batch can still be found.
-      const response = await adminApi.batchCards(countValue, batchGroup, batchTemplate, note ? `${note} · ${reference}` : reference);
+      const response = await adminApi.batchCards(countValue, batchGroup, tier.id, note ? `${note} · ${reference}` : reference);
       if (!response.success) throw new Error('服务器未确认生成结果');
       sessionStorage.removeItem(ISSUANCE_KEY);
       toast.success(`已生成 ${response.cards.length} 张卡密`);
-      setGenerated({cards: response.cards, tier: tier.name, points: tier.points, groupName: String(selectedGroup.name ?? selectedGroup.id), note});
+      // The handout names the plan as the cards keep it (the server's reply), else as it was chosen.
+      const kept = response.cards[0]?.plan;
+      setGenerated({cards: response.cards, tier: kept?.name ?? tier.name, points: kept?.points ?? tier.points, days: kept?.validityDays ?? tier.validity_days,
+        groupName: String(selectedGroup.name ?? selectedGroup.id), note});
       setGeneratedError(''); setShowBatch(false); setBatchNote('');
       await refresh();
     } catch (error) {
-      if (refused(error)) {sessionStorage.removeItem(ISSUANCE_KEY); reportError(`服务端已拒绝，未生成卡密：${errorText(error)}`); return;}
+      if (refused(error)) {sessionStorage.removeItem(ISSUANCE_KEY); reportError(`服务端已拒绝，未生成卡密：${explainRefusal(errorText(error))}`); return;}
       setIssuanceRecovery('refresh'); setShowBatch(false);
       reportError(`没收到生成结果（${errorText(error)}），请先核对列表，不要重复生成。`);
     } finally {writing.current = false; if (alive.current) setGenerating(false);}
@@ -663,11 +684,11 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
   const downloadGenerated = () => {
     if (!generated?.cards.length) return;
     downloadCsv(`generated-cards-${new Date().toISOString().slice(0, 10)}.csv`, [['卡密 ID', '卡密', '套餐', '积分', '有效期', '分组', '备注'],
-      ...generated.cards.map(card => [card.cardId, card.rawCode, generated.tier, generated.points, VALIDITY, generated.groupName, generated.note])]);
+      ...generated.cards.map(card => [card.cardId, card.rawCode, generated.tier, generated.points, validity(generated.days), generated.groupName, generated.note])]);
   };
   // What a seller pastes to the buyer: per card its code, plan, validity and where to get the client.
   const deliveryText = (batch: Generated) => batch.cards.map(card =>
-    [`卡密：${card.rawCode}`, `套餐：${batch.tier}（${formatCount(batch.points)} 积分）`, `有效期：${VALIDITY}`, `下载地址：${DOWNLOAD_URL}`].join('\n')).join('\n\n');
+    [`卡密：${card.rawCode}`, `套餐：${batch.tier}（${formatCount(batch.points)} 积分）`, `有效期：${validity(batch.days)}`, `下载地址：${DOWNLOAD_URL}`].join('\n')).join('\n\n');
   // Issuing needs the server's key, so every card issued keeps its code for 显示卡密; this checks it on the list.
   const recoverable = !!generated && generated.cards.every(card => cards.find(item => item.id === card.cardId)?.codeRecoverable === true);
   // The list as filtered (every page), for reconciling with orders. Never any plaintext code.
@@ -703,7 +724,7 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
   return <div className="page-stack">
     <TopbarActions><Menu label="卡密更多操作" className="btn btn-icon-only" items={[{label: '导出列表（不含明文）', onSelect: exportList}]}/>
       <button type="button" className="btn btn-primary" disabled={!!issuanceRecovery} title={issuanceRecovery ? '上次批量生成的结果未确认，请先在列表上方核对' : undefined}
-      onClick={() => {reportError(''); setShowBatch(true);}}>＋ 批量生成</button></TopbarActions>
+      onClick={openBatch}>＋ 批量生成</button></TopbarActions>
 
     {issuanceRecovery && <section className="recovery-panel" aria-label="制卡结果核对">
       <div>
@@ -826,7 +847,7 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
           })}
           {!filtered.length && <TableState colSpan={9} loading={loading} failed={failed && !cards.length} onRetry={() => void refresh()}
             empty={!cards.length ? '还没有卡密' : '没有匹配的卡密'}
-            action={!cards.length ? <button type="button" className="btn btn-small" onClick={() => setShowBatch(true)}>批量生成</button> : <span className="button-row">
+            action={!cards.length ? <button type="button" className="btn btn-small" onClick={openBatch}>批量生成</button> : <span className="button-row">
               {filtersActive && (search.trim() || groupFilter !== 'ALL' || quick) && <button type="button" className="btn btn-small" disabled={bulkBusy} onClick={resetFilters}>清除筛选</button>}
               {statusTab !== 'ALL' && <button type="button" className="btn btn-small" disabled={bulkBusy} onClick={() => {setStatusTab('ALL');}}>查看全部</button>}
             </span>}/>}
@@ -870,11 +891,14 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
       {actionError && <p role="alert" className="form-error">{actionError}</p>}
       <div className="form-grid">
         <label className="field"><span className="field-label">套餐</span>
-          <select aria-label="积分套餐" value={batchTemplate} disabled={generating} onChange={event => setBatchTemplate(event.target.value)}>
-            {TIERS.map(item => <option key={item.id} value={item.id}>{item.name} · {formatCount(item.points)} 积分 · ¥{item.price_cny}</option>)}
-          </select></label>
+          <select aria-label="积分套餐" value={tier ? batchPlan : ''} disabled={generating || !offered.length} onChange={event => choosePlan(event.target.value)}>
+            {!tier && <option value="" disabled>{offered.length ? '请选择套餐' : '没有在售的套餐'}</option>}
+            {offered.map(item => <option key={item.id} value={item.id} disabled={!planIssuable(item)} title={planIssuable(item) ? undefined : MULTI_DEVICE_NOTE}>
+              {item.name} · {formatCount(item.points)} 积分 · ¥{item.price_cny}{planIssuable(item) ? '' : `（${item.max_devices} 台设备，暂不能发卡）`}</option>)}
+          </select>
+          {!offered.length && <span className="field-hint">在“套餐”里上架一个套餐</span>}</label>
         <label className="field"><span className="field-label">分组</span>
-          <select aria-label="模型与计费分组" value={batchGroup} disabled={generating || !issuable.length} onChange={event => setBatchGroup(event.target.value)}>
+          <select aria-label="模型与计费分组" value={batchGroup} disabled={generating || !issuable.length} onChange={event => {groupChosen.current = true; setBatchGroup(event.target.value);}}>
             <option value="" disabled>{issuable.length ? '请选择分组' : '没有可发卡的分组'}</option>
             {issuable.map(group => <option key={String(group.id)} value={String(group.id)}>{String(group.name ?? group.id)}</option>)}
           </select>
@@ -888,7 +912,9 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
         <label className="field"><span className="field-label">备注</span>
           <input aria-label="备注" maxLength={60} placeholder="例：淘宝 9 月 / 客户张三（可选）" value={batchNote} disabled={generating} onChange={event => setBatchNote(event.target.value)}/></label>
       </div>
-      <p className="batch-summary" aria-label="发卡摘要">合计 {validCount && tier ? formatCount(tier.points * countValue) : '—'} 积分 · 售价合计 {validCount && tier ? formatMoney(tier.price_cny * countValue * 1_000_000) : '—'}（按套餐价） · 每张 1 台设备 · 有效期 30 天（激活起算）</p>
+      {mismatch && tier && selectedGroup && <p className="field-warning batch-mismatch" role="note">这个套餐默认发到「{String(defaultGroup?.name ?? tier.default_group_id)}」{issuable.some(group => group.id === tier.default_group_id) ? '' : '（现在不能发卡）'}，这次发到「{String(selectedGroup.name ?? selectedGroup.id)}」：卡按这个分组的模型和扣费规则使用</p>}
+      <p className="batch-summary" aria-label="发卡摘要">合计 {validCount && tier ? formatCount(tier.points * countValue) : '—'} 积分 · 售价合计 {validCount && tier ? formatMoney(priceMicro(tier) * countValue) : '—'}（按套餐价） · 每张 1 台设备 · 有效期 {tier ? tier.validity_days : '—'} 天（激活起算）</p>
+      {tier && <p className="batch-customer" aria-label="客户看到">客户看到：{customerView(tier)}</p>}
       <div className="modal-actions">
         <button type="button" className="btn" disabled={generating} onClick={() => setShowBatch(false)}>取消</button>
         <button type="button" className="btn btn-primary" disabled={!!generateBlocked || generating || loading} title={generateBlocked} onClick={() => void generate()}>
@@ -945,4 +971,4 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
   </div>;
 }
 
-export {TIERS};
+

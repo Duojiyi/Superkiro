@@ -225,6 +225,33 @@ export interface AdminCardItem {
   rebindCooldownUntil?: number | null;
   /** For a card not yet activated: how long it is valid from its activation (seconds). */
   activationDurationSecs?: number | null;
+  /** The plan it was issued from (for a card issued before the plan catalog, the tier its credits name), what its client calls it and what Kiro is told (newer servers). */
+  planId?: string | null;
+  planName?: string | null;
+  kiroPlanType?: string;
+  /** The plan as it was when the card was issued; null for a card issued before the catalog. */
+  plan?: CardPlan | null;
+}
+
+/** A plan as a card keeps it from its issuance, whatever the catalog becomes. */
+export interface CardPlan {id: string; name: string; points: number; priceMicroCny: number; validityDays: number; maxDevices: number; concurrency: number; kiroPlanType: string}
+
+/**
+ * A plan (套餐) of the catalog cards are issued from: what a card sells for (yuan, to the fen) and
+ * gives, its default group, what Kiro is told it subscribes to, and whether it is on sale.
+ */
+export interface Plan {
+  id: string;
+  name: string;
+  points: number;
+  price_cny: number;
+  validity_days: number;
+  max_devices: number;
+  concurrency: number;
+  default_group_id: string;
+  kiro_plan_type: string;
+  on_sale: boolean;
+  sort_order: number;
 }
 
 /** What a card support action (解封, 解绑设备, 重置换绑次数, 备注, 换分组) answers: the card as it now is. */
@@ -239,6 +266,9 @@ export interface GeneratedCard {
   groupId: string;
   creditTotal: number;
   status: string;
+  /** The plan it was issued from, as the card keeps it (newer servers). */
+  planId?: string | null;
+  plan?: CardPlan | null;
 }
 
 export interface AdminCardsResponse {
@@ -634,11 +664,12 @@ export class AdminApiClient {
     });
   }
 
-  async batchCards(count: number, groupId: string, templateId = 'tier-2000', note?: string): Promise<{ success: boolean; cards: GeneratedCard[] }> {
+  /** Cards issued from a plan; templateId, its older name, is sent too for servers before the catalog. */
+  async batchCards(count: number, groupId: string, planId = 'tier-2000', note?: string): Promise<{ success: boolean; cards: GeneratedCard[] }> {
     if (!groupId?.trim()) throw new Error('请选择模型与计费分组');
     return this.request('/api/v1/admin/cards/batch', {
       method: 'POST',
-      body: JSON.stringify({ count, groupId, templateId, maxDevices: 1, ...(note ? {note} : {}) }),
+      body: JSON.stringify({ count, groupId, planId, templateId: planId, maxDevices: 1, ...(note ? {note} : {}) }),
     });
   }
 
@@ -714,4 +745,7 @@ export interface CommercialConfig {
   rate_cards: Array<Record<string, unknown>>;
   versions: Array<Record<string, unknown>>;
   audit: Array<Record<string, unknown>>;
+  /** The plan catalog in force, by sort order then ID, and the cards issued from each (newer servers). */
+  plans?: Plan[];
+  cards_by_plan?: Record<string, number>;
 }

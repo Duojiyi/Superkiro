@@ -425,6 +425,18 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .failure-breakdown {display: flex; flex-wrap: wrap; align-items: center; gap: 8px 20px; margin-top: 8px;}
 .chips-label {align-self: center; font-size: 12px; color: var(--text-3);}
 .chip.is-static {border-style: dashed;}
+/* 套餐: the catalog, its editor, and what issuance says the customer sees. */
+.plans-table td {vertical-align: middle;}
+.plans-table .mono {font-size: 12px;}
+.plan-tag {margin-left: 6px;}
+.plans-note {margin: 10px 0 0; font-size: 12px;}
+.plan-editor {width: 640px;}
+.plan-editor .form-grid {grid-template-columns: repeat(2, minmax(0, 1fr));}
+.plan-sale {grid-column: 1 / -1;}
+.plan-preview, .batch-customer {margin: 0; padding: 8px 12px; border-radius: 6px; background: var(--info-bg); color: #0a4a8a; font-size: 13px;}
+.batch-mismatch {margin: 0;}
+.card-plan .muted {font-size: 12px;}
+@media (max-width: 640px) {.plan-editor .form-grid {grid-template-columns: minmax(0, 1fr);}}
 /* 存储与账本: a save that failed stops every change and request; otherwise when it last saved. */
 .storage-failure {margin: 0 0 12px; padding: 10px 14px; border: 1px solid #f5b5b0; border-radius: 6px; background: var(--danger-bg); color: #a40e26; font-size: 13px;}
 .storage-failure p {margin: 0;}

@@ -1,6 +1,6 @@
 // The signed-in console: sidebar, topbar, the current page, and the data they share.
 import {useCallback, useEffect, useRef, useState} from 'react';
-import {adminApi, AdminApiError, type AdminAnnouncement, type AdminCardItem, type AdminFinancials, type AdminStats, type AdminTrace, type FinancialSettings, type TraceTotals} from './api';
+import {adminApi, AdminApiError, type AdminAnnouncement, type AdminCardItem, type AdminFinancials, type AdminStats, type AdminTrace, type FinancialSettings, type Plan, type TraceTotals} from './api';
 import CommercialEditor from './CommercialEditor';
 import {ConfirmHost, confirmAction} from './components/confirm';
 import {IconClose, IconRefresh, IconWarning} from './components/icons';
@@ -12,10 +12,12 @@ import AnnouncementsPage from './pages/Announcements';
 import CardsPage from './pages/Cards';
 import FinancePage from './pages/Finance';
 import OverviewPage from './pages/Overview';
+import PlansPage from './pages/Plans';
 import ProvidersPage, {type KeyEditing} from './pages/Providers';
 import SecurityPage from './pages/Security';
 import TracesPage from './pages/Traces';
 import {periodRange} from './period';
+import {planCatalog} from './plans';
 import {publishFailure, type PublishOutcome} from './refusal';
 import {intentOf, OPEN_PARAM, parseRoute, routeHash, routeOf, type Route} from './route';
 import {brokenRoutes, modelName} from './routes';
@@ -24,7 +26,7 @@ import type {ErrorAction, Intent, RefreshOptions, Row, Tab} from './types';
 
 const NAV: Array<{group: string; items: Array<{id: Tab; label: string}>}> = [
   {group: '日常', items: [{id: 'overview', label: '运营概览'}, {id: 'cards', label: '卡密资产'}, {id: 'traces', label: '调用追踪'}]},
-  {group: '配置', items: [{id: 'groups', label: '分组与权益'}, {id: 'models', label: '模型与定价'}, {id: 'providers', label: '供应商与 Key'}, {id: 'announcements', label: '公告管理'}]},
+  {group: '配置', items: [{id: 'groups', label: '分组与权益'}, {id: 'plans', label: '套餐'}, {id: 'models', label: '模型与定价'}, {id: 'providers', label: '供应商与 Key'}, {id: 'announcements', label: '公告管理'}]},
   {group: '财务与安全', items: [{id: 'reconciliation', label: '财务对账'}, {id: 'security', label: '安全与审计'}]},
 ];
 const TITLES = Object.fromEntries(NAV.flatMap(group => group.items.map(item => [item.id, item.label]))) as Record<Tab, string>;
@@ -46,12 +48,15 @@ export interface WorkspaceData {
   groups: Row[];
   models: Row[];
   rateCards: Row[];
+  /** The plan catalog the server keeps (null from a server that sends none), and the cards issued from each. */
+  plans: Plan[] | null;
+  cardsByPlan: Record<string, number> | null;
   settings?: FinancialSettings;
   /** The configuration version the models above belong to: what a publication from outside the editors is checked against. */
   revision?: string;
 }
 
-const EMPTY: WorkspaceData = {stats: null, cards: [], announcements: [], financials: null, financialsToday: null, traces: [], tracesTotals: null, providers: [], providerKeys: [], groups: [], models: [], rateCards: []};
+const EMPTY: WorkspaceData = {stats: null, cards: [], announcements: [], financials: null, financialsToday: null, traces: [], tracesTotals: null, providers: [], providerKeys: [], groups: [], models: [], rateCards: [], plans: null, cardsByPlan: null};
 
 type Section = 'stats' | 'cards' | 'announcements' | 'financials' | 'traces' | 'providers' | 'config';
 const SECTION_NAMES: Record<Section, string> = {stats: '统计', cards: '卡密', announcements: '公告', financials: '财务', traces: '调用追踪', providers: '供应商', config: '配置'};
@@ -207,6 +212,8 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
         groups: config?.success && config.config ? config.config.groups : previous.groups,
         models: config?.success && config.config ? config.config.models : previous.models,
         rateCards: config?.success && config.config ? config.config.rate_cards : previous.rateCards,
+        plans: config?.success && config.config ? config.config.plans ?? null : previous.plans,
+        cardsByPlan: config?.success && config.config ? config.config.cards_by_plan ?? null : previous.cardsByPlan,
         settings: config?.success && config.config?.settings ? config.config.settings : previous.settings,
         revision: config?.success && config.config ? config.config.revision : previous.revision,
       }));
@@ -348,6 +355,8 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
   const down = broken.filter(entry => entry.route.down).length;
   const storage = storageLevel(data.stats);
   const saving = persistence(data.stats);
+  // The plans cards are issued from: the server's catalog, or the four tiers from one that keeps none.
+  const catalog = planCatalog(data.plans, data.groups.map(group => String(group.id)));
   const badges: Partial<Record<Tab, {count: number; tone: 'danger' | 'warning'; text: string}>> = {
     ...(failedLastHour ? {traces: {count: failedLastHour, tone: 'danger' as const, text: `近 1 小时 ${failedLastHour} 次失败`}} : {}),
     ...(broken.length ? {models: {count: broken.length, tone: down ? 'danger' as const : 'warning' as const, text: down ? `${down} 个在售模型无可用线路` : `${broken.length} 个在售模型的主线路不可用`}} : {}),
@@ -419,7 +428,7 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
 
             {activeTab === 'overview' && <OverviewPage data={data} loading={loading} failures={failures} providersLoaded={providersLoaded}
               operator={operator} onNavigate={(tab, next) => void navigate(tab, next)} onRetry={() => void refreshData()}/>}
-            {activeTab === 'cards' && <CardsPage cards={data.cards} groups={data.groups} configFailed={!!failures.config} loading={loading}
+            {activeTab === 'cards' && <CardsPage cards={data.cards} groups={data.groups} plans={catalog} configFailed={!!failures.config} loading={loading}
               failed={!!failures.cards} operator={operator} refresh={refreshData} guards={guards} reportError={reportError}
               actionError={actionError?.text ?? ''} onBusyChange={markPageBusy} onReauthenticate={onReauthenticate}
               selectionEpoch={selectionEpoch} intent={intent.cards} intentRevision={intentRevision} onRoute={reportRoute}
@@ -431,6 +440,8 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
               onCompensate={prefill => void navigate('cards', {cards: {status: 'ALL', search: prefill.cardId, open: prefill.cardId, compensate: prefill}})}/>}
             {activeTab === 'groups' && <CommercialEditor key="groups" kind="groups" onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy}
               cards={data.cards} onPublished={() => void refreshData({keepSelection: true})} refreshEpoch={refreshEpoch}/>}
+            {activeTab === 'plans' && <PlansPage plans={catalog} editable={!!data.plans} cardsByPlan={data.cardsByPlan} groups={data.groups} revision={data.revision}
+              loading={loading} failed={!!failures.config} refresh={refreshData} guards={guards} reportError={reportError} onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy}/>}
             {activeTab === 'models' && <CommercialEditor key="models" kind="models" onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy}
               cards={cardsLoaded ? data.cards : undefined} onPublished={() => void refreshData({keepSelection: true})} refreshEpoch={refreshEpoch} providers={data.providers} providerKeys={data.providerKeys}
               routesKnown={providersLoaded} intent={intent.models}/>}

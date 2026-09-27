@@ -8,7 +8,8 @@ import {daysText, historyDetail, historyLabel, noteProblem, rebindsToReset, rebi
 import {IconChevronDown, IconChevronUp, IconClose, IconCopy} from '../components/icons';
 import {Drawer} from '../components/modal';
 import {copyText, IdCell, StatusBadge, Tag} from '../components/ui';
-import {formatBatchNote, formatCharge, formatCount, formatCredits, formatDateTime, formatExpired, formatFullDateTime, formatRelative, formatRemaining, shortId} from '../format';
+import {formatBatchNote, formatCharge, formatCount, formatCredits, formatDateTime, formatExpired, formatFullDateTime, formatMoney, formatRelative, formatRemaining, shortId} from '../format';
+import {kiroLabel} from '../plans';
 import {CARD_LIMIT_REFUSALS, cardStatusView, traceStatusView, traceStuck} from '../status';
 import type {CardSupport} from './CardSupport';
 
@@ -149,6 +150,10 @@ export default function CardDrawer({card, state, groupName, hasPrev, hasNext, on
         <dt>备注</dt><dd><NoteEditor card={card} disabled={supportBlocked || voided} disabledTitle={voided ? '已作废' : supportTitle} onSave={note => support.saveNote(card, note)}/></dd>
         <dt>分组</dt><dd>{groupName(card.groupId)}
           {!voided && <button type="button" className="btn-text" disabled={supportBlocked} title={supportTitle ?? '换到别的分组（客户需要重新登录）'} onClick={() => support.changeGroup(card)}>换分组</button>}</dd>
+        {(card.plan || card.planName) && <><dt>套餐</dt><dd className="card-plan">{card.plan
+          // As it was when the card was issued: a later change to the plan does not reach this card.
+          ? <><b>{card.plan.name}</b> <span className="muted">{formatCount(card.plan.points)} 积分 · {formatMoney(card.plan.priceMicroCny)} · {card.plan.validityDays} 天 · 同时 {card.plan.concurrency} 个请求 · {kiroLabel(card.plan.kiroPlanType)}</span></>
+          : <><b>{card.planName}</b> <span className="muted" title="套餐目录之前发的卡，按发卡积分对应的档位">{kiroLabel(card.kiroPlanType)} · 按发卡积分对应</span></>}</dd></>}
         <dt>余额</dt><dd><b>{formatCredits(card.pointsAvailable)}</b> / {formatCredits(card.pointsTotal)} 积分
           {shortOf && <span className="balance-short" title={`${formatFullDateTime(shortOf.ts)} 的请求被拒绝：请求开始前要按最大输出预留积分`}>
             余额不够开始 {shortOf.exposed_model || '这个模型'}（约需 {formatCredits(Number(shortOf.needed_micro_credits) / 1_000_000)} 积分）· {formatRelative(shortOf.ts)}</span>}</dd>

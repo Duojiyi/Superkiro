@@ -4,7 +4,7 @@ import type {Compensation} from './compensation';
 
 export type Row = Record<string, unknown>;
 
-export type Tab = 'overview' | 'cards' | 'traces' | 'groups' | 'models' | 'providers' | 'announcements' | 'reconciliation' | 'security';
+export type Tab = 'overview' | 'cards' | 'traces' | 'groups' | 'plans' | 'models' | 'providers' | 'announcements' | 'reconciliation' | 'security';
 
 export type CardTab = 'CURRENT' | 'UNACTIVATED' | 'ACTIVE' | 'FROZEN' | 'BANNED' | 'EXPIRED' | 'ARCHIVED' | 'VOIDED' | 'ALL';
 export type CardQuickFilter = 'expiring' | 'low';

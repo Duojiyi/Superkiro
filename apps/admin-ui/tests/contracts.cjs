@@ -27,7 +27,8 @@ for (const input of ['', '-1', 'NaN', 'Infinity', '1e3', '1.0000001', '900719925
     await api.batchCards(2, group, templateId);
     const call = calls.at(-1);
     assert.equal(call.url, '/api/v1/admin/cards/batch');
-    assert.deepEqual(JSON.parse(call.options.body), {count: 2, groupId: group, templateId, maxDevices: 1});
+    // The plan by its ID, and by templateId, its older name, for a server before the plan catalog.
+    assert.deepEqual(JSON.parse(call.options.body), {count: 2, groupId: group, planId: templateId, templateId, maxDevices: 1});
     assert.equal(call.options.headers.has('Authorization'), false);
     assert.equal(call.options.headers.get('x-csrf-token'), 'test-csrf');
     assert.equal(call.options.credentials, 'same-origin');

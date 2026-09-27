@@ -17,7 +17,7 @@ module.exports = function fixtureApi() {
   // past its date is expired), its rebind allowance, and for a card not yet activated its validity.
   const view = card => {
     const t = Math.floor(Date.now() / 1000);
-    return {...card, effectiveStatus: card.status === 'active' && card.validUntil != null && t >= card.validUntil ? 'expired' : card.status,
+    return {...card, ...cardPlanFields(card), effectiveStatus: card.status === 'active' && card.validUntil != null && t >= card.validUntil ? 'expired' : card.status,
       rebindsUsed: card.rebindsUsed ?? 0, maxRebinds: card.maxRebinds ?? 5, rebindCooldownUntil: card.rebindCooldownUntil > t ? card.rebindCooldownUntil : null,
       activationDurationSecs: card.activatedAt == null ? card.activationDurationSecs ?? 2592000 : null};
   };
@@ -119,9 +119,24 @@ module.exports = function fixtureApi() {
     usage(6, DAY + 3600, 'claude-sonnet', 'fixture-provider', 2000000, 6000), usage(7, DAY + 7200, 'gpt-5', 'fixture-provider', 1800000, 5000),
     usage(8, 10 * DAY, 'claude-sonnet', 'fixture-provider', 4000000, 12000), usage(9, 40 * DAY, 'gpt-5', 'fixture-provider', 6000000, 18000),
   ];
-  // The tiers' list prices, the one table the server and the console take them from.
-  const PLAN_PRICES = [{templateId: 'tier-1000', name: 'PRO', points: 1000, priceMicroCny: 30000000}, {templateId: 'tier-2000', name: 'PRO+', points: 2000, priceMicroCny: 55000000},
-    {templateId: 'tier-5000', name: 'PRO Max', points: 5000, priceMicroCny: 130000000}, {templateId: 'tier-10000', name: 'Power', points: 10000, priceMicroCny: 250000000}];
+  // 套餐 (billing template.rs): the four tiers cards were issued from before the catalog, which a
+  // state that stores no plans still has, and what a card issued before it is taken to be.
+  const TIERS = [['tier-1000', 'PRO', 1000, 30, 'PRO', 10], ['tier-2000', 'PRO+', 2000, 55, 'PRO_PLUS', 20], ['tier-5000', 'PRO Max', 5000, 130, 'PRO_MAX', 30], ['tier-10000', 'Power', 10000, 250, 'POWER', 40]];
+  const seedPlans = () => {
+    const ids = config.groups.map(group => group.id), group = ids.includes('group-pro-plus') ? 'group-pro-plus' : [...ids].sort()[0] ?? 'group-pro-plus';
+    return TIERS.map(([id, name, points, price_cny, kiro_plan_type, sort_order]) => ({id, name, points, price_cny, validity_days: 30, max_devices: 1, concurrency: 2, default_group_id: group, kiro_plan_type, on_sale: true, sort_order}));
+  };
+  // The catalog in force, by sort order then ID; config.plans once a publication has stored them.
+  const catalog = () => [...(config.plans ?? seedPlans())].sort((a, b) => a.sort_order - b.sort_order || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  const legacyTier = card => TIERS.find(([, , points]) => points * 1e6 === card.creditTotal);
+  // A card's plan: the one it was issued from (kept as it was then), else the tier its credits name.
+  const soldAs = card => card.plan ? {id: card.plan.id, name: card.plan.name, points: card.plan.points, price: card.plan.priceMicroCny}
+    : legacyTier(card) ? {id: legacyTier(card)[0], name: legacyTier(card)[1], points: legacyTier(card)[2], price: legacyTier(card)[3] * 1e6} : null;
+  const cardPlanFields = card => {const sold = soldAs(card), tier = legacyTier(card);
+    return {planId: sold?.id ?? null, planName: sold?.name ?? null, kiroPlanType: card.plan?.kiroPlanType ?? tier?.[4] ?? 'CUSTOM', plan: card.plan ?? null};};
+  const cardsByPlan = () => Object.fromEntries(catalog().map(plan => [plan.id, cards.filter(card => soldAs(card)?.id === plan.id).length]));
+  // What GET commercial-config answers: the configuration with its catalog and the cards issued from each plan.
+  const configView = () => ({...config, plans: catalog(), cards_by_plan: cardsByPlan()});
   // GET /financials over [fromSecs, toSecs), as the server computes each block from the ledger and the cards.
   const financials = (from, to) => {
     const t = Math.floor(Date.now() / 1000), face = config.settings.credit_face_value_cny, within = ts => (from === undefined || ts >= from) && (to === undefined || ts < to);
@@ -140,14 +155,21 @@ module.exports = function fixtureApi() {
       uncachedInputTokens: rows.reduce((sum, entry) => sum + entry.input_tokens - entry.cache_read_tokens - entry.cache_write_tokens, 0), outputTokens: rows.reduce((sum, entry) => sum + entry.output_tokens, 0),
       cacheReadTokens: rows.reduce((sum, entry) => sum + entry.cache_read_tokens, 0), cacheWriteTokens: rows.reduce((sum, entry) => sum + entry.cache_write_tokens, 0),
       costMicroCny: rows.reduce((sum, entry) => sum + entry.provider_cost_micro_cny, 0)})).sort((a, b) => b.costMicroCny - a.costMicroCny);
-    // Sales: cards issued (a day before they were activated, as their history says) and activated in the period, at their tier's price.
-    const planOf = card => PLAN_PRICES.findIndex(plan => plan.points * 1e6 === card.creditTotal);
-    const byPlan = PLAN_PRICES.map(plan => ({...plan, issuedCards: 0, activatedCards: 0}));
+    // Sales: cards issued (a day before they were activated, as their history says, or when issued here) and activated in
+    // the period, by plan, each at the price it was sold at (a card issued before the catalog, at its tier's).
+    const row = (id, name, points, price) => ({templateId: id, planId: id, name, points, priceMicroCny: price, issuedCards: 0, activatedCards: 0, issuedValueMicroCny: 0, activatedValueMicroCny: 0});
+    const byPlan = catalog().map(plan => row(plan.id, plan.name, plan.points, Math.round(plan.price_cny * 1e6)));
     const sales = {issuedCards: 0, issuedValueMicroCny: 0, activatedCards: 0, activatedValueMicroCny: 0, unpricedIssuedCards: 0, unpricedActivatedCards: 0, byPlan};
     for (const card of cards) {
-      const plan = planOf(card), issued = (card.activatedAt ?? t) - DAY;
-      if (within(issued) && !(card.status === 'voided' && card.activatedAt == null)) {sales.issuedCards++; if (plan < 0) sales.unpricedIssuedCards++; else {byPlan[plan].issuedCards++; sales.issuedValueMicroCny += byPlan[plan].priceMicroCny;}}
-      if (card.activatedAt != null && within(card.activatedAt)) {sales.activatedCards++; if (plan < 0) sales.unpricedActivatedCards++; else {byPlan[plan].activatedCards++; sales.activatedValueMicroCny += byPlan[plan].priceMicroCny;}}
+      const issued = within(card.issuedAt ?? (card.activatedAt ?? t) - DAY) && !(card.status === 'voided' && card.activatedAt == null), activated = card.activatedAt != null && within(card.activatedAt);
+      if (!issued && !activated) continue;
+      sales.issuedCards += issued ? 1 : 0; sales.activatedCards += activated ? 1 : 0;
+      const sold = soldAs(card);
+      if (!sold) {sales.unpricedIssuedCards += issued ? 1 : 0; sales.unpricedActivatedCards += activated ? 1 : 0; continue;}
+      let plan = byPlan.find(entry => entry.planId === sold.id);
+      if (!plan) {plan = row(sold.id, sold.name, sold.points, sold.price); byPlan.push(plan);}
+      if (issued) {plan.issuedCards++; plan.issuedValueMicroCny += sold.price; sales.issuedValueMicroCny += sold.price;}
+      if (activated) {plan.activatedCards++; plan.activatedValueMicroCny += sold.price; sales.activatedValueMicroCny += sold.price;}
     }
     // Liability: what customers can still use now, whatever the period.
     const usable = cards.filter(card => card.archivedAt == null && !['expired', 'voided', 'banned'].includes(view(card).effectiveStatus));
@@ -159,7 +181,8 @@ module.exports = function fixtureApi() {
       estimates: {retainedLedgerOnly: true, usageFaceValueMicroCny: income, configuredProviderCostMicroCny: cost, faceValueLessCostMicroCny: uncosted ? null : income - cost,
         faceValueMarginPercentage: !uncosted && income > 0 ? (income - cost) / income * 100 : null, costedRequests: costed.length, uncostedRequests: uncosted},
       dashboard: {total_requests: entries.length, total_credits_charged: credits, revenue_micro_cny: income, provider_cost_micro_cny: cost, gross_profit_micro_cny: income - cost, gross_margin_percentage: income > 0 ? (income - cost) / income * 100 : 0},
-      modelRankings: rankings, byProvider, sales, liability, planPrices: PLAN_PRICES,
+      modelRankings: rankings, byProvider, sales, liability,
+      planPrices: catalog().map(plan => ({templateId: plan.id, planId: plan.id, name: plan.name, points: plan.points, priceMicroCny: Math.round(plan.price_cny * 1e6), onSale: plan.on_sale})),
       margin: {costedRequests: costed.length, costedCredits: costed.reduce((sum, entry) => sum + entry.credits_charged, 0), revenueMicroCny: costedIncome, costMicroCny: costedCost,
         grossProfitMicroCny: costedIncome - costedCost, marginPercentage: costedIncome > 0 ? (costedIncome - costedCost) / costedIncome * 100 : null,
         uncostedRequests: uncosted, uncostedCredits: entries.filter(entry => !entry.rate_card_version).reduce((sum, entry) => sum + entry.credits_charged, 0)}};
@@ -203,10 +226,47 @@ module.exports = function fixtureApi() {
   const refuse = message => ({status: 409, body: {success: false, error: `Invalid billing state: ${message}`}});
   const serves = (providerId, model, among = keys) => providers.some(p => p.id === providerId && p.enabled !== false)
     && among.some(k => k.provider_id === providerId && k.enabled !== false && (!Array.isArray(k.allowed_models) || k.allowed_models.includes(model)));
+  // Each field of a published plan is bounded as billing's Plan::problem bounds it.
+  const PLAN_FIELDS = ['id', 'name', 'points', 'price_cny', 'validity_days', 'max_devices', 'concurrency', 'default_group_id', 'kiro_plan_type', 'on_sale', 'sort_order'];
+  const planProblem = plan => {
+    const whole = (value, min, max) => Number.isInteger(value) && value >= min && value <= max, fen = plan.price_cny * 100;
+    if (typeof plan.id !== 'string' || !/^[a-z0-9-]{1,64}$/.test(plan.id)) return 'Plan IDs are 1-64 of a-z, 0-9 and -';
+    if (typeof plan.name !== 'string' || !plan.name.trim() || Buffer.byteLength(plan.name) > 32 || /[\u0000-\u001f\u007f-\u009f]/.test(plan.name)) return 'Plan names are 1-32 bytes';
+    if (!whole(plan.points, 1, 10000000)) return 'Plan points must be 1-10000000';
+    if (typeof plan.price_cny !== 'number' || !(plan.price_cny >= 0 && plan.price_cny <= 100000) || Math.abs(Math.round(fen) - fen) > 1e-6) return 'Plan prices must be 0-100000 yuan, to the fen';
+    if (!whole(plan.validity_days, 1, 3650)) return 'Plan validity must be 1-3650 days';
+    if (!whole(plan.max_devices, 1, 10)) return 'Plans allow 1-10 devices';
+    if (!whole(plan.concurrency, 1, 20)) return 'Plan concurrency must be 1-20';
+    if (!['PRO', 'PRO_PLUS', 'PRO_MAX', 'POWER', 'CUSTOM'].includes(plan.kiro_plan_type)) return 'Plan Kiro types are PRO, PRO_PLUS, PRO_MAX, POWER or CUSTOM';
+    return null;
+  };
   const publish = body => {
     if (body.expected_revision !== config.revision) return refuse('Configuration changed; reload before publishing');
     if (typeof body.reason !== 'string' || !body.reason.trim()) return refuse('Publication reason required (max 500 bytes)');
     const t = Math.floor(Date.now() / 1000);
+    // Plans: the first publication that changes one stores the catalog, the seed with it; only those listed are checked.
+    let nextPlans;
+    if ((body.plans || []).length || (body.removed_plans || []).length) {
+      const plans = (config.plans ?? seedPlans()).map(plan => ({...plan})), listed = new Set(), groupIds = [...config.groups, ...(body.groups || [])].map(group => group.id);
+      for (const plan of body.plans || []) {
+        assert.deepEqual(Object.keys(plan).sort(), [...PLAN_FIELDS].sort(), 'a plan is published with every field');
+        const problem = planProblem(plan);
+        if (problem) return refuse(`${problem}: ${plan.id}`);
+        if (listed.has(plan.id)) return refuse(`Duplicate plan: ${plan.id}`);
+        listed.add(plan.id);
+        if (!groupIds.includes(plan.default_group_id)) return refuse(`Unknown default group of plan: ${plan.id}`);
+        const index = plans.findIndex(old => old.id === plan.id);
+        if (index >= 0) plans[index] = {...plan}; else plans.push({...plan});
+      }
+      for (const id of body.removed_plans || []) {
+        const index = plans.findIndex(plan => plan.id === id);
+        if (index < 0) return refuse(`Unknown plan: ${id}`);
+        if (cards.some(card => soldAs(card)?.id === id)) return refuse(`Plans cards were issued from can only be taken off sale: ${id}`);
+        plans.splice(index, 1);
+      }
+      if (plans.length > 100) return refuse('At most 100 plans');
+      nextPlans = plans.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    }
     for (const m of body.models || []) for (const id of [m.exposed_model_id, ...(m.aliases || [])]) if (!/^[A-Za-z0-9._:/-]{1,128}$/.test(String(id))) return refuse(`Invalid model ID: ${id}`);
     // Only the entries in this publication are checked: a shown, unretired one needs its primary target to serve.
     const stranded = (body.models || []).filter(m => m.visible !== false && m.retired !== true && !serves(m.target_provider_id, m.target_model)).map(m => m.exposed_model_id);
@@ -227,8 +287,9 @@ module.exports = function fixtureApi() {
     config.versions = [...config.versions.filter(row => !(body.cancelled_versions || []).includes(row.id)), ...versions];
     if (body.groups) config.groups = [...config.groups.filter(row => !body.groups.some(next => next.id === row.id)), ...body.groups];
     config.models = nextModels.filter(row => !(body.removed_models || []).includes(row.id));
+    if (nextPlans) config.plans = nextPlans;
     config.revision = `fixture-rev-${Number(config.revision.split('-').pop()) + 1}`;
-    return {status: 200, body: {success: true, config}};
+    return {status: 200, body: {success: true, config: configView()}};
   };
   let authenticated = false, deadline = 0, loginAt = 0;
   const IDLE = 1800, MAX = 8 * 3600;
@@ -290,10 +351,10 @@ module.exports = function fixtureApi() {
     if(endpoint==='commercial-config') {
       if(req.method==='POST') {
         if(body.settings){assert.deepEqual(Object.keys(body).sort(),['expected_revision','reason','settings']);assert.deepEqual(Object.keys(body.settings).sort(),['credit_face_value_cny','usd_cny_rate']);}
-        assert.ok(Object.keys(body).every(key=>['expected_revision','reason','settings','groups','models','rate_cards','versions','removed_models','cancelled_versions'].includes(key)));
+        assert.ok(Object.keys(body).every(key=>['expected_revision','reason','settings','groups','models','rate_cards','versions','removed_models','cancelled_versions','plans','removed_plans'].includes(key)));
         const result=publish(body);return reply(result.body,result.status);
       }
-      return reply({success:true,config});
+      return reply({success:true,config:configView()});
     }
     if(endpoint==='providers') return reply({success:true,providers,keys});
     if(endpoint==='providers/status') {const provider=providers.find(p=>p.id===body.providerId);if(!provider)return reply({success:false,error:'Unknown provider'},404);provider.enabled=body.enabled;return reply({success:true,providerId:provider.id,enabled:provider.enabled});}
@@ -337,10 +398,24 @@ module.exports = function fixtureApi() {
     }
     if(endpoint==='announcements') return reply({success:true,announcements:[{id:'fixture-notice',title:'本地测试：服务维护通知',content:'这是隔离的视觉测试公告，不会向真实用户发布。',level:'info',enabled:true,created_at:now}]});
     if(endpoint==='cards/batch') {
-      assert.equal(body.maxDevices,1); assert.equal('creditTotal' in body,false); assert.ok(groups.some(g=>g.id===body.groupId));
-      const points=Number(body.templateId.replace('tier-','')); assert.ok([1000,2000,5000,10000].includes(points));
-      const generated=Array.from({length:body.count},(_,i)=>({cardId:`fixture-issued-${cards.length+i}`,rawCode:`FIXTURE-NOT-VALID-${points}-${i}`,groupId:body.groupId,creditTotal:points*1000000,status:'unactivated'}));
-      generated.forEach(c=>cards.push({id:c.cardId,codeRecoverable:true,status:c.status,creditTotal:c.creditTotal,creditUsed:0,availableCredits:c.creditTotal,pointsTotal:points,pointsAvailable:points,boundDevices:[],maxDevices:1,groupId:c.groupId,note:body.note}));
+      // As the server issues: from a plan (planId, or its older name templateId), refused as InvalidRequestException.
+      const invalid=message=>reply({__type:'InvalidRequestException',message},400);
+      assert.equal(body.maxDevices,1); assert.equal('creditTotal' in body,false);
+      if(!(body.count>=1&&body.count<=1000))return invalid('count must be between 1 and 1000');
+      if(!body.groupId)return invalid('Select an issuance group explicitly');
+      if(body.planId&&body.templateId&&body.planId!==body.templateId)return invalid('planId and templateId name different plans');
+      const planId=body.planId??body.templateId??'standard-monthly';
+      const plan=catalog().find(p=>p.id===planId)??(planId==='standard-monthly'?catalog().find(p=>p.id==='tier-2000'):undefined);
+      if(!plan)return invalid('unknown plan');
+      if(!plan.on_sale)return invalid('plan is not on sale');
+      if(plan.max_devices!==1)return invalid('cards have one device; issue from a plan with max_devices 1');
+      const group=config.groups.find(g=>g.id===body.groupId);
+      if(!group||group.issuance_enabled===false)return invalid("issuance requires an enabled group, the plan's credits, and maxDevices=1");
+      const kept={id:plan.id,name:plan.name,points:plan.points,priceMicroCny:Math.round(plan.price_cny*1e6),validityDays:plan.validity_days,maxDevices:plan.max_devices,concurrency:plan.concurrency,kiroPlanType:plan.kiro_plan_type};
+      const t=Math.floor(Date.now()/1000);
+      const generated=Array.from({length:body.count},(_,i)=>({cardId:`fixture-issued-${cards.length+i}`,rawCode:`FIXTURE-NOT-VALID-${plan.points}-${i}`,groupId:body.groupId,creditTotal:plan.points*1000000,maxDevices:1,virtualPlanName:plan.name,status:'unactivated',planId:plan.id,plan:kept}));
+      generated.forEach(c=>cards.push({id:c.cardId,codeRecoverable:true,status:c.status,creditTotal:c.creditTotal,creditUsed:0,availableCredits:c.creditTotal,pointsTotal:plan.points,pointsAvailable:plan.points,boundDevices:[],maxDevices:1,groupId:c.groupId,note:body.note,
+        activationDurationSecs:plan.validity_days*86400,issuedAt:t,plan:kept}));
       return reply({success:true,cards:generated});
     }
     // Card support, as the admin API answers: refusals are {success:false, error} in the server's words

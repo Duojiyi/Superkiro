@@ -7,7 +7,7 @@ import type {Intent, Tab} from './types';
 
 export interface Route {tab: Tab; params: Record<string, string>}
 
-const PATHS: Record<Tab, string> = {overview: 'overview', cards: 'cards', traces: 'traces', groups: 'groups', models: 'models',
+const PATHS: Record<Tab, string> = {overview: 'overview', cards: 'cards', traces: 'traces', groups: 'groups', plans: 'plans', models: 'models',
   providers: 'providers', announcements: 'announcements', reconciliation: 'finance', security: 'security'};
 
 type Check = (value: string) => boolean;
