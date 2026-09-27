@@ -554,7 +554,7 @@ impl GenerateAssistantResponseHandler {
                                 "ThrottlingException",
                                 "DAILY_REQUEST_COUNT",
                                 &format!(
-                                    "今日积分用量已达上限：上限 {}，今日已用 {}，本次需预留 {}。请明天再试。",
+                                    "今日积分用量已达上限：上限 {}，今日已用 {}，本次需预留 {}。每日用量按 UTC 日统计，北京时间每天 08:00 重置，请重置后再试。",
                                     credits(limit),
                                     credits(current),
                                     credits(needed)

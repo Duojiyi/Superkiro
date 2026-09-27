@@ -170,13 +170,19 @@ impl Plan {
 }
 
 /// The plans a state that has stored none has: the four tiers as they were issued before
-/// the catalog, 30 days, one device, two requests at once, into group-pro-plus (or, without
-/// it, the first group by ID).
+/// the catalog, 30 days, one device, two requests at once, into group-pro-plus or, without
+/// it, the first group by ID that takes cards: never one closed to issuance, such as the
+/// acceptance probe group, which no customer is in.
 pub fn seed_plans(groups: &HashMap<String, Group>) -> Vec<Plan> {
     let default_group = if groups.contains_key("group-pro-plus") {
         "group-pro-plus"
     } else {
-        groups.keys().min().map_or("group-pro-plus", String::as_str)
+        groups
+            .values()
+            .filter(|group| group.issuance_enabled)
+            .map(|group| group.id.as_str())
+            .min()
+            .unwrap_or("group-pro-plus")
     };
     PLAN_PRICES
         .iter()

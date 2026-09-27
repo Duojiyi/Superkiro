@@ -1588,6 +1588,26 @@ fn sales_count_cards_issued_and_activated_in_the_period_at_list_price() {
         refunded,
     ];
     let plans = billing::template::seed_plans(&Default::default());
+    // Without group-pro-plus, the first group that takes cards: never the acceptance group,
+    // closed to issuance, however it sorts.
+    let mut probe = billing::Group::pro_plus("group-acceptance", "Acceptance");
+    probe.issuance_enabled = false;
+    let groups: std::collections::HashMap<_, _> = [
+        (probe.id.clone(), probe.clone()),
+        (
+            "group-retail".to_string(),
+            billing::Group::pro_plus("group-retail", "Retail"),
+        ),
+    ]
+    .into();
+    let seeded = billing::template::seed_plans(&groups);
+    assert!(seeded
+        .iter()
+        .all(|plan| plan.default_group_id == "group-retail"));
+    let only_probe = [(probe.id.clone(), probe)].into();
+    assert!(billing::template::seed_plans(&only_probe)
+        .iter()
+        .all(|plan| plan.default_group_id == "group-pro-plus"));
     let sales = billing::observability::compute_sales(cards.iter(), &plans, Some(100), Some(200));
     // Issued in [100, 200): pro, pro-plus, custom and the refunded card; the misprint was
     // voided unsold, "later" is at the end of the period and "power" before it.

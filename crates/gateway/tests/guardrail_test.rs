@@ -271,8 +271,11 @@ async fn test_gateway_daily_and_monthly_quota_rejection() {
     let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(json["__type"], "ThrottlingException");
     assert_eq!(json["reason"], "DAILY_REQUEST_COUNT");
-    assert!(json["message"]
-        .as_str()
-        .unwrap()
-        .contains("今日积分用量已达上限"));
+    let message = json["message"].as_str().unwrap();
+    assert!(message.contains("今日积分用量已达上限"), "{message}");
+    // The day is the UTC day, which ends at 08:00 in Beijing.
+    assert!(
+        message.contains("按 UTC 日统计，北京时间每天 08:00 重置"),
+        "{message}"
+    );
 }
