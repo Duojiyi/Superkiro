@@ -10,6 +10,60 @@ tokio::task_local! {
     pub static EMPTY_ATTEMPT: std::sync::Mutex<Option<EmptyAttempt>>;
 }
 
+/// How long an upstream may take: its response headers, one attempt through the model's
+/// start, every attempt of the request, and a silence once the answer has begun (every
+/// line counts, pings included). Kiro abandons a request that sends it nothing for 60
+/// seconds (KIRO_CONVERSE_REQUEST_TIMEOUT_MS), and the whole start is silence to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpstreamLimits {
+    pub headers: Duration,
+    pub attempt: Duration,
+    pub total: Duration,
+    pub idle: Duration,
+}
+
+impl UpstreamLimits {
+    const STANDARD: Self = Self {
+        headers: Duration::from_secs(15),
+        attempt: Duration::from_secs(65),
+        total: Duration::from_secs(150),
+        idle: Duration::from_secs(90),
+    };
+    /// A model that reasons before it answers: some upstreams hold their response headers
+    /// until the model has produced something, which took three 15-second tries to fail,
+    /// and an OpenAI-format upstream sends nothing while the model reasons.
+    const REASONING: Self = Self {
+        headers: Duration::from_secs(45),
+        attempt: Duration::from_secs(90),
+        total: Duration::from_secs(150),
+        idle: Duration::from_secs(180),
+    };
+
+    /// The watchdog for an answer in progress.
+    pub fn watchdog(&self) -> WatchdogConfig {
+        WatchdogConfig {
+            ttfb_timeout: self.attempt,
+            idle_timeout: self.idle,
+            ..WatchdogConfig::default()
+        }
+    }
+
+    pub fn for_request(request: &ChatRequest) -> Self {
+        Self::for_model(&request.model, request.reasoning_effort)
+    }
+
+    pub fn for_model(
+        model: &str,
+        effort: Option<kiro_wire::requests::conversation::ReasoningEffort>,
+    ) -> Self {
+        if super::family::family(model).reasons(effort) {
+            Self::REASONING
+        } else {
+            Self::STANDARD
+        }
+    }
+}
+
 /// An attempt that ended with an ordinary stop and nothing in it, after reporting usage.
 /// It is retried, but the upstream consumed its input: when no attempt of the request
 /// produces output, the request is billed what this one reported.
@@ -63,11 +117,12 @@ fn retryable(error: &ProviderError) -> bool {
     }
 }
 
-/// Prime the stream through its first delta. Failed-attempt usage is discarded, except
+/// Prime the stream through the model's start. Failed-attempt usage is discarded, except
 /// that of an empty attempt, kept in [`EMPTY_ATTEMPT`], while the caller owns a single
 /// reservation across attempts. Dropping this
 /// future drops the provider receiver and cancels the underlying HTTP pump.
-/// The first delta (including reasoning/tool fragments) permanently ends retries.
+/// The model's start, or its first delta (including reasoning/tool fragments), permanently
+/// ends retries: a request the model has started is being worked on, and billed, upstream.
 pub async fn start_stream(
     provider: &dyn ModelProvider,
     client: &reqwest::Client,
@@ -75,18 +130,26 @@ pub async fn start_stream(
     request: &ChatRequest,
     max_attempts: usize,
 ) -> Result<BoxStream<'static, Result<ProviderStreamEvent, ProviderError>>, ProviderError> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
+    let limits = UpstreamLimits::for_request(request);
+    let deadline = tokio::time::Instant::now() + limits.total;
     let attempts = max_attempts.clamp(1, 3);
     for attempt in 0..attempts {
         let started = std::time::Instant::now();
         let prime = async {
             let upstream = provider.chat_stream(client, config, request).await?;
-            let mut upstream = Box::pin(WatchdogStream::new(upstream, WatchdogConfig::default()));
+            let mut upstream = Box::pin(WatchdogStream::new(upstream, limits.watchdog()));
             let mut prefix = Vec::new();
             let (mut stop_reason, mut metered) = (None, false);
             while let Some(event) = upstream.next().await {
                 let event = event?;
-                let output = matches!(event, ProviderStreamEvent::Delta(_));
+                // Liveness for the watchdog, nothing to keep.
+                if event == ProviderStreamEvent::Heartbeat {
+                    continue;
+                }
+                let output = matches!(
+                    event,
+                    ProviderStreamEvent::Delta(_) | ProviderStreamEvent::Started
+                );
                 if let ProviderStreamEvent::StopReason(reason) = &event {
                     stop_reason = Some(reason.clone());
                 }
@@ -138,7 +201,7 @@ pub async fn start_stream(
             }
             Err(ProviderError::StreamDisconnected)
         };
-        let attempt_deadline = deadline.min(tokio::time::Instant::now() + Duration::from_secs(65));
+        let attempt_deadline = deadline.min(tokio::time::Instant::now() + limits.attempt);
         let result = tokio::time::timeout_at(attempt_deadline, prime)
             .await
             .unwrap_or(Err(ProviderError::Timeout));
@@ -310,6 +373,83 @@ mod tests {
         .is_err());
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     }
+    /// Upstream that starts its answer, then fails: the model was working on the request.
+    struct StartsThenFails {
+        calls: AtomicUsize,
+    }
+    impl ModelProvider for StartsThenFails {
+        fn name(&self) -> &'static str {
+            "starts-then-fails"
+        }
+        fn endpoint_url(&self, _: &str) -> String {
+            String::new()
+        }
+        fn translate_request(&self, _: &ChatRequest) -> Result<serde_json::Value, ProviderError> {
+            unreachable!()
+        }
+        fn parse_stream_line(&self, _: &str) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
+            unreachable!()
+        }
+        fn extract_usage(&self, _: &serde_json::Value) -> Option<TokenUsage> {
+            None
+        }
+        fn chat_stream<'a>(
+            &'a self,
+            _: &'a reqwest::Client,
+            _: &'a ProviderConfig,
+            _: &'a ChatRequest,
+        ) -> BoxFuture<
+            'a,
+            Result<BoxStream<'static, Result<ProviderStreamEvent, ProviderError>>, ProviderError>,
+        > {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(ProviderStreamEvent::Heartbeat),
+                    Ok(ProviderStreamEvent::Started),
+                    Err(ProviderError::StreamDisconnected),
+                ])) as BoxStream<'static, _>)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_the_model_has_started_is_not_retried() {
+        let provider = StartsThenFails {
+            calls: AtomicUsize::new(0),
+        };
+        let mut output = start_stream(
+            &provider,
+            &reqwest::Client::new(),
+            &ProviderConfig::new("", "", "test", Duration::from_secs(5)),
+            &request(),
+            3,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            output.next().await.unwrap().unwrap(),
+            ProviderStreamEvent::Started
+        );
+        assert!(output.next().await.unwrap().is_err());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn models_that_reason_first_get_longer_to_start() {
+        let mut request = request();
+        request.model = "claude-opus-5-5".into();
+        let reasoning = UpstreamLimits::for_request(&request);
+        request.model = "gpt-4o".into();
+        let standard = UpstreamLimits::for_request(&request);
+        assert_eq!(standard.headers, Duration::from_secs(15));
+        assert!(reasoning.headers > standard.headers);
+        assert!(reasoning.attempt > standard.attempt);
+        assert!(reasoning.idle > standard.idle);
+        request.reasoning_effort = Some(kiro_wire::requests::conversation::ReasoningEffort::Low);
+        assert_eq!(UpstreamLimits::for_request(&request), reasoning);
+    }
+
     #[test]
     fn permanent_and_rate_limit_errors_are_not_blindly_retried() {
         for status in [400, 401, 403, 404, 429] {

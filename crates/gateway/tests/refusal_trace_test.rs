@@ -331,7 +331,7 @@ async fn each_refusal_before_routing_is_traced_and_charged_nothing() {
             "inv-offline",
             "offline-model",
             plain,
-            StatusCode::BAD_GATEWAY,
+            StatusCode::BAD_REQUEST,
             "no_route",
             "offline-model",
         ),
@@ -396,7 +396,8 @@ async fn each_refusal_before_routing_is_traced_and_charged_nothing() {
 
 /// A request the card's own limits refuse — its balance, its concurrency, its daily or
 /// monthly limit — leaves a trace too, with what it needed for want of balance. The
-/// customer's response is as it was.
+/// customer gets the form Kiro shows in words: a balance refusal is a ValidationException
+/// (402 read as "Something went wrong"), the limits carry the reasons Kiro knows.
 #[tokio::test]
 async fn refusals_for_the_cards_own_limits_are_traced_and_charged_nothing() {
     let upstream = upstream(200).await;
@@ -428,8 +429,8 @@ async fn refusals_for_the_cards_own_limits_are_traced_and_charged_nothing() {
         (
             "inv-broke",
             |card| card.credit_total = 10,
-            StatusCode::PAYMENT_REQUIRED,
-            "InsufficientCreditException",
+            StatusCode::BAD_REQUEST,
+            "积分余额不足",
             "insufficient_balance",
         ),
         (
@@ -443,14 +444,14 @@ async fn refusals_for_the_cards_own_limits_are_traced_and_charged_nothing() {
             "inv-daily",
             |card| card.daily_credit_limit = Some(0),
             StatusCode::TOO_MANY_REQUESTS,
-            "DAILY_LIMIT_EXCEEDED",
+            "DAILY_REQUEST_COUNT",
             "usage_limit",
         ),
         (
             "inv-monthly",
             |card| card.monthly_credit_limit = Some(0),
             StatusCode::TOO_MANY_REQUESTS,
-            "MONTHLY_LIMIT_EXCEEDED",
+            "MONTHLY_REQUEST_COUNT",
             "usage_limit",
         ),
     ];
@@ -478,8 +479,11 @@ async fn refusals_for_the_cards_own_limits_are_traced_and_charged_nothing() {
             assert_eq!(trace.available_micro_credits, Some(10));
             let needed = trace.needed_micro_credits.unwrap();
             assert!(needed > 10, "{needed}");
+            // In credits, as the customer reads them.
+            let needed_credits = format!("{:.2}", needed as f64 / 1_000_000.0);
             assert!(
-                body.contains(&format!("available 10 micro-credits, needed {needed}")),
+                body.contains(&format!("本次请求需预留 {needed_credits}"))
+                    && body.contains("当前可用 0.00"),
                 "{body}"
             );
         } else {

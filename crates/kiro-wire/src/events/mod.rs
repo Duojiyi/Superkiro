@@ -9,7 +9,7 @@ pub mod tool_use;
 
 pub use assistant::AssistantResponseEvent;
 pub use context_usage::ContextUsageEvent;
-pub use metadata::{MetadataEvent, TokenUsage};
+pub use metadata::{MetadataEvent, Refusal, StopDetails, TokenUsage};
 pub use metering::MeteringEvent;
 pub use reasoning::ReasoningContentEvent;
 pub use tool_use::ToolUseEvent;

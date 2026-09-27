@@ -325,7 +325,7 @@ async fn earlier_screenshots_do_not_count_toward_the_prompt_length() {
         4
     );
 
-    // Text still counts.
+    // Text still counts, and Kiro is told the prompt is too long, so it compacts.
     let (status, body) = h
         .send(json!({"conversationState": {
             "conversationId": "conv-vision",
@@ -336,7 +336,8 @@ async fn earlier_screenshots_do_not_count_toward_the_prompt_length() {
         }}))
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(body.contains("Prompt content too long"), "{body}");
+    assert!(body.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD"), "{body}");
+    assert!(body.contains("Input is too long"), "{body}");
 }
 
 /// A configured degradation path must actually run. Before the capability sources

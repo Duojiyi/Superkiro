@@ -5,7 +5,7 @@ pub mod tool;
 
 pub use conversation::{
     ConversationState, CurrentMessage, GenerateAssistantResponseRequest, HistoryAssistantMessage,
-    HistoryUserMessage, KiroImage, KiroImageSource, Message, UserInputMessage,
-    UserInputMessageContext,
+    HistoryUserMessage, KiroDocument, KiroDocumentSource, KiroImage, KiroImageSource, Message,
+    UserInputMessage, UserInputMessageContext,
 };
 pub use tool::{Tool, ToolResult, ToolSpecification, ToolUseEntry};

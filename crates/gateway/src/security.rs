@@ -318,7 +318,14 @@ impl BruteForceProtector {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContentGuardrailConfig {
-    /// Maximum overall HTTP request body size (default: 10MB).
+    /// Largest conversation request body read (default: 32 MB). Kiro sends every image in
+    /// a conversation again with each turn, so a long session with screenshots outgrows
+    /// 10 MB; a larger body is refused as too long, which Kiro compacts the conversation
+    /// for. A request is held about three times over while it is read, parsed and archived,
+    /// so one at the limit peaks near 100 MB besides the upstream request, which the
+    /// 20-image window keeps small, and the large-body gate
+    /// ([`crate::guardrail::LargeBodyGate`]) holds two bodies over 10 MB at a time. 32 MB
+    /// is also the most an Anthropic request may be.
     pub max_body_bytes: usize,
     /// Maximum number of images allowed in a single conversation turn (default: 20).
     pub max_images_per_request: usize,
@@ -333,7 +340,7 @@ pub struct ContentGuardrailConfig {
 impl Default for ContentGuardrailConfig {
     fn default() -> Self {
         Self {
-            max_body_bytes: 10 * 1024 * 1024, // 10 MB
+            max_body_bytes: 32 * 1024 * 1024, // 32 MB
             max_images_per_request: 20,
             max_image_bytes: crate::translate::images::MAX_IMAGE_PAYLOAD_BYTES,
             max_prompt_chars: 2_000_000,
@@ -355,8 +362,30 @@ pub enum GuardrailError {
     #[error("Prompt content too long: {actual} characters exceeds limit of {max}")]
     PromptTooLong { actual: usize, max: usize },
 
+    #[error("Conversation history too long: {actual} messages exceeds limit of {max}")]
+    HistoryTooLong { actual: usize, max: usize },
+
+    #[error("conversationId must be 1 to 256 characters")]
+    InvalidConversationId,
+
     #[error("Image is not a readable PNG, JPEG, GIF or WebP image")]
     InvalidImage,
+}
+
+impl GuardrailError {
+    /// Why the request is too long to send, when that is the refusal: Kiro compacts the
+    /// conversation for it.
+    pub fn overflow_detail(&self) -> Option<String> {
+        match self {
+            Self::PromptTooLong { actual, max } => Some(format!(
+                "请求内容共 {actual} 个字符，超过网关 {max} 个字符的上限"
+            )),
+            Self::HistoryTooLong { actual, max } => Some(format!(
+                "对话历史共 {actual} 条消息，超过网关 {max} 条的上限"
+            )),
+            _ => None,
+        }
+    }
 }
 
 impl ContentGuardrailConfig {

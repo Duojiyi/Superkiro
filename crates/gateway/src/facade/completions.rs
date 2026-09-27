@@ -7,9 +7,11 @@
 //! 2. **Token & Rate Limit Consumption**: Autocomplete triggers on typing pauses (20-50 req/min).
 //!    Routing completions to billable frontier models exhausts user credits and provider rate limits.
 //! 3. **Architectural Modes**:
-//!    - `Throttled` (Default): Returns HTTP 429 with `reason: "MONTHLY_REQUEST_COUNT"`.
-//!      Kiro's native runtime cleanly captures this and displays a non-disruptive message without retrying.
-//!    - `Empty`: Returns HTTP 200 `{"completions": []}` for completely silent no-op.
+//!    - `Empty` (Default): Returns HTTP 200 `{"completions": []}` for a completely silent
+//!      no-op, as when the model has nothing to suggest.
+//!    - `Throttled`: Returns HTTP 429 with `reason: "MONTHLY_REQUEST_COUNT"`. Kiro answers it
+//!      with an error popup, "Autocomplete Failed: Maximum Kiro usage reached for this
+//!      month.", for every completion it asks for.
 //!    - `Forward`: Forwards FIM context to a dedicated fast, cheap completion model or local endpoint.
 
 use super::{BoxFuture, FacadeHandler, Response};
@@ -25,10 +27,13 @@ use std::time::Duration;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AutocompleteMode {
-    /// Returns HTTP 429 ThrottlingException with MONTHLY_REQUEST_COUNT (Spec §2.5, P0-7 default).
-    #[default]
+    /// Returns HTTP 429 ThrottlingException with MONTHLY_REQUEST_COUNT, which Kiro shows as
+    /// an error popup each time.
     Throttled,
-    /// Returns HTTP 200 with `{"completions": []}` for a silent no-op.
+    /// Returns HTTP 200 with `{"completions": []}` for a silent no-op. The default: the
+    /// takeover turns Tab Autocomplete off, and a customer who turns it back on sees no
+    /// suggestions rather than an error on every pause in typing.
+    #[default]
     Empty,
     /// Forwards completion request to a dedicated fast FIM upstream endpoint.
     Forward,

@@ -467,3 +467,254 @@ fn kiro_tool_schemas_reach_the_upstream_unwrapped() {
     assert_eq!(openai["tools"][0]["function"]["parameters"], schema);
     assert_eq!(openai["tools"][1]["function"]["parameters"], schema);
 }
+
+#[test]
+fn a_thinking_signature_reaches_the_stream_and_replays_only_to_its_model() {
+    use gateway::provider::{ProviderOptions, ThinkingBlock};
+    let events = AnthropicProvider
+        .parse_stream_line(
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"EqQBCgIYAh"}}"#,
+        )
+        .unwrap();
+    assert_eq!(
+        events,
+        vec![ProviderStreamEvent::Delta(
+            ProviderDelta::ReasoningSignature("EqQBCgIYAh".into())
+        )]
+    );
+
+    let mut assistant = ChatMessage::new("assistant", serde_json::json!("Done."));
+    assistant.thinking = Some(ThinkingBlock {
+        text: "Checking the file.".into(),
+        signature: "EqQBCgIYAh".into(),
+        model: "claude-opus-5-5".into(),
+    });
+    let request = |model: &str| ChatRequest {
+        reasoning_effort: None,
+        model: model.into(),
+        messages: vec![
+            ChatMessage::new("user", serde_json::json!("check it")),
+            assistant.clone(),
+            ChatMessage::new("user", serde_json::json!("and now?")),
+        ],
+        temperature: None,
+        max_tokens: Some(8192),
+        stream: true,
+        tools: vec![],
+    };
+    let replay = ProviderOptions {
+        replay_thinking: true,
+        ..Default::default()
+    };
+    let first_block = |body: serde_json::Value| body["messages"][1]["content"][0].clone();
+
+    let body = AnthropicProvider
+        .translate_request_with(&request("claude-opus-5-5"), &replay)
+        .unwrap();
+    assert_eq!(
+        first_block(body),
+        serde_json::json!({"type": "thinking", "thinking": "Checking the file.", "signature": "EqQBCgIYAh"})
+    );
+    // Off by default, and never to another model.
+    for (model, options) in [
+        ("claude-opus-5-5", ProviderOptions::default()),
+        ("claude-opus-5", replay),
+    ] {
+        let body = AnthropicProvider
+            .translate_request_with(&request(model), &options)
+            .unwrap();
+        assert_eq!(first_block(body)["type"], "text", "{model}");
+    }
+    // OpenAI has no thinking blocks to take back.
+    let body = OpenAiProvider
+        .translate_request(&request("claude-opus-5-5"))
+        .unwrap();
+    assert!(!body.to_string().contains("EqQBCgIYAh"));
+}
+
+/// Every upstream line proves it alive to the watchdogs: a model thinking silently, or
+/// buffering a tool input, sends pings and empty thinking deltas for minutes.
+#[tokio::test]
+async fn pings_and_empty_deltas_count_as_liveness() {
+    let sse = [
+        "event: message_start",
+        r#"data: {"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":1}}}"#,
+        "",
+        ": keepalive",
+        "event: ping",
+        r#"data: {"type":"ping"}"#,
+        "",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}"#,
+        r#"data: {"type":"message_stop"}"#,
+        "",
+    ]
+    .join("\n");
+    let events: Vec<_> = gateway::provider::process_byte_stream(
+        futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(sse))]),
+        |line| AnthropicProvider.parse_stream_line(line),
+    )
+    .map(Result::unwrap)
+    .collect()
+    .await;
+    assert_eq!(events[0], ProviderStreamEvent::Started);
+    assert!(matches!(events[1], ProviderStreamEvent::Usage(_)));
+    // The comment, the ping's data line and the empty delta; never an `event:` line.
+    let heartbeats = events
+        .iter()
+        .filter(|event| **event == ProviderStreamEvent::Heartbeat)
+        .count();
+    assert_eq!(heartbeats, 3, "{events:?}");
+    // A thinking block's start is the model at work too.
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| **event == ProviderStreamEvent::Started)
+            .count(),
+        2
+    );
+    assert_eq!(events.last(), Some(&ProviderStreamEvent::Done));
+
+    // OpenAI's opening chunk names the role.
+    let opening = OpenAiProvider
+        .parse_stream_line(r#"data: {"choices":[{"delta":{"role":"assistant","content":""}}]}"#)
+        .unwrap();
+    assert_eq!(opening, vec![ProviderStreamEvent::Started]);
+}
+
+#[test]
+fn eager_tool_input_is_asked_for_only_where_it_is_switched_on() {
+    use gateway::provider::ProviderOptions;
+    let request = ChatRequest {
+        reasoning_effort: None,
+        model: "claude-opus-5-5".into(),
+        messages: vec![ChatMessage::new("user", serde_json::json!("write it"))],
+        temperature: None,
+        max_tokens: Some(8192),
+        stream: true,
+        tools: vec![serde_json::json!({"toolSpecification": {
+            "name": "fsWrite",
+            "description": "Write a file",
+            "inputSchema": {"json": {"type": "object", "properties": {"path": {"type": "string"}}}}
+        }})],
+    };
+    let body = AnthropicProvider
+        .translate_request_with(&request, &ProviderOptions::default())
+        .unwrap();
+    assert!(body["tools"][0].get("eager_input_streaming").is_none());
+    let body = AnthropicProvider
+        .translate_request_with(
+            &request,
+            &ProviderOptions {
+                eager_tool_input: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(body["tools"][0]["eager_input_streaming"], true);
+    assert_eq!(body["tools"][0]["name"], "fsWrite");
+}
+
+/// Every agent step resends the same tools, system prompt and history. Breakpoints after
+/// the tools, the system prompt and the last two user turns let the next step read that
+/// prefix from the cache, at a tenth of the input price.
+#[test]
+fn prompt_cache_breakpoints_follow_the_request_shape() {
+    use gateway::provider::ProviderOptions;
+    let tool = |name: &str| {
+        serde_json::json!({"toolSpecification": {"name": name, "description": "d",
+            "inputSchema": {"json": {"type": "object"}}}})
+    };
+    let step = |turns: usize| {
+        let mut messages = vec![
+            ChatMessage::new("system", serde_json::json!("Workspace rules.")),
+            ChatMessage::new("user", serde_json::json!("<kiro system prompt>")),
+        ];
+        for turn in 0..turns {
+            let mut call = ChatMessage::new("assistant", serde_json::json!(""));
+            call.tool_calls = vec![gateway::provider::ToolCallEntry {
+                id: format!("t{turn}"),
+                name: "readFile".into(),
+                arguments: serde_json::json!({"path": format!("f{turn}")}),
+            }];
+            let mut result = ChatMessage::new("tool", serde_json::json!(format!("file {turn}")));
+            result.tool_call_id = Some(format!("t{turn}"));
+            messages.extend([call, result]);
+        }
+        ChatRequest {
+            reasoning_effort: None,
+            model: "claude-opus-5-5".into(),
+            messages,
+            temperature: None,
+            max_tokens: Some(8192),
+            stream: true,
+            tools: vec![tool("readFile"), tool("fsWrite")],
+        }
+    };
+    let marked = |value: &serde_json::Value| value.to_string().matches("cache_control").count();
+
+    let body = AnthropicProvider.translate_request(&step(2)).unwrap();
+    assert_eq!(body["tools"][1]["cache_control"]["type"], "ephemeral");
+    assert!(body["tools"][0].get("cache_control").is_none());
+    assert_eq!(body["system"][0]["text"], "Workspace rules.");
+    assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+    let messages = body["messages"].as_array().unwrap();
+    let last = messages.len() - 1;
+    assert_eq!(
+        messages[last]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+    assert_eq!(
+        messages[last - 2]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+    assert_eq!(marked(&body), 4, "at most four breakpoints");
+
+    // The next step's prefix is this step's, byte for byte, bar the moving breakpoints.
+    let strip = |mut value: serde_json::Value| {
+        fn walk(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    map.remove("cache_control");
+                    map.values_mut().for_each(walk);
+                }
+                serde_json::Value::Array(items) => items.iter_mut().for_each(walk),
+                _ => {}
+            }
+        }
+        walk(&mut value);
+        value
+    };
+    let next = AnthropicProvider.translate_request(&step(3)).unwrap();
+    let next_messages = next["messages"].as_array().unwrap();
+    assert_eq!(
+        strip(serde_json::Value::Array(messages.clone())),
+        strip(serde_json::Value::Array(
+            next_messages[..messages.len()].to_vec()
+        ))
+    );
+    // The breakpoint this step read up to is where the last step wrote one.
+    assert_eq!(
+        next_messages[messages.len() - 1]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+    assert_eq!(strip(next["tools"].clone()), strip(body["tools"].clone()));
+
+    // Off for an upstream that refuses them.
+    let off = AnthropicProvider
+        .translate_request_with(
+            &step(2),
+            &ProviderOptions {
+                prompt_cache: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(marked(&off), 0);
+    assert_eq!(off["system"], "Workspace rules.");
+    // OpenAI caches prefixes by itself.
+    assert_eq!(
+        marked(&OpenAiProvider.translate_request(&step(2)).unwrap()),
+        0
+    );
+}

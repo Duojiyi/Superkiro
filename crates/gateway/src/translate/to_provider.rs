@@ -12,8 +12,10 @@ use super::images::{inspect_image, shrink_image, Inspection, Omission, PreparedI
 use super::tools::{
     process_tools_for_provider, repair_orphan_tool_pairs, ConversationMessage, ToolRegistry,
 };
-use crate::provider::{ChatMessage, ChatRequest, ToolCallEntry};
-use kiro_wire::requests::conversation::{GenerateAssistantResponseRequest, KiroImage, Message};
+use crate::provider::{ChatMessage, ChatRequest, ThinkingBlock, ToolCallEntry};
+use kiro_wire::requests::conversation::{
+    GenerateAssistantResponseRequest, KiroDocument, KiroImage, Message,
+};
 
 use super::vision::{format_fallback_description, model_supports_vision};
 
@@ -172,18 +174,26 @@ fn omission_note(number: usize, omission: Omission) -> String {
 /// Transcriptions are used only for the current message. They are collected per request
 /// for that message alone, so indexing them from a history message would caption a past
 /// image with unrelated text.
+///
+/// Attachments come first, as providers advise, so a message with nothing but a file is
+/// still the user's turn: dropped, it left the request ending on the assistant's turn,
+/// which current models refuse as a prefill.
 fn format_user_content(
     content: &str,
     images: &[KiroImage],
+    documents: &[KiroDocument],
     ctx: &TranslationContext,
     turn: Turn,
 ) -> serde_json::Value {
-    if images.is_empty() {
+    if images.is_empty() && documents.is_empty() {
         return serde_json::Value::String(content.to_string());
     }
+    let attachments = documents
+        .iter()
+        .map(|document| super::documents::content_part(document, ctx.supports_vision));
 
     if ctx.supports_vision {
-        let mut parts = Vec::new();
+        let mut parts: Vec<serde_json::Value> = attachments.collect();
         if !content.is_empty() {
             parts.push(serde_json::json!({
                 "type": "text",
@@ -225,7 +235,11 @@ fn format_user_content(
         }
         serde_json::Value::Array(parts)
     } else {
-        let mut text = content.to_string();
+        // Without vision every attachment is text: a text file's own, or a note.
+        let mut text: String = attachments
+            .filter_map(|part| part["text"].as_str().map(|text| format!("{text}\n\n")))
+            .collect();
+        text.push_str(content);
         for (idx, img) in images.iter().enumerate() {
             let transcription = if turn == Turn::Current {
                 ctx.image_transcriptions.get(idx).and_then(|s| s.as_deref())
@@ -255,12 +269,31 @@ fn format_user_content(
     }
 }
 
+/// A tool result as the model should read it: its text blocks joined, a JSON block pretty
+/// printed. Sent as the JSON of the block list, every newline, quote and backslash of a
+/// file a tool read reached the model escaped, and a Windows path doubled, so an exact
+/// `oldStr` for str_replace had to be un-escaped by the model first.
+fn tool_result_text(blocks: &[serde_json::Value]) -> String {
+    blocks
+        .iter()
+        .map(|block| match block {
+            serde_json::Value::String(text) => text.clone(),
+            _ => match (block.get("text"), block.get("json")) {
+                (Some(serde_json::Value::String(text)), _) => text.clone(),
+                (_, Some(json)) => serde_json::to_string_pretty(json).unwrap_or_default(),
+                _ => block.to_string(),
+            },
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Translate Kiro's `GenerateAssistantResponseRequest` into generic `ChatRequest`.
 pub fn translate_kiro_to_chat_request(
     kiro_req: &GenerateAssistantResponseRequest,
     ctx: &mut TranslationContext,
 ) -> ChatRequest {
-    let mut system_prompts: Vec<String> = kiro_req
+    let system_prompts: Vec<String> = kiro_req
         .system_prompt
         .iter()
         .filter(|s| !s.trim().is_empty())
@@ -273,7 +306,7 @@ pub fn translate_kiro_to_chat_request(
         .current_message
         .user_input_message;
 
-    // 1. Process tools and extract long descriptions
+    // 1. Process tools (provider-safe names; descriptions stay whole)
     let mut processed_tools = Vec::new();
     if let Some(ref ctx_data) = current_input.user_input_message_context {
         if !ctx_data.tools.is_empty() {
@@ -283,12 +316,7 @@ pub fn translate_kiro_to_chat_request(
                 .map(|t| serde_json::to_value(t).unwrap_or_default())
                 .collect();
 
-            let (tools, doc_append) =
-                process_tools_for_provider(&tools_value, &mut ctx.tool_registry);
-            processed_tools = tools;
-            if let Some(doc) = doc_append {
-                system_prompts.push(doc);
-            }
+            processed_tools = process_tools_for_provider(&tools_value, &mut ctx.tool_registry);
         }
     }
 
@@ -307,12 +335,29 @@ pub fn translate_kiro_to_chat_request(
                     })
                     .collect();
 
+                // Kiro sends a turn's thinking back only with the signature it kept for it,
+                // tagged with the upstream model that wrote it; an untagged one is dropped.
+                let thinking = assistant_msg
+                    .reasoning_content
+                    .as_ref()
+                    .and_then(|reasoning| reasoning.reasoning_text.as_ref())
+                    .filter(|reasoning| !reasoning.text.is_empty())
+                    .and_then(|reasoning| {
+                        let (model, signature) =
+                            crate::provider::untag_signature(reasoning.signature.as_deref()?)?;
+                        Some(ThinkingBlock {
+                            text: reasoning.text.clone(),
+                            signature: signature.to_string(),
+                            model: model.to_string(),
+                        })
+                    });
                 raw_messages.push(ConversationMessage {
                     role: "assistant".to_string(),
                     content: serde_json::Value::String(assistant_msg.content.clone()),
                     tool_use_id: None,
                     tool_calls,
                     is_error: None,
+                    thinking,
                 });
             }
             Message::User(u) => {
@@ -320,7 +365,7 @@ pub fn translate_kiro_to_chat_request(
                 // Historical tool results in user context
                 if let Some(ref ctx_data) = user_msg.user_input_message_context {
                     for tr in &ctx_data.tool_results {
-                        let content_str = serde_json::to_string(&tr.content).unwrap_or_default();
+                        let content_str = tool_result_text(&tr.content);
                         let is_error = tr.status.as_deref().map(|s| s == "error" || s == "failed");
                         raw_messages.push(ConversationMessage {
                             role: "tool".to_string(),
@@ -328,14 +373,19 @@ pub fn translate_kiro_to_chat_request(
                             tool_use_id: Some(tr.tool_use_id.clone()),
                             tool_calls: Vec::new(),
                             is_error,
+                            thinking: None,
                         });
                     }
                 }
-                // Historical user message content (with image support)
-                if !user_msg.content.is_empty() || !user_msg.images.is_empty() {
+                // Historical user message content (with image and attachment support)
+                if !user_msg.content.is_empty()
+                    || !user_msg.images.is_empty()
+                    || !user_msg.documents.is_empty()
+                {
                     let content_val = format_user_content(
                         &user_msg.content,
                         &user_msg.images,
+                        &user_msg.documents,
                         ctx,
                         Turn::History(position),
                     );
@@ -345,6 +395,7 @@ pub fn translate_kiro_to_chat_request(
                         tool_use_id: None,
                         tool_calls: Vec::new(),
                         is_error: None,
+                        thinking: None,
                     });
                 }
             }
@@ -354,7 +405,7 @@ pub fn translate_kiro_to_chat_request(
     // 3. Process current user message: tool results and prompt content
     if let Some(ref ctx_data) = current_input.user_input_message_context {
         for tr in &ctx_data.tool_results {
-            let content_str = serde_json::to_string(&tr.content).unwrap_or_default();
+            let content_str = tool_result_text(&tr.content);
             let is_error = tr.status.as_deref().map(|s| s == "error" || s == "failed");
             raw_messages.push(ConversationMessage {
                 role: "tool".to_string(),
@@ -362,6 +413,7 @@ pub fn translate_kiro_to_chat_request(
                 tool_use_id: Some(tr.tool_use_id.clone()),
                 tool_calls: Vec::new(),
                 is_error,
+                thinking: None,
             });
         }
     }
@@ -369,6 +421,7 @@ pub fn translate_kiro_to_chat_request(
     let final_current_content = format_user_content(
         &current_input.content,
         &current_input.images,
+        &current_input.documents,
         ctx,
         Turn::Current,
     );
@@ -378,6 +431,7 @@ pub fn translate_kiro_to_chat_request(
         tool_use_id: None,
         tool_calls: Vec::new(),
         is_error: None,
+        thinking: None,
     });
 
     // 4. Run strictly chronological orphan repair on conversation messages
@@ -394,6 +448,7 @@ pub fn translate_kiro_to_chat_request(
             tool_call_id: None,
             tool_calls: Vec::new(),
             is_error: None,
+            thinking: None,
         });
     }
 
@@ -405,6 +460,7 @@ pub fn translate_kiro_to_chat_request(
             tool_call_id: rm.tool_use_id,
             tool_calls: rm.tool_calls,
             is_error: rm.is_error,
+            thinking: rm.thinking,
         });
     }
 

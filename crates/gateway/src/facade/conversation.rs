@@ -10,22 +10,23 @@
 //! 5. Upstream provider streaming invocation (Spec §15.2).
 //! 6. Binary AWS EventStream encoding, 20s keepalive injection, and client disconnect cancellation (Spec §4.6, §6.3).
 
-use super::{error_response, BoxFuture, FacadeHandler, Response};
+use super::models::SIMPLE_TASK_MODEL;
+use super::{error_response, input_too_long, validation_error, BoxFuture, FacadeHandler, Response};
 use crate::auth::AuthClaims;
-use crate::guardrail::{format_kiro_throttle_response, CapacityGuardrail};
+use crate::guardrail::{format_kiro_throttle_response, CapacityGuardrail, LargeBodyGate};
 use crate::idempotency::IdempotencyManager;
 use crate::ops::{CardRateLimiter, RateLimitError};
 use crate::provider::governance::{
     execute_stream_with_model_fallback, GovernanceError, ProviderKeyPool,
 };
 use crate::provider::ProviderRuntimeRegistry;
-use crate::provider::{ModelProvider, ProviderConfig};
+use crate::provider::{ModelProvider, ProviderConfig, ProviderError};
 use crate::security::{ContentGuardrailConfig, GuardrailError};
 use crate::stream::{create_stream_guard, BillingSettler, StreamGuardConfig};
 use crate::translate::to_provider::{
     prepare_images, translate_kiro_to_chat_request, TranslationContext,
 };
-use crate::watchdog::{WatchdogConfig, WatchdogStream};
+use crate::watchdog::WatchdogStream;
 use axum::{
     body::Body,
     http::{header, Method, Request, StatusCode},
@@ -62,6 +63,8 @@ pub struct GenerateAssistantResponseHandler {
     pub vision_config: Option<crate::translate::VisionFallbackConfig>,
     pub vision_cache: crate::translate::VisionFallbackCache,
     pub content_guardrail: ContentGuardrailConfig,
+    /// Shared by every clone: the places for bodies over 10 MB across the gateway.
+    pub large_bodies: LargeBodyGate,
 }
 
 impl Default for GenerateAssistantResponseHandler {
@@ -81,6 +84,7 @@ impl Default for GenerateAssistantResponseHandler {
             vision_config: None,
             vision_cache: crate::translate::VisionFallbackCache::default(),
             content_guardrail: ContentGuardrailConfig::default(),
+            large_bodies: LargeBodyGate::default(),
         }
     }
 }
@@ -108,6 +112,7 @@ impl GenerateAssistantResponseHandler {
             vision_config: None,
             vision_cache: crate::translate::VisionFallbackCache::default(),
             content_guardrail: ContentGuardrailConfig::default(),
+            large_bodies: LargeBodyGate::default(),
         }
     }
 
@@ -160,21 +165,37 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
         "/generateAssistantResponse"
     }
 
+    /// Every answer names its request (`x-amzn-requestid`): Kiro shows the ID with an
+    /// error and keeps it with the turn's usage, so a customer's report can be traced.
     fn handle<'a>(&'a self, req: Request<Body>) -> BoxFuture<'a, Response> {
         Box::pin(async move {
+            let request_id = req
+                .headers()
+                .get("amz-sdk-invocation-id")
+                .and_then(|value| value.to_str().ok())
+                .filter(|id| valid_invocation_id(id))
+                .map_or_else(generated_invocation_id, str::to_string);
+            let mut response = self.respond(req, &request_id).await;
+            if let Ok(value) = axum::http::HeaderValue::from_str(&request_id) {
+                response.headers_mut().insert("x-amzn-requestid", value);
+            }
+            response
+        })
+    }
+}
+
+impl GenerateAssistantResponseHandler {
+    /// The answer to one conversation request, which `request_id` names when the client
+    /// sent no invocation id of its own.
+    async fn respond(&self, req: Request<Body>, request_id: &str) -> Response {
+        {
             // What a response's time to first output is measured from.
             let received_at = std::time::Instant::now();
             let (parts, body) = req.into_parts();
 
             // 1. Extract amz-sdk-invocation-id header (Spec §4.7)
             let invocation_id = match parts.headers.get("amz-sdk-invocation-id") {
-                None => format!(
-                    "inv-{}",
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos()
-                ),
+                None => request_id.to_string(),
                 Some(value) => match value.to_str().ok().filter(|id| valid_invocation_id(id)) {
                     Some(id) => id.to_string(),
                     None => {
@@ -241,9 +262,23 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                 }
             };
 
-            // 3. Buffer request body
-            let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
-                Ok(b) => b,
+            // 3. Buffer request body. One over the limit is refused as too long, which Kiro
+            // compacts the conversation for, whether its length is declared or found. A
+            // large one first takes a place in the gateway's large-body gate.
+            let body_limit = self.content_guardrail.max_body_bytes;
+            let declared_length = parts
+                .headers
+                .get(header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<u64>().ok());
+            let read = read_body(body, body_limit, declared_length, &self.large_bodies).await;
+            let body_bytes = match read {
+                Ok(BodyRead::Body(b)) => b,
+                Ok(BodyRead::TooLarge) => {
+                    self.record_refusal(claims.as_ref(), &invocation_key, "", "input_too_long");
+                    return body_too_large(body_limit);
+                }
+                Ok(BodyRead::Throttled) => return self.large_bodies.throttled_response(),
                 Err(e) => {
                     return error_response(
                         StatusCode::BAD_REQUEST,
@@ -276,23 +311,11 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
             }
 
             // 4. Local Intent Classifier Interception (Optimization)
-            let classified_message = self
-                .intercept_intent
-                .then(|| intent_classifier_message(&body_bytes))
-                .flatten();
-            if let Some(message) = classified_message {
-                // The instructions themselves describe spec requests; only the user's
-                // message says whether this is one.
-                let message = message.to_lowercase();
-                let is_spec = message.contains("create a spec")
-                    || message.contains("specification")
-                    || message.contains("需求文档")
-                    || message.contains("规范");
-                let probs = if is_spec {
-                    serde_json::json!({ "chat": 0, "do": 0.1, "spec": 0.9 })
-                } else {
-                    serde_json::json!({ "chat": 0, "do": 0.95, "spec": 0.05 })
-                };
+            if self.intercept_intent && is_intent_classifier_call(&body_bytes) {
+                // Do is the classifier's own default, and the answer when unsure. Guessing
+                // spec from words in the message sent "代码规范" (coding conventions) and
+                // "the OpenAPI specification" to spec editing; a spec is still one click.
+                let probs = serde_json::json!({ "chat": 0, "do": 0.95, "spec": 0.05 });
 
                 let meta_frame = encode_event(
                     "messageMetadataEvent",
@@ -322,6 +345,12 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                     .into_response();
             }
 
+            let fallback_model = self
+                .provider_config
+                .as_ref()
+                .map(|c| c.model.as_str())
+                .unwrap_or("claude-3-5-sonnet-20241022");
+
             // Parse and validate before reserving credit.  A malformed or
             // over-sized request must never consume a reservation.
             let mut parsed_request = None;
@@ -341,6 +370,20 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                     };
                 if let Err(error) = validate_conversation_request(&parsed, &self.content_guardrail)
                 {
+                    if let Some(detail) = error.overflow_detail() {
+                        self.record_refusal(
+                            claims.as_ref(),
+                            &invocation_key,
+                            &requested_model_id(
+                                &parsed,
+                                claims.as_ref(),
+                                &self.billing,
+                                fallback_model,
+                            ),
+                            "input_too_long",
+                        );
+                        return input_too_long(&detail);
+                    }
                     return error_response(
                         StatusCode::BAD_REQUEST,
                         "InvalidRequestException",
@@ -359,11 +402,6 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
             };
 
             // 5. Credit Reservation (Spec §6.2)
-            let fallback_model = self
-                .provider_config
-                .as_ref()
-                .map(|c| c.model.as_str())
-                .unwrap_or("claude-3-5-sonnet-20241022");
             let mut has_reservation = false;
             let reservation_lease = self.billing.protect_reservation(&invocation_key);
             let mut hold = HoldRelease {
@@ -442,12 +480,23 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                         )
                     });
                 let estimated_input_tokens = request_for_reservation
-                    .map(|request| {
-                        estimate_input_tokens(request)
-                            .saturating_add(prefix_tokens)
-                            .clamp(1, input_limit)
-                    })
-                    .unwrap_or(2_000);
+                    .map(|request| estimate_input_tokens(request).saturating_add(prefix_tokens))
+                    .unwrap_or(2_000)
+                    .max(1);
+                // Sent anyway, a prompt over the model's limit is refused upstream, and Kiro
+                // could not tell that refusal from an outage. Refused here, it compacts the
+                // conversation and tries again.
+                if estimated_input_tokens > input_limit {
+                    self.record_refusal(
+                        claims.as_ref(),
+                        &invocation_key,
+                        requested_model_for_reservation,
+                        "input_too_long",
+                    );
+                    return input_too_long(&format!(
+                        "本次请求估计约 {estimated_input_tokens} 个 token，超过该模型 {input_limit} 个 token 的输入上限"
+                    ));
+                }
                 reserved_estimated_input = estimated_input_tokens;
                 reserved_max_output = max_output_tokens_for_model(
                     requested_model_for_reservation,
@@ -487,6 +536,8 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                                 Some(2),
                             );
                         }
+                        // Kiro knows these reasons: it shows its usage-limit message and does
+                        // not retry. Unknown ones read "Too many requests" and were retried.
                         billing::engine::BillingError::DailyLimitExceeded {
                             limit,
                             current,
@@ -501,8 +552,13 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                             return crate::guardrail::format_kiro_throttle_response(
                                 StatusCode::TOO_MANY_REQUESTS,
                                 "ThrottlingException",
-                                "DAILY_LIMIT_EXCEEDED",
-                                &format!("Daily credit limit reached (limit: {}, used today: {}, needed: {}).", limit, current, needed),
+                                "DAILY_REQUEST_COUNT",
+                                &format!(
+                                    "今日积分用量已达上限：上限 {}，今日已用 {}，本次需预留 {}。请明天再试。",
+                                    credits(limit),
+                                    credits(current),
+                                    credits(needed)
+                                ),
                                 None,
                             );
                         }
@@ -520,8 +576,13 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                             return crate::guardrail::format_kiro_throttle_response(
                                 StatusCode::TOO_MANY_REQUESTS,
                                 "ThrottlingException",
-                                "MONTHLY_LIMIT_EXCEEDED",
-                                &format!("Monthly credit limit reached (limit: {}, used this month: {}, needed: {}).", limit, current, needed),
+                                "MONTHLY_REQUEST_COUNT",
+                                &format!(
+                                    "近 30 天积分用量已达上限：上限 {}，已用 {}，本次需预留 {}。请稍后再试。",
+                                    credits(limit),
+                                    credits(current),
+                                    credits(needed)
+                                ),
                                 None,
                             );
                         }
@@ -558,19 +619,9 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                                 needed,
                                 available,
                             );
-                            return error_response(
-                                StatusCode::PAYMENT_REQUIRED,
-                                "InsufficientCreditException",
-                                &format!("Credit reservation failed: {}", e),
-                            );
+                            return reservation_refusal(&e);
                         }
-                        _ => {
-                            return error_response(
-                                StatusCode::PAYMENT_REQUIRED,
-                                "InsufficientCreditException",
-                                &format!("Credit reservation failed: {}", e),
-                            );
-                        }
+                        other => return reservation_refusal(&other),
                     }
                 }
                 has_reservation = true;
@@ -669,14 +720,7 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                                 ),
                                 "no_route",
                             );
-                            return error_response(
-                                StatusCode::FORBIDDEN,
-                                "AccessDeniedException",
-                                &format!(
-                                    "Group '{}' ({:?}) cannot access provider with group_id {:?}",
-                                    group.id, group.provider_binding_mode, cfg.group_id
-                                ),
-                            );
+                            return no_route_for_group();
                         }
                     }
                 }
@@ -740,7 +784,8 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                         .current_message
                         .user_input_message
                         .model_id
-                        .is_some()
+                        .as_deref()
+                        .is_some_and(|model| model != SIMPLE_TASK_MODEL)
                         && !billing_models.is_empty()
                     {
                         if has_reservation {
@@ -835,6 +880,27 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                     "This model is not configured for image input. Send the prompt without an image, or ask your administrator to enable image support for it.",
                 );
             }
+            // An attachment no upstream path takes is refused with the reason Kiro shows
+            // document refusals for, naming the file. An earlier message's becomes a note.
+            if let Some((reason, message)) = crate::translate::documents::refusal(
+                &kiro_req
+                    .conversation_state
+                    .current_message
+                    .user_input_message
+                    .documents,
+                vision_supported,
+            ) {
+                if has_reservation {
+                    let _ = self.billing.release(&invocation_key);
+                }
+                self.record_refusal(
+                    claims.as_ref(),
+                    &invocation_key,
+                    requested_model,
+                    "unsupported_capability",
+                );
+                return validation_error(reason, &message);
+            }
 
             // 8. Translate to provider format (Spec §4.3, §14.3 Vision Fallback)
             let mut ctx =
@@ -875,6 +941,11 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                 ctx = ctx.with_prepared_images(prepared);
             }
             let mut chat_req = translate_kiro_to_chat_request(&kiro_req, &mut ctx);
+            // Only the translation is used from here on. A large request gives its place in
+            // the gate back now (or once the archive is done with its copy), not when the
+            // answer ends.
+            drop(kiro_req);
+            drop(body_bytes);
             // The wire protocol currently has no client-controlled max_tokens
             // field.  Keep the provider request bounded by the exposed model
             // contract instead of relying on a provider's default.
@@ -975,11 +1046,7 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                         requested_model,
                         "no_route",
                     );
-                    return error_response(
-                        StatusCode::BAD_GATEWAY,
-                        "RoutingException",
-                        "No enabled or accessible upstream providers available for requested model targets",
-                    );
+                    return no_route_for_group();
                 }
             } else {
                 let default_pool = self
@@ -1088,6 +1155,10 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                             idempotency_guard.fail();
                             return empty_attempts_response();
                         }
+                        Err(e) if upstream_input_too_long(&e) => {
+                            let _ = self.billing.release(&invocation_key);
+                            return input_too_long(UPSTREAM_OVERFLOW);
+                        }
                         Err(GovernanceError::AllKeysInCooldown {
                             next_recovery_secs, ..
                         }) => {
@@ -1102,11 +1173,13 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                         }
                         Err(e) => {
                             let _ = self.billing.release(&invocation_key);
-                            return error_response(
-                                StatusCode::BAD_GATEWAY,
-                                "InternalServerException",
-                                &crate::stream::safe_governance_error(&e),
-                            );
+                            return governance_upstream_refusal(&e).unwrap_or_else(|| {
+                                error_response(
+                                    StatusCode::BAD_GATEWAY,
+                                    "InternalServerException",
+                                    &crate::stream::safe_governance_error(&e),
+                                )
+                            });
                         }
                     }
                 } else if let (Some(ref provider), Some(ref provider_config)) =
@@ -1121,11 +1194,7 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                                 requested_model,
                                 "no_route",
                             );
-                            return error_response(
-                                StatusCode::FORBIDDEN,
-                                "AccessDeniedException",
-                                "Card group cannot access the configured upstream provider",
-                            );
+                            return no_route_for_group();
                         }
                     }
                     let mut direct_config = provider_config.clone();
@@ -1152,14 +1221,26 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                             idempotency_guard.fail();
                             return empty_attempts_response();
                         }
+                        Err(e) if provider_input_too_long(&e) => {
+                            let _ = self.billing.release(&invocation_key);
+                            self.record_refusal(
+                                claims.as_ref(),
+                                &invocation_key,
+                                requested_model,
+                                "input_too_long",
+                            );
+                            return input_too_long(UPSTREAM_OVERFLOW);
+                        }
                         Err(e) => {
                             // Upstream initiation failed; release reservation in full
                             let _ = self.billing.release(&invocation_key);
-                            return error_response(
-                                StatusCode::BAD_GATEWAY,
-                                "InternalServerException",
-                                &crate::stream::safe_provider_error(&e),
-                            );
+                            return upstream_refusal(&e).unwrap_or_else(|| {
+                                error_response(
+                                    StatusCode::BAD_GATEWAY,
+                                    "InternalServerException",
+                                    &crate::stream::safe_provider_error(&e),
+                                )
+                            });
                         }
                     }
                 } else {
@@ -1170,11 +1251,7 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                         requested_model,
                         "no_route",
                     );
-                    return error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "ServiceUnavailableException",
-                    "No upstream provider configured, enabled, or accessible for this card group",
-                );
+                    return no_route_for_group();
                 };
 
             // 10. Wrap in Stream Guard (keepalive + cancellation + tool name restoration + billing settlement + contextUsage)
@@ -1188,6 +1265,14 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                 model_id: requested_model.to_string(),
                 context_window: Some(context_window),
             };
+
+            // Pings and empty deltas count as liveness; a model that reasons first may go
+            // silent longer.
+            let watchdog = crate::provider::retry::UpstreamLimits::for_model(
+                &actual_target_model,
+                chat_req.reasoning_effort,
+            )
+            .watchdog();
 
             // The stream's settler bills or returns the hold from here on.
             hold.armed = false;
@@ -1209,7 +1294,7 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
             .with_estimated_input(translated_input_estimate)
             .with_reservation_lease(reservation_lease);
 
-            let watchdog_stream = WatchdogStream::new(upstream_stream, WatchdogConfig::default());
+            let watchdog_stream = WatchdogStream::new(upstream_stream, watchdog);
             let guarded_stream = create_stream_guard(
                 watchdog_stream,
                 guard_config,
@@ -1224,11 +1309,9 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                 Body::from_stream(guarded_stream),
             )
                 .into_response()
-        })
+        }
     }
-}
 
-impl GenerateAssistantResponseHandler {
     /// Records an authenticated request refused before it was routed: nothing was sent
     /// upstream and nothing is charged. The model it named is kept only when it is a valid
     /// model ID; the request's content is never kept.
@@ -1366,8 +1449,205 @@ fn route_failure_class(
 ) -> &'static str {
     match error {
         GovernanceError::NoAvailableKeys { .. } if attempts.is_empty() => "no_route",
+        error if upstream_input_too_long(error) => "input_too_long",
+        error if governance_upstream_refusal(error).is_some() => "upstream_refused",
         _ => "upstream_start_failed",
     }
+}
+
+/// Micro-credits as the credits a customer sees.
+fn credits(micro: i64) -> String {
+    let credits = micro as f64 / billing::MICRO_CREDITS_PER_CREDIT as f64;
+    format!("{:.2}", credits)
+}
+
+/// A hold the card cannot take, in words Kiro shows as they are: a ValidationException
+/// message, which it neither rewrites nor retries. An unknown exception type read
+/// "Something went wrong".
+fn reservation_refusal(error: &billing::engine::BillingError) -> Response {
+    use billing::card::CardError;
+    use billing::engine::BillingError;
+    let message = match error {
+        BillingError::Card(CardError::InsufficientCredit { available, needed }) => format!(
+            "积分余额不足：本次请求需预留 {}（按该模型的最大输出估算），当前可用 {}。请充值后重试，或换用更便宜的模型。",
+            credits(*needed),
+            credits((*available).max(0))
+        ),
+        BillingError::Card(CardError::Expired) => {
+            "卡密已过期，请续期或更换卡密后重试。".to_string()
+        }
+        BillingError::Card(CardError::NotActive(status)) => {
+            format!("卡密当前不可用（状态：{status:?}），请联系管理员。")
+        }
+        BillingError::CardNotFound(_) => "未找到该卡密，请重新登录后重试。".to_string(),
+        // A settlement still being saved, or state the next request finds consistent: a
+        // retry succeeds.
+        _ => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerException",
+                "Credit reservation is temporarily unavailable",
+            )
+        }
+    };
+    error_response(StatusCode::BAD_REQUEST, "ValidationException", &message)
+}
+
+/// A card whose group may not use any provider that serves the model. Not an
+/// AccessDeniedException: Kiro takes that for an expired login.
+fn no_route_for_group() -> Response {
+    error_response(
+        StatusCode::BAD_REQUEST,
+        "ValidationException",
+        "当前卡密所在分组没有可用于该模型的上游服务，请换一个模型或联系管理员。",
+    )
+}
+
+/// An upstream's refusal of the request itself, which a retry would meet again, in words
+/// Kiro shows as they are; never the upstream's own text. Its rate limits, an invalid key
+/// and a request timeout are the gateway's to handle.
+fn upstream_refusal(error: &ProviderError) -> Option<Response> {
+    let ProviderError::Http(status, _) = error else {
+        return None;
+    };
+    let status = status.as_u16();
+    if !(400..500).contains(&status) || matches!(status, 401 | 408 | 429) {
+        return None;
+    }
+    let why = match status {
+        400 | 422 => "请求内容或参数不被该上游接受",
+        403 => "该上游拒绝处理本次请求",
+        404 => "该上游找不到这个模型",
+        _ => "该上游拒绝了本次请求",
+    };
+    Some(error_response(
+        StatusCode::BAD_REQUEST,
+        "ValidationException",
+        &format!(
+            "上游模型服务拒绝了本次请求（HTTP {status}：{why}），重试不会改变结果。可以调整请求、换一个模型，或联系管理员。"
+        ),
+    ))
+}
+
+fn governance_upstream_refusal(error: &GovernanceError) -> Option<Response> {
+    match error {
+        GovernanceError::NonRetryable(error) | GovernanceError::Provider(error) => {
+            upstream_refusal(error)
+        }
+        _ => None,
+    }
+}
+
+/// What a request refused upstream for its length is told.
+const UPSTREAM_OVERFLOW: &str = "上游模型报告输入超过了它的上下文上限";
+
+/// Whether the upstream refused the request for a prompt longer than its model takes.
+fn upstream_input_too_long(error: &GovernanceError) -> bool {
+    match error {
+        GovernanceError::NonRetryable(error) | GovernanceError::Provider(error) => {
+            provider_input_too_long(error)
+        }
+        _ => false,
+    }
+}
+
+/// Anthropic's "prompt is too long", OpenAI's `context_length_exceeded` and "maximum
+/// context length", and a request too large to be accepted at all. Only the refusal's kind
+/// is read from the upstream's words; they never reach the client.
+fn provider_input_too_long(error: &ProviderError) -> bool {
+    let ProviderError::Http(status, body) = error else {
+        return false;
+    };
+    let body = body.to_ascii_lowercase();
+    status.as_u16() == 413
+        || status.as_u16() == 400
+            && [
+                "prompt is too long",
+                "input is too long",
+                "context_length_exceeded",
+                "maximum context length",
+                "input content length exceeds threshold",
+            ]
+            .iter()
+            .any(|phrase| body.contains(phrase))
+}
+
+/// A conversation larger than the gateway reads. Kiro sends every image in a conversation
+/// again with each turn, so that is mostly screenshots, which compacting it leaves behind.
+fn body_too_large(limit: usize) -> Response {
+    input_too_long(&format!(
+        "请求体超过网关 {} MB 的上限，多为对话中累积的图片",
+        limit / (1024 * 1024)
+    ))
+}
+
+/// What reading a conversation's body came to.
+enum BodyRead {
+    Body(bytes::Bytes),
+    /// Longer than the gateway reads.
+    TooLarge,
+    /// Large, and no place in the large-body gate freed up in time.
+    Throttled,
+}
+
+/// A large body with its place in the gate, which it gives back when its last copy (the
+/// archive's included) is dropped.
+struct HeldBody {
+    body: bytes::Bytes,
+    _place: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl AsRef<[u8]> for HeldBody {
+    fn as_ref(&self) -> &[u8] {
+        &self.body
+    }
+}
+
+/// A request body of at most `limit` bytes. One over the gate's threshold, by the length it
+/// declares or by the bytes that arrive, first takes a place in the gate, and holds it for
+/// as long as the body is kept. Room for a declared length is taken at once, so a large body
+/// is not copied while it arrives.
+async fn read_body(
+    body: Body,
+    limit: usize,
+    declared_length: Option<u64>,
+    gate: &LargeBodyGate,
+) -> Result<BodyRead, axum::Error> {
+    use futures_util::StreamExt;
+    if declared_length.is_some_and(|length| length > limit as u64) {
+        return Ok(BodyRead::TooLarge);
+    }
+    let declared = declared_length.map_or(0, |length| length as usize);
+    let mut place = None;
+    if declared > gate.threshold() {
+        let Some(entered) = gate.enter().await else {
+            return Ok(BodyRead::Throttled);
+        };
+        place = Some(entered);
+    }
+    let mut data = bytes::BytesMut::with_capacity(declared);
+    let mut chunks = body.into_data_stream();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk?;
+        if chunk.len() > limit - data.len() {
+            return Ok(BodyRead::TooLarge);
+        }
+        if place.is_none() && data.len() + chunk.len() > gate.threshold() {
+            let Some(entered) = gate.enter().await else {
+                return Ok(BodyRead::Throttled);
+            };
+            place = Some(entered);
+        }
+        data.extend_from_slice(&chunk);
+    }
+    let body = data.freeze();
+    Ok(BodyRead::Body(match place {
+        Some(place) => bytes::Bytes::from_owner(HeldBody {
+            body,
+            _place: place,
+        }),
+        None => body,
+    }))
 }
 
 /// A request whose every attempt came back empty. It was billed the input consumed, so it
@@ -1419,16 +1699,18 @@ pub fn render_system_prompt_template(
         .replace("{{virtual_plan_name}}", &group.virtual_plan_name)
 }
 
-/// The user's message, when `body` is Kiro's intent-classifier call: the classifier
-/// instructions lead the request, as its system prompt or its first message, and no tools
-/// are offered. The same words anywhere else (a pasted log, a file a tool read, a later
-/// message) are the user's own content, and that turn goes to the model.
-fn intent_classifier_message(body: &[u8]) -> Option<String> {
+/// Whether `body` is Kiro's intent-classifier call: the classifier instructions lead the
+/// request, as its system prompt or its first message, and no tools are offered. The same
+/// words anywhere else (a pasted log, a file a tool read, a later message) are the user's
+/// own content, and that turn goes to the model.
+fn is_intent_classifier_call(body: &[u8]) -> bool {
     let text = String::from_utf8_lossy(body);
     if !text.contains(INTENT_CLASSIFIER_SIGN_A) || !text.contains(INTENT_CLASSIFIER_SIGN_B) {
-        return None;
+        return false;
     }
-    let request: GenerateAssistantResponseRequest = serde_json::from_slice(body).ok()?;
+    let Ok(request) = serde_json::from_slice::<GenerateAssistantResponseRequest>(body) else {
+        return false;
+    };
     let state = &request.conversation_state;
     let current = &state.current_message.user_input_message;
     if current
@@ -1436,7 +1718,7 @@ fn intent_classifier_message(body: &[u8]) -> Option<String> {
         .as_ref()
         .is_some_and(|context| !context.tools.is_empty())
     {
-        return None;
+        return false;
     }
     let instructions = request
         .system_prompt
@@ -1447,11 +1729,22 @@ fn intent_classifier_message(body: &[u8]) -> Option<String> {
                 Some(user.user_input_message.content.as_str())
             }
             kiro_wire::requests::conversation::Message::Assistant(_) => None,
-        })?
-        .trim_start();
-    (instructions.starts_with(INTENT_CLASSIFIER_SIGN_A)
-        && instructions.contains(INTENT_CLASSIFIER_SIGN_B))
-    .then(|| current.content.clone())
+        })
+        .map(str::trim_start);
+    instructions.is_some_and(|instructions| {
+        instructions.starts_with(INTENT_CLASSIFIER_SIGN_A)
+            && instructions.contains(INTENT_CLASSIFIER_SIGN_B)
+    })
+}
+
+fn generated_invocation_id() -> String {
+    format!(
+        "inv-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    )
 }
 
 /// The client's invocation id keys idempotency, the credit hold and the request traces,
@@ -1469,28 +1762,40 @@ fn valid_invocation_id(id: &str) -> bool {
 /// the fallback model every unmapped request is sent to. A request that named no model
 /// was priced as "default-model" and sent to the fallback model, so it was billed at the
 /// built-in default rates whatever its group's models cost.
+///
+/// Kiro's fast model is the model given its name, as an alias as a rule, listed or hidden,
+/// or else the group's default; it is held, routed and billed as that model. Refused for want of a
+/// price, it failed Kiro's commit messages and its spec sub-intents.
 fn requested_model_id(
     request: &GenerateAssistantResponseRequest,
     claims: Option<&AuthClaims>,
     billing: &BillingEngine,
     fallback_model: &str,
 ) -> String {
-    if let Some(model) = request
+    let named = request
         .conversation_state
         .current_message
         .user_input_message
         .model_id
-        .as_deref()
-    {
+        .as_deref();
+    if let Some(model) = named.filter(|model| *model != SIMPLE_TASK_MODEL) {
         return model.to_string();
     }
-    claims
-        .and_then(|claims| billing.get_group(&claims.group_id))
-        .and_then(|group| {
-            billing
-                .list_models_for_group(&group.id, true)
-                .into_iter()
-                .next()
+    let group = claims.and_then(|claims| billing.get_group(&claims.group_id));
+    let fast_model = named.and(group.as_ref()).and_then(|group| {
+        billing
+            .list_models_for_group(&group.id, false)
+            .into_iter()
+            .find(|model| !model.retired && model.matches_model(SIMPLE_TASK_MODEL))
+    });
+    fast_model
+        .or_else(|| {
+            group.and_then(|group| {
+                billing
+                    .list_models_for_group(&group.id, true)
+                    .into_iter()
+                    .next()
+            })
         })
         .map_or_else(
             || fallback_model.to_string(),
@@ -1541,13 +1846,10 @@ fn validate_conversation_request(
     if request.conversation_state.conversation_id.trim().is_empty()
         || request.conversation_state.conversation_id.chars().count() > 256
     {
-        return Err(GuardrailError::PromptTooLong {
-            actual: request.conversation_state.conversation_id.chars().count(),
-            max: 256,
-        });
+        return Err(GuardrailError::InvalidConversationId);
     }
     if request.conversation_state.history.len() > 1_000 {
-        return Err(GuardrailError::PromptTooLong {
+        return Err(GuardrailError::HistoryTooLong {
             actual: request.conversation_state.history.len(),
             max: 1_000,
         });
@@ -1576,8 +1878,38 @@ fn validate_conversation_request(
         .flatten()
         .map(|image| image.source.bytes.chars().count())
         .sum();
+    // Attachments count as what is sent: a text file as its text, never its base64.
+    let documents = request
+        .conversation_state
+        .history
+        .iter()
+        .filter_map(|message| match message {
+            kiro_wire::requests::conversation::Message::User(user) => {
+                Some(&user.user_input_message.documents)
+            }
+            kiro_wire::requests::conversation::Message::Assistant(_) => None,
+        })
+        .chain([&current.documents])
+        .flatten();
+    let (document_chars, document_text_chars) =
+        documents.fold((0usize, 0usize), |(encoded, text), document| {
+            let sent = match crate::translate::documents::document_kind(&document.format) {
+                crate::translate::documents::DocumentKind::Text => {
+                    crate::translate::documents::text_of(document)
+                        .map_or(0, |text| text.chars().count())
+                }
+                _ => 0,
+            };
+            (encoded + document.source.bytes.len(), text + sent)
+        });
     let prompt_chars = serde_json::to_string(request)
-        .map(|json| json.chars().count().saturating_sub(image_chars))
+        .map(|json| {
+            json.chars()
+                .count()
+                .saturating_sub(image_chars)
+                .saturating_sub(document_chars)
+                .saturating_add(document_text_chars)
+        })
         .unwrap_or(usize::MAX);
     let mut image_sizes = Vec::with_capacity(current.images.len());
     for image in &current.images {
@@ -1659,5 +1991,53 @@ mod capability_tests {
             max_output_tokens_for_model("gemini-unknown", None, &billing),
             4096
         );
+    }
+
+    #[test]
+    fn only_an_over_long_prompt_is_read_as_an_overflow() {
+        let http = |status: u16, body: &str| {
+            ProviderError::Http(reqwest::StatusCode::from_u16(status).unwrap(), body.into())
+        };
+        assert!(provider_input_too_long(&http(
+            400,
+            r#"{"error":{"message":"Prompt is too long: 201000 tokens > 200000 maximum"}}"#
+        )));
+        assert!(provider_input_too_long(&http(413, "")));
+        assert!(!provider_input_too_long(&http(
+            400,
+            r#"{"error":{"message":"temperature is not supported"}}"#
+        )));
+        assert!(!provider_input_too_long(&http(500, "prompt is too long")));
+        assert!(!provider_input_too_long(&ProviderError::Timeout));
+    }
+}
+
+#[cfg(test)]
+mod large_body_tests {
+    use super::*;
+
+    /// A large body holds its place for as long as any copy of it is kept (the archive
+    /// keeps one while it writes the request down); a small one never takes a place.
+    #[tokio::test]
+    async fn a_large_body_holds_its_place_while_any_copy_of_it_is_kept() {
+        let gate = LargeBodyGate::new(2, 1024, Duration::from_millis(50));
+        let read = |size: usize, declared: Option<u64>| {
+            read_body(Body::from(vec![b' '; size]), 4096, declared, &gate)
+        };
+        let Ok(BodyRead::Body(small)) = read(1024, Some(1024)).await else {
+            panic!("a small body is read");
+        };
+        assert_eq!((small.len(), gate.in_use()), (1024, 0));
+        for declared in [Some(2048), None] {
+            let Ok(BodyRead::Body(body)) = read(2048, declared).await else {
+                panic!("a large body is read");
+            };
+            assert_eq!((body.len(), gate.in_use()), (2048, 1));
+            let archived = body.clone();
+            drop(body);
+            assert_eq!(gate.in_use(), 1);
+            drop(archived);
+            assert_eq!(gate.in_use(), 0);
+        }
     }
 }

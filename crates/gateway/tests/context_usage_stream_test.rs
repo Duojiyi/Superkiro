@@ -53,13 +53,13 @@ async fn test_stream_guard_emits_context_usage_event_on_provider_usage() {
     }
 
     assert!(received_context_usage, "contextUsageEvent must be emitted");
-    // 50,000 / 200,000 = 0.25 (25% context usage)
-    assert!((verified_percentage - 0.25f64).abs() < 1e-6);
+    // 50,000 of 200,000 tokens: Kiro reads a percentage, and compacts at 80.
+    assert!((verified_percentage - 25.0f64).abs() < 1e-6);
 }
 
 #[tokio::test]
 async fn test_stream_guard_context_usage_custom_window_and_clamping() {
-    // Upstream with 120,000 tokens against a 100,000 custom window (120% -> clamped to 1.0)
+    // Upstream with 120,000 tokens against a 100,000 custom window (120% -> clamped to 100)
     let upstream_events: Vec<Result<ProviderStreamEvent, ProviderError>> = vec![
         Ok(ProviderStreamEvent::Usage(TokenUsage {
             uncached_prompt_tokens: 100_000,
@@ -97,5 +97,5 @@ async fn test_stream_guard_context_usage_custom_window_and_clamping() {
         }
     }
 
-    assert_eq!(verified_percentage, 1.0);
+    assert_eq!(verified_percentage, 100.0);
 }

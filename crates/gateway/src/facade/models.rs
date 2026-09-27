@@ -57,6 +57,12 @@ pub struct ModelInfo {
 
 /// The unit Kiro prints after the multiplier, as its own model list does.
 pub const RATE_UNIT: &str = "Credit";
+/// The same unit for an amount other than one, as Kiro's usage summary prints it.
+pub const RATE_UNIT_PLURAL: &str = "Credits";
+
+/// The model Kiro asks for when it wants a quick answer: commit messages, spec sub-intents,
+/// session recaps and titles. Its own service never lists it, and neither does the gateway.
+pub const SIMPLE_TASK_MODEL: &str = "simple-task";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

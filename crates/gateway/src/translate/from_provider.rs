@@ -34,12 +34,14 @@ impl StreamTranslationState {
         }
     }
 
-    /// Map provider finish/stop reason into Kiro expected stopReason string.
+    /// Map provider finish/stop reason into Kiro expected stopReason string. A refusal or a
+    /// content filter is Kiro's `content_filtered`, which it shows as a refusal.
     pub fn map_stop_reason(reason: &str) -> String {
         match reason {
             "stop" => "end_turn".to_string(),
             "tool_calls" | "tool_use" => "tool_use".to_string(),
             "length" | "max_tokens" => "max_tokens".to_string(),
+            "refusal" | "content_filter" => "content_filtered".to_string(),
             other => other.to_string(),
         }
     }
@@ -64,6 +66,9 @@ pub fn translate_provider_event_to_frames(
                 if !reasoning.is_empty() {
                     frames.push(encode_reasoning(Some(reasoning), None, None));
                 }
+            }
+            ProviderDelta::ReasoningSignature(signature) => {
+                frames.push(encode_reasoning(None, Some(signature), None));
             }
             ProviderDelta::ToolCallChunk {
                 id,
@@ -90,6 +95,9 @@ pub fn translate_provider_event_to_frames(
                 ));
             }
         },
+        ProviderStreamEvent::Started
+        | ProviderStreamEvent::Heartbeat
+        | ProviderStreamEvent::Refusal { .. } => {}
         ProviderStreamEvent::StopReason(reason) => {
             let mapped = StreamTranslationState::map_stop_reason(reason);
             state.last_stop_reason = Some(mapped);

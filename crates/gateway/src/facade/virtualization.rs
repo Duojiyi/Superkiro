@@ -6,7 +6,7 @@
 //! - Virtual credit quota and usage limit
 //! - Stable profile ARN to satisfy Kiro's `ProfileArnGuard`
 
-use super::models::{ModelInfo, TokenLimits};
+use super::models::{ModelInfo, TokenLimits, SIMPLE_TASK_MODEL};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -255,9 +255,10 @@ impl VirtualizationStore {
                 // Fetch models from billing mapped to this group (respecting visibility and sort_order)
                 let billing_models = billing.list_models_for_group(&bg.id, false);
                 let models: Vec<ModelInfo> = if !billing_models.is_empty() {
+                    // Kiro's fast model is asked for by name and never offered.
                     let visible: Vec<_> = billing_models
                         .into_iter()
-                        .filter(|m| m.is_listed())
+                        .filter(|m| m.is_listed() && m.exposed_model_id != SIMPLE_TASK_MODEL)
                         .collect();
                     let rates = rate_multipliers(billing, &bg.id, &visible, crate::now_secs());
                     visible

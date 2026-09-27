@@ -50,7 +50,8 @@ pub fn tokens_from_units(units: u64) -> u64 {
 
 /// Estimate the input tokens of a request from its JSON: a Kiro request, or the
 /// translated provider request. Image payloads, Kiro's `images` or a `data:image/` URL,
-/// count at a fixed cost and their bytes are skipped; everything else, including tool
+/// count at a fixed cost and their bytes are skipped; attachments, Kiro's `documents` or a
+/// PDF's `data:` URL, count as what they are sent as; everything else, including tool
 /// schemas, tool results and editor state, counts as text.
 pub fn estimate_json_tokens(value: &serde_json::Value) -> u64 {
     tokens_from_units(json_units(value))
@@ -60,12 +61,24 @@ fn json_units(value: &serde_json::Value) -> u64 {
     use serde_json::Value;
     match value {
         Value::String(text) if text.starts_with("data:image/") => IMAGE_TOKENS * 4,
-        Value::String(text) => token_units(text),
+        Value::String(text) => match text.strip_prefix("data:application/pdf;base64,") {
+            Some(pdf) => crate::translate::documents::estimate_units("pdf", pdf),
+            None => token_units(text),
+        },
         Value::Array(items) => items.iter().map(json_units).sum(),
         Value::Object(map) => map
             .iter()
             .map(|(key, value)| match (key.as_str(), value) {
                 ("images", Value::Array(images)) => images.len() as u64 * IMAGE_TOKENS * 4,
+                ("documents", Value::Array(documents)) => documents
+                    .iter()
+                    .map(|document| {
+                        crate::translate::documents::estimate_units(
+                            document["format"].as_str().unwrap_or_default(),
+                            document["source"]["bytes"].as_str().unwrap_or_default(),
+                        )
+                    })
+                    .sum(),
                 _ => token_units(key) + json_units(value),
             })
             .sum(),
@@ -128,6 +141,31 @@ mod tests {
         assert!(
             (IMAGE_TOKENS..IMAGE_TOKENS + 100).contains(&estimate),
             "one image estimated at {estimate} tokens"
+        );
+    }
+
+    #[test]
+    fn an_attachment_costs_what_it_is_sent_as_not_its_base64_length() {
+        let encode = |bytes: &[u8]| {
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
+        };
+        let pdf = encode(&[b"%PDF-1.4 <</Type /Page>> ".as_slice(), &[b'x'; 900_000]].concat());
+        let request = json!({"userInputMessage": {"content": "read this", "documents": [
+            {"name": "paper", "format": "pdf", "source": {"bytes": pdf}},
+            {"name": "notes", "format": "md", "source": {"bytes": encode("你好世界".as_bytes())}}
+        ]}});
+        let estimate = estimate_json_tokens(&request);
+        assert!(
+            (2_000..2_100).contains(&estimate),
+            "estimated at {estimate}"
+        );
+        // The translated file part is counted the same way.
+        let translated = json!({"messages": [{"role": "user", "content": [{"type": "file",
+            "file": {"filename": "paper.pdf", "file_data": format!("data:application/pdf;base64,{pdf}")}}]}]});
+        let estimate = estimate_json_tokens(&translated);
+        assert!(
+            (2_000..2_100).contains(&estimate),
+            "estimated at {estimate}"
         );
     }
 
