@@ -43,7 +43,7 @@ fixture.cards.push({id:LONG,codeRecoverable:true,status:'active',creditTotal:100
     // Past its date a card is 已到期: not in use, and its balance no longer usable.
     const inUse=page.locator('.kpi').filter({hasText:'在用卡密'});
     await inUse.getByText('2 张',{exact:true}).waitFor();
-    assert((await inUse.innerText()).includes('未激活 1 · 可用 6,700 积分'),await inUse.innerText());
+    assert((await inUse.innerText()).includes('未激活 1 · 已到期 2 · 可用 6,700 积分'),await inUse.innerText());
     await nav('卡密资产');await row('fixture-card-5').waitFor();
     assert.equal(await row('fixture-card-5').locator('.col-status').innerText(),'已到期');
     assert((await row('fixture-card-5').locator('.col-expiry').innerText()).includes('已过期'));
