@@ -12,12 +12,12 @@ module.exports = function fixtureApi() {
   models.push(entry({id: 'fixture-model-3', exposed_model_id: 'gpt-6-astra', target_provider_id: 'fixture-openai', target_model: 'gpt-6-astra', group_id: groups[0].id, context_window: 272000, max_output: 128000, credit_multiplier: 1, visible: true, supports_tools: true, supports_vision: true, supports_reasoning: true, sort_order: 1}));
   // Card dates follow the clock (activated a day ago, 29 days left), so no card runs out as the calendar moves on.
   const realNow = Math.floor(Date.now() / 1000);
-  const cards = ['active', 'unactivated', 'frozen', 'banned', 'expired', 'active'].map((status, i) => ({id: `fixture-card-${i}`, codeRecoverable: i !== 1, status, creditTotal: 2000000000, creditUsed: i*100000000, availableCredits: 2000000000-i*100000000, pointsTotal: 2000, pointsAvailable: 2000-i*100, boundDevices: status === 'unactivated' ? [] : [`fixture-device-${i}`], maxDevices: 1, activatedAt: realNow-86400, validUntil: realNow+2592000-86400, groupId: groups[i%4].id, note: '本地视觉测试数据', rebindsUsed: 0, maxRebinds: 5}));
+  const cards = ['active', 'unactivated', 'frozen', 'banned', 'expired', 'active'].map((status, i) => ({id: `fixture-card-${i}`, codeRecoverable: i !== 1, status, creditTotal: 2000000000, creditUsed: i*100000000, availableCredits: 2000000000-i*100000000, pointsTotal: 2000, pointsAvailable: 2000-i*100, boundDevices: status === 'unactivated' ? [] : [`fixture-device-${i}`], maxDevices: 1, activatedAt: realNow-86400, validUntil: realNow+2592000-86400, groupId: groups[i%4].id, note: '本地视觉测试数据', rebindsUsed: 0, maxRebinds: 5, maxConcurrency: 2, dailyCreditLimit: null, monthlyCreditLimit: null}));
   // A card as the server's card views show it: its status as the customer meets it (an active card
   // past its date is expired), its rebind allowance, and for a card not yet activated its validity.
   const view = card => {
     const t = Math.floor(Date.now() / 1000);
-    return {...card, ...cardPlanFields(card), effectiveStatus: card.status === 'active' && card.validUntil != null && t >= card.validUntil ? 'expired' : card.status,
+    return {maxConcurrency: 5, dailyCreditLimit: null, monthlyCreditLimit: null, ...card, ...cardPlanFields(card), effectiveStatus: card.status === 'active' && card.validUntil != null && t >= card.validUntil ? 'expired' : card.status,
       rebindsUsed: card.rebindsUsed ?? 0, maxRebinds: card.maxRebinds ?? 5, rebindCooldownUntil: card.rebindCooldownUntil > t ? card.rebindCooldownUntil : null,
       activationDurationSecs: card.activatedAt == null ? card.activationDurationSecs ?? 2592000 : null};
   };
@@ -565,7 +565,7 @@ module.exports = function fixtureApi() {
       const t=Math.floor(Date.now()/1000);
       const generated=Array.from({length:body.count},(_,i)=>({cardId:`fixture-issued-${cards.length+i}`,rawCode:`FIXTURE-NOT-VALID-${plan.points}-${i}`,groupId:body.groupId,creditTotal:plan.points*1000000,maxDevices:1,virtualPlanName:plan.name,status:'unactivated',planId:plan.id,plan:kept}));
       generated.forEach(c=>cards.push({id:c.cardId,codeRecoverable:true,status:c.status,creditTotal:c.creditTotal,creditUsed:0,availableCredits:c.creditTotal,pointsTotal:plan.points,pointsAvailable:plan.points,boundDevices:[],maxDevices:1,groupId:c.groupId,note:body.note,
-        activationDurationSecs:plan.validity_days*86400,issuedAt:t,plan:kept}));
+        activationDurationSecs:plan.validity_days*86400,issuedAt:t,plan:kept,maxConcurrency:plan.concurrency,dailyCreditLimit:null,monthlyCreditLimit:null}));
       return reply({success:true,cards:generated});
     }
     // Card support, as the admin API answers: refusals are {success:false, error} in the server's words
@@ -691,6 +691,26 @@ module.exports = function fixtureApi() {
       if(!group)return cardFail(409,`Unknown group: ${body.groupId}`);
       if(group.issuance_enabled===false)return cardFail(409,`Group does not take cards: ${body.groupId}`);
       if(card.groupId!==group.id){record(card.id,'group',body.reason,{detail:{previousGroupId:card.groupId,groupId:group.id}});card.groupId=group.id;}
+      return reply({success:true,card:view(card)});
+    }
+    // 修改限额, as billing's change_card_quotas: absent keeps a limit, null clears one; each value changed is
+    // written with the one it replaced, and nothing is written when all are as asked.
+    if(endpoint==='cards/quotas') {
+      const field=unknownField(['cardId','maxConcurrency','dailyCreditLimit','monthlyCreditLimit','reason']);if(field)return cardFail(400,`Invalid request body: unknown field \`${field}\``);
+      const typed=(value,test)=>value===undefined||value===null||test(value);
+      if(!typed(body.maxConcurrency,value=>Number.isInteger(value)&&value>=0)||!typed(body.dailyCreditLimit,Number.isInteger)||!typed(body.monthlyCreditLimit,Number.isInteger))
+        return cardFail(400,'Invalid request body: invalid type: expected an integer');
+      if(!String(body.cardId??'').trim())return cardFail(400,'cardId is required');
+      const given=key=>key in body&&!(key==='maxConcurrency'&&body[key]===null);
+      if(!['maxConcurrency','dailyCreditLimit','monthlyCreditLimit'].some(given))return cardFail(400,'Give maxConcurrency, dailyCreditLimit or monthlyCreditLimit');
+      if(given('maxConcurrency')&&!(body.maxConcurrency>=1&&body.maxConcurrency<=20))return cardFail(400,'maxConcurrency must be between 1 and 20');
+      if(['dailyCreditLimit','monthlyCreditLimit'].some(key=>body[key]!=null&&!(body[key]>=0&&body[key]<=10000000000000)))return cardFail(400,'dailyCreditLimit and monthlyCreditLimit must be null or 0-10000000000000 micro-credits');
+      if(!support(body.reason))return cardFail(400,'A reason of 1 to 200 bytes is required');
+      const card=cards.find(c=>c.id===body.cardId);if(!card)return cardFail(404,`Card ${body.cardId} not found`);
+      const current=view(card),detail={};
+      for(const key of ['maxConcurrency','dailyCreditLimit','monthlyCreditLimit'])if(given(key)&&body[key]!==current[key]){
+        detail[`previous${key[0].toUpperCase()}${key.slice(1)}`]=current[key];detail[key]=body[key];card[key]=body[key];}
+      if(Object.keys(detail).length)record(card.id,'quotas',body.reason,{detail});
       return reply({success:true,card:view(card)});
     }
     // Archiving the ledger, as its handler answers: a receipt, and the saved size before and after.

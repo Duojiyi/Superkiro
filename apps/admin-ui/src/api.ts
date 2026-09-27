@@ -232,6 +232,10 @@ export interface AdminCardItem {
   kiroPlanType?: string;
   /** The plan as it was when the card was issued; null for a card issued before the catalog. */
   plan?: CardPlan | null;
+  /** Its limits (newer servers): requests at once, and credits in a UTC day and over 30 days (micro-credits; null: none). */
+  maxConcurrency?: number;
+  dailyCreditLimit?: number | null;
+  monthlyCreditLimit?: number | null;
 }
 
 /** A plan as a card keeps it from its issuance, whatever the catalog becomes. */
@@ -586,6 +590,16 @@ export class AdminApiClient {
   /** 换分组: into a group that takes cards; the card's sessions end, so the customer signs in again. */
   async changeCardGroup(cardId: string, groupId: string, reason: string): Promise<AdminCardReply> {
     return this.request('/api/v1/admin/cards/group', {method: 'POST', body: JSON.stringify({cardId, groupId, reason})});
+  }
+
+  /** 修改限额: only the limits given change (micro-credits; null clears one); written to the card's history with the previous values. */
+  async changeCardQuotas(cardId: string, change: {maxConcurrency?: number; dailyCreditLimit?: number | null; monthlyCreditLimit?: number | null}, reason: string): Promise<AdminCardReply> {
+    return this.request('/api/v1/admin/cards/quotas', {method: 'POST', body: JSON.stringify({cardId, ...change, reason})});
+  }
+
+  /** 更换卡密: a new code, returned this once; the old code and every session of the card stop working. */
+  async rekeyCard(cardId: string, reason: string): Promise<{success: boolean; card?: AdminCardItem; rawCode: string}> {
+    return this.request('/api/v1/admin/cards/rekey', {method: 'POST', body: JSON.stringify({cardId, reason})});
   }
 
   /**

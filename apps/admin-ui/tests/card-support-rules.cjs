@@ -71,6 +71,33 @@ assert.equal(support.historyDetail({action: 'ban', detail: null}), '');
 assert.equal(support.historyDetail({action: 'note'}), '');
 console.log('PASS: history actions and their details (device, previous allowance, new expiry, groups) in words');
 
+// 限额: requests at once, and credits a UTC day and over 30 days; blank is no limit; only what changes is sent.
+{
+  const card = {maxConcurrency: 2, dailyCreditLimit: null, monthlyCreditLimit: 5000000000};
+  assert.equal(support.limitsText(card), '同时 2 个请求 · 每日 不限 · 近 30 天 5,000 积分');
+  assert.deepEqual([support.limitInput(null), support.limitInput(500000000), support.limitInput(1500000)], ['', '500', '1.5']);
+  assert.deepEqual([' ', '500', '1,000.5', '0', '0.000001', '10000000', '10000000.000001', '-1', '1.2345678', 'abc'].map(text => String(support.parseLimit(text))),
+    ['null', '500000000', '1000500000', '0', '1', '10000000000000', 'undefined', 'undefined', 'undefined', 'undefined']);
+  const same = support.quotaChange(card, {concurrency: '2', daily: '', monthly: '5000'});
+  assert.deepEqual(plain(same), {change: {}, problems: [], lines: []}, 'nothing changes');
+  const raised = support.quotaChange(card, {concurrency: '4', daily: '500', monthly: ''});
+  assert.deepEqual(plain(raised.change), {maxConcurrency: 4, dailyCreditLimit: 500000000, monthlyCreditLimit: null});
+  assert.deepEqual(plain(raised.lines), ['同时请求 2 → 4 个', '每日 不限 → 500 积分', '近 30 天 5,000 积分 → 不限']);
+  assert.deepEqual(plain(support.quotaChange(card, {concurrency: '21', daily: '0', monthly: 'x'}).problems),
+    ['同时请求数须是 1–20 的整数', '近 30 天上限须是 0–10,000,000 积分（最多 6 位小数），留空为不限']);
+  assert.deepEqual(plain(support.quotaChange(card, {concurrency: '2', daily: '0', monthly: '5000'}).lines), ['每日 不限 → 0 积分（这张卡将用不了积分）']);
+  assert.equal(support.historyLabel('quotas'), '修改限额');
+  assert.equal(support.historyDetail({action: 'quotas', detail: {previousMaxConcurrency: 2, maxConcurrency: 4, previousDailyCreditLimit: null, dailyCreditLimit: 500000000}}),
+    '同时请求 2 → 4 个 · 每日 不限 → 500 积分');
+  assert.equal(support.historyDetail({action: 'quotas', detail: {previousMonthlyCreditLimit: 5000000000, monthlyCreditLimit: null}}), '近 30 天 5,000 积分 → 不限');
+  for (const [text, expected] of [
+    ['Give maxConcurrency, dailyCreditLimit or monthlyCreditLimit', '没有要修改的限额'],
+    ['maxConcurrency must be between 1 and 20', '同时请求数须在 1–20 之间'],
+    ['dailyCreditLimit and monthlyCreditLimit must be null or 0-10000000000000 micro-credits', '每日和近 30 天的积分上限须在 0–10,000,000 积分之间，或不限'],
+  ]) assert.equal(support.explainCardRefusal(text), expected, text);
+  console.log('PASS: 限额 in words (不限 for none), limits typed in credits to the micro-credit, only the changed ones sent, the history with the values replaced, and the quota refusals in words');
+}
+
 // Refusals in the server's words, explained; the cards they name are listed short.
 for (const [text, expected] of [
   ['A reason of 1 to 200 bytes is required', '请填写原因（1–200 字节，约 60 个汉字）'],

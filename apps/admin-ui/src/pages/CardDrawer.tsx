@@ -4,7 +4,7 @@
 // guard stays exactly as it is in the table.
 import {useEffect, useRef, useState} from 'react';
 import {adminApi, AdminApiError, type AdminCardItem, type AdminTrace, type CardEvent} from '../api';
-import {daysText, historyDetail, historyLabel, noteProblem, rebindsToReset, rebindText} from '../cardSupport';
+import {DAILY_WINDOW, daysText, historyDetail, historyLabel, limitsText, MONTHLY_WINDOW, noteProblem, rebindsToReset, rebindText} from '../cardSupport';
 import {IconChevronDown, IconChevronUp, IconClose, IconCopy} from '../components/icons';
 import {Drawer} from '../components/modal';
 import {copyText, IdCell, StatusBadge, Tag} from '../components/ui';
@@ -98,7 +98,8 @@ export default function CardDrawer({card, state, groupName, hasPrev, hasNext, on
     const result = await adminApi.getCardHistory(card.id);
     if (result.success !== true || !Array.isArray(result.events)) throw new Error('服务器未确认读取成功');
     return result.events;
-  }, [card.id, JSON.stringify([card.status, card.pointsAvailable, card.archivedAt, card.note, card.groupId, card.validUntil, card.activationDurationSecs, card.boundDevices, card.rebindsUsed, card.rebindCooldownUntil])]);
+  }, [card.id, JSON.stringify([card.status, card.pointsAvailable, card.archivedAt, card.note, card.groupId, card.validUntil, card.activationDurationSecs, card.boundDevices, card.rebindsUsed, card.rebindCooldownUntil,
+    card.maxConcurrency, card.dailyCreditLimit, card.monthlyCreditLimit])]);
   const [recent, retryRecent] = useLoad(async () => {
     const result = await adminApi.getTraces(20, card.id);
     if (result.success !== true) throw new Error('服务器未确认读取成功');
@@ -157,6 +158,9 @@ export default function CardDrawer({card, state, groupName, hasPrev, hasNext, on
         <dt>余额</dt><dd><b>{formatCredits(card.pointsAvailable)}</b> / {formatCredits(card.pointsTotal)} 积分
           {shortOf && <span className="balance-short" title={`${formatFullDateTime(shortOf.ts)} 的请求被拒绝：请求开始前要按最大输出预留积分`}>
             余额不够开始 {shortOf.exposed_model || '这个模型'}（约需 {formatCredits(Number(shortOf.needed_micro_credits) / 1_000_000)} 积分）· {formatRelative(shortOf.ts)}</span>}</dd>
+        {typeof card.maxConcurrency === 'number' && <><dt>限额</dt><dd className="card-limits">
+          <span title={`${DAILY_WINDOW}；${MONTHLY_WINDOW}`}>{limitsText(card)}</span>
+          {!voided && <button type="button" className="btn-text" disabled={supportBlocked} title={supportTitle ?? '修改同时请求数和每日、近 30 天的积分上限'} onClick={() => support.changeQuotas(card)}>修改</button>}</dd></>}
         <dt>到期</dt><dd>{card.validUntil
           ? <span title={formatFullDateTime(card.validUntil)}>{formatDateTime(card.validUntil)}{lapsed
             // What the date means for the customer: how long ago, and the balance they can no longer use.

@@ -2,7 +2,7 @@
 // in the console's words: the device allowance, what an extension will make of a card's validity
 // (as crates/billing/src/engine.rs extend_validity computes it), what the card's history records,
 // and why the server refused one. Pure functions, so the rules can be tested without a browser.
-import {formatFullDateTime, shortId} from './format';
+import {formatCredits, formatFullDateTime, shortId} from './format';
 import {explainRefusal} from './refusal';
 
 /** A card as far as these rules read it (the fields of AdminCardItem they need). */
@@ -113,10 +113,61 @@ export function extensionText(result: Extension): string {
   return `到期 ${minuteText(result.from)} → ${minuteText(result.to)}`;
 }
 
+/** A card's limits as the server keeps them: requests at once, and credits in a UTC day and over 30 days (micro-credits; null: none). */
+export interface CardLimits {maxConcurrency?: number; dailyCreditLimit?: number | null; monthlyCreditLimit?: number | null}
+/** What 修改限额 sends: only the limits that change (micro-credits; null clears a limit). */
+export interface QuotaChange {maxConcurrency?: number; dailyCreditLimit?: number | null; monthlyCreditLimit?: number | null}
+/** Requests a card may have at once, as a plan's concurrency is bounded. */
+export const MAX_CONCURRENCY = 20;
+/** The largest daily or 30-day limit, in credits (the most a plan issues). */
+export const MAX_CREDIT_LIMIT = 10_000_000;
+/** What the daily limit counts: the UTC day, which ends at 08:00 in Beijing. */
+export const DAILY_WINDOW = '每日按 UTC 日统计，北京时间每天 08:00 重置';
+/** What the monthly limit counts: today and the 29 UTC days before it. */
+export const MONTHLY_WINDOW = '近 30 天：今天和之前 29 天（按 UTC 日）累计';
+
+/** A limit in words: 不限, or 500 积分. */
+export const limitText = (micro: number | null | undefined) => micro == null ? '不限' : `${formatCredits(micro / 1_000_000)} 积分`;
+/** A limit as its field shows it: blank for none, else the exact credits. */
+export function limitInput(micro: number | null | undefined): string {
+  if (micro == null) return '';
+  const fraction = String(micro % 1_000_000).padStart(6, '0').replace(/0+$/, '');
+  return `${Math.floor(micro / 1_000_000)}${fraction ? `.${fraction}` : ''}`;
+}
+
+/** The limits in a line: 同时 2 个请求 · 每日 不限 · 近 30 天 5,000 积分. */
+export const limitsText = (card: CardLimits) =>
+  `同时 ${card.maxConcurrency ?? '—'} 个请求 · 每日 ${limitText(card.dailyCreditLimit)} · 近 30 天 ${limitText(card.monthlyCreditLimit)}`;
+
+/** Credits typed for a limit, in micro-credits: blank is no limit (null); undefined when the server would not take it. */
+export function parseLimit(text: string): number | null | undefined {
+  const value = text.trim().replace(/[,，]/g, '');
+  if (!value) return null;
+  const match = /^(\d+)(?:\.(\d{1,6}))?$/.exec(value);
+  if (!match) return undefined;
+  const micro = Number(match[1]) * 1_000_000 + Number((match[2] ?? '').padEnd(6, '0'));
+  return Number.isSafeInteger(micro) && micro <= MAX_CREDIT_LIMIT * 1_000_000 ? micro : undefined;
+}
+
+/** What 修改限额 would send for the fields as typed (only what changes), and what is wrong with them. */
+export function quotaChange(card: CardLimits, draft: {concurrency: string; daily: string; monthly: string}): {change: QuotaChange; problems: string[]; lines: string[]} {
+  const change: QuotaChange = {}, problems: string[] = [], lines: string[] = [];
+  const concurrency = draft.concurrency.trim();
+  if (!/^\d+$/.test(concurrency) || Number(concurrency) < 1 || Number(concurrency) > MAX_CONCURRENCY) problems.push(`同时请求数须是 1–${MAX_CONCURRENCY} 的整数`);
+  else if (Number(concurrency) !== card.maxConcurrency) {change.maxConcurrency = Number(concurrency); lines.push(`同时请求 ${card.maxConcurrency ?? '—'} → ${concurrency} 个`);}
+  for (const [key, text, label] of [['dailyCreditLimit', draft.daily, '每日'], ['monthlyCreditLimit', draft.monthly, '近 30 天']] as const) {
+    const micro = parseLimit(text), before = card[key] ?? null;
+    if (micro === undefined) {problems.push(`${label}上限须是 0–${formatCredits(MAX_CREDIT_LIMIT)} 积分（最多 6 位小数），留空为不限`); continue;}
+    if (micro !== before) {change[key] = micro; lines.push(`${label} ${limitText(before)} → ${limitText(micro)}${micro === 0 ? '（这张卡将用不了积分）' : ''}`);}
+  }
+  return {change, problems, lines};
+}
+
 const HISTORY_LABEL: Record<string, string> = {
   issued: '发卡', activated: '激活', topup: '充值', adjust: '调账', freeze: '冻结', unfreeze: '解冻',
   ban: '封禁', unban: '解封', void: '永久作废', archive: '归档', unarchive: '取消归档',
   unbind: '解绑设备', rebinds_reset: '重置换绑次数', extend: '延长有效期', note: '修改备注', group: '换分组',
+  quotas: '修改限额', rekey: '更换卡密',
 };
 
 /** A history entry's action in words; unknown ones are shown as they are. */
@@ -138,6 +189,15 @@ export function historyDetail(event: {action: string; detail?: unknown}, groupNa
     }
     case 'group': return typeof detail.groupId === 'string'
       ? `${typeof detail.previousGroupId === 'string' ? groupName(detail.previousGroupId) : '—'} → ${groupName(detail.groupId)}` : '';
+    // Each limit changed, with the one it replaced (null: no limit).
+    case 'quotas': {
+      const limit = (value: unknown) => limitText(number(value));
+      return [
+        'maxConcurrency' in detail ? `同时请求 ${number(detail.previousMaxConcurrency) ?? '—'} → ${number(detail.maxConcurrency) ?? '—'} 个` : '',
+        'dailyCreditLimit' in detail ? `每日 ${limit(detail.previousDailyCreditLimit)} → ${limit(detail.dailyCreditLimit)}` : '',
+        'monthlyCreditLimit' in detail ? `近 30 天 ${limit(detail.previousMonthlyCreditLimit)} → ${limit(detail.monthlyCreditLimit)}` : '',
+      ].filter(Boolean).join(' · ');
+    }
     default: return '';
   }
 }
@@ -174,6 +234,9 @@ const CARD_REFUSALS: Array<[RegExp, (rest: string, match: RegExpExecArray) => st
   [/cardId and deviceId are required|cardId and groupId are required|cardId is required|Invalid card ID in cardIds/i, () => '请求缺少卡密、设备或分组，请刷新后重试'],
   [/Invalid request body/i, () => '提交的内容无效，请刷新后重试'],
   [/invocationId must be/i, () => '关联的请求编号无效（最多 257 个字母、数字或 - _ . :）'],
+  [/Give maxConcurrency, dailyCreditLimit or monthlyCreditLimit/i, () => '没有要修改的限额'],
+  [/maxConcurrency must be between 1 and 20/i, () => `同时请求数须在 1–${MAX_CONCURRENCY} 之间`],
+  [/dailyCreditLimit and monthlyCreditLimit must be null or/i, () => `每日和近 30 天的积分上限须在 0–${formatCredits(MAX_CREDIT_LIMIT)} 积分之间，或不限`],
   [/Operator ID is required/i, () => '需要重新登录以确认操作人'],
 ];
 

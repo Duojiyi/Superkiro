@@ -9,7 +9,8 @@ import {ask, confirmAction} from '../components/confirm';
 import {Modal} from '../components/modal';
 import {toast} from '../components/toast';
 import {IdCell} from '../components/ui';
-import {CARD_CHANGE_KEY, endOfDay, explainCardRefusal, EXTENSION_DAYS, extension, extensionText, MAX_EXTEND_CARDS, REASON_MAX_CHARS, rebindText, unchanged, validReason} from '../cardSupport';
+import {CARD_CHANGE_KEY, DAILY_WINDOW, endOfDay, explainCardRefusal, EXTENSION_DAYS, extension, extensionText, limitInput, MAX_CONCURRENCY, MAX_EXTEND_CARDS, MONTHLY_WINDOW, quotaChange,
+  REASON_MAX_CHARS, rebindText, unchanged, validReason, type QuotaChange} from '../cardSupport';
 import {formatCount, formatCredits, shortId} from '../format';
 import {cardState, cardStatusView} from '../status';
 import type {Refresh, ReportError, Row, WriteGuards} from '../types';
@@ -136,6 +137,61 @@ function GroupDialog({card, groups, groupName, onSubmit, onClose}: {
   </Modal>;
 }
 
+const QUOTA_REASONS = ['客户要求', '防止滥用', '临时放宽'];
+
+/** 修改限额: requests at once, and credits a day and over 30 days; only what changes is sent. */
+function QuotaDialog({card, onSubmit, onClose}: {
+  card: AdminCardItem;
+  onSubmit: (change: QuotaChange, reason: string) => Promise<string | null>;
+  onClose: () => void;
+}) {
+  const [concurrency, setConcurrency] = useState(String(card.maxConcurrency ?? ''));
+  const [daily, setDaily] = useState(limitInput(card.dailyCreditLimit));
+  const [monthly, setMonthly] = useState(limitInput(card.monthlyCreditLimit));
+  const [reason, setReason] = useState('');
+  const [error, setError] = useState('');
+  const [saving, setSaving] = useState(false);
+  const {change, problems, lines} = quotaChange(card, {concurrency, daily, monthly});
+  const ready = !problems.length && lines.length > 0 && validReason(reason) && !saving;
+  const submit = async () => {
+    if (!ready) return;
+    setSaving(true); setError('');
+    const failure = await onSubmit(change, reason.trim());
+    setSaving(false);
+    if (failure) setError(failure);
+  };
+  return <Modal label="修改限额" onClose={onClose} busy={saving} className="dialog-form">
+    <h3 className="modal-title">修改限额 · <span className="mono">{shortId(card.id, 'card')}</span></h3>
+    {error && <p role="alert" className="form-error">{error}</p>}
+    <div className="form-grid quota-grid">
+      <label className="field"><span className="field-label">同时请求数</span>
+        <input type="number" aria-label="同时请求数" min={1} max={MAX_CONCURRENCY} step={1} value={concurrency} disabled={saving} onChange={event => setConcurrency(event.target.value)}/>
+        <span className="field-hint">1–{MAX_CONCURRENCY}{card.plan ? `；套餐是 ${card.plan.concurrency}` : ''}</span></label>
+      <label className="field"><span className="field-label">每日积分上限</span>
+        <input inputMode="decimal" aria-label="每日积分上限" placeholder="不限" value={daily} disabled={saving} onChange={event => setDaily(event.target.value)}/>
+        <span className="field-hint">{DAILY_WINDOW}；留空为不限</span></label>
+      <label className="field"><span className="field-label">近 30 天积分上限</span>
+        <input inputMode="decimal" aria-label="近 30 天积分上限" placeholder="不限" value={monthly} disabled={saving} onChange={event => setMonthly(event.target.value)}/>
+        <span className="field-hint">{MONTHLY_WINDOW}；留空为不限</span></label>
+    </div>
+    {problems.map(problem => <p key={problem} className="field-error">{problem}</p>)}
+    <div className="review-box" aria-label="限额修改" role="status">
+      {lines.length ? lines.map(line => <p key={line}>{line}</p>) : <p className="muted">没有修改</p>}
+    </div>
+    <div className="field">
+      <label className="field-label" htmlFor="quota-reason">原因<span className="required-mark">（必填）</span></label>
+      <input id="quota-reason" value={reason} maxLength={REASON_MAX_CHARS} placeholder="例：客户要求限制每日用量" disabled={saving} onChange={event => setReason(event.target.value)}/>
+      <div className="chips">{QUOTA_REASONS.map(text => <button key={text} type="button" className="chip" aria-pressed={reason === text} disabled={saving} onClick={() => setReason(text)}>{text}</button>)}</div>
+    </div>
+    <p className="muted">马上生效：超过上限的新请求会被拒绝，进行中的请求照常结算。写进这张卡的操作记录，连同原来的值。</p>
+    <div className="modal-actions">
+      <button type="button" className="btn" disabled={saving} onClick={onClose}>取消</button>
+      <button type="button" className="btn btn-primary" disabled={!ready} title={ready ? undefined : !lines.length ? '没有修改' : problems.length ? problems[0] : '填写原因后可以保存'} onClick={() => void submit()}>
+        {saving ? '正在保存…' : '保存限额'}</button>
+    </div>
+  </Modal>;
+}
+
 export interface CardSupport {
   /** Why support actions are not available now (a result to check, another write), or undefined. */
   blockedTitle?: string;
@@ -147,6 +203,8 @@ export interface CardSupport {
   /** Saves a note; resolves to what went wrong, or null once saved. */
   saveNote: (card: AdminCardItem, note: string) => Promise<string | null>;
   changeGroup: (card: AdminCardItem) => void;
+  /** Opens 修改限额 for the card. */
+  changeQuotas: (card: AdminCardItem) => void;
   /** The recovery panel and the dialogs, rendered by the page. */
   view: ReactNode;
 }
@@ -171,9 +229,10 @@ export function useCardSupport({cards, groups, groupName, guards, refresh, repor
   const [working, setWorking] = useState(false);
   const [extending, setExtending] = useState<{cards: AdminCardItem[]; everyResult: boolean} | null>(null);
   const [grouping, setGrouping] = useState<AdminCardItem | null>(null);
+  const [limiting, setLimiting] = useState<AdminCardItem | null>(null);
   const latest = useRef(cards);
   latest.current = cards;
-  useEffect(() => {if (extending || grouping) reportError('');}, [extending, grouping, reportError]);
+  useEffect(() => {if (extending || grouping || limiting) reportError('');}, [extending, grouping, limiting, reportError]);
 
   /**
    * Sends one change. The intent is kept first, so a reload before the reply still knows a
@@ -272,6 +331,13 @@ export function useCardSupport({cards, groups, groupName, guards, refresh, repor
     return result || null;
   };
 
+  const changeQuotas = (card: AdminCardItem) => {if (!unavailable && !pending) setLimiting(card);};
+  const submitQuotas = async (card: AdminCardItem, change: QuotaChange, reason: string) => {
+    const result = await send('修改限额', [card.id], () => adminApi.changeCardQuotas(card.id, change, reason), `已修改 ${shortId(card.id, 'card')} 的限额`);
+    if (result === null || result === '') setLimiting(null);
+    return result || null;
+  };
+
   const refreshForReview = async () => {
     if (checking || writing.current) return;
     setChecking(true); setReview('refresh');
@@ -304,8 +370,9 @@ export function useCardSupport({cards, groups, groupName, guards, refresh, repor
     {extending && <ExtendDialog targets={extending.cards} everyResult={extending.everyResult} onClose={() => setExtending(null)} onSubmit={submitExtension}/>}
     {grouping && <GroupDialog card={grouping} groups={groups} groupName={groupName} onClose={() => setGrouping(null)}
       onSubmit={(groupId, reason) => submitGroup(grouping, groupId, reason)}/>}
+    {limiting && <QuotaDialog card={limiting} onClose={() => setLimiting(null)} onSubmit={(change, reason) => submitQuotas(limiting, change, reason)}/>}
   </>;
 
   return {blockedTitle, unban: card => void unban(card), unbind: (card, device) => void unbind(card, device), resetRebinds: card => void resetRebinds(card),
-    extend, saveNote, changeGroup, view};
+    extend, saveNote, changeGroup, changeQuotas, view};
 }
