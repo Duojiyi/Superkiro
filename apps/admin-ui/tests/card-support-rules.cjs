@@ -245,10 +245,12 @@ console.log('PASS: refused support actions are explained in words with their car
     {ts: now - 180, attempt_chain: [{provider_id: 'kimera', key_id: 'kimera-1', success: true}]},
     {ts: now - 90000, attempt_chain: [{provider_id: 'hanyue', key_id: 'hanyue-1', success: false, error: 'http_529'}]},
   ];
+  // The upstream refused a prompt too long: it did right, and that attempt is counted apart.
+  traces.push({ts: now - 240, status: 'error', error_class: 'input_too_long', attempt_chain: [{provider_id: 'kimera', key_id: 'kimera-1', success: false, error: 'http_400'}]});
   const {providers, keys} = health.attemptsFromTraces(traces, now);
-  assert.deepEqual(plain(providers.get('hanyue')), {attempts: 3, failures: 3, takenOver: 1, failuresByKind: {http_529: 2, timeout: 1}}, 'taken over only when another provider answered later');
-  assert.deepEqual(plain(providers.get('kimera')), {attempts: 2, failures: 0, takenOver: 0, failuresByKind: {}});
-  assert.deepEqual(plain(keys.get('hanyue-1')), {attempts: 2, failures: 2, takenOver: 1, failuresByKind: {http_529: 2}}, 'older than 24 hours is left out');
+  assert.deepEqual(plain(providers.get('hanyue')), {attempts: 3, failures: 3, takenOver: 1, failuresByKind: {http_529: 2, timeout: 1}, refused: 0}, 'taken over only when another provider answered later');
+  assert.deepEqual(plain(providers.get('kimera')), {attempts: 2, failures: 0, takenOver: 0, failuresByKind: {}, refused: 1});
+  assert.deepEqual(plain(keys.get('hanyue-1')), {attempts: 2, failures: 2, takenOver: 1, failuresByKind: {http_529: 2}, refused: 0}, 'older than 24 hours is left out');
   assert.equal(health.kindsText({http_529: 5, timeout: 2}), 'HTTP 529 · 上游过载 × 5、超时 × 2');
   assert.equal(health.kindsText({http_529: 5, timeout: 2, transport: 1}), 'HTTP 529 · 上游过载 × 5、超时 × 2 等 3 种');
   assert.equal(health.kindsText({stream_incomplete: 2}), '输出中断 × 2', 'a request\'s error class in words');

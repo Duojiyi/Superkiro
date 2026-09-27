@@ -65,8 +65,9 @@ const totalsOf=list=>`次数 ${list.length.toLocaleString('en-US')} 失败 ${lis
     assert.equal(await tab('success').locator('.tab-count').count(),0,'no count the latest 500 cannot give');
     console.log('PASS: the latest 500 are listed with the totals over all 664 kept requests, 全部 and 失败 counted by the server');
 
-    // 失败: the server's own failures, all 23 of them, by model and by provider (by name).
-    searches.length=0;await tab('error').click();await waitRows(23);
+    // 失败: the server's own failures, all 23 of them, by model and by provider (by name). They are asked for
+    // as soon as more matched than were returned, so that 失败 and 拒绝 are counted apart.
+    await tab('error').click();await waitRows(23);
     assert(searches.some(search=>search.status==='error'),JSON.stringify(searches));
     assert.equal(await summary(),'服务器按筛选找到 23 次 · 匹配 23 条 清除筛选');
     assert.equal(await footer(),`筛选合计 ${totalsOf(all.filter(t=>t.status==='error'))}`);

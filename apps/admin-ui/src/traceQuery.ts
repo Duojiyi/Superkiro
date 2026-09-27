@@ -3,7 +3,8 @@
 // unfiltered, and the totals and failure breakdowns of what is shown. Pure functions, so the
 // rules can be tested without a browser.
 import type {AdminTrace, TraceTotals} from './api';
-import type {TraceWindow} from './types';
+import {refusedTrace, TRACE_IN_PROGRESS} from './status';
+import type {TraceTab, TraceWindow} from './types';
 
 /** A chosen range as the two inputs hold it (2026-09-26T08:30); an empty one is open. */
 export interface TraceSpan {from: string; to: string}
@@ -61,6 +62,23 @@ export function inScope(trace: AdminTrace, {bounds, cardId, model, provider}: Tr
 }
 
 
+/** Whether a request belongs under a status tab: 失败 and 拒绝 split the server's error status. */
+export function tabMatches(trace: AdminTrace, tab: TraceTab): boolean {
+  switch (tab) {
+    case 'ALL': return true;
+    case 'in_progress': return TRACE_IN_PROGRESS.includes(String(trace.status));
+    case 'error': return trace.status === 'error' && !refusedTrace(trace);
+    case 'refused': return refusedTrace(trace);
+    default: return trace.status === tab;
+  }
+}
+
+/** The status the server is asked for under a tab: 失败 and 拒绝 are both its error. */
+export const serverStatus = (tab: TraceTab): string | undefined => tab === 'ALL' ? undefined : tab === 'refused' ? 'error' : tab;
+
+/** Requests refused for the card or the request itself among these (the server counts them as failures). */
+export const refusedCount = (traces: AdminTrace[]) => traces.filter(refusedTrace).length;
+
 /** Totals as the server counts them: a failure is a request whose status is error. */
 export function traceTotals(traces: AdminTrace[]): TraceTotals {
   return traces.reduce((totals, trace) => ({count: totals.count + 1, failures: totals.failures + (trace.status === 'error' ? 1 : 0),
@@ -78,7 +96,8 @@ const ranked = (counts: Map<string, number>) => [...counts].sort((a, b) => b[1] 
 export function failureBreakdown(traces: AdminTrace[]): {models: Array<[string, number]>; providers: Array<[string, number]>} {
   const models = new Map<string, number>(), providers = new Map<string, number>();
   for (const trace of traces) {
-    if (trace.status !== 'error') continue;
+    // A refusal for the card or the request itself is not a failure of a model or a provider.
+    if (trace.status !== 'error' || refusedTrace(trace)) continue;
     const model = String(trace.exposed_model ?? '');
     models.set(model, (models.get(model) ?? 0) + 1);
     const chain = trace.attempt_chain ?? [];

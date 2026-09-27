@@ -11,7 +11,7 @@ import {IconCheck, IconWarning} from '../components/icons';
 import {formatBytes, formatCount, formatCredits, formatCreditsMicro, formatDuration, formatFullDateTime, formatMoney, formatMoneyExact, formatPercent, formatRemaining, shortId} from '../format';
 import {uncostedText} from '../financial';
 import {brokenRoutes, modelName, nameList, targetProblem} from '../routes';
-import {cardState, cooldownText, failureLabel, keyAlert, keyCooldownLeft, keyStatusView, persistence, storageLevel, TRACE_IN_PROGRESS} from '../status';
+import {cardState, cooldownText, failureLabel, keyAlert, keyCooldownLeft, keyStatusView, persistence, refusedTrace, storageLevel, TRACE_IN_PROGRESS} from '../status';
 import type {Intent, Row, Tab} from '../types';
 import type {Failures, WorkspaceData} from '../Workspace';
 
@@ -25,11 +25,14 @@ const rateTone = (rate: number | null) => rate === null ? undefined : rate < 90 
 
 /** Totals from the loaded traces, for servers that do not report activity yet. */
 function windowFromTraces(traces: AdminTrace[], start: number): AdminActivityWindow {
-  const window: AdminActivityWindow = {requests: 0, succeeded: 0, failed: 0, clientAborted: 0, creditsCharged: 0, inputTokens: 0, outputTokens: 0, providerCostMicroCny: 0, activeCards: 0};
+  const window: AdminActivityWindow = {requests: 0, succeeded: 0, failed: 0, clientAborted: 0, refused: 0, creditsCharged: 0, inputTokens: 0, outputTokens: 0, providerCostMicroCny: 0, activeCards: 0};
   const cards = new Set<string>();
   const timed: number[] = [];
   for (const trace of traces) {
     if (Number(trace.ts) <= start || TRACE_IN_PROGRESS.includes(String(trace.status))) continue;
+    // A refusal for the card or the request itself is counted apart, as the server counts it.
+    const times = Math.max(1, Number(trace.repeats ?? 0) + 1);
+    if (refusedTrace(trace)) {window.refused = (window.refused ?? 0) + times; continue;}
     window.requests++;
     if (trace.status === 'success') window.succeeded++;
     else if (trace.status === 'error') window.failed++;
@@ -88,7 +91,8 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
   const hours = activity?.hourly?.length ? activity.hourly : Array.from({length: 24}, (_, index) => {
     const startSecs = (Math.floor(nowSecs / 3600) - 23 + index) * 3600;
     const inHour = data.traces.filter(trace => Number(trace.ts) >= startSecs && Number(trace.ts) < startSecs + 3600 && !TRACE_IN_PROGRESS.includes(String(trace.status)));
-    return {startSecs, requests: inHour.length, failed: inHour.filter(trace => trace.status === 'error').length};
+    const served = inHour.filter(trace => !refusedTrace(trace));
+    return {startSecs, requests: served.length, failed: served.filter(trace => trace.status === 'error').length, refused: inHour.length - served.length};
   });
   const peak = Math.max(1, ...hours.map(hour => hour.requests));
   const hourLabel = (secs: number) => String(new Date(secs * 1000).getHours()).padStart(2, '0');
@@ -238,6 +242,8 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
         sub={period && <>
           <button type="button" className="link" onClick={() => onNavigate('traces', {traces: {status: 'error', window: range === '24h' ? 'day' : 'all'}})}>失败 {formatCount(period.failed)}</button>
           {period.clientAborted > 0 && <span> · 中断 {formatCount(period.clientAborted)}</span>}
+          {(period.refused ?? 0) > 0 && <> · <button type="button" className="link" title="按卡的额度或请求本身拒绝（例如余额不足、输入过长），不算请求，也不算失败"
+            onClick={() => onNavigate('traces', {traces: {status: 'refused', window: range === '24h' ? 'day' : 'all'}})}>拒绝 {formatCount(period.refused)}</button></>}
         </>}/>
       <Kpi label="成功率" estimate={requestEstimate} value={formatPercent(rate)} tone={rateTone(rate)}
         sub={period ? `${formatCount(period.succeeded)} 次成功` : undefined}/>
@@ -253,11 +259,12 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
       <section className="panel chart-panel">
         <div className="panel-head"><h3>请求量 · 近 24 小时</h3>{chartEstimate && <EstimateTag title={chartEstimate}/>}</div>
         {!activity && !data.traces.length ? <TableStateBlock loading={loading} failed={!!failures.stats && !!failures.traces} onRetry={onRetry}/> :
-          <div className="request-chart" role="img" aria-label={`近 24 小时 ${hours.reduce((sum, hour) => sum + hour.requests, 0)} 次请求，失败 ${hours.reduce((sum, hour) => sum + hour.failed, 0)} 次`}>
+          <div className="request-chart" role="img" aria-label={`近 24 小时 ${hours.reduce((sum, hour) => sum + hour.requests, 0)} 次请求，失败 ${hours.reduce((sum, hour) => sum + hour.failed, 0)} 次${
+            hours.some(hour => hour.refused) ? `，另有拒绝 ${hours.reduce((sum, hour) => sum + (hour.refused ?? 0), 0)} 次` : ''}`}>
             {hours.map((hour, index) => {
               const current = index === hours.length - 1;
               const end = new Date((hour.startSecs + 3600) * 1000);
-              const title = `${formatFullDateTime(hour.startSecs).slice(5, 16)}–${String(end.getHours()).padStart(2, '0')}:00 · ${hour.requests} 次 · 失败 ${hour.failed}`;
+              const title = `${formatFullDateTime(hour.startSecs).slice(5, 16)}–${String(end.getHours()).padStart(2, '0')}:00 · ${hour.requests} 次 · 失败 ${hour.failed}${hour.refused ? ` · 拒绝 ${hour.refused}` : ''}`;
               return <div key={hour.startSecs} className={`chart-column${current ? ' is-current' : ''}`} data-requests={hour.requests} data-failed={hour.failed} title={title}>
                 <div className="chart-track">
                   <div className="chart-bar" style={{height: `${hour.requests / peak * 100}%`}}>
@@ -299,6 +306,7 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
       <div className="table-scroll"><table className="table health-table">
         <thead><tr><th>供应商</th><th className="col-status">状态</th><th>Key</th>
           <th className="num" title="近 24 小时发给这个供应商的每一次尝试，包括失败后改由备用线路完成的">尝试</th><th className="num">失败</th>
+          <th className="num" title="上游因请求本身（例如输入过长）拒绝的尝试：它做得对，不算失败">拒绝</th>
           <th className="num" title="失败后由别的供应商接着完成的次数">被备用接管</th><th>失败原因</th><th className="num">首字中位数</th><th className="col-actions"><span className="sr-only">操作</span></th></tr></thead>
         <tbody>
           {providerRows.map(({provider, keys, counts, rate, median, attempts}) => {
@@ -309,13 +317,14 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
               <td>{keys.length ? <span className="key-summary">{[...counts.entries()].map(([label, value]) => <span key={label} className={`dot-label dot-${value.tone}`}>{value.count} {label}</span>)}</span> : <span className="muted">没有 Key</span>}</td>
               <td className="num" title={rate === null ? undefined : `它最终完成的请求成功率 ${formatPercent(rate)}`}>{attempts?.attempts ? formatCount(attempts.attempts) : '—'}</td>
               <td className={`num${tone ? ` is-${tone}` : ''}`} title={attempts?.attempts ? `${formatCount(attempts.failures)} / ${formatCount(attempts.attempts)} 次尝试失败` : undefined}>{attempts?.attempts ? failureText(attempts.failures, attempts.attempts) : '—'}</td>
+              <td className="num">{attempts?.refused ? formatCount(attempts.refused) : '—'}</td>
               <td className="num">{attempts?.takenOver ? formatCount(attempts.takenOver) : '—'}</td>
               <td className="col-kinds">{attempts?.failures ? <span className="clip clip-reason" title={kindsText(attempts.failuresByKind, 10)}>{kindsText(attempts.failuresByKind)}</span> : <span className="muted">—</span>}</td>
               <td className="num">{formatDuration(median)}</td>
               <td className="col-actions"><button type="button" className="btn-text" onClick={toProvider(provider.id)}>查看</button></td>
             </tr>;
           })}
-          {!data.providers.length && <TableState colSpan={9} loading={loading} failed={failures.providers} empty="还没有供应商" onRetry={onRetry}
+          {!data.providers.length && <TableState colSpan={10} loading={loading} failed={failures.providers} empty="还没有供应商" onRetry={onRetry}
             action={<button type="button" className="btn btn-small" onClick={() => onNavigate('providers')}>添加供应商</button>}/>}
         </tbody>
       </table></div>

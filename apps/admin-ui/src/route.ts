@@ -20,7 +20,7 @@ const minute: Check = value => /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(value);
 const PARAMS: Partial<Record<Tab, Record<string, Check>>> = {
   cards: {q: search, status: oneOf('UNACTIVATED', 'ACTIVE', 'FROZEN', 'BANNED', 'EXPIRED', 'ARCHIVED', 'VOIDED', 'ALL'),
     quick: oneOf('expiring', 'low'), group: text, open: text},
-  traces: {card: text, q: search, status: oneOf('error', 'client_aborted', 'in_progress', 'success'), range: oneOf('hour', 'day', 'custom'), from: minute, to: minute,
+  traces: {card: text, q: search, status: oneOf('error', 'refused', 'client_aborted', 'in_progress', 'success'), range: oneOf('hour', 'day', 'custom'), from: minute, to: minute,
     // An empty reason is 未分类: a filter of its own.
     reason: value => value === '' || text(value), model: text, provider: text, open: text},
   // 模型与定价: the model a link named (a failing or loss-making model, a broken route).

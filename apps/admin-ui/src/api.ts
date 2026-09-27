@@ -49,6 +49,8 @@ export interface AdminActivityWindow {
   succeeded: number;
   failed: number;
   clientAborted: number;
+  /** Requests refused for the card or the request itself (balance, limits, a prompt too long…), in neither requests nor failed (newer servers). */
+  refused?: number;
   /** Micro-credits: divide by 1,000,000 for credits. */
   creditsCharged: number;
   inputTokens: number;
@@ -66,11 +68,11 @@ export interface AdminActivity {
   last24h: AdminActivityWindow;
   last7d: AdminActivityWindow;
   /** The last 24 clock hours, oldest first; the last is the current hour. */
-  hourly: Array<{startSecs: number; requests: number; failed: number}>;
+  hourly: Array<{startSecs: number; requests: number; failed: number; refused?: number}>;
   /** The oldest trace kept: request counts reach back no further than this. */
   tracesCoverFromSecs?: number | null;
   /** The last 24 hours by provider, busiest first. */
-  providers?: Array<{providerId: string; requests: number; failed: number; ttftMedianMs: number | null}>;
+  providers?: Array<{providerId: string; requests: number; failed: number; refused?: number; ttftMedianMs: number | null}>;
   /** Every upstream attempt by provider and by Key over the last hour, 24 hours and 7 days, a primary's failures included though its backup answered (newer servers). */
   providerAttempts?: ProviderAttempts[];
   keyAttempts?: KeyAttempts[];
@@ -107,6 +109,9 @@ export interface AdminTrace {
   needed_micro_credits?: number;
   available_micro_credits?: number;
   attempt_chain?: AdminTraceAttempt[];
+  /** For a refusal: how many more times the card was refused for the same reason within a minute, and when the last was (newer servers). */
+  repeats?: number;
+  last_seen_secs?: number | null;
 }
 
 /** Over every kept request a search matched, not only those returned; a failure is status error. */

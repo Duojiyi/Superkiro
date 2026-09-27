@@ -55,10 +55,11 @@ fixture.traces.sort((a,b)=>b.ts-a.ts);
     await attention.getByRole('button',{name:'claude-opus-4-8 近 24 小时 3 次请求全部失败：上游未响应（未开始输出）'}).waitFor();
     // 服务健康: every attempt, the failures (coloured), the takeovers and the failures by kind.
     const hanyueRow=await cells('瀚月 Max');
-    assert.deepEqual(hanyueRow.slice(3,7),['12','12（100.0%）','5','HTTP 529 · 上游过载 × 12'],hanyueRow.join(' | '));
+    // 拒绝 (the upstream refusing the request itself) is apart from 失败: none here.
+    assert.deepEqual(hanyueRow.slice(3,8),['12','12（100.0%）','—','5','HTTP 529 · 上游过载 × 12'],hanyueRow.join(' | '));
     assert.equal(await health.getByRole('row').filter({hasText:'瀚月 Max'}).locator('td.num').nth(1).getAttribute('class'),'num is-danger');
     const fixtureRow=await cells('测试供应商 / Fixture');
-    assert.deepEqual(fixtureRow.slice(3,6),['59','11（18.6%）','—'],'its own attempts and failures, the ones it took over counted as its successes');
+    assert.deepEqual(fixtureRow.slice(3,7),['59','11（18.6%）','—','—'],'its own attempts and failures, the ones it took over counted as its successes');
     assert.equal(await health.locator('.estimate-tag').count(),0,'from the server: not an estimate');
     await failing.getByRole('button',{name:'查看失败请求',exact:true}).click();
     await page.getByRole('heading',{name:'调用追踪',level:2,exact:true}).waitFor();
@@ -90,7 +91,7 @@ fixture.traces.sort((a,b)=>b.ts-a.ts);
     await button('刷新').click();await page.locator('.btn-refresh:not([disabled])').waitFor();
     assert.equal(await card.getByLabel('近 24 小时尝试').innerText(),'近 24 小时 尝试 12 · 失败 12（100.0%） · 被备用接管 5 · HTTP 529 · 上游过载 × 12');
     await nav('运营概览');
-    assert.deepEqual((await cells('瀚月 Max')).slice(3,7),['12','12（100.0%）','5','HTTP 529 · 上游过载 × 12']);
+    assert.deepEqual((await cells('瀚月 Max')).slice(3,8),['12','12（100.0%）','—','5','HTTP 529 · 上游过载 × 12']);
     await health.locator('.estimate-tag').waitFor();
     await attention.locator('li').filter({has:page.getByText('近 1 小时 claude-opus-5-5 失败 7 次',{exact:true})}).getByRole('button',{name:'查看失败请求',exact:true}).waitFor();
     assert.deepEqual(errors,[]);assert.deepEqual(nativeDialogs,[],'no browser-native dialogs');

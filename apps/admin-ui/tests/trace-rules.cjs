@@ -5,15 +5,16 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const ts = require('typescript');
-function load(file) {
+function load(file, imports = {}) {
   const exports = {};
   const code = ts.transpileModule(fs.readFileSync(path.join(__dirname, '../src', file), 'utf8'), {
     compilerOptions: {module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020},
   }).outputText;
-  vm.runInNewContext(code, {exports, Date});
+  vm.runInNewContext(code, {exports, Date, require: name => imports[name]});
   return exports;
 }
-const query = load('traceQuery.ts');
+const status = load('status.ts');
+const query = load('traceQuery.ts', {'./status': status});
 const plain = value => JSON.parse(JSON.stringify(value));
 const at = (y, m, d, h = 0, min = 0) => Math.floor(new Date(y, m - 1, d, h, min).getTime() / 1000);
 const now = at(2026, 9, 27, 15, 20) + 17;
@@ -68,4 +69,24 @@ const failures = [
   trace('ok', {}),
 ];
 assert.deepEqual(plain(query.failureBreakdown(failures)), {models: [['claude-opus-5-5', 2], ['gpt-5', 2]], providers: [['hanyue-max', 2], ['astra', 1], ['kimera', 1], ['', 1]]});
-console.log('PASS: totals count failures as the server does; failures break down by model and by each provider whose attempt failed, refusals before sending apart');
+// A refusal for the card or the request itself is 拒绝, not 失败: apart in the tabs, the breakdown and the count.
+const refusals = [trace('r1', {status: 'error', error_class: 'insufficient_balance', attempt_chain: []}), trace('r2', {status: 'error', error_class: 'input_too_long', attempt_chain: [{provider_id: 'hanyue-max', success: false}]}),
+  trace('r3', {status: 'error', error_class: 'model_not_listed', attempt_chain: []})];
+assert.deepEqual(plain(query.failureBreakdown([...failures, ...refusals])), plain(query.failureBreakdown(failures)), 'refusals are no failures of a model or provider');
+const mixed = [...failures, ...refusals, trace('aborted', {status: 'client_aborted'}), trace('running', {status: 'in_progress'})];
+assert.deepEqual(['ALL', 'error', 'refused', 'client_aborted', 'in_progress', 'success'].map(tab => mixed.filter(item => query.tabMatches(item, tab)).length), [10, 4, 3, 1, 1, 1]);
+assert.deepEqual(['ALL', 'error', 'refused', 'success'].map(query.serverStatus).map(String), ['undefined', 'error', 'error', 'success'], '失败 and 拒绝 are both the server\'s error');
+assert.equal(query.refusedCount(mixed), 3);
+assert.equal(query.traceTotals(mixed).failures, 7, 'the server counts refusals among failures: they are taken out where shown');
+console.log('PASS: totals count failures as the server does; failures break down by model and by each provider whose attempt failed, refusals before sending apart; 拒绝 is apart from 失败 in the tabs and the breakdown');
+
+// A request's badge: 拒绝 for a refusal, and 同类拒绝 ×N for one that stands for the same refusal again within a minute.
+assert.deepEqual(plain(status.traceView({status: 'error', error_class: 'usage_limit'}, now)).label, '拒绝');
+assert.equal(status.traceView({status: 'error', error_class: 'stream_incomplete'}, now).label, '失败');
+assert.equal(status.traceView({status: 'in_progress', ts: now - 3600}, now).label, '可能已中断');
+assert.equal(status.repeatedRefusal({repeats: 0}), null);
+const repeated = status.repeatedRefusal({repeats: 4, last_seen_secs: at(2026, 9, 27, 15, 12) + 40});
+assert.equal(repeated.text, '同类拒绝 ×5');assert.equal(repeated.title, '一分钟内这张卡因同一原因被拒绝了 5 次，只记这一条；最后一次 15:12:40');
+assert.deepEqual(plain(status.REQUEST_REFUSALS), ['insufficient_balance', 'concurrency_limit', 'usage_limit', 'input_too_long', 'unsupported_capability', 'invalid_model', 'model_not_listed', 'model_retired'], 'billing\'s CARD_REFUSALS');
+assert.equal(status.errorClassLabel('input_too_long'), '输入超过模型的上下文长度');
+console.log('PASS: a refusal reads 拒绝 with 同类拒绝 ×N and when the last was; the refusal classes are billing\'s');

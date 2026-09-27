@@ -144,6 +144,32 @@ export function traceStuck(trace: {status?: unknown; ts?: unknown}, nowSecs: num
   return TRACE_IN_PROGRESS.includes(String(trace.status)) && Number.isFinite(started) && started > 0 && nowSecs - started > TRACE_STUCK_SECS;
 }
 
+/**
+ * Refusals for the card or the request itself (billing's CARD_REFUSALS): the balance or limits, a
+ * prompt too long for the model, a capability it lacks, a model the card may not or cannot name.
+ * They say nothing about a model's or an upstream's health and are counted apart from failures.
+ */
+export const REQUEST_REFUSALS = ['insufficient_balance', 'concurrency_limit', 'usage_limit', 'input_too_long', 'unsupported_capability', 'invalid_model', 'model_not_listed', 'model_retired'];
+
+/** A request refused for the card or the request itself: 拒绝, not 失败. */
+export const refusedTrace = (trace: {status?: unknown; error_class?: unknown}) => trace.status === 'error' && REQUEST_REFUSALS.includes(String(trace.error_class ?? ''));
+
+const REFUSED: StatusView = {label: '拒绝', tone: 'neutral', title: '按卡的额度或请求本身拒绝（例如余额不足、输入过长），不算失败，也没有扣费'};
+
+/** A request's badge: its status, 拒绝 for a refusal, 可能已中断 for one running far too long. */
+export function traceView(trace: {status?: unknown; error_class?: unknown; ts?: unknown}, nowSecs: number): StatusView {
+  return refusedTrace(trace) ? REFUSED : traceStatusView(trace.status, traceStuck(trace, nowSecs));
+}
+
+/** A refusal that stands for the same refusal again within a minute: 同类拒绝 ×3, with when the last was. */
+export function repeatedRefusal(trace: {repeats?: unknown; last_seen_secs?: unknown}): {text: string; title: string} | null {
+  const repeats = Number(trace.repeats);
+  if (!Number.isInteger(repeats) || repeats <= 0) return null;
+  const last = Number(trace.last_seen_secs), at = Number.isFinite(last) && last > 0 ? new Date(last * 1000) : null;
+  const clock = at ? `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}:${String(at.getSeconds()).padStart(2, '0')}` : '';
+  return {text: `同类拒绝 ×${repeats + 1}`, title: `一分钟内这张卡因同一原因被拒绝了 ${repeats + 1} 次，只记这一条${clock ? `；最后一次 ${clock}` : ''}`};
+}
+
 export function traceStatusView(status: unknown, stuck = false): StatusView {
   switch (String(status)) {
     case 'success': return {label: '成功', tone: 'success'};
@@ -167,6 +193,7 @@ const ERROR_CLASS: Record<string, string> = {
   invalid_model: '模型 ID 无效',
   no_route: '无可用线路',
   unsupported_capability: '模型不支持这项能力',
+  input_too_long: '输入超过模型的上下文长度',
   // Refused for the card's own balance or limits, before any upstream was tried.
   insufficient_balance: '余额不足',
   concurrency_limit: '超过并发上限',

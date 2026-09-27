@@ -48,13 +48,20 @@ module.exports = function fixtureApi() {
         ? [{provider_id: 'fixture-provider', key_id: 'fixture-key', success: false, error: 'HTTP 529 overloaded_error: Overloaded', latency_ms: 1840}, {provider_id: 'fixture-provider', key_id: 'fixture-backup', success: false, error: 'fixture upstream timeout', latency_ms: 580}]
         : [{provider_id: 'fixture-provider', key_id: 'fixture-key', success: status !== 'client_aborted', error: status === 'client_aborted' ? 'client closed the stream' : null, latency_ms: 580 + i * 10}]};
   });
+  // Refusals for the card or the request itself (billing's CARD_REFUSALS), counted apart from requests and
+  // failures; a refusal trace stands for itself and the same refusals within a minute after it (repeats).
+  const CARD_REFUSALS = ['insufficient_balance', 'concurrency_limit', 'usage_limit', 'input_too_long', 'unsupported_capability', 'invalid_model', 'model_not_listed', 'model_retired'];
+  const refusedForCard = t => t.status === 'error' && CARD_REFUSALS.includes(t.error_class);
+  const occurrences = t => (t.repeats ?? 0) + 1;
+  const lastSeen = t => Math.max(t.last_seen_secs ?? t.ts, t.ts);
   // What GET /stats reports as `activity`, computed from those traces at the time of the request.
   const activity = () => {
     const now = Math.floor(Date.now() / 1000), done = traces.filter(t => t.status !== 'in_progress');
+    const times = (list, test) => list.filter(test).reduce((sum, t) => sum + occurrences(t), 0);
     const window = start => {
-      const inWindow = done.filter(t => t.ts > start), timed = inWindow.map(t => t.ttft_ms).filter(v => typeof v === 'number').sort((a, b) => a - b);
-      return {requests: inWindow.length, succeeded: inWindow.filter(t => t.status === 'success').length, failed: inWindow.filter(t => t.status === 'error').length,
-        clientAborted: inWindow.filter(t => t.status === 'client_aborted').length, creditsCharged: inWindow.reduce((sum, t) => sum + t.credits_charged, 0),
+      const inWindow = done.filter(t => t.ts > start), served = inWindow.filter(t => !refusedForCard(t)), timed = inWindow.map(t => t.ttft_ms).filter(v => typeof v === 'number').sort((a, b) => a - b);
+      return {requests: times(served, () => true), succeeded: times(served, t => t.status === 'success'), failed: times(served, t => t.status === 'error'), refused: times(inWindow, refusedForCard),
+        clientAborted: times(served, t => t.status === 'client_aborted'), creditsCharged: inWindow.reduce((sum, t) => sum + t.credits_charged, 0),
         inputTokens: inWindow.reduce((sum, t) => sum + t.input_tokens, 0), outputTokens: inWindow.reduce((sum, t) => sum + t.output_tokens, 0),
         providerCostMicroCny: inWindow.reduce((sum, t) => sum + t.provider_cost_micro_cny, 0), activeCards: new Set(inWindow.filter(t => t.credits_charged > 0).map(t => t.card_id)).size,
         timedRequests: timed.length, ttftMedianMs: timed.length ? timed[Math.floor((timed.length - 1) / 2)] : null, ttftP90Ms: timed.length ? timed[Math.ceil(timed.length * 0.9) - 1] : null};
@@ -62,43 +69,57 @@ module.exports = function fixtureApi() {
     const first = (Math.floor(now / 3600) - 23) * 3600;
     const last24h = window(now - 86400);
     return {last24h, last7d: window(now - 7 * 86400), tracesCoverFromSecs: Math.min(...traces.map(t => t.ts)),
-      hourly: Array.from({length: 24}, (_, i) => {const hour = done.filter(t => t.ts >= first + i * 3600 && t.ts < first + (i + 1) * 3600); return {startSecs: first + i * 3600, requests: hour.length, failed: hour.filter(t => t.status === 'error').length};}),
-      providers: [{providerId: 'fixture-provider', requests: last24h.requests, failed: last24h.failed, ttftMedianMs: last24h.ttftMedianMs}], ...attemptActivity(now)};
+      hourly: Array.from({length: 24}, (_, i) => {const hour = done.filter(t => t.ts >= first + i * 3600 && t.ts < first + (i + 1) * 3600), served = hour.filter(t => !refusedForCard(t));
+        return {startSecs: first + i * 3600, requests: times(served, () => true), failed: times(served, t => t.status === 'error'), refused: times(hour, refusedForCard)};}),
+      providers: [...done.filter(t => t.ts > now - 86400 && t.provider_id).reduce((map, t) => {
+        const entry = map.get(t.provider_id) ?? {providerId: t.provider_id, requests: 0, failed: 0, refused: 0, ttftMedianMs: last24h.ttftMedianMs};
+        if (refusedForCard(t)) entry.refused += occurrences(t); else {entry.requests += occurrences(t); entry.failed += t.status === 'error' ? occurrences(t) : 0;}
+        return map.set(t.provider_id, entry);
+      }, new Map()).values()].sort((a, b) => b.requests - a.requests || a.providerId.localeCompare(b.providerId)), ...attemptActivity(now)};
   };
   // As billing's attempt_activity: every attempt by provider and Key over the last hour, 24 hours and
   // 7 days (a failed one is taken over when another provider answered later), requests by the model
   // customers asked for (not the card's own refusals), and billed use by model over 7 days.
-  const CARD_LIMITS = ['insufficient_balance', 'concurrency_limit', 'usage_limit'];
   const attemptActivity = now => {
     const starts = [now - 3600, now - 86400, now - 7 * 86400];
-    const attemptWindow = () => ({attempts: 0, failures: 0, takenOver: 0, failuresByKind: {}});
-    const healthWindow = () => ({requests: 0, failures: 0, lastFailureAt: null, topFailureKind: null, failuresByKind: {}});
-    const providers = new Map(), keysById = new Map(), models = new Map();
-    const count = (entry, within, attempt, takenOver) => ['last1h', 'last24h', 'last7d'].forEach((name, i) => {
+    const attemptWindow = () => ({attempts: 0, failures: 0, refused: 0, takenOver: 0, failuresByKind: {}});
+    const healthWindow = () => ({requests: 0, failures: 0, refused: 0, lastFailureAt: null, topFailureKind: null, failuresByKind: {}});
+    const providers = new Map(), keysById = new Map(), models = new Map(), refusals = [];
+    // An upstream that refused the request itself (a prompt too long) did right: that attempt is counted as refused.
+    const count = (entry, within, attempt, takenOver, refused) => ['last1h', 'last24h', 'last7d'].forEach((name, i) => {
       if (!within[i]) return;
-      const w = entry[name]; w.attempts++;
+      const w = entry[name];
+      if (refused) {w.refused++; return;}
+      w.attempts++;
       if (!attempt.success) {w.failures++; w.takenOver += takenOver ? 1 : 0; const kind = attempt.error || 'unknown'; w.failuresByKind[kind] = (w.failuresByKind[kind] || 0) + 1;}
     });
     for (const trace of traces.filter(t => t.ts > starts[2] && t.ts <= now)) {
-      const within = starts.map(start => trace.ts > start), chain = trace.attempt_chain || [];
+      const within = starts.map(start => trace.ts > start), chain = trace.attempt_chain || [], refusal = refusedForCard(trace);
       chain.forEach((attempt, index) => {
         const takenOver = chain.slice(index + 1).some(later => later.success && later.provider_id !== attempt.provider_id);
+        const refused = refusal && index === chain.length - 1 && !attempt.success;
         if (!providers.has(attempt.provider_id)) providers.set(attempt.provider_id, {providerId: attempt.provider_id, last1h: attemptWindow(), last24h: attemptWindow(), last7d: attemptWindow()});
-        count(providers.get(attempt.provider_id), within, attempt, takenOver);
+        count(providers.get(attempt.provider_id), within, attempt, takenOver, refused);
         if (!attempt.key_id) return;
         if (!keysById.has(attempt.key_id)) keysById.set(attempt.key_id, {keyId: attempt.key_id, providerId: attempt.provider_id, last1h: attemptWindow(), last24h: attemptWindow(), last7d: attemptWindow()});
-        count(keysById.get(attempt.key_id), within, attempt, takenOver);
+        count(keysById.get(attempt.key_id), within, attempt, takenOver, refused);
       });
-      if (trace.status === 'in_progress' || !trace.exposed_model || CARD_LIMITS.includes(trace.error_class)) continue;
+      if (trace.status === 'in_progress' || !trace.exposed_model) continue;
+      if (refusal) {refusals.push([trace, within]); continue;}
       const failure = trace.status === 'error' ? trace.error_class || [...chain].reverse().find(attempt => !attempt.success)?.error || 'unknown' : null;
       if (!models.has(trace.exposed_model)) models.set(trace.exposed_model, {model: trace.exposed_model, last1h: healthWindow(), last24h: healthWindow(), last7d: healthWindow()});
       ['last1h', 'last24h', 'last7d'].forEach((name, i) => {
         if (!within[i]) return;
-        const w = models.get(trace.exposed_model)[name]; w.requests++;
+        const w = models.get(trace.exposed_model)[name], times = occurrences(trace); w.requests += times;
         if (!failure) return;
-        w.failures++; w.lastFailureAt = Math.max(w.lastFailureAt ?? 0, trace.ts); w.failuresByKind[failure] = (w.failuresByKind[failure] || 0) + 1;
+        w.failures += times; w.lastFailureAt = Math.max(w.lastFailureAt ?? 0, lastSeen(trace)); w.failuresByKind[failure] = (w.failuresByKind[failure] || 0) + times;
         w.topFailureKind = Object.entries(w.failuresByKind).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0][0];
       });
+    }
+    // Refusals are counted apart, under a model its requests already list.
+    for (const [trace, within] of refusals) {
+      const model = models.get(trace.exposed_model);
+      if (model) ['last1h', 'last24h', 'last7d'].forEach((name, i) => {if (within[i]) model[name].refused += occurrences(trace);});
     }
     const usage = new Map();
     for (const trace of traces.filter(t => t.credits_charged > 0 && t.ts > starts[2] && t.ts <= now)) {

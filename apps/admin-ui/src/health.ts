@@ -4,18 +4,20 @@
 // (billing's attempt_activity); for an older server they are counted the same way from the traces
 // the console has. Pure functions, so the rules can be tested without a browser.
 import {formatCount, formatPercent} from './format';
-import {errorClassLabel, failureLabel} from './status';
+import {errorClassLabel, failureLabel, refusedTrace} from './status';
 
-export interface AttemptWindow {attempts: number; failures: number; takenOver: number; failuresByKind: Record<string, number>}
-export interface ModelHealthWindow {requests: number; failures: number; lastFailureAt: number | null; topFailureKind: string | null; failuresByKind: Record<string, number>}
+/** `refused`: attempts the upstream rightly refused for the request itself (a prompt too long), in neither attempts nor failures (newer servers). */
+export interface AttemptWindow {attempts: number; failures: number; takenOver: number; failuresByKind: Record<string, number>; refused?: number}
+/** `refused`: requests refused for the card or the request itself, in neither requests nor failures (newer servers). */
+export interface ModelHealthWindow {requests: number; failures: number; lastFailureAt: number | null; topFailureKind: string | null; failuresByKind: Record<string, number>; refused?: number}
 export interface ProviderAttempts {providerId: string; last1h: AttemptWindow; last24h: AttemptWindow; last7d: AttemptWindow}
 export interface KeyAttempts extends ProviderAttempts {keyId: string}
 export interface ModelHealth {model: string; last1h: ModelHealthWindow; last24h: ModelHealthWindow; last7d: ModelHealthWindow}
 
 interface Attempt {provider_id?: string; key_id?: string; success?: boolean; error?: string | null}
-interface Trace {ts: number; attempt_chain?: Attempt[]}
+interface Trace {ts: number; status?: string; error_class?: string | null; attempt_chain?: Attempt[]}
 
-const empty = (): AttemptWindow => ({attempts: 0, failures: 0, takenOver: 0, failuresByKind: {}});
+const empty = (): AttemptWindow => ({attempts: 0, failures: 0, takenOver: 0, failuresByKind: {}, refused: 0});
 
 /**
  * Attempts over the last `windowSecs`, by provider and by Key, from traces: every attempt counts,
@@ -24,8 +26,10 @@ const empty = (): AttemptWindow => ({attempts: 0, failures: 0, takenOver: 0, fai
  */
 export function attemptsFromTraces(traces: Trace[], nowSecs: number, windowSecs = 86400): {providers: Map<string, AttemptWindow>; keys: Map<string, AttemptWindow>} {
   const providers = new Map<string, AttemptWindow>(), keys = new Map<string, AttemptWindow>();
-  const count = (map: Map<string, AttemptWindow>, id: string, attempt: Attempt, takenOver: boolean) => {
+  const count = (map: Map<string, AttemptWindow>, id: string, attempt: Attempt, takenOver: boolean, refused: boolean) => {
     const window = map.get(id) ?? empty();
+    // The upstream refused the request itself (a prompt too long, as the card's refusal says): it did right.
+    if (refused) {window.refused = (window.refused ?? 0) + 1; map.set(id, window); return;}
     window.attempts++;
     if (!attempt.success) {
       window.failures++;
@@ -37,11 +41,12 @@ export function attemptsFromTraces(traces: Trace[], nowSecs: number, windowSecs 
   };
   for (const trace of traces) {
     if (!(trace.ts > nowSecs - windowSecs && trace.ts <= nowSecs)) continue;
-    const chain = trace.attempt_chain ?? [];
+    const chain = trace.attempt_chain ?? [], refusal = refusedTrace(trace);
     chain.forEach((attempt, index) => {
       const takenOver = chain.slice(index + 1).some(later => later.success && later.provider_id !== attempt.provider_id);
-      if (attempt.provider_id) count(providers, attempt.provider_id, attempt, takenOver);
-      if (attempt.key_id) count(keys, attempt.key_id, attempt, takenOver);
+      const refused = refusal && index === chain.length - 1 && !attempt.success;
+      if (attempt.provider_id) count(providers, attempt.provider_id, attempt, takenOver, refused);
+      if (attempt.key_id) count(keys, attempt.key_id, attempt, takenOver, refused);
     });
   }
   return {providers, keys};

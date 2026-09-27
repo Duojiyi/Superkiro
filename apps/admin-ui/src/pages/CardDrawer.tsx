@@ -10,7 +10,7 @@ import {Drawer} from '../components/modal';
 import {copyText, IdCell, StatusBadge, Tag} from '../components/ui';
 import {formatBatchNote, formatCharge, formatCount, formatCredits, formatDateTime, formatExpired, formatFullDateTime, formatMoney, formatRelative, formatRemaining, shortId} from '../format';
 import {kiroLabel} from '../plans';
-import {CARD_LIMIT_REFUSALS, cardStatusView, traceStatusView, traceStuck} from '../status';
+import {CARD_LIMIT_REFUSALS, cardStatusView, repeatedRefusal, traceView} from '../status';
 import type {CardSupport} from './CardSupport';
 
 /** 编辑备注 in place: Enter saves, Escape puts the note back; a refusal stays to be corrected. */
@@ -228,7 +228,7 @@ export default function CardDrawer({card, state, groupName, hasPrev, hasNext, on
                 checked={picked.includes(trace.id)} onChange={event => {const on = event.currentTarget.checked; setPicked(ids => on ? [...ids, trace.id] : ids.filter(id => id !== trace.id));}}/></td>
               <td title={formatFullDateTime(trace.ts)}>{formatDateTime(trace.ts)}</td>
               <td><span className="clip clip-model">{trace.exposed_model ?? '—'}</span></td>
-              <td className="col-status"><StatusBadge view={traceStatusView(trace.status, traceStuck(trace, Date.now() / 1000))}/></td>
+              <td className="col-status"><StatusBadge view={traceView(trace, Date.now() / 1000)}/>{repeatedRefusal(trace) && <span className="repeat-count" title={repeatedRefusal(trace)!.title}>{repeatedRefusal(trace)!.text}</span>}</td>
               <td className="num">{formatCharge(trace.credits_charged)}</td>
             </tr>;
             })}</tbody>

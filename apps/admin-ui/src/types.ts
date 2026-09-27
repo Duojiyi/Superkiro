@@ -8,7 +8,8 @@ export type Tab = 'overview' | 'cards' | 'traces' | 'groups' | 'plans' | 'models
 
 export type CardTab = 'CURRENT' | 'UNACTIVATED' | 'ACTIVE' | 'FROZEN' | 'BANNED' | 'EXPIRED' | 'ARCHIVED' | 'VOIDED' | 'ALL';
 export type CardQuickFilter = 'expiring' | 'low';
-export type TraceTab = 'ALL' | 'error' | 'client_aborted' | 'in_progress' | 'success';
+/** `refused`: requests refused for the card or the request itself, apart from `error` (the server's status for both). */
+export type TraceTab = 'ALL' | 'error' | 'refused' | 'client_aborted' | 'in_progress' | 'success';
 /** `custom`: from and to, local minutes (see traceQuery.ts). */
 export type TraceWindow = 'hour' | 'day' | 'all' | 'custom';
 
