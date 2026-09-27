@@ -29,6 +29,7 @@ pub mod oauth;
 pub mod portal;
 pub mod profiles;
 pub mod provider_import;
+pub mod spec_analysis;
 pub mod subscriptions;
 pub mod usage;
 pub mod virtualization;

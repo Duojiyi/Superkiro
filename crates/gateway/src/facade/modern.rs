@@ -143,5 +143,22 @@ pub(super) fn register(handlers: &mut Vec<Arc<dyn FacadeHandler>>) {
             }));
         }
     }
+    // Kiro's spec "Analyze Requirements", which its IDE posts to /mcp/stream and its agent
+    // sends by target: a turn of the conversation handler, on the group's fast model.
+    if let Some(conversation) = handlers
+        .iter()
+        .rev()
+        .find(|h| h.path() == "/generateAssistantResponse")
+        .cloned()
+    {
+        let analysis: Arc<dyn FacadeHandler> = Arc::new(
+            super::spec_analysis::RequirementsAnalysis::new(conversation),
+        );
+        rpc.handlers.insert(
+            "KiroRuntimeService.InvokeMCPStream",
+            (Arc::clone(&analysis), false),
+        );
+        handlers.push(analysis);
+    }
     handlers.push(Arc::new(rpc));
 }

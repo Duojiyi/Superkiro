@@ -1682,3 +1682,237 @@ async fn the_fast_model_is_the_cheapest_and_auto_is_the_default() {
     assert_eq!(usage[0].exposed_model, "cheap-model");
     assert_eq!(usage[1].exposed_model, "main-model");
 }
+
+/// Kiro's "Analyze Requirements" call as it builds it: the JSON-RPC `tools/call` of
+/// `spec_disambiguation` with the requirements document.
+fn analysis_call(tool: &str, requirements: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": "3f1c2a9e-5b7d-4c8e-9a0b-1d2e3f4a5b6c",
+        "method": "tools/call",
+        "params": {"name": tool, "arguments": {
+            "conversationId": "conversation-1790000000000",
+            "requirementsText": requirements,
+            "clientMetadata": {}
+        }}
+    })
+}
+
+const REQUIREMENTS: &str = "# Requirements Document\n\n### Requirement 1: Sign-in\n\n\
+    **User Story:** As a user, I want to sign in, so that I can see my projects.\n\n\
+    #### Acceptance Criteria\n\n1. WHEN a user signs in THE system SHALL show the projects\n\
+    2. WHEN a user fails to sign in repeatedly THE system SHALL lock the account\n";
+
+/// The analysis as Kiro reads it: frame by frame as its agent's reader parses them (string
+/// headers only, the event type naming the message), then each JSON-RPC message as both
+/// of its readers take it.
+#[derive(Default)]
+struct AsKiroReads {
+    progress: Vec<String>,
+    questions: Vec<Value>,
+    result: Option<Value>,
+    error: Option<Value>,
+}
+
+fn as_kiro_reads(bytes: &[u8]) -> AsKiroReads {
+    let mut read = AsKiroReads::default();
+    let mut at = 0;
+    while at + 12 <= bytes.len() {
+        let word = |from: usize| u32::from_be_bytes(bytes[from..from + 4].try_into().unwrap());
+        let (total, headers_length) = (word(at) as usize, word(at + 4) as usize);
+        let (mut cursor, headers_end) = (at + 12, at + 12 + headers_length);
+        let mut headers = std::collections::HashMap::new();
+        while cursor < headers_end {
+            let name_length = bytes[cursor] as usize;
+            let name = String::from_utf8(bytes[cursor + 1..cursor + 1 + name_length].to_vec());
+            cursor += 1 + name_length;
+            assert_eq!(bytes[cursor], 7, "Kiro's reader takes string headers only");
+            let value_length = u16::from_be_bytes([bytes[cursor + 1], bytes[cursor + 2]]) as usize;
+            let value = String::from_utf8(bytes[cursor + 3..cursor + 3 + value_length].to_vec());
+            cursor += 3 + value_length;
+            headers.insert(name.unwrap(), value.unwrap());
+        }
+        assert_eq!(headers[":event-type"], "message");
+        assert_eq!(headers[":message-type"], "event");
+        let message: Value = serde_json::from_slice(&bytes[headers_end..at + total - 4]).unwrap();
+        // The IDE's schema requires it.
+        assert_eq!(message["jsonrpc"], "2.0", "{message}");
+        let params = &message["params"];
+        if !message["error"].is_null() {
+            read.error = Some(message["error"].clone());
+        } else if !message["id"].is_null() && message.get("result").is_some() {
+            read.result = Some(message["result"].clone());
+        } else if message["method"] == "notifications/progress" {
+            if params["status"]
+                .as_str()
+                .is_some_and(|status| !status.is_empty())
+            {
+                read.progress
+                    .push(params["message"].as_str().unwrap_or_default().to_string());
+            }
+        } else if message["method"] == "notifications/partial_result"
+            && params["responseType"] == "CLARIFYING_QUESTIONS"
+            && params["requirementId"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+            && params["question"].is_object()
+        {
+            read.questions.push(params.clone());
+        }
+        at += total;
+    }
+    assert_eq!(at, bytes.len(), "a frame was cut short");
+    read
+}
+
+async fn analyse(app: &axum::Router, request: axum::http::request::Builder, call: Value) -> Reply {
+    let mut request = request
+        .method(Method::POST)
+        .body(Body::from(call.to_string()))
+        .unwrap();
+    request.extensions_mut().insert(claims());
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    Reply {
+        status,
+        headers,
+        bytes,
+    }
+}
+
+/// Kiro's spec "Analyze Requirements" met the 404 fallback and failed every time. It is one
+/// turn on the group's fast model, billed as one, streamed back as the questions Kiro shows:
+/// the IDE's call at /mcp/stream.
+#[tokio::test]
+async fn analyze_requirements_asks_its_questions_on_the_fast_model() {
+    let questions = json!({"questions": [
+        {"requirementId": "1.2", "question": "登录失败几次后锁定账户？",
+         "answers": [
+             {"answer": "3 次", "consequence": "第 3 次失败后锁定 15 分钟"},
+             {"answer": "5 次", "consequence": "第 5 次失败后锁定 15 分钟"}
+         ],
+         "autoResolvable": false, "recommendedAnswer": "3 次"},
+        {"requirementId": "REQ-1", "question": "项目列表按什么排序？", "answers": [],
+         "autoResolvable": true, "recommendedAnswer": "按最近打开时间"}
+    ]});
+    let server = upstream(ResponseTemplate::new(200).set_body_raw(
+        anthropic_answer(&questions.to_string()),
+        "text/event-stream",
+    ))
+    .await;
+    let main = ModelMap::new("map-main", GROUP, "main-model", "prov", "up-main");
+    let mut cheap = ModelMap::new("map-cheap", GROUP, "cheap-model", "prov", "up-cheap");
+    cheap.sort_order = 1;
+    let billing = engine(ProviderFormat::Anthropic, &server.uri(), vec![main, cheap]);
+    let mut flagship = price("main-model");
+    flagship.fixed_output_credit_per_m = 25_000_000;
+    billing.upsert_rate_card_version(flagship);
+    let app = serve(&billing);
+
+    let reply = analyse(
+        &app,
+        Request::builder()
+            .uri("/mcp/stream")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(
+                "x-amzn-kiro-profile-arn",
+                "arn:aws:codewhisperer:us-east-1:1:profile/P",
+            ),
+        analysis_call("spec_disambiguation", REQUIREMENTS),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(
+        reply.headers[header::CONTENT_TYPE],
+        "application/vnd.amazon.eventstream"
+    );
+    let read = as_kiro_reads(&reply.bytes);
+    assert!(read.error.is_none(), "{:?}", read.error);
+    assert_eq!(read.result.unwrap()["isError"], false);
+    assert!(!read.progress.is_empty());
+    assert_eq!(read.questions.len(), 2);
+    let first = &read.questions[0];
+    assert_eq!(first["requirementId"], "1.2");
+    assert_eq!(first["question"]["question"], "登录失败几次后锁定账户？");
+    assert_eq!(first["question"]["answerChoices"][1]["answer"], "5 次");
+    assert_eq!(
+        first["question"]["answerChoices"][0]["consequence"],
+        "第 3 次失败后锁定 15 分钟"
+    );
+    assert_eq!(first["question"]["autoResolvable"], false);
+    assert_eq!(first["question"]["defaultChoice"]["answer"], "3 次");
+    let settled = &read.questions[1];
+    assert_eq!(settled["requirementId"], "REQ-1");
+    assert_eq!(settled["question"]["autoResolvable"], true);
+    assert_eq!(settled["question"]["recommendedAnswer"], "按最近打开时间");
+
+    // One call, on the fast model, carrying the document and what to do with it.
+    assert_eq!(models_sent(&server).await, vec!["up-cheap"]);
+    let sent = server.received_requests().await.unwrap();
+    let sent = String::from_utf8_lossy(&sent[0].body);
+    assert!(sent.contains("lock the account"), "{sent}");
+    assert!(sent.contains("leave a decision open"), "{sent}");
+    until(|| !usage_entries(&billing).is_empty()).await;
+    let usage = usage_entries(&billing);
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].exposed_model, "cheap-model");
+}
+
+/// The agent's call by target reaches the same analysis; an answer that holds no questions
+/// is the error Kiro shows, and a tool the gateway does not offer is said so without a call.
+#[tokio::test]
+async fn analyze_requirements_by_target_and_its_errors() {
+    let server = upstream(ResponseTemplate::new(200).set_body_raw(
+        anthropic_answer("Everything looks clear to me."),
+        "text/event-stream",
+    ))
+    .await;
+    let billing = engine(
+        ProviderFormat::Anthropic,
+        &server.uri(),
+        vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+    );
+    let app = serve(&billing);
+    let by_target = || {
+        Request::builder()
+            .uri("/")
+            .header(header::CONTENT_TYPE, "application/x-amz-json-1.0")
+            .header("x-amz-target", "KiroRuntimeService.InvokeMCPStream")
+    };
+
+    let reply = analyse(
+        &app,
+        by_target(),
+        analysis_call("spec_disambiguation", REQUIREMENTS),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    let read = as_kiro_reads(&reply.bytes);
+    let error = read.error.expect("an error Kiro shows");
+    assert_eq!(error["code"], -32000);
+    assert!(
+        error["message"].as_str().unwrap().contains("无法读取"),
+        "{error}"
+    );
+    assert!(read.questions.is_empty() && read.result.is_none());
+    assert_eq!(models_sent(&server).await, vec!["up-model"]);
+
+    let reply = analyse(&app, by_target(), analysis_call("other_tool", REQUIREMENTS)).await;
+    let error = as_kiro_reads(&reply.bytes)
+        .error
+        .expect("an error Kiro shows");
+    assert_eq!(error["code"], -32601);
+    let reply = analyse(
+        &app,
+        by_target(),
+        analysis_call("spec_disambiguation", "  "),
+    )
+    .await;
+    assert_eq!(as_kiro_reads(&reply.bytes).error.unwrap()["code"], -32602);
+    assert_eq!(models_sent(&server).await.len(), 1, "no further model call");
+}
