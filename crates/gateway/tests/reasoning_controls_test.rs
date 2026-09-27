@@ -145,7 +145,7 @@ fn independent_system_prompt_survives_translation() {
     let request = translated(value, "model");
     assert_eq!(request.messages[0].role, "system");
     assert_eq!(
-        AnthropicProvider.translate_request(&request).unwrap()["system"],
+        AnthropicProvider.translate_request(&request).unwrap()["system"][0]["text"],
         "Use the supplied workspace instructions."
     );
     assert_eq!(

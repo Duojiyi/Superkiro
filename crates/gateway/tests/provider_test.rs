@@ -614,3 +614,107 @@ fn eager_tool_input_is_asked_for_only_where_it_is_switched_on() {
     assert_eq!(body["tools"][0]["eager_input_streaming"], true);
     assert_eq!(body["tools"][0]["name"], "fsWrite");
 }
+
+/// Every agent step resends the same tools, system prompt and history. Breakpoints after
+/// the tools, the system prompt and the last two user turns let the next step read that
+/// prefix from the cache, at a tenth of the input price.
+#[test]
+fn prompt_cache_breakpoints_follow_the_request_shape() {
+    use gateway::provider::ProviderOptions;
+    let tool = |name: &str| {
+        serde_json::json!({"toolSpecification": {"name": name, "description": "d",
+            "inputSchema": {"json": {"type": "object"}}}})
+    };
+    let step = |turns: usize| {
+        let mut messages = vec![
+            ChatMessage::new("system", serde_json::json!("Workspace rules.")),
+            ChatMessage::new("user", serde_json::json!("<kiro system prompt>")),
+        ];
+        for turn in 0..turns {
+            let mut call = ChatMessage::new("assistant", serde_json::json!(""));
+            call.tool_calls = vec![gateway::provider::ToolCallEntry {
+                id: format!("t{turn}"),
+                name: "readFile".into(),
+                arguments: serde_json::json!({"path": format!("f{turn}")}),
+            }];
+            let mut result = ChatMessage::new("tool", serde_json::json!(format!("file {turn}")));
+            result.tool_call_id = Some(format!("t{turn}"));
+            messages.extend([call, result]);
+        }
+        ChatRequest {
+            reasoning_effort: None,
+            model: "claude-opus-5-5".into(),
+            messages,
+            temperature: None,
+            max_tokens: Some(8192),
+            stream: true,
+            tools: vec![tool("readFile"), tool("fsWrite")],
+        }
+    };
+    let marked = |value: &serde_json::Value| value.to_string().matches("cache_control").count();
+
+    let body = AnthropicProvider.translate_request(&step(2)).unwrap();
+    assert_eq!(body["tools"][1]["cache_control"]["type"], "ephemeral");
+    assert!(body["tools"][0].get("cache_control").is_none());
+    assert_eq!(body["system"][0]["text"], "Workspace rules.");
+    assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+    let messages = body["messages"].as_array().unwrap();
+    let last = messages.len() - 1;
+    assert_eq!(
+        messages[last]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+    assert_eq!(
+        messages[last - 2]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+    assert_eq!(marked(&body), 4, "at most four breakpoints");
+
+    // The next step's prefix is this step's, byte for byte, bar the moving breakpoints.
+    let strip = |mut value: serde_json::Value| {
+        fn walk(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    map.remove("cache_control");
+                    map.values_mut().for_each(walk);
+                }
+                serde_json::Value::Array(items) => items.iter_mut().for_each(walk),
+                _ => {}
+            }
+        }
+        walk(&mut value);
+        value
+    };
+    let next = AnthropicProvider.translate_request(&step(3)).unwrap();
+    let next_messages = next["messages"].as_array().unwrap();
+    assert_eq!(
+        strip(serde_json::Value::Array(messages.clone())),
+        strip(serde_json::Value::Array(
+            next_messages[..messages.len()].to_vec()
+        ))
+    );
+    // The breakpoint this step read up to is where the last step wrote one.
+    assert_eq!(
+        next_messages[messages.len() - 1]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+    assert_eq!(strip(next["tools"].clone()), strip(body["tools"].clone()));
+
+    // Off for an upstream that refuses them.
+    let off = AnthropicProvider
+        .translate_request_with(
+            &step(2),
+            &ProviderOptions {
+                prompt_cache: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(marked(&off), 0);
+    assert_eq!(off["system"], "Workspace rules.");
+    // OpenAI caches prefixes by itself.
+    assert_eq!(
+        marked(&OpenAiProvider.translate_request(&step(2)).unwrap()),
+        0
+    );
+}

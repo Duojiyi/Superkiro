@@ -159,7 +159,7 @@ pub fn untag_signature(tagged: &str) -> Option<(&str, &str)> {
 }
 
 /// Request options the operator sets per provider, by provider ID, read at start.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderOptions {
     /// Signed thinking from earlier turns goes back to the model that wrote it. Off until
     /// each upstream has been checked to accept it: one that edits or validates history
@@ -169,6 +169,20 @@ pub struct ProviderOptions {
     /// is written instead of arriving in one block after a silent wait. Off: some relays
     /// refuse the field.
     pub eager_tool_input: bool,
+    /// Anthropic prompt-cache breakpoints: each agent step resends the same tools, system
+    /// prompt and history, and a cached prefix is read at a tenth of the input price. On
+    /// unless the operator turns it off for an upstream that refuses them.
+    pub prompt_cache: bool,
+}
+
+impl Default for ProviderOptions {
+    fn default() -> Self {
+        Self {
+            replay_thinking: false,
+            eager_tool_input: false,
+            prompt_cache: true,
+        }
+    }
 }
 
 /// Which providers have which option on: provider IDs, or `*` for every provider,
@@ -177,11 +191,12 @@ pub struct ProviderOptions {
 pub struct ProviderOptionsTable {
     replay_thinking: Vec<String>,
     eager_tool_input: Vec<String>,
+    prompt_cache_off: Vec<String>,
 }
 
 impl ProviderOptionsTable {
-    /// PROVIDER_THINKING_REPLAY and PROVIDER_EAGER_TOOL_INPUT: comma-separated provider
-    /// IDs, or `*`.
+    /// PROVIDER_THINKING_REPLAY, PROVIDER_EAGER_TOOL_INPUT and PROVIDER_PROMPT_CACHE_OFF:
+    /// comma-separated provider IDs, or `*`.
     pub fn from_env() -> Self {
         let ids = |name: &str| -> Vec<String> {
             std::env::var(name)
@@ -195,6 +210,7 @@ impl ProviderOptionsTable {
         Self {
             replay_thinking: ids("PROVIDER_THINKING_REPLAY"),
             eager_tool_input: ids("PROVIDER_EAGER_TOOL_INPUT"),
+            prompt_cache_off: ids("PROVIDER_PROMPT_CACHE_OFF"),
         }
     }
 
@@ -203,15 +219,17 @@ impl ProviderOptionsTable {
         ProviderOptions {
             replay_thinking: on(&self.replay_thinking),
             eager_tool_input: on(&self.eager_tool_input),
+            prompt_cache: !on(&self.prompt_cache_off),
         }
     }
 
     /// The providers each option is on for, as the start-up log prints them.
     pub fn describe(&self) -> String {
         format!(
-            "thinking replay: [{}], eager tool input: [{}]",
+            "thinking replay: [{}], eager tool input: [{}], prompt cache off: [{}]",
             self.replay_thinking.join(", "),
-            self.eager_tool_input.join(", ")
+            self.eager_tool_input.join(", "),
+            self.prompt_cache_off.join(", ")
         )
     }
 }

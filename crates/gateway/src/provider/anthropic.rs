@@ -12,6 +12,48 @@ use serde_json::Value;
 
 pub struct AnthropicProvider;
 
+/// Prompt-cache breakpoints, at most the four allowed, placed by the request's shape alone
+/// so that the next agent step finds the same prefix: after the tools, after the system
+/// prompt, and at the end of the last two user turns (this one, which the next step
+/// extends, and the one before, where this step's prefix was cached).
+fn add_cache_breakpoints(body: &mut Value) {
+    let ephemeral = || serde_json::json!({"type": "ephemeral"});
+    if let Some(last) = body
+        .get_mut("tools")
+        .and_then(Value::as_array_mut)
+        .and_then(|tools| tools.last_mut())
+    {
+        last["cache_control"] = ephemeral();
+    }
+    if let Some(system) = body.get_mut("system") {
+        if let Some(text) = system.as_str().filter(|text| !text.is_empty()) {
+            *system =
+                serde_json::json!([{"type": "text", "text": text, "cache_control": ephemeral()}]);
+        }
+    }
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for message in messages
+        .iter_mut()
+        .rev()
+        .filter(|message| message["role"] == "user")
+        .take(2)
+    {
+        let Some(block) = message
+            .get_mut("content")
+            .and_then(Value::as_array_mut)
+            .and_then(|blocks| blocks.last_mut())
+        else {
+            continue;
+        };
+        // An empty text block cannot carry a breakpoint.
+        if block["type"] != "text" || block["text"].as_str().is_some_and(|text| !text.is_empty()) {
+            block["cache_control"] = ephemeral();
+        }
+    }
+}
+
 fn adaptive_thinking(summarized: bool) -> Value {
     if summarized {
         serde_json::json!({"type": "adaptive", "display": "summarized"})
@@ -336,6 +378,10 @@ impl AnthropicProvider {
                 }
             }
             body["tools"] = serde_json::json!(normalized_tools);
+        }
+
+        if options.prompt_cache {
+            add_cache_breakpoints(&mut body);
         }
 
         Ok(body)

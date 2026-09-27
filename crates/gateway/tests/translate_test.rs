@@ -505,7 +505,10 @@ fn test_t05_multi_turn_payload_translation() {
     let anthropic_payload = anthropic
         .translate_request(&chat_req)
         .expect("Anthropic translate");
-    assert_eq!(anthropic_payload["system"], "You are an AI assistant.");
+    assert_eq!(
+        anthropic_payload["system"][0]["text"],
+        "You are an AI assistant."
+    );
 
     let anthropic_tools = anthropic_payload["tools"].as_array().expect("tools array");
     assert_eq!(anthropic_tools.len(), 1);
