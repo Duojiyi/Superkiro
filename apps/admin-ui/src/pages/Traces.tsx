@@ -11,7 +11,7 @@ import {FilterTabs, IdCell, Pager, StatusBadge, TableState, TopbarActions, copyT
 import {formatCharge, formatClock, formatCount, formatDateTime, formatDuration, formatFullDateTime, formatListTime, formatMoney, formatRelative, formatShortDate, formatSpeed, formatTokenCount} from '../format';
 import {cardCodeOf, cardIdForCode} from '../cardCode';
 import {compensation, type Compensation} from '../compensation';
-import {errorClassLabel, TRACE_IN_PROGRESS, traceStatusView, traceStuck} from '../status';
+import {CARD_LIMIT_NOTE, CARD_LIMIT_REFUSALS, errorClassLabel, TRACE_IN_PROGRESS, traceFailureText, traceStatusView, traceStuck} from '../status';
 import type {Intent, Refresh, ReportError, ReportRoute, Row, TraceTab, TraceWindow, WriteGuards} from '../types';
 import {ConversationView, RawView, ReplyView} from './TraceContent';
 
@@ -271,7 +271,7 @@ export default function TracesPage({traces, cards, providers = [], loading, fail
               <td className="col-result"><span className="result-cell">
                 <StatusBadge view={view}/>
                 {stuck && <span className="result-reason" title={STUCK_NOTE}>{formatRelative(trace.ts)}开始</span>}
-                {trace.error_class && <span className="result-reason" title={trace.error_class}>{errorClassLabel(trace.error_class)}</span>}
+                {trace.error_class && <span className="result-reason" title={trace.error_class}>{traceFailureText(trace)}</span>}
                 {attempts > 1 && <span className="retry-count" title={`共尝试 ${attempts} 次`}>↻{attempts - 1}</span>}
               </span></td>
               <td className={`num col-ttft ${ttftTone(trace.ttft_ms)}`} title={trace.ttft_ms == null ? '此请求没有计时（旧记录或非流式输出）' : undefined}>{formatDuration(trace.ttft_ms)}</td>
@@ -354,7 +354,8 @@ function TraceDrawer({trace, providerName, hasPrev, hasNext, onMove, onClose, on
         </dd>
         <dt>供应商</dt><dd>{trace.provider_id ? <span title={String(trace.provider_id)}>{providerName(trace.provider_id)}</span> : '—'}</dd>
         <dt>请求 ID</dt><dd><IdCell value={trace.id} kind="trace"/></dd>
-        {trace.error_class && <><dt>失败原因</dt><dd><b>{errorClassLabel(trace.error_class)}</b> <span className="mono muted">{trace.error_class}</span></dd></>}
+        {trace.error_class && <><dt>失败原因</dt><dd><b>{traceFailureText(trace)}</b> <span className="mono muted">{trace.error_class}</span>
+          {CARD_LIMIT_NOTE[trace.error_class] && <span className="refusal-note">{CARD_LIMIT_NOTE[trace.error_class]}</span>}</dd></>}
         {lastError && <><dt>上游错误</dt><dd className="error-line"><span>{lastError}</span></dd></>}
       </dl>
       <section className="attempts">
@@ -367,7 +368,10 @@ function TraceDrawer({trace, providerName, hasPrev, hasNext, onMove, onClose, on
           </div>
         </li>)}</ol> : <p className="muted">没有记录尝试</p>}
       </section>
-      <ContentSection key={trace.id} trace={trace} onReply={value => setTiming({id: trace.id, reply: value})}/>
+      {/* The card's own limits refused it before anything was sent: nothing was kept to read. */}
+      {CARD_LIMIT_REFUSALS.includes(String(trace.error_class ?? ''))
+        ? <section className="content-section"><div className="content-head"><h4>内容</h4></div><p className="empty-note">这次在发给上游之前就被拒绝，没有请求内容</p></section>
+        : <ContentSection key={trace.id} trace={trace} onReply={value => setTiming({id: trace.id, reply: value})}/>}
     </div>
   </Drawer>;
 }

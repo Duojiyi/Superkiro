@@ -90,6 +90,9 @@ export interface AdminTrace {
   output_tokens?: number;
   credits_charged?: number;
   provider_cost_micro_cny?: number;
+  /** For a request refused for want of balance: the micro-credits it needed to start, and what the card had. */
+  needed_micro_credits?: number;
+  available_micro_credits?: number;
   attempt_chain?: AdminTraceAttempt[];
 }
 

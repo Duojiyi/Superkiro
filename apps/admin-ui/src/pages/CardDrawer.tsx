@@ -8,8 +8,8 @@ import {daysText, historyDetail, historyLabel, noteProblem, rebindsToReset, rebi
 import {IconChevronDown, IconChevronUp, IconClose, IconCopy} from '../components/icons';
 import {Drawer} from '../components/modal';
 import {copyText, IdCell, StatusBadge, Tag} from '../components/ui';
-import {formatBatchNote, formatCharge, formatCount, formatCredits, formatDateTime, formatExpired, formatFullDateTime, formatRemaining, shortId} from '../format';
-import {cardStatusView, traceStatusView, traceStuck} from '../status';
+import {formatBatchNote, formatCharge, formatCount, formatCredits, formatDateTime, formatExpired, formatFullDateTime, formatRelative, formatRemaining, shortId} from '../format';
+import {CARD_LIMIT_REFUSALS, cardStatusView, traceStatusView, traceStuck} from '../status';
 import type {CardSupport} from './CardSupport';
 
 /** 编辑备注 in place: Enter saves, Escape puts the note back; a refusal stays to be corrected. */
@@ -120,6 +120,11 @@ export default function CardDrawer({card, state, groupName, hasPrev, hasNext, on
   useEffect(() => {setPicked([]);}, [card.id, recent]);
   const pickedRequests = recent.status === 'loaded' ? recent.value.filter(trace => picked.includes(trace.id)) : [];
   const pickedMicro = pickedRequests.reduce((sum, trace) => sum + Number(trace.credits_charged ?? 0), 0);
+  // The customer's latest refusal for the card's own limits: one for the balance, while the balance is
+  // still short of what that request needed to start, is said beside the balance.
+  const refusal = recent.status === 'loaded' ? recent.value.find(trace => CARD_LIMIT_REFUSALS.includes(String(trace.error_class ?? ''))) : undefined;
+  const shortOf = refusal?.error_class === 'insufficient_balance' && typeof refusal.needed_micro_credits === 'number'
+    && card.availableCredits < refusal.needed_micro_credits ? refusal : undefined;
   // An adjustment that made up for a request leads back to it: the recent one here, else on 调用追踪.
   const openRequest = (invocationId: string) => {
     const trace = recent.status === 'loaded' ? recent.value.find(item => item.invocation_id === invocationId) : undefined;
@@ -144,7 +149,9 @@ export default function CardDrawer({card, state, groupName, hasPrev, hasNext, on
         <dt>备注</dt><dd><NoteEditor card={card} disabled={supportBlocked || voided} disabledTitle={voided ? '已作废' : supportTitle} onSave={note => support.saveNote(card, note)}/></dd>
         <dt>分组</dt><dd>{groupName(card.groupId)}
           {!voided && <button type="button" className="btn-text" disabled={supportBlocked} title={supportTitle ?? '换到别的分组（客户需要重新登录）'} onClick={() => support.changeGroup(card)}>换分组</button>}</dd>
-        <dt>余额</dt><dd><b>{formatCredits(card.pointsAvailable)}</b> / {formatCredits(card.pointsTotal)} 积分</dd>
+        <dt>余额</dt><dd><b>{formatCredits(card.pointsAvailable)}</b> / {formatCredits(card.pointsTotal)} 积分
+          {shortOf && <span className="balance-short" title={`${formatFullDateTime(shortOf.ts)} 的请求被拒绝：请求开始前要按最大输出预留积分`}>
+            余额不够开始 {shortOf.exposed_model || '这个模型'}（约需 {formatCredits(Number(shortOf.needed_micro_credits) / 1_000_000)} 积分）· {formatRelative(shortOf.ts)}</span>}</dd>
         <dt>到期</dt><dd>{card.validUntil
           ? <span title={formatFullDateTime(card.validUntil)}>{formatDateTime(card.validUntil)}{lapsed
             // What the date means for the customer: how long ago, and the balance they can no longer use.

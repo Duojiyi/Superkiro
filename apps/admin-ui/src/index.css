@@ -409,6 +409,10 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .note-editor .field-error {flex-basis: 100%;}
 .history-table td.num.is-negative {color: var(--danger);}
 .section-tools {display: inline-flex; align-items: center; flex-wrap: wrap; gap: 8px;}
+/* 余额不够开始 claude-opus-5（约需 20 积分）: the customer's last balance refusal, under the balance. */
+.balance-short {flex-basis: 100%; font-size: 12px; color: var(--warning);}
+/* What a refusal for the card's own limits means, under the reason in a request's details. */
+.refusal-note {flex-basis: 100%; font-size: 12px; color: var(--text-2);}
 .recent-table .col-check, .recent-table th.col-check {width: 28px; padding-right: 0;}
 /* An adjustment that made up for a request links back to it. */
 .history-link {display: block; height: auto; padding: 0; font-size: 12px;}

@@ -143,11 +143,36 @@ const ERROR_CLASS: Record<string, string> = {
   invalid_model: '模型 ID 无效',
   no_route: '无可用线路',
   unsupported_capability: '模型不支持这项能力',
+  // Refused for the card's own balance or limits, before any upstream was tried.
+  insufficient_balance: '余额不足',
+  concurrency_limit: '超过并发上限',
+  usage_limit: '超过每日或每月用量上限',
 };
 
 /** A failure class in words; unknown classes are shown as they are. */
 export const errorClassLabel = (value: unknown): string =>
   typeof value === 'string' && value ? ERROR_CLASS[value] ?? value : '';
+
+/** Refusals for the card's own balance or limits: they say nothing about the model or its route. */
+export const CARD_LIMIT_REFUSALS = ['insufficient_balance', 'concurrency_limit', 'usage_limit'];
+
+const points = (micro: unknown) => typeof micro === 'number' && Number.isFinite(micro)
+  ? (micro / 1_000_000).toLocaleString('en-US', {maximumFractionDigits: 2}) : null;
+
+/** A request's failure in words, with what a balance refusal needed: 余额不足：需要 20.3 积分，余额 15 积分. */
+export function traceFailureText(trace: {error_class?: string | null; needed_micro_credits?: unknown; available_micro_credits?: unknown}): string {
+  const label = errorClassLabel(trace.error_class);
+  if (trace.error_class !== 'insufficient_balance') return label;
+  const needed = points(trace.needed_micro_credits), available = points(trace.available_micro_credits);
+  return needed === null ? label : `${label}：需要 ${needed} 积分${available === null ? '' : `，余额 ${available} 积分`}`;
+}
+
+/** What a refusal for the card's own limits means for the customer, for the request's details. */
+export const CARD_LIMIT_NOTE: Record<string, string> = {
+  insufficient_balance: '请求开始前要按最大输出预留积分；余额不够预留，这次没有发给上游，也没有扣费。',
+  concurrency_limit: '这张卡同时进行的请求已到上限，这次没有发给上游，也没有扣费。',
+  usage_limit: '这张卡已到每日或每月用量上限，这次没有发给上游，也没有扣费。',
+};
 
 export function noticeStatusView(notice: AdminAnnouncement, nowSecs: number): StatusView {
   if (!notice.enabled) return {label: '已撤回', tone: 'neutral'};

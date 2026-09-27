@@ -133,3 +133,16 @@ console.log('PASS: refused support actions are explained in words with their car
   assert.equal(many.points, '38.4');
   console.log('PASS: 补偿这次扣费 gives back the exact charge, names the request and its failure, links one request, and sums several in the reason');
 }
+
+// Requests the card's own balance or limits refused, in words.
+{
+  const status = load('status.ts');
+  assert.equal(status.traceFailureText({error_class: 'insufficient_balance', needed_micro_credits: 20300000, available_micro_credits: 15000000}), '余额不足：需要 20.3 积分，余额 15 积分');
+  assert.equal(status.traceFailureText({error_class: 'insufficient_balance', needed_micro_credits: 20000000}), '余额不足：需要 20 积分');
+  assert.equal(status.traceFailureText({error_class: 'insufficient_balance'}), '余额不足', 'older servers do not say what it needed');
+  assert.equal(status.traceFailureText({error_class: 'concurrency_limit'}), '超过并发上限');
+  assert.equal(status.traceFailureText({error_class: 'usage_limit'}), '超过每日或每月用量上限');
+  assert.equal(status.traceFailureText({error_class: 'stream_incomplete'}), '输出中断');
+  assert.deepEqual([...status.CARD_LIMIT_REFUSALS], ['insufficient_balance', 'concurrency_limit', 'usage_limit'], 'the classes billing names CARD_LIMIT_REFUSALS');
+  console.log('PASS: balance, concurrency and usage refusals in words, a balance refusal with what it needed and what the card had');
+}
