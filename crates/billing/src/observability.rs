@@ -30,6 +30,11 @@ pub struct ActivityWindow {
     /// Requests refused for the card or the request itself (see [`CARD_REFUSALS`]),
     /// counted apart: neither requests nor failed include them.
     pub refused: u64,
+    /// Requests that ended without completing, the client gone or the upstream's stream cut
+    /// short, and were charged for what they used: among requests, and in clientAborted
+    /// when the client closed, but never in failed.
+    pub interrupted_charged: u64,
+    pub interrupted_charged_micro_credits: i64,
     pub credits_charged: i64,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -51,6 +56,9 @@ pub struct ProviderActivity {
     pub failed: u64,
     /// Requests it refused for the request itself, such as a prompt too long.
     pub refused: u64,
+    /// Requests it served that ended without completing and were charged; not in failed.
+    pub interrupted_charged: u64,
+    pub interrupted_charged_micro_credits: i64,
     pub ttft_median_ms: Option<u32>,
 }
 
@@ -62,6 +70,9 @@ pub struct ActivityHour {
     pub requests: u64,
     pub failed: u64,
     pub refused: u64,
+    /// Requests that ended without completing and were charged; not in failed.
+    pub interrupted_charged: u64,
+    pub interrupted_charged_micro_credits: i64,
 }
 
 /// The last 24 hours and 7 days, and the last 24 clock hours one by one.
@@ -121,6 +132,10 @@ pub struct AttemptWindow {
     pub refused: u64,
     /// Failed attempts after which another provider answered the request.
     pub taken_over: u64,
+    /// Requests it served (this provider, or this Key) that ended without completing and
+    /// were charged. Their serving attempt succeeded, so it is no failure.
+    pub interrupted_charged: u64,
+    pub interrupted_charged_micro_credits: i64,
     /// Failures by the kind attempt chains name: http_429, http_401, timeout, transport,
     /// upstream_service, protocol, empty.
     pub failures_by_kind: BTreeMap<String, u64>,
@@ -139,6 +154,13 @@ impl AttemptWindow {
             let kind = attempt.error.as_deref().unwrap_or("unknown");
             *self.failures_by_kind.entry(kind.to_string()).or_default() += 1;
         }
+    }
+
+    pub(crate) fn count_interrupted(&mut self, micro_credits: i64) {
+        self.interrupted_charged += 1;
+        self.interrupted_charged_micro_credits = self
+            .interrupted_charged_micro_credits
+            .saturating_add(micro_credits);
     }
 }
 
@@ -177,6 +199,10 @@ pub struct ModelHealthWindow {
     pub requests: u64,
     pub failures: u64,
     pub refused: u64,
+    /// Requests that ended without completing, the client gone or the stream cut short,
+    /// and were charged: among requests, never among failures.
+    pub interrupted_charged: u64,
+    pub interrupted_charged_micro_credits: i64,
     pub last_failure_at: Option<u64>,
     /// The commonest kind of failure, the earliest in name on a tie.
     pub top_failure_kind: Option<String>,
@@ -185,6 +211,13 @@ pub struct ModelHealthWindow {
 }
 
 impl ModelHealthWindow {
+    pub(crate) fn count_interrupted(&mut self, micro_credits: i64) {
+        self.interrupted_charged += 1;
+        self.interrupted_charged_micro_credits = self
+            .interrupted_charged_micro_credits
+            .saturating_add(micro_credits);
+    }
+
     /// Counts a trace's requests: `times` of them, the last at `ts`.
     pub(crate) fn count(&mut self, ts: u64, failure: Option<&str>, times: u64) {
         self.requests += times;
@@ -284,6 +317,18 @@ impl RequestTrace {
         self.last_seen_secs.unwrap_or(self.ts).max(self.ts)
     }
 
+    /// Whether it records a request that ended without completing, the client gone or the
+    /// upstream's stream cut short, and was charged for what it used: a charge the customer
+    /// may complain of, which is no failure of the upstream's to answer.
+    pub fn interrupted_charged(&self) -> bool {
+        self.credits_charged > 0
+            && match self.status {
+                TraceStatus::ClientAborted => true,
+                TraceStatus::Error => self.error_class.as_deref() == Some("stream_incomplete"),
+                TraceStatus::Success | TraceStatus::InProgress => false,
+            }
+    }
+
     /// Whether it records a request refused for the card or the request itself, one of
     /// [`CARD_REFUSALS`], which says nothing about a model's or an upstream's health.
     pub fn refused_for_card(&self) -> bool {
@@ -354,6 +399,9 @@ impl TraceFilter {
 pub struct TraceTotals {
     pub count: u64,
     pub failures: u64,
+    /// Of those matched, the requests that ended without completing and were charged.
+    pub interrupted_charged: u64,
+    pub interrupted_charged_micro_credits: i64,
     pub credits_charged: i64,
     pub cost_micro_cny: i64,
 }

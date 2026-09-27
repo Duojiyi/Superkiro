@@ -2233,3 +2233,127 @@ fn sales_count_what_was_paid_and_an_upgrade_does_not_restate_them() {
         Some("tier-5000")
     );
 }
+
+/// A request that ended without completing, the client gone or the upstream's stream cut
+/// short, and was charged, is counted as a charged interruption, with its credits, wherever
+/// requests are counted, and never as a failure; one cut short and not charged still fails.
+#[test]
+fn charged_interruptions_are_counted_apart_from_failures() {
+    let engine = BillingEngine::new();
+    let now = 1_000_000;
+    let trace = |id: &str, status: TraceStatus, class: Option<&str>, credits: i64| RequestTrace {
+        id: id.into(),
+        card_id: "card".into(),
+        ts: now - 600,
+        invocation_id: id.into(),
+        exposed_model: "claude-opus-5-5".into(),
+        status,
+        error_class: class.map(str::to_string),
+        provider_id: Some("hanyue".into()),
+        credits_charged: credits,
+        attempt_chain: vec![attempt("hanyue", "key-h", None)],
+        ..RequestTrace::default()
+    };
+    // Kiro closed a stalled stream, after the request was charged.
+    engine.record_trace(trace(
+        "closed",
+        TraceStatus::ClientAborted,
+        Some("stream_incomplete"),
+        5_670_000,
+    ));
+    // The upstream's stream ended before its end, and the output was charged.
+    engine.record_trace(trace(
+        "cut",
+        TraceStatus::Error,
+        Some("stream_incomplete"),
+        1_000_000,
+    ));
+    // Cut short before any output: not charged, a failure.
+    engine.record_trace(trace(
+        "cut-free",
+        TraceStatus::Error,
+        Some("stream_incomplete"),
+        0,
+    ));
+    // Closed before anything was charged: an interruption, not a charged one.
+    engine.record_trace(trace("closed-free", TraceStatus::ClientAborted, None, 0));
+    engine.record_trace(trace("ok", TraceStatus::Success, None, 2_000_000));
+
+    let activity = engine.activity(now);
+    let day = &activity.last_24h;
+    assert_eq!(
+        (
+            day.requests,
+            day.succeeded,
+            day.failed,
+            day.client_aborted,
+            day.interrupted_charged,
+            day.interrupted_charged_micro_credits
+        ),
+        (5, 1, 1, 2, 2, 6_670_000)
+    );
+    assert_eq!(
+        (
+            activity.last_7d.interrupted_charged,
+            activity.last_7d.failed
+        ),
+        (2, 1)
+    );
+    let health = &activity.model_health[0].last_1h;
+    assert_eq!(
+        (
+            health.requests,
+            health.failures,
+            health.interrupted_charged,
+            health.interrupted_charged_micro_credits
+        ),
+        (5, 1, 2, 6_670_000)
+    );
+    let provider = &activity.providers[0];
+    assert_eq!(
+        (
+            provider.requests,
+            provider.failed,
+            provider.interrupted_charged,
+            provider.interrupted_charged_micro_credits
+        ),
+        (5, 1, 2, 6_670_000)
+    );
+    // Its serving attempts succeeded: no attempt failed, and the provider and the Key show
+    // the charged interruptions.
+    let attempts = &activity.provider_attempts[0].last_1h;
+    assert_eq!(
+        (
+            attempts.attempts,
+            attempts.failures,
+            attempts.interrupted_charged,
+            attempts.interrupted_charged_micro_credits
+        ),
+        (5, 0, 2, 6_670_000)
+    );
+    assert_eq!(activity.key_attempts[0].last_24h.interrupted_charged, 2);
+    let hour = activity
+        .hourly
+        .iter()
+        .find(|hour| hour.requests > 0)
+        .unwrap();
+    assert_eq!(
+        (
+            hour.failed,
+            hour.interrupted_charged,
+            hour.interrupted_charged_micro_credits
+        ),
+        (1, 2, 6_670_000)
+    );
+    // The trace list's totals count them too.
+    let (_, totals) = engine.search_traces(&Default::default(), 10);
+    assert_eq!(
+        (
+            totals.count,
+            totals.failures,
+            totals.interrupted_charged,
+            totals.interrupted_charged_micro_credits
+        ),
+        (5, 2, 2, 6_670_000)
+    );
+}

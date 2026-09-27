@@ -6057,8 +6057,17 @@ impl BillingEngine {
                 window.refused += times;
                 return;
             }
+            let interrupted = trace.interrupted_charged();
+            if interrupted {
+                window.interrupted_charged += times;
+                window.interrupted_charged_micro_credits = window
+                    .interrupted_charged_micro_credits
+                    .saturating_add(trace.credits_charged);
+            }
             match trace.status {
                 TraceStatus::Success => window.succeeded += times,
+                // Cut short and charged: counted as interrupted, not as a failure.
+                TraceStatus::Error if interrupted => {}
                 TraceStatus::Error => window.failed += times,
                 TraceStatus::ClientAborted => window.client_aborted += times,
                 TraceStatus::InProgress => return,
@@ -6076,7 +6085,8 @@ impl BillingEngine {
                 .filter(|trace| trace.ts <= now && trace.status != TraceStatus::InProgress);
             for trace in finished {
                 let (times, refused) = (trace.occurrences(), trace.refused_for_card());
-                let failed = if trace.status == TraceStatus::Error {
+                let interrupted = trace.interrupted_charged();
+                let failed = if trace.status == TraceStatus::Error && !interrupted {
                     times
                 } else {
                     0
@@ -6103,6 +6113,12 @@ impl BillingEngine {
                             provider.requests += times;
                             provider.failed += failed;
                         }
+                        if interrupted {
+                            provider.interrupted_charged += times;
+                            provider.interrupted_charged_micro_credits = provider
+                                .interrupted_charged_micro_credits
+                                .saturating_add(trace.credits_charged);
+                        }
                         ttft.extend(trace.ttft_ms);
                     }
                 }
@@ -6113,6 +6129,12 @@ impl BillingEngine {
                     } else {
                         hour.requests += times;
                         hour.failed += failed;
+                    }
+                    if interrupted {
+                        hour.interrupted_charged += times;
+                        hour.interrupted_charged_micro_credits = hour
+                            .interrupted_charged_micro_credits
+                            .saturating_add(trace.credits_charged);
                     }
                 }
             }
@@ -6257,6 +6279,41 @@ impl BillingEngine {
                     }
                 }
             }
+            // Served, and interrupted after it was charged: the serving provider's and Key's.
+            let interrupted = trace.interrupted_charged();
+            if let Some(provider_id) = trace.provider_id.as_ref().filter(|_| interrupted) {
+                let provider =
+                    providers
+                        .entry(provider_id.clone())
+                        .or_insert_with(|| ProviderAttempts {
+                            provider_id: provider_id.clone(),
+                            ..ProviderAttempts::default()
+                        });
+                let windows: [&mut AttemptWindow; 3] = [
+                    &mut provider.last_1h,
+                    &mut provider.last_24h,
+                    &mut provider.last_7d,
+                ];
+                for (window, inside) in windows.into_iter().zip(within) {
+                    if inside {
+                        window.count_interrupted(trace.credits_charged);
+                    }
+                }
+                let serving_key = trace.attempt_chain.iter().rev().find(|attempt| {
+                    attempt.success
+                        && attempt.provider_id == *provider_id
+                        && !attempt.key_id.is_empty()
+                });
+                if let Some(key) = serving_key.and_then(|attempt| keys.get_mut(&attempt.key_id)) {
+                    let windows: [&mut AttemptWindow; 3] =
+                        [&mut key.last_1h, &mut key.last_24h, &mut key.last_7d];
+                    for (window, inside) in windows.into_iter().zip(within) {
+                        if inside {
+                            window.count_interrupted(trace.credits_charged);
+                        }
+                    }
+                }
+            }
             if trace.status == TraceStatus::InProgress || trace.exposed_model.is_empty() {
                 continue;
             }
@@ -6264,7 +6321,8 @@ impl BillingEngine {
                 refusals.push((trace, within));
                 continue;
             }
-            let failure = (trace.status == TraceStatus::Error).then(|| {
+            // Cut short after it was charged, it is counted as interrupted, not as failed.
+            let failure = (trace.status == TraceStatus::Error && !interrupted).then(|| {
                 trace
                     .error_class
                     .clone()
@@ -6289,6 +6347,9 @@ impl BillingEngine {
             for (window, inside) in windows.into_iter().zip(within) {
                 if inside {
                     window.count(trace.last_seen(), failure.as_deref(), trace.occurrences());
+                    if interrupted {
+                        window.count_interrupted(trace.credits_charged);
+                    }
                 }
             }
         }
@@ -6341,6 +6402,12 @@ impl BillingEngine {
         for trace in traces.iter().rev().filter(|trace| filter.matches(trace)) {
             totals.count += 1;
             totals.failures += u64::from(trace.status == TraceStatus::Error);
+            if trace.interrupted_charged() {
+                totals.interrupted_charged += 1;
+                totals.interrupted_charged_micro_credits = totals
+                    .interrupted_charged_micro_credits
+                    .saturating_add(trace.credits_charged);
+            }
             totals.credits_charged = totals.credits_charged.saturating_add(trace.credits_charged);
             totals.cost_micro_cny = totals
                 .cost_micro_cny

@@ -2591,7 +2591,8 @@ async fn traces_are_filtered_on_the_server_with_totals_for_the_whole_match() {
     assert_eq!(body["traces"][0]["id"], "t3");
     assert_eq!(
         body["totals"],
-        json!({"count": 3, "failures": 2, "creditsCharged": 5, "costMicroCny": 50})
+        json!({"count": 3, "failures": 2, "creditsCharged": 5, "costMicroCny": 50,
+            "interruptedCharged": 0, "interruptedChargedMicroCredits": 0})
     );
     let (_, body) = admin_call(
         &app,
