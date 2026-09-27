@@ -823,3 +823,39 @@ async fn a_billed_turn_reports_its_credits_before_it_ends() {
         .unwrap();
     assert!(metering < end, "{frames:?}");
 }
+
+/// Kiro posts every line of its session transcripts to the takeover's endpoint every three
+/// seconds and has no setting that stops it. The gateway takes the batch without reading
+/// it, and only from a signed-in client.
+#[tokio::test]
+async fn kiros_activity_log_is_accepted_and_never_kept() {
+    let batch = json!({"payload": [{"sessionId": "s", "activityType": "text",
+        "content": {"type": "user", "content": "private source code"}}]})
+    .to_string();
+    let post = |app: axum::Router, token: Option<String>| {
+        let batch = batch.clone();
+        async move {
+            let mut request = Request::builder()
+                .method(Method::POST)
+                .uri("/agents/activity")
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(token) = token {
+                request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            app.oneshot(request.body(Body::from(batch)).unwrap())
+                .await
+                .unwrap()
+        }
+    };
+    let response = post(FacadeRegistry::default().into_router(), None).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(bytes.is_empty());
+
+    let secured = FacadeRegistry::default().into_router_with_auth(gateway::auth::AuthState::new(
+        "activity-test-secret-32-characters-long",
+    ));
+    assert_eq!(post(secured, None).await.status(), StatusCode::UNAUTHORIZED);
+}

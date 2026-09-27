@@ -155,6 +155,7 @@ impl FacadeRegistry {
             .register(client::ClientNegotiateHandler)
             .register(client::ClientBeaconHandler)
             .register(client::ClientBrandHandler::default())
+            .register(client::AgentActivityHandler)
             .register(models::ListAvailableModelsHandler::new(store.clone()))
             .register(usage::GetUsageLimitsHandler::new(store.clone()))
             .register(subscriptions::ListAvailableSubscriptionsHandler::new(

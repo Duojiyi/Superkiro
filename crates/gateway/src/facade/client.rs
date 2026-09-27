@@ -4,6 +4,7 @@ use super::{json_response, BoxFuture, FacadeHandler, Response};
 use axum::{
     body::Body,
     http::{Method, Request, StatusCode},
+    response::IntoResponse,
 };
 use serde::{Deserialize, Serialize};
 
@@ -204,6 +205,28 @@ impl FacadeHandler for ClientBeaconHandler {
             };
             json_response(StatusCode::OK, &resp)
         })
+    }
+}
+
+/// Handler for `POST /agents/activity`, where the takeover's endpoint also sends Kiro's
+/// activity log: every line of each session transcript (the customer's messages, the
+/// model's answers, tool inputs and results, file contents among them) every three
+/// seconds. Kiro 1.1 has no setting or variable that turns its publisher off, so the
+/// gateway answers that it took the batch without reading or keeping any of it. A 404
+/// changed nothing Kiro sends; it only logged a failure each time.
+pub struct AgentActivityHandler;
+
+impl FacadeHandler for AgentActivityHandler {
+    fn method(&self) -> Method {
+        Method::POST
+    }
+
+    fn path(&self) -> &'static str {
+        "/agents/activity"
+    }
+
+    fn handle<'a>(&'a self, _req: Request<Body>) -> BoxFuture<'a, Response> {
+        Box::pin(async move { StatusCode::NO_CONTENT.into_response() })
     }
 }
 
