@@ -614,6 +614,19 @@ div.attention-item:hover {background: transparent;}
 .health-table .col-kinds .clip-reason {max-width: 200px;}
 @media (max-width: 1440px) {.health-table .col-kinds .clip-reason {max-width: 150px;}}
 .panel-period {margin-left: 6px; font-size: 13px; font-weight: 400; color: var(--text-2);}
+/* 运营概览: today's revenue, cost and margin under the requests chart. */
+.today-money {display: flex; align-items: flex-end; flex-wrap: wrap; gap: 12px 28px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border-subtle);}
+.today-money > div {display: flex; flex-direction: column; gap: 2px;}
+.today-label {display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--text-2);}
+.today-money b {font-size: 18px; line-height: 24px; font-variant-numeric: tabular-nums;}
+.today-money small {font-size: 12px;}
+.today-money .btn-text {margin-left: auto;}
+/* 财务对账: the period picker, and the dates of a chosen one. */
+.period-bar {display: flex; align-items: center; flex-wrap: wrap; gap: 8px 16px;}
+.period-dates {display: inline-flex; align-items: center; gap: 6px;}
+.period-dates input {height: 32px; padding: 0 8px; border: 1px solid var(--border); border-radius: 6px;}
+.provider-costs tfoot td {font-weight: 600; border-top: 1px solid var(--border);}
+.sales-line {margin: 0 0 8px; display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 6px;}
 .table tr.is-pointed td {background: var(--warning-bg);}
 .table tr.is-pointed td:first-child {box-shadow: inset 3px 0 0 #d4a72c;}
 .keys-table {min-width: 720px; table-layout: fixed;}

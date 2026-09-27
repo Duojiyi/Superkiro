@@ -178,6 +178,19 @@ export interface AdminFinancials {
     gross_margin_percentage: number;
   };
   modelRankings: Array<{model_id?: string; requests?: number; total_tokens?: number; provider_cost_micro_cny?: number; credits_charged?: number; margin_percentage?: number}>;
+  /** The period covered (from inclusive, to exclusive), when one was asked for (newer servers). */
+  fromSecs?: number | null;
+  toSecs?: number | null;
+  /** What each upstream served over the period, and what it should bill for it. */
+  byProvider?: Array<{providerId: string; requests: number; uncachedInputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; costMicroCny: number}>;
+  /** The margin over the requests whose cost is known, and what is left out. */
+  margin?: {costedRequests: number; costedCredits: number; revenueMicroCny: number; costMicroCny: number; grossProfitMicroCny: number; marginPercentage: number | null; uncostedRequests: number; uncostedCredits: number};
+  /** Cards issued and activated over the period, valued at their plan's price. */
+  sales?: {issuedCards: number; issuedValueMicroCny: number; activatedCards: number; activatedValueMicroCny: number; unpricedIssuedCards: number; unpricedActivatedCards: number;
+    byPlan: Array<{templateId: string; planId?: string; name: string; points: number; priceMicroCny: number; issuedCards: number; activatedCards: number; issuedValueMicroCny?: number; activatedValueMicroCny?: number}>};
+  /** Balances still owed now (whatever the period), at the current face value; the part on cards not yet activated. */
+  liability?: {cards: number; microCredits: number; valueMicroCny: number; unactivatedCards: number; unactivatedMicroCredits: number};
+  planPrices?: Array<{templateId: string; planId?: string; name: string; points: number; priceMicroCny: number; onSale?: boolean}>;
 }
 
 export interface AdminCardItem {
@@ -567,8 +580,10 @@ export class AdminApiClient {
     return this.request('/api/v1/admin/announcements/withdraw', {method: 'POST', body: JSON.stringify({id})});
   }
 
-  async getFinancials(): Promise<AdminFinancials> {
-    return this.request('/api/v1/admin/financials');
+  /** Over the whole kept ledger, or from `fromSecs` (inclusive) to `toSecs` (exclusive). */
+  async getFinancials(range: {fromSecs?: number; toSecs?: number} = {}): Promise<AdminFinancials> {
+    const query = [range.fromSecs !== undefined ? `fromSecs=${range.fromSecs}` : '', range.toSecs !== undefined ? `toSecs=${range.toSecs}` : ''].filter(Boolean).join('&');
+    return this.request(`/api/v1/admin/financials${query ? `?${query}` : ''}`);
   }
 
   /** The latest traces, newest first; `cardId` narrows them to one card on the server. */

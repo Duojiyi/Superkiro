@@ -77,8 +77,8 @@ const server=http.createServer(async(req,res)=>{
     await page.screenshot({path:path.join(screenshots,'workspace-authenticated.png'),fullPage:true,animations:'disabled'});
     await page.getByRole('navigation').getByRole('button',{name:'财务对账',exact:true}).click();
     await page.getByRole('heading',{name:'结算参数'}).waitFor();
-    // Incomplete cost coverage: no margin is computed and unpriced requests are not free.
-    await page.getByText('1 次请求未设成本，毛利暂不计算',{exact:true}).waitFor();
+    // Incomplete cost coverage: the margin covers the requests with a cost, and the one without is named, not free.
+    await page.getByText('另有 1 次未设成本',{exact:true}).waitFor();
     await page.getByLabel('积分面值',{exact:true}).fill('0.02');await page.getByLabel('美元汇率',{exact:true}).fill('7.3');await page.getByLabel('变更原因',{exact:true}).fill('fixture settings');
     await page.getByRole('button',{name:'发布',exact:true}).click();
     const financeBox=page.getByRole('alertdialog');await financeBox.waitFor();

@@ -105,6 +105,73 @@ module.exports = function fixtureApi() {
       modelHealth: [...models.values()].sort((a, b) => busiest(a, b, 'requests') || a.model.localeCompare(b.model)),
       modelUsage7d: [...usage.values()].map(entry => ({model: entry.model, requests: entry.requests, cards: entry.cards.size})).sort((a, b) => b.requests - a.requests || a.model.localeCompare(b.model))};
   };
+  // The usage ledger the financials and the CSV export read, relative to the real clock: today, yesterday,
+  // ten and forty days ago. One of today's was served by a route without a cost (not priced by a version).
+  const DAY = 86400, t0 = Math.floor(Date.now() / 1000);
+  const usage = (i, ago, model, provider, credits, cost, extra = {}) => ({id: `fixture-ledger-${i}`, card_id: cards[i % 6].id, ts: t0 - ago, kind: 'usage', invocation_id: `${cards[i % 6].id}:ledger-${i}`,
+    exposed_model: model, provider_id: provider, input_tokens: 40000 + i * 1000, output_tokens: 900 + i * 10, cache_read_tokens: 30000, cache_write_tokens: 2000,
+    credits_charged: credits, provider_cost_micro_cny: cost, rate_card_version: cost ? 'fixture-price-v1' : null, ...extra});
+  const ledger = [
+    usage(0, 600, 'claude-sonnet', 'fixture-provider', 1500000, 4000), usage(1, 1200, 'claude-sonnet', 'fixture-provider', 2500000, 7000),
+    usage(2, 1800, 'gpt-5', 'fixture-provider', 1000000, 3000), usage(3, 2400, 'gpt-6-astra', 'fixture-openai', 3000000, 40000),
+    usage(4, 3000, 'gpt-6-astra', 'fixture-openai', 2000000, 26000), usage(5, 3600, 'gemini-pro', 'fixture-provider', 1200000, 0),
+    usage(6, DAY + 3600, 'claude-sonnet', 'fixture-provider', 2000000, 6000), usage(7, DAY + 7200, 'gpt-5', 'fixture-provider', 1800000, 5000),
+    usage(8, 10 * DAY, 'claude-sonnet', 'fixture-provider', 4000000, 12000), usage(9, 40 * DAY, 'gpt-5', 'fixture-provider', 6000000, 18000),
+  ];
+  // The tiers' list prices, the one table the server and the console take them from.
+  const PLAN_PRICES = [{templateId: 'tier-1000', name: 'PRO', points: 1000, priceMicroCny: 30000000}, {templateId: 'tier-2000', name: 'PRO+', points: 2000, priceMicroCny: 55000000},
+    {templateId: 'tier-5000', name: 'PRO Max', points: 5000, priceMicroCny: 130000000}, {templateId: 'tier-10000', name: 'Power', points: 10000, priceMicroCny: 250000000}];
+  // GET /financials over [fromSecs, toSecs), as the server computes each block from the ledger and the cards.
+  const financials = (from, to) => {
+    const t = Math.floor(Date.now() / 1000), face = config.settings.credit_face_value_cny, within = ts => (from === undefined || ts >= from) && (to === undefined || ts < to);
+    const entries = ledger.filter(entry => within(entry.ts)), revenue = entry => Math.round(entry.credits_charged * face);
+    const total = key => entries.reduce((sum, entry) => sum + entry[key], 0);
+    const credits = total('credits_charged'), cost = total('provider_cost_micro_cny'), income = entries.reduce((sum, entry) => sum + revenue(entry), 0);
+    const costed = entries.filter(entry => entry.rate_card_version), uncosted = entries.length - costed.length;
+    const costedIncome = costed.reduce((sum, entry) => sum + revenue(entry), 0), costedCost = costed.reduce((sum, entry) => sum + entry.provider_cost_micro_cny, 0);
+    const group = key => [...entries.reduce((map, entry) => map.set(entry[key], [...(map.get(entry[key]) ?? []), entry]), new Map())];
+    const rankings = group('exposed_model').map(([model, rows]) => {
+      const value = rows.reduce((sum, entry) => sum + revenue(entry), 0), spent = rows.reduce((sum, entry) => sum + entry.provider_cost_micro_cny, 0);
+      return {model_id: model, requests: rows.length, total_tokens: rows.reduce((sum, entry) => sum + entry.input_tokens + entry.output_tokens, 0), provider_cost_micro_cny: spent,
+        credits_charged: rows.reduce((sum, entry) => sum + entry.credits_charged, 0), margin_percentage: value > 0 ? (value - spent) / value * 100 : 0};
+    }).sort((a, b) => b.provider_cost_micro_cny - a.provider_cost_micro_cny);
+    const byProvider = group('provider_id').map(([providerId, rows]) => ({providerId, requests: rows.length,
+      uncachedInputTokens: rows.reduce((sum, entry) => sum + entry.input_tokens - entry.cache_read_tokens - entry.cache_write_tokens, 0), outputTokens: rows.reduce((sum, entry) => sum + entry.output_tokens, 0),
+      cacheReadTokens: rows.reduce((sum, entry) => sum + entry.cache_read_tokens, 0), cacheWriteTokens: rows.reduce((sum, entry) => sum + entry.cache_write_tokens, 0),
+      costMicroCny: rows.reduce((sum, entry) => sum + entry.provider_cost_micro_cny, 0)})).sort((a, b) => b.costMicroCny - a.costMicroCny);
+    // Sales: cards issued (a day before they were activated, as their history says) and activated in the period, at their tier's price.
+    const planOf = card => PLAN_PRICES.findIndex(plan => plan.points * 1e6 === card.creditTotal);
+    const byPlan = PLAN_PRICES.map(plan => ({...plan, issuedCards: 0, activatedCards: 0}));
+    const sales = {issuedCards: 0, issuedValueMicroCny: 0, activatedCards: 0, activatedValueMicroCny: 0, unpricedIssuedCards: 0, unpricedActivatedCards: 0, byPlan};
+    for (const card of cards) {
+      const plan = planOf(card), issued = (card.activatedAt ?? t) - DAY;
+      if (within(issued) && !(card.status === 'voided' && card.activatedAt == null)) {sales.issuedCards++; if (plan < 0) sales.unpricedIssuedCards++; else {byPlan[plan].issuedCards++; sales.issuedValueMicroCny += byPlan[plan].priceMicroCny;}}
+      if (card.activatedAt != null && within(card.activatedAt)) {sales.activatedCards++; if (plan < 0) sales.unpricedActivatedCards++; else {byPlan[plan].activatedCards++; sales.activatedValueMicroCny += byPlan[plan].priceMicroCny;}}
+    }
+    // Liability: what customers can still use now, whatever the period.
+    const usable = cards.filter(card => card.archivedAt == null && !['expired', 'voided', 'banned'].includes(view(card).effectiveStatus));
+    const owed = card => Math.max(0, card.availableCredits ?? card.creditTotal - card.creditUsed);
+    const liability = {cards: usable.length, microCredits: usable.reduce((sum, card) => sum + owed(card), 0), valueMicroCny: 0,
+      unactivatedCards: usable.filter(card => card.status === 'unactivated').length, unactivatedMicroCredits: usable.filter(card => card.status === 'unactivated').reduce((sum, card) => sum + owed(card), 0)};
+    liability.valueMicroCny = Math.round(liability.microCredits * face);
+    return {success: true, fromSecs: from ?? null, toSecs: to ?? null, basis: 'retained_usage_ledger_estimate_not_cash_revenue', settings: config.settings, actualRevenueMicroCny: null, actualGrossProfitMicroCny: null,
+      estimates: {retainedLedgerOnly: true, usageFaceValueMicroCny: income, configuredProviderCostMicroCny: cost, faceValueLessCostMicroCny: uncosted ? null : income - cost,
+        faceValueMarginPercentage: !uncosted && income > 0 ? (income - cost) / income * 100 : null, costedRequests: costed.length, uncostedRequests: uncosted},
+      dashboard: {total_requests: entries.length, total_credits_charged: credits, revenue_micro_cny: income, provider_cost_micro_cny: cost, gross_profit_micro_cny: income - cost, gross_margin_percentage: income > 0 ? (income - cost) / income * 100 : 0},
+      modelRankings: rankings, byProvider, sales, liability, planPrices: PLAN_PRICES,
+      margin: {costedRequests: costed.length, costedCredits: costed.reduce((sum, entry) => sum + entry.credits_charged, 0), revenueMicroCny: costedIncome, costMicroCny: costedCost,
+        grossProfitMicroCny: costedIncome - costedCost, marginPercentage: costedIncome > 0 ? (costedIncome - costedCost) / costedIncome * 100 : null,
+        uncostedRequests: uncosted, uncostedCredits: entries.filter(entry => !entry.rate_card_version).reduce((sum, entry) => sum + entry.credits_charged, 0)}};
+  };
+  // The ledger CSV as the server writes it: every text cell quoted, the original columns first.
+  const ledgerCsv = () => {
+    const quote = text => `"${String(text).replace(/"/g, '""')}"`, micro = value => String(value / 1e6);
+    const names = Object.fromEntries(providers.map(provider => [provider.id, provider.name]));
+    const header = 'id,card_id,ts,kind,invocation_id,exposed_model,provider_id,input_tokens,output_tokens,credits_charged,provider_cost_micro_cny,time_utc,provider_name,cache_read_tokens,cache_write_tokens,credits,revenue_cny,cost_cny\n';
+    return header + ledger.map(entry => [quote(entry.id), quote(entry.card_id), entry.ts, quote(entry.kind), quote(entry.invocation_id), quote(entry.exposed_model), quote(entry.provider_id),
+      entry.input_tokens, entry.output_tokens, entry.credits_charged, entry.provider_cost_micro_cny, quote(new Date(entry.ts * 1000).toISOString().replace('.000', '')), quote(names[entry.provider_id] ?? entry.provider_id),
+      entry.cache_read_tokens, entry.cache_write_tokens, micro(entry.credits_charged), micro(Math.round(entry.credits_charged * config.settings.credit_face_value_cny)), micro(entry.provider_cost_micro_cny)].join(',') + '\n').join('');
+  };
   // Request content is kept for some requests only; the rest answer like an expired archive.
   const traceContent = invocationId => {
     const trace = traces.find(t => t.invocation_id === invocationId);
@@ -165,7 +232,7 @@ module.exports = function fixtureApi() {
   let authenticated = false, deadline = 0, loginAt = 0;
   const IDLE = 1800, MAX = 8 * 3600;
   const nowSecs = () => Math.floor(Date.now() / 1000);
-  return {writes, cards, traces, providers, keys, config, storage, expire() {authenticated=false;}, get sessionDeadline() {return deadline;}, async handle(req,res) {
+  return {writes, cards, traces, providers, keys, config, storage, ledger, expire() {authenticated=false;}, get sessionDeadline() {return deadline;}, async handle(req,res) {
     const url = new URL(req.url, 'http://127.0.0.1');
     const endpoint = url.pathname.replace('/api/v1/admin/', '');
     const reply = (value, status=200) => {res.writeHead(status, {'Content-Type':'application/json'}); res.end(JSON.stringify(value));};
@@ -243,7 +310,13 @@ module.exports = function fixtureApi() {
       if(String(body.model).includes('overloaded'))return reply({success:true,ok:false,status:529,latency_ms:1840,ttft_ms:null,error:'HTTP 529 overloaded_error: Overloaded',reply:null,key_id:key.id});
       return reply({success:true,ok:true,status:200,latency_ms:620,ttft_ms:410,error:null,reply:'OK',key_id:key.id});
     }
-    if(endpoint==='financials') return reply({success:true,basis:'retained_usage_ledger_estimate_not_cash_revenue',settings:config.settings,actualRevenueMicroCny:null,actualGrossProfitMicroCny:null,estimates:{retainedLedgerOnly:true,usageFaceValueMicroCny:1000000,configuredProviderCostMicroCny:420000,faceValueLessCostMicroCny:null,faceValueMarginPercentage:null,costedRequests:17,uncostedRequests:1},dashboard:{total_requests:18,total_credits_charged:27000000,revenue_micro_cny:0,provider_cost_micro_cny:4200000,gross_profit_micro_cny:0,gross_margin_percentage:0},modelRankings:models.map(m=>({model_id:m.exposed_model_id,provider_cost_micro_cny:1400000}))});
+    if(endpoint==='financials') {
+      const bound=name=>{const value=url.searchParams.get(name);return value===null?undefined:/^\d+$/.test(value)?Number(value):NaN;};
+      const from=bound('fromSecs'),to=bound('toSecs');
+      if(Number.isNaN(from)||Number.isNaN(to))return reply({success:false,error:'fromSecs and toSecs must be whole seconds'},400);
+      if(from!==undefined&&to!==undefined&&from>=to)return reply({success:false,error:'fromSecs must be before toSecs'},400);
+      return reply(financials(from,to));
+    }
     if(endpoint==='announcements') return reply({success:true,announcements:[{id:'fixture-notice',title:'本地测试：服务维护通知',content:'这是隔离的视觉测试公告，不会向真实用户发布。',level:'info',enabled:true,created_at:now}]});
     if(endpoint==='cards/batch') {
       assert.equal(body.maxDevices,1); assert.equal('creditTotal' in body,false); assert.ok(groups.some(g=>g.id===body.groupId));
@@ -368,7 +441,8 @@ module.exports = function fixtureApi() {
       return reply({success:true,receipt:{archive_id:archiveId,archive_file:`ledger_archive_${archiveId}.json`,drained_entries_count:drained,sha256_checksum:crypto.createHash('sha256').update(archiveId).digest('hex'),
         before_ts_secs:before,created_at_secs:t},stateBytesBefore:bytesBefore,stateBytesAfter:storage.bytes,stateCeilingBytes:storage.ceiling});
     }
-    if(endpoint==='exports/ledger.csv') {res.writeHead(200,{'Content-Type':'text/csv'}); return res.end('id,points\nfixture-ledger,27\n');}
+    if(endpoint==='exports/ledger.csv') {res.writeHead(200,{'Content-Type':'text/csv; charset=utf-8'}); return res.end(ledgerCsv());}
+    if(endpoint==='exports/ledger.json') return reply(ledger);
     throw new Error(`Unhandled fixture endpoint: ${req.method} ${endpoint}`);
   }};
 };

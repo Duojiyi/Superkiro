@@ -15,6 +15,7 @@ import OverviewPage from './pages/Overview';
 import ProvidersPage, {type KeyEditing} from './pages/Providers';
 import SecurityPage from './pages/Security';
 import TracesPage from './pages/Traces';
+import {periodRange} from './period';
 import {publishFailure, type PublishOutcome} from './refusal';
 import {intentOf, OPEN_PARAM, parseRoute, routeHash, routeOf, type Route} from './route';
 import {brokenRoutes, modelName} from './routes';
@@ -35,6 +36,8 @@ export interface WorkspaceData {
   cards: AdminCardItem[];
   announcements: AdminAnnouncement[];
   financials: AdminFinancials | null;
+  /** Today's (from local midnight), for 运营概览's 今日收入 / 成本 / 毛利; null when not read. */
+  financialsToday: AdminFinancials | null;
   traces: AdminTrace[];
   providers: Row[];
   providerKeys: Row[];
@@ -46,7 +49,7 @@ export interface WorkspaceData {
   revision?: string;
 }
 
-const EMPTY: WorkspaceData = {stats: null, cards: [], announcements: [], financials: null, traces: [], providers: [], providerKeys: [], groups: [], models: [], rateCards: []};
+const EMPTY: WorkspaceData = {stats: null, cards: [], announcements: [], financials: null, financialsToday: null, traces: [], providers: [], providerKeys: [], groups: [], models: [], rateCards: []};
 
 type Section = 'stats' | 'cards' | 'announcements' | 'financials' | 'traces' | 'providers' | 'config';
 const SECTION_NAMES: Record<Section, string> = {stats: '统计', cards: '卡密', announcements: '公告', financials: '财务', traces: '调用追踪', providers: '供应商', config: '配置'};
@@ -164,7 +167,7 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
       return null;
     };
     try {
-      const [stats, cards, notices, financials, traces, providers, config] = await Promise.all([
+      const [stats, cards, notices, financials, traces, providers, config, today] = await Promise.all([
         adminApi.getStats().catch(failed('stats')),
         adminApi.getCards().catch(failed('cards')),
         adminApi.getAnnouncements().catch(failed('announcements')),
@@ -172,6 +175,8 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
         adminApi.getTraces(500).catch(failed('traces')),
         adminApi.getProviders().catch(failed('providers')),
         adminApi.getCommercialConfig().catch(failed('config')),
+        // Only 运营概览's 今日 figures use it: without it they read —, nothing else is missing.
+        adminApi.getFinancials(periodRange('today') ?? {}).catch(() => null),
       ]);
       if (!mounted.current || seq !== refreshSeq.current) return;
       const unavailable: Failures = {
@@ -192,6 +197,7 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
         cards: cards?.success ? cards.cards : previous.cards,
         announcements: notices?.success ? notices.announcements : previous.announcements,
         financials: financials?.success ? financials : previous.financials,
+        financialsToday: today?.success ? today : null,
         traces: traces?.success ? traces.traces : previous.traces,
         providers: providers?.success ? providers.providers ?? [] : previous.providers,
         providerKeys: providers?.success ? providers.keys ?? [] : previous.providerKeys,
@@ -435,7 +441,7 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
             {activeTab === 'announcements' && <AnnouncementsPage announcements={data.announcements} loading={loading} failed={!!failures.announcements}
               refresh={refreshData} guards={guards} reportError={reportError}
               updateAnnouncements={announcements => setData(previous => ({...previous, announcements}))}/>}
-            {activeTab === 'reconciliation' && <FinancePage financials={data.financials} loading={loading} failed={!!failures.financials}
+            {activeTab === 'reconciliation' && <FinancePage financials={data.financials} providers={data.providers} loading={loading} failed={!!failures.financials}
               refresh={refreshData} reportError={reportError} onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy} refreshEpoch={refreshEpoch}/>}
             {activeTab === 'security' && <SecurityPage operator={operator} keyCount={providersLoaded ? data.providerKeys.length : null} stats={data.stats} refresh={refreshData} guards={guards}
               onLogout={() => void onLogout(false)} onLogoutAll={() => void logoutAll()}/>}

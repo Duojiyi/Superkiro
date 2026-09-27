@@ -7,7 +7,7 @@ import {attemptsFromTraces, failingModels, failureText, failureTone, kindsText, 
 import type {AdminActivityWindow, AdminTrace} from '../api';
 import {EstimateTag, FilterTabs, StatusBadge, TableState, TopbarActions} from '../components/ui';
 import {IconCheck, IconWarning} from '../components/icons';
-import {formatBytes, formatCount, formatCredits, formatCreditsMicro, formatDuration, formatFullDateTime, formatMoney, formatPercent, formatRemaining, shortId} from '../format';
+import {formatBytes, formatCount, formatCredits, formatCreditsMicro, formatDuration, formatFullDateTime, formatMoney, formatMoneyExact, formatPercent, formatRemaining, shortId} from '../format';
 import {brokenRoutes, modelName, nameList, targetProblem} from '../routes';
 import {cardState, cooldownText, failureLabel, keyAlert, keyCooldownLeft, keyStatusView, storageLevel, TRACE_IN_PROGRESS} from '../status';
 import type {Intent, Row, Tab} from '../types';
@@ -164,6 +164,21 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
     if (!notice.enabled || !notice.expires_at || notice.expires_at <= nowSecs || notice.expires_at > nowSecs + DAY) continue;
     attention.push({text: `公告「${notice.title}」${formatRemaining(notice.expires_at, now).text.replace('剩 ', '')}后到期`, tone: 'info', go: () => onNavigate('announcements')});
   }
+  // Today's money: face-value revenue and configured cost of every settled request, the margin over
+  // the ones whose cost is known; a model sold below its cost today is raised.
+  const today = data.financialsToday;
+  const todayRevenue = today?.estimates?.usageFaceValueMicroCny ?? today?.dashboard?.revenue_micro_cny;
+  const todayCost = today?.estimates?.configuredProviderCostMicroCny ?? today?.dashboard?.provider_cost_micro_cny;
+  const todayMargin = today?.margin;
+  const todayFace = today?.settings?.credit_face_value_cny;
+  const losing = (today?.modelRankings ?? []).map(row => {
+    const credits = Number(row.credits_charged ?? 0), cost = Number(row.provider_cost_micro_cny ?? 0), value = typeof todayFace === 'number' ? credits * todayFace : 0;
+    const rate = !(Number(row.requests ?? 0) > 0) || !cost ? null : typeof row.margin_percentage === 'number' ? row.margin_percentage : value ? (value - cost) / value * 100 : null;
+    return {model: String(row.model_id ?? '—'), rate};
+  }).filter((row): row is {model: string; rate: number} => row.rate !== null && row.rate < 0).sort((a, b) => a.rate - b.rate);
+  if (losing.length) attention.push({text: losing.length <= 2
+    ? `今天 ${losing.map(row => `${row.model} 毛利 ${formatPercent(row.rate)}`).join('、')}：售价低于采购价，按成本在亏`
+    : `今天 ${losing.length} 个模型按成本在亏：${nameList(losing.map(row => row.model), 3)}`, tone: 'danger', go: () => onNavigate('reconciliation')});
   attention.sort((a, b) => URGENCY[a.tone] - URGENCY[b.tone]);
   const unknown = failures.cards || failures.providers || failures.traces;
   // Shown models whose primary route cannot serve: those nothing can serve, and those a backup serves.
@@ -237,6 +252,16 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
             })}
           </div>}
         <div className="chart-legend"><span className="legend-ok">成功</span><span className="legend-failed">失败</span></div>
+        {/* Today from local midnight: what the requests settled so far brought in and cost. */}
+        <div className="today-money" role="group" aria-label="今日收入">
+          <div><span className="today-label">今日收入<EstimateTag title="今天 0 点起结算的请求，按积分面值折算；不含实际收款"/></span>
+            <b title={typeof todayRevenue === 'number' ? formatMoneyExact(todayRevenue) : '今天的财务没有读取成功'}>{typeof todayRevenue === 'number' ? formatMoney(todayRevenue) : '—'}</b></div>
+          <div><span className="today-label">成本</span><b title={typeof todayCost === 'number' ? formatMoneyExact(todayCost) : undefined}>{typeof todayCost === 'number' ? formatMoney(todayCost) : '—'}</b></div>
+          <div><span className="today-label">毛利</span>
+            <b className={todayMargin && todayMargin.grossProfitMicroCny < 0 ? 'is-danger' : undefined} title={todayMargin ? formatMoneyExact(todayMargin.grossProfitMicroCny) : undefined}>{todayMargin ? formatMoney(todayMargin.grossProfitMicroCny) : '—'}</b>
+            {todayMargin && <small className={todayMargin.uncostedRequests ? 'is-warning' : 'muted'}>{typeof todayMargin.marginPercentage === 'number' ? formatPercent(todayMargin.marginPercentage) : ''}{todayMargin.uncostedRequests ? `${typeof todayMargin.marginPercentage === 'number' ? ' · ' : ''}另有 ${formatCount(todayMargin.uncostedRequests)} 次未设成本` : ''}</small>}</div>
+          <button type="button" className="btn-text" onClick={() => onNavigate('reconciliation')}>财务对账 ›</button>
+        </div>
       </section>
 
       <section className="panel attention">
