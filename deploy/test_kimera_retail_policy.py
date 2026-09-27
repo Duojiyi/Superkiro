@@ -13,8 +13,8 @@ class CurrentRetailPolicyTests(unittest.TestCase):
             self.assertEqual(block['cost_multiplier'], 0.06 if gpt else 0.08)
             self.assertNotIn('cost_basis_usd_per_m', block)
             if model == 'claude-opus-5-5':
-                self.assertEqual(block['input_usd_per_m'], 5)
-                self.assertEqual(script.costs(block), [0.4, 2.0, 0.5, 0.04])
+                self.assertEqual([block[k + '_usd_per_m'] for k in script.PRICES], [4, 20, 5, 0.2])
+                self.assertEqual(script.costs(block), [0.32, 1.6, 0.4, 0.016])
 
     def test_gpt_override_does_not_follow_route_provider(self):
         mapping = {'exposed_model_id':'gpt-5.6-sol','target_model':'gpt-5.6-sol','target_provider_id':'unknown'}
