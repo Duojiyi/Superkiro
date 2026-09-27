@@ -22,7 +22,7 @@ export interface Intent {
   /** `card`: the search is exactly this card's ID. `reason`: a failure class under 失败. `from`/`to`: a chosen range (2026-09-26T08:30). */
   traces?: {status?: TraceTab; window?: TraceWindow; from?: string; to?: string; search?: string; card?: string; reason?: string; model?: string; provider?: string; open?: string};
   /** 上架模型 for this provider's upstream model (from 供应商与 Key). */
-  models?: {list?: {providerId?: string; model?: string}};
+  models?: {list?: {providerId?: string; model?: string}; /** A model to show in the list (a link naming it). */ model?: string};
   /** `provider` or `key`: what to point out; `edit`: the Key open in the editor. Key IDs are unique across providers. */
   providers?: {provider?: string; key?: string; edit?: string};
 }

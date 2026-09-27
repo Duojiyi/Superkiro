@@ -59,31 +59,25 @@ const server=http.createServer(async(req,res)=>{
     const modelId=drawer.getByLabel('模型 ID',{exact:true});
     assert.equal(await modelId.inputValue(),'gpt-5.6-sol');
     assert.equal(await drawer.getByLabel('显示名称',{exact:true}).getAttribute('placeholder'),'留空显示为 GPT 5.6 Sol');
-    // 参照现有模型 copies capabilities, the model and display multipliers and price, and places it after the reference.
+    // 参照现有模型 copies capabilities and the model and display multipliers, ticks its group and places it after the reference.
     await drawer.getByLabel('参照现有模型',{exact:true}).selectOption('fixture-model-3');
     assert.equal(await drawer.getByLabel('上下文长度',{exact:true}).inputValue(),'272000');
-    assert.equal(await drawer.getByLabel('输入售价',{exact:true}).inputValue(),'1.25');
-    assert.equal(await drawer.getByLabel('模型扣费倍率',{exact:true}).inputValue(),'1');
-    const place=drawer.getByLabel('位置',{exact:true});
+    assert.equal(await drawer.getByLabel('模型倍率',{exact:true}).inputValue(),'1');
+    const place=drawer.getByLabel('PRO 的位置',{exact:true});
     assert.equal(await place.inputValue(),'fixture-model-3');
     assert((await place.locator('option').allTextContents()).includes('排在最前（成为默认模型）'));
     await place.selectOption('fixture-model-0');
-    // 按官方价计算: official USD x the multipliers at the face value (the fixture's credit is CNY 0.01).
-    await drawer.getByText('按官方价计算',{exact:true}).click();
+    // The price from the official price × 计费倍率 at the face value (the fixture's credit is CNY 0.01); this
+    // configuration has no official prices and no 成本倍率 yet, so both are typed here.
+    await drawer.getByText('没有官方价：填四项官方价，或按其他模型定价').waitFor();
     for(const [label,value] of [['官方输入价','4'],['官方输出价','20'],['官方缓存写价','5'],['官方缓存读价','0.4']])await drawer.getByLabel(label,{exact:true}).fill(value);
-    await drawer.getByLabel('售价倍率',{exact:true}).fill('0.24');await drawer.getByLabel('成本倍率',{exact:true}).fill('0.06');
-    await drawer.getByRole('button',{name:'计算',exact:true}).click();
-    assert.equal(await drawer.getByLabel('输入售价',{exact:true}).inputValue(),'96');
-    assert.equal(await drawer.getByLabel('缓存读售价',{exact:true}).inputValue(),'9.6');
-    assert.equal(await drawer.getByLabel('采购输出价',{exact:true}).inputValue(),'1.2');
-    // Each upstream keeps its own cost multiplier; the retail one is shared.
-    assert.deepEqual(await page.evaluate(()=>JSON.parse(localStorage.getItem('admin-listing-rates:v2'))),{retail:'0.24',upstream:{'fixture-openai':'0.06'}});
-    await drawer.getByLabel('供应商',{exact:true}).selectOption('fixture-provider');
-    assert.equal(await drawer.getByLabel('成本倍率',{exact:true}).inputValue(),'');assert.equal(await drawer.getByLabel('售价倍率',{exact:true}).inputValue(),'0.24');
-    await drawer.getByLabel('供应商',{exact:true}).selectOption('fixture-openai');
-    assert.equal(await drawer.getByLabel('成本倍率',{exact:true}).inputValue(),'0.06');
+    await drawer.getByLabel('计费倍率',{exact:true}).fill('0.24');await drawer.getByLabel('成本倍率',{exact:true}).fill('0.06');
+    const results=await drawer.getByRole('table',{name:'按官方价算出的价格'}).innerText();
+    assert(results.includes('96')&&results.includes('9.6')&&results.includes('¥1.2'),results);
+    await drawer.getByRole('status').filter({hasText:'毛利约 75%'}).waitFor();
+    assert.deepEqual(await page.evaluate(()=>Object.keys(localStorage)),[],'nothing about pricing is kept in the browser');
     // Model IDs the server would refuse are stopped here; so is one the group already has.
-    const list=drawer.getByRole('button',{name:'上架',exact:true});
+    const list=drawer.getByRole('button',{name:'预览上架',exact:true});
     await modelId.fill('gpt 5.6 sol');await drawer.getByText('模型 ID 只能用英文字母、数字和 . _ : / -，最多 128 个字符').waitFor();
     assert(await list.isDisabled());
     await modelId.fill('gpt-6-astra');await list.click();
@@ -92,7 +86,7 @@ const server=http.createServer(async(req,res)=>{
     await modelId.fill('gpt-5.6-sol');
     await list.click();
     const facts=await answer(true);
-    for(const expected of ['客户看到：GPT 5.6 Sol（gpt-5.6-sol）','排在 claude-sonnet 之后','线路：OpenAI 格式 / Fixture / gpt-5.6-sol','售价：输入 96 / 输出 480 / 缓存写 120 / 缓存读 9.6 积分/百万 · 上架即生效','扣费倍率 1'])
+    for(const expected of ['客户看到：GPT 5.6 Sol（gpt-5.6-sol）','PRO：排在 claude-sonnet 之后','线路：OpenAI 格式 / Fixture / gpt-5.6-sol','售价：官方价 $4 / $20 / $5 / $0.4 × 计费倍率 ×0.24 · 上架即生效','模型倍率 1'])
       assert(facts.includes(expected),`${expected}\n${facts}`);
     // One publication: shown at once with its first price in force now, the group numbered again from its place.
     await page.locator('.toast').filter({hasText:'已上架 gpt-5.6-sol'}).waitFor();
@@ -107,8 +101,9 @@ const server=http.createServer(async(req,res)=>{
       assert.equal(mapping[field],value,field);
     for(const [field,value] of Object.entries({model:'gpt-5.6-sol',rate_card_id:'fixture-rate',pricing_mode:'fixed',currency:'CNY',fixed_input_credit_per_m:96000000,fixed_cache_read_credit_per_m:9600000,output_price_per_m:1.2,margin_multiplier:1,effective_from_secs:0}))
       assert.equal(version[field],value,field);
+    assert.deepEqual([version.official.output_usd_per_m,version.official.price_multiplier,version.official.cost_multiplier,version.official.credit_face_value_cny],[20,0.24,0.06,0.01]);
     await page.getByRole('row').filter({hasText:'gpt-5.6-sol'}).first().waitFor();
-    console.log('PASS: 上架模型: 测试 first, reference copy with the model multiplier, per-provider cost multiplier, ID rule, one publication shown with its price, renumbered place');
+    console.log('PASS: 上架模型: 测试 first, reference copy with the model multiplier and place, priced from official prices × 计费倍率 with the route cost, ID rule, one publication shown with its price, renumbered place');
 
     // 去上架 while the page has unpublished edits: it says so instead of doing nothing.
     await page.getByLabel('上下文长度',{exact:true}).fill('150000');
@@ -133,21 +128,22 @@ const server=http.createServer(async(req,res)=>{
     console.log('PASS: 去上架 from a Key opens the listing for that provider and model, and says why when the page has unpublished edits');
 
     // A model ID the shared price table already prices (PRO+ sells gpt-5): its price is kept by
-    // default; a new one would start later and apply to PRO+ as well.
+    // default; a new one would start about a minute later and apply to PRO+ as well.
     await again.getByLabel('模型 ID',{exact:true}).fill('gpt-5');
     await again.getByText('价格表里已有 gpt-5 的价格：输入 3 / 输出 15 / 缓存写 3.75 / 缓存读 0.3 积分/百万，PRO+ 分组的 gpt-5 按它扣费').waitFor();
     assert.equal(await again.getByRole('radio',{name:'沿用现有价格',exact:true}).getAttribute('aria-checked'),'true');
-    assert.equal(await again.getByLabel('输入售价',{exact:true}).count(),0,'no price to type when the existing one is kept');
+    assert.equal(await again.getByLabel('官方输入价',{exact:true}).count(),0,'no price to give when the existing one is kept');
     await again.getByRole('radio',{name:'设新价格',exact:true}).click();
-    await again.getByText('新价格在发布后 5 分钟生效，在那之前按现有价格扣费；它也会用于 PRO+ 分组的 gpt-5').waitFor();
-    for(const [label,value] of [['输入售价','4'],['输出售价','16'],['缓存写售价','4'],['缓存读售价','0.4'],['采购输入价','1'],['采购输出价','1'],['采购缓存写价','1'],['采购缓存读价','1']])await again.getByLabel(label,{exact:true}).fill(value);
-    await again.getByRole('button',{name:'上架',exact:true}).click();
+    await again.getByText('新价格约 1 分钟后生效，在那之前按现有价格扣费；它也会用于 PRO+ 分组的 gpt-5').waitFor();
+    await again.getByRole('checkbox',{name:/高级：直接填积分/}).check();
+    for(const [label,value] of [['输入售价','4'],['输出售价','16'],['缓存写售价','4'],['缓存读售价','0.4'],['采购输入价','0.001'],['采购输出价','0.001'],['采购缓存写价','0.001'],['采购缓存读价','0.001']])await again.getByLabel(label,{exact:true}).fill(value);
+    await again.getByRole('button',{name:'预览上架',exact:true}).click();
     const newPrice=await answer(false);
-    assert(newPrice.includes('新价格同时用于 PRO+ 分组的 gpt-5（同一价格表）')&&/在那之前按现有价格/.test(newPrice),newPrice);
+    assert(newPrice.includes('新价格同时用于 PRO+ 分组的 gpt-5（同一价格表）')&&newPrice.includes('约 1 分钟后换新价格，在那之前按现有价格')&&newPrice.includes('售价：直接填积分（旧版）'),newPrice);
     await again.getByRole('radio',{name:'沿用现有价格',exact:true}).click();
     // A result that never arrives: the drawer closes and the page says exactly what to check.
     lose=true;
-    await again.getByRole('button',{name:'上架',exact:true}).click();
+    await again.getByRole('button',{name:'预览上架',exact:true}).click();
     assert((await answer(true)).includes('售价：沿用价格表里现有的价格（输入 3 / 输出 15'));
     await page.getByRole('status').filter({hasText:'没收到上架结果'}).filter({hasText:'请点“重新加载”后核对“模型与定价”里有没有 gpt-5（PRO）、“价格版本”里有没有它的价格，不要重复提交'}).waitFor();
     await again.waitFor({state:'detached'});

@@ -52,9 +52,9 @@ const server=http.createServer(async(req,res)=>{
     assert((await astra.innerText()).includes('272K / 128K'));assert((await astra.innerText()).includes('1.25 / 10'));
     await astra.getByRole('button',{name:'调价',exact:true}).click();
     const priceDrawer=page.locator('#price-drawer');await priceDrawer.waitFor();
-    assert.equal(await priceDrawer.getByLabel('新输入售价',{exact:true}).inputValue(),'1.25');
-    await priceDrawer.getByLabel('新输出售价',{exact:true}).fill('8');
-    await priceDrawer.locator('.price-change').getByText('−20%',{exact:true}).waitFor();
+    // No official price yet for this legacy price: it is priced from the official one typed here.
+    for(const [label,value] of [['官方输入价','10'],['官方输出价','50'],['官方缓存写价','12.5'],['官方缓存读价','1'],['计费倍率','0.24'],['成本倍率','0.06']])await priceDrawer.getByLabel(label,{exact:true}).fill(value);
+    await priceDrawer.getByRole('table',{name:'按官方价算出的价格'}).getByText('1.25 → ',{exact:false}).first().waitFor();
     assert(/≈ ¥/.test(await priceDrawer.getByRole('status').innerText()),'the sample shows yuan');
     await shot('price-drawer-desktop.png');
     await page.keyboard.press('Escape');await priceDrawer.waitFor({state:'detached'});

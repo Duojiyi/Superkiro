@@ -99,23 +99,24 @@ const elsewhere=change=>{change();fixture.config.revision=`fixture-rev-${Number(
     assert.deepEqual(published().at(-1).body.models.map(row=>[row.id,row.visible]),[['fixture-model-9',true]]);
     console.log('PASS: a model is shown only with a price in force and a primary route that serves; each refusal names the model before anything is sent');
 
-    // 结算参数: the same refusal and reload for the face value and exchange rate.
-    await nav('财务对账');
-    const face=page.getByLabel('积分面值',{exact:true}),reason=page.getByLabel('变更原因',{exact:true});
-    await face.waitFor();await page.waitForFunction(()=>!document.querySelector('.settings-panel fieldset')?.disabled);
+    // 定价设置: the same refusal and reload for the face value.
+    await page.getByRole('tab',{name:'定价设置'}).click();
+    const settings=page.getByRole('region',{name:'定价设置'});
+    const face=settings.getByLabel('积分面值',{exact:true}),reason=settings.getByLabel('定价设置变更原因',{exact:true});
     await face.fill('0.03');await reason.fill('新面值');
     elsewhere(()=>{});
-    await button('发布').click();await accept();
-    await page.getByRole('status').filter({hasText:'配置刚被别人更新'}).waitFor();
+    // Two models lose money on the fixture's USD procurement prices: the count is typed.
+    const acceptPreview=async()=>{const box=page.getByRole('alertdialog');await box.waitFor();await box.getByLabel('确认输入').fill('2');await box.locator('[data-confirm="accept"]').click();await box.waitFor({state:'detached'});};
+    await settings.getByRole('button',{name:'预览并发布',exact:true}).click();await acceptPreview();
+    await settings.getByRole('alert').filter({hasText:'配置刚被更新'}).waitFor();
     assert.equal(await face.inputValue(),'0.03');assert.equal(await page.getByText('没收到发布结果').count(),0);
-    await button('重新加载并保留修改').click();
-    await page.getByRole('status').filter({hasText:'你填的数值和原因都保留了'}).waitFor();
-    assert.equal(await face.inputValue(),'0.03');assert.equal(await reason.inputValue(),'新面值');
-    await button('发布').click();await accept();
-    await page.locator('.toast').filter({hasText:'已发布结算参数'}).waitFor();
+    await settings.getByRole('button',{name:'重新加载',exact:true}).click();await settings.getByRole('alert').waitFor({state:'detached'});
+    assert.equal(await face.inputValue(),'0.03');assert.equal(await reason.inputValue(),'新面值','the typed values and reason stay');
+    await settings.getByRole('button',{name:'预览并发布',exact:true}).click();await acceptPreview();
+    await page.locator('.toast').filter({hasText:'已发布定价设置'}).waitFor();
     assert.equal(fixture.config.settings.credit_face_value_cny,0.03);
     assert.deepEqual(errors,[]);assert.deepEqual(nativeDialogs,[],'no browser-native dialogs');
-    console.log('PASS: 结算参数: a conflict keeps the typed values and reason; reloaded, the same values publish');
+    console.log('PASS: 定价设置: a conflict keeps the typed values and reason; reloaded, the same values publish');
   }finally{
     await browser?.close();server.close();
   }

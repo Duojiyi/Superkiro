@@ -116,18 +116,18 @@ fixture.traces.unshift(running('running-2m',120),running('running-29m',29*60),ru
     await page.setViewportSize({width:1280,height:900});await page.unroute('**/api/v1/admin/financials');
     console.log('PASS: 财务对账 KPIs with counts in the millions are not cut off at 1280, 1100 and 390 px; 成本覆盖 puts the total beside or under the count');
 
-    // Wide drawers: min(960px, 100vw − 240px), the whole width on a phone.
+    // Wide drawers: min(960px, 100vw − 240px); the pricing drawers take the whole width below 900px, where their tables no longer fit beside the list.
     await nav('模型与定价');
     await page.getByRole('checkbox',{name:'选择 claude-sonnet',exact:true}).check();
     await page.getByRole('region',{name:'批量模型操作'}).getByRole('button',{name:'批量调价',exact:true}).click();
     const wide=page.locator('#bulk-price');await wide.waitFor();
-    for(const [width,expected] of [[1440,960],[1100,860],[800,560],[390,390]]){
+    for(const [width,expected] of [[1440,960],[1100,860],[800,800],[390,390]]){
       await page.setViewportSize({width,height:900});await page.waitForFunction(w=>innerWidth===w,width);
       assert.equal(Math.round((await wide.boundingBox()).width),expected,`${width}: wide drawer width`);
     }
     await page.setViewportSize({width:1280,height:900});
     await page.keyboard.press('Escape');await wide.waitFor({state:'detached'});
-    console.log('PASS: wide drawers take min(960px, 100vw − 240px), and the whole width on a phone');
+    console.log('PASS: wide drawers take min(960px, 100vw − 240px), and the pricing drawers the whole width below 900px');
     assert.deepEqual(errors,[]);assert.deepEqual(nativeDialogs,[],'no browser-native dialogs');
   }finally{if(browser)await browser.close();await new Promise(resolve=>server.close(resolve));}
 })().catch(error=>{console.error(error);process.exitCode=1;});

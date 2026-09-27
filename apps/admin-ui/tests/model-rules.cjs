@@ -170,11 +170,8 @@ assert.deepEqual(costIn('c', 'up-x', ownRow), ['upstream', 'v-up']);
 assert.deepEqual(costIn('c', 'other', ownRow), ['wildcard', 'v-any']);
 assert.deepEqual(costIn('a', 'none', {...ownRow, exposed_model_id: 'unpriced', target_model: 'none'}), ['wildcard', 'v-any'], "a model charged at the table's `*` costs what `*` says");
 assert.equal(change.costText(priced[1]), 'CNY 1 / 5 / 1.25 / 0.1');
-const staged = change.buildRouteCost({costs: {input_price_per_m: '1', output_price_per_m: '5', cache_creation_price_per_m: '1.25', cache_read_price_per_m: '0.1'}, currency: 'CNY'},
-  {providerId: 'b', targetModel: 'claude-x', rateCardId: 'r', nowSecs: t, taken: []});
-assert.equal(staged.model, 'b/claude-x');assert.equal(staged.effective_from_secs, 0);assert.equal(staged.margin_multiplier, 1);
-for (const field of ['fixed_input_credit_per_m', 'fixed_output_credit_per_m', 'fixed_cache_creation_credit_per_m', 'fixed_cache_read_credit_per_m', 'per_call_credit']) assert.equal(staged[field], 0, `${field}: never charged`);
-assert.throws(() => change.buildRouteCost({costs: {}, currency: 'CNY'}, {providerId: 'b', targetModel: 'x', rateCardId: 'r', nowSecs: t, taken: []}), /采购价需在/);
+// A draft version (the JSON editor's) marked 0 starts at once only as its table's first of that model.
+const staged = {id: 'staged-route', rate_card_id: 'r', model: 'b/claude-x', effective_from_secs: 0};
 assert.deepEqual(plain(change.routeCostOf(priced[1], [{id: 'b', name: 'B'}, {id: 'b2'}])), {provider: {id: 'b', name: 'B'}, target: 'claude-x'});
 assert.equal(change.routeCostOf(priced[0], [{id: 'b'}]), null, 'a customer price is not a route cost');
 // Marked 0: at once for a first version of that model in its table, otherwise at the later time.
@@ -185,10 +182,10 @@ const switched = routes.switchedRoute({target_provider_id: 'a', target_model: 'm
 assert.deepEqual(plain(switched), {target_provider_id: 'b', target_model: 'm1', fallback_chain: [{provider_id: 'a', target_model: 'm1'}, {provider_id: 'c', target_model: 'm1'}]}, 'the new primary leaves the backups; the old one leads them');
 assert.deepEqual(plain(routes.switchedRoute({target_provider_id: 'a', target_model: 'm1'}, {provider_id: 'b', target_model: 'm2'}, false).fallback_chain), []);
 assert.equal(routes.switchedRoute({target_provider_id: 'a', target_model: 'm', fallback_chain: Array.from({length: 8}, (_, i) => ({provider_id: `p${i}`, target_model: 'm'}))}, {provider_id: 'z', target_model: 'm'}, true).fallback_chain.length, 8);
-console.log('PASS route costs: own route first, then upstream, *, the model price; staged costs never charge; 0 made later when not first; switching keeps the old route as backup');
+console.log('PASS legacy route costs: own route version first, then upstream, *, the model price; 0 made later when not first; switching keeps the old route as backup');
 
 // List order: moving a model numbers its whole group again, so no tie remains; the default is the first shown model.
-const listingRules = load('listing.ts', {'./priceChange': change, './routes': routes});
+const listingRules = load('listing.ts', {'./priceChange': change, './routes': routes, './officialPricing': load('officialPricing.ts', {'./priceChange': change, './routes': routes})});
 const ordered = [{id: 'a', group_id: 'g', sort_order: 0, visible: false}, {id: 'b', group_id: 'g', sort_order: 0}, {id: 'c', group_id: 'g', sort_order: 5}, {id: 'x', group_id: 'h', sort_order: 0}];
 const placed = (to, id) => plain(listingRules.reorder(ordered, id, to).map(row => [row.id, row.sort_order]));
 assert.deepEqual(placed('first', 'c'), [['a', 1], ['b', 2], ['c', 0], ['x', 0]], 'to the top; another group is untouched');

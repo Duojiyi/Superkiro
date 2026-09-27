@@ -76,17 +76,27 @@ const server=http.createServer(async(req,res)=>{
     await page.getByRole('button',{name:'刷新',exact:true}).waitFor();
     await page.screenshot({path:path.join(screenshots,'workspace-authenticated.png'),fullPage:true,animations:'disabled'});
     await page.getByRole('navigation').getByRole('button',{name:'财务对账',exact:true}).click();
+    // 结算参数 is read here; it is changed in 模型与定价 › 定价设置.
     await page.getByRole('heading',{name:'结算参数'}).waitFor();
+    await page.getByText('积分面值 0.01 元/积分（1000 积分 = ¥10）').waitFor();
     // Incomplete cost coverage: the margin covers the requests with a cost, and the one without is named, not free.
     await page.getByText('另有 1 次未设成本',{exact:true}).waitFor();
-    await page.getByLabel('积分面值',{exact:true}).fill('0.02');await page.getByLabel('美元汇率',{exact:true}).fill('7.3');await page.getByLabel('变更原因',{exact:true}).fill('fixture settings');
-    await page.getByRole('button',{name:'发布',exact:true}).click();
-    const financeBox=page.getByRole('alertdialog');await financeBox.waitFor();
-    assert((await financeBox.innerText()).includes('0.01 → 0.02'));assert((await financeBox.innerText()).includes('7.2 → 7.3'));
-    await confirmIn(page,true);
-    await page.getByRole('status').filter({hasText:'已发布结算参数'}).waitFor();
-    assert.deepEqual(fixture.writes.find(w=>w.endpoint==='commercial-config').body,{settings:{credit_face_value_cny:0.02,usd_cny_rate:7.3},expected_revision:'fixture-rev-2',reason:'fixture settings'});
     await page.screenshot({path:path.join(screenshots,'financial-settings-estimates.png'),fullPage:true});
+    await page.getByRole('navigation').getByRole('button',{name:'模型与定价',exact:true}).click();
+    await page.getByRole('tab',{name:'定价设置'}).click();
+    const settings=page.getByRole('region',{name:'定价设置'});
+    await settings.getByLabel('积分面值',{exact:true}).fill('0.02');
+    await settings.getByText('高级：旧版成本加成版本使用的汇率').click();await settings.getByLabel('旧版成本加成版本使用的汇率',{exact:true}).fill('7.3');
+    await settings.getByLabel('定价设置变更原因',{exact:true}).fill('fixture settings');
+    await settings.getByRole('button',{name:'预览并发布',exact:true}).click();
+    const financeBox=page.getByRole('alertdialog');await financeBox.waitFor();
+    const financeFacts=await financeBox.innerText();
+    assert(financeFacts.includes('积分面值 0.01 → 0.02 元/积分')&&financeFacts.includes('旧版成本加成汇率 7.2 → 7.3'),financeFacts);
+    // The fixture's USD procurement price loses money on gpt-6-astra: named before anything is sent.
+    await financeBox.getByLabel('确认输入').fill('gpt-6-astra');
+    await confirmIn(page,true);
+    await page.getByRole('status').filter({hasText:'已发布定价设置'}).waitFor();
+    assert.deepEqual(fixture.writes.find(w=>w.endpoint==='commercial-config').body,{settings:{credit_face_value_cny:0.02,usd_cny_rate:7.3},expected_revision:'fixture-rev-2',reason:'fixture settings'});
     // A lost adjustment response keeps one intent key and immutable parameters.
     await page.getByRole('navigation').getByRole('button',{name:'卡密资产',exact:true}).click();
     const adjustmentBodies=[];

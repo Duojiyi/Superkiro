@@ -199,36 +199,38 @@ const until=async ready=>{const end=Date.now()+10000;while(!ready()){assert(Date
     assert.equal(await contextInput.inputValue(),'160000');assert.equal(await page.getByText('又一次更新').count(),0);
     await button('放弃修改并加载').click();await answer(true);await page.locator('td[title="显示名：又一次更新"]').waitFor();
     assert.equal(await contextInput.inputValue(),keptContext);assert.equal(posts.length,1);
-    // 调价: one drawer, one step, published on its own against the version read.
+    // 调价: one drawer, previewed, published on its own against the version read. This configuration
+    // has no official prices: the credits are typed under 高级 (a legacy price, costs in CNY).
     postMode='success';
-    const priced=page.getByRole('row').filter({hasText:'claude-sonnet'}).filter({has:page.getByRole('button',{name:'调价'})});
-    await priced.getByRole('button',{name:'调价',exact:true}).click();
+    // Below 1440 a row's 调价 sits in its ⋯ menu.
+    await page.getByRole('button',{name:'claude-sonnet 的更多操作',exact:true}).click();await page.getByRole('menuitem',{name:'调价',exact:true}).click();
     const drawer=page.locator('#price-drawer');await drawer.waitFor();
+    await drawer.getByText('没有官方价：填四项官方价，或按其他模型定价').waitFor();
+    await drawer.getByRole('checkbox',{name:/高级：直接填积分/}).check();
     assert.equal(await drawer.getByLabel('新输入售价',{exact:true}).inputValue(),'3');assert.equal(await drawer.getByLabel('新输出售价',{exact:true}).inputValue(),'15');
+    assert.equal(await drawer.getByLabel('采购输入价',{exact:true}).inputValue(),'7.2','the USD cost at the older exchange rate, in CNY');
     await drawer.getByLabel('新输出售价',{exact:true}).fill('12');
     await drawer.locator('.price-change').getByText('−20%',{exact:true}).waitFor();
     const sampleText=await drawer.getByRole('status').innerText();
-    assert(sampleText.includes('积分（≈ ¥')&&/毛利约 -?\d+%/.test(sampleText),sampleText);
-    const generatedId=(await drawer.locator('.price-advanced summary .mono').innerText()).trim();
-    assert.match(generatedId,/^claude-sonnet-\d{12}$/);
-    // A reason is required; cancelling the confirmation or the drawer sends nothing.
-    const publishPrice=drawer.getByRole('button',{name:'发布调价',exact:true});
-    assert(await publishPrice.isDisabled());
+    assert(sampleText.includes('积分（≈ ¥')&&/毛利约 [−-]?\d+%/.test(sampleText)&&sampleText.includes('当前价格：'),sampleText);
+    // A reason is required; cancelling the preview or the drawer sends nothing.
+    const previewPrice=drawer.getByRole('button',{name:'预览调价',exact:true});
+    assert(await previewPrice.isDisabled());
     await drawer.getByLabel('调价原因',{exact:true}).fill('输出价下调 20%');
-    await publishPrice.click();
-    const priceConfirm=page.getByRole('alertdialog');await priceConfirm.waitFor();
-    const priceFacts=await priceConfirm.innerText();
-    assert(priceFacts.includes('输出 15 → 12 积分/百万')&&priceFacts.includes('原因：输出价下调 20%')&&priceFacts.includes(generatedId.slice(0,-4)),priceFacts);
-    assert(!priceFacts.includes('输入 3 →'),'unchanged prices are not listed');
-    await answer(false);assert.equal(posts.length,1);
+    // At this fixture's procurement price every sale loses money: the preview asks for the model's name.
+    const confirmPrice=async accept=>{const box=page.getByRole('alertdialog');await box.waitFor();const text=await box.innerText();if(accept)await box.getByLabel('确认输入').fill('claude-sonnet');await answer(accept);return text;};
+    await previewPrice.click();
+    const priceFacts=await confirmPrice(false);
+    assert(priceFacts.includes('15 → 12')&&priceFacts.includes('原因：输出价下调 20%')&&priceFacts.includes('直接填积分（旧版，不记官方价）')&&/版本 claude-sonnet-\d{12}/.test(priceFacts),priceFacts);
+    assert.equal(posts.length,1);
     // Changed elsewhere meanwhile: refused, nothing written, the typed prices stay; reload, then it goes through.
     nextPublishReply={status:409,json:{success:false,error:'Invalid configuration: Configuration changed; reload before publishing'}};
-    await publishPrice.click();await answer(true);
+    await previewPrice.click();await confirmPrice(true);
     await drawer.getByRole('alert').filter({hasText:'配置刚被更新'}).waitFor();
     assert.equal(await drawer.getByLabel('新输出售价',{exact:true}).inputValue(),'12','typed prices survive a refusal');assert.equal(posts.length,2);
     await drawer.getByRole('button',{name:'重新加载',exact:true}).click();await drawer.getByRole('alert').waitFor({state:'detached'});
     const revisionRead=config.revision;
-    await publishPrice.click();await answer(true);
+    await previewPrice.click();await confirmPrice(true);
     await drawer.waitFor({state:'detached'});await toast('已发布 claude-sonnet 的新价格');
     const sent=posts.at(-1);
     assert.deepEqual(Object.keys(sent).sort(),['expected_revision','reason','versions']);
@@ -236,7 +238,8 @@ const until=async ready=>{const end=Date.now()+10000;while(!ready()){assert(Date
     assert.equal(sent.versions.length,1);const priceVersion=sent.versions[0];
     assert.match(priceVersion.id,/^claude-sonnet-\d{12}$/);assert.equal(priceVersion.model,'claude-sonnet');assert.equal(priceVersion.rate_card_id,'fixture-rate');
     assert.equal(priceVersion.fixed_output_credit_per_m,12000000);assert.equal(priceVersion.fixed_input_credit_per_m,3000000);assert.equal(priceVersion.pricing_mode,'fixed');
-    assert(priceVersion.effective_from_secs>Date.now()/1000+240&&priceVersion.effective_from_secs<=Date.now()/1000+360,'five minutes after publishing');
+    assert.equal(priceVersion.currency,'CNY');assert.equal(priceVersion.input_price_per_m,7.2);assert.equal('official' in priceVersion,false,'a typed price records no official block');
+    assert(priceVersion.effective_from_secs>Date.now()/1000&&priceVersion.effective_from_secs<=Date.now()/1000+125,'about a minute after publishing');
     // The versions list: the new price as scheduled; superseded versions only with 显示历史.
     const versionsPanel=page.getByRole('region',{name:'价格版本'});
     await versionsPanel.getByRole('row').filter({hasText:'已排期'}).first().waitFor();
@@ -244,29 +247,35 @@ const until=async ready=>{const end=Date.now()+10000;while(!ready()){assert(Date
     await versionsPanel.getByRole('checkbox',{name:/显示历史/}).check();
     await versionsPanel.getByRole('row').filter({hasText:'已被替代'}).first().waitFor();
     postMode='hold';
-    console.log('PASS: price drawer: current vs new with change and sample yuan/margin, generated ID, required reason, cancel, conflict refusal kept inputs, publish with expected_revision; versions list with 显示历史');
+    console.log('PASS: price drawer: typed credits under 高级 with change and sample yuan/margin, required reason, the preview naming a losing model, cancel, conflict refusal kept inputs, publish with expected_revision about a minute on; versions list with 显示历史');
     console.log('PASS: one in-flight publication; lost acknowledgement locks publish until a successful, confirmed reread');
-    // Financials reject invalid values and retain drafts when review itself fails.
-    await nav('财务对账');const face=page.getByLabel('积分面值',{exact:true}),financialReason=page.getByLabel('变更原因',{exact:true});
+    // 定价设置 rejects invalid values and keeps what was typed when a review fails.
+    await page.getByRole('tab',{name:'定价设置'}).click();
+    const settings=page.getByRole('region',{name:'定价设置'}),face=settings.getByLabel('积分面值',{exact:true}),financialReason=settings.getByLabel('定价设置变更原因',{exact:true});
+    const previewSettings=settings.getByRole('button',{name:'预览并发布',exact:true}),bar=page.getByRole('region',{name:'发布'});
     const financeBase=posts.length;
-    await face.fill('0');await financialReason.fill('fixture invalid');assert(await button('发布').isDisabled());
-    await face.fill('0.02');await financialReason.fill('变'.repeat(167));assert(await button('发布').isDisabled());assert.equal(posts.length,financeBase);
-    await financialReason.fill('fixture finance write');await page.getByLabel('美元汇率',{exact:true}).fill('7.3');
-    await button('发布').click();
-    const financeBox=page.getByRole('alertdialog');await financeBox.waitFor();const financeConfirmation=await financeBox.innerText();
-    await answer(true);await until(()=>held);assert(financeConfirmation.includes('0.01 → 0.02'));assert(financeConfirmation.includes('7.2 → 7.3'));
-    await held.abort('failed');held=null;await status('没收到发布结果');assert.equal(posts.length,financeBase+1);assert(await button('发布').isDisabled());
-    failRead=true;await button('放弃修改').click();await answer(true);await status('修改已保留；重新加载成功前不能发布');
-    assert.equal(await face.inputValue(),'0.02');assert.equal(await financialReason.inputValue(),'fixture finance write');assert(await button('发布').isDisabled());
-    failRead=false;await button('放弃修改').click();await answer(true);await toast('已重新加载结算参数');assert.equal(await face.inputValue(),'0.02');
+    await face.fill('0');await financialReason.fill('fixture invalid');await previewSettings.click();
+    await settings.getByRole('alert').filter({hasText:'积分面值须在 0.0001–1000 元之间'}).waitFor();assert.equal(await page.getByRole('alertdialog').count(),0);
+    await face.fill('0.02');await financialReason.fill('变'.repeat(167));assert(await previewSettings.isDisabled());assert.equal(posts.length,financeBase);
+    await financialReason.fill('fixture finance write');
+    await settings.getByText('高级：旧版成本加成版本使用的汇率').click();await settings.getByLabel('旧版成本加成版本使用的汇率',{exact:true}).fill('7.3');
+    // claude-sonnet (the one model this test's configuration keeps) loses money at the fixture's USD procurement price: the preview asks for its name.
+    const confirmSettings=async()=>{const box=page.getByRole('alertdialog');await box.waitFor();const text=await box.innerText();await box.getByLabel('确认输入').fill('claude-sonnet');await answer(true);return text;};
+    await previewSettings.click();
+    const financeConfirmation=await confirmSettings();await until(()=>held);
+    assert(financeConfirmation.includes('积分面值 0.01 → 0.02'));assert(financeConfirmation.includes('旧版成本加成汇率 7.2 → 7.3'));
+    await held.abort('failed');held=null;await status('没收到发布结果');assert.equal(posts.length,financeBase+1);assert(await previewSettings.isDisabled());
+    failRead=true;await bar.getByRole('button',{name:'重新加载',exact:true}).click();await status('修改已保留；重新加载成功前不能发布');
+    assert.equal(await face.inputValue(),'0.02');assert.equal(await financialReason.inputValue(),'fixture finance write');assert(await previewSettings.isDisabled());
+    failRead=false;await bar.getByRole('button',{name:'重新加载',exact:true}).click();await toast('已重新加载配置');assert.equal(await face.inputValue(),'0.02');
     // Success followed by a read failure must never be reported as an uncertain publication.
     postMode='success';await page.route('**/api/v1/admin/financials',route=>route.fulfill({status:503,json:{error:'fixture estimates unavailable'}}));
-    await face.fill('0.03');await financialReason.fill('fixture successful publish');await button('发布').click();await answer(true);await toast('已发布结算参数');
+    await face.fill('0.03');await financialReason.fill('fixture successful publish');await previewSettings.click();await confirmSettings();await toast('已发布定价设置');
     await page.getByRole('alert').filter({hasText:'部分数据加载失败'}).waitFor();
     assert.equal(await page.getByText('没收到发布结果').count(),0,'a failed estimates refresh is not an uncertain publication');
     assert.equal(posts.length,financeBase+2);assert.equal(await face.inputValue(),'0.03');assert.equal(await financialReason.inputValue(),'');
-    await financialReason.fill('unchanged');await button('发布').click();await status('数值与当前版本一致');assert.equal(posts.length,financeBase+2);
+    await financialReason.fill('unchanged');await previewSettings.click();await settings.getByRole('alert').filter({hasText:'设置没有变化'}).waitFor();assert.equal(posts.length,financeBase+2);
     assert.deepEqual(errors,[]);assert.deepEqual(nativeDialogs,[],'no browser-native dialogs');
-    console.log('PASS: financial validation, before/after confirmation, failed-read draft retention and publish success distinct from estimates refresh');
+    console.log('PASS: 定价设置 validation, before/after preview, failed-read draft retention and publish success distinct from estimates refresh');
   }finally{if(browser)await browser.close();await new Promise(resolve=>server.close(resolve));}
 })().catch(error=>{console.error(error);process.exitCode=1;});
