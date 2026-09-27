@@ -539,6 +539,9 @@ pub fn create_stream_guard_with_send_deadline(
         let mut has_input_usage = false;
         let mut saw_usage_frame = false;
         let mut output_units = 0u64;
+        // The part of the output that is text or a tool call: what the next request sends
+        // back, where thinking goes back only to a provider that replays it.
+        let mut answer_units = 0u64;
         let mut saw_output = false;
         // Text or a tool call: output that answers, which thinking alone does not.
         let mut saw_answer = false;
@@ -587,7 +590,9 @@ pub fn create_stream_guard_with_send_deadline(
                                 ProviderDelta::Text(text) => {
                                     saw_output |= !text.is_empty();
                                     saw_answer |= !text.is_empty();
-                                    output_units = output_units.saturating_add(crate::usage_estimate::token_units(&text));
+                                    let units = crate::usage_estimate::token_units(&text);
+                                    output_units = output_units.saturating_add(units);
+                                    answer_units = answer_units.saturating_add(units);
                                     if archiving {
                                         reply.truncated |= crate::archive::append_capped(&mut reply.text, &text);
                                     }
@@ -627,8 +632,10 @@ pub fn create_stream_guard_with_send_deadline(
                                     }
                                     saw_output |= !arguments.is_empty() || id.is_some() || name.is_some();
                                     saw_answer |= !arguments.is_empty() || id.is_some() || name.is_some();
-                                    output_units = output_units.saturating_add(crate::usage_estimate::token_units(&arguments))
+                                    let units = crate::usage_estimate::token_units(&arguments)
                                         .saturating_add(name.as_ref().map_or(0, |n| crate::usage_estimate::token_units(n)));
+                                    output_units = output_units.saturating_add(units);
+                                    answer_units = answer_units.saturating_add(units);
                                     // Truncated arguments would reach Kiro as a malformed tool
                                     // call, so a response over the limits ends instead, billed
                                     // for what it produced.
@@ -714,15 +721,22 @@ pub fn create_stream_guard_with_send_deadline(
                                 cache_write_input_tokens: usage.cache_creation_input_tokens.unwrap_or(0).min(i64::MAX as u64) as i64,
                             };
                             // Kiro reads a percentage: it summarizes the conversation at 80 and
-                            // truncates it at 95. A fraction never reached either. An upstream
-                            // that leaves the system prompt and tool definitions out of its
-                            // usage (kimera-primary reports 3 input tokens for a 9K-token system
-                            // prompt) would have Kiro compact late and then overflow, so the
-                            // gateway's own estimate is the floor. Billing still follows the
-                            // upstream's report.
-                            let context_tokens = usage.total_tokens.max(estimated_input.saturating_add(
-                                crate::usage_estimate::tokens_from_units(output_units),
-                            ));
+                            // truncates it at 95. A fraction never reached either. The next
+                            // request holds this prompt and what of the answer goes back: its
+                            // text and tool calls, and its thinking only where the provider is
+                            // sent it again; counted, thinking had Kiro compact early after a
+                            // long think. An upstream that leaves the system prompt and tool
+                            // definitions out of its usage (kimera-primary reports 3 input
+                            // tokens for a 9K-token system prompt) would have Kiro compact late
+                            // and then overflow, so the gateway's own estimate of the prompt is
+                            // the floor. Billing still follows the upstream's report.
+                            let thinking_resent = billing_settler.as_ref().is_some_and(|settler| {
+                                crate::provider::provider_options(&settler.provider_id).replay_thinking
+                            });
+                            let resent_units = if thinking_resent { output_units } else { answer_units };
+                            let context_tokens = usage.prompt_tokens.max(estimated_input).saturating_add(
+                                crate::usage_estimate::tokens_from_units(resent_units),
+                            );
                             let frames = [
                                 kiro_wire::encoder::encode_metadata(Some(wire_usage), None),
                                 kiro_wire::encoder::encode_context_usage((context_tokens as f64 * 100.0 / context_window as f64).clamp(0.0, 100.0)),

@@ -291,13 +291,19 @@ pub fn install_provider_options(table: ProviderOptionsTable) {
     let _ = PROVIDER_OPTIONS.set(table);
 }
 
+/// The options of provider `provider_id`.
+pub(crate) fn provider_options(provider_id: &str) -> ProviderOptions {
+    PROVIDER_OPTIONS
+        .get_or_init(ProviderOptionsTable::default)
+        .options_for(provider_id)
+}
+
 /// The options of the provider an upstream attempt is being made with, or those every
 /// provider has when the request is not one of a provider's attempts.
 pub(crate) fn current_provider_options() -> ProviderOptions {
-    let table = PROVIDER_OPTIONS.get_or_init(ProviderOptionsTable::default);
     retry::ATTEMPT_KEY
-        .try_with(|(provider_id, _)| table.options_for(provider_id))
-        .unwrap_or_else(|_| table.options_for(""))
+        .try_with(|(provider_id, _)| provider_options(provider_id))
+        .unwrap_or_else(|_| provider_options(""))
 }
 
 /// Generic assistant tool call entry (T05).

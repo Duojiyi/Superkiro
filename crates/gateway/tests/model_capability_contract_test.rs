@@ -242,8 +242,9 @@ async fn configured_capabilities_reach_catalog_upstream_billing_and_usage() {
             .find(|f| f.event_type() == Some("contextUsageEvent"))
             .unwrap();
         let usage: kiro_wire::events::ContextUsageEvent = event.payload_as_json().unwrap();
+        // The prompt, and the answer the next request sends back: six tokens of text.
         assert!(
-            (usage.context_usage_percentage - 106_000.0 * 100.0 / model_map.context_window as f64)
+            (usage.context_usage_percentage - 100_006.0 * 100.0 / model_map.context_window as f64)
                 .abs()
                 < 1e-6
         );
