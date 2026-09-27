@@ -4759,6 +4759,10 @@ impl BillingEngine {
         let mut candidate = self.export_snapshot_locked(sequence, previous_checksum);
 
         if let (Some(request), Some(charged)) = (request, charged) {
+            // An unknown card is named as such before its request is looked at.
+            if !candidate.cards.contains_key(card_id) {
+                return Err(BillingError::CardNotFound(card_id.to_string()));
+            }
             Self::check_compensation(&candidate, card_id, delta_micro_credits, request, charged)?;
         }
 

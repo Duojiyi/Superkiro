@@ -1036,6 +1036,11 @@ fn a_request_is_compensated_once_and_at_most_what_it_was_charged() {
         compensate("card-a", 1_000_000, "k-other", request("card-b:inv-9")).unwrap_err(),
         "Request card-b:inv-9 was made by card card-b, not card-a"
     );
+    // A card that does not exist is named as such.
+    assert_eq!(
+        compensate("card-x", 1_000_000, "k-no-card", request("card-b:inv-9")).unwrap_err(),
+        "Card card-x not found"
+    );
     // More than it was charged.
     assert_eq!(
         compensate("card-a", 3_500_000, "k-more", request("card-a:inv-1")).unwrap_err(),
