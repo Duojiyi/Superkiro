@@ -1,7 +1,7 @@
 //! MCP (Model Context Protocol) endpoint handler for Kiro IDE (Spec §15.1, §18.7, P4-3).
 //!
 //! Handles JSON-RPC 2.0 MCP requests from Kiro IDE:
-//! - `tools/list`: Lists available MCP tools (including `web_search`).
+//! - `tools/list`: Lists available MCP tools: `web_search` when a search backend is configured.
 //! - `tools/call`: Executes tool calls, routing `web_search` to the configured search source.
 //! - `initialize`: Responds to MCP handshake and protocol negotiation.
 
@@ -39,8 +39,9 @@ pub struct SearchResponsePayload {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchBackend {
-    /// None configured, unless a custom backend URL is: every search then fails as a tool
-    /// error Kiro reports, never as an empty result.
+    /// None configured, unless a custom backend URL is: Kiro is offered no web search, and a
+    /// search that still arrives (from a tool list it kept) fails as a tool error Kiro
+    /// reports, never as an empty result.
     #[default]
     None,
     /// SearXNG, or any service answering `GET <url>?q=...&format=json` with SearXNG's
@@ -360,27 +361,34 @@ impl FacadeHandler for McpHandler {
                         .into_response()
                 }
                 "tools/list" => {
+                    // Without a backend every search fails, and a model offered the tool
+                    // keeps calling it. Kiro offers the tools listed here as its
+                    // remote_web_search; given none, it keeps the empty list and offers no
+                    // web search at all.
+                    let tools = if self.config.effective_backend() == SearchBackend::None {
+                        json!([])
+                    } else {
+                        json!([
+                            {
+                                "name": "web_search",
+                                "description": "Performs web search for up-to-date information, documentation, and news.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "query": {
+                                            "type": "string",
+                                            "description": "The search query keywords"
+                                        }
+                                    },
+                                    "required": ["query"]
+                                }
+                            }
+                        ])
+                    };
                     let resp = json!({
                         "jsonrpc": "2.0",
                         "id": req_id,
-                        "result": {
-                            "tools": [
-                                {
-                                    "name": "web_search",
-                                    "description": "Performs web search for up-to-date information, documentation, and news.",
-                                    "inputSchema": {
-                                        "type": "object",
-                                        "properties": {
-                                            "query": {
-                                                "type": "string",
-                                                "description": "The search query keywords"
-                                            }
-                                        },
-                                        "required": ["query"]
-                                    }
-                                }
-                            ]
-                        }
+                        "result": { "tools": tools }
                     });
                     (
                         StatusCode::OK,

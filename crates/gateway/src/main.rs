@@ -320,7 +320,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let search = web_search_config()?;
     match search.effective_backend() {
         SearchBackend::None => println!(
-            "[*] Notice: no web search backend (WEB_SEARCH_BACKEND); Kiro web_search calls fail as tool errors"
+            "[*] Notice: no web search backend (WEB_SEARCH_BACKEND); Kiro is offered no web search"
         ),
         backend => println!("[√] Web search backend: {backend:?}"),
     }

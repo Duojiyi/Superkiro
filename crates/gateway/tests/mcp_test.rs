@@ -63,10 +63,56 @@ async fn test_mcp_initialize_and_tools_list() {
         .unwrap();
     let json_resp: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
+    // No backend: every search would fail, so Kiro is offered none, and the model does not
+    // keep calling a tool that cannot work.
     let tools = json_resp["result"]["tools"]
         .as_array()
         .expect("tools array");
-    assert!(tools.iter().any(|t| t["name"] == "web_search"));
+    assert!(tools.is_empty(), "{tools:?}");
+}
+
+/// The tools a handler lists.
+async fn listed_tools(handler: &McpHandler) -> Vec<serde_json::Value> {
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/mcp")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({"jsonrpc": "2.0", "id": "list", "method": "tools/list"}).to_string(),
+        ))
+        .unwrap();
+    let response = handler.handle(request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    body["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .clone()
+}
+
+#[tokio::test]
+async fn web_search_is_listed_only_with_a_backend() {
+    assert!(listed_tools(&McpHandler::default()).await.is_empty());
+    for config in [
+        // SearXNG, or a service like it: no key needed.
+        SearchSourceConfig {
+            custom_backend_url: Some("http://127.0.0.1:9/search".into()),
+            ..Default::default()
+        },
+        SearchSourceConfig {
+            backend: SearchBackend::Brave,
+            api_key: Some("brave-key".into()),
+            ..Default::default()
+        },
+    ] {
+        let tools = listed_tools(&McpHandler::new(config)).await;
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "web_search");
+        assert_eq!(tools[0]["inputSchema"]["required"], json!(["query"]));
+    }
 }
 
 #[tokio::test]

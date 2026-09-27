@@ -36,7 +36,7 @@ python test_deployed_server.py
 
 ## 网页搜索（Kiro 的 web_search）
 
-Kiro 的联网搜索经网关 /mcp 转到下列后端之一，配置写在 /etc/kiro-byok/gateway.env，改后重启网关：
+Kiro 的联网搜索经网关 /mcp 转到下列后端之一，配置写在 /etc/kiro-byok/gateway.env，改后重启网关。不设任何 WEB_SEARCH_* 变量也可以运行：网关不向 Kiro 提供搜索工具，Kiro 就没有网页搜索，模型不会去调用一个必然失败的工具；Kiro 本地的 web_fetch（抓取指定网址）照常可用。SearXNG 或自建的兼容地址不需要 API key，Brave 和 Tavily 需要。
 
 | 变量 | 含义 |
 | --- | --- |
@@ -47,7 +47,7 @@ Kiro 的联网搜索经网关 /mcp 转到下列后端之一，配置写在 /etc/
 | WEB_SEARCH_TIMEOUT_SECS | 单次搜索超时，1-60 秒，默认 15 |
 
 - Brave Search API：GET https://api.search.brave.com/res/v1/web/search；Tavily：POST https://api.tavily.com/search。两者都返回标题、链接和摘要，网关只把这三项交给 Kiro。
-- 未配置后端、后端超时或返回错误时，搜索以工具失败返回（Kiro 显示 Tool call failed，模型能区分“搜索失败”和“没有结果”），不再伪装成 0 条结果；错误信息只说明失败类型，不含密钥或地址。
+- 后端超时或返回错误时，搜索以工具失败返回（Kiro 显示 Tool call failed，模型能区分“搜索失败”和“没有结果”），不再伪装成 0 条结果；错误信息只说明失败类型，不含密钥或地址。未配置后端时，Kiro 若仍按旧的工具列表发来搜索，同样以工具失败返回。
 - 启动日志会打印 [√] Web search backend: … 或未配置的提示。配置错误（例如 brave 未给 key、searxng 未给地址）时网关拒绝启动。
 
 ## 备份与恢复
