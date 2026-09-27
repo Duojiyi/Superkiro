@@ -11,6 +11,7 @@ import {toast} from '../components/toast';
 import {FilterTabs, IdCell, Pager, StatusBadge, TableState, Tag, TopbarActions, type TabOption} from '../components/ui';
 import {formatBatchNote, formatCount, formatCredits, formatFullDateTime, formatMoney, formatRemaining, shortId} from '../format';
 import {cardCodeOf, cardIdForCode} from '../cardCode';
+import {compensation, type Compensation} from '../compensation';
 import {adjustmentPointsToMicro} from '../pricing';
 import {cardState, cardStatusView} from '../status';
 import CardDrawer from './CardDrawer';
@@ -142,8 +143,8 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
   intentRevision?: number;
   onRoute?: ReportRoute;
   updateCards: (cards: AdminCardItem[]) => void;
-  /** Opens 调用追踪 for one card, with one request's details open when given. */
-  onOpenTrace: (cardId: string, traceId?: string) => void;
+  /** Opens 调用追踪 for one card, with one request's details open when given (by its ID, or its invocation ID). */
+  onOpenTrace: (cardId: string, traceId?: string, invocationId?: string) => void;
 }) {
   const {writing, mounted} = guards;
   const alive = useRef(true);
@@ -193,6 +194,8 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
   const [adjustAmount, setAdjustAmount] = useState('');
   const [adjustReason, setAdjustReason] = useState('');
   const [adjustStep, setAdjustStep] = useState<'form' | 'review'>('form');
+  // The requests a compensation gives back, when 调账 was opened from them.
+  const [adjustLink, setAdjustLink] = useState<Compensation | null>(null);
   const adjustment = useRef<Adjustment | null>(null);
   const [pendingIntent, setPendingIntent] = useState<Adjustment | null>(null);
   const setIntent = (intent: Adjustment | null) => {adjustment.current = intent; setPendingIntent(intent);};
@@ -485,19 +488,34 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
   };
 
   // ---- Adjust ----
-  const openAdjust = (card: AdminCardItem) => {
+  // 补偿这次扣费 (from a request, or the requests ticked in a card's 最近调用): 调账 opens with the charge,
+  // a reason naming the requests and, for one, the request it makes up for.
+  const openAdjust = (card: AdminCardItem, prefill?: Compensation) => {
     if (bulkBusy || card.status === 'voided') return;
     if (!operator) {reportError('需要重新登录以确认操作人', reauthenticate); return;}
     try {
       const saved = loadAdjustment(sessionStorage, operator);
       if (saved && saved.cardId !== card.id) {reportError(`卡 ${saved.cardId} 的调账结果未确认，请先打开原卡核对。`); return;}
       reportError('');
-      setIntent(saved); setAdjustCard(card); setAdjustStep('form');
+      // A pending intent is retried as it was; a compensation only fills a new one.
+      const fill = saved ? null : prefill ?? null;
+      setIntent(saved); setAdjustCard(card); setAdjustStep('form'); setAdjustLink(fill);
       setAdjustDirection(saved && saved.delta < 0 ? 'deduct' : 'add');
-      setAdjustAmount(saved ? String(Math.abs(saved.delta)) : '');
-      setAdjustReason(saved?.reason ?? '');
+      setAdjustAmount(saved ? String(Math.abs(saved.delta)) : fill?.points ?? '');
+      setAdjustReason(saved?.reason ?? fill?.reason ?? '');
     } catch {reportError('调账恢复记录无法读取，请人工核对账本；未发送请求。');}
   };
+  // Arriving from 调用追踪's 补偿这次扣费: once the card is in the list, 调账 opens for it.
+  const compensating = useRef<Compensation | null>(null);
+  useEffect(() => {
+    const prefill = intent?.compensate;
+    if (!prefill || compensating.current === prefill) return;
+    const card = cards.find(item => item.id === prefill.cardId);
+    if (!card) return;
+    compensating.current = prefill;
+    openAdjust(card, prefill);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [intent?.compensate, cards]);
   const reviewPending = () => {
     try {
       if (!operator) return;
@@ -511,7 +529,7 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
       setAdjustAmount(String(Math.abs(saved.delta))); setAdjustReason(saved.reason);
     } catch {reportError('调账恢复记录无法读取，请人工核对账本；未发送请求。');}
   };
-  const closeAdjust = () => {if (!mutationBusy) {setAdjustCard(null); setAdjustStep('form');}};
+  const closeAdjust = () => {if (!mutationBusy) {setAdjustCard(null); setAdjustStep('form'); setAdjustLink(null);}};
   const locked = !!pendingIntent;
   const zeroMicro = !!pendingIntent && isZeroMicroAdjustment(pendingIntent);
   const parsedAdjust = ((): {delta: number} | {error: string} => {
@@ -533,6 +551,12 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
   const adjustReady = adjustDelta !== null && reasonValid && !overdrawn;
   const adjustAfter = adjustCard && adjustDelta !== null ? adjustCard.pointsAvailable + adjustDelta : null;
   const signed = (value: number) => `${value > 0 ? '+' : ''}${formatCredits(value)}`;
+  // The request the adjustment makes up for: a pending intent's (retried as it was), or the compensation's.
+  const linkedRequest = pendingIntent ? pendingIntent.invocationId : adjustLink?.invocationId;
+  const linkLine = pendingIntent ? (pendingIntent.invocationId ? '这笔调账补偿一次请求，重试时仍关联它' : '')
+    : !adjustLink ? '' : adjustLink.requests === 1
+      ? `补偿这次请求扣的 ${adjustLink.points} 积分${adjustLink.invocationId ? '' : '（这次请求的编号不能关联，只写在原因里）'}`
+      : `补偿 ${adjustLink.requests} 次请求扣的共 ${adjustLink.points} 积分。一笔调账只能关联一次请求，这几次写在原因里`;
 
   const submitAdjust = async () => {
     if (!adjustCard || mutationBusy || adjusting.current) return;
@@ -545,14 +569,16 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
     let sent = false;
     try {
       adjusting.current = true; setMutationBusy(true); reportError('');
-      const intent = loadAdjustment(sessionStorage, operator) ?? {operator, cardId: adjustCard.id, delta, reason: reasonText, key: crypto.randomUUID()};
+      // The request it makes up for is kept with the intent: a retry names the same one, as the server requires.
+      const intent = loadAdjustment(sessionStorage, operator) ?? {operator, cardId: adjustCard.id, delta, reason: reasonText, key: crypto.randomUUID(),
+        ...(adjustLink?.invocationId ? {invocationId: adjustLink.invocationId} : {})};
       if (intent.cardId !== adjustCard.id || intent.delta !== delta || intent.reason !== reasonText) throw new Error('上次调账结果尚未确认，请先用原参数重试');
       saveAdjustment(sessionStorage, intent); setIntent(intent); sent = true;
-      const response = await adminApi.adjustBalance(intent.cardId, intent.delta, intent.reason, intent.key);
+      const response = await adminApi.adjustBalance(intent.cardId, intent.delta, intent.reason, intent.key, intent.invocationId);
       if (!response.success) throw new Error('服务端未确认调账');
       clearAdjustment(sessionStorage, intent); setIntent(null);
       toast.success(`已调整 ${shortId(adjustCard.id, 'card')}：${signed(intent.delta)} 积分`);
-      setAdjustCard(null); setAdjustReason(''); setAdjustAmount(''); setAdjustStep('form');
+      setAdjustCard(null); setAdjustReason(''); setAdjustAmount(''); setAdjustStep('form'); setAdjustLink(null);
       void refresh();
     } catch (error) {
       if (sent && adjustment.current && error instanceof AdminApiError && isUnsubmittedAdjustmentRejection(error.status, error.message, adjustment.current)) {
@@ -871,7 +897,8 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
     </Modal>}
 
     {detailCard && <CardDrawer card={detailCard} state={cardState(detailCard, nowSecs)} groupName={id => groupName(id)} hasPrev={detailIndex > 0} hasNext={detailIndex >= 0 && detailIndex < filtered.length - 1}
-      onMove={moveDetail} onClose={() => setDetailId(null)} onReveal={card => void reveal(card)} onAdjust={openAdjust}
+      onMove={moveDetail} onClose={() => setDetailId(null)} onReveal={card => void reveal(card)} onAdjust={card => openAdjust(card)}
+      onCompensate={(card, requests) => {const prefill = compensation(card.id, requests); if (prefill) openAdjust(card, prefill);}}
       onStatus={(card, action) => void changeStatus(card, action)} onOpenTrace={onOpenTrace}
       revealDisabled={revealing || bulkBusy} blocked={blocked} blockedTitle={staleTitle} support={support}/>}
 
@@ -884,6 +911,7 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
         <button type="button" className="btn btn-small" disabled={mutationBusy} onClick={() => void clearZeroMicro()}>清除零微积分意图</button>
       </div>}
       <p className="adjust-balance">当前余额 <b>{formatCredits(adjustCard.pointsAvailable)}</b> 积分</p>
+      {linkLine && <p className="note-info adjust-link">{linkLine}</p>}
       <div className="adjust-row">
         <div className="segmented" role="radiogroup" aria-label="调账方向">
           {(['add', 'deduct'] as const).map(direction => <button key={direction} type="button" role="radio" aria-checked={adjustDirection === direction}
@@ -901,6 +929,7 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
       {adjustStep === 'review' && adjustDelta !== null && <div className="review-box" aria-label="调账复核">
         <p><span className="mono">{shortId(adjustCard.id, 'card')}</span>：{formatCredits(adjustCard.pointsAvailable)} → <b>{formatCredits(adjustCard.pointsAvailable + adjustDelta)}</b>（{signed(adjustDelta)}）</p>
         <p>原因：{reasonText}</p>
+        {linkedRequest && <p>关联请求：<span className="mono" title={linkedRequest}>{shortId(linkedRequest, 'trace')}</span>（写进这张卡的操作记录，可从记录打开这次请求）</p>}
       </div>}
       <div className="modal-actions">
         {adjustStep === 'form' ? <>

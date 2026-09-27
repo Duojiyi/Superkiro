@@ -112,3 +112,24 @@ assert.equal(support.noteProblem('淘宝 9 月'), '');assert.equal(support.noteP
 assert.equal(support.noteProblem('a'.repeat(257)), '备注最多 256 字节（现在 257 字节，约 85 个汉字）');
 assert.equal(support.noteProblem('第一行\n第二行'), '备注不能包含换行等控制字符');
 console.log('PASS: refused support actions are explained in words with their cards listed short; only a refusal or the server\'s "could not be saved" counts as nothing changed');
+
+// 补偿这次扣费: the charge given back, a reason naming the request, and the request it makes up for.
+{
+  const compensation = load('compensation.ts', {'./format': format, './status': load('status.ts')});
+  const at = new Date(2026, 8, 26, 15, 34).getTime() / 1000, later = at + 3600, nowMs = (at + 86400 * 2) * 1000;
+  assert.equal(compensation.microToPoints(2499600), '2.4996');assert.equal(compensation.microToPoints(3000000), '3');assert.equal(compensation.microToPoints(1), '0.000001');
+  const broken = {ts: at, invocation_id: 'card-1:3f1c9a2e-5b7d', exposed_model: 'claude-opus-5-5', status: 'error', error_class: 'stream_incomplete', credits_charged: 3200000};
+  assert.deepEqual(plain(compensation.compensation('card-1', [broken], nowMs)),
+    {cardId: 'card-1', points: '3.2', reason: '补偿 09-26 15:34 claude-opus-5-5（输出中断）', requests: 1, invocationId: 'card-1:3f1c9a2e-5b7d'});
+  assert.equal(compensation.compensation('card-1', [{...broken, status: 'client_aborted', error_class: null}], nowMs).reason, '补偿 09-26 15:34 claude-opus-5-5（客户端中断）');
+  assert.equal(compensation.compensation('card-1', [{...broken, status: 'success', error_class: null}], nowMs).reason, '补偿 09-26 15:34 claude-opus-5-5');
+  assert.equal(compensation.compensation('card-1', [{...broken, invocation_id: 'card-1:has space'}], nowMs).invocationId, undefined, 'an ID the server would refuse is not linked');
+  assert.equal(compensation.compensation('card-1', [{...broken, credits_charged: 0}], nowMs), null, 'nothing charged, nothing to give back');
+  // Several: their charges added up, named in the reason, linked to none (an adjustment names one request).
+  const two = compensation.compensation('card-1', [{...broken, ts: later, credits_charged: 1500000, status: 'success', error_class: null}, broken, {...broken, credits_charged: 0}], nowMs);
+  assert.deepEqual(plain(two), {cardId: 'card-1', points: '4.7', reason: '补偿 2 次请求：09-26 15:34 claude-opus-5-5（输出中断）、09-26 16:34 claude-opus-5-5', requests: 2});
+  const many = compensation.compensation('card-1', Array.from({length: 12}, (_, i) => ({...broken, ts: at + i * 60})), nowMs);
+  assert.equal(many.reason, '补偿 12 次请求（09-26 15:34 至 09-26 15:45）', 'a long list is summed up by its times');
+  assert.equal(many.points, '38.4');
+  console.log('PASS: 补偿这次扣费 gives back the exact charge, names the request and its failure, links one request, and sums several in the reason');
+}

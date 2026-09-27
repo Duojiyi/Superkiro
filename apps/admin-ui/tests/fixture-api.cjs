@@ -145,7 +145,7 @@ module.exports = function fixtureApi() {
       const cardId=url.searchParams.get('card_id'); const card=cards.find(c=>c.id===cardId);
       if(!card) return reply({__type:'ResourceNotFoundException',message:'没有这张卡密'},404);
       const t=Math.floor(Date.now()/1000);
-      const recent=log.filter(event=>event.cardId===cardId).reverse().map(({cardId:_,...event})=>({invocationId:null,detail:null,...event}));
+      const recent=log.filter(event=>event.cardId===cardId).reverse().map(({cardId:_,key:__,...event})=>({invocationId:null,detail:null,...event}));
       const older=[];
       if(card.status==='banned') older.push({ts:t-3600,action:'ban',credits:0,points:0,operator:'admin',reason:'滥用'});
       if(card.status==='frozen') older.push({ts:t-5400,action:'freeze',credits:0,points:0,operator:'admin',reason:'客户要求'});
@@ -226,6 +226,26 @@ module.exports = function fixtureApi() {
       else card.status=body.action==='freeze'?'frozen':body.action==='unfreeze'?'active':body.action==='void'?'voided':'banned';
       record(card.id,body.action,body.reason);
       return reply({success:true,cardId:card.id,newStatus:card.status,archivedAt:card.archivedAt??null,card:view(card)});
+    }
+    // A balance adjustment, as its handler answers: one idempotency key per intent (a replay with the
+    // same parameters answers the same), and optionally the request it makes up for.
+    if(endpoint==='cards/adjust') {
+      const invalid=message=>reply({__type:'InvalidRequestException',message},400);
+      const key=String(req.headers['idempotency-key']??body.idempotencyKey??'').trim();
+      if(!/^[A-Za-z0-9_.:-]{1,128}$/.test(key))return invalid('a valid idempotency_key is required (1-128 ASCII letters, digits, -_.:)');
+      const delta=body.deltaPoints;
+      if(typeof delta!=='number'||!Number.isFinite(delta)||delta===0||Math.abs(delta)>1000000||!String(body.cardId??'').trim())return invalid('delta_points must be finite, non-zero, bounded, and card_id must be valid');
+      if(body.invocationId!==undefined&&!/^[A-Za-z0-9_.:-]{1,128}$/.test(String(body.invocationId).trim()))return invalid('invocationId must be 1-128 ASCII letters, digits, -_.:');
+      const card=cards.find(c=>c.id===body.cardId);if(!card)return reply({success:false,error:`Card ${body.cardId} not found`},404);
+      const micro=Math.round(delta*1e6),invocationId=body.invocationId?.trim()??null,replay=log.find(event=>event.key===key);
+      if(replay){
+        if(replay.cardId!==card.id||replay.credits!==micro||replay.reason!==body.reason||replay.invocationId!==invocationId)return reply({success:false,error:`Invalid balance adjustment: Idempotency conflict: ${key}`},409);
+      } else {
+        if(card.availableCredits+micro<0)return reply({success:false,error:`Card error: Insufficient credit: available ${card.availableCredits} micro-credits, needed ${-micro}`},409);
+        Object.assign(card,{creditTotal:card.creditTotal+micro,availableCredits:card.availableCredits+micro,pointsTotal:card.pointsTotal+delta,pointsAvailable:Math.round((card.pointsAvailable+delta)*1e6)/1e6});
+        record(card.id,'adjust',body.reason,{credits:micro,points:delta,invocationId,key});
+      }
+      return reply({success:true,cardId:card.id,newAvailableCredits:card.availableCredits,newAvailablePoints:card.availableCredits/1e6});
     }
     if(endpoint==='cards/devices/unbind') {
       const field=unknownField(['cardId','deviceId','reason']);if(field)return cardFail(400,`Invalid request body: unknown field \`${field}\``);

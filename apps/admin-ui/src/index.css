@@ -408,6 +408,10 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .note-editor input {flex: 1 1 200px; min-width: 0; height: 32px; padding: 0 8px; border: 1px solid var(--border); border-radius: 6px;}
 .note-editor .field-error {flex-basis: 100%;}
 .history-table td.num.is-negative {color: var(--danger);}
+.section-tools {display: inline-flex; align-items: center; flex-wrap: wrap; gap: 8px;}
+.recent-table .col-check, .recent-table th.col-check {width: 28px; padding-right: 0;}
+/* An adjustment that made up for a request links back to it. */
+.history-link {display: block; height: auto; padding: 0; font-size: 12px;}
 /* What a change recorded (the device, the new expiry, the groups), under its action. */
 .history-detail {display: block; font-size: 12px; color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 220px;}
 .reason-chips {margin-top: 8px;}

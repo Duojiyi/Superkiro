@@ -69,7 +69,7 @@ function points(event: CardEvent): string {
   return `${event.points > 0 ? '+' : ''}${formatCredits(event.points)}`;
 }
 
-export default function CardDrawer({card, state, groupName, hasPrev, hasNext, onMove, onClose, onReveal, onAdjust, onStatus, onOpenTrace, revealDisabled, blocked, blockedTitle, support}: {
+export default function CardDrawer({card, state, groupName, hasPrev, hasNext, onMove, onClose, onReveal, onAdjust, onCompensate, onStatus, onOpenTrace, revealDisabled, blocked, blockedTitle, support}: {
   card: AdminCardItem;
   /** Its status as it works now (a card past its date is expired). */
   state: AdminCardItem['status'];
@@ -80,9 +80,11 @@ export default function CardDrawer({card, state, groupName, hasPrev, hasNext, on
   onClose: () => void;
   onReveal: (card: AdminCardItem) => void;
   onAdjust: (card: AdminCardItem) => void;
+  /** 调账 with what these requests charged (补偿选中的请求). */
+  onCompensate: (card: AdminCardItem, requests: AdminTrace[]) => void;
   onStatus: (card: AdminCardItem, action: 'freeze' | 'unfreeze' | 'ban') => void;
-  /** Opens 调用追踪 for this card, with one request's details open when given. */
-  onOpenTrace: (cardId: string, traceId?: string) => void;
+  /** Opens 调用追踪 for this card, with one request's details open when given (by its ID, or its invocation ID). */
+  onOpenTrace: (cardId: string, traceId?: string, invocationId?: string) => void;
   revealDisabled: boolean;
   blocked: boolean;
   blockedTitle?: string;
@@ -113,6 +115,16 @@ export default function CardDrawer({card, state, groupName, hasPrev, hasNext, on
   // A card that never expires (no date once activated, a zero validity before) has nothing to extend.
   const extendable = !voided && card.archivedAt == null && (card.validUntil != null || (card.activatedAt == null && card.activationDurationSecs !== 0));
   const allowance = rebindText(card, nowSecs);
+  // Requests ticked in 最近调用 to give back what they charged; only charged ones can be.
+  const [picked, setPicked] = useState<string[]>([]);
+  useEffect(() => {setPicked([]);}, [card.id, recent]);
+  const pickedRequests = recent.status === 'loaded' ? recent.value.filter(trace => picked.includes(trace.id)) : [];
+  const pickedMicro = pickedRequests.reduce((sum, trace) => sum + Number(trace.credits_charged ?? 0), 0);
+  // An adjustment that made up for a request leads back to it: the recent one here, else on 调用追踪.
+  const openRequest = (invocationId: string) => {
+    const trace = recent.status === 'loaded' ? recent.value.find(item => item.invocation_id === invocationId) : undefined;
+    onOpenTrace(card.id, trace?.id, trace ? undefined : invocationId);
+  };
 
   return <Drawer id="card-detail" label="卡密详情" onClose={onClose}>
     <header className="drawer-head">
@@ -167,7 +179,8 @@ export default function CardDrawer({card, state, groupName, hasPrev, hasNext, on
               const detail = historyDetail(event, groupName);
               return <tr key={index}>
                 <td title={formatFullDateTime(event.ts)}>{formatDateTime(event.ts)}</td>
-                <td>{historyLabel(event.action)}{detail && <span className="history-detail" title={typeof event.detail?.deviceId === 'string' ? event.detail.deviceId : detail}>{detail}</span>}</td>
+                <td>{historyLabel(event.action)}{detail && <span className="history-detail" title={typeof event.detail?.deviceId === 'string' ? event.detail.deviceId : detail}>{detail}</span>}
+                  {event.invocationId && <button type="button" className="btn-text history-link" title={`打开这笔调账补偿的请求（${event.invocationId}）`} onClick={() => openRequest(String(event.invocationId))}>查看请求</button>}</td>
                 <td className={`num${event.action !== 'issued' && event.points < 0 ? ' is-negative' : ''}`}>{points(event)}</td>
                 <td>{event.operator === 'system' ? '系统自动' : event.operator ?? '—'}</td>
                 <td className="col-reason" title={event.reason ?? undefined}><span className="clip clip-reason">{event.reason ?? '—'}</span></td>
@@ -180,19 +193,29 @@ export default function CardDrawer({card, state, groupName, hasPrev, hasNext, on
       <section className="drawer-section" aria-label="最近调用">
         <div className="section-head">
           <h4>最近调用</h4>
-          <button type="button" className="btn-text" onClick={() => onOpenTrace(card.id)}>在调用追踪中查看</button>
+          <span className="section-tools">
+            {pickedRequests.length > 0 && <button type="button" className="btn btn-small" disabled={blocked || voided} title={voided ? '已作废，不能调账' : blockedTitle}
+              onClick={() => onCompensate(card, pickedRequests)}>补偿选中的 {pickedRequests.length} 次（{formatCharge(pickedMicro)} 积分）</button>}
+            <button type="button" className="btn-text" onClick={() => onOpenTrace(card.id)}>在调用追踪中查看</button>
+          </span>
         </div>
         {recent.status === 'loading' && <div className="skeleton" role="status" aria-label="正在加载"><span className="skeleton-bar"/></div>}
         {(recent.status === 'missing' || recent.status === 'error') && <div className="inline-state"><span>读取失败：{recent.message}</span><button type="button" className="btn btn-small" onClick={retryRecent}>重试</button></div>}
         {recent.status === 'loaded' && (recent.value.length
           ? <div className="table-scroll"><table className="table table-compact recent-table">
-            <thead><tr><th>时间</th><th>模型</th><th className="col-status">结果</th><th className="num">扣费</th></tr></thead>
-            <tbody>{recent.value.map(trace => <tr key={trace.id} className="is-clickable" title="查看这次请求" onClick={() => onOpenTrace(card.id, trace.id)}>
+            <thead><tr><th className="col-check"><span className="sr-only">补偿</span></th><th>时间</th><th>模型</th><th className="col-status">结果</th><th className="num">扣费</th></tr></thead>
+            <tbody>{recent.value.map(trace => {
+              const charged = Number(trace.credits_charged ?? 0) > 0;
+              // Ticking a request to compensate is not a request for its details.
+              return <tr key={trace.id} className="is-clickable" title="查看这次请求" onClick={event => {if (!(event.target instanceof Element && event.target.closest('input'))) onOpenTrace(card.id, trace.id);}}>
+              <td className="col-check"><input type="checkbox" aria-label={`补偿 ${formatDateTime(trace.ts)} 的请求`} disabled={!charged} title={charged ? '选中后可一起补偿扣费' : '这次请求没有扣费'}
+                checked={picked.includes(trace.id)} onChange={event => {const on = event.currentTarget.checked; setPicked(ids => on ? [...ids, trace.id] : ids.filter(id => id !== trace.id));}}/></td>
               <td title={formatFullDateTime(trace.ts)}>{formatDateTime(trace.ts)}</td>
               <td><span className="clip clip-model">{trace.exposed_model ?? '—'}</span></td>
               <td className="col-status"><StatusBadge view={traceStatusView(trace.status, traceStuck(trace, Date.now() / 1000))}/></td>
               <td className="num">{formatCharge(trace.credits_charged)}</td>
-            </tr>)}</tbody>
+            </tr>;
+            })}</tbody>
           </table></div>
           : <p className="empty-note">还没有调用</p>)}
         {recent.status === 'loaded' && recent.value.length >= 20 && <p className="muted">只显示最近 {formatCount(20)} 次</p>}

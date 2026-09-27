@@ -42,6 +42,7 @@ for (const input of ['', '-1', 'NaN', 'Infinity', '1e3', '1.0000001', '900719925
   assert.deepEqual(JSON.parse(calls.at(-1).options.body), {cardId: 'card-1'});
   for (const [run, endpoint, expected] of [
     [() => api.adjustBalance('card-1', -10, 'refund'), '/cards/adjust', {cardId:'card-1',deltaPoints:-10,reason:'refund'}],
+    [() => api.adjustBalance('card-1', 3.2, '补偿', 'key-1', 'card-1:inv-9'), '/cards/adjust', {cardId:'card-1',deltaPoints:3.2,reason:'补偿',idempotencyKey:'key-1',invocationId:'card-1:inv-9'}],
     [() => api.updateCardStatus('card-1', 'ban', 'abuse'), '/cards/status', {cardId:'card-1',action:'ban',reason:'abuse'}],
     [() => api.updateCardStatus('card-2', 'void', 'unused inventory'), '/cards/status', {cardId:'card-2',action:'void',reason:'unused inventory'}],
     [() => api.updateCardStatus('card-2', 'archive', 'cleanup'), '/cards/status', {cardId:'card-2',action:'archive',reason:'cleanup'}],
@@ -97,7 +98,13 @@ for (const input of ['', '-1', 'NaN', 'Infinity', '1e3', '1.0000001', '900719925
  clearAdjustment(storage,intent);assert.equal(values.size,0);
  assert.throws(()=>saveAdjustment({...storage,setItem(){throw Error('denied');}},intent));
  values.set('superkiro.pending-adjustment.v1:admin','invalid');assert.throws(()=>loadAdjustment(storage,'admin'));
- console.log('PASS adjustment storage: whitelist, operator isolation, stable retry, clear, corrupt/denied');
+ // A compensation keeps the request it makes up for, so a retry names the same one.
+ values.clear();const linked={...intent,invocationId:'card-1:3f1c9a2e-inv'};saveAdjustment(storage,linked);
+ assert.deepEqual(JSON.parse(JSON.stringify(loadAdjustment(storage,'admin'))),linked);
+ assert.throws(()=>saveAdjustment(storage,intent),/已有未确认调账/,'the same intent without its request is another one');
+ values.set('superkiro.pending-adjustment.v1:admin',JSON.stringify({...intent,invocationId:'card-1:bad id'}));assert.throws(()=>loadAdjustment(storage,'admin'));
+ values.clear();
+ console.log('PASS adjustment storage: whitelist, operator isolation, stable retry, clear, corrupt/denied, the linked request kept');
 }
 {
  const {parseFinancialSettings,financialEstimates}=load('financial.ts');

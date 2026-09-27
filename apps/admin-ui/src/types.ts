@@ -1,5 +1,6 @@
 // Types shared by the workspace shell and its pages.
 import type {MutableRefObject} from 'react';
+import type {Compensation} from './compensation';
 
 export type Row = Record<string, unknown>;
 
@@ -15,7 +16,8 @@ export type TraceWindow = 'hour' | 'day' | 'all';
  * filters and the details open. `open` is a card or request ID.
  */
 export interface Intent {
-  cards?: {status?: CardTab; quick?: CardQuickFilter; search?: string; group?: string; open?: string};
+  /** `compensate`: 调账 opens for that card with a request's charge (never kept in the address). */
+  cards?: {status?: CardTab; quick?: CardQuickFilter; search?: string; group?: string; open?: string; compensate?: Compensation};
   /** `card`: the search is exactly this card's ID. `reason`: a failure class under 失败. */
   traces?: {status?: TraceTab; window?: TraceWindow; search?: string; card?: string; reason?: string; model?: string; provider?: string; open?: string};
   /** 上架模型 for this provider's upstream model (from 供应商与 Key). */

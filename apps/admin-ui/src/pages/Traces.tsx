@@ -10,6 +10,7 @@ import {toast} from '../components/toast';
 import {FilterTabs, IdCell, Pager, StatusBadge, TableState, TopbarActions, copyText, type TabOption} from '../components/ui';
 import {formatCharge, formatClock, formatCount, formatDateTime, formatDuration, formatFullDateTime, formatListTime, formatMoney, formatRelative, formatShortDate, formatSpeed, formatTokenCount} from '../format';
 import {cardCodeOf, cardIdForCode} from '../cardCode';
+import {compensation, type Compensation} from '../compensation';
 import {errorClassLabel, TRACE_IN_PROGRESS, traceStatusView, traceStuck} from '../status';
 import type {Intent, Refresh, ReportError, ReportRoute, Row, TraceTab, TraceWindow, WriteGuards} from '../types';
 import {ConversationView, RawView, ReplyView} from './TraceContent';
@@ -26,7 +27,7 @@ const statusMatches = (trace: AdminTrace, tab: TraceTab) =>
 const ttftTone = (ms: unknown) => typeof ms === 'number' ? (ms > 15000 ? 'is-danger' : ms > 5000 ? 'is-warning' : '') : '';
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
-export default function TracesPage({traces, cards, providers = [], loading, failed, refresh, guards, reportError, intent, intentRevision = 0, onRoute, onOpenCard}: {
+export default function TracesPage({traces, cards, providers = [], loading, failed, refresh, guards, reportError, intent, intentRevision = 0, onRoute, onOpenCard, onCompensate}: {
   traces: AdminTrace[];
   cards: AdminCardItem[];
   /** For providers' names; a trace names its provider by ID. */
@@ -41,6 +42,8 @@ export default function TracesPage({traces, cards, providers = [], loading, fail
   intentRevision?: number;
   onRoute?: ReportRoute;
   onOpenCard: (cardId: string) => void;
+  /** 补偿这次扣费: 调账 on 卡密资产, with the charge and a reason naming the request. */
+  onCompensate?: (prefill: Compensation) => void;
 }) {
   const {writing} = guards;
   const alive = useRef(true);
@@ -134,6 +137,12 @@ export default function TracesPage({traces, cards, providers = [], loading, fail
   const rows = filtered.slice(currentPage * PAGE_SIZE, (currentPage + 1) * PAGE_SIZE);
   const selectedIndex = selectedId ? filtered.findIndex(trace => trace.id === selectedId) : -1;
   const selected = selectedIndex >= 0 ? filtered[selectedIndex] : selectedId ? source.find(trace => trace.id === selectedId) ?? null : null;
+  // A card's history names the request an adjustment made up for by its invocation ID: it opens that request.
+  useEffect(() => {
+    if (!selectedId || source.some(trace => trace.id === selectedId)) return;
+    const named = source.find(trace => trace.invocation_id === selectedId);
+    if (named) setSelectedId(named.id);
+  }, [selectedId, source]);
   const filtersActive = !!text || status !== 'ALL' || model !== 'ALL' || provider !== 'ALL' || reason !== null || range !== 'all';
   const resetFilters = () => {setQuery(''); setCodeLookup(null); setStatus('ALL'); setModel('ALL'); setProvider('ALL'); setReason(null); setRange('all'); setPage(0);};
   const providerName = (id: unknown) => String(providers.find(provider => provider.id === id)?.name || id);
@@ -286,11 +295,11 @@ export default function TracesPage({traces, cards, providers = [], loading, fail
 
     {selected && <TraceDrawer trace={selected} providerName={providerName} hasPrev={selectedIndex > 0} hasNext={selectedIndex >= 0 && selectedIndex < filtered.length - 1}
       onMove={move} onClose={() => setSelectedId(null)} onFilterCard={cardId => {setQuery(cardId); setStatus('ALL');}}
-      cardKnown={cards.some(card => card.id === selected.card_id)} onOpenCard={onOpenCard}/>}
+      cardKnown={cards.some(card => card.id === selected.card_id)} onOpenCard={onOpenCard} onCompensate={onCompensate}/>}
   </div>;
 }
 
-function TraceDrawer({trace, providerName, hasPrev, hasNext, onMove, onClose, onFilterCard, cardKnown, onOpenCard}: {
+function TraceDrawer({trace, providerName, hasPrev, hasNext, onMove, onClose, onFilterCard, cardKnown, onOpenCard, onCompensate}: {
   trace: AdminTrace;
   providerName: (id: unknown) => string;
   hasPrev: boolean;
@@ -300,6 +309,7 @@ function TraceDrawer({trace, providerName, hasPrev, hasNext, onMove, onClose, on
   onFilterCard: (cardId: string) => void;
   cardKnown: boolean;
   onOpenCard: (cardId: string) => void;
+  onCompensate?: (prefill: Compensation) => void;
 }) {
   const [timing, setTiming] = useState<{id: string; reply: TraceReply | null} | null>(null);
   const reply = timing?.id === trace.id ? timing.reply : null;
@@ -339,6 +349,8 @@ function TraceDrawer({trace, providerName, hasPrev, hasNext, onMove, onClose, on
           <IdCell value={trace.card_id} kind="card"/>
           {trace.card_id && <button type="button" className="btn-text" onClick={() => onFilterCard(String(trace.card_id))}>只看这张卡</button>}
           {trace.card_id && cardKnown && <button type="button" className="btn-text" onClick={() => onOpenCard(String(trace.card_id))}>去卡密资产</button>}
+          {trace.card_id && cardKnown && onCompensate && Number(trace.credits_charged ?? 0) > 0 && <button type="button" className="btn-text" title="在卡密资产打开调账：金额是这次的扣费，原因写明这次请求"
+            onClick={() => {const prefill = compensation(String(trace.card_id), [trace]); if (prefill) onCompensate(prefill);}}>补偿这次扣费</button>}
         </dd>
         <dt>供应商</dt><dd>{trace.provider_id ? <span title={String(trace.provider_id)}>{providerName(trace.provider_id)}</span> : '—'}</dd>
         <dt>请求 ID</dt><dd><IdCell value={trace.id} kind="trace"/></dd>

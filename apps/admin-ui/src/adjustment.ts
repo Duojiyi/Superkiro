@@ -1,9 +1,11 @@
-export interface Adjustment {operator:string;cardId:string;delta:number;reason:string;key:string}
+/** `invocationId`: the request the adjustment makes up for (a trace's invocation_id), resent as it was on a retry. */
+export interface Adjustment {operator:string;cardId:string;delta:number;reason:string;key:string;invocationId?:string}
 const storageKey=(operator:string)=>`superkiro.pending-adjustment.v1:${encodeURIComponent(operator)}`;
 function validate(value:unknown,operator:string):Adjustment {
   const v=value as Partial<Adjustment>|null;
-  if(!operator||operator.length>128||!v||v.operator!==operator||typeof v.cardId!=='string'||!v.cardId||v.cardId.length>256||typeof v.delta!=='number'||!Number.isFinite(v.delta)||v.delta===0||typeof v.reason!=='string'||!v.reason.trim()||v.reason.length>500||typeof v.key!=='string'||! /^[a-zA-Z0-9_.:-]{1,128}$/.test(v.key))throw new Error('保存的调账意图无效，请人工核对账本；未发送新请求');
-  return {operator,cardId:v.cardId,delta:v.delta,reason:v.reason,key:v.key};
+  if(!operator||operator.length>128||!v||v.operator!==operator||typeof v.cardId!=='string'||!v.cardId||v.cardId.length>256||typeof v.delta!=='number'||!Number.isFinite(v.delta)||v.delta===0||typeof v.reason!=='string'||!v.reason.trim()||v.reason.length>500||typeof v.key!=='string'||! /^[a-zA-Z0-9_.:-]{1,128}$/.test(v.key)
+    ||(v.invocationId!==undefined&&(typeof v.invocationId!=='string'||!/^[A-Za-z0-9_.:-]{1,128}$/.test(v.invocationId))))throw new Error('保存的调账意图无效，请人工核对账本；未发送新请求');
+  return {operator,cardId:v.cardId,delta:v.delta,reason:v.reason,key:v.key,...(v.invocationId!==undefined?{invocationId:v.invocationId}:{})};
 }
 export function loadAdjustment(storage:Storage,operator:string):Adjustment|null {
   const raw=storage.getItem(storageKey(operator));
