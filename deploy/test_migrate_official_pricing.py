@@ -15,6 +15,7 @@ def setUpModule():
     original_policy = script.POLICY
     legacy = copy.deepcopy(original_policy)
     legacy['retail_multiplier'] = 0.24
+    legacy['priced_as'] = {'claude-opus-5-5': 'claude-opus-5'}
     legacy.pop('model_retail_multipliers', None)
     script.POLICY = legacy
 

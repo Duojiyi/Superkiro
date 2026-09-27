@@ -117,10 +117,10 @@ async fn test_audit_b_group_virtual_plan_and_quota_isolation() {
     )
     .await;
     assert_eq!(status_pro, StatusCode::OK);
-    assert!(json_pro["subscriptionInfo"]["subscriptionTitle"]
-        .as_str()
-        .unwrap()
-        .starts_with("Legacy service plan · 有效期至 "));
+    assert_eq!(
+        json_pro["subscriptionInfo"]["subscriptionTitle"],
+        "Legacy service plan"
+    );
     let breakdown_pro = json_pro["usageBreakdownList"].as_array().unwrap();
     assert_eq!(breakdown_pro[0]["usageLimit"].as_f64().unwrap(), 100.0);
     assert_eq!(json_pro["overageConfiguration"]["overageEnabled"], false);
@@ -135,10 +135,10 @@ async fn test_audit_b_group_virtual_plan_and_quota_isolation() {
     )
     .await;
     assert_eq!(status_ent, StatusCode::OK);
-    assert!(json_ent["subscriptionInfo"]["subscriptionTitle"]
-        .as_str()
-        .unwrap()
-        .starts_with("Legacy service plan · 有效期至 "));
+    assert_eq!(
+        json_ent["subscriptionInfo"]["subscriptionTitle"],
+        "Legacy service plan"
+    );
     let breakdown_ent = json_ent["usageBreakdownList"].as_array().unwrap();
     assert_eq!(breakdown_ent[0]["usageLimit"].as_f64().unwrap(), 200.0);
 }

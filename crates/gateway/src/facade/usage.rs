@@ -88,15 +88,26 @@ pub struct GetUsageLimitsResponse {
 /// account page shows as "12/31", no near reset.
 pub const NEVER_EXPIRES: u64 = 253_402_214_400;
 
-/// The plan name Kiro shows beside its usage in the status bar and beside the account
-/// page's "resets on" date: with how long the credits last, which that date cannot say.
-fn plan_title(plan: &str, valid_until: Option<u64>) -> String {
-    match valid_until {
-        Some(until) => format!(
-            "{plan} · 有效期至 {}",
-            &super::oauth::format_epoch_to_iso8601(until)[..10]
-        ),
-        None => format!("{plan} · 长期有效"),
+/// A compact badge, without changing the stored plan or its independent expiry.
+fn compact_plan_title(plan: &str) -> String {
+    if plan.eq_ignore_ascii_case("pro") {
+        "PRO"
+    } else {
+        plan
+    }
+    .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn compact_plan_titles() {
+        for plan in ["pro", "Pro", "PRO"] {
+            assert_eq!(super::compact_plan_title(plan), "PRO");
+        }
+        for plan in ["PRO+", "PRO Max", "Power", "体验卡", "Legacy service plan"] {
+            assert_eq!(super::compact_plan_title(plan), plan);
+        }
     }
 }
 
@@ -190,8 +201,8 @@ impl FacadeHandler for GetUsageLimitsHandler {
             // A card's credits last until it expires; they never refill, and Kiro has no
             // way to say so: its account page prints "resets on MM/DD" whatever it is sent,
             // "NaN/NaN" without a date. It gets the card's expiry, or a date that is plainly
-            // no near refill for a card that never expires, and the plan name beside it
-            // says which ([`plan_title`]). The usage line itself carries no date: Kiro
+            // no near refill for a card that never expires. Expiry remains a separate
+            // field instead of being appended to the badge. The usage line carries no date: Kiro
             // announced one that moved later as "Your usage is reset. You now have N
             // Credits in the new month", so extending cards' validity read as a monthly
             // refill to each of them. Without it, Kiro's low-credit warning ends with its
@@ -215,10 +226,8 @@ impl FacadeHandler for GetUsageLimitsHandler {
                     .then(|| "Settled ledger detail unavailable for this UTC window".to_string()),
                 settled_usage,
                 subscription_info: SubscriptionInfo {
-                    subscription_title: match card {
-                        Some(_) => plan_title(plan, valid_until),
-                        None => plan.to_string(),
-                    },
+                    // Keep the compact Kiro badge to the plan name; expiry remains in valid_until.
+                    subscription_title: compact_plan_title(plan),
                     sub_type: card
                         .as_ref()
                         .map(|c| c.plan_type())
