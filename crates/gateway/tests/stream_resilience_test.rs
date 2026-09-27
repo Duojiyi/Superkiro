@@ -823,7 +823,9 @@ async fn test_t06_concurrent_retry_conflict_and_settlement_io_fault() {
     guard1.fail();
 }
 
-// A normal protocol terminator is not proof that the upstream generated a response.
+// A normal protocol terminator is not proof that the upstream generated a response. The
+// stream is not a success; without a usage report it is released for a retry, and with one
+// its input is billed once and the invocation is not replayed, as for an all-empty request.
 #[tokio::test]
 async fn empty_completed_stream_releases_credits_and_allows_retry() {
     for input_usage in [false, true] {
@@ -892,12 +894,18 @@ async fn empty_completed_stream_releases_credits_and_allows_retry() {
                 .is_string()));
         let card = billing.get_card(&card_id).unwrap();
         assert_eq!(card.credit_reserved, 0);
-        assert_eq!(card.available_credits(), initial_balance);
-        assert!(billing
-            .list_ledger_entries_for_card(&card_id, None)
-            .is_empty());
         assert!(manager.get_completed(inv_id).is_none());
-        assert!(manager.try_acquire(inv_id).is_ok());
+        let entries = billing.list_ledger_entries_for_card(&card_id, None);
+        if input_usage {
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].input_tokens, 1000);
+            assert_eq!(entries[0].output_tokens, 0);
+            assert!(manager.try_acquire(inv_id).is_err());
+        } else {
+            assert_eq!(card.available_credits(), initial_balance);
+            assert!(entries.is_empty());
+            assert!(manager.try_acquire(inv_id).is_ok());
+        }
     }
 }
 
@@ -1162,9 +1170,9 @@ async fn a_response_cut_off_by_the_deadline_ends_with_an_exception() {
     drop(upstream_tx);
 }
 
-// Tool arguments are buffered until the call completes. Past the limit the response ends
-// with an exception and is billed, instead of buffering without bound or forwarding a
-// truncated, malformed tool call.
+// Tool input streams to Kiro as it arrives, within the gateway's limits. Past one the
+// response ends with an exception and is billed, instead of buffering without bound; the
+// call that went over is never closed, so Kiro never runs a truncated call.
 #[tokio::test]
 async fn an_oversized_tool_call_ends_the_response_and_is_billed() {
     for (inv_id, chunks) in [
@@ -1207,10 +1215,36 @@ async fn an_oversized_tool_call_ends_the_response_and_is_billed() {
         );
         let frames = collect_and_decode_frames(stream).await;
 
-        assert!(
-            !frames.iter().any(|(name, _)| name == "toolUseEvent"),
-            "{inv_id}: no tool call is forwarded"
-        );
+        let tool_frames: Vec<serde_json::Value> = frames
+            .iter()
+            .filter(|(name, _)| name == "toolUseEvent")
+            .map(|(_, payload)| serde_json::from_slice(payload).unwrap())
+            .collect();
+        let closed: Vec<&str> = tool_frames
+            .iter()
+            .filter(|frame| frame["stop"] == true)
+            .map(|frame| frame["toolUseId"].as_str().unwrap())
+            .collect();
+        match inv_id {
+            // The call's first 8 MB streamed; it was never closed.
+            "inv-tool-bytes" => {
+                assert!(closed.is_empty(), "{closed:?}");
+                let streamed: usize = tool_frames
+                    .iter()
+                    .map(|frame| frame["input"].as_str().unwrap().len())
+                    .sum();
+                assert_eq!(streamed, 8 * 1024 * 1024);
+            }
+            // The calls the model moved past are closed; the last within the limit was still
+            // open when the next went over it, and the one past it never opened.
+            _ => {
+                assert_eq!(closed.len(), 127);
+                assert!(!closed.contains(&"call-127"));
+                assert!(tool_frames
+                    .iter()
+                    .all(|frame| frame["toolUseId"] != "call-128"));
+            }
+        }
         let message = exception_message(&frames).expect("the stream ends with an exception");
         assert!(
             message.to_lowercase().contains("tool call"),
@@ -1411,4 +1445,55 @@ async fn a_streamed_response_records_its_time_to_first_output() {
     // 40 tokens over the 100 ms after the first output: a speed, and a plausible one.
     let speed = trace.tokens_per_second.expect("output speed is recorded");
     assert!(speed > 0.0 && speed < 4_000.0, "{speed} tokens/s");
+}
+
+// A response the model started is not retried, so an empty one reaches the stream. When
+// the upstream reported the input it read, that input is billed once, as for an empty
+// attempt before the start; without a report it is a failed relay, and costs nothing.
+#[tokio::test]
+async fn an_empty_response_the_model_started_bills_the_input_it_reported() {
+    for (inv_id, reported) in [("inv-empty-reported", true), ("inv-empty-silent", false)] {
+        let (billing, card_id) = create_test_billing();
+        let (upstream_tx, upstream_rx) = mpsc::channel(8);
+        let mut events = vec![ProviderStreamEvent::Started];
+        if reported {
+            events.push(ProviderStreamEvent::Usage(TokenUsage {
+                uncached_prompt_tokens: 50,
+                prompt_tokens: 50,
+                completion_tokens: 0,
+                total_tokens: 50,
+                output_tokens_final: true,
+                prompt_final: false,
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
+            }));
+        }
+        events.push(ProviderStreamEvent::StopReason("end_turn".into()));
+        events.push(ProviderStreamEvent::Done);
+        for event in events {
+            upstream_tx.send(Ok(event)).await.unwrap();
+        }
+        let stream = guarded_stream(
+            &billing,
+            &card_id,
+            inv_id,
+            upstream_rx,
+            Duration::from_secs(30),
+        );
+        let frames = collect_and_decode_frames(stream).await;
+        let message = exception_message(&frames).expect("the stream ends with an exception");
+        let entries = billing.list_ledger_entries_for_card(&card_id, None);
+        if reported {
+            assert!(message.contains("billed"), "{message}");
+            assert_eq!(entries.len(), 1);
+            assert_eq!((entries[0].input_tokens, entries[0].output_tokens), (50, 0));
+        } else {
+            assert!(
+                message.contains("without producing any output"),
+                "{message}"
+            );
+            assert!(entries.is_empty());
+            assert_eq!(billing.get_card(&card_id).unwrap().credit_reserved, 0);
+        }
+    }
 }

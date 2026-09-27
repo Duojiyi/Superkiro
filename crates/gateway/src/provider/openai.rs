@@ -8,7 +8,6 @@ use super::{
 use futures_util::TryStreamExt;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::Value;
-use std::time::Duration;
 
 pub struct OpenAiProvider;
 
@@ -171,6 +170,10 @@ impl ModelProvider for OpenAiProvider {
         // 2. Check choices delta
         if let Some(choices) = val.get("choices").and_then(|c| c.as_array()) {
             if let Some(first) = choices.first() {
+                // The opening chunk names the role: the model has begun.
+                if first.pointer("/delta/role").is_some() {
+                    events.push(ProviderStreamEvent::Started);
+                }
                 if let Some(delta) = first.get("delta") {
                     // Content text
                     if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
@@ -285,9 +288,11 @@ impl ModelProvider for OpenAiProvider {
             );
 
             // Bound connection and response-header wait separately from the
-            // long-lived streaming body timeout.
+            // long-lived streaming body timeout: longer for a model that reasons first.
             let resp = tokio::time::timeout(
-                Duration::from_secs(15).min(config.timeout),
+                super::retry::UpstreamLimits::for_request(request)
+                    .headers
+                    .min(config.timeout),
                 client
                     .post(&url)
                     .headers(headers)

@@ -26,7 +26,7 @@ use crate::stream::{create_stream_guard, BillingSettler, StreamGuardConfig};
 use crate::translate::to_provider::{
     prepare_images, translate_kiro_to_chat_request, TranslationContext,
 };
-use crate::watchdog::{WatchdogConfig, WatchdogStream};
+use crate::watchdog::WatchdogStream;
 use axum::{
     body::Body,
     http::{header, Method, Request, StatusCode},
@@ -1204,6 +1204,14 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                 context_window: Some(context_window),
             };
 
+            // Pings and empty deltas count as liveness; a model that reasons first may go
+            // silent longer.
+            let watchdog = crate::provider::retry::UpstreamLimits::for_model(
+                &actual_target_model,
+                chat_req.reasoning_effort,
+            )
+            .watchdog();
+
             // The stream's settler bills or returns the hold from here on.
             hold.armed = false;
             let settler = BillingSettler::new(
@@ -1224,7 +1232,7 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
             .with_estimated_input(translated_input_estimate)
             .with_reservation_lease(reservation_lease);
 
-            let watchdog_stream = WatchdogStream::new(upstream_stream, WatchdogConfig::default());
+            let watchdog_stream = WatchdogStream::new(upstream_stream, watchdog);
             let guarded_stream = create_stream_guard(
                 watchdog_stream,
                 guard_config,

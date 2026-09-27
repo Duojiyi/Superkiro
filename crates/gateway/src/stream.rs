@@ -254,15 +254,38 @@ struct ToolBuffer {
     id: String,
     name: String,
     arguments: String,
+    /// Kiro has been told of the call, and of `sent` bytes of its arguments.
+    announced: bool,
+    sent: usize,
+}
+
+impl ToolBuffer {
+    /// Whether its arguments are a whole JSON value, so the model has moved past it.
+    fn complete(&self) -> bool {
+        let arguments = self.arguments.trim();
+        !arguments.is_empty() && serde_json::from_str::<serde::de::IgnoredAny>(arguments).is_ok()
+    }
 }
 
 /// Tool calls being assembled, in the order they opened.
+///
+/// Their input streams to Kiro as it arrives, so it shows a file being written and a call
+/// the model has begun, rather than the whole call once the response ends: held back, a
+/// long write was minutes of silence, and a failure in it was retried by Kiro as if nothing
+/// had been started. Kiro adds each fragment to the call it heard of last, so one call at a
+/// time streams: a later call waits until the streaming one's arguments are whole JSON, or
+/// until the response ends, which keeps calls apart however an upstream interleaves them.
 #[derive(Default)]
 struct ToolCalls {
     calls: Vec<ToolBuffer>,
     by_index: HashMap<usize, usize>,
     by_id: HashMap<String, usize>,
+    /// The call streaming to Kiro.
+    live: Option<usize>,
 }
+
+/// A fragment for a call Kiro was told had ended: it would be read as another call's.
+struct ContinuedAfterEnd;
 
 impl ToolCalls {
     /// The call a fragment belongs to: by its index when it has one, otherwise by its id,
@@ -282,6 +305,82 @@ impl ToolCalls {
             self.by_index.insert(index, position);
         }
         position
+    }
+
+    /// The frames that bring Kiro up to date after a fragment of call `position`.
+    fn advance(&mut self, position: usize) -> Result<Vec<Vec<u8>>, ContinuedAfterEnd> {
+        let mut frames = Vec::new();
+        loop {
+            match self.live {
+                Some(live) if live == position => {
+                    frames.extend(self.rest(live));
+                    return Ok(frames);
+                }
+                Some(live) => {
+                    if self.calls[position].announced {
+                        return Err(ContinuedAfterEnd);
+                    }
+                    if !self.calls[live].complete() {
+                        return Ok(frames);
+                    }
+                    frames.push(self.end(live));
+                }
+                None => {
+                    let Some(next) = self.calls.iter().position(|call| {
+                        !call.announced && !call.id.is_empty() && !call.name.is_empty()
+                    }) else {
+                        return Ok(frames);
+                    };
+                    let call = &mut self.calls[next];
+                    call.announced = true;
+                    call.sent = call.arguments.len();
+                    frames.push(kiro_wire::encoder::encode_tool_use(
+                        &call.name,
+                        &call.id,
+                        &call.arguments,
+                        false,
+                    ));
+                    self.live = Some(next);
+                }
+            }
+        }
+    }
+
+    /// The arguments of the streaming call Kiro has not seen yet.
+    fn rest(&mut self, live: usize) -> Option<Vec<u8>> {
+        let call = &mut self.calls[live];
+        if call.sent >= call.arguments.len() {
+            return None;
+        }
+        let frame = kiro_wire::encoder::encode_tool_use(
+            &call.name,
+            &call.id,
+            &call.arguments[call.sent..],
+            false,
+        );
+        call.sent = call.arguments.len();
+        Some(frame)
+    }
+
+    fn end(&mut self, live: usize) -> Vec<u8> {
+        self.live = None;
+        let call = &self.calls[live];
+        kiro_wire::encoder::encode_tool_use(&call.name, &call.id, "", true)
+    }
+
+    /// The frames that end the response's calls: the streaming one ends, and any that never
+    /// streamed go whole, as before.
+    fn finish(&mut self) -> Vec<Vec<u8>> {
+        let mut frames: Vec<Vec<u8>> = self.live.map(|live| self.end(live)).into_iter().collect();
+        frames.extend(
+            self.calls
+                .iter()
+                .filter(|call| !call.announced && (!call.name.is_empty() || !call.id.is_empty()))
+                .map(|call| {
+                    kiro_wire::encoder::encode_tool_use(&call.name, &call.id, &call.arguments, true)
+                }),
+        );
+        frames
     }
 }
 
@@ -335,8 +434,7 @@ pub fn create_stream_guard_with_send_deadline(
 
     tokio::spawn(async move {
         // Keepalives fill any silence the client sees. Only a frame sent restarts the
-        // clock: the fragments of a tool call arrive for minutes but are forwarded only
-        // once it is complete.
+        // clock: a tool call waiting for the one streaming before it sends nothing.
         let mut interval = tokio::time::interval(config.keepalive_interval);
         let deadline_sleep = tokio::time::sleep_until(send_deadline);
         tokio::pin!(deadline_sleep);
@@ -357,6 +455,7 @@ pub fn create_stream_guard_with_send_deadline(
         let mut reply = crate::archive::ArchivedReply::default();
         let mut completed = false;
         let mut rejected_empty = false;
+        let mut empty_turn = false;
         let context_window = config
             .context_window
             .unwrap_or_else(|| {
@@ -385,14 +484,14 @@ pub fn create_stream_guard_with_send_deadline(
                 event = upstream.next() => {
                     match event {
                         Some(Ok(ProviderStreamEvent::Delta(delta))) => {
-                            let frame = match delta {
+                            let frames = match delta {
                                 ProviderDelta::Text(text) => {
                                     saw_output |= !text.is_empty();
                                     output_units = output_units.saturating_add(crate::usage_estimate::token_units(&text));
                                     if archiving {
                                         reply.truncated |= crate::archive::append_capped(&mut reply.text, &text);
                                     }
-                                    Some(kiro_wire::encoder::encode_assistant_response(&text, Some(&config.model_id)))
+                                    vec![kiro_wire::encoder::encode_assistant_response(&text, Some(&config.model_id))]
                                 }
                                 ProviderDelta::Reasoning(text) => {
                                     saw_output |= !text.is_empty();
@@ -400,7 +499,7 @@ pub fn create_stream_guard_with_send_deadline(
                                     if archiving {
                                         reply.truncated |= crate::archive::append_capped(&mut reply.reasoning, &text);
                                     }
-                                    Some(kiro_wire::encoder::encode_reasoning(Some(&text), None, None))
+                                    vec![kiro_wire::encoder::encode_reasoning(Some(&text), None, None)]
                                 }
                                 // Kiro keeps a thinking block in its history only with a signature,
                                 // sent before the text or tool call after it; tagged, it goes back
@@ -410,7 +509,7 @@ pub fn create_stream_guard_with_send_deadline(
                                         Some(model) => crate::provider::tag_signature(model, &signature),
                                         None => signature,
                                     };
-                                    Some(kiro_wire::encoder::encode_reasoning(None, Some(&signature), None))
+                                    vec![kiro_wire::encoder::encode_reasoning(None, Some(&signature), None)]
                                 }
                                 ProviderDelta::ToolCallChunk { index, id, name, arguments } => {
                                     // An empty id or name on a continuation names nothing; it
@@ -447,17 +546,30 @@ pub fn create_stream_guard_with_send_deadline(
                                         buf.name = tool_registry.as_ref().map_or_else(|| name.clone(), |r| r.restore(&name));
                                     }
                                     buf.arguments.push_str(&arguments);
-                                    None
+                                    match tool_calls.advance(position) {
+                                        Ok(frames) => frames,
+                                        Err(ContinuedAfterEnd) => {
+                                            failure = Some(Failure::new(
+                                                None,
+                                                "Upstream continued a tool call after starting the next one",
+                                            ));
+                                            break 'stream;
+                                        }
+                                    }
                                 }
                             };
                             if saw_output && first_output_at.is_none() {
                                 first_output_at = Some(std::time::Instant::now());
                             }
-                            if let Some(frame) = frame {
-                                if !send_frame(&tx, Bytes::from(frame), send_deadline).await { break; }
+                            if !frames.is_empty() {
+                                for frame in frames {
+                                    if !send_frame(&tx, Bytes::from(frame), send_deadline).await { break 'stream; }
+                                }
                                 interval.reset();
                             }
                         }
+                        // Liveness for the watchdog; nothing for Kiro, which keepalives serve.
+                        Some(Ok(ProviderStreamEvent::Started | ProviderStreamEvent::Heartbeat)) => {}
                         Some(Ok(ProviderStreamEvent::Usage(next))) => {
                             saw_usage_frame = true;
                             // Output-only Anthropic message_delta must not erase prompt/cache observations.
@@ -497,20 +609,31 @@ pub fn create_stream_guard_with_send_deadline(
                                     break;
                                 }
                             }
-                            // A terminal marker alone does not constitute a response. Do not
-                            // charge input-only usage or cache this invocation as successful.
+                            // A terminal marker alone does not constitute a response, and is
+                            // never cached as a successful invocation. The model had started,
+                            // so it is not retried here. When the upstream reported the input
+                            // it read, that input is billed, as for an empty attempt before
+                            // the start, and the invocation is not replayed for free; without
+                            // a report it looks like a failed relay and stays unbilled.
                             if !saw_output {
-                                rejected_empty = true;
-                                failure = Some(Failure::new(None, "Upstream completed without producing any output"));
+                                rejected_empty = !has_input_usage;
+                                empty_turn = true;
+                                failure = Some(Failure::new(
+                                    None,
+                                    if has_input_usage {
+                                        "The upstream model returned an empty response; the input it read has been billed"
+                                    } else {
+                                        "Upstream completed without producing any output"
+                                    },
+                                ));
                                 break;
                             }
-                            for buf in std::mem::take(&mut tool_calls.calls) {
-                                if archiving {
+                            for frame in tool_calls.finish() {
+                                if !send_frame(&tx, Bytes::from(frame), send_deadline).await { break 'stream; }
+                            }
+                            if archiving {
+                                for buf in std::mem::take(&mut tool_calls.calls) {
                                     reply.truncated |= archive_tool_call(&mut reply, &buf);
-                                }
-                                if !buf.name.is_empty() || !buf.id.is_empty() {
-                                    let frame = kiro_wire::encoder::encode_tool_use(&buf.name, &buf.id, &buf.arguments, true);
-                                    if !send_frame(&tx, Bytes::from(frame), send_deadline).await { break 'stream; }
                                 }
                             }
                             completed = true;
@@ -614,6 +737,8 @@ pub fn create_stream_guard_with_send_deadline(
                 status,
                 if !settlement_ok {
                     Some("settlement_failed")
+                } else if empty_turn {
+                    Some("empty_completion")
                 } else if !completed {
                     Some("stream_incomplete")
                 } else {

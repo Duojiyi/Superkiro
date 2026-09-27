@@ -165,6 +165,10 @@ pub struct ProviderOptions {
     /// each upstream has been checked to accept it: one that edits or validates history
     /// may refuse it.
     pub replay_thinking: bool,
+    /// Anthropic `eager_input_streaming` on each tool, so a large tool input streams as it
+    /// is written instead of arriving in one block after a silent wait. Off: some relays
+    /// refuse the field.
+    pub eager_tool_input: bool,
 }
 
 /// Which providers have which option on: provider IDs, or `*` for every provider,
@@ -172,10 +176,12 @@ pub struct ProviderOptions {
 #[derive(Debug, Clone, Default)]
 pub struct ProviderOptionsTable {
     replay_thinking: Vec<String>,
+    eager_tool_input: Vec<String>,
 }
 
 impl ProviderOptionsTable {
-    /// PROVIDER_THINKING_REPLAY: comma-separated provider IDs, or `*`.
+    /// PROVIDER_THINKING_REPLAY and PROVIDER_EAGER_TOOL_INPUT: comma-separated provider
+    /// IDs, or `*`.
     pub fn from_env() -> Self {
         let ids = |name: &str| -> Vec<String> {
             std::env::var(name)
@@ -188,6 +194,7 @@ impl ProviderOptionsTable {
         };
         Self {
             replay_thinking: ids("PROVIDER_THINKING_REPLAY"),
+            eager_tool_input: ids("PROVIDER_EAGER_TOOL_INPUT"),
         }
     }
 
@@ -195,12 +202,17 @@ impl ProviderOptionsTable {
         let on = |ids: &[String]| ids.iter().any(|id| id == "*" || id == provider_id);
         ProviderOptions {
             replay_thinking: on(&self.replay_thinking),
+            eager_tool_input: on(&self.eager_tool_input),
         }
     }
 
     /// The providers each option is on for, as the start-up log prints them.
     pub fn describe(&self) -> String {
-        format!("thinking replay: [{}]", self.replay_thinking.join(", "))
+        format!(
+            "thinking replay: [{}], eager tool input: [{}]",
+            self.replay_thinking.join(", "),
+            self.eager_tool_input.join(", ")
+        )
     }
 }
 
@@ -364,6 +376,13 @@ pub enum ProviderStreamEvent {
     Delta(ProviderDelta),
     Usage(TokenUsage),
     StopReason(String),
+    /// The model has begun its answer (Anthropic `message_start` / `content_block_start`,
+    /// OpenAI's opening chunk). The upstream is working on the request and may be billing
+    /// it, so it is no longer retried.
+    Started,
+    /// A line that carried nothing to forward (a ping, a block boundary, an empty thinking
+    /// delta): proof the upstream is alive, for the watchdogs.
+    Heartbeat,
     Done,
 }
 
@@ -505,11 +524,24 @@ where
                 buffer.drain(..=newline_pos);
 
                 let line = line.trim();
-                if line.is_empty() || line.starts_with(':') {
+                if line.is_empty() {
                     continue;
                 }
-
-                match parse_line(line) {
+                // Every line proves the upstream alive: a model that thinks silently, or
+                // buffers a tool input it has not finished, sends pings and empty deltas
+                // for minutes, and a watchdog that saw nothing cut it off. `event:` lines
+                // are always followed by their data line.
+                let parsed = if line.starts_with(':') {
+                    Ok(Vec::new())
+                } else {
+                    parse_line(line)
+                };
+                match parsed {
+                    Ok(events) if events.is_empty() && !line.starts_with("event:") => {
+                        if tx.send(Ok(ProviderStreamEvent::Heartbeat)).await.is_err() {
+                            return;
+                        }
+                    }
                     Ok(events) => {
                         for ev in events {
                             if ev == ProviderStreamEvent::Done {

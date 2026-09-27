@@ -93,6 +93,7 @@ pub fn translate_provider_event_to_frames(
                 ));
             }
         },
+        ProviderStreamEvent::Started | ProviderStreamEvent::Heartbeat => {}
         ProviderStreamEvent::StopReason(reason) => {
             let mapped = StreamTranslationState::map_stop_reason(reason);
             state.last_stop_reason = Some(mapped);

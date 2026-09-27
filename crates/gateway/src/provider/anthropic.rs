@@ -9,7 +9,6 @@ use super::{
 use futures_util::TryStreamExt;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use serde_json::Value;
-use std::time::Duration;
 
 pub struct AnthropicProvider;
 
@@ -273,7 +272,7 @@ impl AnthropicProvider {
         }
 
         if !req.tools.is_empty() {
-            let normalized_tools: Vec<Value> = req
+            let mut normalized_tools: Vec<Value> = req
                 .tools
                 .iter()
                 .map(|t| {
@@ -328,6 +327,14 @@ impl AnthropicProvider {
                     }
                 })
                 .collect();
+            // Streamed as the model writes them, a large tool input (a file being written)
+            // is not held back in one silent block. Off unless the operator turns it on:
+            // some relays refuse the field.
+            if options.eager_tool_input {
+                for tool in normalized_tools.iter_mut().filter(|tool| tool.is_object()) {
+                    tool["eager_input_streaming"] = serde_json::json!(true);
+                }
+            }
             body["tools"] = serde_json::json!(normalized_tools);
         }
 
@@ -369,6 +376,7 @@ impl ModelProvider for AnthropicProvider {
 
         match event_type {
             "message_start" => {
+                events.push(ProviderStreamEvent::Started);
                 if let Some(msg) = val.get("message") {
                     if let Some(mut usage) = self.extract_usage(msg) {
                         usage.output_tokens_final = false;
@@ -398,6 +406,8 @@ impl ModelProvider for AnthropicProvider {
                             name,
                             arguments: String::new(),
                         }));
+                    } else {
+                        events.push(ProviderStreamEvent::Started);
                     }
                 }
             }
@@ -549,9 +559,11 @@ impl ModelProvider for AnthropicProvider {
             headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
 
             // Bound connection and response-header wait separately from the
-            // long-lived streaming body timeout.
+            // long-lived streaming body timeout: longer for a model that reasons first.
             let resp = tokio::time::timeout(
-                Duration::from_secs(15).min(config.timeout),
+                super::retry::UpstreamLimits::for_request(request)
+                    .headers
+                    .min(config.timeout),
                 client
                     .post(&url)
                     .headers(headers)

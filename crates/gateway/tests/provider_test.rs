@@ -504,6 +504,7 @@ fn a_thinking_signature_reaches_the_stream_and_replays_only_to_its_model() {
     };
     let replay = ProviderOptions {
         replay_thinking: true,
+        ..Default::default()
     };
     let first_block = |body: serde_json::Value| body["messages"][1]["content"][0].clone();
 
@@ -529,4 +530,87 @@ fn a_thinking_signature_reaches_the_stream_and_replays_only_to_its_model() {
         .translate_request(&request("claude-opus-5-5"))
         .unwrap();
     assert!(!body.to_string().contains("EqQBCgIYAh"));
+}
+
+/// Every upstream line proves it alive to the watchdogs: a model thinking silently, or
+/// buffering a tool input, sends pings and empty thinking deltas for minutes.
+#[tokio::test]
+async fn pings_and_empty_deltas_count_as_liveness() {
+    let sse = [
+        "event: message_start",
+        r#"data: {"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":1}}}"#,
+        "",
+        ": keepalive",
+        "event: ping",
+        r#"data: {"type":"ping"}"#,
+        "",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}"#,
+        r#"data: {"type":"message_stop"}"#,
+        "",
+    ]
+    .join("\n");
+    let events: Vec<_> = gateway::provider::process_byte_stream(
+        futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(sse))]),
+        |line| AnthropicProvider.parse_stream_line(line),
+    )
+    .map(Result::unwrap)
+    .collect()
+    .await;
+    assert_eq!(events[0], ProviderStreamEvent::Started);
+    assert!(matches!(events[1], ProviderStreamEvent::Usage(_)));
+    // The comment, the ping's data line and the empty delta; never an `event:` line.
+    let heartbeats = events
+        .iter()
+        .filter(|event| **event == ProviderStreamEvent::Heartbeat)
+        .count();
+    assert_eq!(heartbeats, 3, "{events:?}");
+    // A thinking block's start is the model at work too.
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| **event == ProviderStreamEvent::Started)
+            .count(),
+        2
+    );
+    assert_eq!(events.last(), Some(&ProviderStreamEvent::Done));
+
+    // OpenAI's opening chunk names the role.
+    let opening = OpenAiProvider
+        .parse_stream_line(r#"data: {"choices":[{"delta":{"role":"assistant","content":""}}]}"#)
+        .unwrap();
+    assert_eq!(opening, vec![ProviderStreamEvent::Started]);
+}
+
+#[test]
+fn eager_tool_input_is_asked_for_only_where_it_is_switched_on() {
+    use gateway::provider::ProviderOptions;
+    let request = ChatRequest {
+        reasoning_effort: None,
+        model: "claude-opus-5-5".into(),
+        messages: vec![ChatMessage::new("user", serde_json::json!("write it"))],
+        temperature: None,
+        max_tokens: Some(8192),
+        stream: true,
+        tools: vec![serde_json::json!({"toolSpecification": {
+            "name": "fsWrite",
+            "description": "Write a file",
+            "inputSchema": {"json": {"type": "object", "properties": {"path": {"type": "string"}}}}
+        }})],
+    };
+    let body = AnthropicProvider
+        .translate_request_with(&request, &ProviderOptions::default())
+        .unwrap();
+    assert!(body["tools"][0].get("eager_input_streaming").is_none());
+    let body = AnthropicProvider
+        .translate_request_with(
+            &request,
+            &ProviderOptions {
+                eager_tool_input: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(body["tools"][0]["eager_input_streaming"], true);
+    assert_eq!(body["tools"][0]["name"], "fsWrite");
 }
