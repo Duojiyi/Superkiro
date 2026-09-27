@@ -463,6 +463,7 @@ pub fn create_stream_guard_with_send_deadline(
             })
             .max(1);
         let mut stop_reason = None;
+        let mut refusal = None;
         // The upstream model the response comes from, which its thinking may go back to.
         let signing_model = billing_settler
             .as_ref()
@@ -570,6 +571,13 @@ pub fn create_stream_guard_with_send_deadline(
                         }
                         // Liveness for the watchdog; nothing for Kiro, which keepalives serve.
                         Some(Ok(ProviderStreamEvent::Started | ProviderStreamEvent::Heartbeat)) => {}
+                        Some(Ok(ProviderStreamEvent::Refusal { category, explanation })) => {
+                            refusal = Some(kiro_wire::events::Refusal {
+                                category,
+                                explanation,
+                                recommended_model: None,
+                            });
+                        }
                         Some(Ok(ProviderStreamEvent::Usage(next))) => {
                             saw_usage_frame = true;
                             // Output-only Anthropic message_delta must not erase prompt/cache observations.
@@ -648,8 +656,9 @@ pub fn create_stream_guard_with_send_deadline(
                                 },
                                 _ => "Upstream stream ended before completion".to_string(),
                             };
-                            let friendly = format!("\n\n**上游模型服务异常**：{error}\n");
-                            failure = Some(Failure::new(Some(friendly), error));
+                            // The exception ends the turn; text in the answer would stay in the
+                            // conversation the model reads from then on.
+                            failure = Some(Failure::new(None, error));
                             break;
                         }
                     }
@@ -758,10 +767,14 @@ pub fn create_stream_guard_with_send_deadline(
         }
         if completed && settlement_ok {
             if !tx.is_closed() {
-                let frame = kiro_wire::encoder::encode_metadata(
-                    None,
-                    Some(stop_reason.as_deref().unwrap_or("end_turn")),
-                );
+                // A refusal says why, and Kiro shows it with its refusal.
+                let stop = stop_reason.as_deref().unwrap_or("end_turn");
+                let details = refusal
+                    .filter(|_| stop == "content_filtered")
+                    .map(|refusal| kiro_wire::events::StopDetails {
+                        refusal: Some(refusal),
+                    });
+                let frame = kiro_wire::encoder::encode_stop(None, Some(stop), details);
                 if send_terminal_frame(&tx, frame).await {
                     if let Some(guard) = idempotency_guard.take() {
                         guard.commit(CompletedInvocation {
@@ -810,14 +823,11 @@ pub fn create_stream_guard_with_send_deadline(
 }
 
 /// What to show when a turn ends with no visible output, so it is not simply blank.
-/// Stop reasons arrive in each provider's own vocabulary; only the output limit is
-/// normalised before this point.
+/// Stop reasons arrive mapped to Kiro's vocabulary.
 fn empty_turn_notice(stop_reason: Option<&str>) -> Option<&'static str> {
     match stop_reason? {
         "max_tokens" => Some("（模型在给出可见回答前已达到输出上限。请重试，或缩短本次请求。）"),
-        "content_filter" | "refusal" => {
-            Some("（上游模型未返回内容：本次请求被其内容安全策略拦截。）")
-        }
+        "content_filtered" => Some("（上游模型未返回内容：本次请求被其内容安全策略拦截。）"),
         _ => None,
     }
 }

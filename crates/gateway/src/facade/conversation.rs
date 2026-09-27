@@ -161,21 +161,37 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
         "/generateAssistantResponse"
     }
 
+    /// Every answer names its request (`x-amzn-requestid`): Kiro shows the ID with an
+    /// error and keeps it with the turn's usage, so a customer's report can be traced.
     fn handle<'a>(&'a self, req: Request<Body>) -> BoxFuture<'a, Response> {
         Box::pin(async move {
+            let request_id = req
+                .headers()
+                .get("amz-sdk-invocation-id")
+                .and_then(|value| value.to_str().ok())
+                .filter(|id| valid_invocation_id(id))
+                .map_or_else(generated_invocation_id, str::to_string);
+            let mut response = self.respond(req, &request_id).await;
+            if let Ok(value) = axum::http::HeaderValue::from_str(&request_id) {
+                response.headers_mut().insert("x-amzn-requestid", value);
+            }
+            response
+        })
+    }
+}
+
+impl GenerateAssistantResponseHandler {
+    /// The answer to one conversation request, which `request_id` names when the client
+    /// sent no invocation id of its own.
+    async fn respond(&self, req: Request<Body>, request_id: &str) -> Response {
+        {
             // What a response's time to first output is measured from.
             let received_at = std::time::Instant::now();
             let (parts, body) = req.into_parts();
 
             // 1. Extract amz-sdk-invocation-id header (Spec §4.7)
             let invocation_id = match parts.headers.get("amz-sdk-invocation-id") {
-                None => format!(
-                    "inv-{}",
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos()
-                ),
+                None => request_id.to_string(),
                 Some(value) => match value.to_str().ok().filter(|id| valid_invocation_id(id)) {
                     Some(id) => id.to_string(),
                     None => {
@@ -496,6 +512,8 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                                 Some(2),
                             );
                         }
+                        // Kiro knows these reasons: it shows its usage-limit message and does
+                        // not retry. Unknown ones read "Too many requests" and were retried.
                         billing::engine::BillingError::DailyLimitExceeded {
                             limit,
                             current,
@@ -504,8 +522,13 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                             return crate::guardrail::format_kiro_throttle_response(
                                 StatusCode::TOO_MANY_REQUESTS,
                                 "ThrottlingException",
-                                "DAILY_LIMIT_EXCEEDED",
-                                &format!("Daily credit limit reached (limit: {}, used today: {}, needed: {}).", limit, current, needed),
+                                "DAILY_REQUEST_COUNT",
+                                &format!(
+                                    "今日积分用量已达上限：上限 {}，今日已用 {}，本次需预留 {}。请明天再试。",
+                                    credits(limit),
+                                    credits(current),
+                                    credits(needed)
+                                ),
                                 None,
                             );
                         }
@@ -517,8 +540,13 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                             return crate::guardrail::format_kiro_throttle_response(
                                 StatusCode::TOO_MANY_REQUESTS,
                                 "ThrottlingException",
-                                "MONTHLY_LIMIT_EXCEEDED",
-                                &format!("Monthly credit limit reached (limit: {}, used this month: {}, needed: {}).", limit, current, needed),
+                                "MONTHLY_REQUEST_COUNT",
+                                &format!(
+                                    "近 30 天积分用量已达上限：上限 {}，已用 {}，本次需预留 {}。请稍后再试。",
+                                    credits(limit),
+                                    credits(current),
+                                    credits(needed)
+                                ),
                                 None,
                             );
                         }
@@ -545,13 +573,7 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                                 "This model has no published price; choose another model or ask your administrator to publish one",
                             );
                         }
-                        _ => {
-                            return error_response(
-                                StatusCode::PAYMENT_REQUIRED,
-                                "InsufficientCreditException",
-                                &format!("Credit reservation failed: {}", e),
-                            );
-                        }
+                        other => return reservation_refusal(&other),
                     }
                 }
                 has_reservation = true;
@@ -650,14 +672,7 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                                 ),
                                 "no_route",
                             );
-                            return error_response(
-                                StatusCode::FORBIDDEN,
-                                "AccessDeniedException",
-                                &format!(
-                                    "Group '{}' ({:?}) cannot access provider with group_id {:?}",
-                                    group.id, group.provider_binding_mode, cfg.group_id
-                                ),
-                            );
+                            return no_route_for_group();
                         }
                     }
                 }
@@ -978,11 +993,7 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                         requested_model,
                         "no_route",
                     );
-                    return error_response(
-                        StatusCode::BAD_GATEWAY,
-                        "RoutingException",
-                        "No enabled or accessible upstream providers available for requested model targets",
-                    );
+                    return no_route_for_group();
                 }
             } else {
                 let default_pool = self
@@ -1107,11 +1118,13 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                         }
                         Err(e) => {
                             let _ = self.billing.release(&invocation_key);
-                            return error_response(
-                                StatusCode::BAD_GATEWAY,
-                                "InternalServerException",
-                                &crate::stream::safe_governance_error(&e),
-                            );
+                            return governance_upstream_refusal(&e).unwrap_or_else(|| {
+                                error_response(
+                                    StatusCode::BAD_GATEWAY,
+                                    "InternalServerException",
+                                    &crate::stream::safe_governance_error(&e),
+                                )
+                            });
                         }
                     }
                 } else if let (Some(ref provider), Some(ref provider_config)) =
@@ -1126,11 +1139,7 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                                 requested_model,
                                 "no_route",
                             );
-                            return error_response(
-                                StatusCode::FORBIDDEN,
-                                "AccessDeniedException",
-                                "Card group cannot access the configured upstream provider",
-                            );
+                            return no_route_for_group();
                         }
                     }
                     let mut direct_config = provider_config.clone();
@@ -1170,11 +1179,13 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                         Err(e) => {
                             // Upstream initiation failed; release reservation in full
                             let _ = self.billing.release(&invocation_key);
-                            return error_response(
-                                StatusCode::BAD_GATEWAY,
-                                "InternalServerException",
-                                &crate::stream::safe_provider_error(&e),
-                            );
+                            return upstream_refusal(&e).unwrap_or_else(|| {
+                                error_response(
+                                    StatusCode::BAD_GATEWAY,
+                                    "InternalServerException",
+                                    &crate::stream::safe_provider_error(&e),
+                                )
+                            });
                         }
                     }
                 } else {
@@ -1185,11 +1196,7 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                         requested_model,
                         "no_route",
                     );
-                    return error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "ServiceUnavailableException",
-                    "No upstream provider configured, enabled, or accessible for this card group",
-                );
+                    return no_route_for_group();
                 };
 
             // 10. Wrap in Stream Guard (keepalive + cancellation + tool name restoration + billing settlement + contextUsage)
@@ -1247,11 +1254,9 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                 Body::from_stream(guarded_stream),
             )
                 .into_response()
-        })
+        }
     }
-}
 
-impl GenerateAssistantResponseHandler {
     /// Records an authenticated request refused before it was routed: nothing was sent
     /// upstream and nothing is charged. The model it named is kept only when it is a valid
     /// model ID; the request's content is never kept.
@@ -1368,7 +1373,91 @@ fn route_failure_class(
     match error {
         GovernanceError::NoAvailableKeys { .. } if attempts.is_empty() => "no_route",
         error if upstream_input_too_long(error) => "input_too_long",
+        error if governance_upstream_refusal(error).is_some() => "upstream_refused",
         _ => "upstream_start_failed",
+    }
+}
+
+/// Micro-credits as the credits a customer sees.
+fn credits(micro: i64) -> String {
+    let credits = micro as f64 / billing::MICRO_CREDITS_PER_CREDIT as f64;
+    format!("{:.2}", credits)
+}
+
+/// A hold the card cannot take, in words Kiro shows as they are: a ValidationException
+/// message, which it neither rewrites nor retries. An unknown exception type read
+/// "Something went wrong".
+fn reservation_refusal(error: &billing::engine::BillingError) -> Response {
+    use billing::card::CardError;
+    use billing::engine::BillingError;
+    let message = match error {
+        BillingError::Card(CardError::InsufficientCredit { available, needed }) => format!(
+            "积分余额不足：本次请求需预留 {}（按该模型的最大输出估算），当前可用 {}。请充值后重试，或换用更便宜的模型。",
+            credits(*needed),
+            credits((*available).max(0))
+        ),
+        BillingError::Card(CardError::Expired) => {
+            "卡密已过期，请续期或更换卡密后重试。".to_string()
+        }
+        BillingError::Card(CardError::NotActive(status)) => {
+            format!("卡密当前不可用（状态：{status:?}），请联系管理员。")
+        }
+        BillingError::CardNotFound(_) => "未找到该卡密，请重新登录后重试。".to_string(),
+        // A settlement still being saved, or state the next request finds consistent: a
+        // retry succeeds.
+        _ => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerException",
+                "Credit reservation is temporarily unavailable",
+            )
+        }
+    };
+    error_response(StatusCode::BAD_REQUEST, "ValidationException", &message)
+}
+
+/// A card whose group may not use any provider that serves the model. Not an
+/// AccessDeniedException: Kiro takes that for an expired login.
+fn no_route_for_group() -> Response {
+    error_response(
+        StatusCode::BAD_REQUEST,
+        "ValidationException",
+        "当前卡密所在分组没有可用于该模型的上游服务，请换一个模型或联系管理员。",
+    )
+}
+
+/// An upstream's refusal of the request itself, which a retry would meet again, in words
+/// Kiro shows as they are; never the upstream's own text. Its rate limits, an invalid key
+/// and a request timeout are the gateway's to handle.
+fn upstream_refusal(error: &ProviderError) -> Option<Response> {
+    let ProviderError::Http(status, _) = error else {
+        return None;
+    };
+    let status = status.as_u16();
+    if !(400..500).contains(&status) || matches!(status, 401 | 408 | 429) {
+        return None;
+    }
+    let why = match status {
+        400 | 422 => "请求内容或参数不被该上游接受",
+        403 => "该上游拒绝处理本次请求",
+        404 => "该上游找不到这个模型",
+        _ => "该上游拒绝了本次请求",
+    };
+    Some(error_response(
+        StatusCode::BAD_REQUEST,
+        "ValidationException",
+        &format!(
+            "上游模型服务拒绝了本次请求（HTTP {status}：{why}），重试不会改变结果。可以调整请求、换一个模型，或联系管理员。"
+        ),
+    ))
+}
+
+fn governance_upstream_refusal(error: &GovernanceError) -> Option<Response> {
+    match error {
+        GovernanceError::NonRetryable(error) | GovernanceError::Provider(error) => {
+            upstream_refusal(error)
+        }
+        _ => None,
     }
 }
 
@@ -1491,6 +1580,16 @@ fn is_intent_classifier_call(body: &[u8]) -> bool {
         instructions.starts_with(INTENT_CLASSIFIER_SIGN_A)
             && instructions.contains(INTENT_CLASSIFIER_SIGN_B)
     })
+}
+
+fn generated_invocation_id() -> String {
+    format!(
+        "inv-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    )
 }
 
 /// The client's invocation id keys idempotency, the credit hold and the request traces,

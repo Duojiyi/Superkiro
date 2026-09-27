@@ -401,6 +401,11 @@ pub enum ProviderStreamEvent {
     /// A line that carried nothing to forward (a ping, a block boundary, an empty thinking
     /// delta): proof the upstream is alive, for the watchdogs.
     Heartbeat,
+    /// Why the model refused (Anthropic's `stop_details` with a `refusal` stop).
+    Refusal {
+        category: Option<String>,
+        explanation: Option<String>,
+    },
     Done,
 }
 

@@ -116,6 +116,7 @@ fn body(message: Value, history: Vec<Value>) -> Value {
 
 struct Reply {
     status: StatusCode,
+    headers: axum::http::HeaderMap,
     bytes: Vec<u8>,
 }
 
@@ -140,11 +141,16 @@ async fn send(app: &axum::Router, invocation: &str, body: Value) -> Reply {
     request.extensions_mut().insert(claims());
     let response = app.clone().oneshot(request).await.unwrap();
     let status = response.status();
+    let headers = response.headers().clone();
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap()
         .to_vec();
-    Reply { status, bytes }
+    Reply {
+        status,
+        headers,
+        bytes,
+    }
 }
 
 /// The trace of `invocation`'s refusal or routing.
@@ -698,4 +704,80 @@ async fn thinking_streams_with_the_signature_of_the_model_that_wrote_it() {
         !sent.to_string().contains("\"thinking\":\"Checking"),
         "{sent}"
     );
+}
+
+/// An upstream's refusal of the request itself is a ValidationException, which Kiro shows
+/// as it is and does not retry; as a 502 it read "temporary error" and was retried
+/// unchanged. Its words are the gateway's, never the upstream's.
+#[tokio::test]
+async fn an_upstream_refusal_is_shown_and_not_retried() {
+    let server = upstream(ResponseTemplate::new(400).set_body_json(json!({
+        "type": "error",
+        "error": {"type": "invalid_request_error", "message": "tools.0: secret detail"}
+    })))
+    .await;
+    let billing = engine(
+        ProviderFormat::Anthropic,
+        &server.uri(),
+        vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+    );
+    let app = serve(&billing);
+    let reply = send(
+        &app,
+        "inv-refused",
+        body(json!({"content": "hello", "modelId": "model"}), vec![]),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text());
+    let refusal = reply.json();
+    assert_eq!(refusal["__type"], "ValidationException");
+    assert!(refusal["message"].as_str().unwrap().contains("HTTP 400"));
+    assert!(!reply.text().contains("secret detail"));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    nothing_charged(&billing);
+    assert_eq!(reply.headers["x-amzn-requestid"], "inv-refused");
+}
+
+/// A refusal ends the turn as Kiro's `content_filtered`, with its category, so Kiro shows
+/// its refusal instead of an ordinary end.
+#[tokio::test]
+async fn a_refusal_ends_as_content_filtered_with_its_category() {
+    let events = [
+        json!({"type": "message_start", "message": {"usage": {"input_tokens": 10, "output_tokens": 1}}}),
+        json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "I can't help with that."}}),
+        json!({"type": "content_block_stop", "index": 0}),
+        json!({"type": "message_delta", "delta": {"stop_reason": "refusal",
+            "stop_details": {"type": "refusal", "category": "cyber", "explanation": "Declined."}},
+            "usage": {"output_tokens": 7}}),
+        json!({"type": "message_stop"}),
+    ]
+    .iter()
+    .map(|event| format!("data: {event}\n\n"))
+    .collect::<String>();
+    let server =
+        upstream(ResponseTemplate::new(200).set_body_raw(events, "text/event-stream")).await;
+    let billing = engine(
+        ProviderFormat::Anthropic,
+        &server.uri(),
+        vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+    );
+    let app = serve(&billing);
+    let reply = send(
+        &app,
+        "inv-refusal",
+        body(json!({"content": "hack it", "modelId": "model"}), vec![]),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.headers["x-amzn-requestid"], "inv-refusal");
+    let end = frames(&reply.bytes)
+        .into_iter()
+        .rev()
+        .find(|(kind, payload)| kind == "metadataEvent" && payload.get("stopReason").is_some())
+        .map(|(_, payload)| payload)
+        .unwrap();
+    assert_eq!(end["stopReason"], "content_filtered");
+    assert_eq!(end["stopDetails"]["refusal"]["category"], "cyber");
+    assert_eq!(end["stopDetails"]["refusal"]["explanation"], "Declined.");
 }

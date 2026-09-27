@@ -534,9 +534,16 @@ async fn test_e2e_insufficient_credit_rejection() {
         .insert(create_auth_claims("card-broke-001"));
 
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    // Kiro shows a ValidationException's message as it is; an unknown exception type read
+    // "Something went wrong".
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.headers()["x-amzn-requestid"], "inv-broke-001");
 
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let err_json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(err_json["__type"], "InsufficientCreditException");
+    assert_eq!(err_json["__type"], "ValidationException");
+    assert!(err_json["message"]
+        .as_str()
+        .unwrap()
+        .contains("积分余额不足"));
 }

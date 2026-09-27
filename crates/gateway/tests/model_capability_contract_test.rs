@@ -227,7 +227,7 @@ async fn configured_capabilities_reach_catalog_upstream_billing_and_usage() {
             assert_eq!(
                 resp.status(),
                 if quota == "none" {
-                    StatusCode::PAYMENT_REQUIRED
+                    StatusCode::BAD_REQUEST
                 } else {
                     StatusCode::TOO_MANY_REQUESTS
                 }

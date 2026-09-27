@@ -320,7 +320,7 @@ async fn each_refusal_before_routing_is_traced_and_charged_nothing() {
             "inv-offline",
             "offline-model",
             plain,
-            StatusCode::BAD_GATEWAY,
+            StatusCode::BAD_REQUEST,
             "no_route",
             "offline-model",
         ),

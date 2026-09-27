@@ -598,22 +598,14 @@ async fn test_audit_b_mid_stream_provider_error_friendly_presentation() {
     let stream = create_stream_guard(ReceiverStream::new(rx), config, None, None, None);
     let frames = collect_and_decode_frames(stream).await;
 
-    // Must contain the user-friendly Markdown error text chunk
-    let friendly_frame = frames
+    // The failure ends the turn as an exception, not as text in the answer, which would
+    // stay in the conversation the model reads from then on.
+    let answer: String = frames
         .iter()
-        .find(|(name, payload)| {
-            if name == "assistantResponseEvent" {
-                let e: AssistantResponseEvent = decode_single_event(payload);
-                e.content.contains("上游模型服务异常")
-            } else {
-                false
-            }
-        })
-        .expect("Must emit user-friendly markdown error event");
-    let friendly_evt: AssistantResponseEvent = decode_single_event(&friendly_frame.1);
-    // Vendor response bodies are intentionally redacted at the client
-    // boundary; only the stable upstream category/status is exposed.
-    assert!(friendly_evt.content.contains("upstream HTTP status 429"));
+        .filter(|(name, _)| name == "assistantResponseEvent")
+        .map(|(_, payload)| decode_single_event::<AssistantResponseEvent>(payload).content)
+        .collect();
+    assert_eq!(answer, "Starting...");
 
     // Must also contain structured AWS exception frame
     let exc_frame = frames

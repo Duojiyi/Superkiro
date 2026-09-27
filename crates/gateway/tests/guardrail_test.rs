@@ -258,7 +258,7 @@ async fn test_gateway_daily_and_monthly_quota_rejection() {
 
     let resp = app.oneshot(req).await.unwrap();
 
-    // Verify rejection with DAILY_LIMIT_EXCEEDED
+    // A reason Kiro knows: it shows its daily-limit message and does not retry.
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(
         resp.headers().get("x-amzn-errortype").unwrap(),
@@ -270,5 +270,9 @@ async fn test_gateway_daily_and_monthly_quota_rejection() {
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(json["__type"], "ThrottlingException");
-    assert_eq!(json["reason"], "DAILY_LIMIT_EXCEEDED");
+    assert_eq!(json["reason"], "DAILY_REQUEST_COUNT");
+    assert!(json["message"]
+        .as_str()
+        .unwrap()
+        .contains("今日积分用量已达上限"));
 }

@@ -517,6 +517,17 @@ impl ModelProvider for AnthropicProvider {
                     if let Some(stop_reason) = delta.get("stop_reason").and_then(|s| s.as_str()) {
                         events.push(ProviderStreamEvent::StopReason(stop_reason.to_string()));
                     }
+                    if let Some(details) = delta
+                        .get("stop_details")
+                        .or_else(|| val.get("stop_details"))
+                        .filter(|details| details.is_object())
+                    {
+                        let field = |name: &str| details[name].as_str().map(ToString::to_string);
+                        events.push(ProviderStreamEvent::Refusal {
+                            category: field("category"),
+                            explanation: field("explanation"),
+                        });
+                    }
                 }
                 if let Some(mut usage) = self.extract_usage(&val) {
                     // These counts are cumulative. A relay that learns the real prompt

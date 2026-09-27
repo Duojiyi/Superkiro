@@ -202,9 +202,19 @@ pub fn encode_context_usage(percentage: f64) -> Vec<u8> {
 
 /// Helper: Encode metadata usage snapshot frame.
 pub fn encode_metadata(usage: Option<TokenUsage>, stop_reason: Option<&str>) -> Vec<u8> {
+    encode_stop(usage, stop_reason, None)
+}
+
+/// Helper: Encode the metadata frame that ends a turn, with why it was refused, if it was.
+pub fn encode_stop(
+    usage: Option<TokenUsage>,
+    stop_reason: Option<&str>,
+    stop_details: Option<StopDetails>,
+) -> Vec<u8> {
     let evt = MetadataEvent {
         token_usage: usage,
         stop_reason: stop_reason.map(ToString::to_string),
+        stop_details,
     };
     encode_event("metadataEvent", &evt).unwrap_or_default()
 }
