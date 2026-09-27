@@ -58,6 +58,29 @@ class PublicationTests(unittest.TestCase):
         _, optional = self.prepare(mandatory=False)
         self.assertFalse(optional['mandatory'])
 
+    def test_beta_authorization_is_disclosed_and_still_signed(self):
+        self.approval.update(approvalBasis='user-directed-beta-publication',
+                             runtimeAcceptance=False, sourceCommit='a' * 40, buildRun='123')
+        self.save()
+        _, item = self.prepare()
+        self.assertFalse(item['runtimeAcceptance'])
+        self.assertEqual(item['channel'], 'beta')
+        self.assertEqual(item['sourceCommit'], 'a' * 40)
+        self.assertIn('真机运行验收未完成', item['systemRequirements'])
+        self.assertTrue(update_signing.verify(item, item['updateSignature'],
+                                             [update_signing.public_hex(self.key)]))
+        for field, value in [('sourceCommit', ''), ('buildRun', ''), ('runtimeAcceptance', True)]:
+            previous = self.approval[field]
+            self.approval[field] = value
+            self.save()
+            with self.assertRaises(ValueError):
+                self.prepare()
+            self.approval[field] = previous
+        self.approval.pop('approvalBasis')
+        self.save()
+        with self.assertRaises(ValueError):
+            self.prepare()
+
     def test_a_key_clients_do_not_trust_is_refused(self):
         with self.assertRaisesRegex(ValueError, 'UPDATE_KEYS'):
             prepare(self.exe, '1.2.3', self.receipt, Ed25519PrivateKey.generate())

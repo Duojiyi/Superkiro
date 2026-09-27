@@ -36,6 +36,8 @@ def validate_pricing_limits(model):
 
 
 def main():
+    if POLICY['id'] != 'official-024-20260920':
+        raise RuntimeError('Legacy bootstrap pricing disabled for this policy; publish revision-checked official pricing versions instead')
     credentials=json.load(sys.stdin);ssh=pinned_connection(credentials)
     try:
       with deployment_lock(ssh):

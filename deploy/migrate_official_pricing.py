@@ -83,7 +83,8 @@ def official_block(mapping, policy, face_value):
     provider = mapping['target_provider_id']
     block = {f'{kind}_usd_per_m': usd for kind, usd in zip(PRICES, official)}
     block.update({
-        'price_multiplier': float(policy['retail_multiplier']),
+        'price_multiplier': float(policy.get('model_retail_multipliers', {}).get(
+            model, policy['retail_multiplier'])),
         'cost_multiplier': float(policy['provider_upstream_multipliers'].get(
             provider, policy['upstream_multiplier'])),
         'usd_cny': OFFICIAL_USD_CNY,
