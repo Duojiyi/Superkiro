@@ -8,7 +8,7 @@
 //! - "激活即计时" (activation begins the timer).
 //! - Card status lifecycle (Unactivated -> Active -> Expired/Frozen/Banned).
 
-use crate::template::CardTemplate;
+use crate::template::{CardTemplate, IssuedPlan, PlanPrice, PLAN_PRICES};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -80,6 +80,10 @@ pub struct Card {
     /// Immutable issued entitlement, absent for legacy snapshots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issued_credits: Option<i64>,
+    /// The plan it was issued from, as it was then; absent on cards issued before the plan
+    /// catalog, which are taken to be the tier their issued credits name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<IssuedPlan>,
     pub credit_used: i64,
     pub credit_reserved: i64,
     pub status: CardStatus,
@@ -126,6 +130,7 @@ impl Card {
             group_id: group_id.into(),
             credit_total,
             issued_credits: Some(credit_total),
+            plan: None,
             credit_used: 0,
             credit_reserved: 0,
             status: CardStatus::Unactivated,
@@ -167,6 +172,7 @@ impl Card {
             group_id: template.group_id.clone(),
             credit_total: template.credit_total,
             issued_credits: Some(template.credit_total),
+            plan: template.plan.clone(),
             credit_used: 0,
             credit_reserved: 0,
             status: CardStatus::Unactivated,
@@ -198,24 +204,42 @@ impl Card {
             .max(0)
     }
 
-    /// Our service entitlement, never an official Kiro subscription.
-    pub fn plan_name(&self) -> Option<&'static str> {
-        match self.issued_credits? {
-            1_000_000_000 => Some("PRO"),
-            2_000_000_000 => Some("PRO+"),
-            5_000_000_000 => Some("PRO Max"),
-            10_000_000_000 => Some("Power"),
-            _ => None,
+    /// For a card issued before the plan catalog, the tier the credits it was issued with
+    /// name; its balance since says nothing.
+    pub fn legacy_tier(&self) -> Option<&'static PlanPrice> {
+        if self.plan.is_some() {
+            return None;
+        }
+        let credits = self.issued_credits?;
+        PLAN_PRICES
+            .iter()
+            .find(|tier| tier.points.saturating_mul(crate::MICRO_CREDITS_PER_CREDIT) == credits)
+    }
+
+    /// The plan it was issued from, by ID: its own, or its tier's before the catalog.
+    pub fn plan_id(&self) -> Option<&str> {
+        match &self.plan {
+            Some(plan) => Some(&plan.id),
+            None => self.legacy_tier().map(|tier| tier.template_id),
         }
     }
 
-    pub fn plan_type(&self) -> &'static str {
-        match self.plan_name() {
-            Some("PRO") => "PRO",
-            Some("PRO+") => "PRO_PLUS",
-            Some("PRO Max") => "PRO_MAX",
-            Some("Power") => "POWER",
-            _ => "CUSTOM",
+    /// Our service entitlement, never an official Kiro subscription: the name of the plan it
+    /// was issued from, or of its tier before the catalog.
+    pub fn plan_name(&self) -> Option<&str> {
+        match &self.plan {
+            Some(plan) => Some(&plan.name),
+            None => self.legacy_tier().map(|tier| tier.name),
+        }
+    }
+
+    /// What Kiro is told it subscribes to.
+    pub fn plan_type(&self) -> &str {
+        match &self.plan {
+            Some(plan) => &plan.kiro_plan_type,
+            None => self
+                .legacy_tier()
+                .map_or("CUSTOM", |tier| tier.kiro_plan_type),
         }
     }
 

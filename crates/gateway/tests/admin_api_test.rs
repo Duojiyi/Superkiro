@@ -2310,3 +2310,219 @@ async fn stats_say_when_the_state_was_last_saved_and_whether_saving_works() {
     assert_eq!(restarted.state_size().0, billing.state_size().0);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A plan as the console publishes it, into group-pro-plus.
+fn plan_json(id: &str, name: &str, price_cny: f64) -> serde_json::Value {
+    json!({"id": id, "name": name, "points": 300, "price_cny": price_cny, "validity_days": 7,
+           "max_devices": 1, "concurrency": 1, "default_group_id": "group-pro-plus",
+           "kiro_plan_type": "CUSTOM", "on_sale": true, "sort_order": 5})
+}
+
+async fn publish_plans(
+    app: &axum::Router,
+    billing: &BillingEngine,
+    plans: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    let (status, body) = admin_call(
+        app,
+        Method::POST,
+        "/api/v1/admin/commercial-config",
+        Some(json!({
+            "expected_revision": billing.commercial_config().revision,
+            "reason": "套餐调整",
+            "plans": plans,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["config"].clone()
+}
+
+#[tokio::test]
+async fn cards_are_issued_from_the_plan_catalog_and_keep_their_plan() {
+    let (billing, app) = setup_admin_app();
+    billing.set_master_kek(billing::MasterKek::from_bytes([37; 32]));
+    billing.upsert_group(billing::Group::pro_plus("group-other", "Other"));
+    // Before any plan is published, the four tiers.
+    let (_, config) = admin_call(&app, Method::GET, "/api/v1/admin/commercial-config", None).await;
+    let ids: Vec<_> = config["config"]["plans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|plan| plan["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids, ["tier-1000", "tier-2000", "tier-5000", "tier-10000"]);
+    let mut family = plan_json("family", "家庭卡", 20.0);
+    family["max_devices"] = json!(2);
+    let mut old = plan_json("old", "旧卡", 1.0);
+    old["on_sale"] = json!(false);
+    let config = publish_plans(
+        &app,
+        &billing,
+        vec![plan_json("trial-7d", "体验卡", 9.9), family, old],
+    )
+    .await;
+    assert_eq!(config["plans"][0]["id"], "family");
+    assert_eq!(config["cards_by_plan"]["trial-7d"], 0);
+
+    let issue = |body: serde_json::Value| {
+        let app = app.clone();
+        async move { admin_call(&app, Method::POST, "/api/v1/admin/cards/batch", Some(body)).await }
+    };
+    // Into a group other than the plan's default: the console warns, the server issues.
+    let (status, body) =
+        issue(json!({"count": 2, "groupId": "group-other", "planId": "trial-7d"})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let issued = &body["cards"][0];
+    assert_eq!(issued["planId"], "trial-7d");
+    assert_eq!(issued["virtualPlanName"], "体验卡");
+    assert_eq!(issued["creditTotal"], 300_000_000);
+    assert_eq!(issued["groupId"], "group-other");
+    assert_eq!(
+        issued["plan"],
+        json!({"id": "trial-7d", "name": "体验卡", "points": 300, "priceMicroCny": 9_900_000,
+               "validityDays": 7, "maxDevices": 1, "concurrency": 1, "kiroPlanType": "CUSTOM"})
+    );
+    let card_id = issued["cardId"].as_str().unwrap().to_string();
+    // templateId still names a plan, and so does the old default.
+    for (body, plan, name) in [
+        (
+            json!({"count": 1, "groupId": "group-pro-plus", "templateId": "tier-5000"}),
+            "tier-5000",
+            "PRO Max",
+        ),
+        (
+            json!({"count": 1, "groupId": "group-pro-plus"}),
+            "tier-2000",
+            "PRO+",
+        ),
+        (
+            json!({"count": 1, "groupId": "group-pro-plus", "templateId": "standard-monthly", "planId": "standard-monthly"}),
+            "tier-2000",
+            "PRO+",
+        ),
+    ] {
+        let (status, response) = issue(body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let card = billing
+            .get_card(response["cards"][0]["cardId"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(card.plan.as_ref().map(|p| p.id.as_str()), Some(plan));
+        assert_eq!(card.plan_name(), Some(name));
+    }
+    for (body, message) in [
+        (
+            json!({"count": 1, "groupId": "group-pro-plus", "planId": "trial-7d", "templateId": "tier-1000"}),
+            "planId and templateId name different plans",
+        ),
+        (
+            json!({"count": 1, "groupId": "group-pro-plus", "planId": "ghost"}),
+            "unknown plan",
+        ),
+        (
+            json!({"count": 1, "groupId": "group-pro-plus", "planId": "old"}),
+            "plan is not on sale",
+        ),
+        (
+            json!({"count": 1, "groupId": "group-pro-plus", "planId": "family"}),
+            "cards have one device; issue from a plan with max_devices 1",
+        ),
+        (
+            json!({"count": 1, "groupId": "group-pro-plus", "planId": "trial-7d", "creditTotal": 2_000_000_000i64}),
+            "issuance requires an enabled group, the plan's credits, and maxDevices=1",
+        ),
+    ] {
+        let (status, response) = issue(body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(response["message"], message);
+    }
+
+    // The card keeps the plan as it was sold, whatever the catalog becomes.
+    publish_plans(
+        &app,
+        &billing,
+        vec![plan_json("trial-7d", "体验卡Plus", 12.0)],
+    )
+    .await;
+    let (_, cards) = admin_call(&app, Method::GET, "/api/v1/admin/cards?limit=500", None).await;
+    let view = |id: &str| {
+        cards["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|card| card["id"] == id)
+            .cloned()
+            .unwrap()
+    };
+    let card = view(&card_id);
+    assert_eq!(
+        (&card["planId"], &card["planName"], &card["kiroPlanType"]),
+        (&json!("trial-7d"), &json!("体验卡"), &json!("CUSTOM"))
+    );
+    assert_eq!(card["plan"]["priceMicroCny"], 9_900_000);
+    assert_eq!(card["activationDurationSecs"], 7 * 86_400);
+    // A card from before the catalog: its tier by its credits, or none.
+    let legacy = view("card-admin-01");
+    assert_eq!(
+        (
+            &legacy["planId"],
+            &legacy["planName"],
+            &legacy["kiroPlanType"],
+            &legacy["plan"]
+        ),
+        (&json!(null), &json!(null), &json!("CUSTOM"), &json!(null))
+    );
+    let (_, history) = admin_call(
+        &app,
+        Method::GET,
+        &format!("/api/v1/admin/cards/history?card_id={card_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(history["card"]["planName"], "体验卡");
+
+    // Finance prices plans from the catalog and each card at what it was sold for.
+    let (_, finance) = admin_call(&app, Method::GET, "/api/v1/admin/financials", None).await;
+    let trial_price = finance["planPrices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|plan| plan["planId"] == "trial-7d")
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        trial_price,
+        json!({"templateId": "trial-7d", "planId": "trial-7d", "name": "体验卡Plus",
+               "points": 300, "priceMicroCny": 12_000_000, "onSale": true})
+    );
+    let trial_sales = finance["sales"]["byPlan"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|plan| plan["planId"] == "trial-7d")
+        .cloned()
+        .unwrap();
+    assert_eq!(trial_sales["issuedCards"], 2);
+    assert_eq!(trial_sales["issuedValueMicroCny"], 19_800_000);
+    assert_eq!(trial_sales["priceMicroCny"], 12_000_000);
+
+    // Cards were issued from it: it is taken off sale, not removed.
+    let (status, body) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/commercial-config",
+        Some(json!({
+            "expected_revision": billing.commercial_config().revision,
+            "reason": "停售",
+            "removed_plans": ["trial-7d"],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        body["error"],
+        "Invalid billing state: Plans cards were issued from can only be taken off sale: trial-7d"
+    );
+    let (_, config) = admin_call(&app, Method::GET, "/api/v1/admin/commercial-config", None).await;
+    assert_eq!(config["config"]["cards_by_plan"]["trial-7d"], 2);
+}

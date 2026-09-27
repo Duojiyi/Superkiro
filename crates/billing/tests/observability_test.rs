@@ -1292,7 +1292,8 @@ fn sales_count_cards_issued_and_activated_in_the_period_at_list_price() {
         misprint,
         refunded,
     ];
-    let sales = billing::observability::compute_sales(cards.iter(), Some(100), Some(200));
+    let plans = billing::template::seed_plans(&Default::default());
+    let sales = billing::observability::compute_sales(cards.iter(), &plans, Some(100), Some(200));
     // Issued in [100, 200): pro, pro-plus, custom and the refunded card; the misprint was
     // voided unsold, "later" is at the end of the period and "power" before it.
     assert_eq!(sales.issued_cards, 4);
@@ -1308,13 +1309,19 @@ fn sales_count_cards_issued_and_activated_in_the_period_at_list_price() {
         sales.activated_value_micro_cny,
         55_000_000 + 250_000_000 + 55_000_000
     );
-    let plans: Vec<_> = sales
+    let by_plan: Vec<_> = sales
         .by_plan
         .iter()
-        .map(|plan| (plan.template_id, plan.issued_cards, plan.activated_cards))
+        .map(|plan| {
+            (
+                plan.template_id.as_str(),
+                plan.issued_cards,
+                plan.activated_cards,
+            )
+        })
         .collect();
     assert_eq!(
-        plans,
+        by_plan,
         [
             ("tier-1000", 1, 0),
             ("tier-2000", 2, 2),
@@ -1323,8 +1330,81 @@ fn sales_count_cards_issued_and_activated_in_the_period_at_list_price() {
         ]
     );
     // Without a period, every card.
-    let all = billing::observability::compute_sales(cards.iter(), None, None);
+    let all = billing::observability::compute_sales(cards.iter(), &plans, None, None);
     assert_eq!((all.issued_cards, all.activated_cards), (6, 5));
+}
+
+/// A card issued from the catalog counts under its plan at the price it was issued at, one
+/// issued before it under the tier its credits name at the tier's list price, whatever the
+/// catalog says now; a plan the catalog no longer holds still gets its row.
+#[test]
+fn sales_count_each_card_at_the_plan_price_it_was_issued_at() {
+    let mut plans = billing::template::seed_plans(&Default::default());
+    // PRO now sells for ¥35, and a trial plan was added.
+    plans[0].price_cny = 35.0;
+    let trial = billing::template::Plan {
+        id: "trial".into(),
+        name: "体验卡".into(),
+        points: 300,
+        price_cny: 9.9,
+        validity_days: 7,
+        max_devices: 1,
+        concurrency: 1,
+        default_group_id: "group".into(),
+        kiro_plan_type: "CUSTOM".into(),
+        on_sale: true,
+        sort_order: 1,
+    };
+    plans.insert(0, trial.clone());
+    let issued = |id: &str, plan: &billing::template::Plan| {
+        let mut card = Card::from_template(id, "hash", &plan.template("group"), None, 150);
+        card.activated_at = Some(160);
+        card
+    };
+    let mut before_catalog = Card::new("legacy-pro", "group", 1_000_000_000);
+    before_catalog.created_at = 150;
+    let mut retired = trial.clone();
+    retired.id = "retired".into();
+    retired.price_cny = 5.0;
+    let cards = [
+        issued("trial-1", &trial),
+        issued("trial-2", &trial),
+        issued("pro-new", &plans[1]),
+        before_catalog,
+        issued("retired-1", &retired),
+    ];
+    let sales = billing::observability::compute_sales(cards.iter(), &plans, None, None);
+    let rows: Vec<_> = sales
+        .by_plan
+        .iter()
+        .map(|plan| {
+            (
+                plan.plan_id.as_str(),
+                plan.issued_cards,
+                plan.issued_value_micro_cny,
+                plan.activated_cards,
+                plan.activated_value_micro_cny,
+                plan.price_micro_cny,
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ("trial", 2, 19_800_000, 2, 19_800_000, 9_900_000),
+            // One card at the ¥35 it was issued at, one at the ¥30 list price before it.
+            ("tier-1000", 2, 65_000_000, 1, 35_000_000, 35_000_000),
+            ("tier-2000", 0, 0, 0, 0, 55_000_000),
+            ("tier-5000", 0, 0, 0, 0, 130_000_000),
+            ("tier-10000", 0, 0, 0, 0, 250_000_000),
+            ("retired", 1, 5_000_000, 1, 5_000_000, 5_000_000),
+        ]
+    );
+    assert_eq!(
+        sales.issued_value_micro_cny,
+        19_800_000 + 65_000_000 + 5_000_000
+    );
+    assert_eq!((sales.issued_cards, sales.unpriced_issued_cards), (5, 0));
 }
 
 #[test]

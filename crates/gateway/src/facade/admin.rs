@@ -27,7 +27,6 @@ use axum::{
 use billing::card::{Card, CardStatus};
 use billing::engine::BillingEngine;
 use billing::observability::{Announcement, AnnouncementLevel};
-use billing::CardTemplate;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -770,6 +769,21 @@ impl FacadeHandler for AdminFinancialsHandler {
                 .count() as u64;
             let uncosted_requests = dashboard.total_requests.saturating_sub(costed_requests);
             let (from_secs, to_secs) = period;
+            let plans =
+                billing::template::plan_catalog(snapshot.plans.as_deref(), &snapshot.groups);
+            let plan_prices: Vec<serde_json::Value> = plans
+                .iter()
+                .map(|plan| {
+                    serde_json::json!({
+                        "templateId": plan.id,
+                        "planId": plan.id,
+                        "name": plan.name,
+                        "points": plan.points,
+                        "priceMicroCny": plan.price_micro_cny(),
+                        "onSale": plan.on_sale,
+                    })
+                })
+                .collect();
             json_response(
                 StatusCode::OK,
                 &serde_json::json!({
@@ -779,10 +793,11 @@ impl FacadeHandler for AdminFinancialsHandler {
                     // What each upstream should bill for the period.
                     "byProvider": billing::observability::compute_provider_costs(&snapshot.ledger),
                     "margin": billing::observability::compute_costed_margin(&snapshot.ledger, &snapshot.settings),
-                    "sales": billing::observability::compute_sales(snapshot.cards.values(), from_secs, to_secs),
+                    "sales": billing::observability::compute_sales(snapshot.cards.values(), &plans, from_secs, to_secs),
                     // Balances still owed, now, whatever the period.
                     "liability": billing::observability::compute_liability(snapshot.cards.values(), &snapshot.settings, now_secs()),
-                    "planPrices": billing::template::PLAN_PRICES,
+                    // The plan catalog's prices, in its order.
+                    "planPrices": plan_prices,
                     "dashboard": dashboard,
                     "modelRankings": rankings,
                     "basis": "retained_usage_ledger_estimate_not_cash_revenue",
@@ -1147,6 +1162,9 @@ pub struct AdminBatchCardsRequest {
     #[serde(alias = "max_devices")]
     pub max_devices: Option<u32>,
     pub count: usize,
+    /// The plan to issue from, by ID.
+    pub plan_id: Option<String>,
+    /// The older name of planId.
     pub template_id: Option<String>,
     pub group_id: Option<String>,
     pub note: Option<String>,
@@ -1210,14 +1228,47 @@ impl FacadeHandler for AdminBatchCardsHandler {
                     "invalid group_id",
                 );
             }
-            let template_id = body.template_id.as_deref().unwrap_or("standard-monthly");
-            let Some(template) = CardTemplate::tier(template_id, &group_id) else {
+            let plan_id = match (body.plan_id.as_deref(), body.template_id.as_deref()) {
+                (Some(plan), Some(template)) if plan != template => {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidRequestException",
+                        "planId and templateId name different plans",
+                    )
+                }
+                (Some(id), _) | (None, Some(id)) => id,
+                (None, None) => "standard-monthly",
+            };
+            // The PRO+ tier's old default ID still names it, unless a plan has taken it.
+            let plan = self.billing.plan(plan_id).or_else(|| {
+                (plan_id == "standard-monthly")
+                    .then(|| self.billing.plan("tier-2000"))
+                    .flatten()
+            });
+            let Some(plan) = plan else {
                 return error_response(
                     StatusCode::BAD_REQUEST,
                     "InvalidRequestException",
-                    "unknown tier template",
+                    "unknown plan",
                 );
             };
+            if !plan.on_sale {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRequestException",
+                    "plan is not on sale",
+                );
+            }
+            // A card binds one device, whatever a plan says.
+            if plan.max_devices != 1 {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRequestException",
+                    "cards have one device; issue from a plan with max_devices 1",
+                );
+            }
+            // Any group that takes cards, the plan's default or not.
+            let template = plan.template(&group_id);
             if self
                 .billing
                 .get_group(&group_id)
@@ -1230,7 +1281,7 @@ impl FacadeHandler for AdminBatchCardsHandler {
                 return error_response(
                     StatusCode::BAD_REQUEST,
                     "InvalidRequestException",
-                    "issuance requires an enabled group, matching tier credits, and maxDevices=1",
+                    "issuance requires an enabled group, the plan's credits, and maxDevices=1",
                 );
             }
             let now = now_secs();
@@ -1266,6 +1317,8 @@ impl FacadeHandler for AdminBatchCardsHandler {
                         "maxDevices": 1,
                         "virtualPlanName": generated.card.plan_name(),
                         "status": generated.card.status,
+                        "planId": generated.card.plan_id(),
+                        "plan": generated.card.plan.as_ref().map(card_plan_view),
                     })
                 })
                 .collect();
@@ -1475,6 +1528,43 @@ pub struct AdminCardItem {
     pub activation_duration_secs: Option<u64>,
     pub group_id: String,
     pub note: Option<String>,
+    /// The plan it was issued from; for a card issued before the plan catalog, the tier its
+    /// issued credits name, if any.
+    pub plan_id: Option<String>,
+    /// What the customer's client calls its plan.
+    pub plan_name: Option<String>,
+    /// What Kiro is told it subscribes to.
+    pub kiro_plan_type: String,
+    /// The plan as it was when the card was issued; null for cards issued before the plan
+    /// catalog.
+    pub plan: Option<CardPlanView>,
+}
+
+/// The plan a card was issued from, as it was then.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CardPlanView {
+    pub id: String,
+    pub name: String,
+    pub points: i64,
+    pub price_micro_cny: i64,
+    pub validity_days: u32,
+    pub max_devices: u32,
+    pub concurrency: u32,
+    pub kiro_plan_type: String,
+}
+
+fn card_plan_view(plan: &billing::template::IssuedPlan) -> CardPlanView {
+    CardPlanView {
+        id: plan.id.clone(),
+        name: plan.name.clone(),
+        points: plan.points,
+        price_micro_cny: plan.price_micro_cny,
+        validity_days: plan.validity_days,
+        max_devices: plan.max_devices,
+        concurrency: plan.concurrency,
+        kiro_plan_type: plan.kiro_plan_type.clone(),
+    }
 }
 
 fn status_name(status: CardStatus) -> &'static str {
@@ -1510,6 +1600,10 @@ fn card_view(card: Card, now: u64) -> AdminCardItem {
         activation_duration_secs: card
             .activation_duration_secs
             .filter(|_| card.activated_at.is_none()),
+        plan_id: card.plan_id().map(str::to_string),
+        plan_name: card.plan_name().map(str::to_string),
+        kiro_plan_type: card.plan_type().to_string(),
+        plan: card.plan.as_ref().map(card_plan_view),
         id: card.id,
         bound_devices: card.bound_devices,
         group_id: card.group_id,

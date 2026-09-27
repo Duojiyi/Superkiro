@@ -667,19 +667,25 @@ pub fn compute_costed_margin(entries: &[LedgerEntry], settings: &BillingSettings
     margin
 }
 
-/// Cards of one tier issued and activated over a period.
+/// Cards of one plan issued and activated over a period, and what they sold for.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanSales {
-    pub template_id: &'static str,
-    pub name: &'static str,
+    /// The plan's ID, under the name the tiers had.
+    pub template_id: String,
+    pub plan_id: String,
+    pub name: String,
     pub points: i64,
+    /// Its price in the catalog, or, for a plan no longer in it, what its cards sold for.
     pub price_micro_cny: i64,
     pub issued_cards: u64,
     pub activated_cards: u64,
+    /// Each card at the price it was issued at.
+    pub issued_value_micro_cny: i64,
+    pub activated_value_micro_cny: i64,
 }
 
-/// Cards issued and activated over a period, and their value at the tiers' list prices.
+/// Cards issued and activated over a period, and what they sold for.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Sales {
@@ -687,65 +693,86 @@ pub struct Sales {
     pub issued_value_micro_cny: i64,
     pub activated_cards: u64,
     pub activated_value_micro_cny: i64,
-    /// Cards whose credits match no tier: counted, not valued.
+    /// Cards of no plan (issued before the catalog with credits no tier had): counted, not
+    /// valued.
     pub unpriced_issued_cards: u64,
     pub unpriced_activated_cards: u64,
+    /// The catalog's plans in its order, then any plan cards were sold from that it no
+    /// longer holds.
     pub by_plan: Vec<PlanSales>,
 }
 
 /// Issued counts cards created in `[from, to)`, less those voided without ever being
-/// activated, which were never sold; activated counts cards activated in it.
+/// activated, which were never sold; activated counts cards activated in it. A card counts
+/// under the plan it was issued from at the price it was issued at; one issued before the
+/// catalog, under the tier its credits name at that tier's list price.
 pub fn compute_sales<'a>(
     cards: impl IntoIterator<Item = &'a crate::card::Card>,
+    plans: &[crate::template::Plan],
     from: Option<u64>,
     to: Option<u64>,
 ) -> Sales {
     let within = |ts: u64| from.is_none_or(|from| ts >= from) && to.is_none_or(|to| ts < to);
+    let row = |id: &str, name: &str, points: i64, price_micro_cny: i64| PlanSales {
+        template_id: id.to_string(),
+        plan_id: id.to_string(),
+        name: name.to_string(),
+        points,
+        price_micro_cny,
+        issued_cards: 0,
+        activated_cards: 0,
+        issued_value_micro_cny: 0,
+        activated_value_micro_cny: 0,
+    };
     let mut sales = Sales {
-        by_plan: crate::template::PLAN_PRICES
+        by_plan: plans
             .iter()
-            .map(|plan| PlanSales {
-                template_id: plan.template_id,
-                name: plan.name,
-                points: plan.points,
-                price_micro_cny: plan.price_micro_cny,
-                issued_cards: 0,
-                activated_cards: 0,
-            })
+            .map(|plan| row(&plan.id, &plan.name, plan.points, plan.price_micro_cny()))
             .collect(),
         ..Sales::default()
     };
     for card in cards {
-        let plan = card.issued_credits.and_then(|credits| {
-            crate::template::PLAN_PRICES.iter().position(|plan| {
-                plan.points.saturating_mul(crate::MICRO_CREDITS_PER_CREDIT) == credits
-            })
-        });
         let never_sold =
             card.status == crate::card::CardStatus::Voided && card.activated_at.is_none();
-        if within(card.created_at) && !never_sold {
-            sales.issued_cards += 1;
-            match plan {
-                Some(index) => {
-                    sales.by_plan[index].issued_cards += 1;
-                    sales.issued_value_micro_cny = sales
-                        .issued_value_micro_cny
-                        .saturating_add(sales.by_plan[index].price_micro_cny);
-                }
-                None => sales.unpriced_issued_cards += 1,
-            }
+        let issued = within(card.created_at) && !never_sold;
+        let activated = card.activated_at.is_some_and(within);
+        if !issued && !activated {
+            continue;
         }
-        if card.activated_at.is_some_and(within) {
-            sales.activated_cards += 1;
-            match plan {
-                Some(index) => {
-                    sales.by_plan[index].activated_cards += 1;
-                    sales.activated_value_micro_cny = sales
-                        .activated_value_micro_cny
-                        .saturating_add(sales.by_plan[index].price_micro_cny);
-                }
-                None => sales.unpriced_activated_cards += 1,
+        sales.issued_cards += u64::from(issued);
+        sales.activated_cards += u64::from(activated);
+        let sold = match (&card.plan, card.legacy_tier()) {
+            (Some(plan), _) => Some((&*plan.id, &*plan.name, plan.points, plan.price_micro_cny)),
+            (None, Some(tier)) => Some((
+                tier.template_id,
+                tier.name,
+                tier.points,
+                tier.price_micro_cny,
+            )),
+            (None, None) => None,
+        };
+        let Some((id, name, points, price)) = sold else {
+            sales.unpriced_issued_cards += u64::from(issued);
+            sales.unpriced_activated_cards += u64::from(activated);
+            continue;
+        };
+        let index = match sales.by_plan.iter().position(|plan| plan.plan_id == id) {
+            Some(index) => index,
+            None => {
+                sales.by_plan.push(row(id, name, points, price));
+                sales.by_plan.len() - 1
             }
+        };
+        let plan = &mut sales.by_plan[index];
+        if issued {
+            plan.issued_cards += 1;
+            plan.issued_value_micro_cny = plan.issued_value_micro_cny.saturating_add(price);
+            sales.issued_value_micro_cny = sales.issued_value_micro_cny.saturating_add(price);
+        }
+        if activated {
+            plan.activated_cards += 1;
+            plan.activated_value_micro_cny = plan.activated_value_micro_cny.saturating_add(price);
+            sales.activated_value_micro_cny = sales.activated_value_micro_cny.saturating_add(price);
         }
     }
     sales

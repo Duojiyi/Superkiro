@@ -112,6 +112,8 @@ async fn run_after(first: &[Value], frames: &[Value]) -> Outcome {
                 versions: vec![],
                 removed_models: vec![],
                 cancelled_versions: vec![],
+                plans: vec![],
+                removed_plans: vec![],
             },
             1_700_000_000,
         )

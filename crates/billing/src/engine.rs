@@ -120,6 +120,7 @@ pub struct CardReconciliation {
 
 use crate::group::{Group, ModelMap};
 use crate::rate_card::{BillingSettings, MarginSummary, RateCard, RateCardVersion};
+use crate::template::Plan;
 use crate::workbench::{RateCardAuditLog, SimulationResult};
 
 use crate::observability::{
@@ -166,6 +167,7 @@ pub struct BillingEngine {
     rates: Arc<RwLock<HashMap<String, PricingRates>>>,
     topup_codes: Arc<RwLock<HashMap<String, TopupCode>>>,
     groups: Arc<RwLock<HashMap<String, Group>>>,
+    plans: Arc<RwLock<Option<Vec<Plan>>>>,
     model_maps: Arc<RwLock<Vec<ModelMap>>>,
     rate_cards: Arc<RwLock<HashMap<String, RateCard>>>,
     rate_card_versions: Arc<RwLock<Vec<RateCardVersion>>>,
@@ -288,6 +290,9 @@ pub struct BillingSnapshot {
     pub rates: HashMap<String, PricingRates>,
     pub topup_codes: HashMap<String, TopupCode>,
     pub groups: HashMap<String, Group>,
+    /// The plan catalog, once a publication has changed it; until then the seed is in force.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plans: Option<Vec<Plan>>,
     pub model_maps: Vec<ModelMap>,
     pub rate_cards: HashMap<String, RateCard>,
     pub rate_card_versions: Vec<RateCardVersion>,
@@ -642,6 +647,7 @@ impl BillingEngine {
             rates: Arc::new(RwLock::new(HashMap::new())),
             topup_codes: Arc::new(RwLock::new(HashMap::new())),
             groups,
+            plans: Arc::new(RwLock::new(None)),
             model_maps: Arc::new(RwLock::new(Vec::new())),
             rate_cards,
             rate_card_versions: Arc::new(RwLock::new(Vec::new())),
@@ -767,6 +773,7 @@ impl BillingEngine {
             rates: self.rates.read().unwrap().clone(),
             topup_codes: self.topup_codes.read().unwrap().clone(),
             groups: self.groups.read().unwrap().clone(),
+            plans: self.plans.read().unwrap().clone(),
             model_maps: self.model_maps.read().unwrap().clone(),
             rate_cards: self.rate_cards.read().unwrap().clone(),
             rate_card_versions: self.rate_card_versions.read().unwrap().clone(),
@@ -843,6 +850,7 @@ impl BillingEngine {
         *self.rates.write().unwrap() = snapshot.rates;
         *self.topup_codes.write().unwrap() = snapshot.topup_codes;
         *self.groups.write().unwrap() = snapshot.groups;
+        *self.plans.write().unwrap() = snapshot.plans;
         *self.model_maps.write().unwrap() = snapshot.model_maps;
         *self.rate_cards.write().unwrap() = snapshot.rate_cards;
         *self.rate_card_versions.write().unwrap() = snapshot.rate_card_versions;
@@ -4401,6 +4409,21 @@ impl BillingEngine {
     pub fn list_groups(&self) -> Vec<Group> {
         let r = self.groups.read().unwrap();
         r.values().cloned().collect()
+    }
+
+    /// The plan catalog in force, in its order: the plans published, or the seed until a
+    /// publication changes them.
+    pub fn plans(&self) -> Vec<Plan> {
+        let _state_guard = self.state_lock.read().unwrap();
+        crate::template::plan_catalog(
+            self.plans.read().unwrap().as_deref(),
+            &self.groups.read().unwrap(),
+        )
+    }
+
+    /// One plan of the catalog in force.
+    pub fn plan(&self, id: &str) -> Option<Plan> {
+        self.plans().into_iter().find(|plan| plan.id == id)
     }
 
     /// Add or update a model mapping entry for a group.

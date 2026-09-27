@@ -134,6 +134,8 @@ async fn harness(declared_vision: bool, enable_fallback: bool) -> Harness {
                 versions: vec![],
                 removed_models: vec![],
                 cancelled_versions: vec![],
+                plans: vec![],
+                removed_plans: vec![],
             },
             1_700_000_000,
         )

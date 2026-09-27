@@ -125,6 +125,8 @@ async fn configured_capabilities_reach_catalog_upstream_billing_and_usage() {
                         versions: vec![],
                         removed_models: vec![],
                         cancelled_versions: vec![],
+                        plans: vec![],
+                        removed_plans: vec![],
                     },
                     1_700_000_000
                 )
@@ -142,6 +144,8 @@ async fn configured_capabilities_reach_catalog_upstream_billing_and_usage() {
                     versions: vec![],
                     removed_models: vec![],
                     cancelled_versions: vec![],
+                    plans: vec![],
+                    removed_plans: vec![],
                 },
                 1_700_000_000,
             )

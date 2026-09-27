@@ -647,6 +647,8 @@ async fn a_disabled_fallback_is_passed_over() {
                 versions: vec![],
                 removed_models: vec![],
                 cancelled_versions: vec![],
+                plans: vec![],
+                removed_plans: vec![],
             },
             gateway::now_secs(),
         )

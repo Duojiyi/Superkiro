@@ -1,6 +1,7 @@
 //! Validated atomic publication. No secrets are exposed by this view.
 use super::*;
 use crate::rate_card::{Currency, OfficialPricing, PricingMode};
+use crate::template::{plan_catalog, seed_plans, MAX_PLANS};
 use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommercialAudit {
@@ -31,6 +32,14 @@ pub struct CommercialUpdate {
     /// Price versions to withdraw, by ID; only one not yet in force can be.
     #[serde(default)]
     pub cancelled_versions: Vec<String>,
+    /// Plans to add or replace, by ID. The first publication that changes plans stores the
+    /// catalog, the seed included.
+    #[serde(default)]
+    pub plans: Vec<Plan>,
+    /// Plans to delete, by ID; only one no card was issued from can be. The others are taken
+    /// off sale instead.
+    #[serde(default)]
+    pub removed_plans: Vec<String>,
 }
 #[derive(Debug, Serialize)]
 pub struct CommercialConfig {
@@ -41,6 +50,11 @@ pub struct CommercialConfig {
     pub models: Vec<ModelMap>,
     pub rate_cards: Vec<RateCard>,
     pub versions: Vec<RateCardVersion>,
+    /// The plan catalog in force, by sort order then ID.
+    pub plans: Vec<Plan>,
+    /// Cards issued from each plan of the catalog, those issued before it counted under the
+    /// tier their credits name. A plan with any cannot be removed, only taken off sale.
+    pub cards_by_plan: BTreeMap<String, u64>,
 }
 fn view(s: &BillingSnapshot) -> CommercialConfig {
     let mut groups: Vec<_> = s.groups.values().cloned().collect();
@@ -51,13 +65,27 @@ fn view(s: &BillingSnapshot) -> CommercialConfig {
     rate_cards.sort_by(|a, b| a.id.cmp(&b.id));
     let mut versions = s.rate_card_versions.clone();
     versions.sort_by(|a, b| a.id.cmp(&b.id));
-    let bytes =
-        serde_json::to_vec(&(&groups, &models, &rate_cards, &versions, &s.settings)).unwrap();
+    // Until plans are stored, the revision is what it was before the catalog.
+    let bytes = match &s.plans {
+        None => serde_json::to_vec(&(&groups, &models, &rate_cards, &versions, &s.settings)),
+        Some(plans) => {
+            serde_json::to_vec(&(&groups, &models, &rate_cards, &versions, &s.settings, plans))
+        }
+    }
+    .unwrap();
     let revision = ring::digest::digest(&ring::digest::SHA256, &bytes)
         .as_ref()
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
+    let plans = plan_catalog(s.plans.as_deref(), &s.groups);
+    let mut cards_by_plan: BTreeMap<String, u64> =
+        plans.iter().map(|plan| (plan.id.clone(), 0)).collect();
+    for card in s.cards.values() {
+        if let Some(count) = card.plan_id().and_then(|id| cards_by_plan.get_mut(id)) {
+            *count += 1;
+        }
+    }
     CommercialConfig {
         revision,
         settings: s.settings.clone(),
@@ -66,6 +94,8 @@ fn view(s: &BillingSnapshot) -> CommercialConfig {
         models,
         rate_cards,
         versions,
+        plans,
+        cards_by_plan,
     }
 }
 fn text(s: &str, max: usize) -> bool {
@@ -170,6 +200,8 @@ impl BillingEngine {
             + u.versions.len()
             + u.removed_models.len()
             + u.cancelled_versions.len()
+            + u.plans.len()
+            + u.removed_plans.len()
             == 0
             && u.settings.is_none()
         {
@@ -322,6 +354,51 @@ impl BillingEngine {
                 return Err(invalid("Invalid group or unknown rate card"));
             }
             c.groups.insert(g.id.clone(), g);
+        }
+        // The catalog is stored by the first publication that changes a plan, the seed with
+        // it; only the plans a publication lists are checked, against its groups.
+        if !u.plans.is_empty() || !u.removed_plans.is_empty() {
+            let mut plans = c.plans.take().unwrap_or_else(|| seed_plans(&c.groups));
+            let mut listed = std::collections::HashSet::new();
+            for plan in u.plans {
+                if let Some(problem) = plan.problem() {
+                    return Err(invalid_ids(problem, &[plan.id.as_str()]));
+                }
+                if !listed.insert(plan.id.clone()) {
+                    return Err(invalid_ids("Duplicate plan", &[plan.id.as_str()]));
+                }
+                if !c.groups.contains_key(&plan.default_group_id) {
+                    return Err(invalid_ids(
+                        "Unknown default group of plan",
+                        &[plan.id.as_str()],
+                    ));
+                }
+                match plans.iter_mut().find(|old| old.id == plan.id) {
+                    Some(old) => *old = plan,
+                    None => plans.push(plan),
+                }
+            }
+            // A card keeps the plan it was issued from; the catalog keeps it too.
+            for id in &u.removed_plans {
+                let Some(index) = plans.iter().position(|plan| plan.id == *id) else {
+                    return Err(invalid_ids("Unknown plan", &[id.as_str()]));
+                };
+                if c.cards
+                    .values()
+                    .any(|card| card.plan_id() == Some(id.as_str()))
+                {
+                    return Err(invalid_ids(
+                        "Plans cards were issued from can only be taken off sale",
+                        &[id.as_str()],
+                    ));
+                }
+                plans.remove(index);
+            }
+            if plans.len() > MAX_PLANS {
+                return Err(invalid("At most 100 plans"));
+            }
+            plans.sort_by(|a, b| a.id.cmp(&b.id));
+            c.plans = Some(plans);
         }
         // Only the mappings this publication lists are held to the model ID rule requests
         // meet, and to being servable: one published before either rule still loads.
@@ -596,6 +673,7 @@ impl BillingEngine {
             *self.settings.write().unwrap() = c.settings.clone();
             *self.commercial_audit_logs.write().unwrap() = c.commercial_audit_logs.clone();
             *self.groups.write().unwrap() = c.groups.clone();
+            *self.plans.write().unwrap() = c.plans.clone();
             *self.model_maps.write().unwrap() = c.model_maps.clone();
             *self.rate_cards.write().unwrap() = c.rate_cards.clone();
             *self.rate_card_versions.write().unwrap() = c.rate_card_versions.clone();
@@ -620,6 +698,8 @@ mod tests {
             versions: vec![],
             removed_models: vec![],
             cancelled_versions: vec![],
+            plans: vec![],
+            removed_plans: vec![],
         }
     }
     #[test]
@@ -1961,5 +2041,270 @@ mod tests {
                 ("a-later-2", 500, 0.05)
             ]
         );
+    }
+
+    /// A seven-day trial into "new-tier", listed first.
+    fn trial_plan() -> Plan {
+        Plan {
+            id: "trial-7d".into(),
+            name: "体验卡".into(),
+            points: 300,
+            price_cny: 9.9,
+            validity_days: 7,
+            max_devices: 1,
+            concurrency: 1,
+            default_group_id: "new-tier".into(),
+            kiro_plan_type: "CUSTOM".into(),
+            on_sale: true,
+            sort_order: 5,
+        }
+    }
+
+    /// A state that has stored no plans has the four tiers as they were issued, into
+    /// group-pro-plus while it exists, and keeps the revision it had before the catalog. The
+    /// first publication that changes a plan stores the whole catalog, which a restart keeps.
+    #[test]
+    fn a_state_without_plans_has_the_four_tiers_until_one_is_changed() {
+        let e = BillingEngine::new();
+        let config = e.commercial_config();
+        let seeded: Vec<_> = config
+            .plans
+            .iter()
+            .map(|p| {
+                let kind = p.kiro_plan_type.as_str();
+                (
+                    p.id.as_str(),
+                    p.name.as_str(),
+                    p.points,
+                    p.price_cny,
+                    kind,
+                    p.sort_order,
+                )
+            })
+            .collect();
+        assert_eq!(
+            seeded,
+            [
+                ("tier-1000", "PRO", 1000, 30.0, "PRO", 10),
+                ("tier-2000", "PRO+", 2000, 55.0, "PRO_PLUS", 20),
+                ("tier-5000", "PRO Max", 5000, 130.0, "PRO_MAX", 30),
+                ("tier-10000", "Power", 10000, 250.0, "POWER", 40),
+            ]
+        );
+        assert!(config.plans.iter().all(|p| p.validity_days == 30
+            && p.max_devices == 1
+            && p.concurrency == 2
+            && p.on_sale
+            && p.default_group_id == "group-pro-plus"
+            && p.problem().is_none()));
+        // The revision as it was computed before the catalog.
+        let s = e.export_snapshot();
+        let groups: Vec<_> = s.groups.values().cloned().collect();
+        let rate_cards: Vec<_> = s.rate_cards.values().cloned().collect();
+        let no_models: Vec<ModelMap> = vec![];
+        let no_versions: Vec<RateCardVersion> = vec![];
+        let bytes =
+            serde_json::to_vec(&(&groups, &no_models, &rate_cards, &no_versions, &s.settings))
+                .unwrap();
+        let revision: String = ring::digest::digest(&ring::digest::SHA256, &bytes)
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(config.revision, revision);
+
+        // A publication that leaves plans alone stores none.
+        e.publish_commercial_config(update(&e), 100).unwrap();
+        assert!(e.export_snapshot().plans.is_none());
+        // Without group-pro-plus, the seed issues into the first group by ID.
+        let mut without = e.export_snapshot();
+        without.groups.remove("group-pro-plus");
+        let restored = BillingEngine::new();
+        restored.import_snapshot(without);
+        assert!(restored
+            .plans()
+            .iter()
+            .all(|p| p.default_group_id == "new-tier"));
+
+        let mut u = update(&e);
+        let mut pro = e.plan("tier-1000").unwrap();
+        pro.price_cny = 35.0;
+        u.plans = vec![pro];
+        let config = e.publish_commercial_config(u, 200).unwrap();
+        assert_eq!(e.export_snapshot().plans.map(|plans| plans.len()), Some(4));
+        assert_eq!(e.plan("tier-1000").unwrap().price_cny, 35.0);
+        assert_eq!(e.plan("tier-2000").unwrap().price_cny, 55.0);
+        assert_eq!(config.plans, e.plans());
+        let restored = BillingEngine::new();
+        restored.import_snapshot(e.export_snapshot());
+        assert_eq!(restored.commercial_config().revision, config.revision);
+        assert_eq!(restored.plans(), e.plans());
+    }
+
+    /// Each field of a published plan is bounded, its default group is one the configuration
+    /// has, and a refused publication changes nothing.
+    #[test]
+    fn plan_publication_is_bounded_and_refusals_change_nothing() {
+        let e = serving_engine();
+        let before = e.commercial_config().revision;
+        type Edit = Box<dyn Fn(&mut Plan)>;
+        let id = "Plan IDs are 1-64 of a-z, 0-9 and -";
+        let name = "Plan names are 1-32 bytes";
+        let points = "Plan points must be 1-10000000";
+        let price = "Plan prices must be 0-100000 yuan, to the fen";
+        let days = "Plan validity must be 1-3650 days";
+        let devices = "Plans allow 1-10 devices";
+        let concurrency = "Plan concurrency must be 1-20";
+        let kind = "Plan Kiro types are PRO, PRO_PLUS, PRO_MAX, POWER or CUSTOM";
+        let cases: Vec<(Edit, &str)> = vec![
+            (Box::new(|p| p.id = "Trial".into()), id),
+            (Box::new(|p| p.id = "trial_7d".into()), id),
+            (Box::new(|p| p.id = "t".repeat(65)), id),
+            (Box::new(|p| p.id = String::new()), id),
+            (Box::new(|p| p.name = " ".into()), name),
+            (Box::new(|p| p.name = "体验卡".repeat(4)), name),
+            (Box::new(|p| p.name = "line\nbreak".into()), name),
+            (Box::new(|p| p.points = 0), points),
+            (Box::new(|p| p.points = 10_000_001), points),
+            (Box::new(|p| p.price_cny = -0.01), price),
+            (Box::new(|p| p.price_cny = 100_000.01), price),
+            (Box::new(|p| p.price_cny = 9.999), price),
+            (Box::new(|p| p.price_cny = f64::NAN), price),
+            (Box::new(|p| p.validity_days = 0), days),
+            (Box::new(|p| p.validity_days = 3651), days),
+            (Box::new(|p| p.max_devices = 0), devices),
+            (Box::new(|p| p.max_devices = 11), devices),
+            (Box::new(|p| p.concurrency = 0), concurrency),
+            (Box::new(|p| p.concurrency = 21), concurrency),
+            (Box::new(|p| p.kiro_plan_type = "PRO_ULTRA".into()), kind),
+            (
+                Box::new(|p| p.default_group_id = "ghost".into()),
+                "Unknown default group of plan",
+            ),
+        ];
+        for (edit, message) in cases {
+            let mut plan = trial_plan();
+            edit(&mut plan);
+            let expected = format!("{message}: {}", plan.id);
+            let mut u = update(&e);
+            u.plans = vec![plan];
+            assert_eq!(publish(&e, u, 100).unwrap_err(), expected);
+        }
+        let mut u = update(&e);
+        u.plans = vec![trial_plan(), trial_plan()];
+        assert_eq!(publish(&e, u, 100).unwrap_err(), "Duplicate plan: trial-7d");
+        let mut u = update(&e);
+        u.removed_plans = vec!["ghost".into()];
+        assert_eq!(publish(&e, u, 100).unwrap_err(), "Unknown plan: ghost");
+        let mut u = update(&e);
+        u.plans = (0..97)
+            .map(|i| Plan {
+                id: format!("plan-{i}"),
+                ..trial_plan()
+            })
+            .collect();
+        assert_eq!(publish(&e, u, 100).unwrap_err(), "At most 100 plans");
+        assert_eq!(e.commercial_config().revision, before);
+        assert!(e.export_snapshot().plans.is_none());
+
+        // At the bounds; into a group published with it; listed by its sort order.
+        let mut u = update(&e);
+        u.groups.push(Group::pro_plus("vip", "VIP"));
+        u.plans = vec![
+            Plan {
+                name: "x".repeat(32),
+                points: 10_000_000,
+                price_cny: 100_000.0,
+                validity_days: 3650,
+                max_devices: 10,
+                concurrency: 20,
+                default_group_id: "vip".into(),
+                ..trial_plan()
+            },
+            Plan {
+                id: "f".repeat(64),
+                price_cny: 0.0,
+                points: 1,
+                validity_days: 1,
+                sort_order: 50,
+                ..trial_plan()
+            },
+        ];
+        let config = publish(&e, u, 100).unwrap();
+        let order: Vec<_> = config.plans.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(order[0], "trial-7d");
+        assert_eq!(order[5], "f".repeat(64));
+        // Published again, a plan is replaced whole.
+        let mut u = update(&e);
+        u.plans = vec![Plan {
+            on_sale: false,
+            price_cny: 0.01,
+            ..trial_plan()
+        }];
+        let config = publish(&e, u, 101).unwrap();
+        let trial = config.plans.iter().find(|p| p.id == "trial-7d").unwrap();
+        assert_eq!(
+            (trial.on_sale, trial.price_cny, trial.points),
+            (false, 0.01, 300)
+        );
+        assert_eq!(config.plans.len(), 6);
+    }
+
+    /// A plan cards were issued from, from the catalog or before it, cannot be removed, only
+    /// taken off sale; its cards keep the plan as it was when they were issued.
+    #[test]
+    fn only_a_plan_no_card_was_issued_from_can_be_removed() {
+        use crate::card::Card;
+        let e = serving_engine();
+        e.set_master_kek(crate::crypto::MasterKek::from_bytes([7; 32]));
+        let mut u = update(&e);
+        u.plans = vec![trial_plan()];
+        e.publish_commercial_config(u, 100).unwrap();
+        let trial = e.plan("trial-7d").unwrap();
+        let issued = e
+            .issue_cards(&trial.template("new-tier"), 2, None, 150)
+            .unwrap();
+        let card = issued[0].card.clone();
+        assert_eq!(card.plan, Some(trial.snapshot()));
+        assert_eq!(
+            (
+                card.credit_total,
+                card.activation_duration_secs,
+                card.max_concurrency,
+                card.group_id.as_str(),
+                card.plan_type(),
+            ),
+            (300_000_000, Some(7 * 86_400), 1, "new-tier", "CUSTOM")
+        );
+        e.upsert_card(Card::new("legacy", "new-tier", 5_000_000_000));
+        let counts = e.commercial_config().cards_by_plan;
+        assert_eq!(
+            (counts["trial-7d"], counts["tier-5000"], counts["tier-1000"]),
+            (2, 1, 0)
+        );
+        let remove = |ids: &[&str]| {
+            let mut u = update(&e);
+            u.removed_plans = ids.iter().map(|id| id.to_string()).collect();
+            publish(&e, u, 200)
+        };
+        for id in ["trial-7d", "tier-5000"] {
+            assert_eq!(
+                remove(&[id]).unwrap_err(),
+                format!("Plans cards were issued from can only be taken off sale: {id}")
+            );
+        }
+        let mut u = update(&e);
+        u.plans = vec![Plan {
+            name: "旧体验卡".into(),
+            on_sale: false,
+            ..trial.clone()
+        }];
+        e.publish_commercial_config(u, 200).unwrap();
+        assert!(!e.plan("trial-7d").unwrap().on_sale);
+        assert_eq!(e.get_card(&card.id).unwrap().plan_name(), Some("体验卡"));
+        let config = remove(&["tier-10000"]).unwrap();
+        assert!(!config.plans.iter().any(|p| p.id == "tier-10000"));
+        assert!(!config.cards_by_plan.contains_key("tier-10000"));
+        assert_eq!(config.plans.len(), 4);
     }
 }
