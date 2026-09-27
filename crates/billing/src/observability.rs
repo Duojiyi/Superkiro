@@ -916,7 +916,8 @@ pub struct Liability {
     pub unactivated_micro_credits: i64,
 }
 
-/// Every card that is not expired, voided, banned or archived; frozen ones included.
+/// Every card that is not expired, voided, banned or archived; frozen ones included, unless
+/// their validity has passed: unfrozen, they would be expired.
 pub fn compute_liability<'a>(
     cards: impl IntoIterator<Item = &'a crate::card::Card>,
     settings: &BillingSettings,
@@ -929,7 +930,8 @@ pub fn compute_liability<'a>(
             && !matches!(
                 card.effective_status(now_secs),
                 CardStatus::Expired | CardStatus::Voided | CardStatus::Banned
-            );
+            )
+            && card.valid_until.is_none_or(|until| now_secs < until);
         if !usable {
             continue;
         }

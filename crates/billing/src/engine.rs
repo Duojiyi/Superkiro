@@ -3417,8 +3417,10 @@ impl BillingEngine {
     }
 
     /// Lift a ban: the card is usable again, or unactivated if it was banned before it was
-    /// ever activated. The sessions the ban revoked stay revoked: the customer signs in
-    /// again. An archived card is unarchived first, so that archived cards stay unusable.
+    /// ever activated, or frozen again if it was banned while frozen: lifting a ban lifts no
+    /// freeze. The note loses what the ban put before it. The sessions the ban revoked stay
+    /// revoked: the customer signs in again. An archived card is unarchived first, so that
+    /// archived cards stay unusable.
     pub fn unban_card(
         &self,
         card_id: &str,
@@ -3432,7 +3434,7 @@ impl BillingEngine {
             operator_id,
             reason,
             now_secs,
-            |card, _| {
+            |card, snapshot| {
                 if card.status != CardStatus::Banned {
                     return Err(BillingError::InvalidState(format!(
                         "cannot unban {:?}",
@@ -3444,13 +3446,30 @@ impl BillingEngine {
                         "Archived cards must be unarchived before they are unbanned".into(),
                     ));
                 }
-                card.status = if card.activated_at.is_some() {
+                // Frozen before the ban, it keeps what an unfreeze restores.
+                card.status = if card.frozen_from.is_some() {
+                    CardStatus::Frozen
+                } else if card.activated_at.is_some() {
                     CardStatus::Active
                 } else {
                     CardStatus::Unactivated
                 };
-                card.frozen_from = None;
-                Ok(Some(serde_json::Value::Null))
+                let bans: Vec<&str> = snapshot
+                    .ledger
+                    .iter()
+                    .chain(snapshot.archived_ledger_summary.adjustments.values())
+                    .filter(|entry| {
+                        entry.card_id == card.id
+                            && entry.kind == LedgerKind::Adjustment
+                            && entry.exposed_model == "ban_card"
+                    })
+                    .filter_map(|entry| entry.reason.as_deref())
+                    .collect();
+                card.note = card
+                    .note
+                    .as_deref()
+                    .and_then(|note| without_ban_prefixes(note, &bans));
+                Ok(Some(serde_json::json!({ "status": card.status })))
             },
         )
     }
@@ -3534,8 +3553,11 @@ impl BillingEngine {
                 if card.note == note {
                     return Ok(None);
                 }
-                card.note = note;
-                Ok(Some(serde_json::Value::Null))
+                let previous = std::mem::replace(&mut card.note, note);
+                Ok(Some(serde_json::json!({
+                    "note": card.note,
+                    "previousNote": previous,
+                })))
             },
         )
     }
@@ -3702,12 +3724,15 @@ impl BillingEngine {
                 .ok_or_else(|| BillingError::CardNotFound(id.to_string()))?;
             let detail = match (awaits_activation(card), card.valid_until, extension) {
                 (true, _, ValidityExtension::Days(days)) => {
-                    let duration = card
+                    let previous = card
                         .activation_duration_secs
-                        .unwrap_or(LEGACY_ACTIVATION_SECS)
-                        .saturating_add(days.saturating_mul(86_400));
+                        .unwrap_or(LEGACY_ACTIVATION_SECS);
+                    let duration = previous.saturating_add(days.saturating_mul(86_400));
                     card.activation_duration_secs = Some(duration);
-                    serde_json::json!({ "activationDurationSecs": duration })
+                    serde_json::json!({
+                        "activationDurationSecs": duration,
+                        "previousActivationDurationSecs": previous,
+                    })
                 }
                 (false, Some(current), extension) => {
                     let until = match extension {
@@ -3723,7 +3748,7 @@ impl BillingEngine {
                     if card.frozen_from == Some(CardStatus::Expired) {
                         card.frozen_from = Some(CardStatus::Active);
                     }
-                    serde_json::json!({ "validUntil": until })
+                    serde_json::json!({ "validUntil": until, "previousValidUntil": current })
                 }
                 _ => {
                     return Err(BillingError::InvalidState(format!(
@@ -6555,6 +6580,31 @@ fn awaits_activation(card: &Card) -> bool {
     card.activated_at.is_none()
         && card.valid_until.is_none()
         && !matches!(card.status, CardStatus::Active | CardStatus::Expired)
+}
+
+/// A note without what bans put before it, `[BANNED: reason] `, once for each ban; `bans`
+/// are the reasons the card was banned for, which may hold a bracket themselves. A prefix
+/// of no known reason ends at its first bracket. None when nothing else is left.
+fn without_ban_prefixes(note: &str, bans: &[&str]) -> Option<String> {
+    let mut rest = note.trim_start();
+    while let Some(after) = rest.strip_prefix("[BANNED: ") {
+        let reason = bans
+            .iter()
+            .map(|ban| ban.trim())
+            .filter(|ban| {
+                after
+                    .strip_prefix(*ban)
+                    .is_some_and(|tail| tail.starts_with(']'))
+            })
+            .map(str::len)
+            .max()
+            .or_else(|| after.find(']'));
+        let Some(reason) = reason else {
+            break;
+        };
+        rest = after[reason + 1..].trim_start();
+    }
+    (!rest.is_empty()).then(|| rest.to_string())
 }
 
 fn check_rebind_allowed(card: &Card, now_secs: u64) -> Result<(), BillingError> {

@@ -1717,10 +1717,15 @@ fn liability_is_the_balance_of_cards_that_can_still_be_used() {
     current.valid_until = Some(now + 1);
     let mut archived = card("archived", CardStatus::Expired, 5_000_000, 0);
     archived.archived_at = Some(1);
+    // Frozen while active and past its validity since: unfrozen, it would be expired.
+    let mut frozen_lapsed = card("frozen-lapsed", CardStatus::Frozen, 7_000_000, 0);
+    frozen_lapsed.frozen_from = Some(CardStatus::Active);
+    frozen_lapsed.valid_until = Some(now);
     let cards = [
         current,
         lapsed,
         archived,
+        frozen_lapsed,
         card("waiting", CardStatus::Unactivated, 2_000_000, 0),
         card("frozen", CardStatus::Frozen, 3_000_000, 500_000),
         card("banned", CardStatus::Banned, 9_000_000, 0),

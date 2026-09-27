@@ -582,13 +582,28 @@ fn extending_validity_moves_expiries_and_revives_expired_cards() {
     let events = history_of(&engine, "card-current", "extend");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].reason.as_deref(), Some("补偿停机"));
+    // The new expiry and the one it replaced, so that a mistaken extension can be undone.
     assert_eq!(
         events[0].detail,
-        Some(serde_json::json!({ "validUntil": now + 11 * 86_400 }))
+        Some(serde_json::json!({
+            "validUntil": now + 11 * 86_400,
+            "previousValidUntil": now + 86_400,
+        }))
     );
     assert_eq!(
         history_of(&engine, "card-waiting", "extend")[0].detail,
-        Some(serde_json::json!({ "activationDurationSecs": 40 * 86_400 }))
+        Some(serde_json::json!({
+            "activationDurationSecs": 40 * 86_400,
+            "previousActivationDurationSecs": 30 * 86_400,
+        }))
+    );
+    // A legacy card counted from the legacy validity.
+    assert_eq!(
+        history_of(&engine, "card-legacy", "extend")[0]
+            .detail
+            .as_ref()
+            .unwrap()["previousActivationDurationSecs"],
+        30 * 86_400
     );
 
     // To a time: activated cards only, and never earlier than their expiry.
@@ -684,6 +699,79 @@ fn a_note_change_records_who_made_it() {
     assert!(events
         .iter()
         .all(|event| event.operator.as_deref() == Some("admin") && event.reason.is_none()));
+    // Each records the note it wrote and the one it replaced, newest first.
+    let details: Vec<_> = events.iter().map(|event| event.detail.clone()).collect();
+    assert_eq!(
+        details,
+        [
+            Some(serde_json::json!({ "note": null, "previousNote": "VIP 续费客户" })),
+            Some(serde_json::json!({ "note": "VIP 续费客户", "previousNote": null })),
+        ]
+    );
+}
+
+/// Lifting a ban lifts no freeze, and takes back what the ban put before the note.
+#[test]
+fn unbanning_a_card_banned_while_frozen_leaves_it_frozen() {
+    let engine = BillingEngine::new();
+    let mut card = create_test_card("card-held", 1, 5, 0);
+    card.note = Some("VIP 客户".into());
+    engine.upsert_card(card);
+    engine
+        .freeze_card("card-held", "admin", "调查中", 1_000)
+        .unwrap();
+    // Banned twice, once for a reason with a bracket of its own.
+    engine
+        .ban_card("card-held", "admin", "滥用 [第二次]", 1_100)
+        .unwrap();
+    engine
+        .ban_card("card-held", "admin", "再次滥用", 1_150)
+        .unwrap();
+    assert_eq!(
+        engine.get_card("card-held").unwrap().note.as_deref(),
+        Some("[BANNED: 再次滥用] [BANNED: 滥用 [第二次]] [FROZEN: 调查中] VIP 客户")
+    );
+
+    let card = engine
+        .unban_card("card-held", "admin", "误封", 1_200)
+        .unwrap();
+    assert_eq!(card.status, CardStatus::Frozen);
+    assert_eq!(card.frozen_from, Some(CardStatus::Active));
+    assert_eq!(card.note.as_deref(), Some("[FROZEN: 调查中] VIP 客户"));
+    assert_eq!(
+        history_of(&engine, "card-held", "unban")[0].detail,
+        Some(serde_json::json!({ "status": "frozen" }))
+    );
+    // Unfrozen, it is what it was frozen from.
+    let card = engine
+        .unfreeze_card("card-held", "admin", "调查结束", 1_300)
+        .unwrap();
+    assert_eq!(card.status, CardStatus::Active);
+
+    // A ban's note alone leaves none; one no ban in the history wrote ends at its bracket.
+    let mut legacy = create_test_card("card-legacy-ban", 1, 5, 0);
+    legacy.status = CardStatus::Banned;
+    legacy.note = Some("[BANNED: 旧版封禁] 老客户".into());
+    engine.upsert_card(legacy);
+    let card = engine
+        .unban_card("card-legacy-ban", "admin", "误封", 1_400)
+        .unwrap();
+    assert_eq!(
+        (card.status, card.note.as_deref()),
+        (CardStatus::Active, Some("老客户"))
+    );
+    engine.upsert_card(create_test_card("card-bare", 1, 5, 0));
+    engine
+        .ban_card("card-bare", "admin", "滥用", 1_500)
+        .unwrap();
+    let card = engine
+        .unban_card("card-bare", "admin", "误封", 1_600)
+        .unwrap();
+    assert_eq!(card.note, None);
+    assert_eq!(
+        history_of(&engine, "card-bare", "unban")[0].detail,
+        Some(serde_json::json!({ "status": "active" }))
+    );
 }
 
 fn fixed_price(id: &str) -> billing::rate_card::RateCardVersion {
@@ -907,6 +995,9 @@ fn event_detail_has_its_own_field_and_older_entries_still_read() {
     engine
         .set_card_note("card-detail", Some("VIP"), "admin", 1_500)
         .unwrap();
+    engine
+        .freeze_card("card-detail", "admin", "暂停", 1_600)
+        .unwrap();
 
     let entries: Vec<_> = engine
         .ledger_entries()
@@ -922,10 +1013,16 @@ fn event_detail_has_its_own_field_and_older_entries_still_read() {
         [
             ("unbind_device", Some(json!({ "deviceId": "device-old" }))),
             // Its expiry, 87,400, two days later.
-            ("extend_validity", Some(json!({ "validUntil": 260_200 }))),
             (
                 "extend_validity",
-                Some(json!({ "activationDurationSecs": 259_200 }))
+                Some(json!({ "validUntil": 260_200, "previousValidUntil": 87_400 }))
+            ),
+            (
+                "extend_validity",
+                Some(json!({
+                    "activationDurationSecs": 259_200,
+                    "previousActivationDurationSecs": 86_400,
+                }))
             ),
             (
                 "change_group",
@@ -935,12 +1032,16 @@ fn event_detail_has_its_own_field_and_older_entries_still_read() {
                 "adjustment",
                 Some(json!({ "invocationId": "card-detail:inv-1" }))
             ),
-            ("note_card", None),
+            (
+                "note_card",
+                Some(json!({ "note": "VIP", "previousNote": null }))
+            ),
+            ("freeze_card", None),
         ]
     );
     // Absent, the field is not written at all.
-    let note = serde_json::to_value(&entries[5]).unwrap();
-    assert!(note.get("detail").is_none());
+    let freeze = serde_json::to_value(&entries[6]).unwrap();
+    assert!(freeze.get("detail").is_none());
     let history = |engine: &BillingEngine| {
         (
             engine.card_history("card-detail").unwrap(),

@@ -56,7 +56,12 @@ async fn test_admin_unauthorized_without_valid_key() {
 
 #[tokio::test]
 async fn test_admin_stats_and_cards_query() {
-    let (_billing, app) = setup_admin_app();
+    let (billing, app) = setup_admin_app();
+    // Active in its status, but past its expiry: expired, as the customer meets it.
+    let mut lapsed = Card::new("card-admin-lapsed", "group-admin", 5_000_000);
+    lapsed.status = CardStatus::Active;
+    lapsed.valid_until = Some(1);
+    billing.upsert_card(lapsed);
 
     // 1. GET /api/v1/admin/stats
     let req = Request::builder()
@@ -73,8 +78,9 @@ async fn test_admin_stats_and_cards_query() {
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(json["totalCards"], 2);
+    assert_eq!(json["totalCards"], 3);
     assert_eq!(json["activeCards"], 1);
+    assert_eq!(json["expiredCards"], 1);
     assert_eq!(json["unactivatedCards"], 1);
 
     // 2. GET /api/v1/admin/cards
@@ -92,8 +98,8 @@ async fn test_admin_stats_and_cards_query() {
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(json["count"], 2);
-    assert!(json["cards"].as_array().unwrap().len() >= 2);
+    assert_eq!(json["count"], 3);
+    assert!(json["cards"].as_array().unwrap().len() >= 3);
 }
 
 #[tokio::test]
@@ -1813,7 +1819,10 @@ async fn card_support_actions_are_written_to_the_history_with_the_operator() {
     let until = now + 31 * 86_400;
     assert_eq!(body["cards"][0]["validUntil"], until);
     let event = newest_event(&app, "card-support", "extend").await;
-    assert_eq!(event["detail"], json!({"validUntil": until}));
+    assert_eq!(
+        event["detail"],
+        json!({"validUntil": until, "previousValidUntil": now + 86_400})
+    );
     let (status, body) = post(
         "validity",
         json!({"cardIds": ["card-support"], "validUntilSecs": until + 86_400, "reason": "续期"}),
@@ -1832,6 +1841,10 @@ async fn card_support_actions_are_written_to_the_history_with_the_operator() {
     let event = newest_event(&app, "card-support", "note").await;
     assert_eq!(event["operator"], "admin");
     assert_eq!(event["reason"], serde_json::Value::Null);
+    assert_eq!(
+        event["detail"],
+        json!({"note": "VIP 客户", "previousNote": null})
+    );
 
     let (status, body) = post(
         "group",
@@ -1866,6 +1879,8 @@ async fn card_support_actions_are_written_to_the_history_with_the_operator() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["newStatus"], "active");
     assert_eq!(body["card"]["effectiveStatus"], "active");
+    // The note loses what the ban put before it.
+    assert_eq!(body["card"]["note"], "VIP 客户");
     assert_eq!(
         billing.get_card("card-support").unwrap().token_version,
         banned.token_version

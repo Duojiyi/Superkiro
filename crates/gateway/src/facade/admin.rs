@@ -1376,15 +1376,19 @@ impl FacadeHandler for AdminStatsHandler {
             let mut unactivated_cards = 0;
             let mut frozen_cards = 0;
             let mut banned_cards = 0;
+            let mut expired_cards = 0;
             let mut total_credits = 0i64;
             let mut used_credits = 0i64;
 
+            // As the customer meets them: an active card past its expiry is expired.
+            let now = now_secs();
             for c in &cards {
-                match c.status {
+                match c.effective_status(now) {
                     CardStatus::Active => active_cards += 1,
                     CardStatus::Unactivated => unactivated_cards += 1,
                     CardStatus::Frozen => frozen_cards += 1,
                     CardStatus::Banned => banned_cards += 1,
+                    CardStatus::Expired => expired_cards += 1,
                     _ => {}
                 }
                 total_credits += c.credit_total;
@@ -1415,6 +1419,7 @@ impl FacadeHandler for AdminStatsHandler {
                     "unactivatedCards": unactivated_cards,
                     "frozenCards": frozen_cards,
                     "bannedCards": banned_cards,
+                    "expiredCards": expired_cards,
                     "totalCredits": total_credits,
                     "usedCredits": used_credits,
                     "remainingCredits": remaining_credits,
@@ -1422,7 +1427,7 @@ impl FacadeHandler for AdminStatsHandler {
                     "usedPoints": (used_credits as f64) / micro,
                     "remainingPoints": (remaining_credits as f64) / micro,
                     // Real totals for the overview, not a sample of the latest traces.
-                    "activity": self.billing.activity(now_secs()),
+                    "activity": self.billing.activity(now),
                 }),
             )
         })
