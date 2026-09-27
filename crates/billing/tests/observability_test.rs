@@ -35,6 +35,8 @@ fn test_record_and_list_request_traces() {
             error: None,
             latency_ms: 1200,
         }],
+        repeats: 0,
+        last_seen_secs: None,
     };
 
     let trace2 = RequestTrace {
@@ -61,6 +63,8 @@ fn test_record_and_list_request_traces() {
             error: Some("Timeout".to_string()),
             latency_ms: 5000,
         }],
+        repeats: 0,
+        last_seen_secs: None,
     };
 
     engine.record_trace(trace1);
@@ -243,6 +247,8 @@ fn test_provider_health_summary_metrics() {
         needed_micro_credits: None,
         available_micro_credits: None,
         attempt_chain: vec![],
+        repeats: 0,
+        last_seen_secs: None,
     });
 
     engine.record_trace(RequestTrace {
@@ -263,6 +269,8 @@ fn test_provider_health_summary_metrics() {
         needed_micro_credits: None,
         available_micro_credits: None,
         attempt_chain: vec![],
+        repeats: 0,
+        last_seen_secs: None,
     });
 
     engine.record_trace(RequestTrace {
@@ -283,6 +291,8 @@ fn test_provider_health_summary_metrics() {
         needed_micro_credits: None,
         available_micro_credits: None,
         attempt_chain: vec![],
+        repeats: 0,
+        last_seen_secs: None,
     });
 
     let health = engine.get_provider_health("prov-alpha");
@@ -505,6 +515,8 @@ fn test_data_retention_pruning_policy() {
         needed_micro_credits: None,
         available_micro_credits: None,
         attempt_chain: vec![],
+        repeats: 0,
+        last_seen_secs: None,
     };
 
     engine.record_trace(make_trace("t1", 1000));
@@ -570,6 +582,8 @@ fn retry_history_survives_single_settlement_and_final_delivery_error() {
                 },
                 latency_ms: 10,
             }],
+            repeats: 0,
+            last_seen_secs: None,
         });
     }
     assert_eq!(engine.invocation_attempts("retry-inv"), 2);
@@ -681,6 +695,8 @@ fn traces_ride_along_with_the_next_commit_instead_of_saving_on_their_own() {
         needed_micro_credits: None,
         available_micro_credits: None,
         attempt_chain: Vec::new(),
+        repeats: 0,
+        last_seen_secs: None,
     });
     engine.finish_trace("inv-trace", TraceStatus::Success, None);
     assert_eq!(
@@ -775,6 +791,8 @@ fn activity_counts_real_totals_by_period_and_hour() {
         needed_micro_credits: None,
         available_micro_credits: None,
         attempt_chain: Vec::new(),
+        repeats: 0,
+        last_seen_secs: None,
     };
     engine.note_trace_timing("inv-hour-ago", Some(800), Some(40.0));
     engine.note_trace_timing("inv-two-days", Some(2000), Some(20.0));
@@ -1124,6 +1142,232 @@ fn activity_counts_attempts_by_provider_key_and_model() {
         "upstream_start_failed"
     );
     assert_eq!(json["modelUsage7d"], serde_json::json!([]));
+}
+
+/// A refusal for the card or the request itself says nothing about a model or an upstream:
+/// it is counted apart, and the same refusal again within a minute adds no trace.
+#[test]
+fn refusals_are_counted_apart_and_a_repeated_one_adds_no_trace() {
+    let engine = BillingEngine::new();
+    let now = 1_000_000;
+    let trace = |id: &str, card: &str, ts: u64, model: &str, class: Option<&str>| RequestTrace {
+        id: id.into(),
+        card_id: card.into(),
+        ts,
+        invocation_id: format!("{card}:{id}"),
+        exposed_model: model.into(),
+        status: if class.is_some() {
+            TraceStatus::Error
+        } else {
+            TraceStatus::Success
+        },
+        error_class: class.map(str::to_string),
+        ..RequestTrace::default()
+    };
+    // Served, and failed upstream.
+    engine.record_trace(RequestTrace {
+        provider_id: Some("primary".into()),
+        attempt_chain: vec![attempt("primary", "key-a", None)],
+        ..trace("served", "card-1", now - 500, "model-a", None)
+    });
+    engine.record_trace(RequestTrace {
+        provider_id: Some("primary".into()),
+        attempt_chain: vec![attempt("primary", "key-a", Some("http_500"))],
+        ..trace(
+            "failed",
+            "card-1",
+            now - 400,
+            "model-a",
+            Some("upstream_start_failed"),
+        )
+    });
+    // The upstream refused a prompt too long: it did right.
+    engine.record_trace(RequestTrace {
+        provider_id: Some("primary".into()),
+        attempt_chain: vec![attempt("primary", "key-a", Some("upstream_service"))],
+        ..trace(
+            "long",
+            "card-1",
+            now - 300,
+            "model-a",
+            Some("input_too_long"),
+        )
+    });
+    // A card out of credits, retrying in a loop: four times within a minute of the first,
+    // then again after it.
+    for (id, ts) in [
+        ("broke-1", now - 200),
+        ("broke-2", now - 190),
+        ("broke-3", now - 170),
+        ("broke-4", now - 141),
+        ("broke-5", now - 140),
+    ] {
+        engine.record_trace(trace(
+            id,
+            "card-2",
+            ts,
+            "model-a",
+            Some("insufficient_balance"),
+        ));
+    }
+    // Another card, and another reason, keep their own traces.
+    engine.record_trace(trace(
+        "broke-other",
+        "card-3",
+        now - 180,
+        "model-a",
+        Some("insufficient_balance"),
+    ));
+    engine.record_trace(trace(
+        "image",
+        "card-2",
+        now - 160,
+        "model-a",
+        Some("unsupported_capability"),
+    ));
+    // A model no request names: counted in the totals, no row of its own.
+    engine.record_trace(trace(
+        "absent",
+        "card-2",
+        now - 150,
+        "typed-model",
+        Some("model_not_listed"),
+    ));
+    // Refused for want of a route, twice: the operator's to fix, so failures.
+    engine.record_trace(trace(
+        "unrouted-1",
+        "card-1",
+        now - 100,
+        "model-a",
+        Some("no_route"),
+    ));
+    engine.record_trace(trace(
+        "unrouted-2",
+        "card-1",
+        now - 90,
+        "model-a",
+        Some("no_route"),
+    ));
+
+    let traces = engine.list_traces(None, 100);
+    let kept: Vec<_> = traces
+        .iter()
+        .map(|trace| (trace.id.as_str(), trace.repeats, trace.last_seen_secs))
+        .collect();
+    assert_eq!(
+        kept,
+        [
+            ("unrouted-1", 1, Some(now - 90)),
+            ("absent", 0, None),
+            ("image", 0, None),
+            ("broke-other", 0, None),
+            ("broke-5", 0, None),
+            ("broke-1", 3, Some(now - 141)),
+            ("long", 0, None),
+            ("failed", 0, None),
+            ("served", 0, None),
+        ]
+    );
+
+    let activity = engine.activity(now);
+    let window = &activity.last_24h;
+    // Served, failed, and no route twice.
+    assert_eq!(
+        (
+            window.requests,
+            window.succeeded,
+            window.failed,
+            window.refused
+        ),
+        (4, 1, 3, 9)
+    );
+    let hourly = activity.hourly.iter().fold((0, 0, 0), |sum, hour| {
+        (
+            sum.0 + hour.requests,
+            sum.1 + hour.failed,
+            sum.2 + hour.refused,
+        )
+    });
+    assert_eq!(hourly, (4, 3, 9));
+    let provider = &activity.providers[0];
+    assert_eq!(
+        (provider.requests, provider.failed, provider.refused),
+        (2, 1, 1)
+    );
+    let attempts = &activity.provider_attempts[0].last_24h;
+    assert_eq!(
+        (attempts.attempts, attempts.failures, attempts.refused),
+        (2, 1, 1)
+    );
+    assert_eq!(activity.key_attempts[0].last_24h.refused, 1);
+    let models: Vec<_> = activity
+        .model_health
+        .iter()
+        .map(|model| model.model.as_str())
+        .collect();
+    assert_eq!(models, ["model-a"]);
+    let health = &activity.model_health[0].last_24h;
+    assert_eq!(
+        (health.requests, health.failures, health.refused),
+        (4, 3, 8)
+    );
+    assert_eq!(health.failures_by_kind.get("no_route"), Some(&2));
+    assert_eq!(health.last_failure_at, Some(now - 90));
+
+    // As the stats endpoint and the traces list send them.
+    let json = serde_json::to_value(&activity).unwrap();
+    assert_eq!(json["last24h"]["refused"], 9);
+    assert_eq!(json["modelHealth"][0]["last24h"]["refused"], 8);
+    assert_eq!(json["providerAttempts"][0]["last24h"]["refused"], 1);
+    let json = serde_json::to_value(&traces[5]).unwrap();
+    assert_eq!(
+        (&json["repeats"], &json["last_seen_secs"]),
+        (&serde_json::json!(3), &serde_json::json!(now - 141))
+    );
+    // A trace without repeats is saved as before.
+    let json = serde_json::to_value(&traces[6]).unwrap();
+    assert!(json.get("repeats").is_none() && json.get("last_seen_secs").is_none());
+}
+
+/// However fast one card is refused, real requests keep their traces.
+#[test]
+fn a_refusal_flood_cannot_push_real_requests_out_of_the_traces() {
+    let engine = BillingEngine::new();
+    let now = 1_000_000;
+    engine.record_trace(RequestTrace {
+        id: "served".into(),
+        card_id: "card-1".into(),
+        ts: now,
+        invocation_id: "card-1:served".into(),
+        exposed_model: "model".into(),
+        status: TraceStatus::Success,
+        ..RequestTrace::default()
+    });
+    // Sixty a second for five minutes: one trace a minute.
+    for second in 0..300 {
+        for n in 0..60 {
+            engine.record_trace(RequestTrace {
+                id: format!("refused-{second}-{n}"),
+                card_id: "card-2".into(),
+                ts: now + second,
+                invocation_id: format!("card-2:{second}-{n}"),
+                exposed_model: "model".into(),
+                status: TraceStatus::Error,
+                error_class: Some("concurrency_limit".into()),
+                ..RequestTrace::default()
+            });
+        }
+    }
+    let traces = engine.list_traces(None, 100);
+    assert_eq!(traces.len(), 6);
+    assert!(traces.iter().any(|trace| trace.id == "served"));
+    let counted: u64 = traces
+        .iter()
+        .filter(|trace| trace.card_id == "card-2")
+        .map(|trace| trace.occurrences())
+        .sum();
+    assert_eq!(counted, 300 * 60);
+    assert_eq!(engine.activity(now + 300).last_24h.refused, 300 * 60);
 }
 
 /// Billed use by customer model over the last week, from the ledger: requests and cards.

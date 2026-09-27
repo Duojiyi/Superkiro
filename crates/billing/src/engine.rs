@@ -2861,6 +2861,8 @@ impl BillingEngine {
             needed_micro_credits: None,
             available_micro_credits: None,
             attempt_chain,
+            repeats: 0,
+            last_seen_secs: None,
         });
         if candidate.traces.len() > MAX_RETAINED_TRACES {
             candidate
@@ -5293,9 +5295,26 @@ impl BillingEngine {
     /// the whole state (the request's own settlement, or any later write when it is
     /// released), instead of each costing a full save of its own. A crash before that
     /// commit loses only the trace, and with it the attempt count it holds.
+    ///
+    /// A request refused before any upstream was called, refused again for the same
+    /// reason within a minute of a kept refusal of the same card, adds no trace: the kept
+    /// one counts it and when it was last seen. A card refused many times a second, by a
+    /// script or a loop, so keeps one trace a minute per reason and cannot push real
+    /// requests out of the traces.
     pub fn record_trace(&self, trace: RequestTrace) {
         let _state_guard = self.state_lock.write().unwrap();
         let mut traces = self.traces.write().unwrap();
+        // Traces are kept in the order they were made; only the last minute's can match.
+        let kept = traces
+            .iter_mut()
+            .rev()
+            .take_while(|kept| kept.ts.saturating_add(60) > trace.ts)
+            .find(|kept| kept.is_repeated_by(&trace));
+        if let Some(kept) = kept {
+            kept.repeats = kept.repeats.saturating_add(1);
+            kept.last_seen_secs = Some(kept.last_seen().max(trace.ts));
+            return;
+        }
         traces.push(trace);
         if traces.len() > MAX_RETAINED_TRACES {
             let overflow = traces.len() - MAX_RETAINED_TRACES;
@@ -5370,14 +5389,21 @@ impl BillingEngine {
                 .collect(),
             ..Activity::default()
         };
-        let count = |window: &mut ActivityWindow, status: TraceStatus| {
-            match status {
-                TraceStatus::Success => window.succeeded += 1,
-                TraceStatus::Error => window.failed += 1,
-                TraceStatus::ClientAborted => window.client_aborted += 1,
+        // A refusal for the card or the request is counted apart, and a trace counts the
+        // repeated refusals it stands for.
+        let count = |window: &mut ActivityWindow, trace: &RequestTrace| {
+            let times = trace.occurrences();
+            if trace.refused_for_card() {
+                window.refused += times;
+                return;
+            }
+            match trace.status {
+                TraceStatus::Success => window.succeeded += times,
+                TraceStatus::Error => window.failed += times,
+                TraceStatus::ClientAborted => window.client_aborted += times,
                 TraceStatus::InProgress => return,
             }
-            window.requests += 1;
+            window.requests += times;
         };
         let mut day_ttft = Vec::new();
         let mut week_ttft = Vec::new();
@@ -5389,12 +5415,18 @@ impl BillingEngine {
                 .iter()
                 .filter(|trace| trace.ts <= now && trace.status != TraceStatus::InProgress);
             for trace in finished {
+                let (times, refused) = (trace.occurrences(), trace.refused_for_card());
+                let failed = if trace.status == TraceStatus::Error {
+                    times
+                } else {
+                    0
+                };
                 if trace.ts > week_start {
-                    count(&mut activity.last_7d, trace.status);
+                    count(&mut activity.last_7d, trace);
                     week_ttft.extend(trace.ttft_ms);
                 }
                 if trace.ts > day_start {
-                    count(&mut activity.last_24h, trace.status);
+                    count(&mut activity.last_24h, trace);
                     day_ttft.extend(trace.ttft_ms);
                     if let Some(provider_id) = &trace.provider_id {
                         let (provider, ttft) =
@@ -5405,15 +5437,23 @@ impl BillingEngine {
                                 };
                                 (provider, Vec::new())
                             });
-                        provider.requests += 1;
-                        provider.failed += u64::from(trace.status == TraceStatus::Error);
+                        if refused {
+                            provider.refused += times;
+                        } else {
+                            provider.requests += times;
+                            provider.failed += failed;
+                        }
                         ttft.extend(trace.ttft_ms);
                     }
                 }
                 if trace.ts >= first_hour {
                     let hour = &mut activity.hourly[((trace.ts - first_hour) / HOUR) as usize];
-                    hour.requests += 1;
-                    hour.failed += u64::from(trace.status == TraceStatus::Error);
+                    if refused {
+                        hour.refused += times;
+                    } else {
+                        hour.requests += times;
+                        hour.failed += failed;
+                    }
                 }
             }
         }
@@ -5497,7 +5537,6 @@ impl BillingEngine {
     fn attempt_activity(&self, activity: &mut crate::observability::Activity, now: u64) {
         use crate::observability::{
             AttemptWindow, KeyAttempts, ModelHealth, ModelHealthWindow, ProviderAttempts,
-            CARD_LIMIT_REFUSALS,
         };
         const HOUR: u64 = 3600;
         let starts = [
@@ -5508,16 +5547,22 @@ impl BillingEngine {
         let mut providers: BTreeMap<String, ProviderAttempts> = BTreeMap::new();
         let mut keys: BTreeMap<String, KeyAttempts> = BTreeMap::new();
         let mut models: BTreeMap<String, ModelHealth> = BTreeMap::new();
+        let mut refusals = Vec::new();
         let traces = self.traces.read().unwrap();
         for trace in traces
             .iter()
             .filter(|trace| trace.ts > starts[2] && trace.ts <= now)
         {
             let within = starts.map(|start| trace.ts > start);
+            // An upstream that refused the request itself, a prompt too long, did right: its
+            // attempt is counted as refused, not failed.
+            let refused_for_card = trace.refused_for_card();
+            let last = trace.attempt_chain.len().saturating_sub(1);
             for (index, attempt) in trace.attempt_chain.iter().enumerate() {
                 let taken_over = trace.attempt_chain[index + 1..]
                     .iter()
                     .any(|later| later.success && later.provider_id != attempt.provider_id);
+                let refused = refused_for_card && index == last && !attempt.success;
                 let provider = providers
                     .entry(attempt.provider_id.clone())
                     .or_insert_with(|| ProviderAttempts {
@@ -5531,7 +5576,7 @@ impl BillingEngine {
                 ];
                 for (window, inside) in windows.into_iter().zip(within) {
                     if inside {
-                        window.count(attempt, taken_over);
+                        window.count(attempt, taken_over, refused);
                     }
                 }
                 if attempt.key_id.is_empty() {
@@ -5548,18 +5593,15 @@ impl BillingEngine {
                     [&mut key.last_1h, &mut key.last_24h, &mut key.last_7d];
                 for (window, inside) in windows.into_iter().zip(within) {
                     if inside {
-                        window.count(attempt, taken_over);
+                        window.count(attempt, taken_over, refused);
                     }
                 }
             }
-            let refused_for_card = trace
-                .error_class
-                .as_deref()
-                .is_some_and(|class| CARD_LIMIT_REFUSALS.contains(&class));
-            if trace.status == TraceStatus::InProgress
-                || trace.exposed_model.is_empty()
-                || refused_for_card
-            {
+            if trace.status == TraceStatus::InProgress || trace.exposed_model.is_empty() {
+                continue;
+            }
+            if refused_for_card {
+                refusals.push((trace, within));
                 continue;
             }
             let failure = (trace.status == TraceStatus::Error).then(|| {
@@ -5586,7 +5628,20 @@ impl BillingEngine {
                 [&mut model.last_1h, &mut model.last_24h, &mut model.last_7d];
             for (window, inside) in windows.into_iter().zip(within) {
                 if inside {
-                    window.count(trace.ts, failure.as_deref());
+                    window.count(trace.last_seen(), failure.as_deref(), trace.occurrences());
+                }
+            }
+        }
+        // Refusals are counted apart, under a model its requests already list: a name a
+        // customer typed, or a retired model, adds no row of its own.
+        for (trace, within) in refusals {
+            if let Some(model) = models.get_mut(&trace.exposed_model) {
+                let windows: [&mut ModelHealthWindow; 3] =
+                    [&mut model.last_1h, &mut model.last_24h, &mut model.last_7d];
+                for (window, inside) in windows.into_iter().zip(within) {
+                    if inside {
+                        window.refused += trace.occurrences();
+                    }
                 }
             }
         }

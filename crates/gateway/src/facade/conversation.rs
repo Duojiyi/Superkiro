@@ -1140,6 +1140,8 @@ impl GenerateAssistantResponseHandler {
                             needed_micro_credits: None,
                             available_micro_credits: None,
                             attempt_chain: attempts,
+                            repeats: 0,
+                            last_seen_secs: None,
                         });
                     match route_result {
                         Ok(res) => (res.stream, res.provider.id, res.target_model),

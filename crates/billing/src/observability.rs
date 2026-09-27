@@ -27,6 +27,9 @@ pub struct ActivityWindow {
     pub succeeded: u64,
     pub failed: u64,
     pub client_aborted: u64,
+    /// Requests refused for the card or the request itself (see [`CARD_REFUSALS`]),
+    /// counted apart: neither requests nor failed include them.
+    pub refused: u64,
     pub credits_charged: i64,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -46,6 +49,8 @@ pub struct ProviderActivity {
     pub provider_id: String,
     pub requests: u64,
     pub failed: u64,
+    /// Requests it refused for the request itself, such as a prompt too long.
+    pub refused: u64,
     pub ttft_median_ms: Option<u32>,
 }
 
@@ -56,6 +61,7 @@ pub struct ActivityHour {
     pub start_secs: u64,
     pub requests: u64,
     pub failed: u64,
+    pub refused: u64,
 }
 
 /// The last 24 hours and 7 days, and the last 24 clock hours one by one.
@@ -89,10 +95,20 @@ pub struct Activity {
     pub model_usage_7d: Vec<ModelUsage>,
 }
 
-/// Error classes of requests refused for the card's own balance or limits: they say
-/// nothing about the model asked for.
-pub const CARD_LIMIT_REFUSALS: [&str; 3] =
-    ["insufficient_balance", "concurrency_limit", "usage_limit"];
+/// Error classes of requests refused for the card or the request itself: the card's
+/// balance or limits, a prompt too long for the model, a capability the model lacks, or a
+/// model the card may not or cannot name. They say nothing about a model's or an
+/// upstream's health, and are counted apart from requests and failures.
+pub const CARD_REFUSALS: [&str; 8] = [
+    "insufficient_balance",
+    "concurrency_limit",
+    "usage_limit",
+    "input_too_long",
+    "unsupported_capability",
+    "invalid_model",
+    "model_not_listed",
+    "model_retired",
+];
 
 /// Upstream attempts over one period.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -100,6 +116,9 @@ pub const CARD_LIMIT_REFUSALS: [&str; 3] =
 pub struct AttemptWindow {
     pub attempts: u64,
     pub failures: u64,
+    /// Attempts the upstream rightly refused for the request itself, such as a prompt too
+    /// long: neither attempts nor failures include them.
+    pub refused: u64,
     /// Failed attempts after which another provider answered the request.
     pub taken_over: u64,
     /// Failures by the kind attempt chains name: http_429, http_401, timeout, transport,
@@ -108,7 +127,11 @@ pub struct AttemptWindow {
 }
 
 impl AttemptWindow {
-    pub(crate) fn count(&mut self, attempt: &AttemptRecord, taken_over: bool) {
+    pub(crate) fn count(&mut self, attempt: &AttemptRecord, taken_over: bool, refused: bool) {
+        if refused {
+            self.refused += 1;
+            return;
+        }
         self.attempts += 1;
         if !attempt.success {
             self.failures += 1;
@@ -146,13 +169,14 @@ pub struct KeyAttempts {
     pub last_7d: AttemptWindow,
 }
 
-/// Finished requests for one customer model over one period. Refusals for the card's own
-/// balance or limits are not counted.
+/// Finished requests for one customer model over one period. Refusals for the card or the
+/// request itself are counted apart, as refused.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelHealthWindow {
     pub requests: u64,
     pub failures: u64,
+    pub refused: u64,
     pub last_failure_at: Option<u64>,
     /// The commonest kind of failure, the earliest in name on a tie.
     pub top_failure_kind: Option<String>,
@@ -161,12 +185,13 @@ pub struct ModelHealthWindow {
 }
 
 impl ModelHealthWindow {
-    pub(crate) fn count(&mut self, ts: u64, failure: Option<&str>) {
-        self.requests += 1;
+    /// Counts a trace's requests: `times` of them, the last at `ts`.
+    pub(crate) fn count(&mut self, ts: u64, failure: Option<&str>, times: u64) {
+        self.requests += times;
         if let Some(kind) = failure {
-            self.failures += 1;
+            self.failures += times;
             self.last_failure_at = self.last_failure_at.max(Some(ts));
-            *self.failures_by_kind.entry(kind.to_string()).or_default() += 1;
+            *self.failures_by_kind.entry(kind.to_string()).or_default() += times;
             self.top_failure_kind = self
                 .failures_by_kind
                 .iter()
@@ -235,6 +260,57 @@ pub struct RequestTrace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available_micro_credits: Option<i64>,
     pub attempt_chain: Vec<AttemptRecord>,
+    /// For a refusal: how many more times the card was refused for the same reason within
+    /// a minute of it. They add no trace of their own; this one counts them.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub repeats: u64,
+    /// When the last of those was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_secs: Option<u64>,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+impl RequestTrace {
+    /// The requests a trace stands for: its own and the repeated refusals it counts.
+    pub fn occurrences(&self) -> u64 {
+        self.repeats.saturating_add(1)
+    }
+
+    /// When the last request it stands for was made.
+    pub fn last_seen(&self) -> u64 {
+        self.last_seen_secs.unwrap_or(self.ts).max(self.ts)
+    }
+
+    /// Whether it records a request refused for the card or the request itself, one of
+    /// [`CARD_REFUSALS`], which says nothing about a model's or an upstream's health.
+    pub fn refused_for_card(&self) -> bool {
+        self.status == TraceStatus::Error
+            && self
+                .error_class
+                .as_deref()
+                .is_some_and(|class| CARD_REFUSALS.contains(&class))
+    }
+
+    /// Whether `later` is the same refusal again: the same card, refused before any
+    /// upstream was called for the same reason, within a minute of this one.
+    pub(crate) fn is_repeated_by(&self, later: &RequestTrace) -> bool {
+        const REPEAT_WINDOW_SECS: u64 = 60;
+        let refusal = |trace: &RequestTrace| {
+            trace.status == TraceStatus::Error
+                && trace.error_class.is_some()
+                && trace.attempt_chain.is_empty()
+                && trace.credits_charged == 0
+        };
+        refusal(self)
+            && refusal(later)
+            && self.card_id == later.card_id
+            && self.error_class == later.error_class
+            && later.ts >= self.ts
+            && later.ts < self.ts.saturating_add(REPEAT_WINDOW_SECS)
+    }
 }
 
 /// Which traces a search keeps; all of them when nothing is set.

@@ -214,6 +214,16 @@ fn trace_class(billing: &BillingEngine, invocation: &str) -> Vec<String> {
         .collect()
 }
 
+/// How many more times the same refusal as `invocation`'s was counted on its trace.
+fn repeats(billing: &BillingEngine, invocation: &str) -> u64 {
+    let invocation_id = format!("{CARD}:{invocation}");
+    billing
+        .list_traces(Some(CARD), 100)
+        .into_iter()
+        .find(|trace| trace.invocation_id == invocation_id)
+        .map_or(0, |trace| trace.repeats)
+}
+
 fn nothing_charged(billing: &BillingEngine) {
     let card = billing.get_card(CARD).unwrap();
     assert_eq!((card.credit_reserved, card.credit_used), (0, 0));
@@ -629,11 +639,14 @@ async fn an_attachment_no_upstream_reads_is_refused_naming_it() {
             refusal["message"].as_str().unwrap().contains(named),
             "{refusal}"
         );
+        // The first refusal's trace also counts the same refusal again within a minute.
         assert_eq!(
-            trace_class(&billing, invocation),
+            trace_class(&billing, "inv-docx"),
             vec!["unsupported_capability"]
         );
     }
+    assert!(trace_class(&billing, "inv-pdf-text").is_empty());
+    assert_eq!(repeats(&billing, "inv-docx"), 1);
     assert!(server.received_requests().await.unwrap().is_empty());
     nothing_charged(&billing);
 
@@ -1018,10 +1031,9 @@ async fn a_large_conversation_is_read_and_a_larger_one_is_compacted() {
         trace_class(&billing, "inv-declared"),
         vec!["input_too_long"]
     );
-    assert_eq!(
-        trace_class(&billing, "inv-streamed"),
-        vec!["input_too_long"]
-    );
+    // The same refusal again within a minute is counted on the first one's trace.
+    assert!(trace_class(&billing, "inv-streamed").is_empty());
+    assert_eq!(repeats(&billing, "inv-declared"), 1);
 }
 
 /// Held about three times over until it is translated, a body at the 32 MB limit comes to
