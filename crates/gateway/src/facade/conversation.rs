@@ -259,11 +259,15 @@ impl GenerateAssistantResponseHandler {
                         "Request with amz-sdk-invocation-id has already completed; use a new invocation id",
                     );
                 }
+                // Kiro's SDK sends the same invocation again after a 5xx. Work it was billed
+                // for is never run twice; the answer is one Kiro shows as written and does
+                // not retry, where an exception type it does not know read "Something went
+                // wrong: [PriorInvocationFailedException]".
                 Err(crate::idempotency::IdempotencyError::AlreadyFailed(_)) => {
                     return error_response(
-                        StatusCode::BAD_GATEWAY,
-                        "PriorInvocationFailedException",
-                        "This invocation previously failed after partial upstream work; use a new invocation id",
+                        StatusCode::BAD_REQUEST,
+                        "ValidationException",
+                        "这次请求此前已经失败，并已按上游完成的部分计费，不会重复执行。请重新发送消息。",
                     );
                 }
             };
@@ -1700,6 +1704,15 @@ fn no_route_for_group() -> Response {
 /// model the upstream does not know (404) are the operator's to fix, and are told so: the
 /// request is not at fault.
 fn upstream_refusal(error: &ProviderError) -> Option<KiroError> {
+    if let ProviderError::ThinkingNeedsOutput { needed, allowed } = error {
+        return Some(KiroError::new(
+            StatusCode::BAD_REQUEST,
+            "ValidationException",
+            format!(
+                "该模型配置的最大输出只有 {allowed} 个 token，开启思考至少需要 {needed} 个，无法按当前设置发送。可以关闭该模型的思考（effort）后重试，或请管理员调大它的最大输出。"
+            ),
+        ));
+    }
     let ProviderError::Http(status, _) = error else {
         return None;
     };
@@ -1841,11 +1854,14 @@ async fn read_body(
 
 /// A request whose every attempt came back empty. It was billed the input consumed, so it
 /// is not retried under the same invocation id.
+/// Every attempt ended empty, and the input it read is billed once. A ValidationException,
+/// which Kiro shows as written and does not retry: as a 502 its SDK sent the same
+/// invocation again, which is never run twice.
 fn empty_attempts_response() -> Response {
     error_response(
-        StatusCode::BAD_GATEWAY,
-        "InternalServerException",
-        "The upstream model returned an empty response to every attempt; the input it read has been billed",
+        StatusCode::BAD_REQUEST,
+        "ValidationException",
+        crate::stream::EMPTY_ANSWER_BILLED,
     )
 }
 

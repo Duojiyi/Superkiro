@@ -773,13 +773,13 @@ pub fn create_stream_guard_with_send_deadline(
                             if !saw_output {
                                 rejected_empty = !has_input_usage;
                                 empty_turn = true;
-                                failure = Some(Failure::new(
-                                    if has_input_usage {
-                                        "The upstream model returned an empty response; the input it read has been billed"
-                                    } else {
-                                        "Upstream completed without producing any output"
-                                    },
-                                ));
+                                // Billed, it ends with a refusal Kiro shows and does not
+                                // retry: its retry would be a new request, billed again.
+                                failure = Some(if has_input_usage && stop_reason.is_some() {
+                                    Failure::shown(EMPTY_ANSWER_BILLED)
+                                } else {
+                                    Failure::new("Upstream completed without producing any output")
+                                });
                                 break;
                             }
                             // Thinking that used up the output limit left no answer: said so,
@@ -994,6 +994,11 @@ pub fn create_stream_guard_with_send_deadline(
     FrameStream { inner: rx }
 }
 
+/// What a request whose every attempt ended empty is told: the input the upstream read is
+/// billed once.
+pub(crate) const EMPTY_ANSWER_BILLED: &str =
+    "上游模型每次都返回了空回答，已按它读取的输入计费一次。请重新发送，或换一个模型。";
+
 /// What to show when a turn ends without an answer, neither text nor a tool call, so it is
 /// not simply blank. Stop reasons arrive mapped to Kiro's vocabulary. A content filter has
 /// none: Kiro shows its own refusal for `content_filtered`, and a second message beside it
@@ -1139,6 +1144,9 @@ pub(crate) fn safe_provider_error(error: &ProviderError) -> String {
         ProviderError::Watchdog(_) => "upstream watchdog timeout".to_string(),
         ProviderError::EmptyCompletion => {
             "upstream completed without producing any output".to_string()
+        }
+        ProviderError::ThinkingNeedsOutput { .. } => {
+            "the model's output limit leaves no room for thinking".to_string()
         }
     }
 }

@@ -257,7 +257,13 @@ async fn an_empty_ordinary_stop_is_retried_without_harming_the_key() {
             "a shared key was put into cooldown"
         );
     }
-    assert!(outcome.body.contains("InternalServerException"));
+    // Billed once, it is told in words Kiro shows and does not retry.
+    assert_eq!(outcome.status, StatusCode::BAD_REQUEST, "{}", outcome.body);
+    assert!(
+        outcome.body.contains("ValidationException"),
+        "{}",
+        outcome.body
+    );
     let entries = usage_entries(&outcome.billing).await;
     assert_eq!(entries.len(), 1, "billed once, not per attempt");
     assert_eq!(entries[0].input_tokens, 50);

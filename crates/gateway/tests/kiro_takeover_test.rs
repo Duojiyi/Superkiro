@@ -1888,22 +1888,97 @@ async fn an_answer_that_ends_empty_every_time_is_billed_once() {
         )
         .await;
         assert_eq!(server.received_requests().await.unwrap().len() - before, 3);
-        let failure = if limits.is_some() {
+        // Billed once, it ends in words Kiro shows and does not retry: a retry would be
+        // billed again. As a 502, Kiro's SDK sent the same invocation again, and the answer
+        // read "Something went wrong: [PriorInvocationFailedException]".
+        let told = if limits.is_some() {
             // The answer had begun: it ends with the exception.
             assert_eq!(reply.status, StatusCode::OK);
-            frames(&reply.bytes)
-                .into_iter()
-                .any(|(kind, _)| kind == "InternalServerException")
+            error_frame_of(&reply.bytes, "ValidationException")
         } else {
-            reply.status == StatusCode::BAD_GATEWAY
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text());
+            assert_eq!(reply.json()["__type"], "ValidationException");
+            reply.json()
         };
-        assert!(failure, "{}", reply.text());
+        assert!(told.get("reason").is_none(), "{told}");
+        assert!(
+            told["message"]
+                .as_str()
+                .unwrap()
+                .contains("已按它读取的输入计费一次"),
+            "{told}"
+        );
         let entries = usage_entries(&billing);
         assert_eq!(entries.len(), 1, "{limits:?}");
         assert_eq!(entries[0].input_tokens, 50);
         assert!(entries[0].output_tokens <= 1);
         keys_untouched(&runtime);
+
+        // The same invocation again is refused as one that failed, readably.
+        let again = send(
+            &app,
+            "inv-empty",
+            body(json!({"content": "hello", "modelId": "model"}), vec![]),
+        )
+        .await;
+        assert_eq!(again.status, StatusCode::BAD_REQUEST, "{}", again.text());
+        assert_eq!(again.json()["__type"], "ValidationException");
+        assert!(again.json()["message"]
+            .as_str()
+            .unwrap()
+            .contains("此前已经失败"));
+        assert_eq!(server.received_requests().await.unwrap().len() - before, 3);
+        assert_eq!(usage_entries(&billing).len(), 1);
     }
+}
+
+/// The payload of the `kind` exception frame in an answer.
+fn error_frame_of(bytes: &[u8], kind: &str) -> Value {
+    frames(bytes)
+        .into_iter()
+        .find(|(frame, _)| frame == kind)
+        .map(|(_, payload)| payload)
+        .unwrap_or_else(|| panic!("no {kind} frame"))
+}
+
+/// Budget thinking needs room for a budget and for the answer after it. A model configured
+/// with less output than that cannot take it: a configuration refusal Kiro shows as
+/// written, not a 502 "temporary error" its SDK retried unchanged.
+#[tokio::test]
+async fn thinking_a_model_has_no_output_room_for_is_a_configuration_refusal() {
+    let server = upstream(
+        ResponseTemplate::new(200).set_body_raw(anthropic_answer("hi"), "text/event-stream"),
+    )
+    .await;
+    let mut map = ModelMap::new("map", GROUP, "model", "prov", "up-model");
+    map.max_output = 1_500;
+    map.supports_reasoning = true;
+    let billing = engine(ProviderFormat::Anthropic, &server.uri(), vec![map]);
+    let (app, runtime) = routed(&billing, &LargeBodyGate::default());
+    let reply = send(
+        &app,
+        "inv-thinking-room",
+        body(
+            json!({"content": "hello", "modelId": "model",
+                "additionalModelRequestFields": {"output_config": {"effort": "high"}}}),
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text());
+    let refusal = reply.json();
+    assert_eq!(refusal["__type"], "ValidationException");
+    assert!(refusal.get("reason").is_none(), "{refusal}");
+    assert!(
+        refusal["message"]
+            .as_str()
+            .unwrap()
+            .contains("最大输出只有 1500 个 token，开启思考至少需要 2048 个"),
+        "{refusal}"
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+    nothing_charged(&billing);
+    keys_untouched(&runtime);
 }
 
 /// A primary that fails after its model has started, and after the answer to Kiro has

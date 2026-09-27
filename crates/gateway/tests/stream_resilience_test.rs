@@ -886,9 +886,17 @@ async fn empty_completed_stream_releases_credits_and_allows_retry() {
             Some(settler),
         ))
         .await;
-        assert!(frames
-            .iter()
-            .any(|(name, _)| name == "InternalServerException"));
+        // Billed, it ends in words Kiro shows and does not retry: its retry would be a new
+        // request, billed again. Unbilled, it is a temporary error Kiro may retry.
+        let ending = if input_usage {
+            "ValidationException"
+        } else {
+            "InternalServerException"
+        };
+        assert!(
+            frames.iter().any(|(name, _)| name == ending),
+            "{input_usage}"
+        );
         assert!(!frames.iter().any(|(name, payload)| name == "metadataEvent"
             && serde_json::from_slice::<serde_json::Value>(payload).unwrap()["stopReason"]
                 .is_string()));
@@ -1492,7 +1500,8 @@ async fn an_empty_response_the_model_started_bills_the_input_it_reported() {
         let message = exception_message(&frames).expect("the stream ends with an exception");
         let entries = billing.list_ledger_entries_for_card(&card_id, None);
         if reported {
-            assert!(message.contains("billed"), "{message}");
+            assert!(message.contains("已按它读取的输入计费一次"), "{message}");
+            assert_eq!(frames.last().unwrap().0, "ValidationException");
             assert_eq!(entries.len(), 1);
             assert_eq!((entries[0].input_tokens, entries[0].output_tokens), (50, 0));
         } else {

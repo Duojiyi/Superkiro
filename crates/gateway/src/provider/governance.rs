@@ -367,7 +367,9 @@ pub fn is_cooldown_error(err: &ProviderError) -> bool {
         ProviderError::Network(_) | ProviderError::StreamDisconnected | ProviderError::NoAnswer => {
             true
         }
-        ProviderError::Parse(_) | ProviderError::Serialization(_) => false,
+        ProviderError::Parse(_)
+        | ProviderError::Serialization(_)
+        | ProviderError::ThinkingNeedsOutput { .. } => false,
         // A relay's passing failure (kimera-primary sends one for about one request in
         // twenty) says nothing about the key.
         ProviderError::Unavailable => false,

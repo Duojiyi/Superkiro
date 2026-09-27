@@ -83,6 +83,11 @@ pub enum ProviderError {
     /// same thing. The key did answer, so this is retried without cooling the key down.
     #[error("Upstream completed without producing any output")]
     EmptyCompletion,
+
+    /// Thinking within a budget was asked for, and the model's output limit leaves no room
+    /// for one: the request cannot be sent as the model is configured, by any key.
+    #[error("Thinking needs a max output of at least {needed} tokens; the model allows {allowed}")]
+    ThinkingNeedsOutput { needed: u32, allowed: u32 },
 }
 
 /// Whether an upstream's words say the prompt is longer than the model takes: Anthropic's

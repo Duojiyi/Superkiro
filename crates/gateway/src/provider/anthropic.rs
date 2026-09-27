@@ -318,9 +318,10 @@ impl AnthropicProvider {
                 };
                 let budget = wanted.min(max_tokens.saturating_sub((max_tokens / 4).max(1024)));
                 if budget < 1024 {
-                    return Err(ProviderError::Serialization(
-                        "Thinking needs a max output of at least 2048 tokens".into(),
-                    ));
+                    return Err(ProviderError::ThinkingNeedsOutput {
+                        needed: 2048,
+                        allowed: max_tokens,
+                    });
                 }
                 body["thinking"] = serde_json::json!({"type": "enabled", "budget_tokens": budget});
                 thinking = true;

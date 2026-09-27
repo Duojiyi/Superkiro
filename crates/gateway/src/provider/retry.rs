@@ -282,6 +282,7 @@ pub(crate) fn stream_error(value: &serde_json::Value) -> ProviderError {
 pub(crate) fn failure_class(error: &ProviderError) -> String {
     match error {
         ProviderError::Http(status, _) => format!("http_{}", status.as_u16()),
+        ProviderError::ThinkingNeedsOutput { .. } => "configuration".into(),
         ProviderError::Unavailable => "upstream_service".into(),
         ProviderError::Parse(_) => "protocol".into(),
         ProviderError::Timeout | ProviderError::Watchdog(_) | ProviderError::NoAnswer => {
