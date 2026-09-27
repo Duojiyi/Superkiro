@@ -565,6 +565,7 @@ div.attention-item:hover {background: transparent;}
 .provider-name h3 {margin: 0; font-size: 15px;}
 .provider-name .mono {font-size: 12px; overflow-wrap: anywhere;}
 .provider-foot {display: flex; justify-content: flex-start;}
+.provider-tools {display: inline-flex; align-items: center; gap: 8px;}
 /* What a link (运营概览's 需要关注) points to, marked until the operator turns to something else. */
 .provider-card.is-pointed {border-color: #d4a72c; box-shadow: 0 0 0 1px #d4a72c;}
 .table tr.is-pointed td {background: var(--warning-bg);}
@@ -574,7 +575,7 @@ div.attention-item:hover {background: transparent;}
 .keys-table .col-key {width: 260px; overflow: hidden; text-overflow: ellipsis;}
 .keys-table .col-weight {width: 72px;}
 .keys-table .col-status {width: 140px;}
-.keys-table .col-actions {width: 112px;}
+.keys-table .col-actions {width: 128px;}
 .model-tags {display: inline-flex; align-items: center; flex-wrap: wrap; gap: 4px;}
 .switch {display: inline-flex; align-items: center; gap: 8px; height: 28px; font-size: 13px; color: var(--text-2);}
 .switch-track {position: relative; width: 36px; height: 20px; border-radius: 10px; background: #c3cad3; transition: background .15s;}

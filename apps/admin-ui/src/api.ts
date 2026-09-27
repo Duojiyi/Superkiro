@@ -578,6 +578,16 @@ export class AdminApiClient {
     return this.request('/api/v1/admin/providers');
   }
 
+  /** A provider's name, address or API format (`open_ai` | `anthropic`); only the fields given change. */
+  async updateProvider(edit: {id: string; name?: string; base_url?: string; format?: 'open_ai' | 'anthropic'}): Promise<{success: boolean; provider?: Record<string, unknown>}> {
+    return this.request('/api/v1/admin/providers/update', {method: 'POST', body: JSON.stringify(edit)});
+  }
+
+  /** Refused (409) while any model routes through it (primary or backup) or it still has Keys. */
+  async deleteProvider(providerId: string): Promise<{success: boolean}> {
+    return this.request('/api/v1/admin/providers/delete', {method: 'POST', body: JSON.stringify({id: providerId})});
+  }
+
   async updateProviderStatus(providerId: string, enabled: boolean): Promise<{ success: boolean; providerId: string; enabled: boolean }> {
     return this.request('/api/v1/admin/providers/status', {
       method: 'POST',

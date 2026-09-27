@@ -398,7 +398,7 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
               selectionEpoch={selectionEpoch} intent={intent.cards} intentRevision={intentRevision} onRoute={reportRoute}
               updateCards={cards => setData(previous => ({...previous, cards}))}
               onOpenTrace={(cardId, traceId) => void navigate('traces', {traces: {search: cardId, card: cardId, open: traceId}})}/>}
-            {activeTab === 'traces' && <TracesPage traces={data.traces} cards={data.cards} loading={loading} failed={!!failures.traces}
+            {activeTab === 'traces' && <TracesPage traces={data.traces} cards={data.cards} providers={data.providers} loading={loading} failed={!!failures.traces}
               refresh={refreshData} guards={guards} reportError={reportError} intent={intent.traces} intentRevision={intentRevision} onRoute={reportRoute}
               onOpenCard={cardId => void navigate('cards', {cards: {status: 'ALL', search: cardId, open: cardId}})}/>}
             {activeTab === 'groups' && <CommercialEditor key="groups" kind="groups" onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy}

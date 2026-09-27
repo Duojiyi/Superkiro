@@ -65,18 +65,21 @@ const writes=endpoint=>fixture.writes.filter(write=>write.endpoint===endpoint);
     await keyRow('OpenAI 格式 / Fixture','fixture-openai-key-1').getByText('2 小时前 · HTTP 401 · Key 无效或被拒绝').waitFor();
     // The server names the failure's kind (http_529); the console says it in words.
     await keyRow('测试供应商 / Fixture','fixture-backup').getByText('5 分钟前 · HTTP 529 · 上游过载').waitFor();
-    assert.equal(await keyRow('测试供应商 / Fixture','fixture-key').getByRole('button',{name:'恢复',exact:true}).count(),0,'a healthy Key needs no 恢复');
-    // 恢复 clears the state; the badge follows.
-    await keyRow('测试供应商 / Fixture','fixture-backup').getByRole('button',{name:'恢复',exact:true}).click();
+    assert.equal(await keyRow('测试供应商 / Fixture','fixture-key').getByRole('button',{name:'解除冷却',exact:true}).count(),0,'a healthy Key needs no 解除冷却');
+    // A Key refused as invalid is not put back as it is: it needs a new secret.
+    assert.equal(await keyRow('OpenAI 格式 / Fixture','fixture-openai-key-1').getByRole('button',{name:'解除冷却',exact:true}).count(),0);
+    await keyRow('OpenAI 格式 / Fixture','fixture-openai-key-1').getByRole('button',{name:'更换密钥',exact:true}).waitFor();
+    // 解除冷却 clears the cooldown; the badge follows.
+    await keyRow('测试供应商 / Fixture','fixture-backup').getByRole('button',{name:'解除冷却',exact:true}).click();
     const box=page.getByRole('alertdialog');await box.waitFor();const facts=await box.innerText();
     assert(facts.includes('现在：冷却中')&&facts.includes('最近错误：HTTP 529 · 上游过载'),facts);
     await box.locator('[data-confirm="accept"]').click();
-    await page.locator('.toast').filter({hasText:'已恢复 Key fixture-backup'}).waitFor();
+    await page.locator('.toast').filter({hasText:'已解除 Key fixture-backup 的冷却'}).waitFor();
     assert.deepEqual(writes('providers/keys/reset').map(write=>write.body),[{provider_id:'fixture-provider',key_id:'fixture-backup'}]);
     await keyRow('测试供应商 / Fixture','fixture-backup').getByText('正常',{exact:true}).waitFor();
     await keyRow('测试供应商 / Fixture','fixture-backup').getByText('5 分钟前 · HTTP 529 · 上游过载').waitFor();// the last error stays on record
     assert.equal(await page.locator('#nav-badge-providers [aria-hidden="true"]').textContent(),'1');
-    console.log('PASS: live Key health with the last error, 恢复 clears it and the badge follows; format tags from the server’s format');
+    console.log('PASS: live Key health with the last error, 解除冷却 clears a cooldown and the badge follows, a refused Key offers 更换密钥; format tags from the server’s format');
 
     // 测试 in a Key's model list: through that Key, nothing saved.
     key('fixture-key').allowed_models=[...key('fixture-key').allowed_models,'overloaded-model'];await refresh();

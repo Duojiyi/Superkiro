@@ -170,7 +170,8 @@ module.exports = function fixtureApi() {
     if(endpoint==='providers/keys') {
       if(!providers.some(p=>p.id===body.provider_id))return reply({success:false,error:'Unknown provider'},404);
       let key=keyOf();if(!key){if(!body.api_key)return reply({success:false,error:'API key required for new key'},400);key={id:body.key_id,provider_id:body.provider_id,weight:1,enabled:true,health_state:'healthy'};keys.push(key);}
-      Object.assign(key,{allowed_models:[...new Set(body.allowed_models)].sort(),...(body.weight!==undefined?{weight:body.weight}:{}),...(body.enabled!==undefined?{enabled:body.enabled}:{})});
+      // A new secret puts the Key back to healthy, as the server does; its last error stays on record.
+      Object.assign(key,{allowed_models:[...new Set(body.allowed_models)].sort(),...(body.weight!==undefined?{weight:body.weight}:{}),...(body.enabled!==undefined?{enabled:body.enabled}:{}),...(body.api_key?{health_state:'healthy',cooldown_until:null}:{})});
       return reply({success:true,keys:keys.filter(k=>k.provider_id===body.provider_id),published:false});
     }
     if(endpoint==='providers/keys/delete') {

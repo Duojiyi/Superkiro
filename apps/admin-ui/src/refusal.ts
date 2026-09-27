@@ -34,6 +34,13 @@ const REFUSALS: Array<[RegExp, (ids: string) => string]> = [
   [/The Key's secret is unavailable/i, () => '读不到这个 Key 的密钥：编辑这个 Key，重新填写密钥'],
   [/^Unknown key$/i, () => '这个 Key 已不存在（可能刚被删除），请刷新'],
   [/^Unknown provider$/i, () => '这个供应商已不存在（可能刚被删除），请刷新'],
+  // A provider's edit or deletion; `ids` are the models, or the Keys, that still use it.
+  [/Provider still routes models/i, ids => `还有模型的线路用这个供应商${ids ? `：${ids}` : ''}。先在“模型与定价”把它们换到别的供应商（主线路和备用线路都算），或删除这些模型`],
+  [/Provider still has Keys/i, ids => `这个供应商还有 Key${ids ? `：${ids}` : ''}。先删除这些 Key`],
+  [/Invalid provider name/i, () => '供应商名称不能为空，不超过 256 字节，不含控制字符'],
+  [/base_url must be a valid URL/i, () => '请填写完整的上游地址，例如 https://api.example.com'],
+  [/base_url must use HTTPS/i, () => '上游地址须使用 HTTPS（本机 localhost、127.0.0.1 可用 HTTP）'],
+  [/^Nothing to update$/i, () => '没有要保存的修改'],
   // Archiving the ledger.
   [/No ledger entries match the archival cutoff/i, () => '这个日期之前没有可以归档的账本记录：换一个更晚的日期'],
   [/Billing state is not persisted/i, () => '服务器没有把账本保存到磁盘，没有可以归档的内容'],

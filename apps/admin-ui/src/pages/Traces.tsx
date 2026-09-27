@@ -11,7 +11,7 @@ import {FilterTabs, IdCell, Pager, StatusBadge, TableState, TopbarActions, copyT
 import {formatCharge, formatClock, formatCount, formatDateTime, formatDuration, formatFullDateTime, formatListTime, formatMoney, formatRelative, formatShortDate, formatSpeed, formatTokenCount} from '../format';
 import {cardCodeOf, cardIdForCode} from '../cardCode';
 import {errorClassLabel, TRACE_IN_PROGRESS, traceStatusView} from '../status';
-import type {Intent, Refresh, ReportError, ReportRoute, TraceTab, TraceWindow, WriteGuards} from '../types';
+import type {Intent, Refresh, ReportError, ReportRoute, Row, TraceTab, TraceWindow, WriteGuards} from '../types';
 import {ConversationView, RawView, ReplyView} from './TraceContent';
 
 const PAGE_SIZE = 50;
@@ -24,9 +24,11 @@ const statusMatches = (trace: AdminTrace, tab: TraceTab) =>
 const ttftTone = (ms: unknown) => typeof ms === 'number' ? (ms > 15000 ? 'is-danger' : ms > 5000 ? 'is-warning' : '') : '';
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
-export default function TracesPage({traces, cards, loading, failed, refresh, guards, reportError, intent, intentRevision = 0, onRoute, onOpenCard}: {
+export default function TracesPage({traces, cards, providers = [], loading, failed, refresh, guards, reportError, intent, intentRevision = 0, onRoute, onOpenCard}: {
   traces: AdminTrace[];
   cards: AdminCardItem[];
+  /** For providers' names; a trace names its provider by ID. */
+  providers?: Row[];
   loading: boolean;
   failed: boolean;
   refresh: Refresh;
@@ -132,7 +134,8 @@ export default function TracesPage({traces, cards, loading, failed, refresh, gua
   const selected = selectedIndex >= 0 ? filtered[selectedIndex] : selectedId ? source.find(trace => trace.id === selectedId) ?? null : null;
   const filtersActive = !!text || status !== 'ALL' || model !== 'ALL' || provider !== 'ALL' || reason !== null || range !== 'all';
   const resetFilters = () => {setQuery(''); setCodeLookup(null); setStatus('ALL'); setModel('ALL'); setProvider('ALL'); setReason(null); setRange('all'); setPage(0);};
-  const providers = Array.from(new Set(source.map(trace => String(trace.provider_id ?? '')).filter(Boolean))).sort();
+  const providerName = (id: unknown) => String(providers.find(provider => provider.id === id)?.name || id);
+  const providerIds = Array.from(new Set(source.map(trace => String(trace.provider_id ?? '')).filter(Boolean))).sort();
   const models = Array.from(new Set(source.map(trace => String(trace.exposed_model ?? '')).filter(Boolean))).sort();
   const oldest = source.length ? Math.min(...source.map(trace => Number(trace.ts))) : null;
   const tabs: TabOption<TraceTab>[] = ([['ALL', '全部'], ['error', '失败'], ['client_aborted', '中断'], ['in_progress', '进行中'], ['success', '成功']] as Array<[TraceTab, string]>)
@@ -205,10 +208,10 @@ export default function TracesPage({traces, cards, loading, failed, refresh, gua
             {models.map(name => <option key={name} value={name}>{name}</option>)}
           </select>
         </label>
-        {providers.length > 1 && <label className="inline-field"><span>供应商</span>
+        {providerIds.length > 1 && <label className="inline-field"><span>供应商</span>
           <select aria-label="供应商筛选" value={provider} onChange={event => setProvider(event.target.value)}>
             <option value="ALL">全部</option>
-            {providers.map(name => <option key={name} value={name}>{name}</option>)}
+            {providerIds.map(id => <option key={id} value={id}>{providerName(id)}</option>)}
           </select>
         </label>}
         <div className="chips" role="group" aria-label="时间范围">
@@ -274,14 +277,15 @@ export default function TracesPage({traces, cards, loading, failed, refresh, gua
       <Pager page={currentPage} pageSize={PAGE_SIZE} total={filtered.length} onPage={setPage}/>
     </div>
 
-    {selected && <TraceDrawer trace={selected} hasPrev={selectedIndex > 0} hasNext={selectedIndex >= 0 && selectedIndex < filtered.length - 1}
+    {selected && <TraceDrawer trace={selected} providerName={providerName} hasPrev={selectedIndex > 0} hasNext={selectedIndex >= 0 && selectedIndex < filtered.length - 1}
       onMove={move} onClose={() => setSelectedId(null)} onFilterCard={cardId => {setQuery(cardId); setStatus('ALL');}}
       cardKnown={cards.some(card => card.id === selected.card_id)} onOpenCard={onOpenCard}/>}
   </div>;
 }
 
-function TraceDrawer({trace, hasPrev, hasNext, onMove, onClose, onFilterCard, cardKnown, onOpenCard}: {
+function TraceDrawer({trace, providerName, hasPrev, hasNext, onMove, onClose, onFilterCard, cardKnown, onOpenCard}: {
   trace: AdminTrace;
+  providerName: (id: unknown) => string;
   hasPrev: boolean;
   hasNext: boolean;
   onMove: (step: number) => void;
@@ -327,7 +331,7 @@ function TraceDrawer({trace, hasPrev, hasNext, onMove, onClose, onFilterCard, ca
           {trace.card_id && <button type="button" className="btn-text" onClick={() => onFilterCard(String(trace.card_id))}>只看这张卡</button>}
           {trace.card_id && cardKnown && <button type="button" className="btn-text" onClick={() => onOpenCard(String(trace.card_id))}>去卡密资产</button>}
         </dd>
-        <dt>供应商</dt><dd>{trace.provider_id ?? '—'}</dd>
+        <dt>供应商</dt><dd>{trace.provider_id ? <span title={String(trace.provider_id)}>{providerName(trace.provider_id)}</span> : '—'}</dd>
         <dt>请求 ID</dt><dd><IdCell value={trace.id} kind="trace"/></dd>
         {trace.error_class && <><dt>失败原因</dt><dd><b>{errorClassLabel(trace.error_class)}</b> <span className="mono muted">{trace.error_class}</span></dd></>}
         {lastError && <><dt>上游错误</dt><dd className="error-line"><span>{lastError}</span></dd></>}
@@ -337,7 +341,7 @@ function TraceDrawer({trace, hasPrev, hasNext, onMove, onClose, onFilterCard, ca
         {chain.length ? <ol className="attempt-list">{chain.map((attempt, index) => <li key={index} className={attempt.success ? 'is-ok' : 'is-failed'}>
           <span className="attempt-index">{index + 1}</span>
           <div>
-            <p><span className="mono">{attempt.provider_id ?? '—'} / {attempt.key_id ?? '—'}</span> · {attempt.success ? '成功' : '失败'} · {formatDuration(attempt.latency_ms)}</p>
+            <p><span title={attempt.provider_id}>{attempt.provider_id ? providerName(attempt.provider_id) : '—'}</span> / <span className="mono">{attempt.key_id ?? '—'}</span> · {attempt.success ? '成功' : '失败'} · {formatDuration(attempt.latency_ms)}</p>
             {attempt.error && <p className="attempt-error">{attempt.error}</p>}
           </div>
         </li>)}</ol> : <p className="muted">没有记录尝试</p>}

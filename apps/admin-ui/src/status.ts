@@ -62,6 +62,9 @@ export function failureLabel(value: unknown): string {
   return words ? `HTTP ${code} · ${words}` : `HTTP ${code}`;
 }
 
+/** The upstream refused the Key itself (invalid, HTTP 401, or without permission, 403): only a new secret fixes it. */
+export const credentialFailure = (key: Row) => key.health_state === 'unhealthy' || ['http_401', 'http_403'].includes(String(key.last_error ?? ''));
+
 export function keyStatusView(key: Row, nowSecs: number): StatusView {
   if (key.enabled === false) return {label: '已停用', tone: 'neutral'};
   const lastError = failureLabel(key.last_error), error = lastError ? `最近错误：${lastError}` : undefined;
