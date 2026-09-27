@@ -1,3 +1,4 @@
+import type {KeyAttempts, ModelHealth, ProviderAttempts} from './health';
 export class AdminApiError extends Error {
   constructor(message:string, public readonly status:number){super(message);this.name='AdminApiError';}
 }
@@ -65,6 +66,13 @@ export interface AdminActivity {
   tracesCoverFromSecs?: number | null;
   /** The last 24 hours by provider, busiest first. */
   providers?: Array<{providerId: string; requests: number; failed: number; ttftMedianMs: number | null}>;
+  /** Every upstream attempt by provider and by Key over the last hour, 24 hours and 7 days, a primary's failures included though its backup answered (newer servers). */
+  providerAttempts?: ProviderAttempts[];
+  keyAttempts?: KeyAttempts[];
+  /** Requests by the model customers asked for, and their failures, over the same periods. */
+  modelHealth?: ModelHealth[];
+  /** Billed requests and distinct cards by model over the last 7 days. */
+  modelUsage7d?: Array<{model: string; requests: number; cards: number}>;
 }
 
 export interface AdminTraceAttempt {

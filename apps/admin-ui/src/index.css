@@ -608,6 +608,12 @@ div.attention-item:hover {background: transparent;}
 .provider-tools {display: inline-flex; align-items: center; gap: 8px;}
 /* What a link (运营概览's 需要关注) points to, marked until the operator turns to something else. */
 .provider-card.is-pointed {border-color: #d4a72c; box-shadow: 0 0 0 1px #d4a72c;}
+/* 近 24 小时 尝试 120 · 失败 7（5.8%）· 被备用接管 5 · HTTP 529 × 5: every attempt sent to the provider. */
+.provider-attempts {margin: -2px 0 0; font-size: 13px;}
+.keys-table .col-key-traffic {white-space: nowrap;}
+.health-table .col-kinds .clip-reason {max-width: 200px;}
+@media (max-width: 1440px) {.health-table .col-kinds .clip-reason {max-width: 150px;}}
+.panel-period {margin-left: 6px; font-size: 13px; font-weight: 400; color: var(--text-2);}
 .table tr.is-pointed td {background: var(--warning-bg);}
 .table tr.is-pointed td:first-child {box-shadow: inset 3px 0 0 #d4a72c;}
 .keys-table {min-width: 720px; table-layout: fixed;}

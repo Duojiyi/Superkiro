@@ -3,6 +3,7 @@
 import {useState, type ReactNode} from 'react';
 import {loadAdjustment} from '../adjustment';
 import {CARD_CHANGE_KEY} from '../cardSupport';
+import {attemptsFromTraces, failingModels, failureText, failureTone, kindsText, type AttemptWindow} from '../health';
 import type {AdminActivityWindow, AdminTrace} from '../api';
 import {EstimateTag, FilterTabs, StatusBadge, TableState, TopbarActions} from '../components/ui';
 import {IconCheck, IconWarning} from '../components/icons';
@@ -126,9 +127,18 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
   keyItems(liveKeys.filter(key => keyAlert(key, nowSecs) === 'degraded'), key => `Key ${String(key.id)}（${providerName(key.provider_id)}）冷却后试用中`, '冷却后试用中', 'warning');
   keyItems(liveKeys.filter(key => keyAlert(key, nowSecs) === 'unhealthy'),
     key => `Key ${String(key.id)}（${providerName(key.provider_id)}）不可用${failureLabel(key.last_error) ? `：${failureLabel(key.last_error)}` : ''}`, '不可用', 'danger');
+  // Models that fail, from the server's count of requests by model: each named, with a link to its
+  // failed requests. Without it (older servers), failed requests of the last hour from the traces.
+  const failing = activity?.modelHealth ? failingModels(activity.modelHealth) : null;
+  if (failing) {
+    const each = failing.length <= 3 ? failing : [];
+    for (const entry of each) attention.push({text: entry.text, tone: 'danger', go: () => onNavigate('traces', {traces: {status: 'error', window: entry.window, model: entry.model}})});
+    if (failing.length > 3) attention.push({text: `${failing.length} 个模型有失败：${nameList(failing.map(entry => entry.model), 3)}`, tone: 'danger',
+      go: () => onNavigate('traces', {traces: {status: 'error', window: failing.some(entry => entry.window === 'day') ? 'day' : 'hour'}})});
+  }
   // Failed requests, by model: one model is named and filtered on, several give the busiest.
   const failedLastHour = data.traces.filter(trace => trace.status === 'error' && Number(trace.ts) > nowSecs - 3600);
-  if (failedLastHour.length) {
+  if (!failing && failedLastHour.length) {
     const byModel = [...failedLastHour.reduce((counts, trace) => counts.set(String(trace.exposed_model ?? '—'), (counts.get(String(trace.exposed_model ?? '—')) ?? 0) + 1), new Map<string, number>())].sort((a, b) => b[1] - a[1]);
     const only = byModel.length === 1 && byModel[0][0] !== '—' ? byModel[0][0] : null;
     attention.push({text: only ? `近 1 小时 ${only} 失败 ${failedLastHour.length} 次` : `近 1 小时 ${failedLastHour.length} 次失败请求（最多：${byModel[0][0]} ${byModel[0][1]} 次）`,
@@ -160,6 +170,12 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
   const describe = (entries: typeof broken) => nameList(entries.map(({model, route}) => `${modelName(model, data.models, data.groups)}（${targetProblem(route.primary, data.providers, nowSecs)}）`), 4);
   const down = broken.filter(entry => entry.route.down), takeover = broken.filter(entry => !entry.route.down);
 
+  // Every upstream attempt over the last 24 hours by provider (a primary's failures show, though its
+  // backup answered): from the server, else counted from the traces the console has.
+  const attempts24: Map<string, AttemptWindow> = activity?.providerAttempts
+    ? new Map(activity.providerAttempts.map(entry => [entry.providerId, entry.last24h]))
+    : attemptsFromTraces(data.traces, nowSecs).providers;
+  const attemptsEstimate = activity?.providerAttempts ? undefined : `按最近 ${data.traces.length} 条调用记录的尝试统计`;
   const providerRows = data.providers.map(provider => {
     const keys = data.providerKeys.filter(key => key.provider_id === provider.id);
     const counts = new Map<string, {count: number; tone: string}>();
@@ -174,7 +190,7 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
     const failed = reported ? reported.failed : traced.filter(trace => trace.status === 'error').length;
     const timed = traced.map(trace => trace.ttft_ms).filter((value): value is number => typeof value === 'number').sort((a, b) => a - b);
     const median = reported ? reported.ttftMedianMs : timed.length ? timed[Math.floor((timed.length - 1) / 2)] : null;
-    return {provider, keys, counts, rate: requests ? (requests - failed) / requests * 100 : null, median};
+    return {provider, keys, counts, rate: requests ? (requests - failed) / requests * 100 : null, median, attempts: attempts24.get(String(provider.id))};
   });
 
   return <div className="page-stack">
@@ -236,20 +252,28 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
       </section>
     </div>
 
-    <section className="panel">
-      <h3>服务健康</h3>
-      <div className="table-scroll"><table className="table">
-        <thead><tr><th>供应商</th><th className="col-status">状态</th><th>Key</th><th className="num">近 24 小时成功率</th><th className="num">首字中位数</th><th className="col-actions"><span className="sr-only">操作</span></th></tr></thead>
+    <section className="panel" aria-label="服务健康">
+      <div className="panel-head"><h3>服务健康 <span className="panel-period">近 24 小时</span></h3>{attemptsEstimate && <EstimateTag title={attemptsEstimate}/>}</div>
+      <div className="table-scroll"><table className="table health-table">
+        <thead><tr><th>供应商</th><th className="col-status">状态</th><th>Key</th>
+          <th className="num" title="近 24 小时发给这个供应商的每一次尝试，包括失败后改由备用线路完成的">尝试</th><th className="num">失败</th>
+          <th className="num" title="失败后由别的供应商接着完成的次数">被备用接管</th><th>失败原因</th><th className="num">首字中位数</th><th className="col-actions"><span className="sr-only">操作</span></th></tr></thead>
         <tbody>
-          {providerRows.map(({provider, keys, counts, rate, median}) => <tr key={String(provider.id)}>
-            <td className="cell-strong">{String(provider.name || provider.id)}</td>
-            <td className="col-status"><StatusBadge view={provider.enabled === false ? {label: '已停用', tone: 'neutral'} : {label: '启用', tone: 'success'}}/></td>
-            <td>{keys.length ? <span className="key-summary">{[...counts.entries()].map(([label, value]) => <span key={label} className={`dot-label dot-${value.tone}`}>{value.count} {label}</span>)}</span> : <span className="muted">没有 Key</span>}</td>
-            <td className={`num${rateTone(rate) ? ` is-${rateTone(rate)}` : ''}`}>{formatPercent(rate)}</td>
-            <td className="num">{formatDuration(median)}</td>
-            <td className="col-actions"><button type="button" className="btn-text" onClick={toProvider(provider.id)}>查看</button></td>
-          </tr>)}
-          {!data.providers.length && <TableState colSpan={6} loading={loading} failed={failures.providers} empty="还没有供应商" onRetry={onRetry}
+          {providerRows.map(({provider, keys, counts, rate, median, attempts}) => {
+            const tone = attempts ? failureTone(attempts.failures, attempts.attempts) : undefined;
+            return <tr key={String(provider.id)}>
+              <td className="cell-strong">{String(provider.name || provider.id)}</td>
+              <td className="col-status"><StatusBadge view={provider.enabled === false ? {label: '已停用', tone: 'neutral'} : {label: '启用', tone: 'success'}}/></td>
+              <td>{keys.length ? <span className="key-summary">{[...counts.entries()].map(([label, value]) => <span key={label} className={`dot-label dot-${value.tone}`}>{value.count} {label}</span>)}</span> : <span className="muted">没有 Key</span>}</td>
+              <td className="num" title={rate === null ? undefined : `它最终完成的请求成功率 ${formatPercent(rate)}`}>{attempts?.attempts ? formatCount(attempts.attempts) : '—'}</td>
+              <td className={`num${tone ? ` is-${tone}` : ''}`} title={attempts?.attempts ? `${formatCount(attempts.failures)} / ${formatCount(attempts.attempts)} 次尝试失败` : undefined}>{attempts?.attempts ? failureText(attempts.failures, attempts.attempts) : '—'}</td>
+              <td className="num">{attempts?.takenOver ? formatCount(attempts.takenOver) : '—'}</td>
+              <td className="col-kinds">{attempts?.failures ? <span className="clip clip-reason" title={kindsText(attempts.failuresByKind, 10)}>{kindsText(attempts.failuresByKind)}</span> : <span className="muted">—</span>}</td>
+              <td className="num">{formatDuration(median)}</td>
+              <td className="col-actions"><button type="button" className="btn-text" onClick={toProvider(provider.id)}>查看</button></td>
+            </tr>;
+          })}
+          {!data.providers.length && <TableState colSpan={9} loading={loading} failed={failures.providers} empty="还没有供应商" onRetry={onRetry}
             action={<button type="button" className="btn btn-small" onClick={() => onNavigate('providers')}>添加供应商</button>}/>}
         </tbody>
       </table></div>

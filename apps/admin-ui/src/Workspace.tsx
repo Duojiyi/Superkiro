@@ -423,7 +423,7 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
             {activeTab === 'models' && <CommercialEditor key="models" kind="models" onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy}
               cards={cardsLoaded ? data.cards : undefined} onPublished={() => void refreshData({keepSelection: true})} refreshEpoch={refreshEpoch} providers={data.providers} providerKeys={data.providerKeys}
               routesKnown={providersLoaded} intent={intent.models}/>}
-            {activeTab === 'providers' && <ProvidersPage providers={data.providers} providerKeys={data.providerKeys} models={data.models}
+            {activeTab === 'providers' && <ProvidersPage providers={data.providers} providerKeys={data.providerKeys} models={data.models} activity={data.stats?.activity} traces={data.traces}
               loading={loading} failed={!!failures.providers} refresh={refreshData} guards={guards} reportError={reportError}
               editing={keyEditing} setEditing={setKeyEditing} providerDirty={providerDirty} editorBusy={editorBusy}
               intent={intent.providers} intentRevision={intentRevision} onRoute={reportRoute}

@@ -146,3 +146,38 @@ console.log('PASS: refused support actions are explained in words with their car
   assert.deepEqual([...status.CARD_LIMIT_REFUSALS], ['insufficient_balance', 'concurrency_limit', 'usage_limit'], 'the classes billing names CARD_LIMIT_REFUSALS');
   console.log('PASS: balance, concurrency and usage refusals in words, a balance refusal with what it needed and what the card had');
 }
+
+// Health by attempt: a primary failing over to its backup shows its failures, as billing counts them.
+{
+  const health = load('health.ts', {'./format': format, './status': load('status.ts')});
+  const now = 1790000000;
+  const traces = [
+    {ts: now - 60, attempt_chain: [{provider_id: 'hanyue', key_id: 'hanyue-1', success: false, error: 'http_529'}, {provider_id: 'kimera', key_id: 'kimera-1', success: true}]},
+    {ts: now - 120, attempt_chain: [{provider_id: 'hanyue', key_id: 'hanyue-1', success: false, error: 'http_529'}, {provider_id: 'hanyue', key_id: 'hanyue-2', success: false, error: 'timeout'}]},
+    {ts: now - 180, attempt_chain: [{provider_id: 'kimera', key_id: 'kimera-1', success: true}]},
+    {ts: now - 90000, attempt_chain: [{provider_id: 'hanyue', key_id: 'hanyue-1', success: false, error: 'http_529'}]},
+  ];
+  const {providers, keys} = health.attemptsFromTraces(traces, now);
+  assert.deepEqual(plain(providers.get('hanyue')), {attempts: 3, failures: 3, takenOver: 1, failuresByKind: {http_529: 2, timeout: 1}}, 'taken over only when another provider answered later');
+  assert.deepEqual(plain(providers.get('kimera')), {attempts: 2, failures: 0, takenOver: 0, failuresByKind: {}});
+  assert.deepEqual(plain(keys.get('hanyue-1')), {attempts: 2, failures: 2, takenOver: 1, failuresByKind: {http_529: 2}}, 'older than 24 hours is left out');
+  assert.equal(health.kindsText({http_529: 5, timeout: 2}), 'HTTP 529 · 上游过载 × 5、超时 × 2');
+  assert.equal(health.kindsText({http_529: 5, timeout: 2, transport: 1}), 'HTTP 529 · 上游过载 × 5、超时 × 2 等 3 种');
+  assert.equal(health.kindsText({stream_incomplete: 2}), '输出中断 × 2', 'a request\'s error class in words');
+  assert.equal(health.kindsText({'fixture upstream timeout': 1}), 'fixture upstream timeout × 1', 'older free text as it is');
+  assert.deepEqual([health.failureTone(1, 100), health.failureTone(5, 100), health.failureTone(10, 100), health.failureTone(0, 0)], [undefined, 'warning', 'danger', undefined]);
+  assert.equal(health.failureText(7, 120), '7（5.8%）');assert.equal(health.failureText(0, 0), '—');
+  const window = (requests, failures, top = null) => ({requests, failures, lastFailureAt: failures ? now : null, topFailureKind: top, failuresByKind: top ? {[top]: failures} : {}});
+  assert.deepEqual(plain(health.failingModels([
+    {model: 'claude-sonnet-4-6', last1h: window(40, 2, 'http_429'), last24h: window(400, 9, 'http_429'), last7d: window(900, 9)},
+    {model: 'claude-opus-5-5', last1h: window(7, 7, 'upstream_start_failed'), last24h: window(20, 20, 'upstream_start_failed'), last7d: window(90, 20)},
+    {model: 'claude-opus-4-8', last1h: window(0, 0), last24h: window(3, 3, 'http_401'), last7d: window(30, 3)},
+    {model: 'claude-opus-4-6', last1h: window(0, 0), last24h: window(2, 2, 'http_401'), last7d: window(2, 2)},
+    {model: 'gpt-5.6-sol', last1h: window(10, 0), last24h: window(50, 1), last7d: window(80, 1)},
+  ])), [
+    {model: 'claude-opus-5-5', window: 'hour', text: 'claude-opus-5-5 近 1 小时 7 次失败（全部失败）：上游未响应（未开始输出）'},
+    {model: 'claude-opus-4-8', window: 'day', text: 'claude-opus-4-8 近 24 小时 3 次请求全部失败：HTTP 401 · Key 无效或被拒绝'},
+    {model: 'claude-sonnet-4-6', window: 'hour', text: 'claude-sonnet-4-6 近 1 小时 2 次失败（共 40 次）：HTTP 429 · 限流'},
+  ], 'failing in the last hour, or every request of the last 24 hours (three or more); busiest failures first');
+  console.log('PASS: attempts by provider and Key with takeovers, failures by kind in words, failure tones, and the models 需要关注 names');
+}

@@ -3,13 +3,14 @@
 // invalid gets a new secret (更换密钥), a cooling one is put back to work (解除冷却). The key
 // editor opens only when a key is being edited or added.
 import {useEffect, useRef, useState, type MutableRefObject} from 'react';
-import {adminApi} from '../api';
+import {adminApi, type AdminActivity, type AdminTrace} from '../api';
 import {ask, confirmAction} from '../components/confirm';
 import {Menu} from '../components/menu';
 import {Modal} from '../components/modal';
 import {toast} from '../components/toast';
 import {ListState, StatusBadge, Switch, Tag, TopbarActions} from '../components/ui';
-import {formatFullDateTime, formatRelative} from '../format';
+import {formatCount, formatFullDateTime, formatRelative} from '../format';
+import {attemptsFromTraces, failureText, failureTone, kindsText, type AttemptWindow} from '../health';
 import ProviderKeyEditor from '../ProviderKeyEditor';
 import {explainRefusal, isRefusal, type PublishOutcome} from '../refusal';
 import {isLive, lossFacts, modelName, nameList, routeLosses, targetsOf} from '../routes';
@@ -101,11 +102,14 @@ function ModelTags({models}: {models: unknown}) {
   </span>;
 }
 
-export default function ProvidersPage({providers, providerKeys, models, groups = [], loading, failed, refresh, guards, reportError, editing, setEditing, providerDirty, editorBusy, onDirtyChange, onBusyChange, mergeKey, onListModel, onHideModels, intent, intentRevision = 0, onRoute}: {
+export default function ProvidersPage({providers, providerKeys, models, groups = [], activity, traces = [], loading, failed, refresh, guards, reportError, editing, setEditing, providerDirty, editorBusy, onDirtyChange, onBusyChange, mergeKey, onListModel, onHideModels, intent, intentRevision = 0, onRoute}: {
   providers: Row[];
   providerKeys: Row[];
   models: Row[];
   groups?: Row[];
+  /** The server's attempts by provider and Key; without them, the traces are counted. */
+  activity?: AdminActivity;
+  traces?: AdminTrace[];
   loading: boolean;
   failed: boolean;
   refresh: Refresh;
@@ -302,6 +306,10 @@ export default function ProvidersPage({providers, providerKeys, models, groups =
     return `${providerId}-key-${index}`;
   };
   const selectedKey = editing?.keyId ? providerKeys.find(key => key.id === editing.keyId && key.provider_id === editing.providerId) : undefined;
+  // The last 24 hours of attempts by provider and by Key (Key IDs are unique across providers).
+  const counted = activity?.providerAttempts && activity.keyAttempts ? null : attemptsFromTraces(traces, nowSecs);
+  const providerAttempts = (id: string): AttemptWindow | undefined => counted ? counted.providers.get(id) : activity?.providerAttempts?.find(entry => entry.providerId === id)?.last24h;
+  const keyAttempts = (id: string): AttemptWindow | undefined => counted ? counted.keys.get(id) : activity?.keyAttempts?.find(entry => entry.keyId === id)?.last24h;
 
   return <div className="page-stack">
     <TopbarActions><button type="button" className="btn btn-primary" onClick={() => void edit({})}>＋ 添加供应商</button></TopbarActions>
@@ -309,6 +317,7 @@ export default function ProvidersPage({providers, providerKeys, models, groups =
       const id = String(provider.id);
       const keys = providerKeys.filter(key => key.provider_id === id);
       const enabled = provider.enabled !== false;
+      const tried = providerAttempts(id), tone = tried ? failureTone(tried.failures, tried.attempts) : undefined;
       return <section key={id} className={`panel provider-card${pointed.provider === id ? ' is-pointed' : ''}`} data-provider-id={id}>
         <div className="provider-head">
           <div className="provider-name">
@@ -326,8 +335,14 @@ export default function ProvidersPage({providers, providerKeys, models, groups =
             ]}/>
           </span>
         </div>
+        {/* Every attempt sent here: a primary's failures show, though its backup answered. */}
+        <p className="provider-attempts" aria-label="近 24 小时尝试">{tried?.attempts
+          ? <>近 24 小时 尝试 {formatCount(tried.attempts)} · <span className={tone ? `is-${tone}` : undefined}>失败 {failureText(tried.failures, tried.attempts)}</span>
+            {tried.takenOver > 0 && <> · 被备用接管 {formatCount(tried.takenOver)}</>}{tried.failures > 0 && <span className="muted"> · {kindsText(tried.failuresByKind, 3)}</span>}</>
+          : <span className="muted">近 24 小时没有尝试</span>}</p>
         {keys.length ? <div className="table-scroll"><table className="table keys-table">
-          <thead><tr><th className="col-key">Key</th><th>模型</th><th className="num col-weight">权重</th><th className="col-status">状态</th><th>最近错误</th><th className="col-actions"><span className="sr-only">操作</span></th></tr></thead>
+          <thead><tr><th className="col-key">Key</th><th>模型</th><th className="num col-weight">权重</th><th className="col-status">状态</th>
+            <th className="num col-key-traffic" title="近 24 小时用这个 Key 的尝试，和其中失败的比例">近 24 小时</th><th>最近错误</th><th className="col-actions"><span className="sr-only">操作</span></th></tr></thead>
           <tbody>{keys.map(key => {
             const active = editing?.providerId === id && editing?.keyId === key.id;
             return <tr key={String(key.id)} data-key-id={String(key.id)} className={[active && 'is-selected', pointed.key === key.id && 'is-pointed'].filter(Boolean).join(' ') || undefined}>
@@ -335,6 +350,11 @@ export default function ProvidersPage({providers, providerKeys, models, groups =
               <td><ModelTags models={key.allowed_models}/></td>
               <td className="num">{String(key.weight ?? 1)}</td>
               <td className="col-status"><StatusBadge view={keyStatusView(key, nowSecs)}/></td>
+              <td className="num col-key-traffic">{(() => {
+                const used = keyAttempts(String(key.id)), keyTone = used ? failureTone(used.failures, used.attempts) : undefined;
+                return used?.attempts ? <span title={used.failures ? kindsText(used.failuresByKind, 10) : undefined}>{formatCount(used.attempts)} 次 · <span className={keyTone ? `is-${keyTone}` : undefined}>失败 {
+                  (used.failures / used.attempts * 100).toFixed(1)}%</span></span> : <span className="muted">—</span>;
+              })()}</td>
               <td>{failureLabel(key.last_error)
                 ? <span className="clip clip-reason key-error" title={`${failureLabel(key.last_error)}${failureLabel(key.last_error) !== key.last_error ? `（${key.last_error}）` : ''}${typeof key.last_error_at === 'number' ? `\n${formatFullDateTime(key.last_error_at)}` : ''}`}>
                   {typeof key.last_error_at === 'number' && <span className="muted">{formatRelative(key.last_error_at)} · </span>}{failureLabel(key.last_error)}</span>

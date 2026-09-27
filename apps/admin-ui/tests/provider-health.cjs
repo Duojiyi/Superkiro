@@ -42,9 +42,10 @@ const writes=endpoint=>fixture.writes.filter(write=>write.endpoint===endpoint);
     assert((await dead.locator('.attention-item').getAttribute('class')).includes('is-danger'));
     await page.getByRole('alert').filter({hasText:'1 个在售模型无可用线路，客户请求会失败：gpt-6-astra（OpenAI 格式 / Fixture 的 Key 返回 401）'}).waitFor();
     assert.equal(await page.locator('#nav-badge-models [aria-hidden="true"]').textContent(),'1');
-    // Success rates are coloured like the 成功率 KPI (fixture: 44 of 47 did not fail, 93.6%).
-    const rateCell=page.locator('.panel').filter({hasText:'服务健康'}).getByRole('row').filter({hasText:'测试供应商 / Fixture'}).locator('td.num').first();
-    assert.deepEqual([await rateCell.innerText(),await rateCell.getAttribute('class')],['93.6%','num is-warning']);
+    // Failures count every attempt and are coloured like the 成功率 KPI (fixture: 8 of 51 attempts in 24 hours failed, 15.7%).
+    const healthRow=page.getByRole('region',{name:'服务健康'}).getByRole('row').filter({hasText:'测试供应商 / Fixture'});
+    const rateCell=healthRow.locator('td.num').nth(1);
+    assert.deepEqual([await healthRow.locator('td.num').first().innerText(),await rateCell.innerText(),await rateCell.getAttribute('class')],['51','8（15.7%）','num is-danger']);
     await dead.getByRole('button',{name:'查看 Key',exact:true}).click();
     await page.getByRole('heading',{name:'供应商与 Key',level:2,exact:true}).waitFor();
     assert.equal(await page.locator('tr.is-pointed').getAttribute('data-key-id'),'fixture-openai-key-1','the Key to fix is marked');

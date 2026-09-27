@@ -57,7 +57,53 @@ module.exports = function fixtureApi() {
     const last24h = window(now - 86400);
     return {last24h, last7d: window(now - 7 * 86400), tracesCoverFromSecs: Math.min(...traces.map(t => t.ts)),
       hourly: Array.from({length: 24}, (_, i) => {const hour = done.filter(t => t.ts >= first + i * 3600 && t.ts < first + (i + 1) * 3600); return {startSecs: first + i * 3600, requests: hour.length, failed: hour.filter(t => t.status === 'error').length};}),
-      providers: [{providerId: 'fixture-provider', requests: last24h.requests, failed: last24h.failed, ttftMedianMs: last24h.ttftMedianMs}]};
+      providers: [{providerId: 'fixture-provider', requests: last24h.requests, failed: last24h.failed, ttftMedianMs: last24h.ttftMedianMs}], ...attemptActivity(now)};
+  };
+  // As billing's attempt_activity: every attempt by provider and Key over the last hour, 24 hours and
+  // 7 days (a failed one is taken over when another provider answered later), requests by the model
+  // customers asked for (not the card's own refusals), and billed use by model over 7 days.
+  const CARD_LIMITS = ['insufficient_balance', 'concurrency_limit', 'usage_limit'];
+  const attemptActivity = now => {
+    const starts = [now - 3600, now - 86400, now - 7 * 86400];
+    const attemptWindow = () => ({attempts: 0, failures: 0, takenOver: 0, failuresByKind: {}});
+    const healthWindow = () => ({requests: 0, failures: 0, lastFailureAt: null, topFailureKind: null, failuresByKind: {}});
+    const providers = new Map(), keysById = new Map(), models = new Map();
+    const count = (entry, within, attempt, takenOver) => ['last1h', 'last24h', 'last7d'].forEach((name, i) => {
+      if (!within[i]) return;
+      const w = entry[name]; w.attempts++;
+      if (!attempt.success) {w.failures++; w.takenOver += takenOver ? 1 : 0; const kind = attempt.error || 'unknown'; w.failuresByKind[kind] = (w.failuresByKind[kind] || 0) + 1;}
+    });
+    for (const trace of traces.filter(t => t.ts > starts[2] && t.ts <= now)) {
+      const within = starts.map(start => trace.ts > start), chain = trace.attempt_chain || [];
+      chain.forEach((attempt, index) => {
+        const takenOver = chain.slice(index + 1).some(later => later.success && later.provider_id !== attempt.provider_id);
+        if (!providers.has(attempt.provider_id)) providers.set(attempt.provider_id, {providerId: attempt.provider_id, last1h: attemptWindow(), last24h: attemptWindow(), last7d: attemptWindow()});
+        count(providers.get(attempt.provider_id), within, attempt, takenOver);
+        if (!attempt.key_id) return;
+        if (!keysById.has(attempt.key_id)) keysById.set(attempt.key_id, {keyId: attempt.key_id, providerId: attempt.provider_id, last1h: attemptWindow(), last24h: attemptWindow(), last7d: attemptWindow()});
+        count(keysById.get(attempt.key_id), within, attempt, takenOver);
+      });
+      if (trace.status === 'in_progress' || !trace.exposed_model || CARD_LIMITS.includes(trace.error_class)) continue;
+      const failure = trace.status === 'error' ? trace.error_class || [...chain].reverse().find(attempt => !attempt.success)?.error || 'unknown' : null;
+      if (!models.has(trace.exposed_model)) models.set(trace.exposed_model, {model: trace.exposed_model, last1h: healthWindow(), last24h: healthWindow(), last7d: healthWindow()});
+      ['last1h', 'last24h', 'last7d'].forEach((name, i) => {
+        if (!within[i]) return;
+        const w = models.get(trace.exposed_model)[name]; w.requests++;
+        if (!failure) return;
+        w.failures++; w.lastFailureAt = Math.max(w.lastFailureAt ?? 0, trace.ts); w.failuresByKind[failure] = (w.failuresByKind[failure] || 0) + 1;
+        w.topFailureKind = Object.entries(w.failuresByKind).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0][0];
+      });
+    }
+    const usage = new Map();
+    for (const trace of traces.filter(t => t.credits_charged > 0 && t.ts > starts[2] && t.ts <= now)) {
+      const entry = usage.get(trace.exposed_model) ?? {model: trace.exposed_model, requests: 0, cards: new Set()};
+      entry.requests++; entry.cards.add(trace.card_id); usage.set(trace.exposed_model, entry);
+    }
+    const busiest = (a, b, key) => b.last7d[key] - a.last7d[key];
+    return {providerAttempts: [...providers.values()].sort((a, b) => busiest(a, b, 'attempts') || a.providerId.localeCompare(b.providerId)),
+      keyAttempts: [...keysById.values()].sort((a, b) => busiest(a, b, 'attempts') || a.keyId.localeCompare(b.keyId)),
+      modelHealth: [...models.values()].sort((a, b) => busiest(a, b, 'requests') || a.model.localeCompare(b.model)),
+      modelUsage7d: [...usage.values()].map(entry => ({model: entry.model, requests: entry.requests, cards: entry.cards.size})).sort((a, b) => b.requests - a.requests || a.model.localeCompare(b.model))};
   };
   // Request content is kept for some requests only; the rest answer like an expired archive.
   const traceContent = invocationId => {
