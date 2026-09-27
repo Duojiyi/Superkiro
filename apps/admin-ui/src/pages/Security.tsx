@@ -3,7 +3,7 @@
 import {useEffect, useRef, useState} from 'react';
 import {adminApi, type AdminStats, type LedgerArchive} from '../api';
 import {ask} from '../components/confirm';
-import {IconCheck, IconWarning} from '../components/icons';
+import {IconCheck, IconInfo, IconWarning} from '../components/icons';
 import {toast} from '../components/toast';
 import {IdCell, TableState} from '../components/ui';
 import {formatBytes, formatCount, formatDateTime, formatFullDateTime, formatSessionLeft} from '../format';
@@ -117,7 +117,7 @@ export default function SecurityPage({operator, keyCount, stats, refresh, guards
         <ul className="checklist">
           <li className="is-ok"><IconCheck/>API 密钥加密存储{keyCount !== null ? `（${keyCount} 把）` : ''}</li>
           {twoFactor === true ? <li className="is-ok"><IconCheck/>双因素验证已启用</li>
-            : twoFactor === false ? <li className="is-warning"><IconWarning/>双因素验证未启用（在服务器配置中开启）</li>
+            : twoFactor === false ? <li className="is-neutral"><IconInfo/>登录使用用户名和密码（未启用双因素验证）</li>
             : <li className="is-unknown"><IconWarning/>双因素验证状态未知</li>}
           <li className="is-ok"><IconCheck/>30 分钟未操作自动退出（最长 8 小时）</li>
         </ul>

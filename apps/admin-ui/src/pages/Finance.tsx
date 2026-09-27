@@ -68,16 +68,16 @@ export default function FinancePage({financials, loading, failed, refresh, repor
         <div className="kpi-sub">{typeof face === 'number' ? `积分面值 ${face} 元/积分` : ''}</div></section>
       <section className="panel kpi"><p className="kpi-label">采购成本<EstimateTag title={ESTIMATE}/></p>
         <strong className="kpi-value" title={estimates ? formatMoneyExact(estimates.configuredProviderCostMicroCny) : undefined}>{estimates ? formatMoney(estimates.configuredProviderCostMicroCny) : '—'}</strong>
-        <div className="kpi-sub">{estimates?.uncostedRequests ? '部分请求未定价' : ''}</div></section>
+        <div className="kpi-sub">{estimates?.uncostedRequests ? '部分请求未设成本' : ''}</div></section>
       <section className="panel kpi"><p className="kpi-label">毛利<EstimateTag title={ESTIMATE}/></p>
         {estimates && estimates.uncostedRequests > 0
-          ? <><strong className="kpi-value">—</strong><div className="kpi-sub is-warning">{formatCount(estimates.uncostedRequests)} 次请求未定价，毛利暂不计算</div></>
+          ? <><strong className="kpi-value">—</strong><div className="kpi-sub is-warning">{formatCount(estimates.uncostedRequests)} 次请求未设成本，毛利暂不计算</div></>
           : <><strong className="kpi-value" title={estimates ? formatMoneyExact(estimates.faceValueLessCostMicroCny) : undefined}>{estimates ? formatMoney(estimates.faceValueLessCostMicroCny) : '—'}</strong>
             <div className="kpi-sub">{estimates && typeof estimates.faceValueMarginPercentage === 'number' ? `毛利率 ${formatPercent(estimates.faceValueMarginPercentage)}` : ''}</div></>}
       </section>
       <section className="panel kpi"><p className="kpi-label">成本覆盖</p>
         <strong className="kpi-value">{covered !== null && total !== null ? `${formatCount(covered)} / ${formatCount(total)}` : '—'}</strong>
-        <div className="kpi-sub">{estimates?.uncostedRequests ? `${formatCount(estimates.uncostedRequests)} 次请求未定价` : estimates ? '全部已定价' : ''}</div></section>
+        <div className="kpi-sub">{estimates?.uncostedRequests ? `${formatCount(estimates.uncostedRequests)} 次请求未设成本` : estimates ? '全部已设成本' : ''}</div></section>
     </div>
 
     <section className="panel">
@@ -97,7 +97,7 @@ export default function FinancePage({financials, loading, failed, refresh, repor
               <td className="num">{formatCount(row.requests ?? 0)}</td>
               <td className="num">{row.credits_charged === undefined ? '—' : formatCreditsMicro(credits)}</td>
               <td className="num">{faceValue === null || row.credits_charged === undefined ? '—' : formatMoney(faceValue)}</td>
-              <td className="num" title={cost ? formatMoneyExact(cost) : undefined}>{unpriced ? <span className="is-warning">未定价</span> : Number(row.requests ?? 0) ? formatMoney(cost) : '—'}</td>
+              <td className="num" title={cost ? formatMoneyExact(cost) : undefined}>{unpriced ? <span className="is-warning" title="这个模型的线路没有设采购价">未设成本</span> : Number(row.requests ?? 0) ? formatMoney(cost) : '—'}</td>
               <td className="num">{formatPercent(margin)}</td>
             </tr>;
           })}

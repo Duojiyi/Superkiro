@@ -68,7 +68,7 @@ const server=http.createServer(async(req,res)=>{
     await nav('安全与审计');await answer(page,false);
     await page.getByLabel('Key ID',{exact:true}).waitFor();
     await nav('安全与审计');await answer(page,true);
-    await page.getByText('双因素验证未启用（在服务器配置中开启）',{exact:true}).waitFor();
+    await page.getByText('登录使用用户名和密码（未启用双因素验证）',{exact:true}).waitFor();
     await page.getByRole('button',{name:'下线全部会话',exact:true}).click();await answer(page,false);
     assert.equal(fixture.writes.filter(w=>w.endpoint==='session/revoke').length,0);
     await nav('卡密资产');

@@ -649,6 +649,8 @@ div.attention-item:hover {background: transparent;}
 .checklist li.is-warning {color: #6c4a00;}
 .checklist li.is-warning svg {color: #d4a72c;}
 .checklist li.is-unknown svg {color: var(--text-3);}
+.checklist li.is-neutral {color: var(--text-2);}
+.checklist li.is-neutral svg {color: var(--text-3);}
 .session-line {margin: 0 0 12px;}
 /* 存储与账本: the saved state against its ceiling, the two archive levels marked on the meter. */
 .storage-line {display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 8px; margin: 0 0 10px;}
