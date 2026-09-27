@@ -124,6 +124,27 @@ pub struct LedgerEntry {
     /// were earned at. None on other entries, and on usage settled before it was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credit_face_value_cny: Option<f64>,
+    /// What a card event records besides who and why, as a JSON object: the device unbound,
+    /// the new expiry, the groups, the request an adjustment makes up for. Releases before
+    /// this field kept it as JSON in `target_model`; older ones ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<serde_json::Value>,
+}
+
+impl LedgerEntry {
+    /// What a card event records besides who and why, wherever it was kept: in `detail`, or
+    /// by releases before it as a JSON object in `target_model`, where a usage entry names
+    /// its upstream model.
+    pub fn event_detail(&self) -> Option<serde_json::Value> {
+        self.detail.clone().or_else(|| {
+            if self.target_model == self.exposed_model {
+                return None;
+            }
+            serde_json::from_str(&self.target_model)
+                .ok()
+                .filter(serde_json::Value::is_object)
+        })
+    }
 }
 
 /// Micro-credits added up by the face value (CNY per credit) they were earned at.

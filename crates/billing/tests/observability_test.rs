@@ -620,6 +620,7 @@ fn reports_saturate_instead_of_wrapping_on_extreme_entries() {
         operator_id: None,
         reason: None,
         credit_face_value_cny: None,
+        detail: None,
     };
     let entries = [entry("a"), entry("b")];
     let settings = BillingSettings {
@@ -1201,6 +1202,8 @@ fn usage_entry(
         ts_secs: 1_000,
         operator_id: None,
         reason: None,
+        credit_face_value_cny: None,
+        detail: None,
     }
 }
 

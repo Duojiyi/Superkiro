@@ -118,6 +118,7 @@ mod tests {
             operator_id: None,
             reason: None,
             credit_face_value_cny: None,
+            detail: None,
         }
     }
 

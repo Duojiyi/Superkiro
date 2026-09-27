@@ -704,6 +704,7 @@ fn fixed_price(id: &str) -> billing::rate_card::RateCardVersion {
         per_call_credit: 0,
         margin_multiplier: 1.0,
         effective_from_secs: 0,
+        official: None,
     }
 }
 
@@ -836,5 +837,124 @@ fn an_adjustment_keeps_the_request_it_makes_up_for() {
     assert_eq!(
         history_of(&engine, "card-comp", "adjust")[0].invocation_id,
         None
+    );
+}
+
+/// What a change records besides who and why is kept in the entry's own `detail`, and the
+/// history reads the same from entries written before it, which kept it as JSON where a
+/// usage entry names its model; a retried adjustment is still recognised across the two.
+#[test]
+fn event_detail_has_its_own_field_and_older_entries_still_read() {
+    use serde_json::json;
+    let engine = BillingEngine::new();
+    let mut card = create_test_card("card-detail", 1, 5, 0);
+    card.bound_devices = vec!["device-old".into()];
+    engine.upsert_card(card);
+    let mut waiting = Card::new("card-detail-new", "grp-1", 1_000_000);
+    waiting.activation_duration_secs = Some(86_400);
+    engine.upsert_card(waiting);
+    engine.upsert_group(billing::Group::pro_plus("grp-2", "Second"));
+    engine
+        .admin_unbind_device("card-detail", "device-old", "admin", "换电脑", 1_100)
+        .unwrap();
+    engine
+        .extend_validity(
+            &["card-detail".into(), "card-detail-new".into()],
+            billing::ValidityExtension::Days(2),
+            "admin",
+            "补偿",
+            1_200,
+        )
+        .unwrap();
+    engine
+        .change_card_group("card-detail", "grp-2", "admin", "升级", 1_300)
+        .unwrap();
+    let linked = |engine: &BillingEngine, invocation: &str| {
+        engine.adjust_balance_linked(
+            "card-detail",
+            1_000_000,
+            "admin",
+            "补偿失败请求",
+            1_400,
+            Some("comp-detail"),
+            Some(invocation),
+        )
+    };
+    linked(&engine, "card-detail:inv-1").unwrap();
+    engine
+        .set_card_note("card-detail", Some("VIP"), "admin", 1_500)
+        .unwrap();
+
+    let entries: Vec<_> = engine
+        .ledger_entries()
+        .into_iter()
+        .filter(|entry| entry.kind == LedgerKind::Adjustment)
+        .collect();
+    let written: Vec<_> = entries
+        .iter()
+        .map(|entry| (entry.target_model.as_str(), entry.detail.clone()))
+        .collect();
+    assert_eq!(
+        written,
+        [
+            ("unbind_device", Some(json!({ "deviceId": "device-old" }))),
+            // Its expiry, 87,400, two days later.
+            ("extend_validity", Some(json!({ "validUntil": 260_200 }))),
+            (
+                "extend_validity",
+                Some(json!({ "activationDurationSecs": 259_200 }))
+            ),
+            (
+                "change_group",
+                Some(json!({ "previousGroupId": "grp-1", "groupId": "grp-2" }))
+            ),
+            (
+                "adjustment",
+                Some(json!({ "invocationId": "card-detail:inv-1" }))
+            ),
+            ("note_card", None),
+        ]
+    );
+    // Absent, the field is not written at all.
+    let note = serde_json::to_value(&entries[5]).unwrap();
+    assert!(note.get("detail").is_none());
+    let history = |engine: &BillingEngine| {
+        (
+            engine.card_history("card-detail").unwrap(),
+            engine.card_history("card-detail-new").unwrap(),
+        )
+    };
+    let now = history(&engine);
+    let adjusted = now.0.iter().find(|e| e.action == "adjust").unwrap();
+    assert_eq!(adjusted.invocation_id.as_deref(), Some("card-detail:inv-1"));
+    assert_eq!(adjusted.detail, None);
+    let unbound = now.0.iter().find(|e| e.action == "unbind").unwrap();
+    assert_eq!(unbound.detail, Some(json!({ "deviceId": "device-old" })));
+
+    // The same state as a release before the field saved it.
+    let mut older = engine.export_snapshot();
+    for entry in &mut older.ledger {
+        if let Some(detail) = entry.detail.take() {
+            entry.target_model = detail.to_string();
+        }
+    }
+    let restored = BillingEngine::new();
+    restored.import_snapshot(older);
+    assert_eq!(history(&restored), now);
+    // A retry of the adjustment is recognised, and the same key naming another request
+    // is still refused.
+    let retried = linked(&restored, "card-detail:inv-1").unwrap();
+    assert_eq!(retried.detail, None);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&retried.target_model).unwrap(),
+        json!({ "invocationId": "card-detail:inv-1" })
+    );
+    assert!(matches!(
+        linked(&restored, "card-detail:inv-2"),
+        Err(BillingError::InvalidAdjustment(message)) if message.starts_with("Idempotency conflict")
+    ));
+    assert_eq!(
+        restored.get_card("card-detail").unwrap().credit_total,
+        engine.get_card("card-detail").unwrap().credit_total
     );
 }

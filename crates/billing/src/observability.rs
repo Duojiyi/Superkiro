@@ -483,7 +483,8 @@ pub fn compute_model_cost_rankings(
                 .cost_micro_cny
                 .saturating_add(entry.provider_cost_micro_cny);
             agg.credits = agg.credits.saturating_add(entry.credits_charged);
-            agg.earned.add(entry_face_value(entry, settings), entry.credits_charged);
+            agg.earned
+                .add(entry_face_value(entry, settings), entry.credits_charged);
         }
     }
 

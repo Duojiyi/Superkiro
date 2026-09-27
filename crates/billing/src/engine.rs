@@ -2642,6 +2642,7 @@ impl BillingEngine {
             reason: Some(cost_source),
             // Revenue counts these credits at the face value they were sold at.
             credit_face_value_cny: Some(settings.credit_face_value_cny),
+            detail: None,
         };
         let pending = PendingSettlement {
             entry,
@@ -3106,6 +3107,7 @@ impl BillingEngine {
             operator_id: Some(operator_id.to_string()),
             reason: (!reason.is_empty()).then(|| reason.to_string()),
             credit_face_value_cny: None,
+            detail: None,
         }
     }
 
@@ -3368,7 +3370,7 @@ impl BillingEngine {
             now_secs,
         );
         if !detail.is_null() {
-            entry.target_model = detail.to_string();
+            entry.detail = Some(detail);
         }
         candidate.cards.insert(card_id.to_string(), card.clone());
         candidate.ledger.push(entry.clone());
@@ -3705,7 +3707,7 @@ impl BillingEngine {
                 reason,
                 now_secs,
             );
-            entry.target_model = detail.to_string();
+            entry.detail = Some(detail);
             candidate.ledger.push(entry.clone());
             entries.push(entry);
             changed.push(card.clone());
@@ -3996,6 +3998,7 @@ impl BillingEngine {
             operator_id: Some(op.to_string()),
             reason: Some(res.to_string()),
             credit_face_value_cny: None,
+            detail: None,
         };
         candidate.ledger.push(entry.clone());
         let updated_card = card.clone();
@@ -4092,6 +4095,7 @@ impl BillingEngine {
             operator_id: Some(op.to_string()),
             reason: Some(res.to_string()),
             credit_face_value_cny: None,
+            detail: None,
         };
         candidate.ledger.push(entry.clone());
         let updated_card = card.clone();
@@ -4355,6 +4359,7 @@ impl BillingEngine {
             operator_id: Some(operator.to_string()),
             reason: Some(format!("Redeemed top-up code {}", topup_id)),
             credit_face_value_cny: None,
+            detail: None,
         };
         candidate.ledger.push(entry.clone());
 
@@ -4634,11 +4639,8 @@ impl BillingEngine {
         idempotency_key: Option<&str>,
         invocation_id: Option<&str>,
     ) -> Result<LedgerEntry, BillingError> {
-        // The adjustment names what it adjusts where a usage entry names its model.
-        let target_model = match invocation_id {
-            Some(id) => serde_json::json!({ "invocationId": id }).to_string(),
-            None => "adjustment".to_string(),
-        };
+        // The request the adjustment makes up for, which the card's history shows.
+        let detail = invocation_id.map(|id| serde_json::json!({ "invocationId": id }));
         let op = operator_id.trim();
         if op.is_empty() {
             return Err(BillingError::InvalidAdjustment(
@@ -4685,7 +4687,8 @@ impl BillingEngine {
                     && existing.credits_charged == delta_micro_credits
                     && existing.operator_id.as_deref() == Some(op)
                     && existing.reason.as_deref() == Some(res)
-                    && existing.target_model == target_model
+                    // Kept in `detail`, or in `target_model` by releases before it.
+                    && existing.event_detail() == detail
                 {
                     return Ok(existing);
                 } else {
@@ -4738,7 +4741,7 @@ impl BillingEngine {
             invocation_id: Some(adjustment_id),
             exposed_model: "adjustment".to_string(),
             provider_id: "system".to_string(),
-            target_model,
+            target_model: "adjustment".to_string(),
             input_tokens: 0,
             output_tokens: 0,
             cache_creation_tokens: 0,
@@ -4750,6 +4753,7 @@ impl BillingEngine {
             operator_id: Some(op.to_string()),
             reason: Some(res.to_string()),
             credit_face_value_cny: None,
+            detail,
         };
 
         candidate.ledger.push(entry.clone());
@@ -4898,14 +4902,10 @@ impl BillingEngine {
                 (LedgerKind::Adjustment, "change_group") => "group",
                 (LedgerKind::Adjustment, _) => "adjust",
             };
-            // A change that records more than who and why keeps it, as a JSON object,
-            // where a usage entry names its model.
-            let mut detail = match serde_json::from_str(&entry.target_model) {
-                Ok(serde_json::Value::Object(fields))
-                    if entry.target_model != entry.exposed_model =>
-                {
-                    fields
-                }
+            // A change that records more than who and why keeps it as a JSON object: in
+            // `detail`, or where a usage entry names its model in entries written before it.
+            let mut detail = match entry.event_detail() {
+                Some(serde_json::Value::Object(fields)) => fields,
                 _ => serde_json::Map::new(),
             };
             let invocation_id = match detail.remove("invocationId") {

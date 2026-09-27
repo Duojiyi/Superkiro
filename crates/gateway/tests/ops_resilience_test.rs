@@ -145,6 +145,7 @@ fn test_db_jitter_isolation_queue_and_auth_cache() {
             operator_id: None,
             reason: None,
             credit_face_value_cny: None,
+            detail: None,
         };
         assert!(jitter.enqueue_ledger_entry(entry).is_ok());
     }
@@ -171,6 +172,7 @@ fn test_db_jitter_isolation_queue_and_auth_cache() {
         operator_id: None,
         reason: None,
         credit_face_value_cny: None,
+        detail: None,
     };
     assert!(jitter.enqueue_ledger_entry(entry_overflow).is_err());
 

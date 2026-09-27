@@ -1982,6 +1982,7 @@ async fn financials_report_a_period_by_provider_with_sales_and_liability() {
         per_call_credit: 0,
         margin_multiplier: 1.0,
         effective_from_secs: 0,
+        official: None,
     });
     let (start, end) = (1_000_000, 2_000_000);
     let mut card = Card::new("card-finance", "group-admin", 1_000_000_000);
