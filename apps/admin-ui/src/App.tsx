@@ -137,7 +137,8 @@ export default function App() {
 
   if (authState === 'checking') return <main className="auth-page"><p role="status" className="auth-checking">正在检查会话…</p></main>;
   if (authState === 'authenticated') return <>
-    <div className="workspace-shell" ref={node => {if (node) node.inert = !!recheckError;}} aria-hidden={recheckError ? true : undefined}>
+    {/* aria-busy while the session is re-checked: the workspace is replaced if it changed. */}
+    <div className="workspace-shell" ref={node => {if (node) node.inert = !!recheckError;}} aria-hidden={recheckError ? true : undefined} aria-busy={rechecking || undefined}>
       <AdminWorkspace key={workspaceVersion} onLogout={logout} operator={adminApi.authenticatedUsername} expiring={expiring} onReauthenticate={reauthenticate}/>
     </div>
     {recheckError && <div className="session-overlay" role="alertdialog" aria-label="无法确认登录状态">

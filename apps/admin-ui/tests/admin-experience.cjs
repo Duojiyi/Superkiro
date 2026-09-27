@@ -29,9 +29,10 @@ async function waitFor(ready) {
     const nativeDialogs = []; page.on('dialog', dialog => {nativeDialogs.push(dialog.message()); void dialog.dismiss();});
     await page.route('**/*', route => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
     let cardsMode = 'fail', tracesMode = 'fail', noticesMode = 'fail', heldCards;
-    let sessionCsrf = 'fixture-csrf';
+    let sessionCsrf = 'fixture-csrf', sessionHeld = null;
     await page.route('**/api/v1/admin/session', async route => {
       if (route.request().method() !== 'GET') return route.continue();
+      if (sessionHeld) await sessionHeld;
       const response = await route.fetch(), data = await response.json();
       return route.fulfill({response, json: {...data, csrfToken: sessionCsrf}});
     });
@@ -51,11 +52,16 @@ async function waitFor(ready) {
     const nav = name => page.getByRole('navigation').getByRole('button', {name, exact: true}).click();
     const refreshed = () => page.waitForFunction(() => [...document.querySelectorAll('.topbar button')].some(b => b.textContent === '刷新' && !b.disabled));
     const refresh = async () => {await button('刷新').click(); await refreshed();};
+    // Returning to the window re-checks the session in the background, the workspace aria-busy until
+    // the answer is applied. The answer is held until the check shows, so a quick one is not missed,
+    // and what follows is judged on the answer applied, not merely received.
     const focusRecheck = async () => {
-      const response = page.waitForResponse(response => response.url().endsWith('/api/v1/admin/session') && response.request().method() === 'GET');
+      let release; sessionHeld = new Promise(resolve => {release = resolve;});
+      const checking = page.locator('.workspace-shell[aria-busy="true"]');
       await page.evaluate(() => window.dispatchEvent(new Event('focus')));
-      await response;
-      await page.waitForFunction(() => ![...document.querySelectorAll('[role="status"]')].some(node => node.textContent?.trim() === '正在检查会话…'));
+      await checking.waitFor();
+      sessionHeld = null; release();
+      await checking.waitFor({state: 'detached'});
     };
     const emptyFailure = () => page.locator('.list-state').getByText('加载失败', {exact: true});
     // Confirmations are the console's own dialog; irreversible actions also need the word typed.
