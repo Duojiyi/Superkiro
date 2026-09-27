@@ -2065,6 +2065,122 @@ mod tests {
         assert_eq!(moved.credit_face_value_cny, Some(0.01));
     }
 
+    /// The route cost the migration publishes for hanyue's measured route, its basis and its
+    /// 0.22, costs every request exactly what hanyue's price version costs it today.
+    #[test]
+    fn a_measured_route_cost_changes_no_cost() {
+        use crate::card::Card;
+        use crate::reservation::ReservationEstimateParams;
+        let credit = crate::MICRO_CREDITS_PER_CREDIT;
+        let e = serving_engine();
+        e.upsert_provider(Provider::new(
+            "hanyue-max",
+            "hanyue",
+            crate::provider::ProviderFormat::Anthropic,
+            "https://upstream.invalid",
+        ));
+        e.upsert_provider_key(ProviderKey::new("hanyue-key", "hanyue-max", "test"));
+        // As the pricing policy published it: Claude Opus 5's credits, and the measured
+        // $2/$25/$6.25/$0.5 times 0.22 as its cost.
+        let version: RateCardVersion = serde_json::from_value(serde_json::json!({
+            "id": "hanyue022op5", "rate_card_id": "default", "model": "claude-opus-5-5",
+            "currency": "CNY", "pricing_mode": "fixed",
+            "input_price_per_m": 0.44, "output_price_per_m": 5.5,
+            "cache_creation_price_per_m": 1.375, "cache_read_price_per_m": 0.11,
+            "fixed_input_credit_per_m": 40 * credit, "fixed_output_credit_per_m": 200 * credit,
+            "fixed_cache_creation_credit_per_m": 50 * credit,
+            "fixed_cache_read_credit_per_m": 4 * credit,
+            "per_call_credit": 0, "margin_multiplier": 1.0, "effective_from_secs": 0
+        }))
+        .unwrap();
+        let mut u = update(&e);
+        u.models = vec![ModelMap::new(
+            "map-opus",
+            "new-tier",
+            "claude-opus-5-5",
+            "hanyue-max",
+            "claude-opus-5-5",
+        )];
+        u.versions = vec![version];
+        // The settings the migration sets besides the route cost.
+        u.settings = Some(BillingSettings {
+            credit_face_value_cny: 0.03,
+            official_usd_cny: Some(1.0),
+            default_price_multiplier: Some(0.24),
+            default_cost_multiplier: Some(0.08),
+            provider_cost_multipliers: Some([("hanyue-max".to_string(), 0.22)].into()),
+            ..e.get_settings()
+        });
+        e.publish_commercial_config(u, 100).unwrap();
+        let mut card = Card::new("card", "new-tier", 1_000_000 * credit);
+        card.activate(100, 86_400).unwrap();
+        e.upsert_card(card);
+        let requests = [
+            (1, 0, 0, 0),
+            (0, 1, 0, 0),
+            (84_657, 4_094, 0, 76_000),
+            (1_000_000, 1_000_000, 1_000_000, 1_000_000),
+            (123_457, 9_999, 31_337, 7),
+            (10_000_000, 3, 2_500_000, 999_999),
+        ];
+        let costs = |run: &str, at: u64| -> Vec<(i64, String)> {
+            requests
+                .iter()
+                .enumerate()
+                .map(|(i, &(uncached, output, write, read))| {
+                    let id = format!("{run}-{i}");
+                    let params =
+                        ReservationEstimateParams::new(1_000, 1_000).with_model("claude-opus-5-5");
+                    e.reserve("card", &id, &params, at, 600).unwrap();
+                    let tokens = UsageTokens {
+                        uncached_input_tokens: uncached,
+                        output_tokens: output,
+                        cache_creation_tokens: write,
+                        cache_read_tokens: read,
+                    };
+                    let entry = e
+                        .settle(
+                            &id,
+                            &tokens,
+                            "claude-opus-5-5",
+                            "hanyue-max",
+                            "claude-opus-5-5",
+                            at,
+                        )
+                        .unwrap();
+                    (entry.provider_cost_micro_cny, entry.reason.unwrap())
+                })
+                .collect()
+        };
+        let today = costs("today", 110);
+        assert!(today
+            .iter()
+            .all(|(_, reason)| reason == "provider_cost:rate_card_version=hanyue022op5"));
+
+        let mut u = update(&e);
+        u.settings = Some(BillingSettings {
+            route_costs: Some(
+                [(
+                    "hanyue-max/claude-opus-5-5".to_string(),
+                    RouteCost {
+                        basis_usd_per_m: Some([2.0, 25.0, 6.25, 0.5]),
+                        cost_multiplier: Some(0.22),
+                    },
+                )]
+                .into(),
+            ),
+            ..e.get_settings()
+        });
+        e.publish_commercial_config(u, 200).unwrap();
+        let routed = costs("routed", 210);
+        assert!(routed
+            .iter()
+            .all(|(_, reason)| reason == "provider_cost:official=hanyue-max/claude-opus-5-5"));
+        let amounts =
+            |costs: &[(i64, String)]| costs.iter().map(|(cost, _)| *cost).collect::<Vec<_>>();
+        assert_eq!(amounts(&routed), amounts(&today));
+    }
+
     /// The official price table and the route costs are bounded like the other settings and
     /// kept when a publication leaves them out; an official price's time is when its prices
     /// last changed.
