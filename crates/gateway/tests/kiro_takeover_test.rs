@@ -127,6 +127,7 @@ fn routed_on(
         intercept_intent: false,
         large_bodies: gate.clone(),
         upstream_limits: limits,
+        card_slot_wait: gateway::facade::conversation::CARD_SLOT_WAIT,
         ..Default::default()
     });
     (registry.into_router(), runtime)
@@ -1376,6 +1377,62 @@ async fn the_context_kiro_compacts_on_is_never_below_the_gateways_estimate() {
         "{percentages:?}"
     );
     assert_eq!(usage_entries(&billing)[0].input_tokens, 100);
+}
+
+/// With every key cooling down, a short cooldown is a throttle Kiro waits out. A longer one
+/// is said at once, with when the keys come back: Kiro waits out a throttle's Retry-After on
+/// each of its retries and reads it as "<model> is experiencing high load", so a two-minute
+/// cooldown hung the turn for minutes before it failed.
+#[tokio::test]
+async fn keys_cooling_down_are_waited_out_briefly_or_said_at_once() {
+    for cooldown in [5, 3_600] {
+        let server = upstream(
+            ResponseTemplate::new(200).set_body_raw(anthropic_answer("hi"), "text/event-stream"),
+        )
+        .await;
+        let billing = engine(
+            ProviderFormat::Anthropic,
+            &server.uri(),
+            vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+        );
+        let (app, runtime) = routed(&billing, &LargeBodyGate::default());
+        runtime.pool_for("prov").unwrap().mark_key_failure(
+            "key",
+            gateway::now_secs(),
+            Duration::from_secs(cooldown),
+        );
+        let reply = send(
+            &app,
+            "inv-cooling",
+            body(json!({"content": "hello", "modelId": "model"}), vec![]),
+        )
+        .await;
+        let told = reply.json();
+        if cooldown == 5 {
+            assert_eq!(reply.status, StatusCode::TOO_MANY_REQUESTS, "{told}");
+            assert_eq!(told["reason"], "ALL_KEYS_IN_COOLDOWN");
+            let wait: u64 = reply.headers["retry-after"]
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!((1..=5).contains(&wait), "{wait}");
+        } else {
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{told}");
+            assert_eq!(told["__type"], "ValidationException");
+            assert!(told.get("reason").is_none(), "{told}");
+            assert!(
+                told["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("约 60 分钟后恢复"),
+                "{told}"
+            );
+            assert!(reply.headers.get("retry-after").is_none());
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+        nothing_charged(&billing);
+    }
 }
 
 /// An `error` frame of `kind`. With `upstream_error` it is the frame kimera-primary answers

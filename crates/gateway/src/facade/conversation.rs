@@ -69,7 +69,19 @@ pub struct GenerateAssistantResponseHandler {
     /// Limits for every upstream attempt in place of each target model's own (tests use
     /// short ones).
     pub upstream_limits: Option<UpstreamLimits>,
+    /// How long a request waits for its card's other requests to free what it needs: a
+    /// place under the card's concurrency cap, or room its open holds take up.
+    pub card_slot_wait: Duration,
 }
+
+/// How long a request waits for its card's other requests to free a place or room: past the
+/// cap by one, a third subagent on a two-request card was refused at once, and Kiro read the
+/// throttle as "<model> is experiencing high load". Kept well inside the minute Kiro waits
+/// for an answer to begin.
+pub const CARD_SLOT_WAIT: Duration = Duration::from_secs(10);
+
+/// How often a waiting request looks again.
+const CARD_SLOT_POLL: Duration = Duration::from_millis(250);
 
 impl Default for GenerateAssistantResponseHandler {
     fn default() -> Self {
@@ -90,6 +102,7 @@ impl Default for GenerateAssistantResponseHandler {
             content_guardrail: ContentGuardrailConfig::default(),
             large_bodies: LargeBodyGate::default(),
             upstream_limits: None,
+            card_slot_wait: CARD_SLOT_WAIT,
         }
     }
 }
@@ -119,6 +132,7 @@ impl GenerateAssistantResponseHandler {
             content_guardrail: ContentGuardrailConfig::default(),
             large_bodies: LargeBodyGate::default(),
             upstream_limits: None,
+            card_slot_wait: CARD_SLOT_WAIT,
         }
     }
 
@@ -533,11 +547,13 @@ impl GenerateAssistantResponseHandler {
                     model: Some(requested_model_for_reservation.to_string()),
                 };
 
-                if let Err(e) =
-                    self.billing
-                        .reserve(card_id, &invocation_key, &reserve_params, now_secs, 660)
+                if let Err(e) = self
+                    .reserve_waiting(card_id, &invocation_key, &reserve_params, now_secs)
+                    .await
                 {
                     match e {
+                        // Still full after the wait. Kiro reads a Retry-After over a second
+                        // as "<model> is experiencing high load".
                         billing::engine::BillingError::ConcurrencyLimitExceeded {
                             current,
                             max,
@@ -547,7 +563,7 @@ impl GenerateAssistantResponseHandler {
                                 "ThrottlingException",
                                 "CONCURRENCY_LIMIT_EXCEEDED",
                                 &format!("Card concurrency quota exceeded ({}/{}). Please wait for active requests to finish.", current, max),
-                                Some(2),
+                                Some(1),
                             );
                         }
                         billing::engine::BillingError::DailyLimitExceeded {
@@ -1356,6 +1372,35 @@ impl GenerateAssistantResponseHandler {
         }
     }
 
+    /// Reserve the request's hold, waiting up to `card_slot_wait` for what the card's other
+    /// requests will free: a place under its concurrency cap, or room its open holds take up
+    /// under its daily or 30-day limit. Anything else is answered at once.
+    async fn reserve_waiting(
+        &self,
+        card_id: &str,
+        invocation_key: &str,
+        params: &ReservationEstimateParams,
+        now_secs: u64,
+    ) -> Result<(), billing::engine::BillingError> {
+        let until = tokio::time::Instant::now() + self.card_slot_wait;
+        let mut now_secs = now_secs;
+        loop {
+            match self
+                .billing
+                .reserve(card_id, invocation_key, params, now_secs, 660)
+            {
+                Err(error)
+                    if frees_up(&error)
+                        && tokio::time::Instant::now() + CARD_SLOT_POLL <= until =>
+                {
+                    tokio::time::sleep(CARD_SLOT_POLL).await;
+                    now_secs = crate::now_secs().max(now_secs);
+                }
+                result => return result.map(|_| ()),
+            }
+        }
+    }
+
     /// Records an authenticated request refused before it was routed: nothing was sent
     /// upstream and nothing is charged. The model it named is kept only when it is a valid
     /// model ID; the request's content is never kept.
@@ -1523,13 +1568,7 @@ fn route_error(error: &GovernanceError) -> KiroError {
         next_recovery_secs, ..
     } = error
     {
-        return KiroError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "ThrottlingException",
-            "All upstream provider keys are currently in cooldown",
-        )
-        .with_reason("ALL_KEYS_IN_COOLDOWN")
-        .with_retry_after((*next_recovery_secs).max(1));
+        return keys_cooling_error(*next_recovery_secs);
     }
     governance_upstream_refusal(error).unwrap_or_else(|| {
         KiroError::new(
@@ -1539,6 +1578,38 @@ fn route_error(error: &GovernanceError) -> KiroError {
         )
     })
 }
+
+/// Every key of the route is cooling down. Kiro waits out a throttle's Retry-After on each of
+/// its retries (up to five minutes each) and reads a wait over a second as "<model> is
+/// experiencing high load": a two-minute cooldown hung the turn for minutes, then ended in
+/// "Too many requests". A short one is still a throttle to wait out; a longer one is said at
+/// once, with when the keys come back.
+fn keys_cooling_error(next_recovery_secs: u64) -> KiroError {
+    if next_recovery_secs <= KEYS_COOLING_WAIT_SECS {
+        return KiroError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "ThrottlingException",
+            "All upstream provider keys are currently in cooldown",
+        )
+        .with_reason("ALL_KEYS_IN_COOLDOWN")
+        .with_retry_after(next_recovery_secs.max(1));
+    }
+    let back = if next_recovery_secs >= 120 {
+        format!("约 {} 分钟后", next_recovery_secs.div_ceil(60))
+    } else {
+        format!("约 {next_recovery_secs} 秒后")
+    };
+    KiroError::new(
+        StatusCode::BAD_REQUEST,
+        "ValidationException",
+        format!(
+            "该模型的上游服务暂时不可用：所有上游 Key 都在冷却中，{back}恢复。可以稍后重试，或先换一个模型。"
+        ),
+    )
+}
+
+/// The longest cooldown Kiro is asked to wait out rather than told of.
+const KEYS_COOLING_WAIT_SECS: u64 = 10;
 
 /// How Kiro is told the configured upstream failed to answer.
 fn start_error(error: &ProviderError) -> KiroError {
@@ -1632,6 +1703,34 @@ fn reservation_refusal(error: &billing::engine::BillingError) -> Response {
     error_response(StatusCode::BAD_REQUEST, "ValidationException", &message)
 }
 
+/// Whether a refused hold is one the card's other requests free by finishing: a place under
+/// its concurrency cap, or room their open holds take up under a credit limit.
+fn frees_up(error: &billing::engine::BillingError) -> bool {
+    use billing::engine::BillingError;
+    match *error {
+        BillingError::ConcurrencyLimitExceeded { .. } => true,
+        BillingError::DailyLimitExceeded {
+            limit,
+            current,
+            held,
+            needed,
+        }
+        | BillingError::MonthlyLimitExceeded {
+            limit,
+            current,
+            held,
+            needed,
+        } => held_back(limit, current, held, needed),
+        _ => false,
+    }
+}
+
+/// Whether settled usage alone leaves room for `needed` under `limit`: only holds, which
+/// settle for less or go back, stand in the way.
+fn held_back(limit: i64, current: i64, held: i64, needed: i64) -> bool {
+    needed <= limit.saturating_sub(current.saturating_sub(held).max(0))
+}
+
 /// The card's fair-use window that refused a hold.
 #[derive(Clone, Copy)]
 enum LimitWindow {
@@ -1657,7 +1756,7 @@ fn limit_refusal(
 ) -> Response {
     let settled = current.saturating_sub(held).max(0);
     let left = limit.saturating_sub(settled);
-    if needed <= left {
+    if held_back(limit, current, held, needed) {
         return format_kiro_throttle_response(
             StatusCode::TOO_MANY_REQUESTS,
             "ThrottlingException",

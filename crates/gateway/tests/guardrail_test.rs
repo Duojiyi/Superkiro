@@ -145,6 +145,7 @@ async fn test_gateway_card_concurrency_quota_rejection() {
     let handler = GenerateAssistantResponseHandler {
         billing: billing.clone(),
         intercept_intent: false,
+        card_slot_wait: std::time::Duration::from_millis(300),
         ..Default::default()
     };
 
@@ -172,15 +173,18 @@ async fn test_gateway_card_concurrency_quota_rejection() {
     };
     req.extensions_mut().insert(claims);
 
+    let started = std::time::Instant::now();
     let resp = app.oneshot(req).await.unwrap();
 
-    // Verify rejection with Kiro ThrottlingException
+    // Refused after waiting a little for the other request to finish, with a Retry-After
+    // Kiro does not read as "<model> is experiencing high load".
+    assert!(started.elapsed() >= std::time::Duration::from_millis(250));
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(
         resp.headers().get("x-amzn-errortype").unwrap(),
         "ThrottlingException"
     );
-    assert_eq!(resp.headers().get("Retry-After").unwrap(), "2");
+    assert_eq!(resp.headers().get("Retry-After").unwrap(), "1");
 
     let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
         .await
@@ -230,6 +234,7 @@ async fn limit_reply(
     let handler = GenerateAssistantResponseHandler {
         billing: billing.clone(),
         intercept_intent: false,
+        card_slot_wait: std::time::Duration::from_millis(300),
         ..Default::default()
     };
     let mut registry = FacadeRegistry::default();
@@ -395,4 +400,69 @@ async fn test_gateway_quota_refusal_of_a_hold_larger_than_what_is_left() {
     );
     assert!(message.contains("每天北京时间 8:00 重置"), "{message}");
     assert!(message.chars().count() <= 200, "{message}");
+}
+
+/// A request past its card's concurrency cap, or behind the card's open holds, waits a
+/// little for the requests ahead of it: they finish within seconds, and one refused at once
+/// read as "<model> is experiencing high load".
+#[tokio::test]
+async fn a_request_waits_for_its_cards_other_requests_to_finish() {
+    for (daily, max_concurrency) in [(false, 1), (true, 5)] {
+        let now = unix_now();
+        let billing = BillingEngine::new();
+        billing.upsert_rate_card_version(support::wildcard_price("default"));
+        limit_card(&billing, "card-waits");
+        billing
+            .update_card_quotas("card-waits", Some(max_concurrency), None, None)
+            .unwrap();
+        let p = ReservationEstimateParams::new(0, 15_000); // 0.9 credits
+        billing
+            .reserve("card-waits", "inv-ahead", &p, now, 300)
+            .unwrap();
+        if daily {
+            let held = billing.get_card("card-waits").unwrap().credit_reserved;
+            set_limit(&billing, "card-waits", true, held + 100_000);
+        }
+        let handler = GenerateAssistantResponseHandler {
+            billing: billing.clone(),
+            intercept_intent: false,
+            card_slot_wait: std::time::Duration::from_secs(5),
+            ..Default::default()
+        };
+        let mut registry = FacadeRegistry::default();
+        registry.register(handler);
+        let app = registry.into_router();
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/generateAssistantResponse")
+            .header("amz-sdk-invocation-id", "inv-waiting")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"conversationState": {"conversationId": "c1", "currentMessage": {"userInputMessage": {"content": "quota test"}}}}"#,
+            ))
+            .unwrap();
+        req.extensions_mut().insert(AuthClaims {
+            card_id: "card-waits".to_string(),
+            group_id: "group-default".to_string(),
+            token_version: 1,
+            exp: now + 3600,
+            iat: now,
+        });
+
+        let finishing = billing.clone();
+        let ahead = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            finishing.release("inv-ahead").unwrap();
+        });
+        let started = std::time::Instant::now();
+        let resp = app.oneshot(req).await.unwrap();
+        ahead.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "daily limit: {daily}");
+        let waited = started.elapsed();
+        assert!(
+            waited >= std::time::Duration::from_millis(500)
+                && waited < std::time::Duration::from_secs(4),
+            "{waited:?}"
+        );
+    }
 }

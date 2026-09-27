@@ -399,6 +399,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             content_guardrail: Default::default(),
             large_bodies: Default::default(),
             upstream_limits: None,
+            card_slot_wait: gateway::facade::conversation::CARD_SLOT_WAIT,
         };
         registry.register(handler);
     } else if env_flag("ALLOW_STUB_MODE", false) {

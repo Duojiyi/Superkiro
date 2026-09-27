@@ -322,6 +322,7 @@ async fn test_e2e_intent_classifier_interception_optimization() {
         content_guardrail: gateway::security::ContentGuardrailConfig::default(),
         large_bodies: Default::default(),
         upstream_limits: None,
+        card_slot_wait: gateway::facade::conversation::CARD_SLOT_WAIT,
         runtime: None,
     };
 
@@ -508,6 +509,7 @@ async fn test_e2e_insufficient_credit_rejection() {
         content_guardrail: gateway::security::ContentGuardrailConfig::default(),
         large_bodies: Default::default(),
         upstream_limits: None,
+        card_slot_wait: gateway::facade::conversation::CARD_SLOT_WAIT,
         runtime: None,
     };
 

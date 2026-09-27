@@ -123,6 +123,7 @@ async fn test_provider_import_to_real_request_and_lifecycle_loop() {
         content_guardrail: Default::default(),
         large_bodies: Default::default(),
         upstream_limits: None,
+        card_slot_wait: gateway::facade::conversation::CARD_SLOT_WAIT,
     };
     registry.register(conv_handler);
 
