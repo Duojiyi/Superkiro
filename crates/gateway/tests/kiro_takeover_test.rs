@@ -1174,6 +1174,53 @@ async fn a_large_conversations_place_is_given_back_on_every_path() {
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
+/// kimera-primary leaves the system prompt and tool definitions out of its usage: a
+/// 9K-token system prompt reported 3 input tokens, so Kiro heard of almost no context and
+/// compacted late, then overflowed. The context Kiro compacts on is never below what the
+/// gateway estimates the request holds; billing still follows the upstream's report.
+#[tokio::test]
+async fn the_context_kiro_compacts_on_is_never_below_the_gateways_estimate() {
+    let answer = [
+        json!({"type": "message_start", "message": {"usage": {"input_tokens": 100, "output_tokens": 1}}}),
+        json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hi"}}),
+        json!({"type": "content_block_stop", "index": 0}),
+        json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 3}}),
+        json!({"type": "message_stop"}),
+    ]
+    .iter()
+    .map(|event| format!("data: {event}\n\n"))
+    .collect::<String>();
+    let server =
+        upstream(ResponseTemplate::new(200).set_body_raw(answer, "text/event-stream")).await;
+    // A 200K window.
+    let billing = engine(
+        ProviderFormat::Anthropic,
+        &server.uri(),
+        vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+    );
+    let app = serve(&billing);
+    // About 60K tokens of system prompt, which the upstream reports as 100.
+    let mut request = body(json!({"content": "hello", "modelId": "model"}), vec![]);
+    request["systemPrompt"] = json!("rule ".repeat(48_000));
+    let reply = send(&app, "inv-context", request).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+
+    let percentages: Vec<f64> = frames(&reply.bytes)
+        .into_iter()
+        .filter(|(kind, _)| kind == "contextUsageEvent")
+        .map(|(_, payload)| payload["contextUsagePercentage"].as_f64().unwrap())
+        .collect();
+    assert!(!percentages.is_empty());
+    assert!(
+        percentages
+            .iter()
+            .all(|percent| (25.0..50.0).contains(percent)),
+        "{percentages:?}"
+    );
+    assert_eq!(usage_entries(&billing)[0].input_tokens, 100);
+}
+
 /// An `error` frame of `kind`. With `upstream_error` it is the frame kimera-primary answers
 /// about one request in twenty with, as HTTP 200, 0.7 to 7 seconds in, before the model has
 /// started.

@@ -469,6 +469,11 @@ pub fn create_stream_guard_with_send_deadline(
         let signing_model = billing_settler
             .as_ref()
             .map(|settler| settler.target_model.clone());
+        // What the gateway estimates the request holds, which the context Kiro is told of
+        // never falls below.
+        let estimated_input = billing_settler
+            .as_ref()
+            .map_or(0, |settler| settler.estimated_input_tokens);
 
         'stream: loop {
             tokio::select! {
@@ -591,10 +596,18 @@ pub fn create_stream_guard_with_send_deadline(
                                 cache_write_input_tokens: usage.cache_creation_input_tokens.unwrap_or(0).min(i64::MAX as u64) as i64,
                             };
                             // Kiro reads a percentage: it summarizes the conversation at 80 and
-                            // truncates it at 95. A fraction never reached either.
+                            // truncates it at 95. A fraction never reached either. An upstream
+                            // that leaves the system prompt and tool definitions out of its
+                            // usage (kimera-primary reports 3 input tokens for a 9K-token system
+                            // prompt) would have Kiro compact late and then overflow, so the
+                            // gateway's own estimate is the floor. Billing still follows the
+                            // upstream's report.
+                            let context_tokens = usage.total_tokens.max(estimated_input.saturating_add(
+                                crate::usage_estimate::tokens_from_units(output_units),
+                            ));
                             let frames = [
                                 kiro_wire::encoder::encode_metadata(Some(wire_usage), None),
-                                kiro_wire::encoder::encode_context_usage((usage.total_tokens as f64 * 100.0 / context_window as f64).clamp(0.0, 100.0)),
+                                kiro_wire::encoder::encode_context_usage((context_tokens as f64 * 100.0 / context_window as f64).clamp(0.0, 100.0)),
                             ];
                             for frame in frames {
                                 if !send_frame(&tx, Bytes::from(frame), send_deadline).await { break 'stream; }
