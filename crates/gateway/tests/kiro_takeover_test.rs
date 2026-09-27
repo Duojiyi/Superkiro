@@ -1228,3 +1228,128 @@ async fn kiros_other_calls_are_answered_at_its_own_paths() {
         "{body}"
     );
 }
+
+/// 1x1 PNG.
+const PNG_1X1: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+/// The gateway's own refusals carry the reasons Kiro's service gives the same refusals:
+/// Kiro shows an image one as an image error with its detail. InvalidRequestException read
+/// "Something went wrong: [InvalidRequestException] ...".
+#[tokio::test]
+async fn the_gateways_own_refusals_carry_the_reasons_kiro_knows() {
+    let server = upstream(ResponseTemplate::new(200)).await;
+    let billing = engine(
+        ProviderFormat::Anthropic,
+        &server.uri(),
+        vec![ModelMap::new("map", GROUP, "model", "prov", "up")],
+    );
+    let app = serve(&billing);
+    let image = json!({"format": "png", "source": {"bytes": PNG_1X1}});
+    let refusal = |reply: &Reply| {
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text());
+        let body = reply.json();
+        assert_eq!(body["__type"], "ValidationException", "{body}");
+        (
+            body["reason"].as_str().unwrap_or_default().to_string(),
+            body["message"].as_str().unwrap_or_default().to_string(),
+        )
+    };
+
+    let images = vec![image.clone(); 21];
+    let reply = send(
+        &app,
+        "inv-images",
+        body(
+            json!({"content": "look", "modelId": "model", "images": images}),
+            vec![],
+        ),
+    )
+    .await;
+    let (reason, message) = refusal(&reply);
+    assert_eq!(reason, "IMAGE_COUNT_EXCEEDED");
+    assert!(
+        message.contains("21") && message.contains("20"),
+        "{message}"
+    );
+
+    let broken = json!({"format": "png", "source": {"bytes": base64(b"not an image")}});
+    let reply = send(
+        &app,
+        "inv-broken",
+        body(
+            json!({"content": "look", "modelId": "model", "images": [broken]}),
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(refusal(&reply).0, "IMAGE_FORMAT_UNSUPPORTED");
+
+    let mut empty_id = body(json!({"content": "hi", "modelId": "model"}), vec![]);
+    empty_id["conversationState"]["conversationId"] = json!("");
+    let reply = send(&app, "inv-conversation", empty_id).await;
+    assert_eq!(refusal(&reply).0, "INVALID_CONVERSATION_ID");
+
+    let reply = send(
+        &app,
+        "inv-model",
+        body(json!({"content": "hi", "modelId": "bad model!"}), vec![]),
+    )
+    .await;
+    assert_eq!(refusal(&reply).0, "INVALID_MODEL_ID");
+    nothing_charged(&billing);
+}
+
+/// With every upstream disabled nothing can serve the request until the operator acts:
+/// ServiceUnavailableException read "Too many requests, please wait" and was retried.
+#[tokio::test]
+async fn no_enabled_upstream_is_said_plainly_and_not_retried() {
+    let server = upstream(ResponseTemplate::new(200)).await;
+    let billing = engine(
+        ProviderFormat::Anthropic,
+        &server.uri(),
+        vec![ModelMap::new("map", GROUP, "model", "prov", "up")],
+    );
+    let mut provider = billing.get_provider("prov").unwrap();
+    provider.enabled = false;
+    billing.upsert_provider(provider);
+    let app = serve(&billing);
+
+    let reply = send(
+        &app,
+        "inv-no-upstream",
+        body(json!({"content": "hi", "modelId": "model"}), vec![]),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text());
+    assert_eq!(reply.json()["__type"], "ValidationException");
+    assert!(reply.json()["message"].as_str().unwrap().contains("上游"));
+    nothing_charged(&billing);
+}
+
+/// Kiro sends a turn again when it ends without a stop reason, taking it for cut short.
+#[tokio::test]
+async fn the_intent_answer_ends_with_a_stop_reason() {
+    let mut registry = FacadeRegistry::new();
+    registry.register(GenerateAssistantResponseHandler::default());
+    let app = registry.into_router();
+    let classifier = "You are an intent classifier for a language model. Return ONLY a JSON object with 3 properties (chat, do, spec).";
+    let reply = send(
+        &app,
+        "inv-intent",
+        json!({"systemPrompt": classifier, "conversationState": {"conversationId": "c",
+            "history": [], "currentMessage": {"userInputMessage": {"content": "fix the bug"}}}}),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let frames = frames(&reply.bytes);
+    let (kind, payload) = frames.last().unwrap();
+    assert_eq!(kind, "metadataEvent", "{frames:?}");
+    assert_eq!(payload["stopReason"], "end_turn");
+    assert!(frames
+        .iter()
+        .any(|(kind, payload)| kind == "assistantResponseEvent"
+            && payload["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("\"do\"")));
+}

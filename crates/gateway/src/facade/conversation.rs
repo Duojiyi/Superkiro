@@ -303,9 +303,11 @@ impl GenerateAssistantResponseHandler {
             }
 
             if claims.is_some() && !self.billing.persistence_ready() {
+                // Not ServiceUnavailableException, which Kiro reads as "Too many requests":
+                // an internal error, which it shows as temporary and retries.
                 return error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "ServiceUnavailableException",
+                    "InternalServerException",
                     "Billing persistence engine is not ready or in read-only recovery state",
                 );
             }
@@ -328,6 +330,13 @@ impl GenerateAssistantResponseHandler {
 
                 let mut combined = meta_frame;
                 combined.extend_from_slice(&resp_frame);
+                // A turn that ends without a stop reason is one Kiro takes for cut short
+                // and sends again.
+                combined.extend_from_slice(&kiro_wire::encoder::encode_stop(
+                    None,
+                    Some("end_turn"),
+                    None,
+                ));
 
                 // Mark idempotency guard committed
                 idempotency_guard.commit(crate::idempotency::CompletedInvocation {
@@ -384,11 +393,7 @@ impl GenerateAssistantResponseHandler {
                         );
                         return input_too_long(&detail);
                     }
-                    return error_response(
-                        StatusCode::BAD_REQUEST,
-                        "InvalidRequestException",
-                        &error.to_string(),
-                    );
+                    return guardrail_refusal(&error);
                 }
                 parsed_request = Some(parsed);
             }
@@ -437,11 +442,7 @@ impl GenerateAssistantResponseHandler {
                         requested_model_for_reservation,
                         "invalid_model",
                     );
-                    return error_response(
-                        StatusCode::BAD_REQUEST,
-                        "InvalidRequestException",
-                        "modelId is invalid",
-                    );
+                    return invalid_model_refusal();
                 }
                 // A retired model is refused as one its group does not list, before
                 // anything is held.
@@ -589,7 +590,7 @@ impl GenerateAssistantResponseHandler {
                         billing::engine::BillingError::Persistence(_) => {
                             return error_response(
                                 StatusCode::SERVICE_UNAVAILABLE,
-                                "ServiceUnavailableException",
+                                "InternalServerException",
                                 // The underlying io::Error carries server filesystem
                                 // paths and the snapshot size, and the caller cannot act
                                 // on either.
@@ -652,11 +653,7 @@ impl GenerateAssistantResponseHandler {
                         model.as_deref().unwrap_or_default(),
                         "no_route",
                     );
-                    return error_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "ServiceUnavailableException",
-                        "No enabled upstream provider is available",
-                    );
+                    return no_enabled_upstream();
                 }
                 if has_reservation {
                     let _ = self.billing.release(&invocation_key);
@@ -739,11 +736,7 @@ impl GenerateAssistantResponseHandler {
                     requested_model,
                     "invalid_model",
                 );
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    "InvalidRequestException",
-                    "modelId is invalid",
-                );
+                return invalid_model_refusal();
             }
             // Kept 24 hours for tracing: the request as it arrived, its reply once it ends.
             if let (Some(archive), Some(claims)) = (crate::archive::active(), claims.as_ref()) {
@@ -1491,6 +1484,61 @@ fn reservation_refusal(error: &billing::engine::BillingError) -> Response {
         }
     };
     error_response(StatusCode::BAD_REQUEST, "ValidationException", &message)
+}
+
+/// A request the gateway's own checks refuse, with the reason Kiro gives the same refusal
+/// from its own service: an image one is shown as an image error with its detail, a bad
+/// conversation ID as a request error. InvalidRequestException, which Kiro does not know,
+/// read "Something went wrong: [InvalidRequestException] ...".
+fn guardrail_refusal(error: &GuardrailError) -> Response {
+    const MB: usize = 1024 * 1024;
+    let (reason, message) = match error {
+        GuardrailError::TooManyImages { actual, max } => (
+            "IMAGE_COUNT_EXCEEDED",
+            format!("这条消息附带了 {actual} 张图片，每条消息最多 {max} 张，请减少图片后再发送。"),
+        ),
+        GuardrailError::ImageTooLarge { actual, max } => (
+            "IMAGE_SIZE_EXCEEDED",
+            format!(
+                "有一张图片为 {:.1} MB，超过单张 {} MB 的上限，请压缩或截取后再发送。",
+                *actual as f64 / MB as f64,
+                max / MB
+            ),
+        ),
+        GuardrailError::InvalidImage => (
+            "IMAGE_FORMAT_UNSUPPORTED",
+            "有一张图片无法读取：只支持 PNG、JPEG、GIF 和 WebP 图片。".to_string(),
+        ),
+        GuardrailError::InvalidConversationId => (
+            "INVALID_CONVERSATION_ID",
+            "对话 ID 无效（应为 1 到 256 个字符），请新建一个对话后重试。".to_string(),
+        ),
+        other => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "ValidationException",
+                &other.to_string(),
+            )
+        }
+    };
+    validation_error(reason, &message)
+}
+
+/// A model ID no mapping can have. Kiro shows its own "The selected model is not
+/// available. Please select a different model and try again." for this reason.
+fn invalid_model_refusal() -> Response {
+    validation_error("INVALID_MODEL_ID", "modelId is invalid")
+}
+
+/// No upstream is enabled at all: the operator's configuration, which a retry does not
+/// change. ServiceUnavailableException read "Too many requests, please wait" and was
+/// retried.
+fn no_enabled_upstream() -> Response {
+    error_response(
+        StatusCode::BAD_REQUEST,
+        "ValidationException",
+        "当前没有可用的上游模型服务，请稍后再试或联系管理员。",
+    )
 }
 
 /// A card whose group may not use any provider that serves the model. Not an
