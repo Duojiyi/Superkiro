@@ -439,7 +439,8 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
               onOpenCard={cardId => void navigate('cards', {cards: {status: 'ALL', search: cardId, open: cardId}})}
               onCompensate={prefill => void navigate('cards', {cards: {status: 'ALL', search: prefill.cardId, open: prefill.cardId, compensate: prefill}})}/>}
             {activeTab === 'groups' && <CommercialEditor key="groups" kind="groups" onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy}
-              cards={data.cards} onPublished={() => void refreshData({keepSelection: true})} refreshEpoch={refreshEpoch}/>}
+              cards={data.cards} onPublished={() => void refreshData({keepSelection: true})} refreshEpoch={refreshEpoch}
+              onOpenModel={model => void navigate('models', {models: {model}})}/>}
             {activeTab === 'plans' && <PlansPage plans={catalog} editable={!!data.plans} cardsByPlan={data.cardsByPlan} groups={data.groups} revision={data.revision}
               loading={loading} failed={!!failures.config} refresh={refreshData} guards={guards} reportError={reportError} onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy}/>}
             {activeTab === 'models' && <CommercialEditor key="models" kind="models" onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy}

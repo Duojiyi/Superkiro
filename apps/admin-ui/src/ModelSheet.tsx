@@ -26,7 +26,7 @@ export type StateAction = 'hide' | 'retire' | 'restore' | 'remove';
 const MIXED: StatusView = {label: '部分在售', tone: 'warning', title: '有的分组在售，有的分组隐藏或已下架：见模型下方的分组'};
 
 export default function ModelSheet({rows, groups, versions, settings, nowSecs, providers, providerKeys, routesKnown, sample, usage, selectedId, picked, published, busy,
-  priceBlocked, stateBlocked, isEdited, isNew, focus, onPick, onEdit, onPrice, onMove, onState}: {
+  priceBlocked, stateBlocked, isEdited, isNew, focus, fastGroups, onPick, onEdit, onPrice, onMove, onState}: {
   /** The model entries as they will be published (the draft). */
   rows: Row[];
   groups: Row[];
@@ -55,6 +55,8 @@ export default function ModelSheet({rows, groups, versions, settings, nowSecs, p
   onState: (id: string, mappings: Row[], action: StateAction) => void;
   /** A model a link names: the list shows it (all groups, no filter), scrolled to and marked. */
   focus?: {model: string} | null;
+  /** The groups whose hidden Kiro background calls this model serves (as the draft would have it). */
+  fastGroups?: (model: string) => string[];
 }) {
   const [groupView, setGroupView] = useState('');
   const [marked, setMarked] = useState<string | null>(null);
@@ -136,7 +138,8 @@ export default function ModelSheet({rows, groups, versions, settings, nowSecs, p
         <span className="group-chips">{entry.mappings.map(item => {
           const state = item.retired === true ? '已下架' : item.visible === false ? '隐藏' : '';
           return <span key={String(item.id)} className={`group-chip${state ? ' is-off' : ''}`} title={`${groupName(item.group_id)}：${state || '在售'}`}>{groupName(item.group_id)}{state ? ` · ${state}` : ' ✓'}</span>;
-        })}</span>
+        })}
+          {(fastGroups?.(id) ?? []).length > 0 && <Tag tone="info" title={`${nameList(fastGroups!(id))} 的 Kiro 后台调用（提交信息、Spec 子任务、Analyze Requirements）用它，每次按它的价格扣费`}>后台调用</Tag>}</span>
         <span className="cell-sub" title={`${formatTokens(row.context_window)} / ${formatTokens(row.max_output)}`}>{typeof row.context_window === 'number' ? formatTokenCount(row.context_window) : '—'} / {typeof row.max_output === 'number' ? formatTokenCount(row.max_output) : '—'}
           <span className="capabilities">{capability(row)}</span></span></td>
       {withDisplay && <td className="col-display">{String(row.display_name ?? '') || <span className="muted">—</span>}</td>}

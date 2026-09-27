@@ -235,3 +235,43 @@ assert.equal(status.probeView({ok: true, ttft_ms: null, latency_ms: 620}).label,
 assert.equal(status.probeView({ok: false, status: 529, error: 'HTTP 529 overloaded_error: Overloaded'}).label, '失败：HTTP 529 overloaded_error: Overloaded');
 assert.equal(status.probeView({ok: false, status: 502, error: null}).label, '失败：HTTP 502');
 console.log('PASS Key health (cooldown, degraded, unhealthy, over), format tags with the api_type fallback, 测试 results in words');
+
+// Kiro's background calls (simple-task), as the server chooses per group: the alias (listed or
+// hidden, not retired), else the cheapest listed model by a million input + output tokens at the
+// price in force (every multiplier; the first in the group's order among equals), else the default.
+{
+  const fast = load('fastModel.ts', {'./priceChange': change, './listing': listingRules});
+  const version = (model, input, output, extra = {}) => ({id: `v-${model}`, rate_card_id: 'r', model, pricing_mode: 'fixed', fixed_input_credit_per_m: input, fixed_output_credit_per_m: output, margin_multiplier: 1, effective_from_secs: 0, ...extra});
+  const group = {id: 'g', name: 'PRO', rate_card_id: 'r', margin_multiplier: 1};
+  const entry = (id, order, extra = {}) => ({id, exposed_model_id: id, group_id: 'g', target_model: id, sort_order: order, visible: true, credit_multiplier: 1, aliases: [], ...extra});
+  const opus = entry('opus', 0), haiku = entry('haiku', 2), sonnet = entry('sonnet', 1);
+  const versions = [version('opus', 5e6, 25e6), version('haiku', 1e6, 5e6), version('sonnet', 3e6, 15e6)];
+  const pick = models => {const choice = fast.fastModelFor(models, group, versions, {}, 100); return choice && [choice.mapping.id, choice.via];};
+  assert.deepEqual(pick([opus, sonnet, haiku]), ['haiku', 'cheapest']);
+  assert.deepEqual(pick([opus, sonnet, {...haiku, credit_multiplier: 10}]), ['sonnet', 'cheapest'], 'the model multiplier counts');
+  assert.deepEqual(pick([opus, sonnet, {...haiku, visible: false}]), ['sonnet', 'cheapest'], 'a hidden model is not compared');
+  assert.deepEqual(pick([opus, {...sonnet, visible: false, aliases: ['simple-task']}, haiku]), ['sonnet', 'alias'], 'the alias wins, hidden or not');
+  assert.deepEqual(pick([opus, {...sonnet, retired: true, aliases: ['simple-task']}, haiku]), ['haiku', 'cheapest'], 'a retired alias does not');
+  assert.deepEqual(pick([entry('x', 0), entry('y', 1)]), ['x', 'default'], 'nothing priced: the first listed');
+  assert.equal(fast.fastModelFor([entry('x', 0), entry('y', 1)], group, [version('*', 1e6, 1e6), version('y', 1e5, 1e5)], {}, 100).mapping.id, 'y', 'one priced by the wildcard * is compared too');
+  assert.equal(fast.fastModelFor([entry('x', 0), entry('y', 1)], group, [version('*', 1e5, 1e5), version('y', 1e6, 1e6)], {}, 100).mapping.id, 'x');
+  assert.equal(fast.comparedPrice(haiku, {...group, margin_multiplier: 1.5}, versions, {}, 100), 9e6, 'input + output a million each, × every multiplier');
+  const tied = [entry('late', 1), entry('early', 0)], tiedVersions = [version('late', 1e6, 1e6), version('early', 1e6, 1e6)];
+  assert.equal(fast.fastModelFor(tied, group, tiedVersions, {}, 100).mapping.id, 'early', 'the first in the group order among equals');
+  assert.equal(fast.fastModelFor([], group, versions, {}, 100), null);
+  // The stats' names are kept (the server decides); a group they leave out is worked out here.
+  const config = {groups: [group, {id: 'h', name: 'Power', rate_card_id: 'r'}], models: [opus, haiku], versions};
+  assert.deepEqual(plain(fast.fastModels(config, 100, [{groupId: 'g', groupName: 'PRO', model: 'opus', via: 'alias'}])),
+    [{groupId: 'g', groupName: 'PRO', model: 'opus', via: 'alias'}, {groupId: 'h', groupName: 'Power', model: null, via: null}]);
+  assert.deepEqual(plain(fast.fastModelsOf([{groupId: 'g', groupName: 'PRO', model: 'opus', via: 'cheapest'}, {groupId: 'h', model: null, via: null}, 'junk'])),
+    [{groupId: 'g', groupName: 'PRO', model: 'opus', via: 'cheapest'}, {groupId: 'h', groupName: 'h', model: null, via: null}]);
+  assert.equal(fast.fastModelsOf(undefined), null);
+  assert.equal(fast.fastText({model: 'haiku', via: 'cheapest'}), 'haiku（分组里最便宜的在售模型）');
+  assert.equal(fast.fastText({model: null, via: null}), '没有可用的模型：后台调用会失败');
+  // Setting the alias gives it to the chosen entries and takes it from the others of their groups.
+  const other = entry('other', 3, {group_id: 'h', aliases: ['simple-task']});
+  const withAlias = fast.withFastAlias([{...opus, aliases: ['opus-latest']}, {...haiku, aliases: ['simple-task']}, other], ['opus'], true);
+  assert.deepEqual(plain(withAlias.map(row => [row.id, row.aliases])), [['opus', ['opus-latest', 'simple-task']], ['haiku', []], ['other', ['simple-task']]], 'another group keeps its own');
+  assert.deepEqual(plain(fast.withFastAlias(withAlias, ['opus'], false).map(row => [row.id, row.aliases])), [['opus', ['opus-latest']], ['haiku', []], ['other', ['simple-task']]]);
+  console.log('PASS background calls: alias, cheapest listed (multipliers, ties, hidden and retired), default; the stats kept; setting the alias moves it within its groups');
+}

@@ -99,7 +99,7 @@ console.log('PASS: price resolution like billing, generated version IDs, change 
 let states, cursor;
 const jsx = (type, props) => ({type, props});
 const react = {
-  useEffect: () => {}, useRef: initial => ({current: initial}), useState: initial => {const index = cursor++; if (!(index in states)) states[index] = typeof initial === 'function' ? initial() : initial; return [states[index], value => {states[index] = typeof value === 'function' ? value(states[index]) : value;}];},
+  Fragment: 'Fragment', useEffect: () => {}, useRef: initial => ({current: initial}), useState: initial => {const index = cursor++; if (!(index in states)) states[index] = typeof initial === 'function' ? initial() : initial; return [states[index], value => {states[index] = typeof value === 'function' ? value(states[index]) : value;}];},
 };
 const runtime = {jsx, jsxs: jsx, Fragment: 'Fragment'};
 function nodes(node) {if (!node || typeof node !== 'object') return []; if (Array.isArray(node)) return node.flatMap(nodes); return [node, ...nodes(node.props?.children)];}
@@ -174,6 +174,7 @@ const Editor = load('CommercialEditor.tsx', {'./tokens': tokens, './api': {admin
   './officialPricing': load('officialPricing.ts', {'./priceChange': change, './routes': routes}), './OfficialPriceTable': {default: 'OfficialPriceTable'}, './PricingSettings': {default: 'PricingSettings'}, './RouteCostDrawer': {default: 'RouteCostDrawer'},
   './listing': load('listing.ts', {'./priceChange': change, './routes': routes, './officialPricing': load('officialPricing.ts', {'./priceChange': change, './routes': routes})}),
   './ModelSheet': {default: 'ModelSheet'}, './ModelStateDialog': {default: 'ModelStateDialog'},
+  './fastModel': load('fastModel.ts', {'./priceChange': change, './listing': load('listing.ts', {'./priceChange': change, './routes': routes, './officialPricing': load('officialPricing.ts', {'./priceChange': change, './routes': routes})})}),
   './sheetRules': load('sheetRules.ts', {'./officialPricing': load('officialPricing.ts', {'./priceChange': change, './routes': routes}), './priceChange': change, './routes': routes}),
   react, 'react/jsx-runtime': runtime}).default;
 const providers = [{id: 'p', name: '供应商 P'}, {id: 'openai', name: 'Astra', api_type: 'openai'}];
