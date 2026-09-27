@@ -231,10 +231,7 @@ pub fn simulate_candidate_pricing(
         count += 1;
         original_credits = original_credits.saturating_add(entry.credits_charged);
         earned.add(
-            entry
-                .credit_face_value_cny
-                .filter(|face| *face > 0.0)
-                .unwrap_or(fv),
+            crate::observability::entry_face_value(entry, settings),
             entry.credits_charged,
         );
         total_provider_cost = total_provider_cost.saturating_add(entry.provider_cost_micro_cny);

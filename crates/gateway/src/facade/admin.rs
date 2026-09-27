@@ -855,6 +855,10 @@ impl FacadeHandler for AdminFinancialsHandler {
                     "toSecs": to_secs,
                     // What each upstream should bill for the period.
                     "byProvider": billing::observability::compute_provider_costs(&snapshot.ledger),
+                    "legacyFaceValue": {
+                        "entries": usage().filter(|entry| entry.credit_face_value_cny.is_none()).count(),
+                        "valueCny": snapshot.settings.legacy_credit_face_value_cny.unwrap_or(snapshot.settings.credit_face_value_cny),
+                    },
                     "margin": billing::observability::compute_costed_margin(&snapshot.ledger, &snapshot.settings),
                     // Credits given and taken by hand over the period, next to those earned.
                     "adjustments": adjustments,

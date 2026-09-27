@@ -173,6 +173,7 @@ def settings_defaults(policy, settings, official_prices=None):
     """The settings the policy gives, on top of the live `settings`: its route costs are added to
     any the server already has, and so is the official price table given."""
     defaults = {
+        'legacy_credit_face_value_cny': settings.get('legacy_credit_face_value_cny') or settings['credit_face_value_cny'],
         'official_usd_cny': OFFICIAL_USD_CNY,
         'default_price_multiplier': float(policy['retail_multiplier']),
         'default_cost_multiplier': float(policy['upstream_multiplier']),

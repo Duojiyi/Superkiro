@@ -267,8 +267,9 @@ pub(crate) fn stream_error(value: &serde_json::Value) -> ProviderError {
         "api_error" => http(StatusCode::INTERNAL_SERVER_ERROR),
         "rate_limit_error" => http(StatusCode::TOO_MANY_REQUESTS),
         "invalid_request_error" => http(StatusCode::BAD_REQUEST),
-        // The key's problem, as a 401 is.
-        "authentication_error" => http(StatusCode::UNAUTHORIZED),
+        // A relay may forward its own upstream credential failure inside a successful
+        // HTTP response. Only an actual HTTP 401 proves our relay key is invalid.
+        "authentication_error" => ProviderError::Unavailable,
         "permission_error" => http(StatusCode::FORBIDDEN),
         "not_found_error" => http(StatusCode::NOT_FOUND),
         // A relay's own failure: kimera-primary answers about one request in twenty with
@@ -869,10 +870,14 @@ mod tests {
             ProviderError::Unavailable
         ));
         assert!(retryable(&event("upstream_error")));
+        assert!(matches!(
+            event("authentication_error"),
+            ProviderError::Unavailable
+        ));
+        assert!(retryable(&event("authentication_error")));
         assert!(retryable(&event("")));
         for (fault, status) in [
             ("invalid_request_error", 400),
-            ("authentication_error", 401),
             ("permission_error", 403),
             ("not_found_error", 404),
             ("request_too_large", 413),

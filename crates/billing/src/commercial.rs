@@ -252,6 +252,16 @@ impl BillingEngine {
             // Left out, these keep their value: a console that does not know them never
             // wipes them.
             let current = &c.settings;
+            let legacy = current
+                .legacy_credit_face_value_cny
+                .unwrap_or(current.credit_face_value_cny);
+            if settings
+                .legacy_credit_face_value_cny
+                .is_some_and(|value| value != legacy)
+            {
+                return Err(invalid("The legacy credit face value is immutable"));
+            }
+            settings.legacy_credit_face_value_cny = Some(legacy);
             settings.official_usd_cny = settings.official_usd_cny.or(current.official_usd_cny);
             settings.default_price_multiplier = settings
                 .default_price_multiplier
@@ -1489,6 +1499,13 @@ mod tests {
         let providers = |entries: Vec<(String, f64)>| -> Option<BTreeMap<String, f64>> {
             Some(entries.into_iter().collect())
         };
+        let before = e.get_settings().credit_face_value_cny;
+        with(&|s| s.legacy_credit_face_value_cny = None).unwrap();
+        assert_eq!(e.get_settings().legacy_credit_face_value_cny, Some(before));
+        assert_eq!(
+            with(&|s| s.legacy_credit_face_value_cny = Some(before * 2.0)).unwrap_err(),
+            "The legacy credit face value is immutable"
+        );
         let rate = "The official dollar rate must be positive and at most 1000";
         let multipliers = "Multipliers must be positive and at most 100, for at most 200 providers";
         for (refused, message) in [

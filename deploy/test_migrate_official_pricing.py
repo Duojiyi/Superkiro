@@ -140,6 +140,7 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual({v['effective_from_secs'] for v in update['versions']}, {230})
         self.assertEqual(update['settings'], {
             'credit_face_value_cny': FACE, 'usd_cny_rate': 7.25, 'rate_updated_at_secs': 1,
+            'legacy_credit_face_value_cny': FACE,
             'official_usd_cny': 1.0, 'default_price_multiplier': 0.24,
             'default_cost_multiplier': 0.08,
             'provider_cost_multipliers': {'kimera-primary': 0.08, 'kimera-direct': 0.06,
@@ -433,6 +434,15 @@ class OfficialPriceTableTests(unittest.TestCase):
         summary = script.migrate(call, MagicMock(), dry_run=True)
         self.assertEqual((summary['official_prices_added'], summary['costs_unchanged_on']),
                          (['claude-opus-5'], ['kimera-primary/claude-opus-5']))
+
+
+class HistoricalFaceValueTests(unittest.TestCase):
+    def test_migration_freezes_the_original_face_value_once(self):
+        settings = {'credit_face_value_cny': 0.03}
+        first = script.settings_defaults(script.POLICY, settings)
+        self.assertEqual(first['legacy_credit_face_value_cny'], 0.03)
+        later = script.settings_defaults(script.POLICY, {**settings, **first, 'credit_face_value_cny': 0.10})
+        self.assertEqual(later['legacy_credit_face_value_cny'], 0.03)
 
 
 if __name__ == '__main__':

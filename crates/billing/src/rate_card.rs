@@ -40,6 +40,9 @@ pub enum PricingMode {
 pub struct BillingSettings {
     /// RMB face value of 1 credit (e.g. 0.01 = 0.01 CNY per credit, i.e. 1分钱/积分).
     pub credit_face_value_cny: f64,
+    /// Frozen valuation for usage settled before per-entry face values were recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_credit_face_value_cny: Option<f64>,
     /// USD to CNY exchange rate (e.g. 7.25).
     pub usd_cny_rate: f64,
     /// Unix timestamp when the exchange rate was updated.
@@ -111,6 +114,7 @@ impl Default for BillingSettings {
     fn default() -> Self {
         Self {
             credit_face_value_cny: 0.01,
+            legacy_credit_face_value_cny: None,
             usd_cny_rate: 7.25,
             rate_updated_at_secs: 0,
             official_usd_cny: None,
@@ -171,6 +175,7 @@ impl BillingSettings {
         }
         BillingSettings {
             credit_face_value_cny: self.credit_face_value_cny,
+            legacy_credit_face_value_cny: self.legacy_credit_face_value_cny,
             usd_cny_rate: self.usd_cny_rate,
             rate_updated_at_secs: self.rate_updated_at_secs,
             official_usd_cny: self.official_usd_cny,

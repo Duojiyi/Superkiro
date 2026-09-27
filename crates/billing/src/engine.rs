@@ -5826,7 +5826,10 @@ impl BillingEngine {
         // Each entry's credits at the face value it was earned at. The archive keeps usage
         // by card, not by face value, so archived usage counts at the current one.
         let mut earned = EarnedCredits::default();
-        earned.add(face_val, total_credits_charged);
+        earned.add(
+            settings.legacy_credit_face_value_cny.unwrap_or(face_val),
+            total_credits_charged,
+        );
 
         for entry in ledger.iter() {
             if entry.kind == LedgerKind::Usage {
@@ -5836,6 +5839,7 @@ impl BillingEngine {
                 earned.add(
                     entry
                         .credit_face_value_cny
+                        .or(settings.legacy_credit_face_value_cny)
                         .filter(|face| *face > 0.0)
                         .unwrap_or(face_val),
                     entry.credits_charged,
@@ -7150,6 +7154,10 @@ fn validate_snapshot(snapshot: &BillingSnapshot) -> std::io::Result<()> {
         || !snapshot.settings.usd_cny_rate.is_finite()
         || snapshot.settings.credit_face_value_cny < 0.0
         || snapshot.settings.usd_cny_rate < 0.0
+        || snapshot
+            .settings
+            .legacy_credit_face_value_cny
+            .is_some_and(|value| !value.is_finite() || value <= 0.0)
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,

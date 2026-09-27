@@ -955,6 +955,15 @@ fn revenue_keeps_the_face_value_it_was_earned_at() {
     let settings = engine.get_settings();
     let revenue = compute_margin_dashboard(&[older.clone(), second], &settings).revenue_micro_cny;
     assert_eq!(revenue, 1_000_000);
+    let mut migrated = settings.clone();
+    migrated.legacy_credit_face_value_cny = Some(0.03);
+    for face in [0.05, 0.10, 1.0] {
+        migrated.credit_face_value_cny = face;
+        assert_eq!(
+            compute_margin_dashboard(std::slice::from_ref(&older), &migrated).revenue_micro_cny,
+            300_000
+        );
+    }
     // Saved without it, as before; and an older release ignores it, as any unknown field.
     assert!(serde_json::to_value(&older)
         .unwrap()

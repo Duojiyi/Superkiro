@@ -679,10 +679,11 @@ pub fn compute_model_cost_rankings(
 }
 
 /// The ¥ face value of one credit a ledger entry was sold at: the one recorded when it was
-/// settled, else (entries settled before it was recorded) the current settings' face value.
+/// settled, else the frozen legacy value (or current value for unmigrated settings).
 pub fn entry_face_value(entry: &LedgerEntry, settings: &BillingSettings) -> f64 {
     entry
         .credit_face_value_cny
+        .or(settings.legacy_credit_face_value_cny)
         .unwrap_or(settings.credit_face_value_cny)
 }
 
