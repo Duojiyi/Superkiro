@@ -48,11 +48,66 @@ pub struct ModelInfo {
     pub supports_reasoning: bool,
     #[serde(default = "default_true")]
     pub supports_vision: bool,
+    /// The level Kiro starts a reasoning model at; the model's own default when unset or
+    /// not one of its levels.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_effort_level: Option<String>,
+    /// The effort levels the model takes, lowest first; empty when they follow from its ID.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effort_levels: Vec<String>,
     /// Shown by Kiro beside the model as "{rate}x Credit".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_multiplier: Option<f64>,
+}
+
+impl ModelInfo {
+    /// The effort levels Kiro offers for this model, lowest first, and the one it starts
+    /// at, when the model reasons.
+    pub fn effort(&self) -> Option<(Vec<String>, String)> {
+        if !self.supports_reasoning {
+            return None;
+        }
+        let (own_levels, own_default) = crate::provider::family::effort_levels(&self.model_id);
+        let levels: Vec<String> = if self.effort_levels.is_empty() {
+            own_levels.iter().map(|level| level.to_string()).collect()
+        } else {
+            self.effort_levels.clone()
+        };
+        let default = self
+            .default_effort_level
+            .clone()
+            .filter(|level| levels.contains(level))
+            .or_else(|| {
+                levels
+                    .iter()
+                    .find(|level| level.as_str() == own_default)
+                    .cloned()
+            })
+            .or_else(|| levels.first().cloned())?;
+        Some((levels, default))
+    }
+}
+
+/// The request fields a reasoning model takes, as Kiro reads them: the levels from the
+/// `enum` of `output_config.effort` and the level it starts at from its `default`. With no
+/// `default` Kiro started every model at its first level, "low", whatever the operator or
+/// the model meant.
+fn effort_schema(levels: &[String], default: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "output_config": {
+                "type": "object",
+                "properties": {
+                    "effort": {
+                        "type": "string",
+                        "enum": levels,
+                        "default": default
+                    }
+                }
+            }
+        }
+    })
 }
 
 /// The unit Kiro prints after the multiplier, as its own model list does.
@@ -122,32 +177,16 @@ impl FacadeHandler for ListAvailableModelsHandler {
                 .models
                 .into_iter()
                 .map(|m| {
-                    let schema = if m.supports_reasoning {
-                        Some(serde_json::json!({
-                            "type": "object",
-                            "properties": {
-                                "output_config": {
-                                    "type": "object",
-                                    "properties": {
-                                        "effort": {
-                                            "type": "string",
-                                            "enum": ["low", "medium", "high", "xhigh", "max"]
-                                        }
-                                    }
-                                }
-                            }
-                        }))
-                    } else {
-                        None
-                    };
-
+                    let effort = m.effort();
                     ExposedModelItem {
+                        additional_model_request_fields_schema: effort
+                            .as_ref()
+                            .map(|(levels, default)| effort_schema(levels, default)),
+                        default_effort_level: effort.map(|(_, default)| default),
                         model_id: m.model_id,
                         model_name: m.model_name,
                         description: m.description,
                         token_limits: m.token_limits,
-                        additional_model_request_fields_schema: schema,
-                        default_effort_level: m.default_effort_level,
                         rate_unit: m.rate_multiplier.map(|_| RATE_UNIT.to_string()),
                         rate_multiplier: m.rate_multiplier,
                     }

@@ -162,6 +162,7 @@ async fn test_audit_b_group_isolation_custom_models_and_plan() {
             supports_vision: false,
             rate_multiplier: None,
             default_effort_level: None,
+            effort_levels: Vec::new(),
         }],
         provider_binding_mode: billing::group::ProviderBindingMode::Shared,
         system_prompt_prefix: None,
@@ -189,6 +190,7 @@ async fn test_audit_b_group_isolation_custom_models_and_plan() {
                 supports_vision: true,
                 rate_multiplier: None,
                 default_effort_level: Some("max".to_string()),
+                effort_levels: Vec::new(),
             },
             ModelInfo {
                 model_id: "claude-opus-4.8".to_string(),
@@ -202,6 +204,7 @@ async fn test_audit_b_group_isolation_custom_models_and_plan() {
                 supports_vision: true,
                 rate_multiplier: None,
                 default_effort_level: Some("max".to_string()),
+                effort_levels: Vec::new(),
             },
         ],
         provider_binding_mode: billing::group::ProviderBindingMode::Shared,
