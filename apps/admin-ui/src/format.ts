@@ -141,6 +141,13 @@ export function formatRemaining(secs: unknown, now = Date.now()): {text: string;
   return {text: `剩 ${days} 天`, tone: left <= 7 * 86400 ? 'warning' : 'normal'};
 }
 
+/** How long ago an expiry passed: 已过期 12 天, or 已过期不到 1 天. */
+export function formatExpired(secs: unknown, now = Date.now()): string {
+  if (!isNumber(secs)) return '—';
+  const days = Math.floor((now / 1000 - secs) / 86400);
+  return days >= 1 ? `已过期 ${days} 天` : '已过期不到 1 天';
+}
+
 /** Minutes left in a session: 剩余 12 分钟, or m:ss in the last two minutes. */
 export function formatSessionLeft(ms: number): string {
   if (!isNumber(ms) || ms <= 0) return '已到期';

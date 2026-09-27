@@ -6,7 +6,7 @@ import {adminApi, AdminApiError, type AdminCardItem, type AdminTrace, type CardE
 import {IconChevronDown, IconChevronUp, IconClose, IconCopy} from '../components/icons';
 import {Drawer} from '../components/modal';
 import {copyText, IdCell, StatusBadge, Tag} from '../components/ui';
-import {formatBatchNote, formatCharge, formatCount, formatCredits, formatDateTime, formatFullDateTime, formatRemaining, shortId} from '../format';
+import {formatBatchNote, formatCharge, formatCount, formatCredits, formatDateTime, formatExpired, formatFullDateTime, formatRemaining, shortId} from '../format';
 import {cardStatusView, traceStatusView} from '../status';
 
 const ACTION_LABEL: Record<string, string> = {
@@ -38,8 +38,10 @@ function points(event: CardEvent): string {
   return `${event.points > 0 ? '+' : ''}${formatCredits(event.points)}`;
 }
 
-export default function CardDrawer({card, groupName, hasPrev, hasNext, onMove, onClose, onReveal, onAdjust, onStatus, onOpenTrace, revealDisabled, blocked, blockedTitle}: {
+export default function CardDrawer({card, state, groupName, hasPrev, hasNext, onMove, onClose, onReveal, onAdjust, onStatus, onOpenTrace, revealDisabled, blocked, blockedTitle}: {
   card: AdminCardItem;
+  /** Its status as it works now (a card past its date is expired). */
+  state: AdminCardItem['status'];
   groupName: (id: string) => string;
   hasPrev: boolean;
   hasNext: boolean;
@@ -54,7 +56,7 @@ export default function CardDrawer({card, groupName, hasPrev, hasNext, onMove, o
   blocked: boolean;
   blockedTitle?: string;
 }) {
-  const view = cardStatusView(card.status);
+  const view = cardStatusView(state);
   // Reloaded when the card changes (after an action from here or the list).
   const [history, retryHistory] = useLoad(async () => {
     const result = await adminApi.getCardHistory(card.id);
@@ -67,6 +69,7 @@ export default function CardDrawer({card, groupName, hasPrev, hasNext, onMove, o
     return result.traces as AdminTrace[];
   }, [card.id]);
   const remaining = card.validUntil ? formatRemaining(card.validUntil) : null;
+  const lapsed = state === 'expired' && card.validUntil != null && card.validUntil * 1000 <= Date.now();
   const body = useRef<HTMLDivElement>(null);
   useEffect(() => {body.current?.scrollTo?.({top: 0});}, [card.id]);
 
@@ -89,7 +92,10 @@ export default function CardDrawer({card, groupName, hasPrev, hasNext, onMove, o
         <dt>分组</dt><dd>{groupName(card.groupId)}</dd>
         <dt>余额</dt><dd><b>{formatCredits(card.pointsAvailable)}</b> / {formatCredits(card.pointsTotal)} 积分</dd>
         <dt>到期</dt><dd>{card.validUntil
-          ? <span title={formatFullDateTime(card.validUntil)}>{formatDateTime(card.validUntil)}{remaining && <span className={`remaining is-${remaining.tone}`}>（{remaining.text}）</span>}</span>
+          ? <span title={formatFullDateTime(card.validUntil)}>{formatDateTime(card.validUntil)}{lapsed
+            // What the date means for the customer: how long ago, and the balance they can no longer use.
+            ? <span className="remaining is-danger">（{formatExpired(card.validUntil)}{card.pointsAvailable > 0 ? ` · ${formatCredits(card.pointsAvailable)} 积分已不可用` : ''}）</span>
+            : remaining && <span className={`remaining is-${remaining.tone}`}>（{remaining.text}）</span>}</span>
           : <span className="muted">激活后起算</span>}</dd>
         <dt>激活时间</dt><dd>{card.activatedAt ? <span title={formatFullDateTime(card.activatedAt)}>{formatDateTime(card.activatedAt)}</span> : <span className="muted">未激活</span>}</dd>
         <dt>设备</dt><dd>{card.boundDevices?.length
@@ -138,11 +144,11 @@ export default function CardDrawer({card, groupName, hasPrev, hasNext, onMove, o
       </section>
     </div>
     <footer className="drawer-foot">
-      <button type="button" className="btn" disabled={revealDisabled || !card.codeRecoverable} title={card.codeRecoverable ? undefined : '此卡未保存明文'} onClick={() => onReveal(card)}>查看卡密</button>
+      <button type="button" className="btn" disabled={revealDisabled || !card.codeRecoverable} title={card.codeRecoverable ? '显示这张卡的卡密原文（会记录）' : '此卡未保存明文'} onClick={() => onReveal(card)}>显示卡密</button>
       <button type="button" className="btn" disabled={card.status === 'voided' || blocked} title={card.status === 'voided' ? '已作废，不能调账' : blockedTitle} onClick={() => onAdjust(card)}>调账</button>
-      {card.status === 'active' && <button type="button" className="btn" disabled={blocked} title={blockedTitle} onClick={() => onStatus(card, 'freeze')}>冻结</button>}
-      {card.status === 'frozen' && <button type="button" className="btn" disabled={blocked} title={blockedTitle} onClick={() => onStatus(card, 'unfreeze')}>解冻</button>}
-      {!['banned', 'voided'].includes(card.status) && <button type="button" className="btn btn-danger" disabled={blocked} title={blockedTitle} onClick={() => onStatus(card, 'ban')}>封禁</button>}
+      {state === 'active' && <button type="button" className="btn" disabled={blocked} title={blockedTitle} onClick={() => onStatus(card, 'freeze')}>冻结</button>}
+      {state === 'frozen' && <button type="button" className="btn" disabled={blocked} title={blockedTitle} onClick={() => onStatus(card, 'unfreeze')}>解冻</button>}
+      {!['banned', 'voided'].includes(state) && <button type="button" className="btn btn-danger" disabled={blocked} title={blockedTitle} onClick={() => onStatus(card, 'ban')}>封禁</button>}
       <span className="muted drawer-foot-id">{shortId(card.id, 'card')}</span>
     </footer>
   </Drawer>;

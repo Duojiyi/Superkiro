@@ -178,6 +178,8 @@ export interface AdminCardItem {
   validUntil?: number;
   groupId: string;
   note?: string;
+  /** The status as it works now (an expired card is `expired`), from servers that send it. */
+  effectiveStatus?: AdminCardItem['status'];
 }
 
 export interface GeneratedCard {

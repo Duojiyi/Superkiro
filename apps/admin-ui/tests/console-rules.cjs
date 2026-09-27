@@ -81,4 +81,20 @@ const plain = value => JSON.parse(JSON.stringify(value));
   assert.equal(status.storageLevel(null), null);
   assert.deepEqual([0, 900, 820 * 1024, 71.25 * MB, 256 * MB, undefined].map(display.formatBytes), ['0 KB', '1 KB', '820 KB', '71.3 MB', '256 MB', '—']);
   console.log('PASS ledger storage: levels at 32 MB and 64 MB of 256 MB, sizes in KB and MB');
+
+  // A card past its date is 已到期 whatever status the server keeps for it (the server checks the
+  // date only when the card is used); the server's own effectiveStatus wins when it sends one.
+  const NOW = 1_800_000_000, DAY = 86400;
+  const card = (status, validUntil, extra = {}) => ({status, validUntil, ...extra});
+  assert.deepEqual([
+    card('active', NOW - 1), card('active', NOW), card('frozen', NOW - DAY), card('active', NOW + 1), card('frozen', NOW + DAY),
+    card('unactivated', null), card('unactivated', NOW - DAY), card('banned', NOW - DAY), card('voided', NOW - DAY), card('expired', NOW + DAY), card('active', null),
+  ].map(item => status.cardState(item, NOW)),
+  ['expired', 'expired', 'expired', 'active', 'frozen', 'unactivated', 'unactivated', 'banned', 'voided', 'expired', 'active']);
+  assert.equal(status.cardState(card('active', NOW - DAY, {effectiveStatus: 'frozen'}), NOW), 'frozen', 'the server knows best when it says');
+  assert.equal(status.cardState(card('active', NOW + DAY, {effectiveStatus: 'expired'}), NOW), 'expired');
+  assert.equal(status.cardState(card('active', NOW - DAY, {effectiveStatus: 'later'}), NOW), 'expired', 'an unknown effective status is ignored');
+  assert.deepEqual([NOW - 1, NOW - DAY + 1, NOW - DAY, NOW - 12 * DAY - 5, undefined].map(secs => display.formatExpired(secs, NOW * 1000)),
+    ['已过期不到 1 天', '已过期不到 1 天', '已过期 1 天', '已过期 12 天', '—']);
+  console.log('PASS expired cards: past its date an active or frozen card is expired, the server\'s effective status first, days since in whole days');
 })().catch(error => {console.error(error); process.exitCode = 1;});

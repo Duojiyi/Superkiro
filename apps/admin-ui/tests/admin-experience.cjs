@@ -211,8 +211,8 @@ async function waitFor(ready) {
     await nav('卡密资产');
     const sensitiveSearch = page.getByLabel('搜索卡密', {exact: true});
     await sensitiveSearch.fill('fixture-card-0');
-    await button('查看卡密').first().click();
-    const sensitiveDialog = page.getByRole('dialog', {name: '查看卡密', exact: true});
+    await button('显示卡密').first().click();
+    const sensitiveDialog = page.getByRole('dialog', {name: '显示卡密', exact: true});
     await sensitiveDialog.waitFor();
     await focusRecheck();
     assert.equal(await sensitiveDialog.count(), 1, 'same CSRF must keep the sensitive dialog');
@@ -223,7 +223,7 @@ async function waitFor(ready) {
     assert.equal(await page.getByLabel('正文内容', {exact: true}).inputValue(), '同一会话校验后应保留的正文');
 
     await nav('卡密资产');
-    await button('查看卡密').first().click();
+    await button('显示卡密').first().click();
     await sensitiveDialog.waitFor();
     sessionCsrf = 'fixture-csrf-rotated';
     await focusRecheck();

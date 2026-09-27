@@ -34,7 +34,7 @@ const server=http.createServer(async(req,res)=>{
       await box.waitFor({state:'detached'});
     };
     const batchDialog=page.getByRole('dialog',{name:'批量生成卡密'}),generate=batchDialog.locator('.modal-actions .btn-primary');
-    const login=async()=>{await page.getByLabel('密码',{exact:true}).fill('fixture-password');await nav('登录');await nav('卡密资产');await page.getByRole('button',{name:'查看卡密',exact:true}).first().waitFor();};
+    const login=async()=>{await page.getByLabel('密码',{exact:true}).fill('fixture-password');await nav('登录');await nav('卡密资产');await page.getByRole('button',{name:'显示卡密',exact:true}).first().waitFor();};
     await page.goto(origin+'/admin/');await login();
     // A committed batch with a lost response must remain locked even after reload.
     let posts=0;

@@ -65,13 +65,13 @@ const server=http.createServer(async(req,res)=>{
   }
   await nav('卡密资产');
   const cardRow=id=>page.getByRole('row').filter({has:page.getByLabel(`选择卡密 ${id}`,{exact:true})});
-  assert.equal(await cardRow('fixture-card-1').getByRole('button',{name:'查看卡密',exact:true}).isDisabled(),true,'a card without kept plaintext cannot be revealed');
+  assert.equal(await cardRow('fixture-card-1').getByRole('button',{name:'显示卡密',exact:true}).isDisabled(),true,'a card without kept plaintext cannot be revealed');
   await page.getByRole('textbox',{name:'搜索卡密',exact:true}).fill('fixture-card-0');
   assert.equal(await page.locator('tbody tr').count(),1);
-  await page.getByRole('button',{name:'查看卡密',exact:true}).click();
+  await page.getByRole('button',{name:'显示卡密',exact:true}).click();
   await page.getByLabel('卡密明文',{exact:true}).waitFor();
   assert.equal(await page.getByLabel('卡密明文',{exact:true}).inputValue(),'FIXTURE-RECOVERED-CODE');
-  await page.getByRole('dialog',{name:'查看卡密'}).getByRole('button',{name:'关闭',exact:true}).click();
+  await page.getByRole('dialog',{name:'显示卡密'}).getByRole('button',{name:'关闭',exact:true}).click();
   assert.equal(await page.getByLabel('卡密明文',{exact:true}).count(),0);
   await cardRow('fixture-card-0').getByRole('button',{name:'更多操作'}).click();await page.getByRole('menuitem',{name:'冻结'}).click();await confirm();
   await cardRow('fixture-card-0').getByText('已冻结',{exact:true}).waitFor();

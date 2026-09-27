@@ -438,6 +438,7 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .confirm-consequence.is-danger {color: var(--danger); font-weight: 500;}
 .confirm-option {align-items: flex-start; font-weight: 500;}
 .confirm-option input {margin-top: 2px; flex-shrink: 0;}
+.confirm-hint {margin: 0; font-size: 13px; color: var(--text-2);}
 .secret-block {width: 100%; min-height: 64px; padding: 12px; border-radius: 6px; background: var(--bg-muted); font-family: var(--mono); font-size: 16px; line-height: 24px; letter-spacing: .3px; resize: none;}
 .batch-summary {margin: 0; padding: 10px 12px; border-radius: 6px; background: var(--bg-muted); font-size: 13px; color: var(--text-1);}
 .adjust-balance {margin: 0; color: var(--text-2);}

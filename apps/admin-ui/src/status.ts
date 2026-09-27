@@ -17,6 +17,16 @@ export function cardStatusView(status: string): StatusView {
   return CARD[status as AdminCardItem['status']] ?? {label: status || '未知', tone: 'outline'};
 }
 
+/**
+ * A card's status as it works now. The server checks a card's validity only when the card is
+ * used, so one past its date still reads active (or frozen): it is 已到期. The server's own
+ * effectiveStatus comes first when it sends one.
+ */
+export function cardState(card: {status: AdminCardItem['status']; validUntil?: number | null; effectiveStatus?: unknown}, nowSecs: number): AdminCardItem['status'] {
+  if (typeof card.effectiveStatus === 'string' && card.effectiveStatus in CARD) return card.effectiveStatus as AdminCardItem['status'];
+  return (card.status === 'active' || card.status === 'frozen') && card.validUntil != null && card.validUntil <= nowSecs ? 'expired' : card.status;
+}
+
 type Row = Record<string, unknown>;
 
 /** Seconds of cooldown left for a key, or 0. */

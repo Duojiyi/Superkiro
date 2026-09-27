@@ -7,7 +7,7 @@ import {EstimateTag, FilterTabs, StatusBadge, TableState, TopbarActions} from '.
 import {IconCheck, IconWarning} from '../components/icons';
 import {formatBytes, formatCount, formatCredits, formatCreditsMicro, formatDuration, formatFullDateTime, formatMoney, formatPercent, formatRemaining, shortId} from '../format';
 import {brokenRoutes, modelName, nameList, targetProblem} from '../routes';
-import {cooldownText, failureLabel, keyAlert, keyCooldownLeft, keyStatusView, storageLevel, TRACE_IN_PROGRESS} from '../status';
+import {cardState, cooldownText, failureLabel, keyAlert, keyCooldownLeft, keyStatusView, storageLevel, TRACE_IN_PROGRESS} from '../status';
 import type {Intent, Row, Tab} from '../types';
 import type {Failures, WorkspaceData} from '../Workspace';
 
@@ -74,10 +74,11 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
   const rate = period && period.requests ? period.succeeded / period.requests * 100 : null;
   const faceValue = data.settings?.credit_face_value_cny ?? data.financials?.settings?.credit_face_value_cny;
 
-  const currentCards = data.cards.filter(card => card.archivedAt == null && card.status !== 'voided');
-  const activeCards = currentCards.filter(card => card.status === 'active');
-  const unactivated = currentCards.filter(card => card.status === 'unactivated').length;
-  const usableBalance = currentCards.filter(card => ['active', 'unactivated', 'frozen'].includes(card.status)).reduce((sum, card) => sum + card.pointsAvailable, 0);
+  // Cards by their status as it works now: one past its date is expired, whatever the server records.
+  const currentCards = data.cards.filter(card => card.archivedAt == null && cardState(card, nowSecs) !== 'voided');
+  const activeCards = currentCards.filter(card => cardState(card, nowSecs) === 'active');
+  const unactivated = currentCards.filter(card => cardState(card, nowSecs) === 'unactivated').length;
+  const usableBalance = currentCards.filter(card => ['active', 'unactivated', 'frozen'].includes(cardState(card, nowSecs))).reduce((sum, card) => sum + card.pointsAvailable, 0);
 
   // Hour by hour over the last day; the rightmost bar is the current hour.
   const hours = activity?.hourly?.length ? activity.hourly : Array.from({length: 24}, (_, index) => {
@@ -132,9 +133,9 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
     attention.push({text: only ? `近 1 小时 ${only} 失败 ${failedLastHour.length} 次` : `近 1 小时 ${failedLastHour.length} 次失败请求（最多：${byModel[0][0]} ${byModel[0][1]} 次）`,
       tone: 'danger', go: () => onNavigate('traces', {traces: {status: 'error', window: 'hour', ...(only ? {model: only} : {})}})});
   }
-  const frozen = currentCards.filter(card => card.status === 'frozen').length;
+  const frozen = currentCards.filter(card => cardState(card, nowSecs) === 'frozen').length;
   if (frozen) attention.push({text: `${frozen} 张卡已冻结`, tone: 'warning', go: () => onNavigate('cards', {cards: {status: 'FROZEN'}})});
-  const expiring = currentCards.filter(card => ['active', 'frozen'].includes(card.status) && card.validUntil != null && card.validUntil > nowSecs && card.validUntil <= nowSecs + 7 * DAY).length;
+  const expiring = currentCards.filter(card => ['active', 'frozen'].includes(cardState(card, nowSecs)) && card.validUntil != null && card.validUntil <= nowSecs + 7 * DAY).length;
   if (expiring) attention.push({text: `${expiring} 张卡 7 天内到期`, tone: 'info', go: () => onNavigate('cards', {cards: {quick: 'expiring'}})});
   const low = activeCards.filter(card => card.pointsTotal > 0 && card.pointsAvailable / card.pointsTotal < 0.1).length;
   if (low) attention.push({text: `${low} 张卡余额低于 10%`, tone: 'info', go: () => onNavigate('cards', {cards: {quick: 'low'}})});

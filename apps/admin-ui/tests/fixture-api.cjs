@@ -10,14 +10,15 @@ module.exports = function fixtureApi() {
   const models = ['claude-sonnet', 'gpt-5', 'gemini-pro'].map((name, i) => entry({id: `fixture-model-${i}`, exposed_model_id: name, target_provider_id: 'fixture-provider', target_model: name, group_id: groups[i].id, context_window: 200000, max_output: 8192, credit_multiplier: 1, visible: true, supports_tools: true, supports_vision: true, supports_reasoning: true}));
   // An OpenAI-format provider's model, as onboarded in production: 272K context, priced in USD.
   models.push(entry({id: 'fixture-model-3', exposed_model_id: 'gpt-6-astra', target_provider_id: 'fixture-openai', target_model: 'gpt-6-astra', group_id: groups[0].id, context_window: 272000, max_output: 128000, credit_multiplier: 1, visible: true, supports_tools: true, supports_vision: true, supports_reasoning: true, sort_order: 1}));
-  const cards = ['active', 'unactivated', 'frozen', 'banned', 'expired', 'active'].map((status, i) => ({id: `fixture-card-${i}`, codeRecoverable: i !== 1, status, creditTotal: 2000000000, creditUsed: i*100000000, availableCredits: 2000000000-i*100000000, pointsTotal: 2000, pointsAvailable: 2000-i*100, boundDevices: status === 'unactivated' ? [] : [`fixture-device-${i}`], maxDevices: 1, activatedAt: now-86400, validUntil: now+2592000, groupId: groups[i%4].id, note: '本地视觉测试数据'}));
+  // Card dates follow the clock (activated a day ago, 29 days left), so no card runs out as the calendar moves on.
+  const realNow = Math.floor(Date.now() / 1000);
+  const cards = ['active', 'unactivated', 'frozen', 'banned', 'expired', 'active'].map((status, i) => ({id: `fixture-card-${i}`, codeRecoverable: i !== 1, status, creditTotal: 2000000000, creditUsed: i*100000000, availableCredits: 2000000000-i*100000000, pointsTotal: 2000, pointsAvailable: 2000-i*100, boundDevices: status === 'unactivated' ? [] : [`fixture-device-${i}`], maxDevices: 1, activatedAt: realNow-86400, validUntil: realNow+2592000-86400, groupId: groups[i%4].id, note: '本地视觉测试数据'}));
   // The saved billing state's size, as GET /stats reports it (billing's warning level and ceiling),
   // and how far back the ledger has been archived.
   const storage = {bytes: 13212876, warning: 33554432, ceiling: 268435456, archivedBefore: 0};
   const cardRevision = () => crypto.createHash('sha256').update(cards.map(card => card.id).join('\n')).digest('hex');
   // Requests relative to the real clock, so "近 24 小时" and the 24-hour content archive
   // behave as in production: one every 30 minutes, the newest a minute ago.
-  const realNow = Math.floor(Date.now() / 1000);
   const errorClasses = ['upstream_start_failed', 'stream_incomplete', 'empty_completion'];
   const traces = Array.from({length: 64}, (_, i) => {
     const status = i >= 18 && i <= 20 ? 'error' : i >= 21 && i <= 22 ? 'client_aborted' : i === 23 ? 'in_progress' : 'success';
@@ -194,7 +195,7 @@ module.exports = function fixtureApi() {
       assert.equal(body.maxDevices,1); assert.equal('creditTotal' in body,false); assert.ok(groups.some(g=>g.id===body.groupId));
       const points=Number(body.templateId.replace('tier-','')); assert.ok([1000,2000,5000,10000].includes(points));
       const generated=Array.from({length:body.count},(_,i)=>({cardId:`fixture-issued-${cards.length+i}`,rawCode:`FIXTURE-NOT-VALID-${points}-${i}`,groupId:body.groupId,creditTotal:points*1000000,status:'unactivated'}));
-      generated.forEach(c=>cards.push({id:c.cardId,status:c.status,creditTotal:c.creditTotal,creditUsed:0,availableCredits:c.creditTotal,pointsTotal:points,pointsAvailable:points,boundDevices:[],maxDevices:1,groupId:c.groupId,note:body.note}));
+      generated.forEach(c=>cards.push({id:c.cardId,codeRecoverable:true,status:c.status,creditTotal:c.creditTotal,creditUsed:0,availableCredits:c.creditTotal,pointsTotal:points,pointsAvailable:points,boundDevices:[],maxDevices:1,groupId:c.groupId,note:body.note}));
       return reply({success:true,cards:generated});
     }
     if(endpoint==='cards/status') {const card=cards.find(c=>c.id===body.cardId); assert.ok(card); card.status=body.action==='freeze'?'frozen':body.action==='unfreeze'?'active':'banned'; return reply({success:true,cardId:card.id,newStatus:card.status});}
