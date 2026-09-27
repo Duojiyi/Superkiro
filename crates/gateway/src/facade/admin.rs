@@ -751,6 +751,16 @@ impl FacadeHandler for AdminFinancialsHandler {
             snapshot
                 .ledger
                 .retain(|entry| within_period(entry.ts_secs, period));
+            // Every adjustment is kept, archived or not.
+            let adjustments = billing::observability::compute_adjustments(
+                snapshot.ledger.iter().chain(
+                    snapshot
+                        .archived_ledger_summary
+                        .adjustments
+                        .values()
+                        .filter(|entry| within_period(entry.ts_secs, period)),
+                ),
+            );
             let dashboard = billing::observability::compute_margin_dashboard(
                 &snapshot.ledger,
                 &snapshot.settings,
@@ -795,6 +805,8 @@ impl FacadeHandler for AdminFinancialsHandler {
                     // What each upstream should bill for the period.
                     "byProvider": billing::observability::compute_provider_costs(&snapshot.ledger),
                     "margin": billing::observability::compute_costed_margin(&snapshot.ledger, &snapshot.settings),
+                    // Credits given and taken by hand over the period, next to those earned.
+                    "adjustments": adjustments,
                     "sales": billing::observability::compute_sales(snapshot.cards.values(), &plans, from_secs, to_secs),
                     // Balances still owed, now, whatever the period.
                     "liability": billing::observability::compute_liability(snapshot.cards.values(), &snapshot.settings, now_secs()),

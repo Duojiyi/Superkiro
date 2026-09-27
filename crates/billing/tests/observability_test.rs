@@ -1569,7 +1569,9 @@ fn the_ledger_csv_adds_readable_columns_after_the_original_ones() {
             "cache_write_tokens",
             "credits",
             "revenue_cny",
-            "cost_cny"
+            "cost_cny",
+            "operator",
+            "reason"
         ]
     );
     let usage = &rows[1];
@@ -1590,11 +1592,56 @@ fn the_ledger_csv_adds_readable_columns_after_the_original_ones() {
         usage[17].parse::<f64>().unwrap(),
         entry.provider_cost_micro_cny as f64 / 1_000_000.0
     );
-    // An adjustment: credits as a signed decimal, no revenue or cost.
+    // Where its cost came from, and no operator.
+    assert_eq!(usage[18], "");
+    assert!(usage[19].starts_with("provider_cost:"), "{usage:?}");
+    // An adjustment: credits as a signed decimal, no revenue or cost, who and why.
     let adjustment = &rows[2];
     assert_eq!(adjustment[15], "-1.5");
     assert_eq!((adjustment[16].as_str(), adjustment[17].as_str()), ("", ""));
     assert_eq!(adjustment[12], "system");
+    assert_eq!(
+        (adjustment[18].as_str(), adjustment[19].as_str()),
+        ("admin", "correction")
+    );
+}
+
+#[test]
+fn adjustments_add_up_credits_given_and_taken_once_each() {
+    let entry = |id: &str, kind: billing::ledger::LedgerKind, credits: i64| {
+        let mut entry = usage_entry(id, "system", (0, 0, 0, 0), credits, 0, false);
+        entry.kind = kind;
+        entry
+    };
+    use billing::ledger::LedgerKind::{Adjustment, Topup, Usage};
+    let live = [
+        entry("comp", Adjustment, 2_000_000),
+        entry("promo", Adjustment, 500_000_000),
+        entry("correction", Adjustment, -1_500_000),
+        // A card event, a top-up and a request move no credits by hand.
+        entry("note", Adjustment, 0),
+        entry("topup", Topup, 1_000_000_000),
+        entry("usage", Usage, 3_000_000),
+    ];
+    // An archived adjustment also still in the live ledger counts once.
+    let archived = [
+        entry("comp", Adjustment, 2_000_000),
+        entry("old", Adjustment, 1_000_000),
+    ];
+    let totals = billing::observability::compute_adjustments(live.iter().chain(&archived));
+    assert_eq!(
+        totals,
+        billing::observability::AdjustmentTotals {
+            count: 4,
+            positive_micro_credits: 503_000_000,
+            negative_micro_credits: -1_500_000,
+            net_micro_credits: 501_500_000,
+        }
+    );
+    assert_eq!(
+        billing::observability::compute_adjustments([]),
+        Default::default()
+    );
 }
 
 #[test]

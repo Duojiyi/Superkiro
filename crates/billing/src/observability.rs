@@ -672,6 +672,50 @@ pub fn compute_costed_margin(entries: &[LedgerEntry], settings: &BillingSettings
     margin
 }
 
+/// Credits given and taken by balance adjustments over a period: compensations, promotions
+/// and corrections, which usage revenue does not show. A card event (a note, an extension)
+/// changes no balance and is not one.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdjustmentTotals {
+    pub count: u64,
+    /// Credits given.
+    pub positive_micro_credits: i64,
+    /// Credits taken, as a negative amount.
+    pub negative_micro_credits: i64,
+    pub net_micro_credits: i64,
+}
+
+/// Adds up the balance adjustments among `entries`, each entry once by its ID.
+pub fn compute_adjustments<'a>(
+    entries: impl IntoIterator<Item = &'a LedgerEntry>,
+) -> AdjustmentTotals {
+    let mut totals = AdjustmentTotals::default();
+    let mut seen = std::collections::HashSet::new();
+    for entry in entries {
+        if entry.kind != crate::ledger::LedgerKind::Adjustment
+            || entry.credits_charged == 0
+            || !seen.insert(entry.id.as_str())
+        {
+            continue;
+        }
+        totals.count += 1;
+        if entry.credits_charged > 0 {
+            totals.positive_micro_credits = totals
+                .positive_micro_credits
+                .saturating_add(entry.credits_charged);
+        } else {
+            totals.negative_micro_credits = totals
+                .negative_micro_credits
+                .saturating_add(entry.credits_charged);
+        }
+    }
+    totals.net_micro_credits = totals
+        .positive_micro_credits
+        .saturating_add(totals.negative_micro_credits);
+    totals
+}
+
 /// Cards of one plan issued and activated over a period, and what they sold for.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -902,13 +946,14 @@ pub fn export_reconciliation_csv(entries: &[LedgerEntry]) -> String {
 
 /// The ledger as CSV. The original columns come first, so tools reading them keep working;
 /// readable ones follow: the time in UTC, the provider's name, cache reads and writes,
-/// credits as a decimal, and for usage its ¥ revenue at face value and ¥ cost.
+/// credits as a decimal, and for usage its ¥ revenue at face value and ¥ cost. Then who made
+/// an adjustment or card event and why; for usage, `reason` says where its cost came from.
 pub fn export_ledger_csv(
     entries: &[LedgerEntry],
     provider_names: &std::collections::HashMap<String, String>,
     settings: &BillingSettings,
 ) -> String {
-    let mut csv = String::from("id,card_id,ts,kind,invocation_id,exposed_model,provider_id,input_tokens,output_tokens,credits_charged,provider_cost_micro_cny,time_utc,provider_name,cache_read_tokens,cache_write_tokens,credits,revenue_cny,cost_cny\n");
+    let mut csv = String::from("id,card_id,ts,kind,invocation_id,exposed_model,provider_id,input_tokens,output_tokens,credits_charged,provider_cost_micro_cny,time_utc,provider_name,cache_read_tokens,cache_write_tokens,credits,revenue_cny,cost_cny,operator,reason\n");
     for e in entries {
         let usage = e.kind == crate::ledger::LedgerKind::Usage;
         let revenue = usage.then(|| {
@@ -918,7 +963,7 @@ pub fn export_ledger_csv(
             ))
         });
         csv.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             csv_text(&e.id),
             csv_text(&e.card_id),
             e.ts_secs,
@@ -941,6 +986,8 @@ pub fn export_ledger_csv(
             } else {
                 String::new()
             },
+            csv_text(e.operator_id.as_deref().unwrap_or("")),
+            csv_text(e.reason.as_deref().unwrap_or("")),
         ));
     }
     csv

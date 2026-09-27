@@ -2143,6 +2143,19 @@ async fn financials_report_a_period_by_provider_with_sales_and_liability() {
             .settle(invocation, &tokens, "priced-model", provider, target, at)
             .unwrap();
     }
+    // Credits given and taken by hand, two of them in the period; a note moves none.
+    for (credits, reason, at) in [
+        (5_000_000, "活动赠送", start + 200),
+        (-1_000_000, "更正", start + 300),
+        (7_000_000, "补偿", end),
+    ] {
+        billing
+            .adjust_balance("card-finance", credits, "admin", reason, at)
+            .unwrap();
+    }
+    billing
+        .set_card_note("card-finance", Some("VIP"), "admin", start + 400)
+        .unwrap();
 
     let (status, body) = admin_call(
         &app,
@@ -2157,6 +2170,11 @@ async fn financials_report_a_period_by_provider_with_sales_and_liability() {
         (Some(start), Some(end))
     );
     assert_eq!(body["dashboard"]["total_requests"], 1);
+    assert_eq!(
+        body["adjustments"],
+        json!({"count": 2, "positiveMicroCredits": 5_000_000,
+            "negativeMicroCredits": -1_000_000, "netMicroCredits": 4_000_000})
+    );
     let providers = body["byProvider"].as_array().unwrap();
     assert_eq!(providers.len(), 1, "{body}");
     assert_eq!(providers[0]["providerId"], "prov-a");
@@ -2177,7 +2195,7 @@ async fn financials_report_a_period_by_provider_with_sales_and_liability() {
     assert_eq!(body["liability"]["cards"], 3);
     assert_eq!(
         body["liability"]["microCredits"],
-        10_000_000 + 5_000_000 + 1_000_000_000 - 4_000_000
+        10_000_000 + 5_000_000 + 1_000_000_000 - 4_000_000 + 11_000_000
     );
 
     let (status, body) = admin_call(&app, Method::GET, "/api/v1/admin/financials", None).await;
@@ -2185,6 +2203,8 @@ async fn financials_report_a_period_by_provider_with_sales_and_liability() {
     assert_eq!(body["dashboard"]["total_requests"], 2);
     assert_eq!(body["byProvider"].as_array().unwrap().len(), 2);
     assert_eq!(body["fromSecs"], serde_json::Value::Null);
+    assert_eq!(body["adjustments"]["count"], 3);
+    assert_eq!(body["adjustments"]["netMicroCredits"], 11_000_000);
     // An estimated cost is not a known one, wherever requests are counted as costed.
     assert_eq!(
         (
@@ -2236,7 +2256,7 @@ async fn financials_report_a_period_by_provider_with_sales_and_liability() {
     assert!(csv.starts_with(
         "id,card_id,ts,kind,invocation_id,exposed_model,provider_id,input_tokens,output_tokens,\
          credits_charged,provider_cost_micro_cny,time_utc,provider_name,cache_read_tokens,\
-         cache_write_tokens,credits,revenue_cny,cost_cny\n"
+         cache_write_tokens,credits,revenue_cny,cost_cny,operator,reason\n"
     ));
 }
 
