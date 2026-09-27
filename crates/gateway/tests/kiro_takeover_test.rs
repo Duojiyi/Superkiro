@@ -1225,9 +1225,14 @@ async fn the_context_kiro_compacts_on_is_never_below_the_gateways_estimate() {
 /// about one request in twenty with, as HTTP 200, 0.7 to 7 seconds in, before the model has
 /// started.
 fn error_frame(kind: &str) -> String {
-    let error = json!({"type": "error", "error": {"type": kind, "code": kind,
-        "message": "当前模型暂时不可用，请稍后重试或切换模型。"}});
-    format!("event: error\ndata: {error}\n\n")
+    error_event(json!({"type": kind, "code": kind,
+        "message": "当前模型暂时不可用，请稍后重试或切换模型。"}))
+}
+
+/// An Anthropic-style `error` frame carrying `error`.
+fn error_event(error: Value) -> String {
+    let event = json!({"type": "error", "error": error});
+    format!("event: error\ndata: {event}\n\n")
 }
 
 /// No key of the provider was cooled down, retired or given a failure.
@@ -1310,12 +1315,69 @@ async fn a_relays_repeated_error_moves_to_another_key_and_cools_none() {
     nothing_charged(&billing);
 }
 
-/// An error that blames the request itself is not retried: every attempt would get it.
+/// An error in the stream that blames the request itself reaches Kiro as the same refusal
+/// from an upstream's HTTP status would: a ValidationException in the gateway's words,
+/// sent once, uncharged and traced. Too large a request is the overflow Kiro compacts for.
+/// As a 502 it read "temporary error" and Kiro retried it unchanged.
 #[tokio::test]
-async fn an_error_blaming_the_request_is_not_retried() {
+async fn an_error_blaming_the_request_is_refused_as_a_validation_error() {
+    for (kind, class) in [
+        ("invalid_request_error", "upstream_refused"),
+        ("permission_error", "upstream_refused"),
+        ("not_found_error", "upstream_refused"),
+        ("request_too_large", "input_too_long"),
+    ] {
+        let server = upstream(
+            ResponseTemplate::new(200).set_body_raw(error_frame(kind), "text/event-stream"),
+        )
+        .await;
+        let billing = engine(
+            ProviderFormat::Anthropic,
+            &server.uri(),
+            vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+        );
+        let (app, runtime) = routed(&billing, &LargeBodyGate::default());
+        let reply = send(
+            &app,
+            "inv-request-fault",
+            body(json!({"content": "hello", "modelId": "model"}), vec![]),
+        )
+        .await;
+        assert_eq!(
+            reply.status,
+            StatusCode::BAD_REQUEST,
+            "{kind}: {}",
+            reply.text()
+        );
+        let refusal = reply.json();
+        assert_eq!(refusal["__type"], "ValidationException", "{kind}");
+        if kind == "request_too_large" {
+            assert_overflow(&reply);
+        } else {
+            assert!(
+                refusal["message"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("上游模型服务拒绝了本次请求"),
+                "{kind}: {refusal}"
+            );
+        }
+        // The vendor's words never reach the customer.
+        assert!(!reply.text().contains("当前模型暂时不可用"), "{kind}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1, "{kind}");
+        nothing_charged(&billing);
+        assert_eq!(trace_class(&billing, "inv-request-fault"), vec![class]);
+        keys_untouched(&runtime);
+    }
+}
+
+/// An `authentication_error` in the stream is the key's problem, as an HTTP 401 is: the key
+/// is set aside, and the customer is not told their request was at fault.
+#[tokio::test]
+async fn an_authentication_error_in_the_stream_retires_the_key_like_a_401() {
     let server = upstream(
         ResponseTemplate::new(200)
-            .set_body_raw(error_frame("invalid_request_error"), "text/event-stream"),
+            .set_body_raw(error_frame("authentication_error"), "text/event-stream"),
     )
     .await;
     let billing = engine(
@@ -1326,14 +1388,60 @@ async fn an_error_blaming_the_request_is_not_retried() {
     let (app, runtime) = routed(&billing, &LargeBodyGate::default());
     let reply = send(
         &app,
-        "inv-request-fault",
+        "inv-auth-fault",
         body(json!({"content": "hello", "modelId": "model"}), vec![]),
     )
     .await;
     assert_eq!(reply.status, StatusCode::BAD_GATEWAY, "{}", reply.text());
     assert_eq!(reply.json()["__type"], "InternalServerException");
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
-    keys_untouched(&runtime);
+    let health = runtime.key_health(gateway::now_secs());
+    assert_eq!(health["key"].health_state, "unhealthy");
+    assert_eq!(health["key"].last_error.as_deref(), Some("http_401"));
+    nothing_charged(&billing);
+}
+
+/// A relay may report a prompt over the model's context in the stream rather than as an
+/// HTTP 400: Anthropic's "prompt is too long" in an `error` frame, OpenAI's
+/// `context_length_exceeded` in an error chunk. Only that classification is kept from the
+/// vendor's words, and it is the overflow Kiro compacts for, uncharged.
+#[tokio::test]
+async fn an_overflow_reported_in_the_stream_is_the_overflow_kiro_compacts_for() {
+    let anthropic = error_event(json!({"type": "invalid_request_error",
+        "message": "prompt is too long: 250000 tokens > 200000 maximum"}));
+    let openai = format!(
+        "data: {}\n\n",
+        json!({"error": {"message": "This model's maximum context length is 128000 tokens.",
+            "type": "invalid_request_error", "param": "messages", "code": "context_length_exceeded"}})
+    );
+    for (format, events) in [
+        (ProviderFormat::Anthropic, anthropic),
+        (ProviderFormat::OpenAi, openai),
+    ] {
+        let server =
+            upstream(ResponseTemplate::new(200).set_body_raw(events, "text/event-stream")).await;
+        let billing = engine(
+            format,
+            &server.uri(),
+            vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+        );
+        let (app, runtime) = routed(&billing, &LargeBodyGate::default());
+        let reply = send(
+            &app,
+            "inv-overflow-in-stream",
+            body(json!({"content": "hello", "modelId": "model"}), vec![]),
+        )
+        .await;
+        assert_overflow(&reply);
+        assert!(!reply.text().contains("250000") && !reply.text().contains("128000"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        nothing_charged(&billing);
+        assert_eq!(
+            trace_class(&billing, "inv-overflow-in-stream"),
+            vec!["input_too_long"]
+        );
+        keys_untouched(&runtime);
+    }
 }
 
 /// Once the model has started, the request is being worked on upstream: the same error then

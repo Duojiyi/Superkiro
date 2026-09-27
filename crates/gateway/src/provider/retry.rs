@@ -74,27 +74,35 @@ pub struct EmptyAttempt {
     pub usage: TokenUsage,
 }
 
+/// An error an upstream reports in its stream, as the HTTP status that would have said the
+/// same, so it is refused, retried or cooled as that status is. Vendor messages are not
+/// retained (they can contain prompts or credentials): only whether one says the prompt is
+/// too long, which Kiro compacts the conversation for.
 pub(crate) fn stream_error(value: &serde_json::Value) -> ProviderError {
-    // Do not retain vendor messages: they can contain prompts or credentials.
-    let kind = value
-        .pointer("/error/type")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
+    use reqwest::StatusCode;
+    let field = |name: &str| {
+        value
+            .pointer(&format!("/error/{name}"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    };
+    let http = |status: StatusCode| ProviderError::Http(status, String::new());
+    let kind = field("type");
+    if kind == "request_too_large"
+        || says_input_too_long(field("code"))
+        || says_input_too_long(field("message"))
+    {
+        return http(StatusCode::PAYLOAD_TOO_LARGE);
+    }
     match kind {
-        "overloaded_error" => {
-            ProviderError::Http(reqwest::StatusCode::SERVICE_UNAVAILABLE, String::new())
-        }
-        "api_error" => {
-            ProviderError::Http(reqwest::StatusCode::INTERNAL_SERVER_ERROR, String::new())
-        }
-        "rate_limit_error" => {
-            ProviderError::Http(reqwest::StatusCode::TOO_MANY_REQUESTS, String::new())
-        }
-        "invalid_request_error"
-        | "authentication_error"
-        | "permission_error"
-        | "not_found_error"
-        | "request_too_large" => ProviderError::Service,
+        "overloaded_error" => http(StatusCode::SERVICE_UNAVAILABLE),
+        "api_error" => http(StatusCode::INTERNAL_SERVER_ERROR),
+        "rate_limit_error" => http(StatusCode::TOO_MANY_REQUESTS),
+        "invalid_request_error" => http(StatusCode::BAD_REQUEST),
+        // The key's problem, as a 401 is.
+        "authentication_error" => http(StatusCode::UNAUTHORIZED),
+        "permission_error" => http(StatusCode::FORBIDDEN),
+        "not_found_error" => http(StatusCode::NOT_FOUND),
         // A relay's own failure: kimera-primary answers about one request in twenty with
         // `upstream_error` ("当前模型暂时不可用") as its first frame, and the next succeeds.
         _ => ProviderError::Unavailable,
@@ -106,7 +114,7 @@ pub(crate) fn stream_error(value: &serde_json::Value) -> ProviderError {
 pub(crate) fn failure_class(error: &ProviderError) -> String {
     match error {
         ProviderError::Http(status, _) => format!("http_{}", status.as_u16()),
-        ProviderError::Service | ProviderError::Unavailable => "upstream_service".into(),
+        ProviderError::Unavailable => "upstream_service".into(),
         ProviderError::Parse(_) => "protocol".into(),
         ProviderError::Timeout | ProviderError::Watchdog(_) => "timeout".into(),
         ProviderError::EmptyCompletion => "empty".into(),
@@ -239,7 +247,6 @@ pub async fn start_stream(
                 let class = match &error {
                     ProviderError::Http(s, _) => format!("http_{}", s.as_u16()),
                     ProviderError::Parse(_) => "protocol".into(),
-                    ProviderError::Service => "service".into(),
                     ProviderError::Unavailable => "unavailable".into(),
                     ProviderError::Timeout | ProviderError::Watchdog(_) => "timeout".into(),
                     ProviderError::EmptyCompletion => "empty".into(),
@@ -473,7 +480,6 @@ mod tests {
             )));
         }
         assert!(!retryable(&ProviderError::Parse("bad JSON".into())));
-        assert!(!retryable(&ProviderError::Service));
         assert!(retryable(&stream_error(
             &serde_json::json!({"error":{"type":"overloaded_error"}})
         )));
@@ -490,14 +496,17 @@ mod tests {
         ));
         assert!(retryable(&event("upstream_error")));
         assert!(retryable(&event("")));
-        for fault in [
-            "invalid_request_error",
-            "authentication_error",
-            "permission_error",
-            "not_found_error",
-            "request_too_large",
+        for (fault, status) in [
+            ("invalid_request_error", 400),
+            ("authentication_error", 401),
+            ("permission_error", 403),
+            ("not_found_error", 404),
+            ("request_too_large", 413),
         ] {
-            assert!(matches!(event(fault), ProviderError::Service), "{fault}");
+            assert!(
+                matches!(event(fault), ProviderError::Http(got, _) if got.as_u16() == status),
+                "{fault}"
+            );
             assert!(!retryable(&event(fault)), "{fault}");
         }
         assert!(matches!(

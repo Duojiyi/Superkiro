@@ -341,9 +341,9 @@ pub fn is_cooldown_error(err: &ProviderError) -> bool {
         }
         ProviderError::Network(_) | ProviderError::StreamDisconnected => true,
         ProviderError::Parse(_) | ProviderError::Serialization(_) => false,
-        // Neither the request's own fault nor a relay's passing failure (kimera-primary
-        // sends one for about one request in twenty) says anything about the key.
-        ProviderError::Service | ProviderError::Unavailable => false,
+        // A relay's passing failure (kimera-primary sends one for about one request in
+        // twenty) says nothing about the key.
+        ProviderError::Unavailable => false,
         // A request that took too long says more about the request (a long prompt, a model
         // thinking before it answers) than about the key; cooling a lone key for it refused
         // every other customer of its route for a minute.

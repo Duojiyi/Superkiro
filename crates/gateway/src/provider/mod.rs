@@ -60,11 +60,6 @@ pub enum ProviderError {
     #[error("Failed to parse provider response or stream chunk: {0}")]
     Parse(String),
 
-    /// The upstream's stream reported an error that blames the request itself (invalid,
-    /// unauthorized, forbidden, not found, too large): every key would get the same.
-    #[error("Upstream reported a service error")]
-    Service,
-
     /// The upstream's stream reported a failure of its own, such as a relay's
     /// `upstream_error` ("当前模型暂时不可用"), or a type the gateway does not know. Before
     /// the model has started it is retried, on the same key and then another, and the key
@@ -83,6 +78,23 @@ pub enum ProviderError {
     /// same thing. The key did answer, so this is retried without cooling the key down.
     #[error("Upstream completed without producing any output")]
     EmptyCompletion,
+}
+
+/// Whether an upstream's words say the prompt is longer than the model takes: Anthropic's
+/// "prompt is too long", OpenAI's `context_length_exceeded` and "maximum context length",
+/// and the phrasing of Kiro's own service. Only this is read from them; they never reach a
+/// client.
+pub(crate) fn says_input_too_long(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    [
+        "prompt is too long",
+        "input is too long",
+        "context_length_exceeded",
+        "maximum context length",
+        "input content length exceeds threshold",
+    ]
+    .iter()
+    .any(|phrase| text.contains(phrase))
 }
 
 /// Bound and normalize vendor error bodies before they enter logs or error

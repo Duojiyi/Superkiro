@@ -982,7 +982,6 @@ pub(crate) fn safe_provider_error(error: &ProviderError) -> String {
         ProviderError::Timeout => "upstream request timed out".to_string(),
         ProviderError::StreamDisconnected => "upstream stream disconnected".to_string(),
         ProviderError::Parse(_) => "upstream response parse error".to_string(),
-        ProviderError::Service => "upstream reported a service error".to_string(),
         ProviderError::Unavailable => "upstream reported a temporary failure".to_string(),
         ProviderError::Serialization(_) => "upstream request serialization error".to_string(),
         ProviderError::Watchdog(_) => "upstream watchdog timeout".to_string(),

@@ -1504,18 +1504,7 @@ fn provider_input_too_long(error: &ProviderError) -> bool {
     let ProviderError::Http(status, body) = error else {
         return false;
     };
-    let body = body.to_ascii_lowercase();
-    status.as_u16() == 413
-        || status.as_u16() == 400
-            && [
-                "prompt is too long",
-                "input is too long",
-                "context_length_exceeded",
-                "maximum context length",
-                "input content length exceeds threshold",
-            ]
-            .iter()
-            .any(|phrase| body.contains(phrase))
+    status.as_u16() == 413 || status.as_u16() == 400 && crate::provider::says_input_too_long(body)
 }
 
 /// A conversation larger than the gateway reads. Kiro sends every image in a conversation
