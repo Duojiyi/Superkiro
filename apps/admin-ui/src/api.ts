@@ -1,6 +1,7 @@
 import type {KeyAttempts, ModelHealth, ProviderAttempts} from './health';
+/** A refused request: the server's words, its status, and the rest of its answer (a refusal's `refusal` object, say). */
 export class AdminApiError extends Error {
-  constructor(message:string, public readonly status:number){super(message);this.name='AdminApiError';}
+  constructor(message:string, public readonly status:number, public readonly body:Record<string, unknown> = {}){super(message);this.name='AdminApiError';}
 }
 /**
  * Kiro BYOK Admin Console Frontend API Contract & Client.
@@ -477,7 +478,7 @@ export class AdminApiClient {
         if (errorVersion !== this.sessionVersion) throw new Error('管理会话已改变，请重新加载');
         if(path==='/api/v1/admin/session' && errorVersion===this.sessionVersion){this.twoFactorEnabled=typeof error.twoFactorEnabled==='boolean'?error.twoFactorEnabled:undefined;this.totpRequired=error.totpRequired===true;}
         // Admin errors come as {error} or, from the shared handler, {__type, message}.
-        throw new AdminApiError(error.error || error.message || (res.status === 401 ? '用户名或密码错误' : `请求失败 (${res.status})`),res.status);
+        throw new AdminApiError(error.error || error.message || (res.status === 401 ? '用户名或密码错误' : `请求失败 (${res.status})`),res.status,error && typeof error === 'object' ? error : {});
       }
       const result = await (blob ? res.blob() : res.json());
       if (version !== this.sessionVersion) throw new Error('管理会话已改变，请重新加载');

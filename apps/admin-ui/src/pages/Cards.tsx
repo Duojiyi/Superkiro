@@ -593,7 +593,7 @@ export default function CardsPage({cards, groups, plans, configFailed, loading, 
         try {
           clearAdjustment(sessionStorage, adjustment.current); setIntent(null);
           // A compensation refused stays on its review, with what the server found and, where it can be, 仍要补偿.
-          const refusal = compensationRefusal(error.message);
+          const refusal = compensationRefusal(error.message, error.body.refusal);
           if (refusal) {setAdjustRefusal(refusal); reportError(''); return;}
           setAdjustStep('form');
           reportError(error.message === 'allowRepeat needs a reason' ? '仍要补偿需要写明理由，未入账。'

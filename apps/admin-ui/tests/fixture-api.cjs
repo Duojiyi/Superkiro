@@ -613,13 +613,16 @@ module.exports = function fixtureApi() {
       const card=cards.find(c=>c.id===body.cardId);if(!card)return reply({success:false,error:`Card ${body.cardId} not found`},404);
       if(invocationId){
         const charged=chargedRequest(invocationId);
-        if(!charged)return reply({success:false,error:`Request ${invocationId} was not found`},404);
-        if(charged.cardId!==card.id)return reply({success:false,error:`Request ${invocationId} was made by card ${charged.cardId}, not ${card.id}`},409);
+        // Each refusal carries, beside its words, a `refusal` object naming what was found (S1).
+        if(!charged)return reply({success:false,error:`Request ${invocationId} was not found`,refusal:{kind:'unknown',requests:[{invocationId}]}},404);
+        if(charged.cardId!==card.id)return reply({success:false,error:`Request ${invocationId} was made by card ${charged.cardId}, not ${card.id}`,refusal:{kind:'otherCard',requests:[{invocationId,cardId:charged.cardId}]}},409);
         if(micro>0&&body.allowRepeat!==true){
-          const found=`Request ${invocationId} was charged ${microDecimal(charged.credits)} credits at ${isoUtc(charged.ts)}`;
+          const found=`Request ${invocationId} was charged ${microDecimal(charged.credits)} credits at ${isoUtc(charged.ts)}`,request={invocationId,chargedMicroCredits:charged.credits,chargedAtSecs:charged.ts};
           const earlier=log.filter(event=>event.action==='adjust'&&event.cardId===card.id&&event.credits>0&&event.invocationId===invocationId).sort((a,b)=>b.ts-a.ts)[0];
-          if(earlier)return reply({success:false,error:`${found}, and was already compensated ${microDecimal(earlier.credits)} credits at ${isoUtc(earlier.ts)} by ${earlier.operator??'unknown'} (${earlier.reason??'no reason'}); send allowRepeat with a reason to compensate it again`},409);
-          if(micro>charged.credits)return reply({success:false,error:`${found}; a compensation of ${microDecimal(micro)} credits is more than that; send allowRepeat with a reason to compensate more`},409);
+          if(earlier)return reply({success:false,error:`${found}, and was already compensated ${microDecimal(earlier.credits)} credits at ${isoUtc(earlier.ts)} by ${earlier.operator??'unknown'} (${earlier.reason??'no reason'}); send allowRepeat with a reason to compensate it again`,
+            refusal:{kind:'repeat',requests:[{...request,compensatedMicroCredits:earlier.credits,compensatedAtSecs:earlier.ts,operator:earlier.operator??'unknown',reason:earlier.reason??'no reason'}]}},409);
+          if(micro>charged.credits)return reply({success:false,error:`${found}; a compensation of ${microDecimal(micro)} credits is more than that; send allowRepeat with a reason to compensate more`,
+            refusal:{kind:'over',requests:[request],askedMicroCredits:micro,chargedTotalMicroCredits:charged.credits}},409);
         }
       }
       if(card.status==='voided')return reply({success:false,error:'Invalid billing state: cannot adjust a voided card'},400);

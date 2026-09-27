@@ -80,15 +80,18 @@ const listTime=secs=>{const d=new Date(secs*1000),p=n=>String(n).padStart(2,'0')
 
     // Compensated already: the server says when, by whom and why, and nothing is given; 仍要补偿 asks why
     // and sends it with allowRepeat, the reason kept with why.
+    // The server's refusal object is read before its words: here the object names another operator.
+    await page.route('**/api/v1/admin/cards/adjust',async route=>{const response=await route.fetch(),json=await response.json();
+      if(json.refusal)json.refusal.requests[0].operator='值班员';await route.fulfill({response,json});},{times:1});
     await compensate(19);await button('下一步').click();await button('确认入账').click();
     await refusal.getByText('这次请求已经补偿过，没有入账',{exact:true}).waitFor();
     const found=await refusal.innerText();
-    assert(found.includes(`这次请求 ${listTime(broken.ts)} 扣了 3.2 积分`)&&found.includes(`由 admin 补偿过 3.2 积分（原因：${expected}）`),found);
+    assert(found.includes(`这次请求 ${listTime(broken.ts)} 扣了 3.2 积分`)&&found.includes(`由 值班员 补偿过 3.2 积分（原因：${expected}）`),found);
     assert.equal(await button('确认入账').count(),0,'the same adjustment would be refused again');
     const facts=await (async()=>{await button('仍要补偿…').click();const box=page.getByRole('alertdialog');await box.waitFor();const text=await box.innerText();
       assert(await box.locator('[data-confirm="accept"]').isDisabled(),'why is required first');await box.locator('#confirm-reason').fill('上次补偿后又失败了');
       await box.locator('[data-confirm="accept"]').click();await box.waitFor({state:'detached'});return text;})();
-    assert(facts.includes('仍要补偿这次请求？')&&facts.includes(`由 admin 补偿过 3.2 积分`),facts);
+    assert(facts.includes('仍要补偿这次请求？')&&facts.includes(`由 值班员 补偿过 3.2 积分`),facts);
     await adjust.waitFor({state:'detached'});await toasts.shown('已调整 fixture-card-0：+3.2 积分');
     const again=adjusts().at(-1);
     assert.deepEqual([again.allowRepeat,again.invocationId,again.reason],[true,'fixture-card-0:fixture-inv-19',`${expected}；仍要补偿：上次补偿后又失败了`]);
@@ -107,7 +110,7 @@ const listTime=secs=>{const d=new Date(secs*1000),p=n=>String(n).padStart(2,'0')
     assert.equal(await button('仍要补偿…').count(),0);assert.equal(await button('确认入账').count(),0);
     await adjust.getByRole('button',{name:'返回修改',exact:true}).click();await adjust.getByRole('button',{name:'取消',exact:true}).click();await adjust.waitFor({state:'detached'});
     fixture.traces.splice(21,0,pruned);
-    console.log('PASS: a request compensated already or by more than it charged is refused with what the server found, and 仍要补偿 sends it with why; an unknown one cannot be repeated');
+    console.log('PASS: a request compensated already or by more than it charged is refused with what the server found (its refusal object first), and 仍要补偿 sends it with why; an unknown one cannot be repeated');
 
     // Several requests ticked in 最近调用: their charges added up, named in the reason, linked to none.
     await nav('卡密资产');await page.getByRole('row').filter({has:page.getByLabel('选择卡密 fixture-card-0',{exact:true})}).locator('.col-group').click();
