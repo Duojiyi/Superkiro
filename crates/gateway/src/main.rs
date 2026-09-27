@@ -326,8 +326,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     registry.register(McpHandler::new(search));
 
-    // Per-provider request options: PROVIDER_THINKING_REPLAY, PROVIDER_EAGER_TOOL_INPUT and
-    // PROVIDER_PROMPT_CACHE_OFF, each a list of provider IDs or *.
+    // Per-provider request options: PROVIDER_THINKING_REPLAY, PROVIDER_EAGER_TOOL_INPUT,
+    // PROVIDER_PROMPT_CACHE_OFF and PROVIDER_NO_DOCUMENTS, each a list of provider IDs or *.
     let provider_options = gateway::provider::ProviderOptionsTable::from_env();
     println!("[*] Provider options: {}", provider_options.describe());
     gateway::provider::install_provider_options(provider_options);

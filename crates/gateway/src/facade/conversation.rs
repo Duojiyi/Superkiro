@@ -505,6 +505,27 @@ impl GenerateAssistantResponseHandler {
                     .map(|request| estimate_input_tokens(request).saturating_add(prefix_tokens))
                     .unwrap_or(2_000)
                     .max(1);
+                // An attachment the model cannot take on its own is refused as the
+                // attachment it is: refused as an overflow, Kiro compacted the conversation,
+                // which left the attachment in place, and it failed again.
+                if let Some((reason, message)) = request_for_reservation.and_then(|request| {
+                    crate::translate::documents::too_large_for_model(
+                        &request
+                            .conversation_state
+                            .current_message
+                            .user_input_message
+                            .documents,
+                        input_limit,
+                    )
+                }) {
+                    self.record_refusal(
+                        claims.as_ref(),
+                        &invocation_key,
+                        requested_model_for_reservation,
+                        "unsupported_capability",
+                    );
+                    return validation_error(reason, &message);
+                }
                 // Sent anyway, a prompt over the model's limit is refused upstream, and Kiro
                 // could not tell that refusal from an outage. Refused here, it compacts the
                 // conversation and tries again.
@@ -955,6 +976,9 @@ impl GenerateAssistantResponseHandler {
                 ctx = ctx.with_prepared_images(prepared);
             }
             let mut chat_req = translate_kiro_to_chat_request(&kiro_req, &mut ctx);
+            // Which upstreams may take this request, and what an upstream's refusal of it
+            // is about, depend on the PDFs it sends.
+            let pdfs = crate::translate::documents::RequestPdfs::of(&kiro_req);
             // Only the translation is used from here on. A large request gives its place in
             // the gate back now (or once the archive is done with its copy), not when the
             // answer ends.
@@ -1087,6 +1111,51 @@ impl GenerateAssistantResponseHandler {
                 }
             }
 
+            // PDFs go only to upstreams that read them (PROVIDER_NO_DOCUMENTS). With none
+            // to take them, one in this message is refused, and an earlier message's is a
+            // note so that the conversation goes on.
+            if !pdfs.is_empty() {
+                let reads =
+                    |provider_id: &str| crate::provider::provider_options(provider_id).documents;
+                let readable = if candidates.is_empty() {
+                    reads("")
+                } else {
+                    candidates
+                        .iter()
+                        .any(|(pool, _)| reads(&pool.provider().id))
+                };
+                if readable {
+                    candidates.retain(|(pool, _)| reads(&pool.provider().id));
+                } else if let Some(name) = pdfs.current() {
+                    let _ = self.billing.release(&invocation_key);
+                    self.record_refusal(
+                        claims.as_ref(),
+                        &invocation_key,
+                        requested_model,
+                        "unsupported_capability",
+                    );
+                    return validation_error(
+                        PDF_NOT_READ,
+                        &format!(
+                            "该模型的上游服务不能读取 PDF 附件（{name}）：请换一个模型，或把内容以文本发送。"
+                        ),
+                    );
+                } else {
+                    crate::translate::documents::pdfs_as_notes(
+                        &mut chat_req.messages,
+                        crate::translate::documents::NO_PDF_NOTE,
+                    );
+                }
+            }
+            // Whether an upstream's refusal is about the request's PDFs, as the document
+            // reason Kiro shows.
+            let document_refusal = |error: &ProviderError| match error {
+                ProviderError::Http(status, body) if !pdfs.is_empty() => {
+                    crate::translate::documents::upstream_refusal_reason(status.as_u16(), body)
+                }
+                _ => None,
+            };
+
             let remaining_attempts =
                 3usize.saturating_sub(self.billing.invocation_attempts(&invocation_key));
             if remaining_attempts == 0 {
@@ -1173,6 +1242,23 @@ impl GenerateAssistantResponseHandler {
                             let _ = self.billing.release(&invocation_key);
                             return input_too_long(UPSTREAM_OVERFLOW);
                         }
+                        Err(e)
+                            if governance_provider_error(&e)
+                                .and_then(document_refusal)
+                                .is_some() =>
+                        {
+                            let _ = self.billing.release(&invocation_key);
+                            let reason = governance_provider_error(&e)
+                                .and_then(document_refusal)
+                                .unwrap_or(PDF_NOT_READ);
+                            self.record_refusal(
+                                claims.as_ref(),
+                                &invocation_key,
+                                requested_model,
+                                "upstream_document_refusal",
+                            );
+                            return validation_error(reason, &pdfs.refused(reason));
+                        }
                         Err(GovernanceError::AllKeysInCooldown {
                             next_recovery_secs, ..
                         }) => {
@@ -1244,6 +1330,17 @@ impl GenerateAssistantResponseHandler {
                                 "input_too_long",
                             );
                             return input_too_long(UPSTREAM_OVERFLOW);
+                        }
+                        Err(e) if document_refusal(&e).is_some() => {
+                            let _ = self.billing.release(&invocation_key);
+                            let reason = document_refusal(&e).unwrap_or(PDF_NOT_READ);
+                            self.record_refusal(
+                                claims.as_ref(),
+                                &invocation_key,
+                                requested_model,
+                                "upstream_document_refusal",
+                            );
+                            return validation_error(reason, &pdfs.refused(reason));
                         }
                         Err(e) => {
                             // Upstream initiation failed; release reservation in full
@@ -1596,6 +1693,17 @@ fn upstream_refusal(error: &ProviderError) -> Option<Response> {
             "上游模型服务拒绝了本次请求（HTTP {status}：{why}），重试不会改变结果。可以调整请求、换一个模型，或联系管理员。"
         ),
     ))
+}
+
+/// The reason Kiro shows for a PDF no upstream reads.
+const PDF_NOT_READ: &str = "DOCUMENT_MODEL_NOT_SUPPORTED";
+
+/// The upstream's own error behind a routing failure, when there is one.
+fn governance_provider_error(error: &GovernanceError) -> Option<&ProviderError> {
+    match error {
+        GovernanceError::NonRetryable(error) | GovernanceError::Provider(error) => Some(error),
+        _ => None,
+    }
 }
 
 fn governance_upstream_refusal(error: &GovernanceError) -> Option<Response> {

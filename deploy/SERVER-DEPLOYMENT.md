@@ -50,6 +50,19 @@ Kiro 的联网搜索经网关 /mcp 转到下列后端之一，配置写在 /etc/
 - 未配置后端、后端超时或返回错误时，搜索以工具失败返回（Kiro 显示 Tool call failed，模型能区分“搜索失败”和“没有结果”），不再伪装成 0 条结果；错误信息只说明失败类型，不含密钥或地址。
 - 启动日志会打印 [√] Web search backend: … 或未配置的提示。配置错误（例如 brave 未给 key、searxng 未给地址）时网关拒绝启动。
 
+## 上游开关（PROVIDER_*）
+
+按上游逐个打开的请求选项，写在 /etc/kiro-byok/gateway.env，值为逗号分隔的上游 ID（后台“上游”列表中的 ID），`*` 表示全部；改后重启网关。启动日志打印 `[*] Provider options: …`，可核对生效的名单。
+
+| 变量 | 含义 |
+| --- | --- |
+| PROVIDER_THINKING_REPLAY | 把此前回合的签名思考内容发回写出它的模型；默认关闭，逐个上游验证可接受后再打开 |
+| PROVIDER_EAGER_TOOL_INPUT | Anthropic 工具参数边写边流式返回（eager_input_streaming）；默认关闭，部分中转会拒绝该字段 |
+| PROVIDER_PROMPT_CACHE_OFF | 关闭 Anthropic 提示缓存断点；默认开启，只对拒绝缓存字段的上游关闭 |
+| PROVIDER_NO_DOCUMENTS | 该上游不读取 PDF 附件：当前消息带 PDF 时直接拒绝，Kiro 显示网关的说明（换模型或改发文本），不重试；此前消息中的 PDF 改为一条说明，不再发送 |
+
+本服务必须设置 `PROVIDER_NO_DOCUMENTS=kimera-primary`：该上游收到 PDF 时只回答“无法读取 PDF”，并照常计费。若同一模型还有能读 PDF 的后备上游，带 PDF 的请求只发往后者。
+
 ## 备份与恢复
 
 - 每日 UTC 03:30（北京时间 11:30）执行加密账本备份，保留 7 天，由 systemd timer 管理。
