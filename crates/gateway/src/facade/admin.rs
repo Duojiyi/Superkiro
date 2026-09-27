@@ -574,6 +574,21 @@ pub struct AdminStatsHandler {
 
 /// Why the saved state cannot be written, in words the operator can act on. The error
 /// itself names server paths and sizes, which are not shown.
+/// What the console is told when a change could not be saved. The storage error itself names
+/// server paths, so it is never sent.
+pub(crate) const NOT_SAVED: &str =
+    "The change could not be saved, so nothing was changed; retry shortly";
+
+/// A billing error as the console reads it: one that could not be saved says so, without
+/// the storage error.
+fn billing_error_text(error: &billing::BillingError) -> String {
+    match error {
+        billing::BillingError::Persistence(_) => NOT_SAVED.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// What stopped the state from being written, in words that name no server path.
 fn persistence_problem(error: Option<&str>) -> &'static str {
     let error = error.unwrap_or_default().to_ascii_lowercase();
     let names = |needles: &[&str]| needles.iter().any(|needle| error.contains(needle));
@@ -1172,6 +1187,11 @@ impl FacadeHandler for AdminArchiveLedgerHandler {
                 Err(billing::BillingError::InvalidAdjustment(message)) => {
                     error_response(StatusCode::BAD_REQUEST, "ValidationException", &message)
                 }
+                Err(billing::BillingError::Persistence(message)) => error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "PersistenceException",
+                    persistence_problem(Some(&message)),
+                ),
                 Err(error) => error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "PersistenceException",
@@ -1324,6 +1344,13 @@ impl FacadeHandler for AdminBatchCardsHandler {
                             StatusCode::CONFLICT,
                             "IssuanceDisabledException",
                             "Group no longer allows new card issuance; refresh the configuration",
+                        )
+                    }
+                    Err(error @ billing::BillingError::Persistence(_)) => {
+                        return error_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "PersistenceException",
+                            &billing_error_text(&error),
                         )
                     }
                     Err(error) => {
@@ -1813,6 +1840,9 @@ impl FacadeHandler for AdminCardStatusHandler {
                         "card": card_view(card, now_secs()),
                     }),
                 ),
+                Err(billing::BillingError::Persistence(_)) => {
+                    failure(StatusCode::SERVICE_UNAVAILABLE, NOT_SAVED)
+                }
                 Err(e) => (
                     StatusCode::BAD_REQUEST,
                     [(header::CONTENT_TYPE, "application/json")],
@@ -2108,7 +2138,9 @@ impl FacadeHandler for AdminCardAdjustHandler {
                     (
                         status,
                         [(header::CONTENT_TYPE, "application/json")],
-                        axum::Json(serde_json::json!({ "success": false, "error": e.to_string() })),
+                        axum::Json(
+                            serde_json::json!({ "success": false, "error": billing_error_text(&e) }),
+                        ),
                     )
                         .into_response()
                 }
@@ -2196,10 +2228,9 @@ fn card_action_refused(error: billing::BillingError) -> Response {
             failure(StatusCode::BAD_REQUEST, &message)
         }
         billing::BillingError::InvalidState(message) => failure(StatusCode::CONFLICT, &message),
-        billing::BillingError::Persistence(_) => failure(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "The change could not be saved, so nothing was changed; retry shortly",
-        ),
+        billing::BillingError::Persistence(_) => {
+            failure(StatusCode::SERVICE_UNAVAILABLE, NOT_SAVED)
+        }
         other => failure(StatusCode::CONFLICT, &other.to_string()),
     }
 }
@@ -2924,7 +2955,7 @@ impl FacadeHandler for AdminSnapshotSyncHandler {
                 Err(error) => error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "PersistenceException",
-                    &error.to_string(),
+                    persistence_problem(Some(&error.to_string())),
                 ),
             }
         })

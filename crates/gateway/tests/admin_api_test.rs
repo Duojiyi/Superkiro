@@ -2482,6 +2482,105 @@ async fn traces_are_filtered_on_the_server_with_totals_for_the_whole_match() {
     }
 }
 
+/// A change that could not be saved says so, without the storage error, which names the
+/// server's paths: a status change, an adjustment, a publication, an issuance, and a sync.
+#[tokio::test]
+async fn a_change_that_could_not_be_saved_names_no_storage_error() {
+    let dir = std::env::temp_dir().join(format!(
+        "kiro-admin-unsaved-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let path = dir.join("billing_state.json");
+    let (billing, app) = setup_admin_app();
+    billing.set_master_kek(billing::MasterKek::from_bytes([6; 32]));
+    billing.save_to_file(&path).unwrap();
+    let not_saved = "The change could not be saved, so nothing was changed; retry shortly";
+    // Each fails with saving working until then, so none is refused for an earlier failure.
+    let unsaved = |status: StatusCode, body: serde_json::Value| {
+        billing.inject_persistence_fault(false);
+        billing.save_to_file(&path).unwrap();
+        (status, body)
+    };
+
+    billing.inject_persistence_fault(true);
+    let (status, body) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/cards/status",
+        Some(json!({"cardId": "card-admin-02", "action": "freeze", "reason": "调查"})),
+    )
+    .await;
+    let (status, body) = unsaved(status, body);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body, json!({"success": false, "error": not_saved}));
+
+    billing.inject_persistence_fault(true);
+    let (status, body) = adjust(
+        &app,
+        "adjust-unsaved",
+        json!({"cardId": "card-admin-02", "deltaPoints": 1.0, "reason": "补偿"}),
+    )
+    .await;
+    let (status, body) = unsaved(status, body);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body, json!({"success": false, "error": not_saved}));
+
+    billing.inject_persistence_fault(true);
+    let (status, body) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/commercial-config",
+        Some(json!({
+            "expected_revision": billing.commercial_config().revision,
+            "reason": "unsaved publication",
+            "groups": [billing::Group::pro_plus("new-tier", "New tier")],
+            "rate_cards": [billing::RateCard::new("default", "Default", 100)],
+        })),
+    )
+    .await;
+    let (status, body) = unsaved(status, body);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body, json!({"success": false, "error": not_saved}));
+    assert!(billing.get_group("new-tier").is_none());
+
+    billing.inject_persistence_fault(true);
+    let (status, body) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/cards/batch",
+        Some(json!({"count": 1, "groupId": "group-pro-plus"})),
+    )
+    .await;
+    let (status, body) = unsaved(status, body);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["message"], not_saved);
+
+    billing.inject_persistence_fault(true);
+    let (status, body) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/snapshot/sync",
+        Some(json!({})),
+    )
+    .await;
+    let (status, body) = unsaved(status, body);
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["message"], "The saved state could not be written");
+
+    // Nothing was changed.
+    let card = billing.get_card("card-admin-02").unwrap();
+    assert_eq!(
+        (card.status, card.credit_total),
+        (CardStatus::Active, 5_000_000)
+    );
+    assert_eq!(billing.list_all_cards().len(), 2);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[tokio::test]
 async fn stats_say_when_the_state_was_last_saved_and_whether_saving_works() {
     let dir = std::env::temp_dir().join(format!(
