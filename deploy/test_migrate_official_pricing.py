@@ -1,5 +1,6 @@
 """Offline tests only: no SSH connections or HTTP requests are made."""
 import copy
+import math
 import unittest
 from decimal import Decimal
 from unittest.mock import MagicMock
@@ -37,11 +38,26 @@ def live_version(model, provider='kimera-primary', **overrides):
 
 
 def config(models, versions, settings=None, revision='old'):
+    """A configuration as the release that knows official prices sends it."""
     return {'revision': revision, 'models': models, 'versions': versions,
-            'groups': [{'id': 'group-pro-plus', 'rate_card_id': 'default'},
-                       {'id': 'group-other', 'rate_card_id': 'default'}],
+            'groups': [{'id': 'group-pro-plus', 'rate_card_id': 'default', 'margin_multiplier': 1.0},
+                       {'id': 'group-other', 'rate_card_id': 'default', 'margin_multiplier': 1.0}],
             'settings': settings or {'credit_face_value_cny': FACE, 'usd_cny_rate': 7.25,
-                                     'rate_updated_at_secs': 1}}
+                                     'rate_updated_at_secs': 1},
+            'plans': [], 'cards_by_plan': {}}
+
+
+# hanyue's measured route, as the settings cost it after the migration.
+HANYUE_ROUTE = {'hanyue-max/claude-opus-5-5': {'basis_usd_per_m': [2.0, 25.0, 6.25, 0.5],
+                                               'cost_multiplier': 0.22}}
+
+
+def micro_cny(prices_per_m, tokens):
+    """What the server records a request as costing, from CNY per million tokens by class, in its
+    order: the tokens of each class times its price over a million, added up, then rounded to
+    micro-CNY, halves away from zero, and never below zero."""
+    cny = sum(count * price / 1_000_000 for count, price in zip(tokens, prices_per_m))
+    return max(0, math.floor(cny * 1_000_000 + 0.5))
 
 
 class VersionBuilderTests(unittest.TestCase):
@@ -91,7 +107,9 @@ class VersionBuilderTests(unittest.TestCase):
 
 
 class PublicationTests(unittest.TestCase):
-    def test_each_listed_price_is_republished_once_with_the_settings_defaults(self):
+    def test_each_callable_price_is_republished_once_with_the_settings_defaults(self):
+        # A hidden model can still be called by name: it is republished with the listed ones. A
+        # retired one cannot, and is left alone.
         models = [mapping('claude-opus-5'), mapping('claude-sonnet-5'),
                   mapping('claude-opus-5-5', 'hanyue-max'),
                   mapping('claude-opus-4-6', visible=False), mapping('claude-opus-4-7', retired=True),
@@ -100,20 +118,21 @@ class PublicationTests(unittest.TestCase):
                                  fixed_input_credit_per_m=1),
                     live_version('claude-opus-5'), live_version('claude-sonnet-5'),
                     live_version('claude-opus-5-5', 'hanyue-max'),
-                    live_version('claude-opus-4-6', fixed_input_credit_per_m=1),
+                    live_version('claude-opus-4-6'),
                     live_version('claude-opus-4-7', fixed_input_credit_per_m=1)]
         update, problems = script.publication(config(models, versions), script.POLICY, 200, 230)
         self.assertEqual(problems, [])
         self.assertEqual((update['expected_revision'], update['reason']), ('old', script.REASON))
         self.assertEqual([v['model'] for v in update['versions']],
-                         ['claude-opus-5', 'claude-sonnet-5', 'claude-opus-5-5'])
+                         ['claude-opus-5', 'claude-sonnet-5', 'claude-opus-5-5', 'claude-opus-4-6'])
         self.assertEqual({v['effective_from_secs'] for v in update['versions']}, {230})
         self.assertEqual(update['settings'], {
             'credit_face_value_cny': FACE, 'usd_cny_rate': 7.25, 'rate_updated_at_secs': 1,
             'official_usd_cny': 1.0, 'default_price_multiplier': 0.24,
             'default_cost_multiplier': 0.08,
             'provider_cost_multipliers': {'kimera-primary': 0.08, 'kimera-direct': 0.06,
-                                          'hanyue-max': 0.22}})
+                                          'hanyue-max': 0.22},
+            'route_costs': HANYUE_ROUTE})
         # Once every price in force is official and the defaults are set, nothing is left.
         done = config(models, versions + update['versions'], update['settings'])
         self.assertEqual(script.publication(done, script.POLICY, 300, 330), (None, []))
@@ -146,6 +165,61 @@ class PublicationTests(unittest.TestCase):
         # And one with no price in force at all.
         _, problems = script.publication(config([mapping('claude-opus-5')], []), script.POLICY, 200, 230)
         self.assertEqual(problems, ['claude-opus-5: no price in force'])
+
+    def test_a_hidden_price_it_would_change_or_a_multiplier_not_1_is_named(self):
+        models = [mapping('claude-opus-4-6', visible=False), mapping('claude-opus-5'),
+                  mapping('claude-sonnet-5', group_id='group-other'),
+                  mapping('claude-opus-4-8', credit_multiplier=2.0)]
+        versions = [live_version('claude-opus-4-6', fixed_input_credit_per_m=1),
+                    live_version('claude-opus-5'), live_version('claude-sonnet-5'),
+                    live_version('claude-opus-4-8')]
+        before = config(models, versions)
+        before['groups'][1]['margin_multiplier'] = 1.5
+        update, problems = script.publication(before, script.POLICY, 200, 230)
+        self.assertEqual([problem.split(':')[0] for problem in problems],
+                         ['claude-opus-4-6', 'claude-sonnet-5', 'claude-opus-4-8'])
+        self.assertIn('credits [1, 200000000', problems[0])
+        self.assertIn('分组倍率 1.5 and 模型倍率 1.0 must both be 1', problems[1])
+        self.assertIn('分组倍率 1.0 and 模型倍率 2.0 must both be 1', problems[2])
+        self.assertEqual([v['model'] for v in update['versions']], ['claude-opus-5'])
+        call = MagicMock(return_value=({'config': before}, 1000))
+        with self.assertRaisesRegex(PreconditionFailed, 'claude-sonnet-5: 分组倍率 1.5'):
+            script.migrate(call, MagicMock())
+        call.assert_called_once_with('commercial-config')
+
+
+class RouteCostTests(unittest.TestCase):
+    def test_a_measured_route_is_costed_exactly_as_its_versions_are_today(self):
+        routes = script.route_costs(script.POLICY)
+        self.assertEqual(routes, HANYUE_ROUTE)
+        tokens_seen = [(1, 0, 0, 0), (0, 1, 0, 0), (84_657, 4_094, 0, 76_000),
+                       (1_000_000, 1_000_000, 1_000_000, 1_000_000), (123_457, 9_999, 31_337, 7),
+                       (10_000_000, 3, 2_500_000, 999_999)]
+        for route, cost in routes.items():
+            provider, _, model = route.partition('/')
+            with self.subTest(route=route):
+                # The prices per million the settings give it, as the server multiplies them.
+                official = [usd * cost['cost_multiplier'] * script.OFFICIAL_USD_CNY
+                            for usd in cost['basis_usd_per_m']]
+                version = live_version(model, provider)
+                today = [version[kind + '_price_per_m'] for kind in script.PRICES]
+                # The same binary numbers, so the same cost for any request.
+                self.assertEqual(official, today)
+                for tokens in tokens_seen:
+                    self.assertEqual(micro_cny(official, tokens), micro_cny(today, tokens))
+
+    def test_route_costs_the_server_already_has_are_kept(self):
+        settings = {'credit_face_value_cny': FACE, 'usd_cny_rate': 7.25,
+                    'route_costs': {'kimera-direct/gpt-5.6-sol': {'cost_multiplier': 0.05}}}
+        defaults = script.settings_defaults(script.POLICY, settings)
+        self.assertEqual(defaults['route_costs'],
+                         {'kimera-direct/gpt-5.6-sol': {'cost_multiplier': 0.05}, **HANYUE_ROUTE})
+
+    def test_a_malformed_route_is_refused(self):
+        policy = copy.deepcopy(script.POLICY)
+        policy['upstream_price_basis'] = {'claude-opus-5-5': [2, 25, 6.25, 0.5]}
+        with self.assertRaises(PreconditionFailed):
+            script.route_costs(policy)
 
 
 class MigrateTests(unittest.TestCase):
@@ -189,6 +263,19 @@ class MigrateTests(unittest.TestCase):
         with self.assertRaisesRegex(PreconditionFailed, 'claude-sonnet-5: credits'):
             script.migrate(call, MagicMock())
         call.assert_called_once_with('commercial-config')
+
+    def test_an_older_server_is_refused_before_anything_is_sent(self):
+        # What a server before the release sends: no plan catalog.
+        older = {key: value for key, value in self.before.items()
+                 if key not in ('plans', 'cards_by_plan')}
+        call, record = MagicMock(return_value=({'config': older}, 1000)), MagicMock()
+        for dry_run in (False, True):
+            with self.subTest(dry_run=dry_run):
+                with self.assertRaisesRegex(PreconditionFailed, 'older than the release'):
+                    script.migrate(call, record, dry_run=dry_run)
+        self.assertEqual(call.call_count, 2)
+        call.assert_called_with('commercial-config')
+        record.assert_not_called()
 
     def test_a_readback_without_the_block_is_an_error(self):
         # What a server that does not know official prices would keep.

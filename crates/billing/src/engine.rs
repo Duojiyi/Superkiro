@@ -14,7 +14,10 @@ use thiserror::Error;
 
 #[path = "commercial.rs"]
 mod commercial;
-pub use commercial::{CommercialAudit, CommercialConfig, CommercialUpdate};
+pub use commercial::{
+    CommercialAudit, CommercialConfig, CommercialUpdate, MAX_COMMERCIAL_UPDATE_BYTES,
+    MAX_OFFICIAL_PRICES, MAX_PROVIDER_MULTIPLIERS, MAX_ROUTE_COSTS,
+};
 
 #[cfg(test)]
 type SnapshotSaveHook = (Arc<std::sync::Barrier>, Arc<std::sync::Barrier>);
@@ -99,6 +102,12 @@ pub enum BillingError {
 
     #[error("Billing persistence failed: {0}")]
     Persistence(String),
+
+    #[error("Request {0} was not found")]
+    RequestNotFound(String),
+
+    #[error("{0}")]
+    CompensationRefused(String),
 }
 
 /// Card balance reconciliation details against the immutable usage ledger (Spec §5, §14.9, §14.10.5).
@@ -147,6 +156,22 @@ impl RefreshRotation {
             Self::Rotated(version) | Self::Reissued(version) => version,
         }
     }
+}
+
+/// The request an adjustment makes up for, and whether the operator explicitly allows
+/// compensating it again, or by more than it was charged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompensatedRequest<'a> {
+    pub invocation_id: &'a str,
+    pub allow_repeat: bool,
+}
+
+/// Where a request was charged: its card, the micro-credits and when.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChargedRequest {
+    card_id: String,
+    credits: i64,
+    ts_secs: u64,
 }
 
 /// How an operator extends cards' validity: by a number of days, or to a time.
@@ -2302,7 +2327,7 @@ impl BillingEngine {
                 .map(|m| m.credit_multiplier)
                 .unwrap_or(params.credit_multiplier);
 
-            let settings = self.settings.read().unwrap().clone();
+            let settings = self.settings.read().unwrap();
             let models = price_names(model, model_map);
             // A named model is never billed at the built-in default rates: without a
             // published price it is refused here, before any work. It used to reserve and
@@ -2317,10 +2342,23 @@ impl BillingEngine {
                 model_multiplier,
                 &settings,
             );
+            // The routes that may serve it, whose costs its settlement reads.
+            let routes: Vec<(String, String)> = model_map
+                .map(|m| {
+                    m.full_target_chain()
+                        .into_iter()
+                        .map(|target| (target.provider_id, target.target_model))
+                        .collect()
+                })
+                .unwrap_or_default();
             let pricing = LockedPricing {
                 group_margin,
                 model_multiplier,
-                settings,
+                settings: settings.for_routes(&routes, model),
+                routes: routes
+                    .iter()
+                    .map(|(provider, target)| format!("{provider}/{target}"))
+                    .collect(),
             };
             (amt, Some(rcv.id), Some(pricing))
         } else {
@@ -2551,14 +2589,27 @@ impl BillingEngine {
         };
 
         // A request is charged at what it was reserved at: a publication while it was in
-        // flight changes neither its price version nor these.
-        let (group_margin, model_multiplier, settings) = match locked_pricing {
-            Some(locked) => (
-                locked.group_margin,
-                locked.model_multiplier,
-                locked.settings,
+        // flight changes neither its price version nor these. It is costed at them too,
+        // unless the route that served it could not serve it then.
+        let served = format!("{provider_id}/{target_model}");
+        let (group_margin, model_multiplier, settings, route_settings) = match locked_pricing {
+            Some(locked) => {
+                let route_settings = (!locked.routes.is_empty()
+                    && !locked.routes.contains(&served))
+                .then(|| candidate.settings.clone());
+                (
+                    locked.group_margin,
+                    locked.model_multiplier,
+                    locked.settings,
+                    route_settings,
+                )
+            }
+            None => (
+                group_margin,
+                model_multiplier,
+                candidate.settings.clone(),
+                None,
             ),
-            None => (group_margin, model_multiplier, candidate.settings.clone()),
         };
         let (charge, mut cost_micro_cny, version_id) = if let Some(ref rcv) = resolved_rcv {
             let cost = rcv.calculate_cost_micro_cny(tokens, &settings);
@@ -2582,7 +2633,10 @@ impl BillingEngine {
         // A request costs what the upstream that served it bills, whatever group or price
         // table it came from: from official prices, when they give that route a basis and a
         // multiplier, at the settings it was reserved at.
-        let official_cost = settings.official_cost_micro_cny(provider_id, target_model, tokens);
+        let official_cost = route_settings
+            .as_ref()
+            .unwrap_or(&settings)
+            .official_cost_micro_cny(provider_id, target_model, tokens);
         // Otherwise from price versions. Provider-qualified model prices take precedence over
         // shared target-model prices. Served by its primary target, a model costs what its own
         // price version says, the one it is charged at; a fallback costs what its target does.
@@ -2811,7 +2865,6 @@ impl BillingEngine {
         }
         reservation.finish(ReservationState::Settled);
         candidate.pending_settlements.remove(invocation_id);
-        candidate.ledger.push(entry.clone());
         let mut attempt_chain = Vec::new();
         candidate.traces.retain(|trace| {
             if trace.invocation_id == invocation_id {
@@ -2821,6 +2874,21 @@ impl BillingEngine {
                 true
             }
         });
+        // The Key that answered, when its attempt was traced: the last one of the serving
+        // provider that succeeded. Traces are dropped after 10 000; the ledger keeps it for
+        // reconciling an upstream account over any period.
+        if entry.detail.is_none() {
+            entry.detail = attempt_chain
+                .iter()
+                .rev()
+                .find(|attempt| {
+                    attempt.success
+                        && attempt.provider_id == entry.provider_id
+                        && !attempt.key_id.is_empty()
+                })
+                .map(|attempt| serde_json::json!({ "keyId": attempt.key_id }));
+        }
+        candidate.ledger.push(entry.clone());
         candidate.traces.push(RequestTrace {
             id: format!("trace-{invocation_id}"),
             card_id: entry.card_id.clone(),
@@ -2839,6 +2907,8 @@ impl BillingEngine {
             needed_micro_credits: None,
             available_micro_credits: None,
             attempt_chain,
+            repeats: 0,
+            last_seen_secs: None,
         });
         if candidate.traces.len() > MAX_RETAINED_TRACES {
             candidate
@@ -3393,8 +3463,10 @@ impl BillingEngine {
     }
 
     /// Lift a ban: the card is usable again, or unactivated if it was banned before it was
-    /// ever activated. The sessions the ban revoked stay revoked: the customer signs in
-    /// again. An archived card is unarchived first, so that archived cards stay unusable.
+    /// ever activated, or frozen again if it was banned while frozen: lifting a ban lifts no
+    /// freeze. The note loses what the ban put before it. The sessions the ban revoked stay
+    /// revoked: the customer signs in again. An archived card is unarchived first, so that
+    /// archived cards stay unusable.
     pub fn unban_card(
         &self,
         card_id: &str,
@@ -3408,7 +3480,7 @@ impl BillingEngine {
             operator_id,
             reason,
             now_secs,
-            |card, _| {
+            |card, snapshot| {
                 if card.status != CardStatus::Banned {
                     return Err(BillingError::InvalidState(format!(
                         "cannot unban {:?}",
@@ -3420,13 +3492,30 @@ impl BillingEngine {
                         "Archived cards must be unarchived before they are unbanned".into(),
                     ));
                 }
-                card.status = if card.activated_at.is_some() {
+                // Frozen before the ban, it keeps what an unfreeze restores.
+                card.status = if card.frozen_from.is_some() {
+                    CardStatus::Frozen
+                } else if card.activated_at.is_some() {
                     CardStatus::Active
                 } else {
                     CardStatus::Unactivated
                 };
-                card.frozen_from = None;
-                Ok(Some(serde_json::Value::Null))
+                let bans: Vec<&str> = snapshot
+                    .ledger
+                    .iter()
+                    .chain(snapshot.archived_ledger_summary.adjustments.values())
+                    .filter(|entry| {
+                        entry.card_id == card.id
+                            && entry.kind == LedgerKind::Adjustment
+                            && entry.exposed_model == "ban_card"
+                    })
+                    .filter_map(|entry| entry.reason.as_deref())
+                    .collect();
+                card.note = card
+                    .note
+                    .as_deref()
+                    .and_then(|note| without_ban_prefixes(note, &bans));
+                Ok(Some(serde_json::json!({ "status": card.status })))
             },
         )
     }
@@ -3510,8 +3599,11 @@ impl BillingEngine {
                 if card.note == note {
                     return Ok(None);
                 }
-                card.note = note;
-                Ok(Some(serde_json::Value::Null))
+                let previous = std::mem::replace(&mut card.note, note);
+                Ok(Some(serde_json::json!({
+                    "note": card.note,
+                    "previousNote": previous,
+                })))
             },
         )
     }
@@ -3678,12 +3770,15 @@ impl BillingEngine {
                 .ok_or_else(|| BillingError::CardNotFound(id.to_string()))?;
             let detail = match (awaits_activation(card), card.valid_until, extension) {
                 (true, _, ValidityExtension::Days(days)) => {
-                    let duration = card
+                    let previous = card
                         .activation_duration_secs
-                        .unwrap_or(LEGACY_ACTIVATION_SECS)
-                        .saturating_add(days.saturating_mul(86_400));
+                        .unwrap_or(LEGACY_ACTIVATION_SECS);
+                    let duration = previous.saturating_add(days.saturating_mul(86_400));
                     card.activation_duration_secs = Some(duration);
-                    serde_json::json!({ "activationDurationSecs": duration })
+                    serde_json::json!({
+                        "activationDurationSecs": duration,
+                        "previousActivationDurationSecs": previous,
+                    })
                 }
                 (false, Some(current), extension) => {
                     let until = match extension {
@@ -3699,7 +3794,7 @@ impl BillingEngine {
                     if card.frozen_from == Some(CardStatus::Expired) {
                         card.frozen_from = Some(CardStatus::Active);
                     }
-                    serde_json::json!({ "validUntil": until })
+                    serde_json::json!({ "validUntil": until, "previousValidUntil": current })
                 }
                 _ => {
                     return Err(BillingError::InvalidState(format!(
@@ -4217,15 +4312,7 @@ impl BillingEngine {
             .get_mut(card_id)
             .ok_or_else(|| BillingError::CardNotFound(card_id.to_string()))?;
 
-        if let Some(concurrency) = max_concurrency {
-            card.max_concurrency = concurrency;
-        }
-        if let Some(daily) = daily_limit {
-            card.daily_credit_limit = daily;
-        }
-        if let Some(monthly) = monthly_limit {
-            card.monthly_credit_limit = monthly;
-        }
+        set_quotas(card, max_concurrency, daily_limit, monthly_limit);
         let updated_card = card.clone();
         let cid = card_id.to_string();
 
@@ -4236,6 +4323,123 @@ impl BillingEngine {
                 .insert(cid, updated_card.clone());
             updated_card
         })
+    }
+
+    /// An operator changes a card's concurrency, or its daily or monthly credit limit (in
+    /// micro-credits; `Some(None)` clears one), on the quota update path above, and the card's
+    /// history records each value changed with the one it replaced, who and why. Nothing is
+    /// written when every value is already as asked.
+    #[allow(clippy::too_many_arguments)]
+    pub fn change_card_quotas(
+        &self,
+        card_id: &str,
+        max_concurrency: Option<u32>,
+        daily_limit: Option<Option<i64>>,
+        monthly_limit: Option<Option<i64>>,
+        operator_id: &str,
+        reason: &str,
+        now_secs: u64,
+    ) -> Result<Card, BillingError> {
+        self.change_card(
+            card_id,
+            "change_quotas",
+            operator_id,
+            reason,
+            now_secs,
+            |card, _| {
+                let before = card.clone();
+                set_quotas(card, max_concurrency, daily_limit, monthly_limit);
+                let mut detail = serde_json::Map::new();
+                let mut changed =
+                    |name: &str, previous: serde_json::Value, now: serde_json::Value| {
+                        if previous != now {
+                            let capitalized = format!("{}{}", name[..1].to_uppercase(), &name[1..]);
+                            detail.insert(format!("previous{capitalized}"), previous);
+                            detail.insert(name.to_string(), now);
+                        }
+                    };
+                changed(
+                    "maxConcurrency",
+                    before.max_concurrency.into(),
+                    card.max_concurrency.into(),
+                );
+                changed(
+                    "dailyCreditLimit",
+                    before.daily_credit_limit.into(),
+                    card.daily_credit_limit.into(),
+                );
+                changed(
+                    "monthlyCreditLimit",
+                    before.monthly_credit_limit.into(),
+                    card.monthly_credit_limit.into(),
+                );
+                Ok((!detail.is_empty()).then_some(serde_json::Value::Object(detail)))
+            },
+        )
+    }
+
+    /// Give a card a new code for an operator, when the old one leaked: the old code signs in
+    /// no more, and every session the card has ends. Its balance, devices and history stay.
+    /// With a master key the new code can be revealed again later, as an issued card's can;
+    /// without one it is returned here only. The history records a fingerprint of the old and
+    /// the new code, never either code, with who and why. Returns the card and the new code.
+    pub fn rekey_card(
+        &self,
+        card_id: &str,
+        operator_id: &str,
+        reason: &str,
+        now_secs: u64,
+    ) -> Result<(Card, String), BillingError> {
+        let rng = ring::rand::SystemRandom::new();
+        let raw_code = crate::generator::generate_raw_code(&rng)?;
+        let code_hash = crate::card::hash_card_code(&raw_code);
+        let recovery = match self.master_kek() {
+            Some(kek) => {
+                // Bound to the card and its code, as an issued card's copy is.
+                let payload =
+                    serde_json::to_string(&("card-code-v1", card_id, &code_hash, &raw_code))
+                        .map_err(|_| BillingError::InvalidState("Card encryption failed".into()))?;
+                Some(
+                    kek.encrypt(&payload)
+                        .map_err(|_| BillingError::InvalidState("Card encryption failed".into()))?,
+                )
+            }
+            None => None,
+        };
+        let card = self.change_card(
+            card_id,
+            "rekey_card",
+            operator_id,
+            reason,
+            now_secs,
+            |card, snapshot| {
+                if card.status == CardStatus::Voided {
+                    return Err(BillingError::InvalidState(format!(
+                        "Voided cards cannot be given a new code: {card_id}"
+                    )));
+                }
+                if card.archived_at.is_some() {
+                    return Err(BillingError::InvalidState(format!(
+                        "Archived cards must be unarchived before they are given a new code: {card_id}"
+                    )));
+                }
+                if snapshot.cards.values().any(|other| other.code_hash == code_hash) {
+                    return Err(BillingError::InvalidState(
+                        "another card already uses this code".into(),
+                    ));
+                }
+                let fingerprint = |hash: &str| hash.chars().take(8).collect::<String>();
+                let detail = serde_json::json!({
+                    "previousCodeFingerprint": fingerprint(&card.code_hash),
+                    "codeFingerprint": fingerprint(&code_hash),
+                });
+                card.code_hash = code_hash.clone();
+                card.code_encrypted = recovery.clone();
+                card.token_version = card.token_version.saturating_add(1);
+                Ok(Some(detail))
+            },
+        )?;
+        Ok((card, raw_code))
     }
 
     // ==========================================
@@ -4651,6 +4855,11 @@ impl BillingEngine {
 
     /// An idempotent adjustment that may name the request it makes up for; the card's
     /// history keeps it. A replay under the same key must name the same request.
+    ///
+    /// The request must be this card's and must have been made: it is found in the ledger,
+    /// live or archived, or in the traces. A second positive adjustment for it, or one of
+    /// more than it was charged, is refused, naming what it charged and how it was already
+    /// compensated, unless `allow_repeat` says the operator means it.
     #[allow(clippy::too_many_arguments)]
     pub fn adjust_balance_linked(
         &self,
@@ -4660,10 +4869,12 @@ impl BillingEngine {
         reason: &str,
         now_secs: u64,
         idempotency_key: Option<&str>,
-        invocation_id: Option<&str>,
+        request: Option<CompensatedRequest<'_>>,
     ) -> Result<LedgerEntry, BillingError> {
         // The request the adjustment makes up for, which the card's history shows.
-        let detail = invocation_id.map(|id| serde_json::json!({ "invocationId": id }));
+        let detail = request.map(|r| serde_json::json!({ "invocationId": r.invocation_id }));
+        // Looked up before the state lock: it may have to read the ledger archives.
+        let charged = request.map(|r| self.charged_request(r.invocation_id));
         let op = operator_id.trim();
         if op.is_empty() {
             return Err(BillingError::InvalidAdjustment(
@@ -4729,6 +4940,14 @@ impl BillingEngine {
         let previous_checksum = self.last_snapshot_checksum.read().unwrap().clone();
         let mut candidate = self.export_snapshot_locked(sequence, previous_checksum);
 
+        if let (Some(request), Some(charged)) = (request, charged) {
+            // An unknown card is named as such before its request is looked at.
+            if !candidate.cards.contains_key(card_id) {
+                return Err(BillingError::CardNotFound(card_id.to_string()));
+            }
+            Self::check_compensation(&candidate, card_id, delta_micro_credits, request, charged)?;
+        }
+
         let card = candidate
             .cards
             .get_mut(card_id)
@@ -4790,6 +5009,117 @@ impl BillingEngine {
             self.ledger.write().unwrap().push(entry.clone());
             entry
         })
+    }
+
+    /// Where a request was charged: its usage entry in the live ledger or still settling, its
+    /// trace, or its usage entry in a ledger archive. None when none of them has it.
+    fn charged_request(&self, invocation_id: &str) -> Option<ChargedRequest> {
+        let usage = |entry: &&LedgerEntry| {
+            entry.kind == LedgerKind::Usage && entry.invocation_id.as_deref() == Some(invocation_id)
+        };
+        let of_entry = |entry: &LedgerEntry| ChargedRequest {
+            card_id: entry.card_id.clone(),
+            credits: entry.credits_charged,
+            ts_secs: entry.ts_secs,
+        };
+        if let Some(entry) = self.ledger.read().unwrap().iter().find(usage) {
+            return Some(of_entry(entry));
+        }
+        if let Some(pending) = self.pending_settlements.read().unwrap().get(invocation_id) {
+            return Some(of_entry(&pending.entry));
+        }
+        let traced = self
+            .traces
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|trace| trace.invocation_id == invocation_id)
+            .max_by_key(|trace| trace.credits_charged)
+            .map(|trace| ChargedRequest {
+                card_id: trace.card_id.clone(),
+                credits: trace.credits_charged,
+                ts_secs: trace.ts,
+            });
+        if traced.is_some() {
+            return traced;
+        }
+        // Slow on a large archive, so read only when nothing live has it.
+        let dir = self.ledger_archive_dir()?;
+        let kek = self.master_kek();
+        self.list_archived_ledger_receipts()
+            .iter()
+            .find_map(|receipt| {
+                let path = dir.join(&receipt.archive_file);
+                verify_ledger_archive_with(&path, &receipt.sha256_checksum, kek.as_ref())
+                    .ok()?
+                    .entries
+                    .iter()
+                    .find(usage)
+                    .map(of_entry)
+            })
+    }
+
+    /// Why a compensation for `request` cannot be made, if it cannot. The request must be
+    /// this card's; a positive compensation must neither repeat one already made for it nor
+    /// exceed what it was charged, unless the operator explicitly allows it.
+    fn check_compensation(
+        candidate: &BillingSnapshot,
+        card_id: &str,
+        delta_micro_credits: i64,
+        request: CompensatedRequest<'_>,
+        charged: Option<ChargedRequest>,
+    ) -> Result<(), BillingError> {
+        use crate::observability::{iso_utc, micro_decimal};
+        let id = request.invocation_id;
+        let charged = charged.ok_or_else(|| BillingError::RequestNotFound(id.to_string()))?;
+        if charged.card_id != card_id {
+            return Err(BillingError::CompensationRefused(format!(
+                "Request {id} was made by card {}, not {card_id}",
+                charged.card_id
+            )));
+        }
+        if delta_micro_credits <= 0 || request.allow_repeat {
+            return Ok(());
+        }
+        let found = format!(
+            "Request {id} was charged {} credits at {}",
+            micro_decimal(charged.credits),
+            iso_utc(charged.ts_secs)
+        );
+        let compensated = candidate
+            .ledger
+            .iter()
+            .chain(candidate.archived_ledger_summary.adjustments.values())
+            .filter(|entry| {
+                entry.kind == LedgerKind::Adjustment
+                    && entry.card_id == card_id
+                    && entry.credits_charged > 0
+                    && entry.event_detail().is_some_and(|detail| {
+                        detail
+                            .get("invocationId")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(id)
+                    })
+            })
+            .max_by_key(|entry| entry.ts_secs);
+        if let Some(earlier) = compensated {
+            return Err(BillingError::CompensationRefused(format!(
+                "{found}, and was already compensated {} credits at {} by {} ({}); \
+                 send allowRepeat with a reason to compensate it again",
+                micro_decimal(earlier.credits_charged),
+                iso_utc(earlier.ts_secs),
+                earlier.operator_id.as_deref().unwrap_or("unknown"),
+                earlier.reason.as_deref().unwrap_or("no reason"),
+            )));
+        }
+        if delta_micro_credits > charged.credits {
+            return Err(BillingError::CompensationRefused(format!(
+                "{found}; a compensation of {} credits is more than that; \
+                 send allowRepeat with a reason to compensate more",
+                micro_decimal(delta_micro_credits)
+            )));
+        }
+        Ok(())
     }
 
     /// Audit & reconcile card balance against the immutable ledger (Spec §5, §14.9, §14.10.5).
@@ -4923,6 +5253,8 @@ impl BillingEngine {
                 (LedgerKind::Adjustment, "extend_validity") => "extend",
                 (LedgerKind::Adjustment, "note_card") => "note",
                 (LedgerKind::Adjustment, "change_group") => "group",
+                (LedgerKind::Adjustment, "change_quotas") => "quotas",
+                (LedgerKind::Adjustment, "rekey_card") => "rekey",
                 (LedgerKind::Adjustment, _) => "adjust",
             };
             // A change that records more than who and why keeps it as a JSON object: in
@@ -5145,9 +5477,26 @@ impl BillingEngine {
     /// the whole state (the request's own settlement, or any later write when it is
     /// released), instead of each costing a full save of its own. A crash before that
     /// commit loses only the trace, and with it the attempt count it holds.
+    ///
+    /// A request refused before any upstream was called, refused again for the same
+    /// reason within a minute of a kept refusal of the same card, adds no trace: the kept
+    /// one counts it and when it was last seen. A card refused many times a second, by a
+    /// script or a loop, so keeps one trace a minute per reason and cannot push real
+    /// requests out of the traces.
     pub fn record_trace(&self, trace: RequestTrace) {
         let _state_guard = self.state_lock.write().unwrap();
         let mut traces = self.traces.write().unwrap();
+        // Traces are kept in the order they were made; only the last minute's can match.
+        let kept = traces
+            .iter_mut()
+            .rev()
+            .take_while(|kept| kept.ts.saturating_add(60) > trace.ts)
+            .find(|kept| kept.is_repeated_by(&trace));
+        if let Some(kept) = kept {
+            kept.repeats = kept.repeats.saturating_add(1);
+            kept.last_seen_secs = Some(kept.last_seen().max(trace.ts));
+            return;
+        }
         traces.push(trace);
         if traces.len() > MAX_RETAINED_TRACES {
             let overflow = traces.len() - MAX_RETAINED_TRACES;
@@ -5222,14 +5571,21 @@ impl BillingEngine {
                 .collect(),
             ..Activity::default()
         };
-        let count = |window: &mut ActivityWindow, status: TraceStatus| {
-            match status {
-                TraceStatus::Success => window.succeeded += 1,
-                TraceStatus::Error => window.failed += 1,
-                TraceStatus::ClientAborted => window.client_aborted += 1,
+        // A refusal for the card or the request is counted apart, and a trace counts the
+        // repeated refusals it stands for.
+        let count = |window: &mut ActivityWindow, trace: &RequestTrace| {
+            let times = trace.occurrences();
+            if trace.refused_for_card() {
+                window.refused += times;
+                return;
+            }
+            match trace.status {
+                TraceStatus::Success => window.succeeded += times,
+                TraceStatus::Error => window.failed += times,
+                TraceStatus::ClientAborted => window.client_aborted += times,
                 TraceStatus::InProgress => return,
             }
-            window.requests += 1;
+            window.requests += times;
         };
         let mut day_ttft = Vec::new();
         let mut week_ttft = Vec::new();
@@ -5241,12 +5597,18 @@ impl BillingEngine {
                 .iter()
                 .filter(|trace| trace.ts <= now && trace.status != TraceStatus::InProgress);
             for trace in finished {
+                let (times, refused) = (trace.occurrences(), trace.refused_for_card());
+                let failed = if trace.status == TraceStatus::Error {
+                    times
+                } else {
+                    0
+                };
                 if trace.ts > week_start {
-                    count(&mut activity.last_7d, trace.status);
+                    count(&mut activity.last_7d, trace);
                     week_ttft.extend(trace.ttft_ms);
                 }
                 if trace.ts > day_start {
-                    count(&mut activity.last_24h, trace.status);
+                    count(&mut activity.last_24h, trace);
                     day_ttft.extend(trace.ttft_ms);
                     if let Some(provider_id) = &trace.provider_id {
                         let (provider, ttft) =
@@ -5257,15 +5619,23 @@ impl BillingEngine {
                                 };
                                 (provider, Vec::new())
                             });
-                        provider.requests += 1;
-                        provider.failed += u64::from(trace.status == TraceStatus::Error);
+                        if refused {
+                            provider.refused += times;
+                        } else {
+                            provider.requests += times;
+                            provider.failed += failed;
+                        }
                         ttft.extend(trace.ttft_ms);
                     }
                 }
                 if trace.ts >= first_hour {
                     let hour = &mut activity.hourly[((trace.ts - first_hour) / HOUR) as usize];
-                    hour.requests += 1;
-                    hour.failed += u64::from(trace.status == TraceStatus::Error);
+                    if refused {
+                        hour.refused += times;
+                    } else {
+                        hour.requests += times;
+                        hour.failed += failed;
+                    }
                 }
             }
         }
@@ -5349,7 +5719,6 @@ impl BillingEngine {
     fn attempt_activity(&self, activity: &mut crate::observability::Activity, now: u64) {
         use crate::observability::{
             AttemptWindow, KeyAttempts, ModelHealth, ModelHealthWindow, ProviderAttempts,
-            CARD_LIMIT_REFUSALS,
         };
         const HOUR: u64 = 3600;
         let starts = [
@@ -5360,16 +5729,22 @@ impl BillingEngine {
         let mut providers: BTreeMap<String, ProviderAttempts> = BTreeMap::new();
         let mut keys: BTreeMap<String, KeyAttempts> = BTreeMap::new();
         let mut models: BTreeMap<String, ModelHealth> = BTreeMap::new();
+        let mut refusals = Vec::new();
         let traces = self.traces.read().unwrap();
         for trace in traces
             .iter()
             .filter(|trace| trace.ts > starts[2] && trace.ts <= now)
         {
             let within = starts.map(|start| trace.ts > start);
+            // An upstream that refused the request itself, a prompt too long, did right: its
+            // attempt is counted as refused, not failed.
+            let refused_for_card = trace.refused_for_card();
+            let last = trace.attempt_chain.len().saturating_sub(1);
             for (index, attempt) in trace.attempt_chain.iter().enumerate() {
                 let taken_over = trace.attempt_chain[index + 1..]
                     .iter()
                     .any(|later| later.success && later.provider_id != attempt.provider_id);
+                let refused = refused_for_card && index == last && !attempt.success;
                 let provider = providers
                     .entry(attempt.provider_id.clone())
                     .or_insert_with(|| ProviderAttempts {
@@ -5383,7 +5758,7 @@ impl BillingEngine {
                 ];
                 for (window, inside) in windows.into_iter().zip(within) {
                     if inside {
-                        window.count(attempt, taken_over);
+                        window.count(attempt, taken_over, refused);
                     }
                 }
                 if attempt.key_id.is_empty() {
@@ -5400,18 +5775,15 @@ impl BillingEngine {
                     [&mut key.last_1h, &mut key.last_24h, &mut key.last_7d];
                 for (window, inside) in windows.into_iter().zip(within) {
                     if inside {
-                        window.count(attempt, taken_over);
+                        window.count(attempt, taken_over, refused);
                     }
                 }
             }
-            let refused_for_card = trace
-                .error_class
-                .as_deref()
-                .is_some_and(|class| CARD_LIMIT_REFUSALS.contains(&class));
-            if trace.status == TraceStatus::InProgress
-                || trace.exposed_model.is_empty()
-                || refused_for_card
-            {
+            if trace.status == TraceStatus::InProgress || trace.exposed_model.is_empty() {
+                continue;
+            }
+            if refused_for_card {
+                refusals.push((trace, within));
                 continue;
             }
             let failure = (trace.status == TraceStatus::Error).then(|| {
@@ -5438,7 +5810,20 @@ impl BillingEngine {
                 [&mut model.last_1h, &mut model.last_24h, &mut model.last_7d];
             for (window, inside) in windows.into_iter().zip(within) {
                 if inside {
-                    window.count(trace.ts, failure.as_deref());
+                    window.count(trace.last_seen(), failure.as_deref(), trace.occurrences());
+                }
+            }
+        }
+        // Refusals are counted apart, under a model its requests already list: a name a
+        // customer typed, or a retired model, adds no row of its own.
+        for (trace, within) in refusals {
+            if let Some(model) = models.get_mut(&trace.exposed_model) {
+                let windows: [&mut ModelHealthWindow; 3] =
+                    [&mut model.last_1h, &mut model.last_24h, &mut model.last_7d];
+                for (window, inside) in windows.into_iter().zip(within) {
+                    if inside {
+                        window.refused += trace.occurrences();
+                    }
                 }
             }
         }
@@ -6348,10 +6733,54 @@ fn validate_snapshot(snapshot: &BillingSnapshot) -> std::io::Result<()> {
 
 /// Whether the card has yet to be activated, frozen or banned before it was: its validity
 /// is still a duration counted from activation.
+/// Sets what is given of a card's concurrency and daily and monthly credit limits; `Some(None)`
+/// clears a limit.
+fn set_quotas(
+    card: &mut Card,
+    max_concurrency: Option<u32>,
+    daily_limit: Option<Option<i64>>,
+    monthly_limit: Option<Option<i64>>,
+) {
+    if let Some(concurrency) = max_concurrency {
+        card.max_concurrency = concurrency;
+    }
+    if let Some(daily) = daily_limit {
+        card.daily_credit_limit = daily;
+    }
+    if let Some(monthly) = monthly_limit {
+        card.monthly_credit_limit = monthly;
+    }
+}
+
 fn awaits_activation(card: &Card) -> bool {
     card.activated_at.is_none()
         && card.valid_until.is_none()
         && !matches!(card.status, CardStatus::Active | CardStatus::Expired)
+}
+
+/// A note without what bans put before it, `[BANNED: reason] `, once for each ban; `bans`
+/// are the reasons the card was banned for, which may hold a bracket themselves. A prefix
+/// of no known reason ends at its first bracket. None when nothing else is left.
+fn without_ban_prefixes(note: &str, bans: &[&str]) -> Option<String> {
+    let mut rest = note.trim_start();
+    while let Some(after) = rest.strip_prefix("[BANNED: ") {
+        let reason = bans
+            .iter()
+            .map(|ban| ban.trim())
+            .filter(|ban| {
+                after
+                    .strip_prefix(*ban)
+                    .is_some_and(|tail| tail.starts_with(']'))
+            })
+            .map(str::len)
+            .max()
+            .or_else(|| after.find(']'));
+        let Some(reason) = reason else {
+            break;
+        };
+        rest = after[reason + 1..].trim_start();
+    }
+    (!rest.is_empty()).then(|| rest.to_string())
 }
 
 fn check_rebind_allowed(card: &Card, now_secs: u64) -> Result<(), BillingError> {

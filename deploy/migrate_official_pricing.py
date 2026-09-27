@@ -1,21 +1,30 @@
-"""Republish every listed model's price in force with the official price it is computed from.
+"""Republish every callable model's price in force with the official price it is computed from.
 
 Read JSON from stdin: {"password": "SSH password"}. Charging does not change: each new version
 keeps the credits and costs of the one it replaces and adds the `official` block the server
 checks them against, built from deploy/pricing_policy.json at the live face value (official
 prices, `priced_as`, `retail_multiplier`; the primary provider's `provider_upstream_multipliers`
-entry, else `upstream_multiplier`, on the `upstream_price_basis` that provider bills). When that
-would not reproduce a model's credits or costs, the model is named and nothing is published.
+entry, else `upstream_multiplier`, on the `upstream_price_basis` that provider bills). Hidden
+models are republished too: they can still be called by name, and a face-value change must
+reprice them with the listed ones. Retired ones cannot be called and are left alone. When the
+policy would not reproduce a model's credits or costs, or its group's 分组倍率 or its own 模型倍率
+is not 1 (customers would pay more than the block says), the model is named and nothing is
+published.
+
 The settings gain the policy's defaults: official_usd_cny 1.0, the retail and upstream
-multipliers, and each provider's. The official price table and route costs are left as they
-are: with them a request is costed from its route, which changes what requests cost.
+multipliers, each provider's, and a route cost for every `upstream_price_basis` entry: the
+measured basis and that provider's multiplier, which cost those routes exactly what their
+versions do today. Without them a later official price for the route's model would re-cost the
+route from the list price. The official price table is left as it is.
+
 Revision-checked; the new versions start 30 seconds after the server's clock, and the live
-configuration is read back before and after they do.
+configuration is read back before and after they do. The server must already run the release
+that knows official prices: a configuration without plans comes from an older one, which would
+drop the blocks and the settings, and is refused before anything is sent.
 
 --dry-run reads the live configuration through the same admin session and writes the intended
-publication to .acceptance/ without sending it. The server must already run the release that
-knows official prices: an older one would drop the block, and the read-back refuses that.
-SSH/admin credentials stay in memory; only a summary is printed.
+publication to .acceptance/ without sending it. SSH/admin credentials stay in memory; only a
+summary is printed.
 """
 import contextlib
 import email.utils
@@ -39,8 +48,9 @@ PRICES = ('input', 'output', 'cache_creation', 'cache_read')
 # CNY per official dollar: ¥1 = $1.
 OFFICIAL_USD_CNY = 1.0
 ACTIVATION_DELAY_SECS = 30
-REASON = ('Record what every listed price is computed from: official USD x retail multiplier at '
-          'the face value, cost x the provider multiplier. Credits and costs unchanged.')
+REASON = ('Record what every callable price is computed from: official USD x retail multiplier '
+          'at the face value, cost x the provider multiplier, and what the measured routes '
+          'bill. Credits and costs unchanged.')
 
 
 def four(values, what):
@@ -133,30 +143,66 @@ def migrated_version(mapping, current, scheduled, policy, face_value, stamp):
             'effective_from_secs': stamp, 'official': block}, None
 
 
-def settings_defaults(policy):
+def route_costs(policy):
+    """What each route the policy measured bills: its basis, and its provider's multiplier (else
+    the policy's), as the versions it serves are costed today."""
+    routes = {}
+    for route, basis in policy.get('upstream_price_basis', {}).items():
+        provider, _, target = route.partition('/')
+        if not provider or not target:
+            raise PreconditionFailed(f'Invalid pricing policy: route {route}')
+        multiplier = policy['provider_upstream_multipliers'].get(
+            provider, policy['upstream_multiplier'])
+        routes[route] = {'basis_usd_per_m': four(basis, route),
+                         'cost_multiplier': float(multiplier)}
+    return routes
+
+
+def settings_defaults(policy, settings):
+    """The settings the policy gives, on top of the live `settings`: its route costs are added to
+    any the server already has."""
     return {
         'official_usd_cny': OFFICIAL_USD_CNY,
         'default_price_multiplier': float(policy['retail_multiplier']),
         'default_cost_multiplier': float(policy['upstream_multiplier']),
         'provider_cost_multipliers': {provider: float(multiplier) for provider, multiplier
                                       in policy['provider_upstream_multipliers'].items()},
+        'route_costs': {**(settings.get('route_costs') or {}), **route_costs(policy)},
     }
 
 
-def publication(config, policy, now, stamp):
-    """(the publication, or None when nothing changes; the listed models it cannot republish).
+def newer_server(config):
+    """Refuses a configuration from a server older than the release: only the release that knows
+    official prices sends the plan catalog, and an older one silently drops the official blocks
+    and the settings a publication sends."""
+    if 'plans' not in config or 'cards_by_plan' not in config:
+        raise PreconditionFailed('The server is older than the release that knows official '
+                                 'prices (its configuration has no plans); deploy that release '
+                                 'first. Nothing was published.')
 
-    Every listed model's price in force that carries no official block yet is republished with
-    one, from `stamp`, keeping its credits and costs. One already computed from an official
-    price is left alone, and so is a price two listed models share, once."""
+
+def publication(config, policy, now, stamp):
+    """(the publication, or None when nothing changes; the models it cannot republish).
+
+    Every callable model's price in force, listed or hidden, that carries no official block yet
+    is republished with one, from `stamp`, keeping its credits and costs. One already computed
+    from an official price is left alone, and so is a price two models share, once. A model of a
+    group whose 分组倍率, or with a 模型倍率, other than 1 is refused, as publish_pricing.py
+    refuses it: its block would not say what customers pay."""
     face_value = config['settings']['credit_face_value_cny']
     groups = {group['id']: group for group in config['groups']}
     versions, problems = {}, []
     for mapping in config['models']:
-        if not mapping['visible'] or mapping.get('retired'):
+        if mapping.get('retired'):
             continue
         model = mapping['exposed_model_id']
-        rate_card = groups[mapping['group_id']]['rate_card_id']
+        group = groups[mapping['group_id']]
+        multipliers = (group.get('margin_multiplier'), mapping.get('credit_multiplier'))
+        if multipliers != (1, 1):
+            problems.append(f'{model}: 分组倍率 {multipliers[0]} and 模型倍率 {multipliers[1]} '
+                            'must both be 1; review required')
+            continue
+        rate_card = group['rate_card_id']
         current = in_force(config['versions'], rate_card, [model, mapping['target_model']], now)
         if current is not None and 'official' in current:
             continue
@@ -171,7 +217,7 @@ def publication(config, policy, now, stamp):
             versions[current['id']] = version
     update = {'expected_revision': config['revision'], 'reason': REASON,
               'versions': list(versions.values())}
-    defaults = settings_defaults(policy)
+    defaults = settings_defaults(policy, config['settings'])
     if any(config['settings'].get(key) != value for key, value in defaults.items()):
         update['settings'] = {**config['settings'], **defaults}
     if not update['versions'] and 'settings' not in update:
@@ -187,6 +233,7 @@ def migrate(call, record, dry_run=False, wait=time.sleep):
     them). Returns a summary of what is live."""
     reply, now = call('commercial-config')
     before = reply['config']
+    newer_server(before)
     stamp = now + ACTIVATION_DELAY_SECS
     update, problems = publication(before, POLICY, now, stamp)
     record(before, update, problems)

@@ -356,8 +356,12 @@ async fn each_refusal_before_routing_is_traced_and_charged_nothing() {
     assert_eq!(bodies["inv-alias"], bodies["inv-absent"]);
 
     let traces = billing.list_traces(Some(CARD), 100);
+    // The same refusal again within a minute adds no trace: the first of its reason
+    // counts it.
+    let mut first = std::collections::HashMap::new();
     for (invocation, _, _, _, class, exposed) in cases {
-        let invocation_id = format!("{CARD}:{invocation}");
+        let (kept, kept_model) = *first.entry(class).or_insert((invocation, exposed));
+        let invocation_id = format!("{CARD}:{kept}");
         let trace: Vec<_> = traces
             .iter()
             .filter(|trace| trace.invocation_id == invocation_id)
@@ -366,7 +370,7 @@ async fn each_refusal_before_routing_is_traced_and_charged_nothing() {
         let trace = trace[0];
         assert_eq!(trace.status, billing::TraceStatus::Error, "{invocation}");
         assert_eq!(trace.error_class.as_deref(), Some(class), "{invocation}");
-        assert_eq!(trace.exposed_model, exposed, "{invocation}");
+        assert_eq!(trace.exposed_model, kept_model, "{invocation}");
         assert_eq!(trace.provider_id, None, "{invocation}");
         assert!(trace.attempt_chain.is_empty(), "{invocation}");
         assert_eq!(
@@ -379,6 +383,24 @@ async fn each_refusal_before_routing_is_traced_and_charged_nothing() {
             "{invocation}"
         );
     }
+    let mut repeated: Vec<_> = traces
+        .iter()
+        .map(|trace| (trace.invocation_id.as_str(), trace.repeats))
+        .collect();
+    repeated.sort_unstable();
+    let id = |invocation: &str| format!("{CARD}:{invocation}");
+    let (retired, reasoning, offline) = (id("inv-retired"), id("inv-reasoning"), id("inv-offline"));
+    let (invalid, unpriced, absent) = (id("inv-invalid"), id("inv-unpriced"), id("inv-absent"));
+    let mut expected = vec![
+        (retired.as_str(), 1),
+        (reasoning.as_str(), 1),
+        (offline.as_str(), 1),
+        (invalid.as_str(), 0),
+        (unpriced.as_str(), 0),
+        (absent.as_str(), 0),
+    ];
+    expected.sort_unstable();
+    assert_eq!(repeated, expected);
     // Nothing reached the upstream, nothing is held and nothing was charged.
     assert!(models_sent(&upstream).await.is_empty());
     let card = billing.get_card(CARD).unwrap();
@@ -455,19 +477,24 @@ async fn refusals_for_the_cards_own_limits_are_traced_and_charged_nothing() {
             "usage_limit",
         ),
     ];
+    // The same refusal again within a minute adds no trace: the first of its reason counts
+    // it, as the monthly limit's is counted on the daily limit's.
+    let mut first = std::collections::HashMap::new();
     for (invocation, edit, status, code, class) in cases {
         limit(edit);
         let (got, body) = turn(&app, invocation, Some("listed-model"), plain).await;
         assert_eq!(got, status, "{invocation}: {body}");
         assert!(body.contains(code), "{invocation}: {body}");
         let traces = billing.list_traces(Some(CARD), 100);
-        let invocation_id = format!("{CARD}:{invocation}");
+        let kept = *first.entry(class).or_insert(invocation);
+        let invocation_id = format!("{CARD}:{kept}");
         let trace: Vec<_> = traces
             .iter()
             .filter(|trace| trace.invocation_id == invocation_id)
             .collect();
         assert_eq!(trace.len(), 1, "{invocation}");
         let trace = trace[0];
+        assert_eq!(trace.repeats, u64::from(kept != invocation), "{invocation}");
         assert_eq!(trace.status, billing::TraceStatus::Error);
         assert_eq!(trace.error_class.as_deref(), Some(class), "{invocation}");
         assert_eq!(trace.exposed_model, "listed-model");

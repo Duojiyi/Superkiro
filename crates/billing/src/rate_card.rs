@@ -129,6 +129,69 @@ impl BillingSettings {
         self.official_usd_cny.unwrap_or(1.0)
     }
 
+    /// Of these settings, what settling a request served by one of `routes` (provider,
+    /// upstream model) reads: the face value, the exchange rates, the default 成本倍率, and
+    /// each route's own cost, its provider's 成本倍率 and its upstream model's official price,
+    /// without its note. With no routes, for a request no mapping serves, which is sent to the
+    /// model it names by whichever provider: what any provider serving `model` reads.
+    pub fn for_routes(&self, routes: &[(String, String)], model: &str) -> BillingSettings {
+        let provider_serves = |provider: &str| {
+            routes.is_empty() || routes.iter().any(|(serving, _)| serving == provider)
+        };
+        let target_serves = |target: &str| {
+            if routes.is_empty() {
+                target == model
+            } else {
+                routes.iter().any(|(_, serving)| serving == target)
+            }
+        };
+        let route_serves = |route: &str| {
+            if routes.is_empty() {
+                route
+                    .split_once('/')
+                    .is_some_and(|(_, target)| target == model)
+            } else {
+                routes
+                    .iter()
+                    .any(|(provider, target)| route == format!("{provider}/{target}"))
+            }
+        };
+        fn kept<V: Clone>(
+            map: &Option<BTreeMap<String, V>>,
+            keep: impl Fn(&str) -> bool,
+            copy: impl Fn(&V) -> V,
+        ) -> Option<BTreeMap<String, V>> {
+            let kept: BTreeMap<String, V> = map
+                .iter()
+                .flatten()
+                .filter(|(key, _)| keep(key))
+                .map(|(key, value)| (key.clone(), copy(value)))
+                .collect();
+            (!kept.is_empty()).then_some(kept)
+        }
+        BillingSettings {
+            credit_face_value_cny: self.credit_face_value_cny,
+            usd_cny_rate: self.usd_cny_rate,
+            rate_updated_at_secs: self.rate_updated_at_secs,
+            official_usd_cny: self.official_usd_cny,
+            // Offered for new prices; no settlement reads it.
+            default_price_multiplier: None,
+            default_cost_multiplier: self.default_cost_multiplier,
+            provider_cost_multipliers: kept(
+                &self.provider_cost_multipliers,
+                provider_serves,
+                |m| *m,
+            ),
+            official_prices: kept(&self.official_prices, target_serves, |price| {
+                OfficialPrice {
+                    note: None,
+                    ..price.clone()
+                }
+            }),
+            route_costs: kept(&self.route_costs, route_serves, RouteCost::clone),
+        }
+    }
+
     /// What `provider` bills for `tokens` of its upstream model `target`, in micro-CNY, from
     /// official prices: the route's own basis, else `target`'s official price, times the
     /// route's 成本倍率, else the provider's, else the default, at `official_usd_cny`. None

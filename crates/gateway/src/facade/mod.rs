@@ -269,6 +269,8 @@ impl FacadeRegistry {
             admin::CardAction::ExtendValidity,
             admin::CardAction::Note,
             admin::CardAction::ChangeGroup,
+            admin::CardAction::Quotas,
+            admin::CardAction::Rekey,
         ] {
             self.register(admin::AdminCardActionHandler {
                 billing: billing.clone(),

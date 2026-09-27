@@ -554,7 +554,7 @@ impl GenerateAssistantResponseHandler {
                                 "ThrottlingException",
                                 "DAILY_REQUEST_COUNT",
                                 &format!(
-                                    "今日积分用量已达上限：上限 {}，今日已用 {}，本次需预留 {}。请明天再试。",
+                                    "今日积分用量已达上限：上限 {}，今日已用 {}，本次需预留 {}。每日用量按 UTC 日统计，北京时间每天 08:00 重置，请重置后再试。",
                                     credits(limit),
                                     credits(current),
                                     credits(needed)
@@ -1140,6 +1140,8 @@ impl GenerateAssistantResponseHandler {
                             needed_micro_credits: None,
                             available_micro_credits: None,
                             attempt_chain: attempts,
+                            repeats: 0,
+                            last_seen_secs: None,
                         });
                     match route_result {
                         Ok(res) => (res.stream, res.provider.id, res.target_model),
@@ -1751,7 +1753,7 @@ fn generated_invocation_id() -> String {
 /// and is copied into the saved billing state. SDKs send a UUID. Anything else is
 /// refused before it is used: an unbounded id would be stored in every snapshot.
 fn valid_invocation_id(id: &str) -> bool {
-    (1..=128).contains(&id.len())
+    (1..=billing::MAX_CLIENT_INVOCATION_ID_BYTES).contains(&id.len())
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))

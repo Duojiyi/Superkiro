@@ -27,6 +27,9 @@ pub struct ActivityWindow {
     pub succeeded: u64,
     pub failed: u64,
     pub client_aborted: u64,
+    /// Requests refused for the card or the request itself (see [`CARD_REFUSALS`]),
+    /// counted apart: neither requests nor failed include them.
+    pub refused: u64,
     pub credits_charged: i64,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -46,6 +49,8 @@ pub struct ProviderActivity {
     pub provider_id: String,
     pub requests: u64,
     pub failed: u64,
+    /// Requests it refused for the request itself, such as a prompt too long.
+    pub refused: u64,
     pub ttft_median_ms: Option<u32>,
 }
 
@@ -56,6 +61,7 @@ pub struct ActivityHour {
     pub start_secs: u64,
     pub requests: u64,
     pub failed: u64,
+    pub refused: u64,
 }
 
 /// The last 24 hours and 7 days, and the last 24 clock hours one by one.
@@ -89,10 +95,20 @@ pub struct Activity {
     pub model_usage_7d: Vec<ModelUsage>,
 }
 
-/// Error classes of requests refused for the card's own balance or limits: they say
-/// nothing about the model asked for.
-pub const CARD_LIMIT_REFUSALS: [&str; 3] =
-    ["insufficient_balance", "concurrency_limit", "usage_limit"];
+/// Error classes of requests refused for the card or the request itself: the card's
+/// balance or limits, a prompt too long for the model, a capability the model lacks, or a
+/// model the card may not or cannot name. They say nothing about a model's or an
+/// upstream's health, and are counted apart from requests and failures.
+pub const CARD_REFUSALS: [&str; 8] = [
+    "insufficient_balance",
+    "concurrency_limit",
+    "usage_limit",
+    "input_too_long",
+    "unsupported_capability",
+    "invalid_model",
+    "model_not_listed",
+    "model_retired",
+];
 
 /// Upstream attempts over one period.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -100,6 +116,9 @@ pub const CARD_LIMIT_REFUSALS: [&str; 3] =
 pub struct AttemptWindow {
     pub attempts: u64,
     pub failures: u64,
+    /// Attempts the upstream rightly refused for the request itself, such as a prompt too
+    /// long: neither attempts nor failures include them.
+    pub refused: u64,
     /// Failed attempts after which another provider answered the request.
     pub taken_over: u64,
     /// Failures by the kind attempt chains name: http_429, http_401, timeout, transport,
@@ -108,7 +127,11 @@ pub struct AttemptWindow {
 }
 
 impl AttemptWindow {
-    pub(crate) fn count(&mut self, attempt: &AttemptRecord, taken_over: bool) {
+    pub(crate) fn count(&mut self, attempt: &AttemptRecord, taken_over: bool, refused: bool) {
+        if refused {
+            self.refused += 1;
+            return;
+        }
         self.attempts += 1;
         if !attempt.success {
             self.failures += 1;
@@ -146,13 +169,14 @@ pub struct KeyAttempts {
     pub last_7d: AttemptWindow,
 }
 
-/// Finished requests for one customer model over one period. Refusals for the card's own
-/// balance or limits are not counted.
+/// Finished requests for one customer model over one period. Refusals for the card or the
+/// request itself are counted apart, as refused.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelHealthWindow {
     pub requests: u64,
     pub failures: u64,
+    pub refused: u64,
     pub last_failure_at: Option<u64>,
     /// The commonest kind of failure, the earliest in name on a tie.
     pub top_failure_kind: Option<String>,
@@ -161,12 +185,13 @@ pub struct ModelHealthWindow {
 }
 
 impl ModelHealthWindow {
-    pub(crate) fn count(&mut self, ts: u64, failure: Option<&str>) {
-        self.requests += 1;
+    /// Counts a trace's requests: `times` of them, the last at `ts`.
+    pub(crate) fn count(&mut self, ts: u64, failure: Option<&str>, times: u64) {
+        self.requests += times;
         if let Some(kind) = failure {
-            self.failures += 1;
+            self.failures += times;
             self.last_failure_at = self.last_failure_at.max(Some(ts));
-            *self.failures_by_kind.entry(kind.to_string()).or_default() += 1;
+            *self.failures_by_kind.entry(kind.to_string()).or_default() += times;
             self.top_failure_kind = self
                 .failures_by_kind
                 .iter()
@@ -235,6 +260,57 @@ pub struct RequestTrace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available_micro_credits: Option<i64>,
     pub attempt_chain: Vec<AttemptRecord>,
+    /// For a refusal: how many more times the card was refused for the same reason within
+    /// a minute of it. They add no trace of their own; this one counts them.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub repeats: u64,
+    /// When the last of those was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_secs: Option<u64>,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+impl RequestTrace {
+    /// The requests a trace stands for: its own and the repeated refusals it counts.
+    pub fn occurrences(&self) -> u64 {
+        self.repeats.saturating_add(1)
+    }
+
+    /// When the last request it stands for was made.
+    pub fn last_seen(&self) -> u64 {
+        self.last_seen_secs.unwrap_or(self.ts).max(self.ts)
+    }
+
+    /// Whether it records a request refused for the card or the request itself, one of
+    /// [`CARD_REFUSALS`], which says nothing about a model's or an upstream's health.
+    pub fn refused_for_card(&self) -> bool {
+        self.status == TraceStatus::Error
+            && self
+                .error_class
+                .as_deref()
+                .is_some_and(|class| CARD_REFUSALS.contains(&class))
+    }
+
+    /// Whether `later` is the same refusal again: the same card, refused before any
+    /// upstream was called for the same reason, within a minute of this one.
+    pub(crate) fn is_repeated_by(&self, later: &RequestTrace) -> bool {
+        const REPEAT_WINDOW_SECS: u64 = 60;
+        let refusal = |trace: &RequestTrace| {
+            trace.status == TraceStatus::Error
+                && trace.error_class.is_some()
+                && trace.attempt_chain.is_empty()
+                && trace.credits_charged == 0
+        };
+        refusal(self)
+            && refusal(later)
+            && self.card_id == later.card_id
+            && self.error_class == later.error_class
+            && later.ts >= self.ts
+            && later.ts < self.ts.saturating_add(REPEAT_WINDOW_SECS)
+    }
 }
 
 /// Which traces a search keeps; all of them when nothing is set.
@@ -631,20 +707,25 @@ pub struct CostedMargin {
     pub margin_percentage: Option<f64>,
     pub uncosted_requests: u64,
     pub uncosted_credits: i64,
+    /// Of the uncosted, those settlement costed at an estimate, for want of the serving
+    /// route's own cost: a fallback costed at its primary's price, say.
+    pub estimated_requests: u64,
 }
 
-/// A billed request is costed when it was priced by a published price version.
+/// A billed request is costed when its cost is what the route that served it bills, from
+/// official prices or a price version for that route; one costed at an estimate is not.
 pub fn compute_costed_margin(entries: &[LedgerEntry], settings: &BillingSettings) -> CostedMargin {
     let mut margin = CostedMargin::default();
     for entry in entries
         .iter()
         .filter(|entry| entry.kind == crate::ledger::LedgerKind::Usage)
     {
-        if entry.rate_card_version.is_none() {
+        if !entry.cost_is_known() {
             margin.uncosted_requests += 1;
             margin.uncosted_credits = margin
                 .uncosted_credits
                 .saturating_add(entry.credits_charged);
+            margin.estimated_requests += u64::from(entry.cost_is_estimated());
             continue;
         }
         margin.costed_requests += 1;
@@ -665,6 +746,50 @@ pub fn compute_costed_margin(entries: &[LedgerEntry], settings: &BillingSettings
     margin.margin_percentage = (margin.revenue_micro_cny > 0)
         .then(|| margin.gross_profit_micro_cny as f64 / margin.revenue_micro_cny as f64 * 100.0);
     margin
+}
+
+/// Credits given and taken by balance adjustments over a period: compensations, promotions
+/// and corrections, which usage revenue does not show. A card event (a note, an extension)
+/// changes no balance and is not one.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdjustmentTotals {
+    pub count: u64,
+    /// Credits given.
+    pub positive_micro_credits: i64,
+    /// Credits taken, as a negative amount.
+    pub negative_micro_credits: i64,
+    pub net_micro_credits: i64,
+}
+
+/// Adds up the balance adjustments among `entries`, each entry once by its ID.
+pub fn compute_adjustments<'a>(
+    entries: impl IntoIterator<Item = &'a LedgerEntry>,
+) -> AdjustmentTotals {
+    let mut totals = AdjustmentTotals::default();
+    let mut seen = std::collections::HashSet::new();
+    for entry in entries {
+        if entry.kind != crate::ledger::LedgerKind::Adjustment
+            || entry.credits_charged == 0
+            || !seen.insert(entry.id.as_str())
+        {
+            continue;
+        }
+        totals.count += 1;
+        if entry.credits_charged > 0 {
+            totals.positive_micro_credits = totals
+                .positive_micro_credits
+                .saturating_add(entry.credits_charged);
+        } else {
+            totals.negative_micro_credits = totals
+                .negative_micro_credits
+                .saturating_add(entry.credits_charged);
+        }
+    }
+    totals.net_micro_credits = totals
+        .positive_micro_credits
+        .saturating_add(totals.negative_micro_credits);
+    totals
 }
 
 /// Cards of one plan issued and activated over a period, and what they sold for.
@@ -791,7 +916,8 @@ pub struct Liability {
     pub unactivated_micro_credits: i64,
 }
 
-/// Every card that is not expired, voided, banned or archived; frozen ones included.
+/// Every card that is not expired, voided, banned or archived; frozen ones included, unless
+/// their validity has passed: unfrozen, they would be expired.
 pub fn compute_liability<'a>(
     cards: impl IntoIterator<Item = &'a crate::card::Card>,
     settings: &BillingSettings,
@@ -804,7 +930,8 @@ pub fn compute_liability<'a>(
             && !matches!(
                 card.effective_status(now_secs),
                 CardStatus::Expired | CardStatus::Voided | CardStatus::Banned
-            );
+            )
+            && card.valid_until.is_none_or(|until| now_secs < until);
         if !usable {
             continue;
         }
@@ -897,13 +1024,15 @@ pub fn export_reconciliation_csv(entries: &[LedgerEntry]) -> String {
 
 /// The ledger as CSV. The original columns come first, so tools reading them keep working;
 /// readable ones follow: the time in UTC, the provider's name, cache reads and writes,
-/// credits as a decimal, and for usage its ¥ revenue at face value and ¥ cost.
+/// credits as a decimal, and for usage its ¥ revenue at face value and ¥ cost. Then who made
+/// an adjustment or card event and why; for usage, `reason` says where its cost came from,
+/// then the price version that charged it and the Key that served it, when known.
 pub fn export_ledger_csv(
     entries: &[LedgerEntry],
     provider_names: &std::collections::HashMap<String, String>,
     settings: &BillingSettings,
 ) -> String {
-    let mut csv = String::from("id,card_id,ts,kind,invocation_id,exposed_model,provider_id,input_tokens,output_tokens,credits_charged,provider_cost_micro_cny,time_utc,provider_name,cache_read_tokens,cache_write_tokens,credits,revenue_cny,cost_cny\n");
+    let mut csv = String::from("id,card_id,ts,kind,invocation_id,exposed_model,provider_id,input_tokens,output_tokens,credits_charged,provider_cost_micro_cny,time_utc,provider_name,cache_read_tokens,cache_write_tokens,credits,revenue_cny,cost_cny,operator,reason,rate_card_version,key_id\n");
     for e in entries {
         let usage = e.kind == crate::ledger::LedgerKind::Usage;
         let revenue = usage.then(|| {
@@ -913,7 +1042,7 @@ pub fn export_ledger_csv(
             ))
         });
         csv.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             csv_text(&e.id),
             csv_text(&e.card_id),
             e.ts_secs,
@@ -936,13 +1065,24 @@ pub fn export_ledger_csv(
             } else {
                 String::new()
             },
+            csv_text(e.operator_id.as_deref().unwrap_or("")),
+            csv_text(e.reason.as_deref().unwrap_or("")),
+            csv_text(e.rate_card_version.as_deref().unwrap_or("")),
+            csv_text(
+                e.detail
+                    .as_ref()
+                    .filter(|_| usage)
+                    .and_then(|detail| detail.get("keyId"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+            ),
         ));
     }
     csv
 }
 
 /// A micro-unit amount as a decimal of whole units, without trailing zeros: -1.5, 2, 0.000001.
-fn micro_decimal(micro: i64) -> String {
+pub(crate) fn micro_decimal(micro: i64) -> String {
     let sign = if micro < 0 { "-" } else { "" };
     let (whole, fraction) = (
         micro.unsigned_abs() / 1_000_000,

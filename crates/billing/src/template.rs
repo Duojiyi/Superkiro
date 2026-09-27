@@ -69,6 +69,8 @@ pub struct Plan {
     pub price_cny: f64,
     /// How long a card is valid from its activation.
     pub validity_days: u32,
+    /// Devices a card may bind: 1, the only number issuance takes. Kept so that cards with
+    /// more devices can raise it once they exist.
     pub max_devices: u32,
     /// Requests a card may have in flight at once.
     pub concurrency: u32,
@@ -154,8 +156,9 @@ impl Plan {
             Some("Plan prices must be 0-100000 yuan, to the fen")
         } else if !(1..=3650).contains(&self.validity_days) {
             Some("Plan validity must be 1-3650 days")
-        } else if !(1..=10).contains(&self.max_devices) {
-            Some("Plans allow 1-10 devices")
+        } else if self.max_devices != 1 {
+            // A plan for more would be on sale and never issue a card.
+            Some("Plans allow exactly 1 device, as cards bind one")
         } else if !(1..=20).contains(&self.concurrency) {
             Some("Plan concurrency must be 1-20")
         } else if !KIRO_PLAN_TYPES.contains(&self.kiro_plan_type.as_str()) {
@@ -167,13 +170,19 @@ impl Plan {
 }
 
 /// The plans a state that has stored none has: the four tiers as they were issued before
-/// the catalog, 30 days, one device, two requests at once, into group-pro-plus (or, without
-/// it, the first group by ID).
+/// the catalog, 30 days, one device, two requests at once, into group-pro-plus or, without
+/// it, the first group by ID that takes cards: never one closed to issuance, such as the
+/// acceptance probe group, which no customer is in.
 pub fn seed_plans(groups: &HashMap<String, Group>) -> Vec<Plan> {
     let default_group = if groups.contains_key("group-pro-plus") {
         "group-pro-plus"
     } else {
-        groups.keys().min().map_or("group-pro-plus", String::as_str)
+        groups
+            .values()
+            .filter(|group| group.issuance_enabled)
+            .map(|group| group.id.as_str())
+            .min()
+            .unwrap_or("group-pro-plus")
     };
     PLAN_PRICES
         .iter()

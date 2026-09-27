@@ -203,6 +203,11 @@ async fn production_cookie_login_csrf_reveal_logout_and_fail_closed() {
             json!({"cardId": card_id, "action": "unban", "reason": "误封"}),
         ),
         (
+            "cards/quotas",
+            json!({"cardId": card_id, "maxConcurrency": 2, "reason": "调整"}),
+        ),
+        ("cards/rekey", json!({"cardId": card_id, "reason": "泄露"})),
+        (
             "announcements/edit",
             json!({"id": "ann-1", "title": "维护改期"}),
         ),
