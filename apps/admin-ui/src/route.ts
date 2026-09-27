@@ -23,6 +23,8 @@ const PARAMS: Partial<Record<Tab, Record<string, Check>>> = {
   traces: {card: text, q: search, status: oneOf('error', 'client_aborted', 'in_progress', 'success'), range: oneOf('hour', 'day', 'custom'), from: minute, to: minute,
     // An empty reason is 未分类: a filter of its own.
     reason: value => value === '' || text(value), model: text, provider: text, open: text},
+  // 模型与定价: the model a link named (a failing or loss-making model, a broken route).
+  models: {model: text},
   providers: {provider: text, key: text, edit: text},
 };
 
@@ -57,19 +59,21 @@ export function intentOf({tab, params}: Route): Intent {
   if (tab === 'cards') return {cards: {status: params.status as never, quick: params.quick as never, search: params.q, group: params.group, open: params.open}};
   if (tab === 'traces') return {traces: {status: params.status as never, window: params.range as never, from: params.from, to: params.to, search: params.card ?? params.q,
     card: params.card, reason: params.reason, model: params.model, provider: params.provider, open: params.open}};
+  if (tab === 'models') return {models: {model: params.model}};
   if (tab === 'providers') return {providers: {provider: params.provider, key: params.key, edit: params.edit}};
   return {};
 }
 
 /** A page's address for where it is (its state in the words of an Intent). */
 export function routeOf(tab: Tab, intent: Intent = {}): Route {
-  const cards = intent.cards, traces = intent.traces, providers = intent.providers;
+  const cards = intent.cards, traces = intent.traces, providers = intent.providers, models = intent.models;
   const raw: Record<string, string | undefined> = tab === 'cards' ? {q: cards?.search?.trim(), status: cards?.status === 'CURRENT' ? undefined : cards?.status,
       quick: cards?.quick, group: cards?.group === 'ALL' ? undefined : cards?.group, open: cards?.open}
     : tab === 'traces' ? {card: traces?.card, q: traces?.card ? undefined : traces?.search?.trim(), status: traces?.status === 'ALL' ? undefined : traces?.status,
       range: traces?.window === 'all' ? undefined : traces?.window, from: traces?.window === 'custom' ? traces.from : undefined, to: traces?.window === 'custom' ? traces.to : undefined,
       reason: traces?.reason, model: traces?.model === 'ALL' ? undefined : traces?.model,
       provider: traces?.provider === 'ALL' ? undefined : traces?.provider, open: traces?.open}
+    : tab === 'models' ? {model: models?.model}
     : tab === 'providers' ? {provider: providers?.provider, key: providers?.key, edit: providers?.edit} : {};
   return {tab, params: kept(tab, name => raw[name])};
 }

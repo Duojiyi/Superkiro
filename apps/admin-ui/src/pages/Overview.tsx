@@ -101,6 +101,10 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
   const providerName = (id: unknown) => String(data.providers.find(provider => provider.id === id)?.name ?? id);
   const toKey = (key: Row) => () => onNavigate('providers', {providers: {key: String(key.id)}});
   const toProvider = (id: unknown) => () => onNavigate('providers', {providers: {provider: String(id)}});
+  // 模型与定价 scrolled to a model customers ask for, when it is listed there.
+  const listed = (model: unknown) => data.models.some(row => row.exposed_model_id === model);
+  const toModel = (model: unknown) => () => onNavigate('models', {models: {model: String(model)}});
+  const modelLink = (model: unknown) => listed(model) ? [{label: '查看模型', go: toModel(model)}] : [];
   // A save failed: until one succeeds the server refuses every change and every request.
   const saving = persistence(data.stats);
   if (saving?.problem) attention.push({text: `保存失败：${saving.problem.text}，服务器现在拒绝所有修改和客户请求`, tone: 'danger', go: () => onNavigate('security')});
@@ -113,7 +117,7 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
   for (const {model, route} of broken.filter(entry => entry.route.down)) {
     const problem = targetProblem(route.primary, data.providers, nowSecs), fix = route.primary.keys?.[0];
     const links = [...(fix ? [{label: '查看 Key', go: toKey(fix)}] : ['no_key', 'provider_disabled'].includes(String(route.primary.problem)) ? [{label: '查看供应商', go: toProvider(route.primary.provider_id)}] : []),
-      {label: '去模型与定价', go: () => onNavigate('models')}];
+      {label: '去模型与定价', go: toModel(model.exposed_model_id)}];
     attention.push({text: `${modelName(model, data.models, data.groups)}：${route.backups.length ? `主线路 ${problem}，${route.backups.length} 条备用线路也不能用` : `唯一线路 ${problem}`}`,
       tone: 'danger', go: links[0].go, links});
   }
@@ -136,7 +140,10 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
   const failing = activity?.modelHealth ? failingModels(activity.modelHealth) : null;
   if (failing) {
     const each = failing.length <= 3 ? failing : [];
-    for (const entry of each) attention.push({text: entry.text, tone: 'danger', go: () => onNavigate('traces', {traces: {status: 'error', window: entry.window, model: entry.model}})});
+    for (const entry of each) {
+      const toFailures = () => onNavigate('traces', {traces: {status: 'error', window: entry.window, model: entry.model}});
+      attention.push({text: entry.text, tone: 'danger', go: toFailures, ...(listed(entry.model) ? {links: [{label: '查看失败请求', go: toFailures}, ...modelLink(entry.model)]} : {})});
+    }
     if (failing.length > 3) attention.push({text: `${failing.length} 个模型有失败：${nameList(failing.map(entry => entry.model), 3)}`, tone: 'danger',
       go: () => onNavigate('traces', {traces: {status: 'error', window: failing.some(entry => entry.window === 'day') ? 'day' : 'hour'}})});
   }
@@ -145,8 +152,9 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
   if (!failing && failedLastHour.length) {
     const byModel = [...failedLastHour.reduce((counts, trace) => counts.set(String(trace.exposed_model ?? '—'), (counts.get(String(trace.exposed_model ?? '—')) ?? 0) + 1), new Map<string, number>())].sort((a, b) => b[1] - a[1]);
     const only = byModel.length === 1 && byModel[0][0] !== '—' ? byModel[0][0] : null;
+    const toFailures = () => onNavigate('traces', {traces: {status: 'error', window: 'hour', ...(only ? {model: only} : {})}});
     attention.push({text: only ? `近 1 小时 ${only} 失败 ${failedLastHour.length} 次` : `近 1 小时 ${failedLastHour.length} 次失败请求（最多：${byModel[0][0]} ${byModel[0][1]} 次）`,
-      tone: 'danger', go: () => onNavigate('traces', {traces: {status: 'error', window: 'hour', ...(only ? {model: only} : {})}})});
+      tone: 'danger', go: toFailures, ...(only && listed(only) ? {links: [{label: '查看失败请求', go: toFailures}, ...modelLink(only)]} : {})});
   }
   const frozen = currentCards.filter(card => cardState(card, nowSecs) === 'frozen').length;
   if (frozen) attention.push({text: `${frozen} 张卡已冻结`, tone: 'warning', go: () => onNavigate('cards', {cards: {status: 'FROZEN'}})});
@@ -181,9 +189,12 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
     const rate = !(Number(row.requests ?? 0) > 0) || !cost ? null : typeof row.margin_percentage === 'number' ? row.margin_percentage : value ? (value - cost) / value * 100 : null;
     return {model: String(row.model_id ?? '—'), rate};
   }).filter((row): row is {model: string; rate: number} => row.rate !== null && row.rate < 0).sort((a, b) => a.rate - b.rate);
+  const toFinance = () => onNavigate('reconciliation');
   if (losing.length) attention.push({text: losing.length <= 2
     ? `今天 ${losing.map(row => `${row.model} 毛利 ${formatPercent(row.rate)}`).join('、')}：售价低于采购价，按成本在亏`
-    : `今天 ${losing.length} 个模型按成本在亏：${nameList(losing.map(row => row.model), 3)}`, tone: 'danger', go: () => onNavigate('reconciliation')});
+    : `今天 ${losing.length} 个模型按成本在亏：${nameList(losing.map(row => row.model), 3)}`, tone: 'danger', go: toFinance,
+    // One model: its price is changed on 模型与定价.
+    ...(losing.length === 1 && listed(losing[0].model) ? {links: [{label: '去财务对账', go: toFinance}, ...modelLink(losing[0].model)]} : {})});
   attention.sort((a, b) => URGENCY[a.tone] - URGENCY[b.tone]);
   const unknown = failures.cards || failures.providers || failures.traces;
   // Shown models whose primary route cannot serve: those nothing can serve, and those a backup serves.

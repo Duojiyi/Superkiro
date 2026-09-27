@@ -18,6 +18,10 @@ const now=Math.floor(Date.now()/1000);
 // failed outright, and for five the test provider took over and answered.
 fixture.providers.push({id:'hanyue-max',name:'瀚月 Max',base_url:'https://max.hanyue.invalid',enabled:true,format:'anthropic'});
 fixture.keys.push({id:'hanyue-max-key-1',provider_id:'hanyue-max',allowed_models:['claude-opus-5-5'],weight:1,enabled:true,health_state:'healthy'});
+// claude-opus-5-5 is listed on 模型与定价, served by 瀚月 Max with the test provider as its backup.
+fixture.config.models.push({id:'fixture-model-opus',exposed_model_id:'claude-opus-5-5',target_provider_id:'hanyue-max',target_model:'claude-opus-5-5',group_id:'fixture-group-0',context_window:200000,max_output:64000,
+  credit_multiplier:1,visible:true,supports_tools:true,supports_vision:true,supports_reasoning:true,sort_order:0,aliases:[],fallback_chain:[{provider_id:'fixture-provider',target_model:'claude-sonnet'}],
+  display_name:null,description:null,rate_multiplier:null,retired:false});
 const hanyue={provider_id:'hanyue-max',key_id:'hanyue-max-key-1',success:false,error:'http_529',latency_ms:900};
 const request=(id,ts,fields)=>({id,card_id:'fixture-card-0',ts,invocation_id:`fixture-card-0:${id}`,exposed_model:'claude-opus-5-5',status:'error',ttft_ms:null,tokens_per_second:null,
   error_class:'upstream_start_failed',provider_id:null,input_tokens:0,output_tokens:0,credits_charged:0,provider_cost_micro_cny:0,attempt_chain:[hanyue],...fields});
@@ -45,9 +49,9 @@ fixture.traces.sort((a,b)=>b.ts-a.ts);
     const cells=async name=>health.getByRole('row').filter({hasText:name}).locator('td').allInnerTexts();
     await page.goto(origin+'/admin/');await page.getByLabel('密码',{exact:true}).fill('fixture-password');await button('登录').click();await button('刷新').waitFor();
 
-    // 需要关注 names each failing model, and leads to its failed requests.
-    const failing=attention.getByRole('button',{name:'claude-opus-5-5 近 1 小时 7 次失败（共 12 次）：上游未响应（未开始输出）'});await failing.waitFor();
-    assert((await failing.getAttribute('class')).includes('is-danger'));
+    // 需要关注 names each failing model, and leads to its failed requests and, when it is listed, to the model.
+    const failing=attention.locator('li').filter({has:page.getByText('claude-opus-5-5 近 1 小时 7 次失败（共 12 次）：上游未响应（未开始输出）',{exact:true})});await failing.waitFor();
+    assert((await failing.locator('.attention-item').getAttribute('class')).includes('is-danger'));
     await attention.getByRole('button',{name:'claude-opus-4-8 近 24 小时 3 次请求全部失败：上游未响应（未开始输出）'}).waitFor();
     // 服务健康: every attempt, the failures (coloured), the takeovers and the failures by kind.
     const hanyueRow=await cells('瀚月 Max');
@@ -56,12 +60,19 @@ fixture.traces.sort((a,b)=>b.ts-a.ts);
     const fixtureRow=await cells('测试供应商 / Fixture');
     assert.deepEqual(fixtureRow.slice(3,6),['59','11（18.6%）','—'],'its own attempts and failures, the ones it took over counted as its successes');
     assert.equal(await health.locator('.estimate-tag').count(),0,'from the server: not an estimate');
-    await failing.click();
+    await failing.getByRole('button',{name:'查看失败请求',exact:true}).click();
     await page.getByRole('heading',{name:'调用追踪',level:2,exact:true}).waitFor();
     assert.equal(await page.evaluate(()=>location.hash),'#/traces?status=error&range=hour&model=claude-opus-5-5');
     await page.locator('tbody tr').filter({hasText:'claude-opus-5-5'}).first().waitFor();
     assert.equal(await page.locator('tbody tr').count(),7);
-    console.log('PASS: 需要关注 names the models that fail (in the last hour, or all of the last day) and opens their failed requests; 服务健康 counts attempts, failures, takeovers and kinds');
+    // 查看模型: 模型与定价 scrolled to it and marked; the address names it, so a reload shows it again.
+    await nav('运营概览');await failing.getByRole('button',{name:'查看模型',exact:true}).click();
+    await page.locator('tr[data-model="claude-opus-5-5"].is-marked').waitFor();
+    assert.equal(await page.evaluate(()=>location.hash),'#/models?model=claude-opus-5-5');
+    await page.reload();await page.locator('tr[data-model="claude-opus-5-5"].is-marked').waitFor();
+    await nav('运营概览');
+    assert.equal(await attention.locator('li').filter({hasText:'claude-opus-4-8 近 24 小时'}).getByRole('button',{name:'查看模型'}).count(),0,'a model not listed has no model to open');
+    console.log('PASS: 需要关注 names the models that fail (in the last hour, or all of the last day) and opens their failed requests or, when listed, the model; 服务健康 counts attempts, failures, takeovers and kinds');
 
     // The provider cards and their Keys: the same attempts, per Key too.
     await nav('供应商与 Key');
@@ -81,7 +92,7 @@ fixture.traces.sort((a,b)=>b.ts-a.ts);
     await nav('运营概览');
     assert.deepEqual((await cells('瀚月 Max')).slice(3,7),['12','12（100.0%）','5','HTTP 529 · 上游过载 × 12']);
     await health.locator('.estimate-tag').waitFor();
-    await attention.getByRole('button',{name:'近 1 小时 claude-opus-5-5 失败 7 次'}).waitFor();
+    await attention.locator('li').filter({has:page.getByText('近 1 小时 claude-opus-5-5 失败 7 次',{exact:true})}).getByRole('button',{name:'查看失败请求',exact:true}).waitFor();
     assert.deepEqual(errors,[]);assert.deepEqual(nativeDialogs,[],'no browser-native dialogs');
     console.log('PASS: without the server\'s attempts, the traces are counted the same way (marked as an estimate), and failed requests of the last hour are named as before');
   }finally{

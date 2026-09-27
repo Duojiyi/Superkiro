@@ -52,6 +52,8 @@ const writes=endpoint=>fixture.writes.filter(write=>write.endpoint===endpoint);
     assert.equal(await page.evaluate(()=>location.hash),'#/providers?key=fixture-openai-key-1');
     await page.evaluate(()=>history.back());await page.getByRole('heading',{name:'运营概览',level:2,exact:true}).waitFor();
     await attention.locator('li').first().getByRole('button',{name:'去模型与定价',exact:true}).click();
+    // The model itself, marked, and named in the address.
+    await page.locator('tr[data-model="gpt-6-astra"].is-marked').waitFor();assert.equal(await page.evaluate(()=>location.hash),'#/models?model=gpt-6-astra');
     const astraRow=page.getByRole('row').filter({has:page.getByRole('button',{name:'gpt-6-astra 的更多操作',exact:true})});
     const mark=astraRow.getByText('无可用线路',{exact:true});await mark.waitFor();
     assert.equal(await mark.getAttribute('title'),'OpenAI 格式 / Fixture 的 Key 返回 401');

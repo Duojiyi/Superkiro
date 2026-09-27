@@ -54,8 +54,12 @@ const sums=(from,to)=>{
     assert.deepEqual(figures,[money(day.revenue),money(day.cost),money(day.gross)],figures.join(' | '));
     if(day.uncosted)await strip.getByText(`另有 ${day.uncosted} 次未设成本`,{exact:false}).waitFor();
     if(day.entries.some(entry=>entry.exposed_model==='gpt-6-astra')){
-      const loss=page.locator('.attention-list').getByRole('button',{name:/^今天 gpt-6-astra 毛利 -\d+\.\d%：售价低于采购价，按成本在亏/});
-      await loss.click();await page.getByRole('heading',{name:'财务对账',level:2,exact:true}).waitFor();
+      // One model: to its price on 模型与定价, or to 财务对账.
+      const loss=page.locator('.attention-list li').filter({has:page.getByText(/^今天 gpt-6-astra 毛利 -\d+\.\d%：售价低于采购价，按成本在亏$/)});
+      await loss.getByRole('button',{name:'查看模型',exact:true}).click();
+      await page.locator('tr[data-model="gpt-6-astra"].is-marked').waitFor();assert.equal(await page.evaluate(()=>location.hash),'#/models?model=gpt-6-astra');
+      await nav('运营概览');
+      await loss.getByRole('button',{name:'去财务对账',exact:true}).click();await page.getByRole('heading',{name:'财务对账',level:2,exact:true}).waitFor();
     } else {console.log('(the loss-making requests fell before midnight: the attention item is not checked)');await nav('财务对账');}
     console.log('PASS: 运营概览 shows 今日收入 / 成本 / 毛利 from today\'s financials and raises a model sold below cost today');
 
