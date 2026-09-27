@@ -113,6 +113,21 @@ export function extensionText(result: Extension): string {
   return `到期 ${minuteText(result.from)} → ${minuteText(result.to)}`;
 }
 
+/** Where a customer downloads the client: in the texts handed to them. */
+export const DOWNLOAD_URL = 'https://kiro.rent';
+
+/** A card as the text handed with a new code reads it. */
+export interface HandoutCard {id: string; pointsAvailable: number; validUntil?: number | null; activationDurationSecs?: number | null; planName?: string | null; plan?: {name: string} | null}
+
+/** What the customer is sent with a new code: the code, what the card holds now, and that the old one no longer works. */
+export function rekeyHandout(card: HandoutCard, code: string): string {
+  const plan = card.plan?.name ?? card.planName;
+  const validity = card.validUntil ? `到 ${minuteText(card.validUntil)}`
+    : typeof card.activationDurationSecs === 'number' && card.activationDurationSecs > 0 ? `激活后 ${daysText(card.activationDurationSecs)}` : '激活后起算';
+  return [`卡密：${code}`, ...(plan ? [`套餐：${plan}`] : []), `余额：${formatCredits(card.pointsAvailable)} 积分`, `有效期：${validity}`, `下载地址：${DOWNLOAD_URL}`,
+    '原来的卡密已停用，请用新卡密重新登录。'].join('\n');
+}
+
 /** A card's limits as the server keeps them: requests at once, and credits in a UTC day and over 30 days (micro-credits; null: none). */
 export interface CardLimits {maxConcurrency?: number; dailyCreditLimit?: number | null; monthlyCreditLimit?: number | null}
 /** What 修改限额 sends: only the limits that change (micro-credits; null clears a limit). */
@@ -189,6 +204,9 @@ export function historyDetail(event: {action: string; detail?: unknown}, groupNa
     }
     case 'group': return typeof detail.groupId === 'string'
       ? `${typeof detail.previousGroupId === 'string' ? groupName(detail.previousGroupId) : '—'} → ${groupName(detail.groupId)}` : '';
+    // A fingerprint of the old and the new code (the first 8 hex digits of their hashes), never a code.
+    case 'rekey': return typeof detail.codeFingerprint === 'string'
+      ? `卡密指纹 ${typeof detail.previousCodeFingerprint === 'string' ? detail.previousCodeFingerprint : '—'} → ${detail.codeFingerprint}` : '';
     // Each limit changed, with the one it replaced (null: no limit).
     case 'quotas': {
       const limit = (value: unknown) => limitText(number(value));
@@ -234,6 +252,10 @@ const CARD_REFUSALS: Array<[RegExp, (rest: string, match: RegExpExecArray) => st
   [/cardId and deviceId are required|cardId and groupId are required|cardId is required|Invalid card ID in cardIds/i, () => '请求缺少卡密、设备或分组，请刷新后重试'],
   [/Invalid request body/i, () => '提交的内容无效，请刷新后重试'],
   [/invocationId must be/i, () => '关联的请求编号无效（最多 257 个字母、数字或 - _ . :）'],
+  [/Voided cards cannot be given a new code/i, () => '已作废的卡不能更换卡密'],
+  [/Archived cards must be unarchived before they are given a new code/i, () => '已归档的卡要先取消归档，再更换卡密'],
+  [/another card already uses this code/i, () => '新卡密恰好和另一张卡的一样（极少见），没有更换：请再换一次'],
+  [/Card encryption failed/i, () => '服务器没能加密保存新卡密，没有更换：请检查服务器的主密钥'],
   [/Give maxConcurrency, dailyCreditLimit or monthlyCreditLimit/i, () => '没有要修改的限额'],
   [/maxConcurrency must be between 1 and 20/i, () => `同时请求数须在 1–${MAX_CONCURRENCY} 之间`],
   [/dailyCreditLimit and monthlyCreditLimit must be null or/i, () => `每日和近 30 天的积分上限须在 0–${formatCredits(MAX_CREDIT_LIMIT)} 积分之间，或不限`],

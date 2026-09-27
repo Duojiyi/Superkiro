@@ -820,3 +820,12 @@ div.attention-item:hover {background: transparent;}
   .cards-table .col-note, .cards-table .col-group, .cards-table .col-device {display: none;}
 }
 @media (prefers-reduced-motion: reduce) {* {transition: none !important; animation: none !important; scroll-behavior: auto !important;}}
+
+/* ---------- Support, money and records (cards, 调用追踪, finance, notices) ---------- */
+/* A card's drawer: what cannot be undone, apart at its end. */
+.danger-zone {padding-top: 12px; border-top: 1px solid var(--border-subtle);}
+.danger-zone h4 {color: var(--danger);}
+.danger-actions {display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px;}
+.danger-actions .muted {font-size: 12px; line-height: 18px;}
+.quota-grid {grid-template-columns: repeat(3, minmax(0, 1fr));}
+@media (max-width: 640px) {.quota-grid {grid-template-columns: minmax(0, 1fr);}}

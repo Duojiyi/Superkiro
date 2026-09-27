@@ -95,7 +95,19 @@ console.log('PASS: history actions and their details (device, previous allowance
     ['maxConcurrency must be between 1 and 20', '同时请求数须在 1–20 之间'],
     ['dailyCreditLimit and monthlyCreditLimit must be null or 0-10000000000000 micro-credits', '每日和近 30 天的积分上限须在 0–10,000,000 积分之间，或不限'],
   ]) assert.equal(support.explainCardRefusal(text), expected, text);
-  console.log('PASS: 限额 in words (不限 for none), limits typed in credits to the micro-credit, only the changed ones sent, the history with the values replaced, and the quota refusals in words');
+  // 更换卡密: the history keeps fingerprints only; its refusals in words; the customer's text says what the card holds.
+  assert.equal(support.historyLabel('rekey'), '更换卡密');
+  assert.equal(support.historyDetail({action: 'rekey', detail: {previousCodeFingerprint: '1a2b3c4d', codeFingerprint: '5e6f7a8b'}}), '卡密指纹 1a2b3c4d → 5e6f7a8b');
+  for (const [text, expected] of [
+    ['Voided cards cannot be given a new code: card-1', '已作废的卡不能更换卡密'],
+    ['Archived cards must be unarchived before they are given a new code: card-1', '已归档的卡要先取消归档，再更换卡密'],
+    ['another card already uses this code', '新卡密恰好和另一张卡的一样（极少见），没有更换：请再换一次'],
+    ['Card encryption failed', '服务器没能加密保存新卡密，没有更换：请检查服务器的主密钥'],
+  ]) assert.equal(support.explainCardRefusal(text), expected, text);
+  const handout = support.rekeyHandout({id: 'card-1', pointsAvailable: 884.02, validUntil: null, activationDurationSecs: 30 * DAY, plan: {name: 'PRO+'}}, 'kiro-aaaa-bbbb');
+  assert.equal(handout, '卡密：kiro-aaaa-bbbb\n套餐：PRO+\n余额：884.02 积分\n有效期：激活后 30 天\n下载地址：https://kiro.rent\n原来的卡密已停用，请用新卡密重新登录。');
+  assert.match(support.rekeyHandout({id: 'card-1', pointsAvailable: 10, validUntil: now, planName: 'PRO'}, 'kiro-c'), /^卡密：kiro-c\n套餐：PRO\n余额：10 积分\n有效期：到 \d{4}-\d{2}-\d{2} \d{2}:\d{2}\n/);
+  console.log('PASS: 限额 in words (不限 for none), limits typed in credits to the micro-credit, only the changed ones sent, the history with the values replaced, and the quota refusals in words; 更换卡密 keeps fingerprints only, its refusals in words, and its text for the customer says what the card holds');
 }
 
 // Refusals in the server's words, explained; the cards they name are listed short.

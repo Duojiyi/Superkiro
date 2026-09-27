@@ -9,8 +9,8 @@ import {ask, confirmAction} from '../components/confirm';
 import {Modal} from '../components/modal';
 import {toast} from '../components/toast';
 import {IdCell} from '../components/ui';
-import {CARD_CHANGE_KEY, DAILY_WINDOW, endOfDay, explainCardRefusal, EXTENSION_DAYS, extension, extensionText, limitInput, MAX_CONCURRENCY, MAX_EXTEND_CARDS, MONTHLY_WINDOW, quotaChange,
-  REASON_MAX_CHARS, rebindText, unchanged, validReason, type QuotaChange} from '../cardSupport';
+import {CARD_CHANGE_KEY, DAILY_WINDOW, DOWNLOAD_URL, endOfDay, explainCardRefusal, EXTENSION_DAYS, extension, extensionText, limitInput, MAX_CONCURRENCY, MAX_EXTEND_CARDS, MONTHLY_WINDOW, quotaChange,
+  REASON_MAX_CHARS, rebindText, rekeyHandout, unchanged, validReason, type QuotaChange} from '../cardSupport';
 import {formatCount, formatCredits, shortId} from '../format';
 import {cardState, cardStatusView} from '../status';
 import type {Refresh, ReportError, Row, WriteGuards} from '../types';
@@ -192,6 +192,33 @@ function QuotaDialog({card, onSubmit, onClose}: {
   </Modal>;
 }
 
+/** The new code, shown this once, with copy and the text for the customer; closing asks whether it was kept. */
+function NewCodeDialog({card, code, onClose}: {card: AdminCardItem; code: string; onClose: () => void}) {
+  const [error, setError] = useState('');
+  const copy = async (text: string, done: string) => {
+    try {await navigator.clipboard.writeText(text); setError(''); toast.success(done);}
+    catch {setError('复制失败，请手动选中复制');}
+  };
+  const finish = async () => {
+    if (await confirmAction({title: '已保存新卡密？', consequence: card.codeRecoverable ? '之后可在列表里用“显示卡密”再看（会记录）。' : '关闭后不再显示，也不能再查看。', confirmLabel: '完成'})) onClose();
+  };
+  return <Modal label="新卡密" onClose={() => void finish()} className="dialog-narrow">
+    <h3 className="modal-title">新卡密 · <span className="mono">{shortId(card.id, 'card')}</span></h3>
+    <textarea aria-label="新卡密明文" readOnly rows={2} className="secret-block" value={code} onFocus={event => event.currentTarget.select()}/>
+    <p className="note-warning">旧卡密已经停用，这张卡的登录都已退出：把新卡密发给客户，客户用它重新登录。</p>
+    <p className="muted">卡密 ID 不变（<span className="mono">{card.id}</span>）：以后按新卡密搜索找不到这张卡，请用卡密 ID 或备注搜索。{card.codeRecoverable ? '之后可在列表里用“显示卡密”再看（会记录）。' : '只显示这一次。'}</p>
+    {error && <p role="alert" className="form-error">{error}</p>}
+    <div className="modal-actions">
+      <button type="button" className="btn" title={`新卡密、套餐、余额、有效期和下载地址 ${DOWNLOAD_URL}`} onClick={() => void copy(rekeyHandout(card, code), '已复制发给客户的文本')}>复制发货文本</button>
+      <button type="button" className="btn btn-primary" data-autofocus onClick={() => void copy(code, '已复制新卡密')}>复制</button>
+      <button type="button" className="btn" onClick={() => void finish()}>完成</button>
+    </div>
+  </Modal>;
+}
+
+/** The end of a card's short ID, typed to confirm what cannot be undone (the whole ID when it is short). */
+export const typedCardId = (id: string) => shortId(id, 'card').includes('…') ? id.slice(-4) : id;
+
 export interface CardSupport {
   /** Why support actions are not available now (a result to check, another write), or undefined. */
   blockedTitle?: string;
@@ -205,11 +232,15 @@ export interface CardSupport {
   changeGroup: (card: AdminCardItem) => void;
   /** Opens 修改限额 for the card. */
   changeQuotas: (card: AdminCardItem) => void;
+  /** 更换卡密, after a strong confirmation; `preface` says why it is offered (from 解绑, say). */
+  rekey: (card: AdminCardItem, preface?: string) => void;
+  /** Counts the changes made here; a card's history is read again after each (a new code changes no field it shows). */
+  revision: number;
   /** The recovery panel and the dialogs, rendered by the page. */
   view: ReactNode;
 }
 
-export function useCardSupport({cards, groups, groupName, guards, refresh, reportError, updateCards, blocked, onShowCards}: {
+export function useCardSupport({cards, groups, groupName, guards, refresh, reportError, updateCards, blocked, onShowCards, onSecretShown}: {
   cards: AdminCardItem[];
   groups: Row[];
   groupName: (id: string) => string;
@@ -221,6 +252,8 @@ export function useCardSupport({cards, groups, groupName, guards, refresh, repor
   blocked: boolean;
   /** Shows this card in the list with its details open (the recovery panel's 查看这张卡). */
   onShowCards: (cardIds: string[]) => void;
+  /** A new code is on screen (leaving the page asks first), or no longer. */
+  onSecretShown?: (shown: boolean) => void;
 }): CardSupport {
   const {writing, mounted} = guards;
   const [pending, setPending] = useState<Pending | null>(loadPending);
@@ -230,6 +263,9 @@ export function useCardSupport({cards, groups, groupName, guards, refresh, repor
   const [extending, setExtending] = useState<{cards: AdminCardItem[]; everyResult: boolean} | null>(null);
   const [grouping, setGrouping] = useState<AdminCardItem | null>(null);
   const [limiting, setLimiting] = useState<AdminCardItem | null>(null);
+  const [rekeyed, setRekeyed] = useState<{card: AdminCardItem; code: string} | null>(null);
+  const [revision, setRevision] = useState(0);
+  useEffect(() => {onSecretShown?.(!!rekeyed);}, [rekeyed, onSecretShown]);
   const latest = useRef(cards);
   latest.current = cards;
   useEffect(() => {if (extending || grouping || limiting) reportError('');}, [extending, grouping, limiting, reportError]);
@@ -251,6 +287,7 @@ export function useCardSupport({cards, groups, groupName, guards, refresh, repor
       sessionStorage.removeItem(CARD_CHANGE_KEY);
       const changed = result.cards ?? (result.card ? [result.card] : []);
       if (mounted.current && changed.length) updateCards(latest.current.map(card => ({...card, ...changed.find(next => next.id === card.id)})));
+      if (mounted.current) setRevision(value => value + 1);
       toast.success(done);
       void refresh({keepSelection: true});
       return null;
@@ -338,6 +375,29 @@ export function useCardSupport({cards, groups, groupName, guards, refresh, repor
     return result || null;
   };
 
+  const rekey = async (card: AdminCardItem, preface?: string) => {
+    if (unavailable || pending) return;
+    const answer = await ask({
+      title: `更换卡密 ${shortId(card.id, 'card')}？`,
+      facts: [...facts(card), card.boundDevices.length ? `已绑定 ${card.boundDevices.length} 台设备（不变）` : '未绑定设备'],
+      body: preface ? <p className="confirm-hint">{preface}</p> : undefined,
+      consequence: '旧卡密马上失效，这张卡的所有登录马上退出，客户要用新卡密重新登录。余额、有效期、设备和记录都不变。新卡密只在下一步显示。',
+      confirmLabel: '更换卡密', danger: true, typed: typedCardId(card.id),
+      reason: reasonField('例：客户说卡密泄露了', ['卡密泄露', '电脑丢失或被盗', '客户要求']),
+    });
+    if (!answer.confirmed || !mounted.current) return;
+    let code = '', changed: AdminCardItem | undefined;
+    const failure = await send('更换卡密', [card.id], async () => {
+      const result = await adminApi.rekeyCard(card.id, answer.reason);
+      code = typeof result.rawCode === 'string' ? result.rawCode : ''; changed = result.card;
+      return result;
+    }, `已更换 ${shortId(card.id, 'card')} 的卡密`);
+    if (failure) {reportError(`没有更换卡密：${failure}`); return;}
+    if (failure !== null || !mounted.current) return;
+    if (!code) {reportError('卡密已经更换，但服务器没有返回新卡密：请用“显示卡密”查看，或再换一次。'); return;}
+    setRekeyed({card: changed ?? card, code});
+  };
+
   const refreshForReview = async () => {
     if (checking || writing.current) return;
     setChecking(true); setReview('refresh');
@@ -370,9 +430,10 @@ export function useCardSupport({cards, groups, groupName, guards, refresh, repor
     {extending && <ExtendDialog targets={extending.cards} everyResult={extending.everyResult} onClose={() => setExtending(null)} onSubmit={submitExtension}/>}
     {grouping && <GroupDialog card={grouping} groups={groups} groupName={groupName} onClose={() => setGrouping(null)}
       onSubmit={(groupId, reason) => submitGroup(grouping, groupId, reason)}/>}
+    {rekeyed && <NewCodeDialog card={rekeyed.card} code={rekeyed.code} onClose={() => setRekeyed(null)}/>}
     {limiting && <QuotaDialog card={limiting} onClose={() => setLimiting(null)} onSubmit={(change, reason) => submitQuotas(limiting, change, reason)}/>}
   </>;
 
   return {blockedTitle, unban: card => void unban(card), unbind: (card, device) => void unbind(card, device), resetRebinds: card => void resetRebinds(card),
-    extend, saveNote, changeGroup, changeQuotas, view};
+    extend, saveNote, changeGroup, changeQuotas, rekey: (card, preface) => void rekey(card, preface), revision, view};
 }

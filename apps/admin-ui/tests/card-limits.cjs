@@ -1,6 +1,6 @@
 // A card's drawer: 限额 (requests at once, credits a UTC day and over 30 days), each change written to
-// the card's history with the values it replaced; refusals in words. Final build + loopback fixture,
-// never production.
+// the card's history with the values it replaced; 更换卡密 behind a strong confirmation, the new code
+// shown once; refusals in words. Final build + loopback fixture, never production.
 const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
 const recordToasts=require('./toasts.cjs');
 const http=require('node:http'),fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
@@ -73,6 +73,43 @@ const server=http.createServer(async(req,res)=>{
     await limits.getByText('同时 4 个请求 · 每日 不限 · 近 30 天 不限',{exact:true}).waitFor();
     await idle();
     console.log('PASS: 限额 shows requests at once and the daily (UTC day, 08:00 Beijing) and 30-day limits in credits; a change sends only what changed, needs a reason, is refused in words, and is in the history with the values replaced');
+
+    // 更换卡密: in the danger area, behind a typed confirmation with a reason; the new code is shown once,
+    // with the text for the customer; the history keeps fingerprints only; 显示卡密 then shows the new code.
+    await page.evaluate(()=>{window.copied=[];Object.defineProperty(navigator,'clipboard',{configurable:true,value:{writeText:async value=>{window.copied.push(value);}}});});
+    await page.keyboard.press('Escape');await drawer.waitFor({state:'detached'});await open('fixture-card-5');
+    const danger=drawer.getByRole('region',{name:'危险操作'});
+    await danger.getByRole('button',{name:'更换卡密',exact:true}).click();
+    const confirm=page.getByRole('alertdialog');await confirm.waitFor();
+    const asked=await confirm.innerText();
+    assert(asked.includes('更换卡密 fixture-card-5？')&&asked.includes('旧卡密马上失效，这张卡的所有登录马上退出，客户要用新卡密重新登录')&&asked.includes('余额、有效期、设备和记录都不变'),asked);
+    const accept=confirm.locator('[data-confirm="accept"]');
+    await confirm.getByRole('button',{name:'卡密泄露',exact:true}).click();assert(await accept.isDisabled(),'the card ID must be typed');
+    await confirm.getByLabel('确认输入',{exact:true}).fill('fixture-card-5');await accept.click();await confirm.waitFor({state:'detached'});
+    const shown=page.getByRole('dialog',{name:'新卡密'});await shown.waitFor();await toasts.shown('已更换 fixture-card-5 的卡密');
+    const code=await shown.getByLabel('新卡密明文',{exact:true}).inputValue();
+    assert.match(code,/^kiro(-[0-9a-f]{4}){8}$/);assert.equal(code,fixture.cards[5].rawCode);
+    assert.deepEqual(writes('cards/rekey'),[{cardId:'fixture-card-5',reason:'卡密泄露'}]);
+    assert((await shown.innerText()).includes('以后按新卡密搜索找不到这张卡，请用卡密 ID 或备注搜索'));
+    await shown.getByRole('button',{name:'复制发货文本',exact:true}).click();await toasts.shown('已复制发给客户的文本');
+    const text=(await page.evaluate(()=>window.copied)).at(-1);
+    assert(text.startsWith(`卡密：${code}\n`)&&text.includes('余额：1,500 积分')&&text.endsWith('原来的卡密已停用，请用新卡密重新登录。'),text);
+    // Closing asks whether it was kept; until then leaving the page asks too.
+    await shown.getByRole('button',{name:'完成',exact:true}).click();const kept=page.getByRole('alertdialog');await kept.waitFor();
+    assert((await kept.innerText()).includes('之后可在列表里用“显示卡密”再看（会记录）'));await kept.locator('[data-confirm="accept"]').click();await shown.waitFor({state:'detached'});
+    await history().first().filter({hasText:'更换卡密'}).filter({hasText:'卡密泄露'}).waitFor();
+    const entry=await history().first().innerText();assert(/卡密指纹 [0-9a-f]{8} → [0-9a-f]{8}/.test(entry)&&!entry.includes(code),entry);
+    await idle();
+    await drawer.getByRole('button',{name:'显示卡密',exact:true}).click();
+    assert.equal(await page.getByRole('dialog',{name:'显示卡密'}).getByLabel('卡密明文',{exact:true}).inputValue(),code);
+    await page.getByRole('dialog',{name:'显示卡密'}).getByRole('button',{name:'关闭',exact:true}).click();
+    // An archived card must be unarchived first: said on the button; a refusal from the server is said in words.
+    await page.route('**/api/v1/admin/cards/rekey',route=>route.fulfill({status:409,contentType:'application/json',body:JSON.stringify({success:false,error:'Archived cards must be unarchived before they are given a new code: fixture-card-5'})}),{times:1});
+    await danger.getByRole('button',{name:'更换卡密',exact:true}).click();await confirm.waitFor();
+    await confirm.locator('#confirm-reason').fill('客户要求');await confirm.getByLabel('确认输入',{exact:true}).fill('fixture-card-5');await accept.click();
+    await page.getByRole('alert').filter({hasText:'没有更换卡密：已归档的卡要先取消归档，再更换卡密'}).waitFor();
+    assert.equal(fixture.cards[5].rawCode,code,'nothing changed');assert.equal(await page.getByRole('dialog',{name:'新卡密'}).count(),0);
+    console.log('PASS: 更换卡密 is in the drawer\'s danger area behind a typed confirmation with a reason; the new code is shown once with the text for the customer, the history keeps fingerprints only, and a refusal is said in words');
 
     assert.deepEqual(errors,[]);assert.deepEqual(nativeDialogs,[],'no browser-native dialogs');
   }finally{

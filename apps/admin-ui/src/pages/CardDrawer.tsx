@@ -99,7 +99,7 @@ export default function CardDrawer({card, state, groupName, hasPrev, hasNext, on
     if (result.success !== true || !Array.isArray(result.events)) throw new Error('服务器未确认读取成功');
     return result.events;
   }, [card.id, JSON.stringify([card.status, card.pointsAvailable, card.archivedAt, card.note, card.groupId, card.validUntil, card.activationDurationSecs, card.boundDevices, card.rebindsUsed, card.rebindCooldownUntil,
-    card.maxConcurrency, card.dailyCreditLimit, card.monthlyCreditLimit])]);
+    card.maxConcurrency, card.dailyCreditLimit, card.monthlyCreditLimit]), support.revision]);
   const [recent, retryRecent] = useLoad(async () => {
     const result = await adminApi.getTraces(20, card.id);
     if (result.success !== true) throw new Error('服务器未确认读取成功');
@@ -236,6 +236,14 @@ export default function CardDrawer({card, state, groupName, hasPrev, hasNext, on
           : <p className="empty-note">还没有调用</p>)}
         {recent.status === 'loaded' && recent.value.length >= 20 && <p className="muted">只显示最近 {formatCount(20)} 次</p>}
       </section>
+      {!voided && <section className="drawer-section danger-zone" aria-label="危险操作">
+        <h4>危险操作</h4>
+        <div className="danger-actions">
+          <button type="button" className="btn btn-danger" disabled={supportBlocked || card.archivedAt != null}
+            title={card.archivedAt != null ? '已归档的卡要先取消归档，再更换卡密' : supportTitle ?? '卡密泄露或电脑丢失时换一个新卡密：旧卡密和所有登录马上失效'} onClick={() => support.rekey(card)}>更换卡密</button>
+          <span className="muted">旧卡密和这张卡的所有登录马上失效，客户用新卡密重新登录；余额和有效期不变。</span>
+        </div>
+      </section>}
     </div>
     <footer className="drawer-foot">
       <button type="button" className="btn" disabled={revealDisabled || !card.codeRecoverable} title={card.codeRecoverable ? '显示这张卡的卡密原文（会记录）' : '此卡未保存明文'} onClick={() => onReveal(card)}>显示卡密</button>

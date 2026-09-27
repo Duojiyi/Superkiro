@@ -17,7 +17,8 @@ module.exports = function fixtureApi() {
   // past its date is expired), its rebind allowance, and for a card not yet activated its validity.
   const view = card => {
     const t = Math.floor(Date.now() / 1000);
-    return {maxConcurrency: 5, dailyCreditLimit: null, monthlyCreditLimit: null, ...card, ...cardPlanFields(card), effectiveStatus: card.status === 'active' && card.validUntil != null && t >= card.validUntil ? 'expired' : card.status,
+    const {rawCode: _code, ...shown} = card;
+    return {maxConcurrency: 5, dailyCreditLimit: null, monthlyCreditLimit: null, ...shown, ...cardPlanFields(card), effectiveStatus: card.status === 'active' && card.validUntil != null && t >= card.validUntil ? 'expired' : card.status,
       rebindsUsed: card.rebindsUsed ?? 0, maxRebinds: card.maxRebinds ?? 5, rebindCooldownUntil: card.rebindCooldownUntil > t ? card.rebindCooldownUntil : null,
       activationDurationSecs: card.activatedAt == null ? card.activationDurationSecs ?? 2592000 : null};
   };
@@ -409,7 +410,8 @@ module.exports = function fixtureApi() {
     let body={};
     if(req.method==='POST') {assert.equal(req.headers['x-csrf-token'],'fixture-csrf'); let raw=''; for await(const chunk of req) raw+=chunk; body=JSON.parse(raw||'{}'); writes.push({endpoint,body});}
     if(endpoint==='me' || (endpoint==='session' && req.method==='GET')) return reply({success:true,role:'admin',username:'admin',csrfToken:'fixture-csrf',expiresAt:deadline,expiresIn:deadline-nowSecs(),twoFactorEnabled:false,totpRequired:false});
-    if(endpoint==='cards/reveal') return reply({success:true,rawCode:'FIXTURE-RECOVERED-CODE'});
+    // The code a card has now: the one it was issued with, or its latest from 更换卡密.
+    if(endpoint==='cards/reveal') return reply({success:true,rawCode:cards.find(c=>c.id===body.cardId)?.rawCode??'FIXTURE-RECOVERED-CODE'});
     if(endpoint==='session/revoke') {authenticated=false; res.setHeader('Set-Cookie','fixture_session=; Max-Age=0; Path=/'); return reply({success:true});}
     if(endpoint==='stats') return reply({success:true,stateBytes:storage.bytes,stateWarningBytes:storage.warning,stateCeilingBytes:storage.ceiling,
       lastSavedAtSecs:storage.savedAt,persistenceReady:!storage.persistenceError,persistenceError:storage.persistenceError,totalCards:cards.length,activeCards:2,unactivatedCards:1,frozenCards:1,bannedCards:1,totalCredits:12000000000,usedCredits:1500000000,remainingCredits:10500000000,totalPoints:12000,usedPoints:1500,remainingPoints:10500,activity:activity()});
@@ -712,6 +714,21 @@ module.exports = function fixtureApi() {
         detail[`previous${key[0].toUpperCase()}${key.slice(1)}`]=current[key];detail[key]=body[key];card[key]=body[key];}
       if(Object.keys(detail).length)record(card.id,'quotas',body.reason,{detail});
       return reply({success:true,card:view(card)});
+    }
+    // 更换卡密, as billing's rekey_card: a new code returned once (no-store), the old code and every session end;
+    // the history keeps a fingerprint of the old and the new code, never a code.
+    if(endpoint==='cards/rekey') {
+      const field=unknownField(['cardId','reason']);if(field)return cardFail(400,`Invalid request body: unknown field \`${field}\``);
+      if(!String(body.cardId??'').trim())return cardFail(400,'cardId is required');
+      if(!support(body.reason))return cardFail(400,'A reason of 1 to 200 bytes is required');
+      const card=cards.find(c=>c.id===body.cardId);if(!card)return cardFail(404,`Card ${body.cardId} not found`);
+      if(card.status==='voided')return cardFail(409,`Voided cards cannot be given a new code: ${card.id}`);
+      if(card.archivedAt!=null)return cardFail(409,`Archived cards must be unarchived before they are given a new code: ${card.id}`);
+      const fingerprint=code=>crypto.createHash('sha256').update(code.toLowerCase().replace(/[- ]/g,'')).digest('hex').slice(0,8);
+      const previous=card.rawCode??`kiro-fixture-${card.id}`,rawCode=`kiro-${crypto.randomBytes(16).toString('hex').match(/.{4}/g).join('-')}`;
+      record(card.id,'rekey',body.reason,{detail:{previousCodeFingerprint:fingerprint(previous),codeFingerprint:fingerprint(rawCode)}});
+      card.rawCode=rawCode;res.setHeader('Cache-Control','no-store');
+      return reply({success:true,card:view(card),rawCode});
     }
     // Archiving the ledger, as its handler answers: a receipt, and the saved size before and after.
     if(endpoint==='ledger/archive') {

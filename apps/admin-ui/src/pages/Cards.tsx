@@ -15,6 +15,7 @@ import {compensation, compensationRefusal, MAX_ADJUST_REASON, refusalFacts, refu
 import {customerView, issuable as planIssuable, MULTI_DEVICE_NOTE, priceMicro} from '../plans';
 import {adjustmentPointsToMicro} from '../pricing';
 import {explainRefusal} from '../refusal';
+import {DOWNLOAD_URL} from '../cardSupport';
 import {cardState, cardStatusView} from '../status';
 import CardDrawer from './CardDrawer';
 import {useCardSupport} from './CardSupport';
@@ -22,8 +23,6 @@ import type {CardQuickFilter, CardTab, ErrorAction, Intent, Refresh, ReportError
 
 const PAGE_SIZE = 50;
 const DAY = 86400;
-// Where a customer downloads the client: in the text 复制发货文本 copies.
-const DOWNLOAD_URL = 'https://kiro.rent';
 /** A plan's validity as the handout words it: 激活后 30 天. */
 const validity = (days: number) => `激活后 ${days} 天`;
 const ISSUANCE_KEY = 'admin-pending-issuance:v1';
@@ -205,7 +204,9 @@ export default function CardsPage({cards, groups, plans, configFailed, loading, 
   const adjusting = useRef(false);
 
   // New card codes are shown once: while they are on screen, leaving or reloading asks first.
-  useEffect(() => {onBusyChange(bulkBusy || generating || !!generated); }, [bulkBusy, generating, generated, onBusyChange]);
+  // A new code from 更换卡密 is shown once too.
+  const [secretShown, setSecretShown] = useState(false);
+  useEffect(() => {onBusyChange(bulkBusy || generating || !!generated || secretShown); }, [bulkBusy, generating, generated, secretShown, onBusyChange]);
   useEffect(() => () => onBusyChange(false), [onBusyChange]);
 
   useEffect(() => {
@@ -276,7 +277,7 @@ export default function CardsPage({cards, groups, plans, configFailed, loading, 
     }, () => {if (alive.current && attempt === lookup.current) setCodeLookup({error: '这个浏览器不能在本机算出卡密 ID（控制台要用 HTTPS 打开）：请改用卡密 ID 搜索'});});
   };
   const codeNote = !codeLookup ? null : 'error' in codeLookup ? codeLookup.error : search !== codeLookup.cardId ? null
-    : cards.some(card => card.id === codeLookup.cardId) ? '按卡密找到 1 张' : loading ? '正在按卡密查找…' : `按卡密没有找到：没有卡密 ID 为 ${codeLookup.cardId} 的卡`;
+    : cards.some(card => card.id === codeLookup.cardId) ? '按卡密找到 1 张' : loading ? '正在按卡密查找…' : `按卡密没有找到：没有卡密 ID 为 ${codeLookup.cardId} 的卡（换过卡密的卡按新卡密找不到，请用卡密 ID 或备注搜索）`;
   const detailIndex = detailId ? filtered.findIndex(card => card.id === detailId) : -1;
   const moveDetail = (step: number) => {
     const next = detailIndex >= 0 ? filtered[detailIndex + step] : undefined;
@@ -324,7 +325,7 @@ export default function CardsPage({cards, groups, plans, configFailed, loading, 
   const reauthenticate: ErrorAction = {label: '重新登录', run: onReauthenticate};
   // 解封, 解绑设备, 重置换绑次数, 延长有效期, 备注 and 换分组, from the drawer, the row menu and the selection bar.
   const support = useCardSupport({cards, groups, groupName: id => groupName(id), guards, refresh, reportError, updateCards, blocked: blocked || revealing,
-    onShowCards: ids => {setSearch(ids[0]); setCodeLookup(null); setGroupFilter('ALL'); setStatusTab('ALL'); setQuick(null); setDetailId(ids[0]);}});
+    onShowCards: ids => {setSearch(ids[0]); setCodeLookup(null); setGroupFilter('ALL'); setStatusTab('ALL'); setQuick(null); setDetailId(ids[0]);}, onSecretShown: setSecretShown});
   const supportBlocked = blocked || !!support.blockedTitle;
 
   // ---- Single-card status changes ----

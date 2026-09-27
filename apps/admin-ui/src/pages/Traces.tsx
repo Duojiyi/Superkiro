@@ -151,7 +151,7 @@ export default function TracesPage({traces, totals = null, cards, providers = []
       () => {if (alive.current && attempt === lookup.current) setCodeLookup({error: '这个浏览器不能在本机算出卡密 ID（控制台要用 HTTPS 打开）：请改用卡密 ID 搜索'});});
   };
   const codeNote = !codeLookup ? null : 'error' in codeLookup ? codeLookup.error : query !== codeLookup.cardId ? null
-    : cards.some(card => card.id === codeLookup.cardId) ? '按卡密找到 1 张' : loading ? '正在按卡密查找…' : `按卡密没有找到：没有卡密 ID 为 ${codeLookup.cardId} 的卡`;
+    : cards.some(card => card.id === codeLookup.cardId) ? '按卡密找到 1 张' : loading ? '正在按卡密查找…' : `按卡密没有找到：没有卡密 ID 为 ${codeLookup.cardId} 的卡（换过卡密的卡按新卡密找不到，请用卡密 ID 搜索）`;
 
   const text = query.trim().toLowerCase();
   const matches = (trace: AdminTrace) => !!scope && inScope(trace, scope) &&
