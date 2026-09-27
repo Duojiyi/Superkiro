@@ -1589,7 +1589,15 @@ mod tests {
         e.upsert_card(card);
         let params = ReservationEstimateParams::new(0, 1_000_000).with_model("model-a");
         let hold = e.reserve("card", "held", &params, 101, 600).unwrap();
-        assert_eq!(hold.pricing.unwrap().settings, e.get_settings());
+        let locked = hold.pricing.unwrap();
+        assert_eq!(locked.routes, ["p/target-a"]);
+        assert_eq!(
+            locked.settings,
+            BillingSettings {
+                default_price_multiplier: None,
+                ..e.get_settings()
+            }
+        );
 
         let reprice = |versions: Vec<RateCardVersion>, cancelled: &[&str]| {
             let mut u = update(&e);
@@ -1948,6 +1956,113 @@ mod tests {
             serve("card-b", "after", "opus", ("kimera", "opus"), 203),
             (400_000, official("kimera/opus"))
         );
+
+        // A held request keeps only what its settlement reads: the costs of the routes that
+        // may serve it, hanyue's and its backup kimera's, not sonnet's price or p's route,
+        // and no notes.
+        let mut u = update(&e);
+        u.groups.push(Group::pro_plus("other-tier", "Other tier"));
+        u.settings = Some(BillingSettings {
+            official_prices: Some(
+                [
+                    (
+                        "opus".to_string(),
+                        official_price([4.0, 20.0, 5.0, 0.2], Some("list".into())),
+                    ),
+                    (
+                        "sonnet".to_string(),
+                        official_price([3.0, 15.0, 3.75, 0.3], None),
+                    ),
+                ]
+                .into(),
+            ),
+            ..e.get_settings()
+        });
+        e.publish_commercial_config(u, 300).unwrap();
+        reserve("card-a", "fallback-held", "opus", 301);
+        reserve("card-a", "moved", "opus", 301);
+        let locked = e.export_snapshot().reservations["fallback-held"]
+            .pricing
+            .clone()
+            .unwrap();
+        assert_eq!(locked.routes, ["hanyue/opus", "kimera/opus"]);
+        let kept = &locked.settings;
+        // Its price as it was stamped, when it last changed.
+        let opus = OfficialPrice {
+            updated_at_secs: 100,
+            ..official_price([4.0, 20.0, 5.0, 0.2], None)
+        };
+        assert_eq!(
+            kept.official_prices,
+            Some([("opus".to_string(), opus)].into())
+        );
+        assert_eq!(
+            kept.route_costs
+                .as_ref()
+                .map(|routes| routes.keys().cloned().collect::<Vec<_>>()),
+            Some(vec!["hanyue/opus".to_string()])
+        );
+        assert_eq!(
+            kept.provider_cost_multipliers,
+            Some([("hanyue".to_string(), 0.22), ("kimera".to_string(), 0.1)].into())
+        );
+        assert_eq!(kept.default_cost_multiplier, Some(0.1));
+
+        // Then everything it reads changes while it is in flight: the face value, kimera's
+        // multiplier, opus's official price, a route cost of its own for the backup.
+        let mut u = update(&e);
+        u.groups.push(Group::pro_plus("other-tier", "Other tier"));
+        u.models = vec![
+            // "moved" is now served by p, which could not serve it when it was reserved.
+            ModelMap::new("map-a", "new-tier", "opus", "p", "opus"),
+            ModelMap::new("map-b", "other-tier", "opus", "kimera", "opus"),
+            ModelMap::new("map-c", "new-tier", "legacy", "kimera", "legacy"),
+        ];
+        u.settings = Some(BillingSettings {
+            credit_face_value_cny: 0.02,
+            provider_cost_multipliers: Some(
+                [("hanyue".to_string(), 0.22), ("kimera".to_string(), 0.5)].into(),
+            ),
+            official_prices: Some(
+                [(
+                    "opus".to_string(),
+                    official_price([10.0, 20.0, 5.0, 0.2], None),
+                )]
+                .into(),
+            ),
+            route_costs: Some(
+                [(
+                    "kimera/opus".to_string(),
+                    RouteCost {
+                        cost_multiplier: Some(0.9),
+                        basis_usd_per_m: None,
+                    },
+                )]
+                .into(),
+            ),
+            ..e.get_settings()
+        });
+        e.publish_commercial_config(u, 302).unwrap();
+        // Served by its backup, it is costed and charged as when it was reserved: opus's $4
+        // times kimera's 0.1, at 0.01 CNY a credit.
+        let held = e
+            .settle("fallback-held", &tokens, "opus", "kimera", "opus", 303)
+            .unwrap();
+        assert_eq!(
+            (held.provider_cost_micro_cny, held.reason.as_deref()),
+            (400_000, Some("provider_cost:official=kimera/opus"))
+        );
+        assert_eq!(
+            (held.credits_charged, held.credit_face_value_cny),
+            (credit, Some(0.01))
+        );
+        // A route it was not held for is costed at the settings in force: opus's $10 times
+        // the default 0.1, for p has none of its own.
+        let moved = e
+            .settle("moved", &tokens, "opus", "p", "opus", 303)
+            .unwrap();
+        assert_eq!(moved.provider_cost_micro_cny, 1_000_000);
+        assert_eq!(moved.credit_face_value_cny, Some(0.01));
     }
 
     /// The official price table and the route costs are bounded like the other settings and

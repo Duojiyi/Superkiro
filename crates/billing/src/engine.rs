@@ -2327,7 +2327,7 @@ impl BillingEngine {
                 .map(|m| m.credit_multiplier)
                 .unwrap_or(params.credit_multiplier);
 
-            let settings = self.settings.read().unwrap().clone();
+            let settings = self.settings.read().unwrap();
             let models = price_names(model, model_map);
             // A named model is never billed at the built-in default rates: without a
             // published price it is refused here, before any work. It used to reserve and
@@ -2342,10 +2342,23 @@ impl BillingEngine {
                 model_multiplier,
                 &settings,
             );
+            // The routes that may serve it, whose costs its settlement reads.
+            let routes: Vec<(String, String)> = model_map
+                .map(|m| {
+                    m.full_target_chain()
+                        .into_iter()
+                        .map(|target| (target.provider_id, target.target_model))
+                        .collect()
+                })
+                .unwrap_or_default();
             let pricing = LockedPricing {
                 group_margin,
                 model_multiplier,
-                settings,
+                settings: settings.for_routes(&routes, model),
+                routes: routes
+                    .iter()
+                    .map(|(provider, target)| format!("{provider}/{target}"))
+                    .collect(),
             };
             (amt, Some(rcv.id), Some(pricing))
         } else {
@@ -2576,14 +2589,27 @@ impl BillingEngine {
         };
 
         // A request is charged at what it was reserved at: a publication while it was in
-        // flight changes neither its price version nor these.
-        let (group_margin, model_multiplier, settings) = match locked_pricing {
-            Some(locked) => (
-                locked.group_margin,
-                locked.model_multiplier,
-                locked.settings,
+        // flight changes neither its price version nor these. It is costed at them too,
+        // unless the route that served it could not serve it then.
+        let served = format!("{provider_id}/{target_model}");
+        let (group_margin, model_multiplier, settings, route_settings) = match locked_pricing {
+            Some(locked) => {
+                let route_settings = (!locked.routes.is_empty()
+                    && !locked.routes.contains(&served))
+                .then(|| candidate.settings.clone());
+                (
+                    locked.group_margin,
+                    locked.model_multiplier,
+                    locked.settings,
+                    route_settings,
+                )
+            }
+            None => (
+                group_margin,
+                model_multiplier,
+                candidate.settings.clone(),
+                None,
             ),
-            None => (group_margin, model_multiplier, candidate.settings.clone()),
         };
         let (charge, mut cost_micro_cny, version_id) = if let Some(ref rcv) = resolved_rcv {
             let cost = rcv.calculate_cost_micro_cny(tokens, &settings);
@@ -2607,7 +2633,10 @@ impl BillingEngine {
         // A request costs what the upstream that served it bills, whatever group or price
         // table it came from: from official prices, when they give that route a basis and a
         // multiplier, at the settings it was reserved at.
-        let official_cost = settings.official_cost_micro_cny(provider_id, target_model, tokens);
+        let official_cost = route_settings
+            .as_ref()
+            .unwrap_or(&settings)
+            .official_cost_micro_cny(provider_id, target_model, tokens);
         // Otherwise from price versions. Provider-qualified model prices take precedence over
         // shared target-model prices. Served by its primary target, a model costs what its own
         // price version says, the one it is charged at; a fallback costs what its target does.
