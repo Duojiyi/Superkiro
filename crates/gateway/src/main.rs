@@ -397,6 +397,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             vision_config: vision_fallback_config(),
             vision_cache: Default::default(),
             content_guardrail: Default::default(),
+            large_bodies: Default::default(),
         };
         registry.register(handler);
     } else if env_flag("ALLOW_STUB_MODE", false) {

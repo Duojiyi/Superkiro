@@ -320,6 +320,7 @@ async fn test_e2e_intent_classifier_interception_optimization() {
         vision_config: None,
         vision_cache: Default::default(),
         content_guardrail: gateway::security::ContentGuardrailConfig::default(),
+        large_bodies: Default::default(),
         runtime: None,
     };
 
@@ -504,6 +505,7 @@ async fn test_e2e_insufficient_credit_rejection() {
         vision_config: None,
         vision_cache: Default::default(),
         content_guardrail: gateway::security::ContentGuardrailConfig::default(),
+        large_bodies: Default::default(),
         runtime: None,
     };
 

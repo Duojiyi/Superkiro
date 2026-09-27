@@ -13,7 +13,7 @@
 use super::models::SIMPLE_TASK_MODEL;
 use super::{error_response, input_too_long, validation_error, BoxFuture, FacadeHandler, Response};
 use crate::auth::AuthClaims;
-use crate::guardrail::{format_kiro_throttle_response, CapacityGuardrail};
+use crate::guardrail::{format_kiro_throttle_response, CapacityGuardrail, LargeBodyGate};
 use crate::idempotency::IdempotencyManager;
 use crate::ops::{CardRateLimiter, RateLimitError};
 use crate::provider::governance::{
@@ -63,6 +63,8 @@ pub struct GenerateAssistantResponseHandler {
     pub vision_config: Option<crate::translate::VisionFallbackConfig>,
     pub vision_cache: crate::translate::VisionFallbackCache,
     pub content_guardrail: ContentGuardrailConfig,
+    /// Shared by every clone: the places for bodies over 10 MB across the gateway.
+    pub large_bodies: LargeBodyGate,
 }
 
 impl Default for GenerateAssistantResponseHandler {
@@ -82,6 +84,7 @@ impl Default for GenerateAssistantResponseHandler {
             vision_config: None,
             vision_cache: crate::translate::VisionFallbackCache::default(),
             content_guardrail: ContentGuardrailConfig::default(),
+            large_bodies: LargeBodyGate::default(),
         }
     }
 }
@@ -109,6 +112,7 @@ impl GenerateAssistantResponseHandler {
             vision_config: None,
             vision_cache: crate::translate::VisionFallbackCache::default(),
             content_guardrail: ContentGuardrailConfig::default(),
+            large_bodies: LargeBodyGate::default(),
         }
     }
 
@@ -259,23 +263,22 @@ impl GenerateAssistantResponseHandler {
             };
 
             // 3. Buffer request body. One over the limit is refused as too long, which Kiro
-            // compacts the conversation for, whether its length is declared or found.
+            // compacts the conversation for, whether its length is declared or found. A
+            // large one first takes a place in the gateway's large-body gate.
             let body_limit = self.content_guardrail.max_body_bytes;
             let declared_length = parts
                 .headers
                 .get(header::CONTENT_LENGTH)
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.trim().parse::<u64>().ok());
-            if declared_length.is_some_and(|length| length > body_limit as u64) {
-                self.record_refusal(claims.as_ref(), &invocation_key, "", "input_too_long");
-                return body_too_large(body_limit);
-            }
-            let body_bytes = match read_body(body, body_limit, declared_length).await {
-                Ok(Some(b)) => b,
-                Ok(None) => {
+            let read = read_body(body, body_limit, declared_length, &self.large_bodies).await;
+            let body_bytes = match read {
+                Ok(BodyRead::Body(b)) => b,
+                Ok(BodyRead::TooLarge) => {
                     self.record_refusal(claims.as_ref(), &invocation_key, "", "input_too_long");
                     return body_too_large(body_limit);
                 }
+                Ok(BodyRead::Throttled) => return self.large_bodies.throttled_response(),
                 Err(e) => {
                     return error_response(
                         StatusCode::BAD_REQUEST,
@@ -908,6 +911,11 @@ impl GenerateAssistantResponseHandler {
                 ctx = ctx.with_prepared_images(prepared);
             }
             let mut chat_req = translate_kiro_to_chat_request(&kiro_req, &mut ctx);
+            // Only the translation is used from here on. A large request gives its place in
+            // the gate back now (or once the archive is done with its copy), not when the
+            // answer ends.
+            drop(kiro_req);
+            drop(body_bytes);
             // The wire protocol currently has no client-controlled max_tokens
             // field.  Keep the provider request bounded by the exposed model
             // contract instead of relying on a provider's default.
@@ -1519,25 +1527,73 @@ fn body_too_large(limit: usize) -> Response {
     ))
 }
 
-/// A request body of at most `limit` bytes, or `None` when it is longer. Room for the
-/// length it declares is taken at once, so a large body is not copied while it arrives.
+/// What reading a conversation's body came to.
+enum BodyRead {
+    Body(bytes::Bytes),
+    /// Longer than the gateway reads.
+    TooLarge,
+    /// Large, and no place in the large-body gate freed up in time.
+    Throttled,
+}
+
+/// A large body with its place in the gate, which it gives back when its last copy (the
+/// archive's included) is dropped.
+struct HeldBody {
+    body: bytes::Bytes,
+    _place: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl AsRef<[u8]> for HeldBody {
+    fn as_ref(&self) -> &[u8] {
+        &self.body
+    }
+}
+
+/// A request body of at most `limit` bytes. One over the gate's threshold, by the length it
+/// declares or by the bytes that arrive, first takes a place in the gate, and holds it for
+/// as long as the body is kept. Room for a declared length is taken at once, so a large body
+/// is not copied while it arrives.
 async fn read_body(
     body: Body,
     limit: usize,
     declared_length: Option<u64>,
-) -> Result<Option<bytes::Bytes>, axum::Error> {
+    gate: &LargeBodyGate,
+) -> Result<BodyRead, axum::Error> {
     use futures_util::StreamExt;
-    let capacity = declared_length.map_or(0, |length| length.min(limit as u64) as usize);
-    let mut data = bytes::BytesMut::with_capacity(capacity);
+    if declared_length.is_some_and(|length| length > limit as u64) {
+        return Ok(BodyRead::TooLarge);
+    }
+    let declared = declared_length.map_or(0, |length| length as usize);
+    let mut place = None;
+    if declared > gate.threshold() {
+        let Some(entered) = gate.enter().await else {
+            return Ok(BodyRead::Throttled);
+        };
+        place = Some(entered);
+    }
+    let mut data = bytes::BytesMut::with_capacity(declared);
     let mut chunks = body.into_data_stream();
     while let Some(chunk) = chunks.next().await {
         let chunk = chunk?;
         if chunk.len() > limit - data.len() {
-            return Ok(None);
+            return Ok(BodyRead::TooLarge);
+        }
+        if place.is_none() && data.len() + chunk.len() > gate.threshold() {
+            let Some(entered) = gate.enter().await else {
+                return Ok(BodyRead::Throttled);
+            };
+            place = Some(entered);
         }
         data.extend_from_slice(&chunk);
     }
-    Ok(Some(data.freeze()))
+    let body = data.freeze();
+    Ok(BodyRead::Body(match place {
+        Some(place) => bytes::Bytes::from_owner(HeldBody {
+            body,
+            _place: place,
+        }),
+        None => body,
+    }))
 }
 
 /// A request whose every attempt came back empty. It was billed the input consumed, so it
@@ -1899,5 +1955,35 @@ mod capability_tests {
         )));
         assert!(!provider_input_too_long(&http(500, "prompt is too long")));
         assert!(!provider_input_too_long(&ProviderError::Timeout));
+    }
+}
+
+#[cfg(test)]
+mod large_body_tests {
+    use super::*;
+
+    /// A large body holds its place for as long as any copy of it is kept (the archive
+    /// keeps one while it writes the request down); a small one never takes a place.
+    #[tokio::test]
+    async fn a_large_body_holds_its_place_while_any_copy_of_it_is_kept() {
+        let gate = LargeBodyGate::new(2, 1024, Duration::from_millis(50));
+        let read = |size: usize, declared: Option<u64>| {
+            read_body(Body::from(vec![b' '; size]), 4096, declared, &gate)
+        };
+        let Ok(BodyRead::Body(small)) = read(1024, Some(1024)).await else {
+            panic!("a small body is read");
+        };
+        assert_eq!((small.len(), gate.in_use()), (1024, 0));
+        for declared in [Some(2048), None] {
+            let Ok(BodyRead::Body(body)) = read(2048, declared).await else {
+                panic!("a large body is read");
+            };
+            assert_eq!((body.len(), gate.in_use()), (2048, 1));
+            let archived = body.clone();
+            drop(body);
+            assert_eq!(gate.in_use(), 1);
+            drop(archived);
+            assert_eq!(gate.in_use(), 0);
+        }
     }
 }

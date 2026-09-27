@@ -8,11 +8,14 @@ use billing::group::{Group, ModelMap};
 use billing::provider::{Provider, ProviderFormat, ProviderKey};
 use billing::rate_card::{Currency, PricingMode, RateCardVersion};
 use billing::BillingEngine;
+use futures_util::StreamExt;
 use gateway::auth::AuthClaims;
 use gateway::facade::conversation::GenerateAssistantResponseHandler;
 use gateway::facade::FacadeRegistry;
+use gateway::guardrail::LargeBodyGate;
 use gateway::provider::ProviderRuntimeRegistry;
 use serde_json::{json, Value};
+use std::time::Duration;
 use tower::ServiceExt;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -83,6 +86,11 @@ fn engine(format: ProviderFormat, url: &str, maps: Vec<ModelMap>) -> BillingEngi
 }
 
 fn serve(billing: &BillingEngine) -> axum::Router {
+    serve_gated(billing, &LargeBodyGate::default())
+}
+
+/// The conversation route, with `gate` for its large bodies.
+fn serve_gated(billing: &BillingEngine, gate: &LargeBodyGate) -> axum::Router {
     let runtime = ProviderRuntimeRegistry::new();
     runtime.sync_from_billing(billing);
     let mut registry = FacadeRegistry::new().with_runtime(runtime.clone());
@@ -90,6 +98,7 @@ fn serve(billing: &BillingEngine) -> axum::Router {
         billing: billing.clone(),
         runtime: Some(runtime),
         intercept_intent: false,
+        large_bodies: gate.clone(),
         ..Default::default()
     });
     registry.into_router()
@@ -131,13 +140,44 @@ impl Reply {
 }
 
 async fn send(app: &axum::Router, invocation: &str, body: Value) -> Reply {
+    post(app, invocation, None, Body::from(body.to_string())).await
+}
+
+const MB: usize = 1024 * 1024;
+
+type Chunk = Result<bytes::Bytes, std::io::Error>;
+
+/// A plain turn for `model`.
+fn turn() -> String {
+    body(json!({"content": "hello", "modelId": "model"}), vec![]).to_string()
+}
+
+/// `turn` padded with JSON whitespace to `size` bytes.
+fn padded(turn: &str, size: usize) -> String {
+    format!("{turn}{}", " ".repeat(size - turn.len()))
+}
+
+/// `turn`, then `megabytes` of JSON whitespace a megabyte at a time.
+fn chunks(turn: &str, megabytes: usize) -> impl futures_util::Stream<Item = Chunk> + Send {
+    let padding = bytes::Bytes::from(vec![b' '; MB]);
+    futures_util::stream::iter(
+        std::iter::once(bytes::Bytes::from(turn.to_string()))
+            .chain(std::iter::repeat_n(padding, megabytes))
+            .map(Ok),
+    )
+}
+
+/// Sends `body` as a conversation, declaring `length` when given.
+async fn post(app: &axum::Router, invocation: &str, length: Option<usize>, body: Body) -> Reply {
     let mut request = Request::builder()
         .method(Method::POST)
         .uri("/generateAssistantResponse")
         .header(header::CONTENT_TYPE, "application/json")
-        .header("amz-sdk-invocation-id", invocation)
-        .body(Body::from(body.to_string()))
-        .unwrap();
+        .header("amz-sdk-invocation-id", invocation);
+    if let Some(length) = length {
+        request = request.header(header::CONTENT_LENGTH, length);
+    }
+    let mut request = request.body(body).unwrap();
     request.extensions_mut().insert(claims());
     let response = app.clone().oneshot(request).await.unwrap();
     let status = response.status();
@@ -150,6 +190,15 @@ async fn send(app: &axum::Router, invocation: &str, body: Value) -> Reply {
         status,
         headers,
         bytes,
+    }
+}
+
+/// Waits, up to five seconds, until `condition` holds.
+async fn until(condition: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !condition() {
+        assert!(std::time::Instant::now() < deadline, "condition never held");
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -931,46 +980,20 @@ async fn a_large_conversation_is_read_and_a_larger_one_is_compacted() {
     );
     // As served, with the router-wide default limit, which no facade handler reads.
     let app = serve(&billing).layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024));
-    let post = |invocation: &str, length: Option<usize>, body: Body| {
-        let mut request = Request::builder()
-            .method(Method::POST)
-            .uri("/generateAssistantResponse")
-            .header(header::CONTENT_TYPE, "application/json")
-            .header("amz-sdk-invocation-id", invocation);
-        if let Some(length) = length {
-            request = request.header(header::CONTENT_LENGTH, length);
-        }
-        let mut request = request.body(body).unwrap();
-        request.extensions_mut().insert(claims());
-        let app = app.clone();
-        async move {
-            let response = app.oneshot(request).await.unwrap();
-            let status = response.status();
-            let headers = response.headers().clone();
-            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap()
-                .to_vec();
-            Reply {
-                status,
-                headers,
-                bytes,
-            }
-        }
-    };
-    let turn = body(json!({"content": "hello", "modelId": "model"}), vec![]).to_string();
+    let turn = turn();
 
     // 12 MB, padded with JSON whitespace.
-    let large = format!("{turn}{}", " ".repeat(12 * 1024 * 1024));
-    let reply = post("inv-large", Some(large.len()), Body::from(large)).await;
+    let large = padded(&turn, 12 * MB);
+    let reply = post(&app, "inv-large", Some(large.len()), Body::from(large)).await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
     assert_eq!(usage_entries(&billing).len(), 1);
 
     // Declared over the limit: refused before it is read.
     let reply = post(
+        &app,
         "inv-declared",
-        Some(33 * 1024 * 1024),
+        Some(33 * MB),
         Body::from(turn.clone()),
     )
     .await;
@@ -979,14 +1002,11 @@ async fn a_large_conversation_is_read_and_a_larger_one_is_compacted() {
     assert_eq!(reply.headers["x-amzn-requestid"], "inv-declared");
 
     // Sent without a length, and found over it while reading.
-    let padding = bytes::Bytes::from(vec![b' '; 1024 * 1024]);
-    let chunks = std::iter::once(bytes::Bytes::from(turn))
-        .chain(std::iter::repeat_n(padding, 33))
-        .map(Ok::<_, std::io::Error>);
     let reply = post(
+        &app,
         "inv-streamed",
         None,
-        Body::from_stream(futures_util::stream::iter(chunks)),
+        Body::from_stream(chunks(&turn, 33)),
     )
     .await;
     assert_overflow(&reply);
@@ -1001,4 +1021,147 @@ async fn a_large_conversation_is_read_and_a_larger_one_is_compacted() {
         trace_class(&billing, "inv-streamed"),
         vec!["input_too_long"]
     );
+}
+
+/// Held about three times over until it is translated, a body at the 32 MB limit comes to
+/// about 100 MB, and the gateway runs in 1 GB. Bodies over 10 MB are read and processed two
+/// at a time across the gateway: a third waits briefly for a place, then is throttled, which
+/// Kiro retries. Smaller bodies never wait.
+#[tokio::test]
+async fn a_third_large_conversation_at_once_is_throttled_and_small_ones_are_not() {
+    let server = upstream(
+        ResponseTemplate::new(200).set_body_raw(anthropic_answer("hi"), "text/event-stream"),
+    )
+    .await;
+    let billing = engine(
+        ProviderFormat::Anthropic,
+        &server.uri(),
+        vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+    );
+    let gate = LargeBodyGate::new(2, 10 * MB, Duration::from_millis(300));
+    let app = serve_gated(&billing, &gate);
+    let turn = turn();
+
+    // One large by the length it declares, holding its place before any of it arrives...
+    let (release_declared, held) = tokio::sync::oneshot::channel::<()>();
+    let rest = bytes::Bytes::from(padded("", 12 * MB - turn.len()));
+    let body = futures_util::stream::iter([Chunk::Ok(bytes::Bytes::from(turn.clone()))]).chain(
+        futures_util::stream::once(async move {
+            let _ = held.await;
+            Chunk::Ok(rest)
+        }),
+    );
+    let declared = tokio::spawn({
+        let app = app.clone();
+        async move { post(&app, "inv-declared", Some(12 * MB), Body::from_stream(body)).await }
+    });
+    // ...and one sent without a length, holding its place once 10 MB of it has arrived.
+    let (release_streamed, held) = tokio::sync::oneshot::channel::<()>();
+    let body = chunks(&turn, 11).chain(futures_util::stream::once(async move {
+        let _ = held.await;
+        Ok(bytes::Bytes::new())
+    }));
+    let streamed = tokio::spawn({
+        let app = app.clone();
+        async move { post(&app, "inv-streamed", None, Body::from_stream(body)).await }
+    });
+    until(|| gate.in_use() == 2).await;
+
+    // A third waits for a place, then is throttled in the form Kiro retries...
+    let third = padded(&turn, 12 * MB);
+    let started = std::time::Instant::now();
+    let reply = post(
+        &app,
+        "inv-third",
+        Some(third.len()),
+        Body::from(third.clone()),
+    )
+    .await;
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    assert_eq!(
+        reply.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "{}",
+        reply.text()
+    );
+    assert_eq!(reply.json()["__type"], "ThrottlingException");
+    assert_eq!(reply.json()["reason"], "LARGE_REQUEST_CAPACITY");
+    assert_eq!(reply.headers[header::RETRY_AFTER], "2");
+    assert_eq!(reply.headers["x-amzn-requestid"], "inv-third");
+    // ...while a small one goes straight through.
+    let started = std::time::Instant::now();
+    let reply = post(&app, "inv-small", None, Body::from(turn.clone())).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert!(started.elapsed() < Duration::from_millis(300));
+    assert_eq!(gate.in_use(), 2);
+
+    release_declared.send(()).unwrap();
+    release_streamed.send(()).unwrap();
+    assert_eq!(declared.await.unwrap().status, StatusCode::OK);
+    assert_eq!(streamed.await.unwrap().status, StatusCode::OK);
+    assert_eq!(gate.in_use(), 0);
+    // Kiro's retry of the third finds a place.
+    let reply = post(&app, "inv-third", Some(third.len()), Body::from(third)).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(gate.in_use(), 0);
+    assert_eq!(server.received_requests().await.unwrap().len(), 4);
+}
+
+/// A large body's place comes back however its request ends: refused, broken off while the
+/// body arrives, dropped when the client goes away, or served.
+#[tokio::test]
+async fn a_large_conversations_place_is_given_back_on_every_path() {
+    let server = upstream(
+        ResponseTemplate::new(200).set_body_raw(anthropic_answer("hi"), "text/event-stream"),
+    )
+    .await;
+    let billing = engine(
+        ProviderFormat::Anthropic,
+        &server.uri(),
+        vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+    );
+    let gate = LargeBodyGate::new(2, 10 * MB, Duration::from_millis(300));
+    let app = serve_gated(&billing, &gate);
+    let turn = turn();
+
+    // Not a conversation.
+    let junk = "x".repeat(12 * MB);
+    let reply = post(&app, "inv-junk", Some(junk.len()), Body::from(junk)).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text());
+    assert_eq!(reply.json()["__type"], "SerializationException");
+    assert_eq!(gate.in_use(), 0);
+
+    // Past the limit after it took its place.
+    let reply = post(&app, "inv-over", None, Body::from_stream(chunks(&turn, 33))).await;
+    assert_overflow(&reply);
+    assert_eq!(gate.in_use(), 0);
+
+    // The connection breaks while the body arrives.
+    let broken = chunks(&turn, 11).chain(futures_util::stream::once(async {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset",
+        ))
+    }));
+    let reply = post(&app, "inv-broken", None, Body::from_stream(broken)).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text());
+    assert_eq!(gate.in_use(), 0);
+
+    // The client goes away mid-body, and the server drops the request.
+    let stalled = chunks(&turn, 11).chain(futures_util::stream::pending());
+    let request = tokio::spawn({
+        let app = app.clone();
+        async move { post(&app, "inv-gone", None, Body::from_stream(stalled)).await }
+    });
+    until(|| gate.in_use() == 1).await;
+    request.abort();
+    assert!(matches!(request.await, Err(error) if error.is_cancelled()));
+    assert_eq!(gate.in_use(), 0);
+
+    // Served.
+    let served = padded(&turn, 12 * MB);
+    let reply = post(&app, "inv-served", Some(served.len()), Body::from(served)).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(gate.in_use(), 0);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
