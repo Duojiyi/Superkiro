@@ -1266,3 +1266,124 @@ fn an_archived_request_is_found_and_its_compensation_still_counts() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// An operator changes a card's concurrency and limits; the history keeps each value with the
+/// one it replaced, and a change to what is already set writes nothing.
+#[test]
+fn quota_changes_record_what_they_replaced() {
+    let engine = BillingEngine::new();
+    let mut card = create_test_card("card-quota", 1, 5, 0);
+    card.max_concurrency = 1;
+    card.daily_credit_limit = Some(1_000_000);
+    engine.upsert_card(card);
+
+    let card = engine
+        .change_card_quotas(
+            "card-quota",
+            Some(4),
+            Some(None),
+            Some(Some(30_000_000)),
+            "admin",
+            "大客户",
+            1_100,
+        )
+        .unwrap();
+    assert_eq!(
+        (
+            card.max_concurrency,
+            card.daily_credit_limit,
+            card.monthly_credit_limit
+        ),
+        (4, None, Some(30_000_000))
+    );
+    // Only what changes is recorded; the same values again write nothing.
+    engine
+        .change_card_quotas("card-quota", Some(4), None, None, "admin", "再次", 1_200)
+        .unwrap();
+    let events = history_of(&engine, "card-quota", "quotas");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].operator.as_deref(), Some("admin"));
+    assert_eq!(events[0].reason.as_deref(), Some("大客户"));
+    assert_eq!(
+        events[0].detail,
+        Some(serde_json::json!({
+            "maxConcurrency": 4, "previousMaxConcurrency": 1,
+            "dailyCreditLimit": null, "previousDailyCreditLimit": 1_000_000,
+            "monthlyCreditLimit": 30_000_000, "previousMonthlyCreditLimit": null,
+        }))
+    );
+    assert!(matches!(
+        engine.change_card_quotas("no-card", Some(2), None, None, "admin", "x", 1_300),
+        Err(BillingError::CardNotFound(_))
+    ));
+}
+
+/// A leaked code is replaced: the new one signs in, the old one no more, and every session
+/// ends. With a master key the new code can be revealed again; the history keeps only
+/// fingerprints.
+#[test]
+fn a_new_code_replaces_a_leaked_one() {
+    let engine = BillingEngine::new();
+    engine.set_master_kek(billing::MasterKek::from_bytes([9; 32]));
+    let old_code = "kiro-0000-1111-2222-3333-4444-5555-6666-7777";
+    let mut card = create_test_card("card-leaked", 1, 5, 0);
+    card.code_hash = billing::hash_card_code(old_code);
+    card.bound_devices = vec!["device-a".into()];
+    engine.upsert_card(card);
+    let before = engine.get_card("card-leaked").unwrap();
+
+    let (card, new_code) = engine
+        .rekey_card("card-leaked", "admin", "卡密泄露", 1_100)
+        .unwrap();
+    assert_ne!(new_code, old_code);
+    assert!(billing::verify_card_code(&new_code, &card.code_hash));
+    assert_eq!(
+        engine.find_card_by_secret(&new_code).map(|card| card.id),
+        Some("card-leaked".to_string())
+    );
+    assert!(engine.find_card_by_secret(old_code).is_none());
+    assert_eq!(card.token_version, before.token_version + 1);
+    // Its balance, devices and status stay.
+    assert_eq!(
+        (card.credit_total, card.bound_devices.clone(), card.status),
+        (before.credit_total, before.bound_devices, before.status)
+    );
+    assert_eq!(
+        engine.reveal_card_code("card-leaked").unwrap(),
+        Some(new_code.clone())
+    );
+    let events = history_of(&engine, "card-leaked", "rekey");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].reason.as_deref(), Some("卡密泄露"));
+    let detail = events[0].detail.clone().unwrap();
+    assert_eq!(
+        detail["previousCodeFingerprint"],
+        before.code_hash[..8].to_string()
+    );
+    assert_eq!(detail["codeFingerprint"], card.code_hash[..8].to_string());
+    assert!(!detail.to_string().contains(&new_code) && !detail.to_string().contains(old_code));
+
+    // Without a master key it is returned only then.
+    let plain = BillingEngine::new();
+    plain.upsert_card(create_test_card("card-plain", 1, 5, 0));
+    let (card, _) = plain
+        .rekey_card("card-plain", "admin", "泄露", 1_100)
+        .unwrap();
+    assert_eq!(card.code_encrypted, None);
+
+    // Not a voided card, nor an archived one until it is unarchived.
+    let mut voided = create_test_card("card-voided", 1, 5, 0);
+    voided.status = CardStatus::Voided;
+    engine.upsert_card(voided);
+    let mut archived = create_test_card("card-archived", 1, 5, 0);
+    archived.archived_at = Some(1_000);
+    engine.upsert_card(archived);
+    for id in ["card-voided", "card-archived"] {
+        let before = engine.get_card(id).unwrap();
+        assert!(matches!(
+            engine.rekey_card(id, "admin", "泄露", 1_200),
+            Err(BillingError::InvalidState(_))
+        ));
+        assert_eq!(engine.get_card(id).unwrap(), before);
+    }
+}

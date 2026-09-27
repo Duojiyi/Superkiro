@@ -4298,15 +4298,7 @@ impl BillingEngine {
             .get_mut(card_id)
             .ok_or_else(|| BillingError::CardNotFound(card_id.to_string()))?;
 
-        if let Some(concurrency) = max_concurrency {
-            card.max_concurrency = concurrency;
-        }
-        if let Some(daily) = daily_limit {
-            card.daily_credit_limit = daily;
-        }
-        if let Some(monthly) = monthly_limit {
-            card.monthly_credit_limit = monthly;
-        }
+        set_quotas(card, max_concurrency, daily_limit, monthly_limit);
         let updated_card = card.clone();
         let cid = card_id.to_string();
 
@@ -4317,6 +4309,123 @@ impl BillingEngine {
                 .insert(cid, updated_card.clone());
             updated_card
         })
+    }
+
+    /// An operator changes a card's concurrency, or its daily or monthly credit limit (in
+    /// micro-credits; `Some(None)` clears one), on the quota update path above, and the card's
+    /// history records each value changed with the one it replaced, who and why. Nothing is
+    /// written when every value is already as asked.
+    #[allow(clippy::too_many_arguments)]
+    pub fn change_card_quotas(
+        &self,
+        card_id: &str,
+        max_concurrency: Option<u32>,
+        daily_limit: Option<Option<i64>>,
+        monthly_limit: Option<Option<i64>>,
+        operator_id: &str,
+        reason: &str,
+        now_secs: u64,
+    ) -> Result<Card, BillingError> {
+        self.change_card(
+            card_id,
+            "change_quotas",
+            operator_id,
+            reason,
+            now_secs,
+            |card, _| {
+                let before = card.clone();
+                set_quotas(card, max_concurrency, daily_limit, monthly_limit);
+                let mut detail = serde_json::Map::new();
+                let mut changed =
+                    |name: &str, previous: serde_json::Value, now: serde_json::Value| {
+                        if previous != now {
+                            let capitalized = format!("{}{}", name[..1].to_uppercase(), &name[1..]);
+                            detail.insert(format!("previous{capitalized}"), previous);
+                            detail.insert(name.to_string(), now);
+                        }
+                    };
+                changed(
+                    "maxConcurrency",
+                    before.max_concurrency.into(),
+                    card.max_concurrency.into(),
+                );
+                changed(
+                    "dailyCreditLimit",
+                    before.daily_credit_limit.into(),
+                    card.daily_credit_limit.into(),
+                );
+                changed(
+                    "monthlyCreditLimit",
+                    before.monthly_credit_limit.into(),
+                    card.monthly_credit_limit.into(),
+                );
+                Ok((!detail.is_empty()).then_some(serde_json::Value::Object(detail)))
+            },
+        )
+    }
+
+    /// Give a card a new code for an operator, when the old one leaked: the old code signs in
+    /// no more, and every session the card has ends. Its balance, devices and history stay.
+    /// With a master key the new code can be revealed again later, as an issued card's can;
+    /// without one it is returned here only. The history records a fingerprint of the old and
+    /// the new code, never either code, with who and why. Returns the card and the new code.
+    pub fn rekey_card(
+        &self,
+        card_id: &str,
+        operator_id: &str,
+        reason: &str,
+        now_secs: u64,
+    ) -> Result<(Card, String), BillingError> {
+        let rng = ring::rand::SystemRandom::new();
+        let raw_code = crate::generator::generate_raw_code(&rng)?;
+        let code_hash = crate::card::hash_card_code(&raw_code);
+        let recovery = match self.master_kek() {
+            Some(kek) => {
+                // Bound to the card and its code, as an issued card's copy is.
+                let payload =
+                    serde_json::to_string(&("card-code-v1", card_id, &code_hash, &raw_code))
+                        .map_err(|_| BillingError::InvalidState("Card encryption failed".into()))?;
+                Some(
+                    kek.encrypt(&payload)
+                        .map_err(|_| BillingError::InvalidState("Card encryption failed".into()))?,
+                )
+            }
+            None => None,
+        };
+        let card = self.change_card(
+            card_id,
+            "rekey_card",
+            operator_id,
+            reason,
+            now_secs,
+            |card, snapshot| {
+                if card.status == CardStatus::Voided {
+                    return Err(BillingError::InvalidState(format!(
+                        "Voided cards cannot be given a new code: {card_id}"
+                    )));
+                }
+                if card.archived_at.is_some() {
+                    return Err(BillingError::InvalidState(format!(
+                        "Archived cards must be unarchived before they are given a new code: {card_id}"
+                    )));
+                }
+                if snapshot.cards.values().any(|other| other.code_hash == code_hash) {
+                    return Err(BillingError::InvalidState(
+                        "another card already uses this code".into(),
+                    ));
+                }
+                let fingerprint = |hash: &str| hash.chars().take(8).collect::<String>();
+                let detail = serde_json::json!({
+                    "previousCodeFingerprint": fingerprint(&card.code_hash),
+                    "codeFingerprint": fingerprint(&code_hash),
+                });
+                card.code_hash = code_hash.clone();
+                card.code_encrypted = recovery.clone();
+                card.token_version = card.token_version.saturating_add(1);
+                Ok(Some(detail))
+            },
+        )?;
+        Ok((card, raw_code))
     }
 
     // ==========================================
@@ -5130,6 +5239,8 @@ impl BillingEngine {
                 (LedgerKind::Adjustment, "extend_validity") => "extend",
                 (LedgerKind::Adjustment, "note_card") => "note",
                 (LedgerKind::Adjustment, "change_group") => "group",
+                (LedgerKind::Adjustment, "change_quotas") => "quotas",
+                (LedgerKind::Adjustment, "rekey_card") => "rekey",
                 (LedgerKind::Adjustment, _) => "adjust",
             };
             // A change that records more than who and why keeps it as a JSON object: in
@@ -6608,6 +6719,25 @@ fn validate_snapshot(snapshot: &BillingSnapshot) -> std::io::Result<()> {
 
 /// Whether the card has yet to be activated, frozen or banned before it was: its validity
 /// is still a duration counted from activation.
+/// Sets what is given of a card's concurrency and daily and monthly credit limits; `Some(None)`
+/// clears a limit.
+fn set_quotas(
+    card: &mut Card,
+    max_concurrency: Option<u32>,
+    daily_limit: Option<Option<i64>>,
+    monthly_limit: Option<Option<i64>>,
+) {
+    if let Some(concurrency) = max_concurrency {
+        card.max_concurrency = concurrency;
+    }
+    if let Some(daily) = daily_limit {
+        card.daily_credit_limit = daily;
+    }
+    if let Some(monthly) = monthly_limit {
+        card.monthly_credit_limit = monthly;
+    }
+}
+
 fn awaits_activation(card: &Card) -> bool {
     card.activated_at.is_none()
         && card.valid_until.is_none()

@@ -2006,6 +2006,145 @@ async fn card_support_actions_are_written_to_the_history_with_the_operator() {
     assert_eq!(history["card"]["groupId"], "group-new");
 }
 
+/// A card's concurrency and limits, and a new code for a leaked one, are support actions:
+/// bounded, and written to the history with who, why and what they replaced.
+#[tokio::test]
+async fn quotas_and_a_new_code_are_support_actions_in_the_history() {
+    let (billing, app) = setup_admin_app();
+    billing.set_master_kek(billing::MasterKek::from_bytes([21; 32]));
+    let old_code = "kiro-aaaa-bbbb-cccc-dddd-eeee-ffff-0000-1111";
+    billing
+        .set_card_code_hash("card-admin-02", &billing::hash_card_code(old_code))
+        .unwrap();
+    let post = |path: &str, body: serde_json::Value| {
+        let app = app.clone();
+        let uri = format!("/api/v1/admin/cards/{path}");
+        async move { admin_call(&app, Method::POST, &uri, Some(body)).await }
+    };
+    let before = billing.get_card("card-admin-02").unwrap();
+    let limits =
+        "dailyCreditLimit and monthlyCreditLimit must be null or 0-10000000000000 micro-credits";
+    for (body, status, message) in [
+        (
+            json!({"cardId": "card-admin-02", "reason": "调整"}),
+            StatusCode::BAD_REQUEST,
+            "Give maxConcurrency, dailyCreditLimit or monthlyCreditLimit",
+        ),
+        (
+            json!({"cardId": "card-admin-02", "maxConcurrency": 0, "reason": "调整"}),
+            StatusCode::BAD_REQUEST,
+            "maxConcurrency must be between 1 and 20",
+        ),
+        (
+            json!({"cardId": "card-admin-02", "maxConcurrency": 21, "reason": "调整"}),
+            StatusCode::BAD_REQUEST,
+            "maxConcurrency must be between 1 and 20",
+        ),
+        (
+            json!({"cardId": "card-admin-02", "dailyCreditLimit": -1, "reason": "调整"}),
+            StatusCode::BAD_REQUEST,
+            limits,
+        ),
+        (
+            json!({"cardId": "card-admin-02", "monthlyCreditLimit": 10_000_000_000_001i64,
+                "reason": "调整"}),
+            StatusCode::BAD_REQUEST,
+            limits,
+        ),
+        (
+            json!({"cardId": "card-admin-02", "maxConcurrency": 2}),
+            StatusCode::BAD_REQUEST,
+            "A reason of 1 to 200 bytes is required",
+        ),
+        (
+            json!({"cardId": "no-such-card", "maxConcurrency": 2, "reason": "调整"}),
+            StatusCode::NOT_FOUND,
+            "Card no-such-card not found",
+        ),
+    ] {
+        let (got, response) = post("quotas", body.clone()).await;
+        assert_eq!(got, status, "{body}: {response}");
+        assert_eq!(response["error"], message, "{body}");
+    }
+    assert_eq!(billing.get_card("card-admin-02").unwrap(), before);
+
+    let (status, body) = post(
+        "quotas",
+        json!({"cardId": "card-admin-02", "maxConcurrency": 3, "dailyCreditLimit": 5_000_000,
+            "reason": "大客户"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        (
+            &body["card"]["maxConcurrency"],
+            &body["card"]["dailyCreditLimit"]
+        ),
+        (&json!(3), &json!(5_000_000))
+    );
+    // Null clears a limit; what is left out stays.
+    let (status, body) = post(
+        "quotas",
+        json!({"cardId": "card-admin-02", "dailyCreditLimit": null, "reason": "取消日限额"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["card"]["dailyCreditLimit"], serde_json::Value::Null);
+    assert_eq!(body["card"]["maxConcurrency"], 3);
+    let event = newest_event(&app, "card-admin-02", "quotas").await;
+    assert_eq!(
+        (&event["operator"], &event["reason"]),
+        (&json!("admin"), &json!("取消日限额"))
+    );
+    assert_eq!(
+        event["detail"],
+        json!({"dailyCreditLimit": null, "previousDailyCreditLimit": 5_000_000})
+    );
+
+    // A new code, this once and never cached: it signs in, the old one no more, and every
+    // session ends.
+    let (status, _) = post("rekey", json!({"cardId": "card-admin-02"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/admin/cards/rekey")
+        .header("x-admin-key", TEST_ADMIN_KEY)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({"cardId": "card-admin-02", "reason": "卡密泄露"}).to_string(),
+        ))
+        .unwrap();
+    let response = tower::ServiceExt::oneshot(app.clone(), request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let new_code = body["rawCode"].as_str().unwrap().to_string();
+    assert!(new_code.starts_with("kiro-"), "{new_code}");
+    assert_eq!(body["card"]["codeRecoverable"], true);
+    assert_eq!(
+        billing.find_card_by_secret(&new_code).map(|card| card.id),
+        Some("card-admin-02".to_string())
+    );
+    assert!(billing.find_card_by_secret(old_code).is_none());
+    assert_eq!(
+        billing.get_card("card-admin-02").unwrap().token_version,
+        before.token_version + 1
+    );
+    let event = newest_event(&app, "card-admin-02", "rekey").await;
+    assert_eq!(event["reason"], "卡密泄露");
+    assert!(event["detail"]["previousCodeFingerprint"].is_string());
+    assert!(!event.to_string().contains(&new_code));
+    let (status, _) = post("rekey", json!({"cardId": "no-such-card", "reason": "泄露"})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
 #[tokio::test]
 async fn card_support_actions_refuse_with_a_message_and_change_nothing() {
     let (billing, app) = setup_admin_app();

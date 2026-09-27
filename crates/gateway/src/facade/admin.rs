@@ -1482,7 +1482,7 @@ pub async fn card_secret_no_store(req: Request<Body>, next: axum::middleware::Ne
     let reveal = req.uri().path() == "/api/v1/admin/cards/reveal";
     let sensitive = matches!(
         req.uri().path(),
-        "/api/v1/admin/cards/reveal" | "/api/v1/admin/cards/batch"
+        "/api/v1/admin/cards/reveal" | "/api/v1/admin/cards/batch" | "/api/v1/admin/cards/rekey"
     );
     let mut response = next.run(req).await;
     if reveal && matches!(response.status().as_u16(), 400 | 401 | 403 | 429) {
@@ -1598,6 +1598,11 @@ pub struct AdminCardItem {
     /// The plan as it was when the card was issued; null for cards issued before the plan
     /// catalog.
     pub plan: Option<CardPlanView>,
+    /// Requests it may have in flight at once.
+    pub max_concurrency: u32,
+    /// Micro-credits it may use per UTC day and per month; null for no limit.
+    pub daily_credit_limit: Option<i64>,
+    pub monthly_credit_limit: Option<i64>,
 }
 
 /// The plan a card was issued from, as it was then.
@@ -1664,6 +1669,9 @@ fn card_view(card: Card, now: u64) -> AdminCardItem {
         plan_name: card.plan_name().map(str::to_string),
         kiro_plan_type: card.plan_type().to_string(),
         plan: card.plan.as_ref().map(card_plan_view),
+        max_concurrency: card.max_concurrency,
+        daily_credit_limit: card.daily_credit_limit,
+        monthly_credit_limit: card.monthly_credit_limit,
         id: card.id,
         bound_devices: card.bound_devices,
         group_id: card.group_id,
@@ -2168,6 +2176,10 @@ pub enum CardAction {
     Note,
     /// Move the card to another group.
     ChangeGroup,
+    /// Change its concurrency or its daily or monthly credit limit.
+    Quotas,
+    /// Give it a new code, returned once; the old code and every session end.
+    Rekey,
 }
 
 pub struct AdminCardActionHandler {
@@ -2214,6 +2226,31 @@ struct GroupRequest {
     group_id: String,
     reason: Option<String>,
 }
+
+/// Absent keeps a limit; null clears it.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct QuotasRequest {
+    card_id: String,
+    max_concurrency: Option<u32>,
+    #[serde(default, deserialize_with = "present")]
+    daily_credit_limit: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "present")]
+    monthly_credit_limit: Option<Option<i64>>,
+    reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RekeyRequest {
+    card_id: String,
+    reason: Option<String>,
+}
+
+/// Requests a card may have in flight at once, as a plan's concurrency is bounded.
+const MAX_CARD_CONCURRENCY: u32 = 20;
+/// The largest daily or monthly limit: the most credits a plan issues, in micro-credits.
+const MAX_CARD_CREDIT_LIMIT: i64 = 10_000_000 * billing::MICRO_CREDITS_PER_CREDIT;
 
 /// Longest extension, by days or to a time from now.
 const MAX_EXTENSION_DAYS: u64 = 3650;
@@ -2363,6 +2400,83 @@ impl AdminCardActionHandler {
         ))
     }
 
+    fn quotas(&self, operator: &str, body: QuotasRequest) -> Response {
+        if !valid_card_id(&body.card_id) {
+            return failure(StatusCode::BAD_REQUEST, "cardId is required");
+        }
+        if body.max_concurrency.is_none()
+            && body.daily_credit_limit.is_none()
+            && body.monthly_credit_limit.is_none()
+        {
+            return failure(
+                StatusCode::BAD_REQUEST,
+                "Give maxConcurrency, dailyCreditLimit or monthlyCreditLimit",
+            );
+        }
+        if body
+            .max_concurrency
+            .is_some_and(|n| !(1..=MAX_CARD_CONCURRENCY).contains(&n))
+        {
+            return failure(
+                StatusCode::BAD_REQUEST,
+                "maxConcurrency must be between 1 and 20",
+            );
+        }
+        if [body.daily_credit_limit, body.monthly_credit_limit]
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|limit| !(0..=MAX_CARD_CREDIT_LIMIT).contains(&limit))
+        {
+            return failure(
+                StatusCode::BAD_REQUEST,
+                "dailyCreditLimit and monthlyCreditLimit must be null or 0-10000000000000 micro-credits",
+            );
+        }
+        let Some(reason) = support_reason(body.reason.as_deref()) else {
+            return failure(
+                StatusCode::BAD_REQUEST,
+                "A reason of 1 to 200 bytes is required",
+            );
+        };
+        Self::one_card(self.billing.change_card_quotas(
+            body.card_id.trim(),
+            body.max_concurrency,
+            body.daily_credit_limit,
+            body.monthly_credit_limit,
+            operator,
+            reason,
+            now_secs(),
+        ))
+    }
+
+    fn rekey(&self, operator: &str, body: RekeyRequest) -> Response {
+        if !valid_card_id(&body.card_id) {
+            return failure(StatusCode::BAD_REQUEST, "cardId is required");
+        }
+        let Some(reason) = support_reason(body.reason.as_deref()) else {
+            return failure(
+                StatusCode::BAD_REQUEST,
+                "A reason of 1 to 200 bytes is required",
+            );
+        };
+        match self
+            .billing
+            .rekey_card(body.card_id.trim(), operator, reason, now_secs())
+        {
+            // The new code, this once; the response is never cached.
+            Ok((card, raw_code)) => json_response(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "success": true,
+                    "card": card_view(card, now_secs()),
+                    "rawCode": raw_code,
+                }),
+            ),
+            Err(error) => card_action_refused(error),
+        }
+    }
+
     fn change_group(&self, operator: &str, body: GroupRequest) -> Response {
         if !valid_card_id(&body.card_id) || !valid_group_id(&body.group_id) {
             return failure(StatusCode::BAD_REQUEST, "cardId and groupId are required");
@@ -2400,6 +2514,8 @@ impl FacadeHandler for AdminCardActionHandler {
             CardAction::ExtendValidity => "/api/v1/admin/cards/validity",
             CardAction::Note => "/api/v1/admin/cards/note",
             CardAction::ChangeGroup => "/api/v1/admin/cards/group",
+            CardAction::Quotas => "/api/v1/admin/cards/quotas",
+            CardAction::Rekey => "/api/v1/admin/cards/rekey",
         }
     }
 
@@ -2424,6 +2540,12 @@ impl FacadeHandler for AdminCardActionHandler {
                 CardAction::Note => card_action_body(&bytes).map(|body| self.note(operator, body)),
                 CardAction::ChangeGroup => {
                     card_action_body(&bytes).map(|body| self.change_group(operator, body))
+                }
+                CardAction::Quotas => {
+                    card_action_body(&bytes).map(|body| self.quotas(operator, body))
+                }
+                CardAction::Rekey => {
+                    card_action_body(&bytes).map(|body| self.rekey(operator, body))
                 }
             };
             response.unwrap_or_else(|message| failure(StatusCode::BAD_REQUEST, &message))
