@@ -54,6 +54,24 @@ fn add_cache_breakpoints(body: &mut Value) {
     }
 }
 
+/// Whether a request's prompt may be read again soon, which a cache write (a quarter over
+/// the input price) pays for. An agent step always carries its tools and is followed by the
+/// next step within seconds, and a conversation that goes on has answers in it. One with
+/// neither is a one-shot: a commit message, a session title, a recap, a single question.
+fn read_again(body: &Value) -> bool {
+    body.get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty())
+        || body
+            .get("messages")
+            .and_then(Value::as_array)
+            .is_some_and(|messages| {
+                messages
+                    .iter()
+                    .any(|message| message["role"] == "assistant")
+            })
+}
+
 fn adaptive_thinking(summarized: bool) -> Value {
     if summarized {
         serde_json::json!({"type": "adaptive", "display": "summarized"})
@@ -380,7 +398,7 @@ impl AnthropicProvider {
             body["tools"] = serde_json::json!(normalized_tools);
         }
 
-        if options.prompt_cache {
+        if options.prompt_cache && read_again(&body) {
             add_cache_breakpoints(&mut body);
         }
 

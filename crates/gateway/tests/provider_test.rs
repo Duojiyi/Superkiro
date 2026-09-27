@@ -718,6 +718,19 @@ fn prompt_cache_breakpoints_follow_the_request_shape() {
         marked(&OpenAiProvider.translate_request(&step(2)).unwrap()),
         0
     );
+
+    // A first agent step is read by the next one within seconds.
+    assert_eq!(
+        marked(&AnthropicProvider.translate_request(&step(0)).unwrap()),
+        3
+    );
+    // A request with neither tools nor an earlier answer is a one-shot: nothing reads its
+    // prompt again, and a cache write costs a quarter over the input price.
+    let mut single = step(0);
+    single.tools.clear();
+    let body = AnthropicProvider.translate_request(&single).unwrap();
+    assert_eq!(marked(&body), 0);
+    assert_eq!(body["system"], "Workspace rules.");
 }
 
 /// A turn after one whose thinking claude-opus-5-5 signed.

@@ -299,11 +299,19 @@ pub(crate) fn provider_options(provider_id: &str) -> ProviderOptions {
 }
 
 /// The options of the provider an upstream attempt is being made with, or those every
-/// provider has when the request is not one of a provider's attempts.
+/// provider has when the request is not one of a provider's attempts. A request whose
+/// prompt nothing reads again writes no prompt cache on any provider.
 pub(crate) fn current_provider_options() -> ProviderOptions {
-    retry::ATTEMPT_KEY
+    let options = retry::ATTEMPT_KEY
         .try_with(|(provider_id, _)| provider_options(provider_id))
-        .unwrap_or_else(|_| provider_options(""))
+        .unwrap_or_else(|_| provider_options(""));
+    let read_again = retry::ROUTE
+        .try_with(|route| route.read_again())
+        .unwrap_or(true);
+    ProviderOptions {
+        prompt_cache: options.prompt_cache && read_again,
+        ..options
+    }
 }
 
 /// Generic assistant tool call entry (T05).

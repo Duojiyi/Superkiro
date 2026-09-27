@@ -699,6 +699,15 @@ impl GenerateAssistantResponseHandler {
             let requested_model =
                 requested_model_id(&kiro_req, claims.as_ref(), &self.billing, fallback_model);
             let requested_model = requested_model.as_str();
+            // Kiro's fast model writes commit messages, recaps and sub-intents: one-shots,
+            // whose prompt nothing reads again.
+            let one_shot = kiro_req
+                .conversation_state
+                .current_message
+                .user_input_message
+                .model_id
+                .as_deref()
+                == Some(SIMPLE_TASK_MODEL);
             if !valid_model_id(requested_model) {
                 if has_reservation {
                     let _ = self.billing.release(&invocation_key);
@@ -1066,6 +1075,9 @@ impl GenerateAssistantResponseHandler {
                 Some(limits) => crate::provider::retry::Route::with_limits(limits),
                 None => crate::provider::retry::Route::new(limits.total),
             };
+            if one_shot {
+                route.not_read_again();
+            }
             let commit_at = tokio::time::Instant::from_std(received_at) + limits.commit;
             let (upstream_stream, actual_provider_id, actual_target_model, committed) =
                 if !candidates.is_empty() {

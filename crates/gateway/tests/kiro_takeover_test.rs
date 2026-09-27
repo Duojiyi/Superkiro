@@ -532,11 +532,59 @@ async fn kiros_fast_model_is_the_model_named_for_it_and_billed_as_it() {
     .await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
     assert_eq!(models_sent(&server).await, vec!["up-cheap"]);
+    // A one-shot: nothing reads its prompt again, so it writes no prompt cache.
+    let sent = upstream_body(&server).await;
+    assert!(!sent.to_string().contains("cache_control"), "{sent}");
     let usage = usage_entries(&billing);
     assert_eq!(usage.len(), 1);
     assert_eq!(usage[0].exposed_model, "cheap-model");
     assert!(usage[0].credits_charged > 0);
     assert_eq!(listed(&billing), vec!["main-model"]);
+}
+
+/// Kiro's fast model writes one-shots: commit messages, recaps, spec sub-intents. Tools and
+/// a history or not, nothing reads their prompt again, so they write no prompt cache, which
+/// costs a quarter over the input price. A conversation's steps do write it.
+#[tokio::test]
+async fn a_fast_model_request_writes_no_prompt_cache() {
+    let server = upstream(
+        ResponseTemplate::new(200).set_body_raw(anthropic_answer("ok"), "text/event-stream"),
+    )
+    .await;
+    let billing = engine(
+        ProviderFormat::Anthropic,
+        &server.uri(),
+        vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+    );
+    let app = serve(&billing);
+    let tools = json!([{"toolSpecification": {
+        "name": "readFile",
+        "description": "Read a file",
+        "inputSchema": {"json": {"type": "object"}}
+    }}]);
+    let history = vec![
+        json!({"userInputMessage": {"content": "You are Kiro, working in the user's IDE."}}),
+        json!({"assistantResponseMessage": {"content": "I will follow these instructions."}}),
+    ];
+    for (model, cached) in [("simple-task", false), ("model", true)] {
+        let reply = send(
+            &app,
+            &format!("inv-cache-{model}"),
+            body(
+                json!({"content": "Write a commit message", "modelId": model,
+                    "userInputMessageContext": {"tools": tools}}),
+                history.clone(),
+            ),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+        let sent = upstream_body(&server).await;
+        assert_eq!(
+            sent.to_string().contains("cache_control"),
+            cached,
+            "{model}: {sent}"
+        );
+    }
 }
 
 #[tokio::test]

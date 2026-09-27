@@ -125,6 +125,9 @@ pub struct Route {
     deadline: std::sync::Mutex<tokio::time::Instant>,
     /// Limits for every attempt in place of each target model's own, when set.
     limits: Option<UpstreamLimits>,
+    /// Whether the request's prompt may be read again soon, which a prompt-cache write pays
+    /// for.
+    read_again: std::sync::atomic::AtomicBool,
 }
 
 impl Route {
@@ -133,6 +136,7 @@ impl Route {
         std::sync::Arc::new(Self {
             deadline: std::sync::Mutex::new(tokio::time::Instant::now() + total),
             limits: None,
+            read_again: true.into(),
         })
     }
 
@@ -141,7 +145,20 @@ impl Route {
         std::sync::Arc::new(Self {
             deadline: std::sync::Mutex::new(tokio::time::Instant::now() + limits.total),
             limits: Some(limits),
+            read_again: true.into(),
         })
+    }
+
+    /// The request's prompt is one nothing reads again soon, such as a commit message
+    /// Kiro's fast model writes: its attempts write no prompt cache, which costs a quarter
+    /// over the input price and is never read.
+    pub fn not_read_again(&self) {
+        self.read_again
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn read_again(&self) -> bool {
+        self.read_again.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The route the current request is on, or a new one for `request`.
