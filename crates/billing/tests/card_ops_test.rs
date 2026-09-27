@@ -795,10 +795,32 @@ fn a_group_change_ends_sessions_and_keeps_in_flight_requests_at_their_price() {
     assert_eq!(history_of(&engine, "card-moved", "group").len(), 1);
 }
 
+/// A request the card made and was charged `credits` for, as its trace records it.
+fn charged_request(engine: &BillingEngine, card_id: &str, invocation_id: &str, credits: i64) {
+    engine.record_trace(billing::RequestTrace {
+        id: format!("trace-{invocation_id}"),
+        card_id: card_id.into(),
+        ts: 1_050,
+        invocation_id: invocation_id.into(),
+        exposed_model: "model".into(),
+        status: billing::TraceStatus::Success,
+        credits_charged: credits,
+        ..billing::RequestTrace::default()
+    });
+}
+
+fn request(invocation_id: &str) -> billing::CompensatedRequest<'_> {
+    billing::CompensatedRequest {
+        invocation_id,
+        allow_repeat: false,
+    }
+}
+
 #[test]
 fn an_adjustment_keeps_the_request_it_makes_up_for() {
     let engine = BillingEngine::new();
     engine.upsert_card(create_test_card("card-comp", 1, 5, 0));
+    charged_request(&engine, "card-comp", "card-comp:inv-broken", 5_000_000);
     let adjust = |invocation: Option<&str>| {
         engine.adjust_balance_linked(
             "card-comp",
@@ -807,7 +829,7 @@ fn an_adjustment_keeps_the_request_it_makes_up_for() {
             "补偿失败请求",
             1_100,
             Some("comp-1"),
-            invocation,
+            invocation.map(request),
         )
     };
     adjust(Some("card-comp:inv-broken")).unwrap();
@@ -869,6 +891,7 @@ fn event_detail_has_its_own_field_and_older_entries_still_read() {
     engine
         .change_card_group("card-detail", "grp-2", "admin", "升级", 1_300)
         .unwrap();
+    charged_request(&engine, "card-detail", "card-detail:inv-1", 3_000_000);
     let linked = |engine: &BillingEngine, invocation: &str| {
         engine.adjust_balance_linked(
             "card-detail",
@@ -877,7 +900,7 @@ fn event_detail_has_its_own_field_and_older_entries_still_read() {
             "补偿失败请求",
             1_400,
             Some("comp-detail"),
-            Some(invocation),
+            Some(request(invocation)),
         )
     };
     linked(&engine, "card-detail:inv-1").unwrap();
@@ -957,4 +980,183 @@ fn event_detail_has_its_own_field_and_older_entries_still_read() {
         restored.get_card("card-detail").unwrap().credit_total,
         engine.get_card("card-detail").unwrap().credit_total
     );
+}
+
+/// A compensation names a request of this card that was made. It is paid once, and never
+/// beyond what the request was charged, unless the operator explicitly allows it.
+#[test]
+fn a_request_is_compensated_once_and_at_most_what_it_was_charged() {
+    let engine = BillingEngine::new();
+    engine.upsert_card(create_test_card("card-a", 1, 5, 0));
+    engine.upsert_card(create_test_card("card-b", 1, 5, 0));
+    // Charged 3 credits, settled from the live ledger.
+    engine.upsert_rate_card_version(fixed_price("price-support"));
+    let params = billing::reservation::ReservationEstimateParams::new(1_000, 1_000)
+        .with_model("support-model");
+    engine
+        .reserve("card-a", "card-a:inv-1", &params, 1_000, 600)
+        .unwrap();
+    let tokens = billing::ledger::UsageTokens {
+        uncached_input_tokens: 1_000_000,
+        output_tokens: 2_000_000,
+        cache_creation_tokens: 0,
+        cache_read_tokens: 0,
+    };
+    engine
+        .settle(
+            "card-a:inv-1",
+            &tokens,
+            "support-model",
+            "prov",
+            "target",
+            1_700_000_000,
+        )
+        .unwrap();
+    charged_request(&engine, "card-b", "card-b:inv-9", 1_000_000);
+    let compensate = |card: &str, credits: i64, key: &str, request: billing::CompensatedRequest| {
+        engine
+            .adjust_balance_linked(
+                card,
+                credits,
+                "admin",
+                "补偿失败请求",
+                1_700_000_100,
+                Some(key),
+                Some(request),
+            )
+            .map_err(|error| error.to_string())
+    };
+
+    // A request that was never made, or another card's.
+    assert_eq!(
+        compensate("card-a", 1_000_000, "k-unknown", request("card-a:nope")).unwrap_err(),
+        "Request card-a:nope was not found"
+    );
+    assert_eq!(
+        compensate("card-a", 1_000_000, "k-other", request("card-b:inv-9")).unwrap_err(),
+        "Request card-b:inv-9 was made by card card-b, not card-a"
+    );
+    // More than it was charged.
+    assert_eq!(
+        compensate("card-a", 3_500_000, "k-more", request("card-a:inv-1")).unwrap_err(),
+        "Request card-a:inv-1 was charged 3 credits at 2023-11-14T22:13:20Z; a compensation of \
+         3.5 credits is more than that; send allowRepeat with a reason to compensate more"
+    );
+    compensate("card-a", 2_000_000, "k-first", request("card-a:inv-1")).unwrap();
+    // A second one with a fresh key names the first.
+    assert_eq!(
+        compensate("card-a", 1_000_000, "k-second", request("card-a:inv-1")).unwrap_err(),
+        "Request card-a:inv-1 was charged 3 credits at 2023-11-14T22:13:20Z, and was already \
+         compensated 2 credits at 2023-11-14T22:15:00Z by admin (补偿失败请求); send \
+         allowRepeat with a reason to compensate it again"
+    );
+    // The first one's retry is the same adjustment, not a second.
+    compensate("card-a", 2_000_000, "k-first", request("card-a:inv-1")).unwrap();
+    assert_eq!(engine.get_card("card-a").unwrap().credit_total, 102_000_000);
+
+    // Explicitly allowed: again, and beyond the charge.
+    let allowed = billing::CompensatedRequest {
+        invocation_id: "card-a:inv-1",
+        allow_repeat: true,
+    };
+    compensate("card-a", 5_000_000, "k-allowed", allowed).unwrap();
+    assert_eq!(engine.get_card("card-a").unwrap().credit_total, 107_000_000);
+    // A negative correction for the request is not a compensation, but must name it rightly.
+    compensate(
+        "card-a",
+        -1_000_000,
+        "k-correction",
+        request("card-a:inv-1"),
+    )
+    .unwrap();
+    assert!(compensate("card-a", -1_000_000, "k-wrong", request("card-b:inv-9")).is_err());
+    // An adjustment naming no request is not checked against any.
+    engine
+        .adjust_balance_linked(
+            "card-a",
+            9_000_000,
+            "admin",
+            "赠送",
+            1_700_000_200,
+            Some("k-gift"),
+            None,
+        )
+        .unwrap();
+    let events = history_of(&engine, "card-a", "adjust");
+    assert_eq!(events.len(), 4);
+    assert!(events[1..]
+        .iter()
+        .all(|event| event.invocation_id.as_deref() == Some("card-a:inv-1")));
+}
+
+/// A request whose usage entry was archived can still be compensated, and still only once:
+/// the archive is read for the charge, and archived adjustments are kept for the check.
+#[test]
+fn an_archived_request_is_found_and_its_compensation_still_counts() {
+    let dir = std::env::temp_dir().join(format!(
+        "kiro-compensation-archive-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let engine = BillingEngine::new();
+    engine.set_persistence_path(dir.join("billing_state.json"));
+    engine.upsert_card(create_test_card("card-old", 1, 5, 0));
+    engine.upsert_rate_card_version(fixed_price("price-support"));
+    let params = billing::reservation::ReservationEstimateParams::new(1_000, 1_000)
+        .with_model("support-model");
+    engine
+        .reserve("card-old", "card-old:inv-1", &params, 1_000, 600)
+        .unwrap();
+    let tokens = billing::ledger::UsageTokens {
+        uncached_input_tokens: 1_000_000,
+        output_tokens: 1_000_000,
+        cache_creation_tokens: 0,
+        cache_read_tokens: 0,
+    };
+    engine
+        .settle(
+            "card-old:inv-1",
+            &tokens,
+            "support-model",
+            "prov",
+            "target",
+            1_001,
+        )
+        .unwrap();
+    engine
+        .adjust_balance_linked(
+            "card-old",
+            1_000_000,
+            "admin",
+            "补偿",
+            1_002,
+            Some("k-old"),
+            Some(request("card-old:inv-1")),
+        )
+        .unwrap();
+    engine.prune_traces(u64::MAX);
+    engine
+        .archive_ledger(2_000, &engine.ledger_archive_dir().unwrap())
+        .unwrap();
+    assert!(engine.ledger_entries().is_empty());
+
+    let again = engine.adjust_balance_linked(
+        "card-old",
+        1_000_000,
+        "admin",
+        "补偿",
+        3_000,
+        Some("k-again"),
+        Some(request("card-old:inv-1")),
+    );
+    assert!(
+        matches!(&again, Err(BillingError::CompensationRefused(message))
+            if message.contains("was charged 2 credits") && message.contains("already compensated 1 credits")),
+        "{again:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
 }

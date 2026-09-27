@@ -942,7 +942,7 @@ pub fn export_ledger_csv(
 }
 
 /// A micro-unit amount as a decimal of whole units, without trailing zeros: -1.5, 2, 0.000001.
-fn micro_decimal(micro: i64) -> String {
+pub(crate) fn micro_decimal(micro: i64) -> String {
     let sign = if micro < 0 { "-" } else { "" };
     let (whole, fraction) = (
         micro.unsigned_abs() / 1_000_000,

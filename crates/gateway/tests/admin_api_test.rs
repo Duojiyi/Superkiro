@@ -1619,6 +1619,141 @@ async fn newest_event(app: &axum::Router, card_id: &str, action: &str) -> serde_
         .unwrap_or_else(|| panic!("no {action} event: {body}"))
 }
 
+/// A balance adjustment sent under an idempotency key: its status and JSON body.
+async fn adjust(
+    app: &axum::Router,
+    idempotency_key: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/admin/cards/adjust")
+        .header("x-admin-key", TEST_ADMIN_KEY)
+        .header("idempotency-key", idempotency_key)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = tower::ServiceExt::oneshot(app.clone(), request)
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap_or_default())
+}
+
+/// A request the card made and was charged `credits` micro-credits for, as its trace keeps it.
+fn charged_request(billing: &BillingEngine, card_id: &str, invocation_id: &str, credits: i64) {
+    billing.record_trace(billing::RequestTrace {
+        id: format!("trace-{invocation_id}"),
+        card_id: card_id.into(),
+        ts: 1_700_000_000,
+        invocation_id: invocation_id.into(),
+        exposed_model: "claude-opus-5".into(),
+        status: billing::TraceStatus::Success,
+        credits_charged: credits,
+        ..billing::RequestTrace::default()
+    });
+}
+
+#[tokio::test]
+async fn a_compensation_names_a_request_of_the_card_and_is_paid_once() {
+    let (billing, app) = setup_admin_app();
+    billing.upsert_card(Card::new("card-other", "group-admin", 1_000));
+    charged_request(&billing, "card-admin-02", "card-admin-02:inv-1", 3_000_000);
+    charged_request(&billing, "card-other", "card-other:inv-2", 3_000_000);
+    let body = |points: f64, invocation: &str| {
+        json!({"cardId": "card-admin-02", "deltaPoints": points, "reason": "补偿失败请求",
+            "invocationId": invocation})
+    };
+    let before = billing
+        .get_card("card-admin-02")
+        .unwrap()
+        .available_credits();
+    for (key, request, expected, message) in [
+        (
+            "comp-unknown",
+            body(1.0, "card-admin-02:inv-missing"),
+            StatusCode::NOT_FOUND,
+            "Request card-admin-02:inv-missing was not found".to_string(),
+        ),
+        (
+            "comp-other-card",
+            body(1.0, "card-other:inv-2"),
+            StatusCode::CONFLICT,
+            "Request card-other:inv-2 was made by card card-other, not card-admin-02".to_string(),
+        ),
+        (
+            "comp-too-much",
+            body(4.0, "card-admin-02:inv-1"),
+            StatusCode::CONFLICT,
+            "Request card-admin-02:inv-1 was charged 3 credits at 2023-11-14T22:13:20Z; a \
+             compensation of 4 credits is more than that; send allowRepeat with a reason to \
+             compensate more"
+                .to_string(),
+        ),
+        (
+            "comp-long-id",
+            body(1.0, &format!("card-admin-02:{}", "x".repeat(245))),
+            StatusCode::BAD_REQUEST,
+            "invocationId must be 1-257 ASCII letters, digits, -_.:".to_string(),
+        ),
+        (
+            "comp-repeat-no-reason",
+            json!({"cardId": "card-admin-02", "deltaPoints": 1.0, "allowRepeat": true,
+                "invocationId": "card-admin-02:inv-1"}),
+            StatusCode::BAD_REQUEST,
+            "allowRepeat needs a reason".to_string(),
+        ),
+    ] {
+        let (status, response) = adjust(&app, key, request).await;
+        assert_eq!(status, expected, "{key}: {response}");
+        // Malformed requests are refused in the older shape, with a message.
+        let error = response["error"].as_str().or(response["message"].as_str());
+        assert_eq!(error, Some(message.as_str()), "{key}");
+    }
+    assert_eq!(
+        billing
+            .get_card("card-admin-02")
+            .unwrap()
+            .available_credits(),
+        before
+    );
+
+    let (status, response) = adjust(&app, "comp-1", body(2.0, "card-admin-02:inv-1")).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    // A second compensation under a fresh key is refused and names the first.
+    let (status, response) = adjust(&app, "comp-2", body(1.0, "card-admin-02:inv-1")).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    let error = response["error"].as_str().unwrap();
+    assert!(
+        error.contains("was already compensated 2 credits at")
+            && error.contains("by admin (补偿失败请求)"),
+        "{error}"
+    );
+    // The operator can compensate again, with a reason.
+    let mut repeat = body(1.0, "card-admin-02:inv-1");
+    repeat["allowRepeat"] = json!(true);
+    let (status, response) = adjust(&app, "comp-3", repeat).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    // An adjustment that names no request is not checked against one.
+    let (status, response) = adjust(
+        &app,
+        "comp-plain",
+        json!({"cardId": "card-admin-02", "deltaPoints": 10.0, "reason": "活动赠送"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(
+        billing
+            .get_card("card-admin-02")
+            .unwrap()
+            .available_credits(),
+        before + 13_000_000
+    );
+}
+
 #[tokio::test]
 async fn card_support_actions_are_written_to_the_history_with_the_operator() {
     let (billing, app) = setup_admin_app();
@@ -1739,22 +1874,20 @@ async fn card_support_actions_are_written_to_the_history_with_the_operator() {
     assert_eq!(event["reason"], "误封");
 
     // A compensation names the request it makes up for.
-    let request = Request::builder()
-        .method(Method::POST)
-        .uri("/api/v1/admin/cards/adjust")
-        .header("x-admin-key", TEST_ADMIN_KEY)
-        .header("idempotency-key", "comp-support-1")
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            json!({"cardId": "card-support", "deltaPoints": 2.0, "reason": "补偿失败请求",
-                "invocationId": "card-support:inv-failed-1"})
-            .to_string(),
-        ))
-        .unwrap();
-    let response = tower::ServiceExt::oneshot(app.clone(), request)
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    charged_request(
+        &billing,
+        "card-support",
+        "card-support:inv-failed-1",
+        3_000_000,
+    );
+    let (status, body) = adjust(
+        &app,
+        "comp-support-1",
+        json!({"cardId": "card-support", "deltaPoints": 2.0, "reason": "补偿失败请求",
+            "invocationId": "card-support:inv-failed-1"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     let event = newest_event(&app, "card-support", "adjust").await;
     assert_eq!(event["invocationId"], "card-support:inv-failed-1");
     assert_eq!(event["credits"], 2_000_000);

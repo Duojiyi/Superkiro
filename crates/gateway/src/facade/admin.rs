@@ -1877,6 +1877,9 @@ pub struct AdminCardAdjustRequest {
     pub idempotency_key: Option<String>,
     /// The request the adjustment makes up for, as its trace names it.
     pub invocation_id: Option<String>,
+    /// Compensate that request again, or by more than it was charged; needs a reason.
+    #[serde(default)]
+    pub allow_repeat: bool,
 }
 
 pub struct AdminCardAdjustHandler {
@@ -1983,6 +1986,15 @@ impl FacadeHandler for AdminCardAdjustHandler {
                 );
             }
             let delta_credits = scaled.round() as i64;
+            // Compensating a request again, or by more than it was charged, is never done
+            // without saying why.
+            if req_data.allow_repeat && req_data.reason.is_none() {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRequestException",
+                    "allowRepeat needs a reason",
+                );
+            }
             let reason = req_data
                 .reason
                 .unwrap_or_else(|| "admin-manual-adjustment".to_string());
@@ -1997,7 +2009,7 @@ impl FacadeHandler for AdminCardAdjustHandler {
             let invocation_id = req_data.invocation_id.as_deref().map(str::trim);
             if invocation_id.is_some_and(|id| {
                 id.is_empty()
-                    || id.len() > 128
+                    || id.len() > billing::MAX_INVOCATION_KEY_BYTES
                     || !id
                         .bytes()
                         .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b))
@@ -2005,7 +2017,7 @@ impl FacadeHandler for AdminCardAdjustHandler {
                 return error_response(
                     StatusCode::BAD_REQUEST,
                     "InvalidRequestException",
-                    "invocationId must be 1-128 ASCII letters, digits, -_.:",
+                    "invocationId must be 1-257 ASCII letters, digits, -_.:",
                 );
             }
 
@@ -2017,7 +2029,10 @@ impl FacadeHandler for AdminCardAdjustHandler {
                 &reason,
                 now,
                 Some(idempotency_key),
-                invocation_id,
+                invocation_id.map(|invocation_id| billing::CompensatedRequest {
+                    invocation_id,
+                    allow_repeat: req_data.allow_repeat,
+                }),
             ) {
                 Ok(_entry) => {
                     let card = self.billing.get_card(&req_data.card_id);
@@ -2037,7 +2052,13 @@ impl FacadeHandler for AdminCardAdjustHandler {
                         billing::engine::BillingError::Persistence(_) => {
                             StatusCode::SERVICE_UNAVAILABLE
                         }
-                        billing::engine::BillingError::CardNotFound(_) => StatusCode::NOT_FOUND,
+                        billing::engine::BillingError::CardNotFound(_)
+                        | billing::engine::BillingError::RequestNotFound(_) => {
+                            StatusCode::NOT_FOUND
+                        }
+                        billing::engine::BillingError::CompensationRefused(_) => {
+                            StatusCode::CONFLICT
+                        }
                         billing::engine::BillingError::InvalidAdjustment(msg)
                             if msg.starts_with("Idempotency conflict") =>
                         {
