@@ -454,7 +454,9 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
               mergeKey={saved => setData(previous => ({...previous, providerKeys: previous.providerKeys.some(key => key.id === saved.id && key.provider_id === saved.provider_id)
                 ? previous.providerKeys.map(key => key.id === saved.id && key.provider_id === saved.provider_id ? {...key, ...saved} : key)
                 : [...previous.providerKeys, saved]}))}/>}
-            {activeTab === 'announcements' && <AnnouncementsPage announcements={data.announcements} loading={loading} failed={!!failures.announcements}
+            {activeTab === 'announcements' && <AnnouncementsPage announcements={data.announcements} groups={data.groups} loading={loading} failed={!!failures.announcements}
+              // A server that says where each notice stands (or reports its saves, from the same release) takes a start, an end and an audience.
+              scheduling={data.announcements.some(notice => typeof notice.status === 'string') || typeof data.stats?.persistenceReady === 'boolean'}
               refresh={refreshData} guards={guards} reportError={reportError}
               updateAnnouncements={announcements => setData(previous => ({...previous, announcements}))}/>}
             {activeTab === 'reconciliation' && <FinancePage financials={data.financials} providers={data.providers} loading={loading} failed={!!failures.financials}

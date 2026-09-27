@@ -316,7 +316,13 @@ export interface AdminAnnouncement {
   level: 'info' | 'warning' | 'critical';
   enabled: boolean;
   created_at: number;
-  expires_at?: number;
+  /** When it stops being shown; null or absent: until withdrawn. */
+  expires_at?: number | null;
+  /** When it is first shown, the groups whose cards see it (every customer when empty), its edits and where it stands (newer servers). */
+  starts_at?: number;
+  audience?: string[];
+  edits?: Array<{operator: string; at_secs: number; changed: string[]}>;
+  status?: 'scheduled' | 'active' | 'ended' | 'withdrawn';
 }
 
 // How long before the end of a session the operator is warned.
@@ -595,23 +601,31 @@ export class AdminApiClient {
     });
   }
 
-  async getAnnouncements(): Promise<{
+  /** Scheduled and shown ones, newest first; `all`: ended and withdrawn ones too (newer servers). */
+  async getAnnouncements(all = false): Promise<{
     success: boolean;
     announcements: AdminAnnouncement[];
   }> {
-    return this.request('/api/v1/admin/announcements');
+    return this.request(`/api/v1/admin/announcements${all ? '?all=true' : ''}`);
   }
 
+  /** Shown from `startsAtSecs` (now when left out) for `ttlSecs`, up to `endsAtSecs`, or until withdrawn; `audience`: the groups whose cards see it. */
   async createAnnouncement(
     title: string,
     content: string,
     level: 'info' | 'warning' | 'critical' = 'info',
-    ttlSecs?: number
+    ttlSecs?: number,
+    schedule: {startsAtSecs?: number; endsAtSecs?: number; audience?: string[]} = {},
   ): Promise<{ success: boolean; announcement: AdminAnnouncement }> {
     return this.request('/api/v1/admin/announcements', {
       method: 'POST',
-      body: JSON.stringify({ title, content, level, ttlSecs }),
+      body: JSON.stringify({ title, content, level, ttlSecs, ...schedule }),
     });
+  }
+
+  /** Changes a published one: each field sent replaces its value (endsAtSecs null: until withdrawn). */
+  async editAnnouncement(edit: {id: string} & Record<string, unknown>): Promise<{ success: boolean; announcement: AdminAnnouncement }> {
+    return this.request('/api/v1/admin/announcements/edit', {method: 'POST', body: JSON.stringify(edit)});
   }
 
   async withdrawAnnouncement(id: string): Promise<{ success: boolean; id: string }> {

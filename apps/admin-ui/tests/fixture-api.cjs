@@ -25,6 +25,10 @@ module.exports = function fixtureApi() {
   const log = [];
   // The saved billing state's size, as GET /stats reports it (billing's warning level and ceiling),
   // and how far back the ledger has been archived.
+  // 公告 as the server keeps them; the view adds where each stands now.
+  const notices = [{id: 'fixture-notice', title: '本地测试：服务维护通知', content: '这是隔离的视觉测试公告，不会向真实用户发布。', level: 'info', enabled: true, created_at: realNow, expires_at: null, audience: [], edits: []}];
+  const noticeView = (notice, t) => ({...notice, starts_at: notice.starts_at ?? notice.created_at,
+    status: !notice.enabled ? 'withdrawn' : notice.expires_at != null && t >= notice.expires_at ? 'ended' : t < (notice.starts_at ?? notice.created_at) ? 'scheduled' : 'active'});
   // The saved state: its size, when it was last saved, and why the latest save failed (null: it did not).
   const storage = {bytes: 13212876, warning: 33554432, ceiling: 268435456, archivedBefore: 0, savedAt: realNow - 180, persistenceError: null};
   const cardRevision = () => crypto.createHash('sha256').update(cards.map(card => card.id).join('\n')).digest('hex');
@@ -294,7 +298,7 @@ module.exports = function fixtureApi() {
   let authenticated = false, deadline = 0, loginAt = 0;
   const IDLE = 1800, MAX = 8 * 3600;
   const nowSecs = () => Math.floor(Date.now() / 1000);
-  return {writes, cards, traces, providers, keys, config, storage, ledger, expire() {authenticated=false;}, get sessionDeadline() {return deadline;}, async handle(req,res) {
+  return {writes, cards, traces, providers, keys, config, storage, ledger, notices, expire() {authenticated=false;}, get sessionDeadline() {return deadline;}, async handle(req,res) {
     const url = new URL(req.url, 'http://127.0.0.1');
     const endpoint = url.pathname.replace('/api/v1/admin/', '');
     const reply = (value, status=200) => {res.writeHead(status, {'Content-Type':'application/json'}); res.end(JSON.stringify(value));};
@@ -396,7 +400,59 @@ module.exports = function fixtureApi() {
       if(from!==undefined&&to!==undefined&&from>=to)return reply({success:false,error:'fromSecs must be before toSecs'},400);
       return reply(financials(from,to));
     }
-    if(endpoint==='announcements') return reply({success:true,announcements:[{id:'fixture-notice',title:'本地测试：服务维护通知',content:'这是隔离的视觉测试公告，不会向真实用户发布。',level:'info',enabled:true,created_at:now}]});
+    // 公告, as the server keeps them: shown from a start to an end (or until withdrawn), to every
+    // customer or the cards of some groups, edited in place with each edit kept.
+    const t=Math.floor(Date.now()/1000),AHEAD=3650*86400;
+    const noticeFail=(message,status=400)=>reply({success:false,error:message},status);
+    const windowProblem=(start,end)=>start>t+AHEAD?'startsAtSecs must be within 3650 days':end!=null&&(end<=start||end>t+AHEAD)?'endsAtSecs must be after the start and within 3650 days':null;
+    const audienceOf=ids=>{if(ids.length>50)return {problem:'audience names at most 50 groups'};const list=[];
+      for(const id of ids.map(value=>String(value).trim())){if(!config.groups.some(group=>group.id===id))return {problem:`Unknown group in audience: ${id}`};if(!list.includes(id))list.push(id);}return {list};};
+    const validText=(value,max)=>typeof value==='string'&&!!value.trim()&&[...value.trim()].length<=max;
+    if(endpoint==='announcements'&&req.method==='GET') {
+      const all=url.searchParams.get('all')==='true';
+      return reply({success:true,announcements:notices.filter(notice=>all||(notice.enabled&&(notice.expires_at==null||t<notice.expires_at))).sort((a,b)=>b.created_at-a.created_at).map(notice=>noticeView(notice,t))});
+    }
+    if(endpoint==='announcements') {
+      if(!validText(body.title,256)||!validText(body.content,20000)||(body.ttlSecs!=null&&!(body.ttlSecs>=60&&body.ttlSecs<=31*86400)))return reply({__type:'InvalidRequestException',message:'announcement fields are invalid'},400);
+      const start=Math.max(body.startsAtSecs??t,t);
+      if(body.endsAtSecs!=null&&body.ttlSecs!=null)return noticeFail('Give at most one of endsAtSecs and ttlSecs');
+      const end=body.endsAtSecs??(body.ttlSecs!=null?start+body.ttlSecs:null);
+      const problem=windowProblem(start,end);if(problem)return noticeFail(problem);
+      const audience=audienceOf(body.audience??[]);if(audience.problem)return noticeFail(audience.problem);
+      const notice={id:`ann-${Date.now()}${notices.length}`,title:body.title,content:body.content,level:['warning','critical'].includes(body.level)?body.level:'info',enabled:true,created_at:t,
+        ...(start>t?{starts_at:start}:{}),expires_at:end,audience:audience.list,edits:[]};
+      notices.push(notice);return reply({success:true,announcement:noticeView(notice,t)});
+    }
+    if(endpoint==='announcements/edit') {
+      const fields=['id','title','content','level','startsAtSecs','endsAtSecs','ttlSecs','audience'],unknown=Object.keys(body).find(key=>!fields.includes(key));
+      if(unknown)return noticeFail(`Invalid request body: unknown field \`${unknown}\`, expected one of ${fields.map(field=>`\`${field}\``).join(', ')}`);
+      if(!validText(body.id,128))return noticeFail('announcement id is required');
+      if((body.title!==undefined&&!validText(body.title,256))||(body.content!==undefined&&!validText(body.content,20000)))return noticeFail('title must be 1 to 256 characters and content 1 to 20000');
+      if(body.level!==undefined&&!['info','warning','critical'].includes(body.level))return noticeFail('level must be info, warning or critical');
+      if('endsAtSecs' in body&&body.ttlSecs!=null)return noticeFail('Give at most one of endsAtSecs and ttlSecs');
+      if(body.ttlSecs!=null&&!(body.ttlSecs>=60&&body.ttlSecs<=31*86400))return noticeFail('ttlSecs must be between 60 and 2678400');
+      const audience=body.audience===undefined?null:audienceOf(body.audience);if(audience?.problem)return noticeFail(audience.problem);
+      const notice=notices.find(item=>item.id===body.id.trim());
+      if(!notice)return noticeFail('announcement not found',404);
+      if(!notice.enabled)return noticeFail('A withdrawn announcement cannot be edited',409);
+      const startOf=item=>item.starts_at??item.created_at,next={...notice};
+      for(const field of ['title','content','level'])if(body[field]!==undefined)next[field]=body[field];
+      if(body.startsAtSecs!=null&&body.startsAtSecs!==startOf(notice))next.starts_at=Math.max(body.startsAtSecs,t);
+      if('endsAtSecs' in body)next.expires_at=body.endsAtSecs;
+      if(body.ttlSecs!=null)next.expires_at=startOf(next)+body.ttlSecs;
+      if(audience)next.audience=audience.list;
+      const problem=windowProblem(startOf(next),next.expires_at);if(problem)return noticeFail(problem);
+      const changed=[['title',next.title!==notice.title],['content',next.content!==notice.content],['level',next.level!==notice.level],['starts_at',startOf(next)!==startOf(notice)],
+        ['expires_at',next.expires_at!==notice.expires_at],['audience',JSON.stringify(next.audience)!==JSON.stringify(notice.audience)]].filter(([,change])=>change).map(([field])=>field);
+      if(changed.length)Object.assign(notice,next,{edits:[...notice.edits,{operator:'admin',at_secs:t,changed}]});
+      return reply({success:true,announcement:noticeView(notice,t)});
+    }
+    if(endpoint==='announcements/withdraw') {
+      const notice=typeof body.id==='string'?notices.find(item=>item.id===body.id):undefined;
+      if(!body.id)return reply({__type:'InvalidRequestException',message:'announcement id is required'},400);
+      if(!notice||!notice.enabled)return reply({__type:'ResourceNotFoundException',message:'announcement not found'},404);
+      notice.enabled=false;return reply({success:true,id:notice.id});
+    }
     if(endpoint==='cards/batch') {
       // As the server issues: from a plan (planId, or its older name templateId), refused as InvalidRequestException.
       const invalid=message=>reply({__type:'InvalidRequestException',message},400);
