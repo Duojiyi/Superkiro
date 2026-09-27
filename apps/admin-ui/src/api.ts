@@ -35,6 +35,8 @@ export interface AdminStats {
   lastSavedAtSecs?: number | null;
   persistenceReady?: boolean;
   persistenceError?: string | null;
+  /** Where each group's hidden Kiro background calls (`simple-task`) go, and why; billed at that model's price (newer servers). */
+  simpleTaskModels?: Array<{groupId: string; groupName: string; model: string | null; via: 'alias' | 'cheapest' | 'default' | null}>;
 }
 
 /** What POST /ledger/archive did: the entries moved into an archive file beside the saved state, and its size before and after. */

@@ -83,3 +83,11 @@
 /* The editor: which of the model's groups an edit goes to. */
 .mapping-editor .edit-scope {display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; margin: 0 0 12px; padding: 8px 12px; border: 1px solid var(--border-subtle); border-radius: 6px; background: var(--bg-muted);}
 .state-dialog .state-groups {display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 0; padding: 0; border: 0;}
+/* Kiro's background calls: where each group's go, above the model list and on 分组与权益. */
+.fast-models {display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-surface); font-size: 13px;}
+.fast-models .field-label {margin: 0;}
+.fast-model {white-space: nowrap;}
+.fast-model .tag {margin-left: 4px;}
+.config-table .col-fast .cell-sub {display: block; font-size: 12px; color: var(--text-3);}
+.fast-alias .check-field {margin-top: 6px;}
+.sheet-table .group-chips .tag {height: 18px; font-size: 11px;}

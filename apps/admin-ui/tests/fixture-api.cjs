@@ -132,6 +132,29 @@ module.exports = function fixtureApi() {
       modelHealth: [...models.values()].sort((a, b) => busiest(a, b, 'requests') || a.model.localeCompare(b.model)),
       modelUsage7d: [...usage.values()].map(entry => ({model: entry.model, requests: entry.requests, cards: entry.cards.size})).sort((a, b) => b.requests - a.requests || a.model.localeCompare(b.model))};
   };
+  // Where each group's hidden Kiro background calls (simple-task) go, as the stats name it (facade/models.rs
+  // simple_task_model): the entry with that alias, listed or hidden (not retired); else the listed one whose
+  // million input and million output tokens cost least at the price in force, the first in order among equals;
+  // else the group's first listed model.
+  const comparedPrice = (group, model, t) => {
+    const names = [model.exposed_model_id, model.target_model], latest = name => config.versions.filter(v => v.rate_card_id === group.rate_card_id && v.model === name && v.effective_from_secs <= t)
+      .sort((a, b) => b.effective_from_secs - a.effective_from_secs)[0];
+    const version = names.map(latest).find(Boolean) ?? latest('*');
+    if (!version) return null;
+    const factor = (version.margin_multiplier ?? 1) * (group.margin_multiplier ?? 1) * (model.credit_multiplier ?? 1);
+    if (version.pricing_mode === 'fixed') return Math.ceil((version.fixed_input_credit_per_m + version.fixed_output_credit_per_m) * factor);
+    const rate = version.currency === 'USD' ? config.settings.usd_cny_rate : 1;
+    return Math.ceil((version.input_price_per_m + version.output_price_per_m) * rate * factor / (config.settings.credit_face_value_cny || 0.01) * 1e6);
+  };
+  const simpleTaskModels = t => config.groups.map(group => {
+    const inGroup = config.models.filter(m => m.group_id === group.id).sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0));
+    const aliased = inGroup.find(m => m.retired !== true && (m.exposed_model_id === 'simple-task' || (m.aliases || []).includes('simple-task')));
+    const listed = inGroup.filter(m => m.visible !== false && m.retired !== true);
+    let choice = aliased ? {model: aliased, via: 'alias'} : null;
+    if (!choice) for (const m of listed) {const price = comparedPrice(group, m, t); if (price > 0 && (!choice || price < choice.price)) choice = {model: m, via: 'cheapest', price};}
+    if (!choice && listed.length) choice = {model: listed[0], via: 'default'};
+    return {groupId: group.id, groupName: group.name, model: choice?.model.exposed_model_id ?? null, via: choice?.via ?? null};
+  });
   // The usage ledger the financials and the CSV export read, relative to the real clock: today, yesterday,
   // ten and forty days ago. One of today's was served by a route without a cost (not priced by a version).
   const DAY = 86400, t0 = Math.floor(Date.now() / 1000);
@@ -456,7 +479,7 @@ module.exports = function fixtureApi() {
       lastSavedAtSecs:storage.savedAt,persistenceReady:!storage.persistenceError,persistenceError:storage.persistenceError,totalCards:cards.length,activeCards:2,unactivatedCards:1,frozenCards:1,bannedCards:1,
       // As the customer meets them (card.rs effective_status): an active card past its date is expired.
       expiredCards:cards.filter(card=>view(card).effectiveStatus==='expired').length,
-      totalCredits:12000000000,usedCredits:1500000000,remainingCredits:10500000000,totalPoints:12000,usedPoints:1500,remainingPoints:10500,activity:activity()});
+      totalCredits:12000000000,usedCredits:1500000000,remainingCredits:10500000000,totalPoints:12000,usedPoints:1500,remainingPoints:10500,activity:activity(),simpleTaskModels:simpleTaskModels(nowSecs())});
     if(endpoint==='cards') return reply({success:true,count:cards.length,cards:cards.map(view),revision:cardRevision()});
     // One card's history, newest first: this session's changes, then realistic older events.
     if(endpoint==='cards/history') {

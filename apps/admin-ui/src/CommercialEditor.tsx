@@ -1,10 +1,10 @@
 import { parseTokenInput, formatTokens } from './tokens';
-import { useEffect, useRef, useState } from 'react';
+import { Fragment, useEffect, useRef, useState } from 'react';
 import { adminApi, AdminApiError, type AdminCardItem, type CommercialConfig } from './api';
 import { confirmAction } from './components/confirm';
 import { toast } from './components/toast';
 import { Drawer, Modal } from './components/modal';
-import { FilterTabs, InfoTip, TopbarActions } from './components/ui';
+import { FilterTabs, InfoTip, Tag, TopbarActions } from './components/ui';
 import { formatClock, formatCount, formatTokenCount } from './format';
 import { currentVersion, timeDraftVersions } from './priceChange';
 import PriceDrawer, { type PublishOutcome } from './PriceDrawer';
@@ -27,6 +27,7 @@ import './pricing.css';
 import { publishFailure } from './refusal';
 import { authorizedModels, canRoute, isLive, modelName, modelRoute, nameList, targetProblem, targetsOf, targetState, type Target } from './routes';
 import { providerFormatLabel } from './status';
+import { FAST_ALIAS, FAST_NOTE, fastModels, fastModelsOf, fastText, VIA_TEXT, withFastAlias, type FastModel } from './fastModel';
 
 type Row = Record<string, unknown>;
 
@@ -38,7 +39,7 @@ type Row = Record<string, unknown>;
 // the new one). On 模型与定价 the list has one row per customer model (ModelSheet), and an edit
 // goes to the model's entry in each group ticked under 修改应用到. Prices, listing and a model's
 // state change on their own, each after its preview or dialog.
-export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, cards, onPublished, refreshEpoch = 0, providers = [], providerKeys = [], routesKnown = false, intent }: {
+export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, cards, onPublished, refreshEpoch = 0, providers = [], providerKeys = [], routesKnown = false, intent, onOpenModel }: {
   kind: 'groups' | 'models';
   onDirtyChange: (dirty: boolean) => void;
   onBusyChange: (busy: boolean) => void;
@@ -53,6 +54,8 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
   routesKnown?: boolean;
   /** From another page: open 上架模型 for this provider's upstream model, or show a model (model). */
   intent?: {list?: {providerId?: string; model?: string}; model?: string};
+  /** 分组与权益: shows a model on 模型与定价 (where the one its background calls use is chosen). */
+  onOpenModel?: (model: string) => void;
 }) {
   const [config, setConfig] = useState<CommercialConfig | null>(null);
   const [draft, setDraft] = useState(''), [loadedDraft, setLoadedDraft] = useState('');
@@ -93,6 +96,9 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
   const [traces, setTraces] = useState<Row[]>([]);
   // The last 7 days by customer model, when the server reports them.
   const [usage, setUsage] = useState<Map<string, {requests: number; cards: number}> | null>(null);
+  // Where each group's hidden Kiro background calls go, as the server says (read again after each publication).
+  const [fastReported, setFastReported] = useState<FastModel[] | null>(null);
+  const [statsEpoch, setStatsEpoch] = useState(0);
   // 隐藏 / 下架 / 重新上架 / 删除: the model and the dialog open for it.
   const [stateTarget, setStateTarget] = useState<{id: string; mappings: Row[]; action: StateAction} | null>(null);
   // The model's other groups left out of the edits (修改应用到).
@@ -191,15 +197,16 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
   useEffect(() => {alive.current = true; void load(); return () => {alive.current = false;};}, [kind]);
   // The latest requests, read with the page and on every console refresh; without them samples are 1K/1K.
   useEffect(() => {
-    if (kind !== 'models') return;
     let current = true;
     adminApi.getTraces(500).then(result => {if (current && result.success === true && Array.isArray(result.traces)) setTraces(result.traces as unknown as Row[]);}).catch(() => {/* samples fall back to 1K/1K */});
     adminApi.getStats().then(result => {
+      if (!current) return;
       const list = (result.activity as unknown as Row | undefined)?.modelUsage7d;
-      if (current) setUsage(Array.isArray(list) ? new Map((list as Row[]).filter(item => typeof item.model === 'string').map(item => [String(item.model), {requests: Number(item.requests) || 0, cards: Number(item.cards) || 0}])) : null);
-    }).catch(() => {/* the column is left out */});
+      if (kind === 'models') setUsage(Array.isArray(list) ? new Map((list as Row[]).filter(item => typeof item.model === 'string').map(item => [String(item.model), {requests: Number(item.requests) || 0, cards: Number(item.cards) || 0}])) : null);
+      setFastReported(fastModelsOf(result.simpleTaskModels));
+    }).catch(() => {/* the column is left out; background calls are worked out from the configuration */});
     return () => {current = false;};
-  }, [kind, refreshEpoch]);
+  }, [kind, refreshEpoch, statsEpoch]);
   // A console refresh reloads this page too, but never over unpublished edits.
   const seenEpoch = useRef(refreshEpoch);
   useEffect(() => {
@@ -293,6 +300,7 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
           ...(diffs.length ? diffs.slice(0, 8).map(diff => `${String(diff.row.exposed_model_id ?? diff.row.id)}（${String(config.groups.find(group => group.id === diff.row.group_id)?.name ?? diff.row.group_id)}）：${diff.lines.join('；') || '无字段变化'}`).concat(diffs.length > 8 ? [`等 ${diffs.length} 个条目`] : [])
             : names.length ? [`修改：${names.slice(0, 5).join('、')}${names.length > 5 ? ` 等 ${names.length} 项` : ''}`] : []),
           ...(newVersions ? [`${newVersions} 个新价格版本：${[atOnce && `${atOnce} 个发布即生效`, delayed && `${delayed} 个 ${formatClock(later)} 起生效`, newVersions - atOnce - delayed && `${newVersions - atOnce - delayed} 个按指定时间生效`].filter(Boolean).join('，')}`] : []),
+          ...fastShown.filter(entry => entry.pending).map(entry => `${entry.groupName} 的 Kiro 后台调用：${entry.was.model ?? '没有模型'} → ${entry.model ?? '没有可用的模型（后台调用会失败）'}${entry.model ? '，每次按它的价格扣费' : ''}`),
           `原因：${reason.trim()}`,
           `基于 ${formatClock(readAt.current)} 读取的配置`,
         ],
@@ -307,7 +315,7 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
       if (result.success !== true) throw new AdminApiError('服务器未确认发布成功', 400);
       if (!result.config?.revision) throw new Error('服务器未返回可核对的配置版本');
       try {sessionStorage.removeItem(draftKey);} catch {/* published; nothing left to keep */}
-      if (alive.current) {apply(result.config, false); toast.success('已发布'); onPublished?.();}
+      if (alive.current) {apply(result.config, false); toast.success('已发布'); onPublished?.(); setStatsEpoch(value => value + 1);}
     } catch (error) {
       if (alive.current) {
         const text = error instanceof Error ? error.message : String(error);
@@ -354,7 +362,7 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
       if (result.success !== true) throw new AdminApiError('服务器未确认发布成功', 400);
       if (!result.config?.revision) throw new Error('服务器未返回可核对的配置版本');
       if (alive.current) {
-        apply(result.config, false); if (done) toast.success(done); onPublished?.();
+        apply(result.config, false); if (done) toast.success(done); onPublished?.(); setStatsEpoch(value => value + 1);
         const warning = verify?.(result.config);
         if (warning) say(warning, 'warning');
       }
@@ -387,6 +395,13 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
   const priceBlocked = ownBlocked('调价'), listingBlocked = ownBlocked('上架'), stateBlocked = ownBlocked('操作'), canListModels = kind === 'models';
   const pricing = readSettings(config?.settings);
   const sample = (model: string): Four => sampleFor(traces, model).tokens;
+  // Kiro's background calls, per group: as the server says now, and where the draft would send them.
+  const publishedConfig = {groups: configGroups, models: configModels, versions: configVersions, settings: config?.settings};
+  const fastNow = fastModels(publishedConfig, nowSecs, fastReported), fastWorked = fastModels(publishedConfig, nowSecs, null);
+  const fastDraft = kind === 'models' ? fastModels({...publishedConfig, models: rows}, nowSecs, null) : fastWorked;
+  const fastShown = fastNow.map((entry, index) => fastDraft[index] && (fastDraft[index].model !== fastWorked[index]?.model || fastDraft[index].via !== fastWorked[index]?.via)
+    ? {...fastDraft[index], pending: true, was: entry} : {...entry, pending: false, was: entry});
+  const fastGroups = (model: string) => fastShown.filter(entry => entry.model === model).map(entry => entry.groupName);
   const openListing = (preset: {providerId?: string; model?: string}) => {setJsonOpen(false); setPriceModel(null); setSwitching(false); setBulkPricing(false); setListing(preset);};
   // A link from 供应商与 Key opens the drawer for that provider's model, once, when the page has loaded.
   const intentUsed = useRef(false);
@@ -472,6 +487,20 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
   const upstreamHint = !upstreamProvider ? '' : upstreamProvider.enabled === false ? '这个供应商已停用：这条线路不会被使用'
     : canRoute(upstreamProvider.id, String(selectedRow?.target_model), providerKeys) ? '' : '这个供应商的 Key 还没有授权此模型（停用的 Key 不算）';
 
+  // 别名 simple-task: Kiro's background calls in this model's groups (those the edit applies to) go to it.
+  const fastToggle = (row: Row) => {
+    const targets = [row, ...siblings(row).filter(other => !scopeOff.includes(String(other.group_id)))];
+    const on = Array.isArray(row.aliases) && row.aliases.map(String).includes(FAST_ALIAS);
+    const names = nameList(targets.map(target => String(configGroups.find(group => group.id === target.group_id)?.name ?? target.group_id)));
+    const now = fastShown.find(entry => entry.groupId === row.group_id);
+    return <div className="field fast-alias">
+      <span className="field-label">Kiro 后台调用<InfoTip text={`${FAST_NOTE}。勾选后给它加上别名 simple-task（同一分组里别的模型的这个别名会去掉）`}/></span>
+      <label className="check-field"><input type="checkbox" checked={on} onChange={event => setDraft(JSON.stringify({...parsedDraft, models: withFastAlias(rows, targets.map(target => String(target.id)), event.target.checked)}, null, 2))}/>
+        Kiro 后台调用用这个模型</label>
+      <span className="field-hint">{on ? `${names} 的后台调用由它处理，每次按它的价格扣费` : now ? `现在：${fastText(now)}` : '不指定时用分组里最便宜的在售模型'}</span>
+    </div>;
+  };
+
   // The primary route is edited in its own block (线路), with the backups.
   const routeFields = kind === 'models' ? ['target_provider_id', 'target_model'] : [];
   const selectedRateCard = kind === 'models' && selectedRow ? String(configGroups.find(group => group.id === selectedRow.group_id)?.rate_card_id ?? '') || null : null;
@@ -515,6 +544,14 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
     <td className="num">{typeof row.virtual_usage_limit === 'number' ? formatCount(row.virtual_usage_limit) : '—'}</td>
     <td title={String(row.rate_card_id ?? '')}>{rateCardName(row.rate_card_id)}</td>
     <td className="num">{String(row.margin_multiplier ?? '—')}</td>
+    <td className="col-fast">{(() => {
+      // Where this group's hidden Kiro background calls go (a group new in the draft has none yet).
+      const fast = fastShown.find(entry => entry.groupId === row.id);
+      if (!fast) return <span className="muted">—</span>;
+      return <>{fast.model ? <span className="mono">{fast.model}</span> : <span className="is-warning">没有可用的模型</span>}
+        <span className="cell-sub" title={FAST_NOTE}>{fast.model ? (fast.via ? VIA_TEXT[fast.via] : '原因未知') : '后台调用会失败'}</span>
+        {fast.model && onOpenModel && <button type="button" className="btn-text btn-small" title="在“模型与定价”里打开它：在模型的“编辑”里勾选“Kiro 后台调用用这个模型”可以换一个" onClick={() => onOpenModel(fast.model!)}>去模型与定价</button>}</>;
+    })()}</td>
     <td className="num">{cardCount(row.id) ?? '—'}</td>
     <td className="col-actions"><span className="row-actions">
       <button type="button" className="btn-text" disabled={busy} onClick={() => {setSelected(String(row.id)); focusEditor();}}>编辑</button>
@@ -605,19 +642,26 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
       </div>
       <button type="button" className="btn-text" onClick={() => setPicked([])}>取消选择</button>
     </div>}
+    {kind === 'models' && config && fastShown.length > 0 && <div className="fast-models" role="group" aria-label="Kiro 后台调用">
+      <span className="field-label">Kiro 后台调用<InfoTip text={`${FAST_NOTE}；在模型的“编辑”里勾选“Kiro 后台调用用这个模型”可以指定，不指定时用分组里最便宜的在售模型`}/></span>
+      {fastShown.map(entry => <span key={entry.groupId} className="fast-model" title={fastText(entry)}>
+        {entry.groupName} → {entry.model ? <span className="mono">{entry.model}</span> : <span className="is-warning">没有可用的模型</span>}
+        <span className="muted">（{!entry.model ? '会失败' : entry.via === 'alias' ? '别名' : entry.via === 'cheapest' ? '最便宜' : entry.via === 'default' ? '默认模型' : '原因未知'}）</span>
+        {entry.pending && <Tag tone="warning" title={`现在：${fastText(entry.was)}`}>发布后</Tag>}</span>)}
+    </div>}
     {kind === 'models' ? <ModelSheet rows={rows} groups={configGroups} versions={configVersions} settings={pricing} nowSecs={nowSecs} providers={providers} providerKeys={providerKeys}
       routesKnown={routesKnown} sample={sample} usage={usage} selectedId={selectedRow ? String(selectedRow.id) : null} picked={picked} published={row => configModels.some(model => model.id === row.id)}
       busy={busy} priceBlocked={priceBlocked} stateBlocked={stateBlocked} isEdited={isEdited} isNew={row => !originalOf(row)} onPick={pick}
       onEdit={row => {setSelected(String(row.id)); setScopeOff([]); focusEditor();}} onPrice={row => {setJsonOpen(false); setListing(null); setPriceModel(String(row.id));}}
-      onMove={move} onState={changeState} focus={focusModel}/>
+      onMove={move} onState={changeState} focus={focusModel} fastGroups={fastGroups}/>
     : <section className="panel">
       {searchable && <div className="toolbar-row"><label className="search-field"><input aria-label="搜索分组" placeholder="分组名称或 ID" value={query} onChange={event => setQuery(event.target.value)}/></label>
         {needle && <span className="muted">匹配 {formatCount(listed.length)} 个</span>}</div>}
       <div className="table-scroll"><table className="table config-table">
-        <thead><tr>{['名称', '可发卡', '对外套餐名', '用量上限', '价格表', '分组倍率', '卡密数', ''].map((label, index) =>
-          <th key={index} className={['用量上限', '分组倍率', '卡密数'].includes(label) ? 'num' : label ? undefined : 'col-actions'}>{label || <span className="sr-only">操作</span>}</th>)}</tr></thead>
+        <thead><tr>{['名称', '可发卡', '对外套餐名', '用量上限', '价格表', '分组倍率', 'Kiro 后台调用', '卡密数', ''].map((label, index) =>
+          <th key={index} className={['用量上限', '分组倍率', '卡密数'].includes(label) ? 'num' : label ? undefined : 'col-actions'}>{label === 'Kiro 后台调用' ? <>{label}<InfoTip text={`${FAST_NOTE}；在“模型与定价”里某个模型的“编辑”中勾选“Kiro 后台调用用这个模型”即可指定`}/></> : label || <span className="sr-only">操作</span>}</th>)}</tr></thead>
         <tbody>{listed.map(renderGroupRow)}</tbody>
-        {!listed.length && <tbody><tr className="state-row"><td colSpan={8}>{busy ? <div className="skeleton" role="status" aria-label="正在加载"><span className="skeleton-bar"/><span className="skeleton-bar"/></div> : <div className="list-state"><p>{needle ? '没有匹配的条目' : '暂无数据'}</p></div>}</td></tr></tbody>}
+        {!listed.length && <tbody><tr className="state-row"><td colSpan={9}>{busy ? <div className="skeleton" role="status" aria-label="正在加载"><span className="skeleton-bar"/><span className="skeleton-bar"/></div> : <div className="list-state"><p>{needle ? '没有匹配的条目' : '暂无数据'}</p></div>}</td></tr></tbody>}
       </table></div>
     </section>}
 
@@ -632,7 +676,8 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
         <span className="field-hint">同一个模型在勾选的分组里一起改（线路、能力、名称等）；取消勾选的分组保持原样</span>
       </div>}
       <fieldset disabled={busy || !selectedRow} className="form-grid form-grid-3">
-        {editorFields.filter(field => !checkFields.includes(field) && !routeFields.includes(field)).map(renderField)}
+        {editorFields.filter(field => !checkFields.includes(field) && !routeFields.includes(field)).map(field => field === 'aliases' && kind === 'models' && selectedRow
+          ? <Fragment key={field}>{renderField(field)}{fastToggle(selectedRow)}</Fragment> : renderField(field))}
         {kind === 'models' && selectedRow && <section className="field-span route-editor" aria-label="线路">
           <h4>线路 <span className="muted">主线路不能用时，按顺序改走备用线路</span></h4>
           <div className="form-grid form-grid-3">{editorFields.filter(field => routeFields.includes(field)).map(renderField)}</div>
