@@ -2865,7 +2865,6 @@ impl BillingEngine {
         }
         reservation.finish(ReservationState::Settled);
         candidate.pending_settlements.remove(invocation_id);
-        candidate.ledger.push(entry.clone());
         let mut attempt_chain = Vec::new();
         candidate.traces.retain(|trace| {
             if trace.invocation_id == invocation_id {
@@ -2875,6 +2874,21 @@ impl BillingEngine {
                 true
             }
         });
+        // The Key that answered, when its attempt was traced: the last one of the serving
+        // provider that succeeded. Traces are dropped after 10 000; the ledger keeps it for
+        // reconciling an upstream account over any period.
+        if entry.detail.is_none() {
+            entry.detail = attempt_chain
+                .iter()
+                .rev()
+                .find(|attempt| {
+                    attempt.success
+                        && attempt.provider_id == entry.provider_id
+                        && !attempt.key_id.is_empty()
+                })
+                .map(|attempt| serde_json::json!({ "keyId": attempt.key_id }));
+        }
+        candidate.ledger.push(entry.clone());
         candidate.traces.push(RequestTrace {
             id: format!("trace-{invocation_id}"),
             card_id: entry.card_id.clone(),

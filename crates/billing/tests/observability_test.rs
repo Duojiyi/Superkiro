@@ -1820,7 +1820,9 @@ fn the_ledger_csv_adds_readable_columns_after_the_original_ones() {
             "revenue_cny",
             "cost_cny",
             "operator",
-            "reason"
+            "reason",
+            "rate_card_version",
+            "key_id"
         ]
     );
     let usage = &rows[1];
@@ -1891,6 +1893,101 @@ fn adjustments_add_up_credits_given_and_taken_once_each() {
         billing::observability::compute_adjustments([]),
         Default::default()
     );
+}
+
+/// A billed request names the Key that served it, from its traced attempts, and the ledger
+/// export shows it with the price version that charged it and where its cost came from.
+#[test]
+fn a_usage_entry_names_the_key_that_served_it() {
+    let engine = BillingEngine::new();
+    engine.upsert_rate_card_version(billing::RateCardVersion {
+        id: "price-keyed".to_string(),
+        rate_card_id: "default".to_string(),
+        model: "keyed-model".to_string(),
+        currency: billing::Currency::Cny,
+        pricing_mode: billing::PricingMode::Fixed,
+        input_price_per_m: 1.0,
+        output_price_per_m: 1.0,
+        cache_creation_price_per_m: 0.0,
+        cache_read_price_per_m: 0.0,
+        fixed_input_credit_per_m: 1_000_000,
+        fixed_output_credit_per_m: 1_000_000,
+        fixed_cache_creation_credit_per_m: 0,
+        fixed_cache_read_credit_per_m: 0,
+        per_call_credit: 0,
+        margin_multiplier: 1.0,
+        effective_from_secs: 0,
+        official: None,
+    });
+    let mut card = Card::new("card-keyed", "group-pro-plus", 100_000_000);
+    card.status = CardStatus::Active;
+    engine.upsert_card(card);
+    let tokens = UsageTokens {
+        uncached_input_tokens: 1_000,
+        output_tokens: 1_000,
+        ..UsageTokens::default()
+    };
+    let settle = |invocation: &str, attempts: Vec<AttemptRecord>| {
+        if !attempts.is_empty() {
+            engine.record_trace(RequestTrace {
+                id: format!("attempt-{invocation}"),
+                card_id: "card-keyed".into(),
+                ts: 1_000,
+                invocation_id: invocation.into(),
+                exposed_model: "keyed-model".into(),
+                status: TraceStatus::InProgress,
+                attempt_chain: attempts,
+                ..RequestTrace::default()
+            });
+        }
+        let params = ReservationEstimateParams::new(1_000, 1_000).with_model("keyed-model");
+        engine
+            .reserve("card-keyed", invocation, &params, 1_000, 60)
+            .unwrap();
+        engine
+            .settle(
+                invocation,
+                &tokens,
+                "keyed-model",
+                "prov-b",
+                "keyed-model",
+                1_001,
+            )
+            .unwrap()
+    };
+    // prov-a's Key was refused, and prov-b's answered.
+    let served = settle(
+        "inv-keyed",
+        vec![
+            attempt("prov-a", "key-a", Some("http_429")),
+            attempt("prov-b", "key-b", None),
+        ],
+    );
+    assert_eq!(served.detail, Some(serde_json::json!({ "keyId": "key-b" })));
+    // Without a traced attempt, no Key is named.
+    let untraced = settle("inv-untraced", vec![]);
+    assert_eq!(untraced.detail, None);
+
+    let rows = csv_rows(&engine.export_ledger_csv(Some("card-keyed")));
+    let column = |name: &str| rows[0].iter().position(|cell| cell == name).unwrap();
+    let (reason, version, key) = (
+        column("reason"),
+        column("rate_card_version"),
+        column("key_id"),
+    );
+    assert_eq!(
+        (
+            rows[1][reason].as_str(),
+            rows[1][version].as_str(),
+            rows[1][key].as_str()
+        ),
+        (
+            "provider_cost:rate_card_version=price-keyed",
+            "price-keyed",
+            "key-b"
+        )
+    );
+    assert_eq!(rows[2][key], "");
 }
 
 #[test]

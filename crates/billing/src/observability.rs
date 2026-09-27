@@ -1025,13 +1025,14 @@ pub fn export_reconciliation_csv(entries: &[LedgerEntry]) -> String {
 /// The ledger as CSV. The original columns come first, so tools reading them keep working;
 /// readable ones follow: the time in UTC, the provider's name, cache reads and writes,
 /// credits as a decimal, and for usage its ¥ revenue at face value and ¥ cost. Then who made
-/// an adjustment or card event and why; for usage, `reason` says where its cost came from.
+/// an adjustment or card event and why; for usage, `reason` says where its cost came from,
+/// then the price version that charged it and the Key that served it, when known.
 pub fn export_ledger_csv(
     entries: &[LedgerEntry],
     provider_names: &std::collections::HashMap<String, String>,
     settings: &BillingSettings,
 ) -> String {
-    let mut csv = String::from("id,card_id,ts,kind,invocation_id,exposed_model,provider_id,input_tokens,output_tokens,credits_charged,provider_cost_micro_cny,time_utc,provider_name,cache_read_tokens,cache_write_tokens,credits,revenue_cny,cost_cny,operator,reason\n");
+    let mut csv = String::from("id,card_id,ts,kind,invocation_id,exposed_model,provider_id,input_tokens,output_tokens,credits_charged,provider_cost_micro_cny,time_utc,provider_name,cache_read_tokens,cache_write_tokens,credits,revenue_cny,cost_cny,operator,reason,rate_card_version,key_id\n");
     for e in entries {
         let usage = e.kind == crate::ledger::LedgerKind::Usage;
         let revenue = usage.then(|| {
@@ -1041,7 +1042,7 @@ pub fn export_ledger_csv(
             ))
         });
         csv.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             csv_text(&e.id),
             csv_text(&e.card_id),
             e.ts_secs,
@@ -1066,6 +1067,15 @@ pub fn export_ledger_csv(
             },
             csv_text(e.operator_id.as_deref().unwrap_or("")),
             csv_text(e.reason.as_deref().unwrap_or("")),
+            csv_text(e.rate_card_version.as_deref().unwrap_or("")),
+            csv_text(
+                e.detail
+                    .as_ref()
+                    .filter(|_| usage)
+                    .and_then(|detail| detail.get("keyId"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+            ),
         ));
     }
     csv

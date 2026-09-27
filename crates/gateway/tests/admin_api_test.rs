@@ -2497,7 +2497,8 @@ async fn financials_report_a_period_by_provider_with_sales_and_liability() {
     assert!(csv.starts_with(
         "id,card_id,ts,kind,invocation_id,exposed_model,provider_id,input_tokens,output_tokens,\
          credits_charged,provider_cost_micro_cny,time_utc,provider_name,cache_read_tokens,\
-         cache_write_tokens,credits,revenue_cny,cost_cny,operator,reason\n"
+         cache_write_tokens,credits,revenue_cny,cost_cny,operator,reason,rate_card_version,\
+         key_id\n"
     ));
 }
 
