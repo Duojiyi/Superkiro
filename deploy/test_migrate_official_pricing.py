@@ -8,6 +8,21 @@ from unittest.mock import MagicMock
 from deploy import migrate_official_pricing as script
 from deploy.release_candidate import PreconditionFailed
 
+# Historical migration fixtures deliberately use the original 0.24 policy.
+# Current per-model pricing is covered separately; never silently reprice this fixture.
+def setUpModule():
+    global original_policy
+    original_policy = script.POLICY
+    legacy = copy.deepcopy(original_policy)
+    legacy['retail_multiplier'] = 0.24
+    legacy.pop('model_retail_multipliers', None)
+    script.POLICY = legacy
+
+
+def tearDownModule():
+    script.POLICY = original_policy
+
+
 FACE = 0.03
 # The provider each model in the policy is sold through.
 PROVIDERS = {'gpt-6-astra': 'kimera-direct', 'gpt-5.6-sol': 'kimera-direct',
