@@ -110,10 +110,15 @@ fn effort_schema(levels: &[String], default: &str) -> serde_json::Value {
     })
 }
 
-/// The unit Kiro prints after the multiplier, as its own model list does.
-pub const RATE_UNIT: &str = "Credit";
-/// The same unit for an amount other than one, as Kiro's usage summary prints it.
+/// The unit a turn's credits are metered in: Kiro's own "credit". Kiro adds up a turn's
+/// usage by this unit, starts an interrupted turn at 0 in it, and its telemetry knows only
+/// this one ("Credit" counted as "other").
+pub const RATE_UNIT: &str = "credit";
+/// The same unit for an amount other than one, as Kiro's usage summary prints it ("Est.
+/// Credits Used").
 pub const RATE_UNIT_PLURAL: &str = "Credits";
+/// The unit Kiro prints after a model's multiplier in its model list: "2.2x Credit".
+pub const MODEL_RATE_UNIT: &str = "Credit";
 
 /// The model Kiro asks for when it wants a quick answer: commit messages, spec sub-intents,
 /// session recaps and titles. Its own service never lists it, and neither does the gateway.
@@ -187,7 +192,7 @@ impl FacadeHandler for ListAvailableModelsHandler {
                         model_name: m.model_name,
                         description: m.description,
                         token_limits: m.token_limits,
-                        rate_unit: m.rate_multiplier.map(|_| RATE_UNIT.to_string()),
+                        rate_unit: m.rate_multiplier.map(|_| MODEL_RATE_UNIT.to_string()),
                         rate_multiplier: m.rate_multiplier,
                     }
                 })

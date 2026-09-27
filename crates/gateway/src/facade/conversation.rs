@@ -175,7 +175,28 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                 .and_then(|value| value.to_str().ok())
                 .filter(|id| valid_invocation_id(id))
                 .map_or_else(generated_invocation_id, str::to_string);
+            // A body refused before it is read is read and dropped before the answer goes:
+            // sent while Kiro was still sending, the refusal could reach it as a connection
+            // reset, which it reports as a network error and answers by sending it all again.
+            use futures_util::StreamExt;
+            let (parts, body) = req.into_parts();
+            let unread = Arc::new(std::sync::Mutex::new(Some(body)));
+            let lazy = {
+                let unread = Arc::clone(&unread);
+                futures_util::stream::once(async move { unread.lock().unwrap().take() })
+                    .filter_map(std::future::ready)
+                    .flat_map(Body::into_data_stream)
+            };
+            let req = Request::from_parts(parts, Body::from_stream(lazy));
             let mut response = self.respond(req, &request_id).await;
+            let left = unread.lock().unwrap().take();
+            if let Some(body) = left {
+                super::discard_body(
+                    body,
+                    self.content_guardrail.max_body_bytes.saturating_mul(2),
+                )
+                .await;
+            }
             if let Ok(value) = axum::http::HeaderValue::from_str(&request_id) {
                 response.headers_mut().insert("x-amzn-requestid", value);
             }
@@ -1677,11 +1698,15 @@ async fn read_body(
     let mut chunks = body.into_data_stream();
     while let Some(chunk) = chunks.next().await {
         let chunk = chunk?;
+        // What is left of a refused body is read and dropped, as for one not read at all.
         if chunk.len() > limit - data.len() {
+            super::discard_rest(chunks, limit).await;
             return Ok(BodyRead::TooLarge);
         }
         if place.is_none() && data.len() + chunk.len() > gate.threshold() {
             let Some(entered) = gate.enter().await else {
+                drop(data);
+                super::discard_rest(chunks, limit).await;
                 return Ok(BodyRead::Throttled);
             };
             place = Some(entered);

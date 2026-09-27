@@ -95,8 +95,12 @@ const DISCARD_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 /// body unread, and the proxy in front of the gateway resets it. Kiro then reports a
 /// network error and sends the whole body again.
 pub(crate) async fn discard_body(body: Body, limit: usize) {
+    discard_rest(body.into_data_stream(), limit).await
+}
+
+/// [`discard_body`] for a body already partly read.
+pub(crate) async fn discard_rest(mut chunks: axum::body::BodyDataStream, limit: usize) {
     use futures_util::StreamExt;
-    let mut chunks = body.into_data_stream();
     let _ = tokio::time::timeout(DISCARD_WAIT, async {
         let mut read = 0usize;
         while let Some(Ok(chunk)) = chunks.next().await {

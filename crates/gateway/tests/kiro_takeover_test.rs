@@ -861,7 +861,8 @@ async fn a_billed_turn_reports_its_credits_before_it_ends() {
     let charged = usage_entries(&billing)[0].credits_charged;
     assert!(charged > 0);
     let event = &frames[metering].1;
-    assert_eq!(event["unit"], "Credit");
+    // Kiro's own unit: it adds a turn's usage up by it, and its telemetry knows only it.
+    assert_eq!(event["unit"], "credit");
     assert_eq!(event["unitPlural"], "Credits");
     assert!(
         (event["usage"].as_f64().unwrap() - charged as f64 / 1_000_000.0).abs() < 1e-9,
@@ -1352,4 +1353,89 @@ async fn the_intent_answer_ends_with_a_stop_reason() {
                 .as_str()
                 .unwrap_or_default()
                 .contains("\"do\"")));
+}
+
+/// A body sent a chunk at a time, counting the chunks the server has read.
+fn counted_body(
+    prefix: &str,
+    chunks: usize,
+    read: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> Body {
+    let first = bytes::Bytes::from(prefix.to_string());
+    let rest = std::iter::repeat_n(bytes::Bytes::from(vec![b' '; 64 * 1024]), chunks);
+    Body::from_stream(
+        futures_util::stream::iter(std::iter::once(first).chain(rest)).map(move |chunk| {
+            read.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, std::io::Error>(chunk)
+        }),
+    )
+}
+
+/// A refusal answered while Kiro is still sending its body can reach it as a connection
+/// reset, which it reports as a network error and answers by sending it all again. What is
+/// refused before it is read is read and dropped first.
+#[tokio::test]
+async fn a_body_refused_before_it_is_read_is_read_before_the_answer() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let server = upstream(
+        ResponseTemplate::new(200).set_body_raw(anthropic_answer("ok"), "text/event-stream"),
+    )
+    .await;
+    let billing = engine(
+        ProviderFormat::Anthropic,
+        &server.uri(),
+        vec![ModelMap::new("map", GROUP, "model", "prov", "up")],
+    );
+    let runtime = ProviderRuntimeRegistry::new();
+    runtime.sync_from_billing(&billing);
+    let mut registry = FacadeRegistry::new().with_runtime(runtime.clone());
+    registry.register(GenerateAssistantResponseHandler {
+        billing: billing.clone(),
+        runtime: Some(runtime),
+        intercept_intent: false,
+        card_rate_limiter: gateway::ops::CardRateLimiter::new(1),
+        ..Default::default()
+    });
+    let app = registry.into_router();
+    // Takes the card's one request this second, and is refused as unreadable.
+    let first = post(&app, "inv-first", None, Body::from("not json")).await;
+    assert_eq!(first.status, StatusCode::BAD_REQUEST, "{}", first.text());
+
+    // Over the card's rate: refused before its body is read.
+    let read = Arc::new(AtomicUsize::new(0));
+    let reply = post(
+        &app,
+        "inv-second",
+        None,
+        counted_body(&turn(), 16, read.clone()),
+    )
+    .await;
+    assert_eq!(
+        reply.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "{}",
+        reply.text()
+    );
+    assert_eq!(
+        read.load(Ordering::SeqCst),
+        17,
+        "the whole body is read first"
+    );
+
+    // Kiro's activity log, which Kiro moves past only once a batch is answered.
+    let read = Arc::new(AtomicUsize::new(0));
+    let response = FacadeRegistry::default()
+        .into_router()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/agents/activity")
+                .body(counted_body("{\"payload\":[]}", 16, read.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(read.load(Ordering::SeqCst), 17);
 }
