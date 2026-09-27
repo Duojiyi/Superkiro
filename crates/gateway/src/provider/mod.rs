@@ -538,6 +538,33 @@ impl<T> Stream for ReceiverStream<T> {
     }
 }
 
+/// `data:` lines of one stream that did not parse. A relay's own keepalive (`data:
+/// keep-alive`) is passed over as the liveness it is, and one garbled event is too; ended at
+/// the first such line, a whole turn failed with "upstream response parse error". Garbled
+/// events that keep coming are an upstream that is not speaking the format, and end it.
+#[derive(Default)]
+struct UnparseableLines {
+    garbled: usize,
+}
+
+impl UnparseableLines {
+    /// Garbled events a stream may carry before it is ended.
+    const TOLERATED: usize = 2;
+
+    /// Whether the unparseable `line` is passed over rather than ending the stream.
+    fn passes_over(&mut self, line: &str) -> bool {
+        let Some(payload) = line.strip_prefix("data:").map(str::trim) else {
+            return false;
+        };
+        if !payload.starts_with('{') && !payload.starts_with('[') {
+            return true;
+        }
+        self.garbled += 1;
+        eprintln!("sse_line_garbled count={}", self.garbled);
+        self.garbled <= Self::TOLERATED
+    }
+}
+
 /// Helper function to transform a byte stream into line-delimited SSE event stream.
 pub fn process_byte_stream<F>(
     byte_stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
@@ -558,6 +585,7 @@ where
         let mut buffer = String::new();
         let mut stream = Box::pin(byte_stream);
         let mut emitted_done = false;
+        let mut unparseable = UnparseableLines::default();
 
         loop {
             let chunk_res = tokio::select! {
@@ -637,6 +665,10 @@ where
                 } else {
                     parse_line(line)
                 };
+                let parsed = match parsed {
+                    Err(ProviderError::Parse(_)) if unparseable.passes_over(line) => Ok(Vec::new()),
+                    parsed => parsed,
+                };
                 match parsed {
                     Ok(events) if events.is_empty() && !line.starts_with("event:") => {
                         if tx.send(Ok(ProviderStreamEvent::Heartbeat)).await.is_err() {
@@ -681,7 +713,13 @@ where
             return;
         }
         if !remaining.is_empty() && !remaining.starts_with(':') {
-            match parse_line(remaining) {
+            let parsed = match parse_line(remaining) {
+                Err(ProviderError::Parse(_)) if unparseable.passes_over(remaining) => {
+                    Ok(Vec::new())
+                }
+                parsed => parsed,
+            };
+            match parsed {
                 Ok(events) => {
                     for ev in events {
                         if ev == ProviderStreamEvent::Done {
@@ -768,5 +806,80 @@ mod overflow_tests {
         ] {
             assert!(!says_input_too_long(text), "{text}");
         }
+    }
+}
+
+#[cfg(test)]
+mod sse_line_tests {
+    use super::*;
+
+    /// The events and the error, if any, that `body` streams as, parsed as Anthropic lines.
+    async fn events_of(body: &str) -> (Vec<ProviderStreamEvent>, Option<ProviderError>) {
+        let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> =
+            vec![Ok(bytes::Bytes::from(body.to_string()))];
+        let mut stream = process_byte_stream(futures_util::stream::iter(chunks), |line| {
+            anthropic::AnthropicProvider.parse_stream_line(line)
+        });
+        let (mut events, mut error) = (Vec::new(), None);
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(event) => events.push(event),
+                Err(failure) => {
+                    error = Some(failure);
+                    break;
+                }
+            }
+        }
+        (events, error)
+    }
+
+    fn delta(text: &str) -> String {
+        format!(
+            "data: {}\n\n",
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": text}})
+        )
+    }
+
+    // A relay's own keepalive line, and a garbled event now and then, are passed over:
+    // ended at the first, a whole turn failed with "upstream response parse error".
+    #[tokio::test]
+    async fn an_unparseable_line_is_passed_over() {
+        let body = [
+            delta("Hello"),
+            "data: keep-alive\n\n".to_string(),
+            "data: {\"type\": \"content_block_delta\", \"ind\n\n".to_string(),
+            "data: keep-alive\n\n".to_string(),
+            "data: keep-alive\n\n".to_string(),
+            delta(" world"),
+            "data: {\"type\": \"message_stop\"}\n\n".to_string(),
+        ]
+        .concat();
+        let (events, error) = events_of(&body).await;
+        assert!(error.is_none(), "{error:?}");
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderStreamEvent::Delta(ProviderDelta::Text(text)) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Hello world");
+        assert!(events.contains(&ProviderStreamEvent::Heartbeat));
+        assert_eq!(events.last(), Some(&ProviderStreamEvent::Done));
+    }
+
+    // Garbled events that keep coming are an upstream not speaking the format.
+    #[tokio::test]
+    async fn garbled_events_that_keep_coming_end_the_stream() {
+        let garbled = "data: {\"type\": \"content_block_delta\", \"ind\n\n";
+        let body = [delta("Hello"), garbled.repeat(3), delta(" world")].concat();
+        let (events, error) = events_of(&body).await;
+        assert!(matches!(error, Some(ProviderError::Parse(_))), "{error:?}");
+        assert!(
+            !events.contains(&ProviderStreamEvent::Delta(ProviderDelta::Text(
+                " world".into()
+            )))
+        );
     }
 }
