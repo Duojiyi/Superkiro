@@ -733,3 +733,23 @@ pub async fn auth_middleware(
         }
     }
 }
+
+/// For a public route that shows a signed-in card more: a valid Bearer token's claims go
+/// into the request's extensions, as `auth_middleware` puts them; a missing or invalid one
+/// leaves the request anonymous rather than refusing it.
+pub async fn optional_auth_middleware(
+    State(auth): State<AuthState>,
+    mut req: Request<Body>,
+    next: Next,
+) -> Response {
+    let claims = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .and_then(|token| auth.verify_token(token.trim()).ok());
+    if let Some(claims) = claims {
+        req.extensions_mut().insert(claims);
+    }
+    next.run(req).await
+}

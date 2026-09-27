@@ -354,6 +354,10 @@ impl FacadeRegistry {
                 billing: billing.clone(),
                 auth: auth.clone(),
             })
+            .register(admin::AdminEditAnnouncementHandler {
+                billing: billing.clone(),
+                auth: auth.clone(),
+            })
             .register(admin::AdminSnapshotSyncHandler { billing, auth });
         self
     }
@@ -515,6 +519,7 @@ impl FacadeRegistry {
             protected_router = protected_router.route(path, method_router);
         }
 
+        let optional_auth = auth.clone();
         let protected_router = protected_router.layer(axum::middleware::from_fn_with_state(
             auth,
             crate::auth::auth_middleware,
@@ -590,6 +595,13 @@ impl FacadeRegistry {
                     }),
                     _ => panic!("Unsupported HTTP method for facade handler: {}", method),
                 };
+            }
+            // Public, but an announcement for some groups reaches only their signed-in cards.
+            if path == "/api/v1/announcements" {
+                method_router = method_router.layer(axum::middleware::from_fn_with_state(
+                    optional_auth.clone(),
+                    crate::auth::optional_auth_middleware,
+                ));
             }
             public_router = public_router.route(path, method_router);
         }

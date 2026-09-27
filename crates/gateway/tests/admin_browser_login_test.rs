@@ -202,6 +202,10 @@ async fn production_cookie_login_csrf_reveal_logout_and_fail_closed() {
             "cards/status",
             json!({"cardId": card_id, "action": "unban", "reason": "误封"}),
         ),
+        (
+            "announcements/edit",
+            json!({"id": "ann-1", "title": "维护改期"}),
+        ),
     ] {
         for token in [None, Some("wrong")] {
             let response = app

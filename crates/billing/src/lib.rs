@@ -28,8 +28,9 @@ pub use crypto::{
 pub use observability::{
     compute_margin_dashboard, compute_model_cost_rankings, compute_provider_health,
     export_reconciliation_csv, export_reconciliation_json, prune_traces_in_place, Announcement,
-    AnnouncementLevel, AnomalyAction, AnomalyAlert, AttemptRecord, DailyUsageSummary,
-    MarginDashboard, ModelCostRanking, ProviderHealthSummary, RequestTrace, TraceStatus,
+    AnnouncementEdit, AnnouncementLevel, AnomalyAction, AnomalyAlert, AttemptRecord,
+    DailyUsageSummary, MarginDashboard, ModelCostRanking, ProviderHealthSummary, RequestTrace,
+    TraceStatus,
 };
 pub use provider::{HealthState, Provider, ProviderFormat, ProviderKey};
 pub use tenant::{TenantContext, TenantViolation};

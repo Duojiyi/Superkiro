@@ -5657,6 +5657,42 @@ impl BillingEngine {
             .collect()
     }
 
+    /// Every announcement kept: scheduled, shown, ended and withdrawn.
+    pub fn list_announcements(&self) -> Vec<Announcement> {
+        self.announcements.read().unwrap().clone()
+    }
+
+    /// Change a published announcement: `change` edits it and says whether it changed
+    /// anything. Reported only once saved; a failed save changes nothing. `None` when no
+    /// announcement has that id.
+    pub fn edit_announcement<F>(
+        &self,
+        id: &str,
+        change: F,
+    ) -> Result<Option<Announcement>, BillingError>
+    where
+        F: FnOnce(&mut Announcement) -> Result<bool, BillingError>,
+    {
+        let _state_guard = self.state_lock.write().unwrap();
+        let mut candidate = self.export_snapshot_locked(
+            self.snapshot_sequence
+                .load(Ordering::Acquire)
+                .saturating_add(1),
+            self.last_snapshot_checksum.read().unwrap().clone(),
+        );
+        let Some(announcement) = candidate.announcements.iter_mut().find(|a| a.id == id) else {
+            return Ok(None);
+        };
+        if !change(announcement)? {
+            return Ok(Some(announcement.clone()));
+        }
+        let edited = announcement.clone();
+        self.commit_candidate_snapshot(&candidate, || {
+            *self.announcements.write().unwrap() = candidate.announcements.clone();
+            Some(edited)
+        })
+    }
+
     /// Export ledger entries to CSV (Spec §14.4), naming providers as they are called now.
     pub fn export_ledger_csv(&self, card_id: Option<&str>) -> String {
         let names: HashMap<String, String> = self

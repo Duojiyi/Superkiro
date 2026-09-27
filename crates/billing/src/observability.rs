@@ -368,6 +368,25 @@ pub struct Announcement {
     pub enabled: bool,
     pub created_at: u64,
     pub expires_at: Option<u64>,
+    /// When it is first shown. Unset, it is shown from when it was published. Older releases
+    /// ignore it and show a scheduled announcement at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starts_at: Option<u64>,
+    /// The groups whose cards are shown it; every customer when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audience: Vec<String>,
+    /// Its edits, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edits: Vec<AnnouncementEdit>,
+}
+
+/// Who changed a published announcement, when, and which of its fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnnouncementEdit {
+    pub operator: String,
+    pub at_secs: u64,
+    /// Of title, content, level, starts_at, expires_at and audience.
+    pub changed: Vec<String>,
 }
 
 impl Announcement {
@@ -386,6 +405,9 @@ impl Announcement {
             enabled: true,
             created_at: now_secs,
             expires_at: None,
+            starts_at: None,
+            audience: Vec::new(),
+            edits: Vec::new(),
         }
     }
 
@@ -394,16 +416,33 @@ impl Announcement {
         self
     }
 
+    pub fn with_start(mut self, starts_at: u64) -> Self {
+        self.starts_at = Some(starts_at);
+        self
+    }
+
+    pub fn with_audience(mut self, group_ids: Vec<String>) -> Self {
+        self.audience = group_ids;
+        self
+    }
+
+    /// When it is first shown: its start, or when it was published.
+    pub fn start_secs(&self) -> u64 {
+        self.starts_at.unwrap_or(self.created_at)
+    }
+
+    /// Shown now: not withdrawn, and its window, from its start up to its end, holds `now_secs`.
     pub fn is_active(&self, now_secs: u64) -> bool {
-        if !self.enabled {
-            return false;
-        }
-        if let Some(exp) = self.expires_at {
-            if now_secs >= exp {
-                return false;
-            }
-        }
-        true
+        self.enabled
+            && self.starts_at.is_none_or(|start| now_secs >= start)
+            && self.expires_at.is_none_or(|end| now_secs < end)
+    }
+
+    /// Whether a card of `group_id` is shown it; a caller of no known group sees only what is
+    /// shown to everyone.
+    pub fn is_for(&self, group_id: Option<&str>) -> bool {
+        self.audience.is_empty()
+            || group_id.is_some_and(|group| self.audience.iter().any(|id| id == group))
     }
 }
 

@@ -10,8 +10,9 @@
 //! - `POST /api/v1/admin/cards/devices/unbind`, `.../rebinds/reset`, `.../validity`,
 //!   `.../note`, `.../group`: support actions, each written to the card's history
 //! - `POST /api/v1/admin/cards/batch`: batch generate cards from template
-//! - `GET /api/v1/admin/announcements`: list announcements
-//! - `POST /api/v1/admin/announcements`: publish announcement
+//! - `GET /api/v1/admin/announcements`: list announcements, scheduled ones included
+//! - `POST /api/v1/admin/announcements`: publish announcement, from a start to an end, for groups
+//! - `POST /api/v1/admin/announcements/edit`: change a published one's text, times or groups
 //! - `GET /api/v1/admin/providers`: provider, model mapping, and rate card config
 //! - `GET /api/v1/admin/traces`: request execution traces
 //! - `GET /api/v1/admin/financials`: margin dashboard and model cost rankings
@@ -2252,8 +2253,69 @@ impl FacadeHandler for AdminCardActionHandler {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Admin Announcements Handlers (GET / POST /api/v1/admin/announcements)
+// 6. Admin Announcements Handlers (GET / POST /api/v1/admin/announcements, .../edit)
 // ---------------------------------------------------------------------------
+
+/// How far ahead an announcement may start or end: ten years.
+const MAX_ANNOUNCEMENT_AHEAD_SECS: u64 = 3650 * 86_400;
+
+/// An announcement as the console shows it: its fields, when it is first shown, the groups
+/// it is for (every customer when empty), its edits, and where it stands now.
+fn announcement_view(announcement: &Announcement, now: u64) -> serde_json::Value {
+    let status = if !announcement.enabled {
+        "withdrawn"
+    } else if announcement.expires_at.is_some_and(|end| now >= end) {
+        "ended"
+    } else if !announcement.is_active(now) {
+        "scheduled"
+    } else {
+        "active"
+    };
+    serde_json::json!({
+        "id": announcement.id,
+        "title": announcement.title,
+        "content": announcement.content,
+        "level": announcement.level,
+        "enabled": announcement.enabled,
+        "created_at": announcement.created_at,
+        "starts_at": announcement.start_secs(),
+        "expires_at": announcement.expires_at,
+        "audience": announcement.audience,
+        "edits": announcement.edits,
+        "status": status,
+    })
+}
+
+/// The groups an announcement is for, each once, or why they cannot be: at most 50 groups,
+/// each one that exists.
+fn announcement_audience(billing: &BillingEngine, ids: &[String]) -> Result<Vec<String>, String> {
+    if ids.len() > 50 {
+        return Err("audience names at most 50 groups".into());
+    }
+    let mut audience: Vec<String> = Vec::with_capacity(ids.len());
+    for id in ids.iter().map(|id| id.trim()) {
+        if billing.get_group(id).is_none() {
+            return Err(format!("Unknown group in audience: {id}"));
+        }
+        if !audience.iter().any(|known| known == id) {
+            audience.push(id.to_string());
+        }
+    }
+    Ok(audience)
+}
+
+/// Why an announcement's window cannot be: it must end after it starts, and neither may be
+/// more than ten years away.
+fn announcement_window_problem(start: u64, end: Option<u64>, now: u64) -> Option<&'static str> {
+    let latest = now.saturating_add(MAX_ANNOUNCEMENT_AHEAD_SECS);
+    if start > latest {
+        Some("startsAtSecs must be within 3650 days")
+    } else if end.is_some_and(|end| end <= start || end > latest) {
+        Some("endsAtSecs must be after the start and within 3650 days")
+    } else {
+        None
+    }
+}
 
 pub struct AdminGetAnnouncementsHandler {
     pub billing: BillingEngine,
@@ -2275,7 +2337,18 @@ impl FacadeHandler for AdminGetAnnouncementsHandler {
                 return unauthorized_response();
             }
 
-            let list = self.billing.list_active_announcements(now_secs());
+            // Scheduled and shown ones, newest first; with all=true, ended and withdrawn too.
+            let now = now_secs();
+            let all = parse_query(req.uri(), "all").is_some_and(|value| value == "true");
+            let mut list: Vec<Announcement> = self
+                .billing
+                .list_announcements()
+                .into_iter()
+                .filter(|a| all || (a.enabled && a.expires_at.is_none_or(|end| now < end)))
+                .collect();
+            list.sort_by_key(|a| std::cmp::Reverse(a.created_at));
+            let list: Vec<serde_json::Value> =
+                list.iter().map(|a| announcement_view(a, now)).collect();
             json_response(
                 StatusCode::OK,
                 &serde_json::json!({ "success": true, "announcements": list }),
@@ -2290,7 +2363,15 @@ pub struct AdminCreateAnnouncementRequest {
     pub title: String,
     pub content: String,
     pub level: Option<String>,
+    /// Shown for this long from its start: the older way to give its end.
     pub ttl_secs: Option<u64>,
+    /// When it is first shown; now when left out or already past.
+    pub starts_at_secs: Option<u64>,
+    /// When it stops being shown; left out with ttlSecs, it is shown until withdrawn.
+    pub ends_at_secs: Option<u64>,
+    /// The groups whose cards are shown it; every customer when left out or empty.
+    #[serde(default)]
+    pub audience: Vec<String>,
 }
 
 pub struct AdminCreateAnnouncementHandler {
@@ -2349,6 +2430,24 @@ impl FacadeHandler for AdminCreateAnnouncementHandler {
                 Some("critical") => AnnouncementLevel::Critical,
                 _ => AnnouncementLevel::Info,
             };
+            let start = req_data.starts_at_secs.unwrap_or(now).max(now);
+            let end = match (req_data.ends_at_secs, req_data.ttl_secs) {
+                (Some(_), Some(_)) => {
+                    return failure(
+                        StatusCode::BAD_REQUEST,
+                        "Give at most one of endsAtSecs and ttlSecs",
+                    )
+                }
+                (Some(end), None) => Some(end),
+                (None, ttl) => ttl.map(|ttl| start.saturating_add(ttl)),
+            };
+            if let Some(problem) = announcement_window_problem(start, end, now) {
+                return failure(StatusCode::BAD_REQUEST, problem);
+            }
+            let audience = match announcement_audience(&self.billing, &req_data.audience) {
+                Ok(audience) => audience,
+                Err(problem) => return failure(StatusCode::BAD_REQUEST, &problem),
+            };
 
             let id = format!(
                 "ann-{}",
@@ -2357,9 +2456,14 @@ impl FacadeHandler for AdminCreateAnnouncementHandler {
                     .unwrap_or_default()
                     .as_nanos()
             );
-            let mut ann = Announcement::new(id, req_data.title, req_data.content, level, now);
-            if let Some(ttl) = req_data.ttl_secs {
-                ann = ann.with_expiry(now + ttl);
+            let mut ann = Announcement::new(id, req_data.title, req_data.content, level, now)
+                .with_audience(audience);
+            // One shown from now needs no start: an older release shows it the same way.
+            if start > now {
+                ann = ann.with_start(start);
+            }
+            if let Some(end) = end {
+                ann = ann.with_expiry(end);
             }
 
             if self.billing.publish_announcement(ann.clone()).is_err() {
@@ -2372,7 +2476,7 @@ impl FacadeHandler for AdminCreateAnnouncementHandler {
 
             json_response(
                 StatusCode::OK,
-                &serde_json::json!({ "success": true, "announcement": ann }),
+                &serde_json::json!({ "success": true, "announcement": announcement_view(&ann, now) }),
             )
         })
     }
@@ -2444,6 +2548,195 @@ impl FacadeHandler for AdminWithdrawAnnouncementHandler {
                 StatusCode::OK,
                 &serde_json::json!({ "success": true, "id": id }),
             )
+        })
+    }
+}
+
+/// A field that may be sent as null, told apart from one left out: null is `Some(None)`.
+fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+/// An edit of a published announcement: each field given replaces its value; one left out
+/// keeps it.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EditAnnouncementRequest {
+    id: String,
+    title: Option<String>,
+    content: Option<String>,
+    level: Option<String>,
+    /// Now when already past.
+    starts_at_secs: Option<u64>,
+    /// Null: shown until withdrawn.
+    #[serde(default, deserialize_with = "present")]
+    ends_at_secs: Option<Option<u64>>,
+    /// Shown for this long from its start, instead of endsAtSecs.
+    ttl_secs: Option<u64>,
+    /// Empty: every customer.
+    audience: Option<Vec<String>>,
+}
+
+/// A typo or a moved maintenance window is corrected in place rather than by withdrawing
+/// and publishing anew; each edit is kept with who made it and when.
+pub struct AdminEditAnnouncementHandler {
+    pub billing: BillingEngine,
+    pub auth: Arc<AdminAuthState>,
+}
+
+impl FacadeHandler for AdminEditAnnouncementHandler {
+    fn method(&self) -> Method {
+        Method::POST
+    }
+
+    fn path(&self) -> &'static str {
+        "/api/v1/admin/announcements/edit"
+    }
+
+    fn handle<'a>(&'a self, req: Request<Body>) -> BoxFuture<'a, Response> {
+        Box::pin(async move {
+            let Some(operator) = self.auth.authenticated_operator(req.headers()) else {
+                return unauthorized_response();
+            };
+            let Ok(bytes) = axum::body::to_bytes(req.into_body(), 64 * 1024).await else {
+                return failure(StatusCode::BAD_REQUEST, "Invalid request body");
+            };
+            let body: EditAnnouncementRequest = match card_action_body(&bytes) {
+                Ok(body) => body,
+                Err(message) => return failure(StatusCode::BAD_REQUEST, &message),
+            };
+            if !valid_text(&body.id, 128) {
+                return failure(StatusCode::BAD_REQUEST, "announcement id is required");
+            }
+            if body.title.as_deref().is_some_and(|t| !valid_text(t, 256))
+                || body
+                    .content
+                    .as_deref()
+                    .is_some_and(|c| !valid_text(c, 20_000))
+            {
+                return failure(
+                    StatusCode::BAD_REQUEST,
+                    "title must be 1 to 256 characters and content 1 to 20000",
+                );
+            }
+            let level = match body.level.as_deref() {
+                None => None,
+                Some("info") => Some(AnnouncementLevel::Info),
+                Some("warning") => Some(AnnouncementLevel::Warning),
+                Some("critical") => Some(AnnouncementLevel::Critical),
+                Some(_) => {
+                    return failure(
+                        StatusCode::BAD_REQUEST,
+                        "level must be info, warning or critical",
+                    )
+                }
+            };
+            if body.ends_at_secs.is_some() && body.ttl_secs.is_some() {
+                return failure(
+                    StatusCode::BAD_REQUEST,
+                    "Give at most one of endsAtSecs and ttlSecs",
+                );
+            }
+            if body
+                .ttl_secs
+                .is_some_and(|ttl| !(60..=31 * 86_400).contains(&ttl))
+            {
+                return failure(
+                    StatusCode::BAD_REQUEST,
+                    "ttlSecs must be between 60 and 2678400",
+                );
+            }
+            let audience = match body.audience.as_deref() {
+                None => None,
+                Some(ids) => match announcement_audience(&self.billing, ids) {
+                    Ok(audience) => Some(audience),
+                    Err(problem) => return failure(StatusCode::BAD_REQUEST, &problem),
+                },
+            };
+            let now = now_secs();
+            let result = self.billing.edit_announcement(body.id.trim(), |current| {
+                if !current.enabled {
+                    return Err(billing::BillingError::InvalidState(
+                        "A withdrawn announcement cannot be edited".into(),
+                    ));
+                }
+                let mut next = current.clone();
+                if let Some(title) = body.title {
+                    next.title = title;
+                }
+                if let Some(content) = body.content {
+                    next.content = content;
+                }
+                if let Some(level) = level {
+                    next.level = level;
+                }
+                // A start sent back unchanged is kept, though it has passed.
+                if let Some(start) = body.starts_at_secs {
+                    if start != current.start_secs() {
+                        next.starts_at = Some(start.max(now));
+                    }
+                }
+                if let Some(end) = body.ends_at_secs {
+                    next.expires_at = end;
+                }
+                if let Some(ttl) = body.ttl_secs {
+                    next.expires_at = Some(next.start_secs().saturating_add(ttl));
+                }
+                if let Some(audience) = audience {
+                    next.audience = audience;
+                }
+                if let Some(problem) =
+                    announcement_window_problem(next.start_secs(), next.expires_at, now)
+                {
+                    return Err(billing::BillingError::InvalidAdjustment(problem.into()));
+                }
+                let changed: Vec<String> = [
+                    ("title", next.title != current.title),
+                    ("content", next.content != current.content),
+                    ("level", next.level != current.level),
+                    ("starts_at", next.start_secs() != current.start_secs()),
+                    ("expires_at", next.expires_at != current.expires_at),
+                    ("audience", next.audience != current.audience),
+                ]
+                .into_iter()
+                .filter(|(_, changed)| *changed)
+                .map(|(field, _)| field.to_string())
+                .collect();
+                if changed.is_empty() {
+                    return Ok(false);
+                }
+                next.edits.push(billing::AnnouncementEdit {
+                    operator: operator.to_string(),
+                    at_secs: now,
+                    changed,
+                });
+                *current = next;
+                Ok(true)
+            });
+            match result {
+                Ok(Some(announcement)) => json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({
+                        "success": true,
+                        "announcement": announcement_view(&announcement, now),
+                    }),
+                ),
+                Ok(None) => failure(StatusCode::NOT_FOUND, "announcement not found"),
+                Err(billing::BillingError::InvalidAdjustment(problem)) => {
+                    failure(StatusCode::BAD_REQUEST, &problem)
+                }
+                Err(billing::BillingError::InvalidState(problem)) => {
+                    failure(StatusCode::CONFLICT, &problem)
+                }
+                Err(_) => failure(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "The edit could not be saved; the announcement is unchanged",
+                ),
+            }
         })
     }
 }

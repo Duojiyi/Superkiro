@@ -243,7 +243,9 @@ impl FacadeHandler for ClientBrandHandler {
     }
 }
 
-/// Public, read-only announcements; display fields and Unix-second timestamps only.
+/// Public, read-only announcements; display fields and Unix-second timestamps only. Only
+/// those whose window holds now are shown, and one for some groups only to a caller signed
+/// in with a card of one of them.
 pub struct AnnouncementsHandler {
     pub billing: billing::BillingEngine,
 }
@@ -255,16 +257,22 @@ impl FacadeHandler for AnnouncementsHandler {
     fn path(&self) -> &'static str {
         "/api/v1/announcements"
     }
-    fn handle<'a>(&'a self, _req: Request<Body>) -> BoxFuture<'a, Response> {
+    fn handle<'a>(&'a self, req: Request<Body>) -> BoxFuture<'a, Response> {
         Box::pin(async move {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
+            // Put there by the optional sign-in in front of this route.
+            let group = req
+                .extensions()
+                .get::<crate::auth::AuthClaims>()
+                .map(|claims| claims.group_id.as_str());
             let announcements: Vec<_> = self
                 .billing
                 .list_active_announcements(now)
                 .into_iter()
+                .filter(|item| item.is_for(group))
                 .map(|item| {
                     serde_json::json!({
                         "id": item.id, "level": item.level, "title": item.title,
