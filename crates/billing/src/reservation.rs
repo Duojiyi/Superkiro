@@ -61,12 +61,21 @@ impl ReservationEstimateParams {
     }
 }
 
-/// What a request is charged with besides its price version, captured when it is reserved.
+/// What a request is charged and costed with besides its price version, captured when it is
+/// reserved: the group's margin, the model's multiplier, and of the settings only what its
+/// settlement reads (see [`BillingSettings::for_routes`]), not a copy of every official
+/// price and route cost with each request in flight.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LockedPricing {
     pub group_margin: f64,
     pub model_multiplier: f64,
     pub settings: BillingSettings,
+    /// The routes, `<provider>/<upstream model>`, that could serve it when it was reserved:
+    /// its mapping's primary and fallbacks, whose costs `settings` keeps. Empty for a request
+    /// no mapping serves. One served by another route, its mapping changed while it was in
+    /// flight, is costed at the settings in force when it settles.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<String>,
 }
 
 /// Record tracking an active or completed credit reservation.
@@ -113,6 +122,13 @@ impl CreditReservation {
     pub fn with_rate_card_version(mut self, version: impl Into<String>) -> Self {
         self.rate_card_version = Some(version.into());
         self
+    }
+
+    /// Settled or released. What it was priced with has served; the record is kept only to
+    /// refuse a replay of its invocation, and would otherwise carry every setting for a day.
+    pub(crate) fn finish(&mut self, state: ReservationState) {
+        self.state = state;
+        self.pricing = None;
     }
 
     /// Check if this held reservation has expired and should be reclaimed by janitor.

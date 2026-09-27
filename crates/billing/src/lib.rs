@@ -28,8 +28,9 @@ pub use crypto::{
 pub use observability::{
     compute_margin_dashboard, compute_model_cost_rankings, compute_provider_health,
     export_reconciliation_csv, export_reconciliation_json, prune_traces_in_place, Announcement,
-    AnnouncementLevel, AnomalyAction, AnomalyAlert, AttemptRecord, DailyUsageSummary,
-    MarginDashboard, ModelCostRanking, ProviderHealthSummary, RequestTrace, TraceStatus,
+    AnnouncementEdit, AnnouncementLevel, AnomalyAction, AnomalyAlert, AttemptRecord,
+    DailyUsageSummary, MarginDashboard, ModelCostRanking, ProviderHealthSummary, RequestTrace,
+    TraceStatus,
 };
 pub use provider::{HealthState, Provider, ProviderFormat, ProviderKey};
 pub use tenant::{TenantContext, TenantViolation};
@@ -44,14 +45,15 @@ pub use card_platform::{
 pub use engine::{
     read_snapshot_anchor, verify_ledger_archive, verify_ledger_archive_with, ArchivedCardSummary,
     ArchivedLedgerPayload, ArchivedLedgerReceipt, ArchivedLedgerSummary, BillingEngine,
-    BillingError, BillingSnapshot, CardReconciliation, IssuanceOrder, PendingSettlement,
-    SnapshotAnchor, SnapshotVerificationReport, UnpaidCharge,
+    BillingError, BillingSnapshot, CardReconciliation, CompensatedRequest, IssuanceOrder,
+    PendingSettlement, SnapshotAnchor, SnapshotVerificationReport, UnpaidCharge, ValidityExtension,
 };
 pub use generator::{export_csv, export_json, generate_batch, generate_card, GeneratedCard};
 pub use group::{FallbackTarget, Group, ModelMap, ProviderBindingMode};
 pub use ledger::{LedgerEntry, LedgerKind, PricingRates, UsageTokens};
 pub use rate_card::{
-    BillingSettings, Currency, MarginSummary, PricingMode, RateCard, RateCardVersion,
+    BillingSettings, Currency, MarginSummary, OfficialPrice, OfficialPricing, PricingMode,
+    RateCard, RateCardVersion, RouteCost,
 };
 pub use reservation::{
     CreditReservation, LockedPricing, ReservationEstimateParams, ReservationState,
@@ -68,6 +70,21 @@ pub use workbench::{
 
 /// 1 credit = 1_000_000 micro credits (integer micro-credits precision, Spec §5).
 pub const MICRO_CREDITS_PER_CREDIT: i64 = 1_000_000;
+
+/// The longest card ID the admin API takes, in bytes; issued ones are 21.
+pub const MAX_CARD_ID_BYTES: usize = 128;
+/// The longest group ID, in bytes, wherever one is published or named.
+pub const MAX_GROUP_ID_BYTES: usize = 128;
+/// The longest invocation ID a client may send, in bytes.
+pub const MAX_CLIENT_INVOCATION_ID_BYTES: usize = 128;
+/// The longest key a request is held, billed and traced under: its card's ID, a colon and
+/// the client's invocation ID.
+pub const MAX_INVOCATION_KEY_BYTES: usize = MAX_CARD_ID_BYTES + 1 + MAX_CLIENT_INVOCATION_ID_BYTES;
+
+/// Whether `id` can be an ID of at most `max` bytes: not blank, without control characters.
+pub fn valid_id(id: &str, max: usize) -> bool {
+    !id.trim().is_empty() && id.len() <= max && !id.chars().any(char::is_control)
+}
 
 #[cfg(test)]
 mod tests {

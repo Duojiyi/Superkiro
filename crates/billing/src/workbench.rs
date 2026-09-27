@@ -7,7 +7,7 @@
 //! 4. Reverse-calibrate plan pricing ("Card = X credits, typical user lasts 30 days").
 //! 5. One-click publish new RateCardVersion with immutable audit logs.
 
-use crate::ledger::{LedgerEntry, LedgerKind};
+use crate::ledger::{EarnedCredits, LedgerEntry, LedgerKind};
 use crate::rate_card::{BillingSettings, Currency, PricingMode, RateCardVersion};
 use crate::MICRO_CREDITS_PER_CREDIT;
 use serde::{Deserialize, Serialize};
@@ -68,6 +68,7 @@ impl ModelPresets {
             per_call_credit: 0,
             margin_multiplier: 1.30, // 30% default target gross margin
             effective_from_secs: now_secs,
+            official: None,
         })
     }
 }
@@ -208,6 +209,14 @@ pub fn simulate_candidate_pricing(
     let mut original_credits = 0i64;
     let mut simulated_credits = 0i64;
     let mut total_provider_cost = 0i64;
+    let fv = if settings.credit_face_value_cny > 0.0 {
+        settings.credit_face_value_cny
+    } else {
+        0.01
+    };
+    // What was charged counts at the face value it was earned at; the candidate, at the
+    // current one.
+    let mut earned = EarnedCredits::default();
 
     for entry in historical_entries {
         if entry.kind != LedgerKind::Usage {
@@ -221,6 +230,13 @@ pub fn simulate_candidate_pricing(
 
         count += 1;
         original_credits = original_credits.saturating_add(entry.credits_charged);
+        earned.add(
+            entry
+                .credit_face_value_cny
+                .filter(|face| *face > 0.0)
+                .unwrap_or(fv),
+            entry.credits_charged,
+        );
         total_provider_cost = total_provider_cost.saturating_add(entry.provider_cost_micro_cny);
 
         let tokens = crate::ledger::UsageTokens {
@@ -236,12 +252,7 @@ pub fn simulate_candidate_pricing(
         simulated_credits = simulated_credits.saturating_add(sim_charge);
     }
 
-    let fv = if settings.credit_face_value_cny > 0.0 {
-        settings.credit_face_value_cny
-    } else {
-        0.01
-    };
-    let orig_rev = ((original_credits as f64) * fv).round() as i64;
+    let orig_rev = earned.revenue_micro_cny();
     let sim_rev = ((simulated_credits as f64) * fv).round() as i64;
 
     let orig_profit = orig_rev.saturating_sub(total_provider_cost);

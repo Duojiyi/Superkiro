@@ -4,7 +4,7 @@ use gateway::auth::AuthState;
 use gateway::facade::client::{ClientBeaconHandler, ClientBrandHandler, ClientNegotiateHandler};
 use gateway::facade::conversation::GenerateAssistantResponseHandler;
 use gateway::facade::healthz::{HealthzHandler, MetricsHandler};
-use gateway::facade::mcp::McpHandler;
+use gateway::facade::mcp::{McpHandler, SearchBackend, SearchSourceConfig};
 use gateway::facade::oauth::{OAuthTokenHandler, RefreshTokenHandler};
 use gateway::facade::virtualization::VirtualizationStore;
 use gateway::facade::FacadeRegistry;
@@ -51,6 +51,50 @@ fn vision_fallback_config() -> Option<VisionFallbackConfig> {
         fallback_model: model,
         max_tokens: bounded_env_u32("VISION_FALLBACK_MAX_TOKENS", 1024, 128, 8192).ok()?,
     })
+}
+
+/// Kiro's web_search backend: WEB_SEARCH_BACKEND (searxng, brave or tavily; searxng when only
+/// WEB_SEARCH_URL is set), WEB_SEARCH_URL (the SearXNG endpoint, or a replacement for the
+/// hosted API's own), WEB_SEARCH_API_KEY or WEB_SEARCH_API_KEY_FILE, WEB_SEARCH_MAX_RESULTS
+/// (1-20, default 10) and WEB_SEARCH_TIMEOUT_SECS (1-60, default 15). With none, every search
+/// fails as a tool error Kiro reports.
+fn web_search_config() -> Result<SearchSourceConfig, Box<dyn std::error::Error>> {
+    let backend = match std::env::var("WEB_SEARCH_BACKEND")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "none" => SearchBackend::None,
+        "searxng" => SearchBackend::Searxng,
+        "brave" => SearchBackend::Brave,
+        "tavily" => SearchBackend::Tavily,
+        other => {
+            return Err(format!(
+                "unsupported WEB_SEARCH_BACKEND: {other} (searxng, brave or tavily)"
+            )
+            .into())
+        }
+    };
+    let config = SearchSourceConfig {
+        backend,
+        custom_backend_url: std::env::var("WEB_SEARCH_URL")
+            .ok()
+            .map(|url| url.trim().to_string())
+            .filter(|url| !url.is_empty()),
+        api_key: get_secret_from_env_or_file("WEB_SEARCH_API_KEY")?,
+        max_results: bounded_env_u32("WEB_SEARCH_MAX_RESULTS", 10, 1, 20)? as usize,
+        timeout_secs: bounded_env_u32("WEB_SEARCH_TIMEOUT_SECS", 15, 1, 60)?.into(),
+    };
+    match config.effective_backend() {
+        SearchBackend::Searxng if config.custom_backend_url.is_none() => {
+            Err("WEB_SEARCH_BACKEND=searxng requires WEB_SEARCH_URL".into())
+        }
+        SearchBackend::Brave | SearchBackend::Tavily if config.api_key.is_none() => {
+            Err("WEB_SEARCH_BACKEND=brave or tavily requires WEB_SEARCH_API_KEY".into())
+        }
+        _ => Ok(config),
+    }
 }
 
 fn unix_now() -> u64 {
@@ -273,7 +317,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     registry.register(ClientBrandHandler::default());
 
     // 7. 注册 MCP 与供应商一键导入
-    registry.register(McpHandler::default());
+    let search = web_search_config()?;
+    match search.effective_backend() {
+        SearchBackend::None => println!(
+            "[*] Notice: no web search backend (WEB_SEARCH_BACKEND); Kiro web_search calls fail as tool errors"
+        ),
+        backend => println!("[√] Web search backend: {backend:?}"),
+    }
+    registry.register(McpHandler::new(search));
+
+    // Per-provider request options: PROVIDER_THINKING_REPLAY, PROVIDER_EAGER_TOOL_INPUT,
+    // PROVIDER_PROMPT_CACHE_OFF and PROVIDER_NO_DOCUMENTS, each a list of provider IDs or *.
+    let provider_options = gateway::provider::ProviderOptionsTable::from_env();
+    println!("[*] Provider options: {}", provider_options.describe());
+    gateway::provider::install_provider_options(provider_options);
     registry.register_provider_import_facade(store.clone(), billing.clone());
 
     // 8. 注册对话流式接管处理器 (P1-05, T04)
@@ -340,6 +397,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             vision_config: vision_fallback_config(),
             vision_cache: Default::default(),
             content_guardrail: Default::default(),
+            large_bodies: Default::default(),
         };
         registry.register(handler);
     } else if env_flag("ALLOW_STUB_MODE", false) {
@@ -417,7 +475,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "[√] Client Negotiate Endpoint: http://{}/client/negotiate",
         addr
     );
-    println!("[√] Global body limit: 10 MB, request timeout: 300s");
+    println!(
+        "[√] Body limit: 10 MB (conversations {} MB), request timeout: 300s",
+        gateway::security::ContentGuardrailConfig::default().max_body_bytes / (1024 * 1024)
+    );
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await

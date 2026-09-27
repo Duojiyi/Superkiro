@@ -128,7 +128,7 @@ async fn test_facade_all_spec_4_2_endpoints_routable() {
     assert!(!profiles.is_empty());
     assert!(profiles[0]["arn"].as_str().unwrap().starts_with("arn:aws:"));
 
-    // 8. POST /GenerateCompletions (Graceful 429 rejection for autocomplete)
+    // 8. POST /GenerateCompletions (no completions, no error popup)
     let (status, _, json) = send_request(
         app.clone(),
         Method::POST,
@@ -136,9 +136,8 @@ async fn test_facade_all_spec_4_2_endpoints_routable() {
         Body::empty(),
     )
     .await;
-    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(json["__type"], "ThrottlingException");
-    assert_eq!(json["reason"], "MONTHLY_REQUEST_COUNT");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["completions"], serde_json::json!([]));
 }
 
 #[tokio::test]

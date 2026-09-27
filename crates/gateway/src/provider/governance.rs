@@ -339,12 +339,13 @@ pub fn is_cooldown_error(err: &ProviderError) -> bool {
         ProviderError::Http(status, _) => {
             status.as_u16() == 429 || status.is_server_error() || status.as_u16() == 401
         }
-        ProviderError::Timeout | ProviderError::Network(_) | ProviderError::StreamDisconnected => {
-            true
-        }
+        ProviderError::Network(_) | ProviderError::StreamDisconnected => true,
         ProviderError::Parse(_) | ProviderError::Serialization(_) => false,
         ProviderError::Service => false,
-        ProviderError::Watchdog(_) => true,
+        // A request that took too long says more about the request (a long prompt, a model
+        // thinking before it answers) than about the key; cooling a lone key for it refused
+        // every other customer of its route for a minute.
+        ProviderError::Timeout | ProviderError::Watchdog(_) => false,
         // The key answered; an empty answer says nothing about the key.
         ProviderError::EmptyCompletion => false,
     }
@@ -360,7 +361,10 @@ fn provider_adapter(provider: &Provider) -> Box<dyn ModelProvider> {
 /// Whether a failed attempt leaves another key or target worth trying for this request.
 /// Anything else is a problem with the request itself, which every key would share.
 fn worth_another_attempt(error: &ProviderError) -> bool {
-    matches!(error, ProviderError::EmptyCompletion) || is_cooldown_error(error)
+    matches!(
+        error,
+        ProviderError::EmptyCompletion | ProviderError::Timeout | ProviderError::Watchdog(_)
+    ) || is_cooldown_error(error)
 }
 
 /// Start the stream with one key of `pool`, making up to `retries` attempts with it, and
@@ -533,7 +537,8 @@ pub async fn execute_stream_with_model_fallback(
     max_attempts: usize,
     now_secs: u64,
 ) -> Result<ModelFallbackResult, GovernanceError> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
+    let deadline =
+        tokio::time::Instant::now() + super::retry::UpstreamLimits::for_request(chat_req).total;
     let (pool, target_model) = match candidates {
         [] => return Err(GovernanceError::AllCandidatesExhausted),
         [only] => only,
@@ -826,5 +831,30 @@ pub async fn probe_provider_key(
                 reply: (!reply.is_empty()).then_some(reply),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cooldown_tests {
+    use super::*;
+
+    /// A request that took too long is tried again, on another key when there is one, but
+    /// does not cool its key down: cooling a lone key refused its route to everyone.
+    #[test]
+    fn a_request_timeout_is_retried_without_cooling_the_key() {
+        for timeout in [
+            ProviderError::Timeout,
+            ProviderError::Watchdog(crate::watchdog::WatchdogError::TtfbTimeout {
+                timeout: Duration::from_secs(60),
+            }),
+        ] {
+            assert!(!is_cooldown_error(&timeout));
+            assert!(worth_another_attempt(&timeout));
+        }
+        assert!(is_cooldown_error(&ProviderError::Network("refused".into())));
+        assert!(is_cooldown_error(&ProviderError::Http(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            String::new()
+        )));
     }
 }

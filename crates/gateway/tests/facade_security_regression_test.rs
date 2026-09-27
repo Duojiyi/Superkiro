@@ -233,7 +233,7 @@ async fn caller_cannot_select_another_card_or_use_user_token_as_admin() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(usage["availableCredits"], 10.0);
-    assert_eq!(usage["userInfo"]["email"], "a@kiro-byok.local");
+    assert_eq!(usage["userInfo"]["email"], "卡号 ····a");
     for token in [None, Some(access.as_str()), Some("forged-admin-session")] {
         assert_eq!(
             request(&app, "GET", "/api/v1/admin/cards", json!({}), token)

@@ -121,6 +121,7 @@ async fn test_provider_import_to_real_request_and_lifecycle_loop() {
         vision_config: None,
         vision_cache: Default::default(),
         content_guardrail: Default::default(),
+        large_bodies: Default::default(),
     };
     registry.register(conv_handler);
 
@@ -236,7 +237,7 @@ async fn test_provider_import_to_real_request_and_lifecycle_loop() {
     // Verify runtime is immediately synced to disabled
     assert!(!runtime.has_available_provider());
 
-    // 7. Request with disabled provider must FAIL CLOSED (503 Service Unavailable, no silent hijacking)
+    // 7. Request with disabled provider must FAIL CLOSED (no silent hijacking)
     let conv_payload_disabled = create_kiro_conversation_payload("Are you there?", "gpt-4o");
     let mut conv_req_disabled = Request::builder()
         .method(Method::POST)
@@ -249,8 +250,24 @@ async fn test_provider_import_to_real_request_and_lifecycle_loop() {
         .extensions_mut()
         .insert(create_auth_claims("card-t04-test"));
 
+    // Refused as a service with no upstream, which Kiro shows as written: as a 503
+    // ServiceUnavailableException it read "Too many requests" and was retried.
     let conv_resp_disabled = app.clone().oneshot(conv_req_disabled).await.unwrap();
-    assert_eq!(conv_resp_disabled.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(conv_resp_disabled.status(), StatusCode::BAD_REQUEST);
+    let refusal: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(conv_resp_disabled.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(refusal["__type"], "ValidationException");
+    assert!(
+        refusal["message"]
+            .as_str()
+            .unwrap()
+            .contains("没有可用的上游"),
+        "{refusal}"
+    );
 
     // 8. Re-enable provider via POST /api/v1/admin/providers/status
     let enable_payload = json!({

@@ -29,9 +29,11 @@ pub mod oauth;
 pub mod portal;
 pub mod profiles;
 pub mod provider_import;
+pub mod spec_analysis;
 pub mod subscriptions;
 pub mod usage;
 pub mod virtualization;
+pub mod web_bearer;
 
 pub use healthz::{HealthzHandler, MetricsHandler};
 
@@ -61,6 +63,56 @@ pub fn error_response(status: StatusCode, error_type: &str, message: &str) -> Re
         axum::Json(body),
     )
         .into_response()
+}
+
+/// A refusal Kiro classifies by its `reason`, as it does its own service's validation
+/// errors. It does not retry one; one whose reason it does not special-case shows the
+/// message.
+pub fn validation_error(reason: &str, message: &str) -> Response {
+    crate::guardrail::format_kiro_throttle_response(
+        StatusCode::BAD_REQUEST,
+        "ValidationException",
+        reason,
+        message,
+        None,
+    )
+}
+
+/// The refusal Kiro takes for a context overflow: its ContextOverflowHandler compacts the
+/// conversation and sends it again, as when its own service refuses an over-long prompt.
+/// Kiro matches the reason, and the message's opening words where the reason is lost.
+pub fn input_too_long(detail: &str) -> Response {
+    validation_error(
+        "CONTENT_LENGTH_EXCEEDS_THRESHOLD",
+        &format!("Input is too long: {detail}"),
+    )
+}
+
+/// How long a refusal waits for the rest of a request body it does not read.
+const DISCARD_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Reads and drops what is left of a request body, at most `limit` bytes and for at most
+/// 30 seconds, before a refusal is sent. Answered while the client is still sending, the
+/// refusal can reach it as a connection reset instead: the connection is closed with the
+/// body unread, and the proxy in front of the gateway resets it. Kiro then reports a
+/// network error and sends the whole body again.
+pub(crate) async fn discard_body(body: Body, limit: usize) {
+    discard_rest(body.into_data_stream(), limit).await
+}
+
+/// [`discard_body`] for a body already partly read.
+pub(crate) async fn discard_rest(mut chunks: axum::body::BodyDataStream, limit: usize) {
+    use futures_util::StreamExt;
+    let _ = tokio::time::timeout(DISCARD_WAIT, async {
+        let mut read = 0usize;
+        while let Some(Ok(chunk)) = chunks.next().await {
+            read = read.saturating_add(chunk.len());
+            if read > limit {
+                break;
+            }
+        }
+    })
+    .await;
 }
 
 /// Structured JSON success response helper.
@@ -129,9 +181,13 @@ impl FacadeRegistry {
         self.register(healthz::MetricsHandler::default())
             .register(oauth::OAuthTokenHandler::default())
             .register(oauth::RefreshTokenHandler::default())
+            .register(oauth::LogoutHandler)
+            .register(oauth::DeleteAccountHandler)
+            .register(usage::SetUserPreferenceHandler)
             .register(client::ClientNegotiateHandler)
             .register(client::ClientBeaconHandler)
             .register(client::ClientBrandHandler::default())
+            .register(client::AgentActivityHandler)
             .register(models::ListAvailableModelsHandler::new(store.clone()))
             .register(usage::GetUsageLimitsHandler::new(store.clone()))
             .register(subscriptions::ListAvailableSubscriptionsHandler::new(
@@ -146,6 +202,9 @@ impl FacadeRegistry {
         self.register(conv)
             .register(completions::GenerateCompletionsHandler::default())
             .register(mcp::McpHandler::default());
+        for handler in web_bearer::WebBearerHandler::all() {
+            self.register(handler);
+        }
         // self.register_portal_facades(b, Some(store)); // ponytail: removed double registration
         self
     }
@@ -238,6 +297,21 @@ impl FacadeRegistry {
                 runtime.clone(),
                 action,
             ));
+        }
+        for action in [
+            admin::CardAction::UnbindDevice,
+            admin::CardAction::ResetRebinds,
+            admin::CardAction::ExtendValidity,
+            admin::CardAction::Note,
+            admin::CardAction::ChangeGroup,
+            admin::CardAction::Quotas,
+            admin::CardAction::Rekey,
+        ] {
+            self.register(admin::AdminCardActionHandler {
+                billing: billing.clone(),
+                auth: auth.clone(),
+                action,
+            });
         }
         self.register(admin::AdminSessionHandler { auth: auth.clone() })
             .register(admin::AdminRevokeSessionsHandler { auth: auth.clone() })
@@ -338,6 +412,10 @@ impl FacadeRegistry {
                 auth: auth.clone(),
             })
             .register(admin::AdminWithdrawAnnouncementHandler {
+                billing: billing.clone(),
+                auth: auth.clone(),
+            })
+            .register(admin::AdminEditAnnouncementHandler {
                 billing: billing.clone(),
                 auth: auth.clone(),
             })
@@ -447,12 +525,14 @@ impl FacadeRegistry {
                 || path == "/oauth/token"
                 || path == "/oauth/token/refresh"
                 || path == "/refreshToken"
+                || path == "/logout"
                 || path == "/client/negotiate"
                 || path == "/api/v1/announcements"
                 || path == "/client/beacon"
                 || path == "/client/brand"
                 || path == "/portal"
                 || path.starts_with("/api/v1/portal/")
+                || path.starts_with(web_bearer::PATH_PREFIX)
             {
                 public_routes.insert((path, h.method()), h);
             } else if path == "/metrics" || path.starts_with("/api/v1/admin/") {
@@ -502,6 +582,7 @@ impl FacadeRegistry {
             protected_router = protected_router.route(path, method_router);
         }
 
+        let optional_auth = auth.clone();
         let protected_router = protected_router.layer(axum::middleware::from_fn_with_state(
             auth,
             crate::auth::auth_middleware,
@@ -577,6 +658,13 @@ impl FacadeRegistry {
                     }),
                     _ => panic!("Unsupported HTTP method for facade handler: {}", method),
                 };
+            }
+            // Public, but an announcement for some groups reaches only their signed-in cards.
+            if path == "/api/v1/announcements" {
+                method_router = method_router.layer(axum::middleware::from_fn_with_state(
+                    optional_auth.clone(),
+                    crate::auth::optional_auth_middleware,
+                ));
             }
             public_router = public_router.route(path, method_router);
         }

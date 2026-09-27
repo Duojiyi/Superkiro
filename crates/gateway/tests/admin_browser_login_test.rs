@@ -177,6 +177,78 @@ async fn production_cookie_login_csrf_reveal_logout_and_fail_closed() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
     }
+    // So are the card support actions, however well formed; with the token they go through.
+    let card_id = issued[0].card.id.clone();
+    let before = billing.get_card(&card_id).unwrap();
+    for (path, body) in [
+        (
+            "cards/devices/unbind",
+            json!({"cardId": card_id, "deviceId": "device", "reason": "换电脑"}),
+        ),
+        (
+            "cards/rebinds/reset",
+            json!({"cardId": card_id, "reason": "换机"}),
+        ),
+        (
+            "cards/validity",
+            json!({"cardIds": [card_id], "days": 1, "reason": "补偿"}),
+        ),
+        ("cards/note", json!({"cardId": card_id, "note": "VIP"})),
+        (
+            "cards/group",
+            json!({"cardId": card_id, "groupId": "group-pro-plus", "reason": "换组"}),
+        ),
+        (
+            "cards/status",
+            json!({"cardId": card_id, "action": "unban", "reason": "误封"}),
+        ),
+        (
+            "cards/quotas",
+            json!({"cardId": card_id, "maxConcurrency": 2, "reason": "调整"}),
+        ),
+        ("cards/rekey", json!({"cardId": card_id, "reason": "泄露"})),
+        (
+            "announcements/edit",
+            json!({"id": "ann-1", "title": "维护改期"}),
+        ),
+    ] {
+        for token in [None, Some("wrong")] {
+            let response = app
+                .clone()
+                .oneshot(request("POST", path, Some(cookie), token, body.clone()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+    }
+    assert_eq!(billing.get_card(&card_id).unwrap(), before);
+    let response = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "cards/note",
+            Some(cookie),
+            Some(csrf),
+            json!({"cardId": card_id, "note": "VIP"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(response).await["card"]["note"], "VIP");
+    let response = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            &format!("cards/history?card_id={card_id}"),
+            Some(cookie),
+            None,
+            json!(null),
+        ))
+        .await
+        .unwrap();
+    let history = json_body(response).await;
+    assert_eq!(history["events"][0]["action"], "note");
+    assert_eq!(history["events"][0]["operator"], "admin");
     let response = app
         .clone()
         .oneshot(request(

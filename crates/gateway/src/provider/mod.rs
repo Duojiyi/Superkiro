@@ -11,6 +11,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 pub mod anthropic;
+pub mod family;
 pub mod governance;
 pub mod import;
 pub mod openai;
@@ -134,6 +135,144 @@ impl ProviderConfig {
     }
 }
 
+/// Signed thinking from an earlier assistant turn, with the upstream model that wrote it: a
+/// model accepts only its own thinking back, unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThinkingBlock {
+    pub text: String,
+    pub signature: String,
+    pub model: String,
+}
+
+/// The signature Kiro keeps with a thinking block, tagged with the upstream model that wrote
+/// it, so that it goes back to that model alone: a fallback target, or a remapped model,
+/// is sent none. Kiro treats a signature as opaque.
+pub fn tag_signature(model: &str, signature: &str) -> String {
+    format!("{model}#{signature}")
+}
+
+/// A tagged signature's model and signature; an untagged one cannot be traced to a model.
+pub fn untag_signature(tagged: &str) -> Option<(&str, &str)> {
+    tagged
+        .rsplit_once('#')
+        .filter(|(model, signature)| !model.is_empty() && !signature.is_empty())
+}
+
+/// Request options the operator sets per provider, by provider ID, read at start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderOptions {
+    /// Signed thinking from earlier turns goes back to the model that wrote it. Off until
+    /// each upstream has been checked to accept it: one that edits or validates history
+    /// may refuse it.
+    pub replay_thinking: bool,
+    /// Anthropic `eager_input_streaming` on each tool, so a large tool input streams as it
+    /// is written instead of arriving in one block after a silent wait. Off: some relays
+    /// refuse the field.
+    pub eager_tool_input: bool,
+    /// Anthropic prompt-cache breakpoints: each agent step resends the same tools, system
+    /// prompt and history, and a cached prefix is read at a tenth of the input price. On
+    /// unless the operator turns it off for an upstream that refuses them.
+    pub prompt_cache: bool,
+    /// PDF attachments. On unless the operator turns them off for an upstream that ignores
+    /// them (kimera-primary answers "I can't read the PDF" and bills the turn): a PDF in
+    /// the current message is then refused, an earlier message's is a note.
+    pub documents: bool,
+}
+
+impl Default for ProviderOptions {
+    fn default() -> Self {
+        Self {
+            replay_thinking: false,
+            eager_tool_input: false,
+            prompt_cache: true,
+            documents: true,
+        }
+    }
+}
+
+/// Which providers have which option on: provider IDs, or `*` for every provider,
+/// including the one configured by UPSTREAM_API_KEY.
+#[derive(Debug, Clone, Default)]
+pub struct ProviderOptionsTable {
+    replay_thinking: Vec<String>,
+    eager_tool_input: Vec<String>,
+    prompt_cache_off: Vec<String>,
+    no_documents: Vec<String>,
+}
+
+impl ProviderOptionsTable {
+    /// PROVIDER_THINKING_REPLAY, PROVIDER_EAGER_TOOL_INPUT, PROVIDER_PROMPT_CACHE_OFF and
+    /// PROVIDER_NO_DOCUMENTS: comma-separated provider IDs, or `*`.
+    pub fn from_env() -> Self {
+        let ids = |name: &str| -> Vec<String> {
+            std::env::var(name)
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .collect()
+        };
+        Self {
+            replay_thinking: ids("PROVIDER_THINKING_REPLAY"),
+            eager_tool_input: ids("PROVIDER_EAGER_TOOL_INPUT"),
+            prompt_cache_off: ids("PROVIDER_PROMPT_CACHE_OFF"),
+            no_documents: ids("PROVIDER_NO_DOCUMENTS"),
+        }
+    }
+
+    /// The table with `ids` reading no PDF attachments, as PROVIDER_NO_DOCUMENTS sets it.
+    pub fn with_no_documents(mut self, ids: &[&str]) -> Self {
+        self.no_documents = ids.iter().map(|id| id.to_string()).collect();
+        self
+    }
+
+    pub fn options_for(&self, provider_id: &str) -> ProviderOptions {
+        let on = |ids: &[String]| ids.iter().any(|id| id == "*" || id == provider_id);
+        ProviderOptions {
+            replay_thinking: on(&self.replay_thinking),
+            eager_tool_input: on(&self.eager_tool_input),
+            prompt_cache: !on(&self.prompt_cache_off),
+            documents: !on(&self.no_documents),
+        }
+    }
+
+    /// The providers each option is on for, as the start-up log prints them.
+    pub fn describe(&self) -> String {
+        format!(
+            "thinking replay: [{}], eager tool input: [{}], prompt cache off: [{}], no documents: [{}]",
+            self.replay_thinking.join(", "),
+            self.eager_tool_input.join(", "),
+            self.prompt_cache_off.join(", "),
+            self.no_documents.join(", ")
+        )
+    }
+}
+
+static PROVIDER_OPTIONS: std::sync::OnceLock<ProviderOptionsTable> = std::sync::OnceLock::new();
+
+/// Set the per-provider options, once, at start.
+pub fn install_provider_options(table: ProviderOptionsTable) {
+    let _ = PROVIDER_OPTIONS.set(table);
+}
+
+/// The options of `provider_id`, outside its attempts: which providers a request with PDFs
+/// may go to is decided before any is tried.
+pub fn provider_options(provider_id: &str) -> ProviderOptions {
+    PROVIDER_OPTIONS
+        .get_or_init(ProviderOptionsTable::default)
+        .options_for(provider_id)
+}
+
+/// The options of the provider an upstream attempt is being made with, or those every
+/// provider has when the request is not one of a provider's attempts.
+pub(crate) fn current_provider_options() -> ProviderOptions {
+    let table = PROVIDER_OPTIONS.get_or_init(ProviderOptionsTable::default);
+    retry::ATTEMPT_KEY
+        .try_with(|(provider_id, _)| table.options_for(provider_id))
+        .unwrap_or_else(|_| table.options_for(""))
+}
+
 /// Generic assistant tool call entry (T05).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolCallEntry {
@@ -155,6 +294,9 @@ pub struct ChatMessage {
     pub tool_calls: Vec<ToolCallEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
+    /// An assistant turn's signed thinking, sent back only where replay is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingBlock>,
 }
 
 impl ChatMessage {
@@ -166,6 +308,7 @@ impl ChatMessage {
             tool_call_id: None,
             tool_calls: Vec::new(),
             is_error: None,
+            thinking: None,
         }
     }
 }
@@ -191,6 +334,9 @@ pub struct ChatRequest {
 pub enum ProviderDelta {
     Text(String),
     Reasoning(String),
+    /// The signature that closes a thinking block: the model accepts that thinking back
+    /// with it, unchanged.
+    ReasoningSignature(String),
     /// A fragment of a tool call. `index` is the call's position when the upstream says
     /// it; without one, a fragment with an id opens or continues that call, and one with
     /// neither continues the latest call.
@@ -271,6 +417,18 @@ pub enum ProviderStreamEvent {
     Delta(ProviderDelta),
     Usage(TokenUsage),
     StopReason(String),
+    /// The model has begun its answer (Anthropic `message_start` / `content_block_start`,
+    /// OpenAI's opening chunk). The upstream is working on the request and may be billing
+    /// it, so it is no longer retried.
+    Started,
+    /// A line that carried nothing to forward (a ping, a block boundary, an empty thinking
+    /// delta): proof the upstream is alive, for the watchdogs.
+    Heartbeat,
+    /// Why the model refused (Anthropic's `stop_details` with a `refusal` stop).
+    Refusal {
+        category: Option<String>,
+        explanation: Option<String>,
+    },
     Done,
 }
 
@@ -412,11 +570,24 @@ where
                 buffer.drain(..=newline_pos);
 
                 let line = line.trim();
-                if line.is_empty() || line.starts_with(':') {
+                if line.is_empty() {
                     continue;
                 }
-
-                match parse_line(line) {
+                // Every line proves the upstream alive: a model that thinks silently, or
+                // buffers a tool input it has not finished, sends pings and empty deltas
+                // for minutes, and a watchdog that saw nothing cut it off. `event:` lines
+                // are always followed by their data line.
+                let parsed = if line.starts_with(':') {
+                    Ok(Vec::new())
+                } else {
+                    parse_line(line)
+                };
+                match parsed {
+                    Ok(events) if events.is_empty() && !line.starts_with("event:") => {
+                        if tx.send(Ok(ProviderStreamEvent::Heartbeat)).await.is_err() {
+                            return;
+                        }
+                    }
                     Ok(events) => {
                         for ev in events {
                             if ev == ProviderStreamEvent::Done {

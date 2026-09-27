@@ -10,6 +10,7 @@
 use crate::ledger::{ceil_nonnegative_to_i64, UsageTokens};
 use crate::MICRO_CREDITS_PER_CREDIT;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Currency denomination for upstream provider prices (Spec §5, §14.10.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,6 +34,8 @@ pub enum PricingMode {
 }
 
 /// Global billing anchor settings (Spec §5, §14.10.1, §14.10.5).
+///
+/// Unknown fields are ignored, so an older release still loads settings a later one saved.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BillingSettings {
     /// RMB face value of 1 credit (e.g. 0.01 = 0.01 CNY per credit, i.e. 1分钱/积分).
@@ -42,6 +45,66 @@ pub struct BillingSettings {
     /// Unix timestamp when the exchange rate was updated.
     #[serde(default)]
     pub rate_updated_at_secs: u64,
+    /// CNY per official US dollar in prices computed from official ones; 1.0 when unset.
+    /// Not `usd_cny_rate`, which converts USD cost-plus prices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub official_usd_cny: Option<f64>,
+    /// 计费倍率 offered for a price computed from an official one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_price_multiplier: Option<f64>,
+    /// 成本倍率 offered for a provider with none of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_cost_multiplier: Option<f64>,
+    /// 成本倍率 by provider ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_cost_multipliers: Option<BTreeMap<String, f64>>,
+    /// Official list prices by model name (an upstream model a route targets, or a customer
+    /// model): the basis for route costs and the start for new prices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub official_prices: Option<BTreeMap<String, OfficialPrice>>,
+    /// What a route, `<provider>/<upstream model>`, really bills where it differs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_costs: Option<BTreeMap<String, RouteCost>>,
+}
+
+/// An official list price in USD per 1M tokens.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OfficialPrice {
+    pub input_usd_per_m: f64,
+    pub output_usd_per_m: f64,
+    pub cache_creation_usd_per_m: f64,
+    pub cache_read_usd_per_m: f64,
+    /// Where the price comes from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// When its prices last changed; set by the server.
+    #[serde(default)]
+    pub updated_at_secs: u64,
+}
+
+impl OfficialPrice {
+    /// Input, output, cache write and cache read.
+    pub fn usd_per_m(&self) -> [f64; 4] {
+        [
+            self.input_usd_per_m,
+            self.output_usd_per_m,
+            self.cache_creation_usd_per_m,
+            self.cache_read_usd_per_m,
+        ]
+    }
+}
+
+/// What one upstream bills for one model, where that is not its provider's 成本倍率 on the
+/// model's official price.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RouteCost {
+    /// Instead of the provider's 成本倍率.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_multiplier: Option<f64>,
+    /// Input, output, cache write and cache read, when it bills other prices than the official
+    /// ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basis_usd_per_m: Option<[f64; 4]>,
 }
 
 impl Default for BillingSettings {
@@ -50,8 +113,145 @@ impl Default for BillingSettings {
             credit_face_value_cny: 0.01,
             usd_cny_rate: 7.25,
             rate_updated_at_secs: 0,
+            official_usd_cny: None,
+            default_price_multiplier: None,
+            default_cost_multiplier: None,
+            provider_cost_multipliers: None,
+            official_prices: None,
+            route_costs: None,
         }
     }
+}
+
+impl BillingSettings {
+    /// CNY per official US dollar: ¥1 = $1 unless set.
+    pub fn official_usd_cny(&self) -> f64 {
+        self.official_usd_cny.unwrap_or(1.0)
+    }
+
+    /// Of these settings, what settling a request served by one of `routes` (provider,
+    /// upstream model) reads: the face value, the exchange rates, the default 成本倍率, and
+    /// each route's own cost, its provider's 成本倍率 and its upstream model's official price,
+    /// without its note. With no routes, for a request no mapping serves, which is sent to the
+    /// model it names by whichever provider: what any provider serving `model` reads.
+    pub fn for_routes(&self, routes: &[(String, String)], model: &str) -> BillingSettings {
+        let provider_serves = |provider: &str| {
+            routes.is_empty() || routes.iter().any(|(serving, _)| serving == provider)
+        };
+        let target_serves = |target: &str| {
+            if routes.is_empty() {
+                target == model
+            } else {
+                routes.iter().any(|(_, serving)| serving == target)
+            }
+        };
+        let route_serves = |route: &str| {
+            if routes.is_empty() {
+                route
+                    .split_once('/')
+                    .is_some_and(|(_, target)| target == model)
+            } else {
+                routes
+                    .iter()
+                    .any(|(provider, target)| route == format!("{provider}/{target}"))
+            }
+        };
+        fn kept<V: Clone>(
+            map: &Option<BTreeMap<String, V>>,
+            keep: impl Fn(&str) -> bool,
+            copy: impl Fn(&V) -> V,
+        ) -> Option<BTreeMap<String, V>> {
+            let kept: BTreeMap<String, V> = map
+                .iter()
+                .flatten()
+                .filter(|(key, _)| keep(key))
+                .map(|(key, value)| (key.clone(), copy(value)))
+                .collect();
+            (!kept.is_empty()).then_some(kept)
+        }
+        BillingSettings {
+            credit_face_value_cny: self.credit_face_value_cny,
+            usd_cny_rate: self.usd_cny_rate,
+            rate_updated_at_secs: self.rate_updated_at_secs,
+            official_usd_cny: self.official_usd_cny,
+            // Offered for new prices; no settlement reads it.
+            default_price_multiplier: None,
+            default_cost_multiplier: self.default_cost_multiplier,
+            provider_cost_multipliers: kept(
+                &self.provider_cost_multipliers,
+                provider_serves,
+                |m| *m,
+            ),
+            official_prices: kept(&self.official_prices, target_serves, |price| {
+                OfficialPrice {
+                    note: None,
+                    ..price.clone()
+                }
+            }),
+            route_costs: kept(&self.route_costs, route_serves, RouteCost::clone),
+        }
+    }
+
+    /// What `provider` bills for `tokens` of its upstream model `target`, in micro-CNY, from
+    /// official prices: the route's own basis, else `target`'s official price, times the
+    /// route's 成本倍率, else the provider's, else the default, at `official_usd_cny`. None
+    /// when the basis or the multiplier is unknown; the cost then comes from price versions.
+    pub fn official_cost_micro_cny(
+        &self,
+        provider: &str,
+        target: &str,
+        tokens: &UsageTokens,
+    ) -> Option<i64> {
+        let route = self
+            .route_costs
+            .as_ref()
+            .and_then(|routes| routes.get(&format!("{provider}/{target}")));
+        let basis = route
+            .and_then(|route| route.basis_usd_per_m)
+            .or_else(|| Some(self.official_prices.as_ref()?.get(target)?.usd_per_m()))?;
+        let multiplier = route
+            .and_then(|route| route.cost_multiplier)
+            .or_else(|| {
+                self.provider_cost_multipliers
+                    .as_ref()?
+                    .get(provider)
+                    .copied()
+            })
+            .or(self.default_cost_multiplier)?;
+        // CNY per 1M tokens, as a version computed from the official price records them.
+        let [input, output, cache_creation, cache_read] =
+            basis.map(|usd| usd * multiplier * self.official_usd_cny());
+        let cny = (tokens.uncached_input_tokens as f64) * input / 1_000_000.0
+            + (tokens.output_tokens as f64) * output / 1_000_000.0
+            + (tokens.cache_creation_tokens as f64) * cache_creation / 1_000_000.0
+            + (tokens.cache_read_tokens as f64) * cache_read / 1_000_000.0;
+        Some(ceil_nonnegative_to_i64((cny * 1_000_000.0).round()))
+    }
+}
+
+/// What a version's prices were computed from: official list prices in USD per 1M tokens, the
+/// multipliers, and the settings used. Publication checks that it gives the version's credits
+/// and costs; settlement still charges the version's own fields.
+///
+/// Unknown fields are ignored here and on the version, so an older release still loads it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OfficialPricing {
+    pub input_usd_per_m: f64,
+    pub output_usd_per_m: f64,
+    pub cache_creation_usd_per_m: f64,
+    pub cache_read_usd_per_m: f64,
+    /// 计费倍率: our price is official × this, in CNY at `usd_cny`.
+    pub price_multiplier: f64,
+    /// 成本倍率: our cost is the cost basis × this, in CNY at `usd_cny`.
+    pub cost_multiplier: f64,
+    /// Input, output, cache write and cache read, when the upstream bills other prices than
+    /// the official ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_basis_usd_per_m: Option<[f64; 4]>,
+    /// `BillingSettings::official_usd_cny` used.
+    pub usd_cny: f64,
+    /// `BillingSettings::credit_face_value_cny` used.
+    pub credit_face_value_cny: f64,
 }
 
 /// Rate card header group (Spec §5).
@@ -101,6 +301,11 @@ pub struct RateCardVersion {
 
     // Version activation timestamp (Spec §6.4)
     pub effective_from_secs: u64,
+
+    /// What the fixed credits and CNY costs were computed from, when priced from an official
+    /// price.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub official: Option<OfficialPricing>,
 }
 
 impl RateCardVersion {

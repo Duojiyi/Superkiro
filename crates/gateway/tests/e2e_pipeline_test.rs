@@ -320,6 +320,7 @@ async fn test_e2e_intent_classifier_interception_optimization() {
         vision_config: None,
         vision_cache: Default::default(),
         content_guardrail: gateway::security::ContentGuardrailConfig::default(),
+        large_bodies: Default::default(),
         runtime: None,
     };
 
@@ -327,12 +328,15 @@ async fn test_e2e_intent_classifier_interception_optimization() {
     registry.register(conv_handler);
     let app = registry.into_router();
 
-    // Kiro's classifier call is answered locally, in either of the shapes Kiro sends.
-    // The instructions themselves describe spec requests; only the user's message decides.
-    for (n, (message, system_field, spec)) in [
-        ("Please write a rust function to parse JSON.", false, false),
-        ("Please write a rust function to parse JSON.", true, false),
-        ("Create a spec for the login feature", false, true),
+    // Kiro's classifier call is answered locally, in either of the shapes Kiro sends, with
+    // do: its own default, and the answer when unsure. Words in the message decide nothing;
+    // "代码规范" is coding conventions, not a spec.
+    for (n, (message, system_field)) in [
+        ("Please write a rust function to parse JSON.", false),
+        ("Please write a rust function to parse JSON.", true),
+        ("Create a spec for the login feature", false),
+        ("请按照代码规范重构这个函数", false),
+        ("Follow the OpenAPI specification for this endpoint", true),
     ]
     .into_iter()
     .enumerate()
@@ -349,15 +353,11 @@ async fn test_e2e_intent_classifier_interception_optimization() {
         assert_eq!(frames[1].0, "assistantResponseEvent");
         let probs: serde_json::Value = serde_json::from_str(&assistant_text(&frames)).unwrap();
         assert_eq!(probs["chat"], 0);
-        if spec {
-            assert_eq!(probs["spec"], 0.9, "{message}");
-        } else {
-            assert_eq!(
-                probs["do"], 0.95,
-                "{message} (system field: {system_field})"
-            );
-            assert_eq!(probs["spec"], 0.05);
-        }
+        assert_eq!(
+            probs["do"], 0.95,
+            "{message} (system field: {system_field})"
+        );
+        assert_eq!(probs["spec"], 0.05, "{message}");
     }
 
     // No upstream was called and no card credits were touched!
@@ -505,6 +505,7 @@ async fn test_e2e_insufficient_credit_rejection() {
         vision_config: None,
         vision_cache: Default::default(),
         content_guardrail: gateway::security::ContentGuardrailConfig::default(),
+        large_bodies: Default::default(),
         runtime: None,
     };
 
@@ -535,9 +536,16 @@ async fn test_e2e_insufficient_credit_rejection() {
         .insert(create_auth_claims("card-broke-001"));
 
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    // Kiro shows a ValidationException's message as it is; an unknown exception type read
+    // "Something went wrong".
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.headers()["x-amzn-requestid"], "inv-broke-001");
 
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let err_json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(err_json["__type"], "InsufficientCreditException");
+    assert_eq!(err_json["__type"], "ValidationException");
+    assert!(err_json["message"]
+        .as_str()
+        .unwrap()
+        .contains("积分余额不足"));
 }

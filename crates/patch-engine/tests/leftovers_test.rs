@@ -102,6 +102,8 @@ fn a_takeover_whose_records_are_lost_is_found_and_undone() {
     for key in [
         "kiroAuthConfig",
         "codewhisperer.config",
+        "kiroAgent.cloudConfig.endpoint",
+        "kiroAgent.remoteSessions.endpoint",
         "http.noProxy",
         "update.mode",
     ] {

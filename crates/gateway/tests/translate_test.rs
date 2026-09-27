@@ -80,6 +80,7 @@ fn test_audit_b_orphan_tool_result_repaired() {
             tool_use_id: None,
             tool_calls: vec![],
             is_error: None,
+            thinking: None,
         },
         ConversationMessage {
             role: "tool".to_string(),
@@ -87,6 +88,7 @@ fn test_audit_b_orphan_tool_result_repaired() {
             tool_use_id: Some("orphan_call_1".to_string()),
             tool_calls: vec![],
             is_error: None,
+            thinking: None,
         },
     ];
 
@@ -155,29 +157,77 @@ fn test_audit_b_ultra_long_tool_name_shortening_and_restoration() {
 }
 
 // --------------------------------------------------------------------------
-// 4. Audit B - Counterexample 3: 超长工具文档挪入 system prompt
+// 4. Audit B - Counterexample 3: 超长工具文档只在 OpenAI 请求中挪入 system prompt
 // --------------------------------------------------------------------------
+/// An OpenAI function takes a description of at most 1024 characters, so a longer one goes
+/// into that request's system prompt. Anthropic takes it whole: Kiro's grep_search, memory
+/// and other tools reached Claude as "Documentation for … is provided in the system prompt."
 #[test]
 fn test_audit_b_ultra_long_tool_description_relocation() {
     let long_desc = "A".repeat(1500); // 1500 chars > 1024
-    let tool = serde_json::json!({
-        "name": "super_tool",
-        "description": long_desc,
-        "inputSchema": { "type": "object" }
-    });
+    let tools = serde_json::json!([
+        {"toolSpecification": {"name": "super_tool", "description": long_desc,
+            "inputSchema": {"json": {"type": "object"}}}},
+        {"toolSpecification": {"name": "small_tool", "description": "Short.",
+            "inputSchema": {"json": {"type": "object"}}}}
+    ]);
+    let request = |system_prompt: Option<&str>| -> GenerateAssistantResponseRequest {
+        serde_json::from_value(serde_json::json!({
+            "systemPrompt": system_prompt,
+            "conversationState": {
+                "conversationId": "long-tool-docs",
+                "history": [],
+                "currentMessage": {"userInputMessage": {"content": "search",
+                    "userInputMessageContext": {"tools": tools}}}
+            }
+        }))
+        .unwrap()
+    };
 
     let mut registry = ToolRegistry::new();
-    let (tools, doc_append) = process_tools_for_provider(&[tool], &mut registry);
+    let shared = process_tools_for_provider(tools.as_array().unwrap(), &mut registry);
+    assert_eq!(
+        shared[0]["toolSpecification"]["description"],
+        long_desc.as_str()
+    );
 
-    assert_eq!(tools.len(), 1);
-    let desc = tools[0]["description"].as_str().unwrap();
-    assert!(desc.contains("Documentation for super_tool is provided in the system prompt."));
-    assert!(desc.len() < 100);
+    let chat = translate_kiro_to_chat_request(
+        &request(Some("Be brief.")),
+        &mut TranslationContext::new("claude-sonnet-4-6"),
+    );
+    let anthropic = AnthropicProvider.translate_request(&chat).unwrap();
+    assert_eq!(anthropic["tools"][0]["description"], long_desc.as_str());
+    assert_eq!(anthropic["tools"][1]["description"], "Short.");
+    assert!(!anthropic["system"]
+        .to_string()
+        .contains("Extended Tool Documentation"));
 
-    let doc = doc_append.expect("Must produce system documentation append");
-    assert!(doc.contains("## Extended Tool Documentation"));
-    assert!(doc.contains("super_tool"));
-    assert!(doc.contains(&"A".repeat(100)));
+    let openai = OpenAiProvider.translate_request(&chat).unwrap();
+    let function = |index: usize| &openai["tools"][index]["function"];
+    assert_eq!(
+        function(0)["description"],
+        "Documentation for super_tool is provided in the system prompt."
+    );
+    assert_eq!(function(1)["description"], "Short.");
+    let messages = openai["messages"].as_array().unwrap();
+    assert_eq!(messages.iter().filter(|m| m["role"] == "system").count(), 1);
+    let system = messages[0]["content"].as_str().unwrap();
+    assert!(system.starts_with("Be brief."), "{system}");
+    assert!(system.contains("## Extended Tool Documentation\n### Tool: super_tool\n"));
+    assert!(system.ends_with(&long_desc));
+    assert!(!system.contains("small_tool"));
+
+    // Without a system prompt of its own the OpenAI request gets one for the documentation.
+    let chat =
+        translate_kiro_to_chat_request(&request(None), &mut TranslationContext::new("gpt-4o"));
+    let openai = OpenAiProvider.translate_request(&chat).unwrap();
+    assert_eq!(openai["messages"][0]["role"], "system");
+    let system = openai["messages"][0]["content"].as_str().unwrap();
+    assert!(
+        system.starts_with("## Extended Tool Documentation"),
+        "{system}"
+    );
+    assert_eq!(openai["messages"][1]["role"], "user");
 }
 
 // --------------------------------------------------------------------------
@@ -474,6 +524,7 @@ fn test_t05_multi_turn_payload_translation() {
                     arguments: serde_json::json!({ "command": "ls -la" }),
                 }],
                 is_error: None,
+                thinking: None,
             },
             ChatMessage {
                 role: "tool".to_string(),
@@ -482,6 +533,7 @@ fn test_t05_multi_turn_payload_translation() {
                 tool_call_id: Some("tool_call_01".to_string()),
                 tool_calls: vec![],
                 is_error: Some(false),
+                thinking: None,
             },
             ChatMessage::new(
                 "user",
@@ -501,7 +553,10 @@ fn test_t05_multi_turn_payload_translation() {
     let anthropic_payload = anthropic
         .translate_request(&chat_req)
         .expect("Anthropic translate");
-    assert_eq!(anthropic_payload["system"], "You are an AI assistant.");
+    assert_eq!(
+        anthropic_payload["system"][0]["text"],
+        "You are an AI assistant."
+    );
 
     let anthropic_tools = anthropic_payload["tools"].as_array().expect("tools array");
     assert_eq!(anthropic_tools.len(), 1);
@@ -604,4 +659,56 @@ fn openai_usage_without_a_total_saturates() {
         }}))
         .expect("usage");
     assert_eq!(usage.total_tokens, u64::MAX);
+}
+
+/// A tool result reaches the model as the text the tool produced. Sent as the JSON of
+/// Kiro's block list, a file line with a Windows path reached it as
+/// `[{"text":"let p = \"C:\\\\Users\\\\x\";..."}]`: every quote, newline and backslash
+/// escaped, which an exact str_replace `oldStr` then had to undo.
+#[test]
+fn tool_results_reach_both_providers_as_their_text() {
+    let file = "let p = \"C:\\Users\\x\";\nfn main() {}";
+    let request: GenerateAssistantResponseRequest = serde_json::from_value(serde_json::json!({
+        "conversationState": {
+            "conversationId": "tool-text",
+            "history": [
+                {"userInputMessage": {"content": "read main.rs"}},
+                {"assistantResponseMessage": {"content": "", "toolUses": [
+                    {"toolUseId": "t1", "name": "readFile", "input": {"path": "main.rs"}}
+                ]}}
+            ],
+            "currentMessage": {"userInputMessage": {"content": "", "userInputMessageContext": {
+                "toolResults": [{"toolUseId": "t1", "status": "error",
+                    "content": [{"text": file}, {"json": {"exit": 1}}]}]
+            }}}
+        }
+    }))
+    .unwrap();
+    let chat =
+        translate_kiro_to_chat_request(&request, &mut TranslationContext::new("claude-sonnet-4-6"));
+    let expected = format!("{file}\n{{\n  \"exit\": 1\n}}");
+
+    let anthropic = AnthropicProvider.translate_request(&chat).unwrap();
+    let result = anthropic["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|message| message["content"].as_array().cloned().unwrap_or_default())
+        .find(|block| block["type"] == "tool_result")
+        .unwrap();
+    assert_eq!(result["content"], expected.as_str());
+    assert_eq!(result["is_error"], true);
+
+    let openai = OpenAiProvider.translate_request(&chat).unwrap();
+    let tool = openai["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .unwrap();
+    // The OpenAI format has no error flag: the failure opens the text the model reads.
+    assert_eq!(
+        tool["content"],
+        format!("[工具调用失败 / tool call failed]\n{expected}").as_str()
+    );
 }

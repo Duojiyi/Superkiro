@@ -117,6 +117,74 @@ impl CapacityGuardrail {
     }
 }
 
+/// Conversations with a body over 10 MB are read and processed at most two at a time across
+/// the gateway. Until it is translated, one is held about three times over (read, parsed,
+/// archived), close to 100 MB at the 32 MB limit, and the gateway runs in 1 GB: five at once
+/// would be an out-of-memory kill for every customer. One that finds both places taken
+/// waits a few seconds for one to free up, then is throttled, which Kiro retries. Smaller
+/// bodies never wait.
+#[derive(Debug, Clone)]
+pub struct LargeBodyGate {
+    places: Arc<tokio::sync::Semaphore>,
+    max: usize,
+    threshold: usize,
+    wait: std::time::Duration,
+}
+
+impl Default for LargeBodyGate {
+    fn default() -> Self {
+        Self::new(2, 10 * 1024 * 1024, std::time::Duration::from_secs(3))
+    }
+}
+
+impl LargeBodyGate {
+    /// Retry-After of a large body that found no place.
+    pub const RETRY_AFTER_SECS: u64 = 2;
+
+    /// `max` bodies over `threshold` bytes at once; another waits up to `wait` for a place.
+    pub fn new(max: usize, threshold: usize, wait: std::time::Duration) -> Self {
+        Self {
+            places: Arc::new(tokio::sync::Semaphore::new(max)),
+            max,
+            threshold,
+            wait,
+        }
+    }
+
+    /// The body size over which a conversation needs a place.
+    pub fn threshold(&self) -> usize {
+        self.threshold
+    }
+
+    /// How many large bodies hold a place now.
+    pub fn in_use(&self) -> usize {
+        self.max - self.places.available_permits()
+    }
+
+    /// A place for one large body, given back when it is dropped, or `None` when none freed
+    /// up in time.
+    pub async fn enter(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        tokio::time::timeout(self.wait, self.places.clone().acquire_owned())
+            .await
+            .ok()?
+            .ok()
+    }
+
+    /// The answer to a large body that found no place: a throttle Kiro retries.
+    pub fn throttled_response(&self) -> Response {
+        format_kiro_throttle_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "ThrottlingException",
+            "LARGE_REQUEST_CAPACITY",
+            &format!(
+                "Too many large conversations are being processed. Please retry after {} seconds.",
+                Self::RETRY_AFTER_SECS
+            ),
+            Some(Self::RETRY_AFTER_SECS),
+        )
+    }
+}
+
 /// Helper to construct a standard Kiro / AWS SDK structured throttling response.
 pub fn format_kiro_throttle_response(
     status: StatusCode,

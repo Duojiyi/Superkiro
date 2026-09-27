@@ -1,16 +1,17 @@
-//! Tool name shortening, description relocation, and orphan repair.
+//! Tool name shortening and orphan repair.
 //!
 //! Spec §4.3:
 //! - Tool name shortening & restoration (OpenAI 64-char limit).
-//! - Long tool descriptions (>1024 chars) moved to system prompt.
 //! - Orphan tool_use / tool_result repair.
+//!
+//! Long tool descriptions stay in the tools; the OpenAI adapter moves the ones its
+//! functions cannot take into its system prompt.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
 pub const MAX_TOOL_NAME_LEN: usize = 64;
-pub const MAX_TOOL_DESC_LEN: usize = 1024;
 
 /// Tool name mapping registry for a single conversation request.
 #[derive(Debug, Clone, Default)]
@@ -75,15 +76,10 @@ impl ToolRegistry {
     }
 }
 
-/// Process tools for upstream providers:
-/// 1. Shortens names that exceed provider limits.
-/// 2. Relocates oversized descriptions (>1024 chars) into a system prompt section.
-pub fn process_tools_for_provider(
-    tools: &[Value],
-    registry: &mut ToolRegistry,
-) -> (Vec<Value>, Option<String>) {
+/// Process tools for upstream providers: shortens names that exceed provider limits.
+/// Descriptions are kept whole; a model reads a tool's documentation best in the tool.
+pub fn process_tools_for_provider(tools: &[Value], registry: &mut ToolRegistry) -> Vec<Value> {
     let mut processed_tools = Vec::new();
-    let mut relocated_docs = Vec::new();
 
     for tool in tools {
         let mut tool_obj = tool.clone();
@@ -97,35 +93,16 @@ pub fn process_tools_for_provider(
 
         if let Some(name_val) = spec.get("name").and_then(|n| n.as_str()) {
             let short_name = registry.register(name_val);
-            spec["name"] = Value::String(short_name.clone());
-
-            if let Some(desc) = spec.get("description").and_then(|d| d.as_str()) {
-                if desc.len() > MAX_TOOL_DESC_LEN {
-                    relocated_docs.push(format!("### Tool: {}\n{}", short_name, desc));
-                    spec["description"] = Value::String(format!(
-                        "Documentation for {} is provided in the system prompt.",
-                        short_name
-                    ));
-                }
-            }
+            spec["name"] = Value::String(short_name);
         }
 
         processed_tools.push(tool_obj);
     }
 
-    let system_append = if relocated_docs.is_empty() {
-        None
-    } else {
-        Some(format!(
-            "\n\n## Extended Tool Documentation\n{}",
-            relocated_docs.join("\n\n")
-        ))
-    };
-
-    (processed_tools, system_append)
+    processed_tools
 }
 
-use crate::provider::ToolCallEntry;
+use crate::provider::{ThinkingBlock, ToolCallEntry};
 
 /// Generic representation of a conversation turn for orphan pairing check.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,6 +112,8 @@ pub struct ConversationMessage {
     pub tool_use_id: Option<String>,
     pub tool_calls: Vec<ToolCallEntry>, // Full tool calls emitted by assistant
     pub is_error: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingBlock>,
 }
 
 /// Sanitizes conversation turns by repairing orphan tool_use or tool_result pairs in strict
@@ -160,6 +139,7 @@ pub fn repair_orphan_tool_pairs(messages: Vec<ConversationMessage>) -> Vec<Conve
                         tool_use_id: Some(pending_id),
                         tool_calls: Vec::new(),
                         is_error: Some(true),
+                        thinking: None,
                     });
                 }
                 for tc in &msg.tool_calls {
@@ -200,6 +180,7 @@ pub fn repair_orphan_tool_pairs(messages: Vec<ConversationMessage>) -> Vec<Conve
                             tool_use_id: Some(pending_id),
                             tool_calls: Vec::new(),
                             is_error: Some(true),
+                            thinking: None,
                         });
                     }
                 }
@@ -218,6 +199,7 @@ pub fn repair_orphan_tool_pairs(messages: Vec<ConversationMessage>) -> Vec<Conve
             tool_use_id: Some(pending_id),
             tool_calls: Vec::new(),
             is_error: Some(true),
+            thinking: None,
         });
     }
 

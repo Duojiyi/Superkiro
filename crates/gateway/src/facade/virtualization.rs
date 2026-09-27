@@ -6,7 +6,7 @@
 //! - Virtual credit quota and usage limit
 //! - Stable profile ARN to satisfy Kiro's `ProfileArnGuard`
 
-use super::models::{ModelInfo, TokenLimits};
+use super::models::{ModelInfo, TokenLimits, SIMPLE_TASK_MODEL};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -59,6 +59,7 @@ impl Default for VirtualGroup {
                     supports_vision: true,
                     rate_multiplier: None,
                     default_effort_level: Some("high".to_string()),
+                    effort_levels: Vec::new(),
                 },
                 ModelInfo {
                     model_id: "deepseek-chat".to_string(),
@@ -74,6 +75,7 @@ impl Default for VirtualGroup {
                     supports_vision: false,
                     rate_multiplier: None,
                     default_effort_level: None,
+                    effort_levels: Vec::new(),
                 },
                 ModelInfo {
                     model_id: "deepseek-reasoner".to_string(),
@@ -87,6 +89,7 @@ impl Default for VirtualGroup {
                     supports_vision: false,
                     rate_multiplier: None,
                     default_effort_level: Some("medium".to_string()),
+                    effort_levels: Vec::new(),
                 },
             ],
         }
@@ -232,6 +235,7 @@ impl VirtualizationStore {
             supports_vision: false,
             rate_multiplier: None,
             default_effort_level: None,
+            effort_levels: Vec::new(),
         });
     }
 
@@ -255,9 +259,10 @@ impl VirtualizationStore {
                 // Fetch models from billing mapped to this group (respecting visibility and sort_order)
                 let billing_models = billing.list_models_for_group(&bg.id, false);
                 let models: Vec<ModelInfo> = if !billing_models.is_empty() {
+                    // Kiro's fast model is asked for by name and never offered.
                     let visible: Vec<_> = billing_models
                         .into_iter()
-                        .filter(|m| m.is_listed())
+                        .filter(|m| m.is_listed() && m.exposed_model_id != SIMPLE_TASK_MODEL)
                         .collect();
                     let rates = rate_multipliers(billing, &bg.id, &visible, crate::now_secs());
                     visible
@@ -268,6 +273,11 @@ impl VirtualizationStore {
                                 .display_name
                                 .clone()
                                 .unwrap_or_else(|| display_name(&m.exposed_model_id));
+                            // What the upstream model takes, not what its exposed name
+                            // suggests: the levels it has and the one it defaults to.
+                            let effort = m
+                                .supports_reasoning
+                                .then(|| crate::provider::family::effort_levels(&m.target_model));
                             ModelInfo {
                                 model_id: m.exposed_model_id.clone(),
                                 // The upstream target stays internal: never in the list.
@@ -283,11 +293,11 @@ impl VirtualizationStore {
                                 )),
                                 supports_reasoning: m.supports_reasoning,
                                 supports_vision: m.supports_vision,
-                                default_effort_level: if m.supports_reasoning {
-                                    Some("medium".to_string())
-                                } else {
-                                    None
-                                },
+                                default_effort_level: effort
+                                    .map(|(_, default)| default.to_string()),
+                                effort_levels: effort.map_or_else(Vec::new, |(levels, _)| {
+                                    levels.iter().map(|level| level.to_string()).collect()
+                                }),
                                 rate_multiplier,
                             }
                         })

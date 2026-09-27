@@ -125,6 +125,8 @@ async fn configured_capabilities_reach_catalog_upstream_billing_and_usage() {
                         versions: vec![],
                         removed_models: vec![],
                         cancelled_versions: vec![],
+                        plans: vec![],
+                        removed_plans: vec![],
                     },
                     1_700_000_000
                 )
@@ -142,6 +144,8 @@ async fn configured_capabilities_reach_catalog_upstream_billing_and_usage() {
                     versions: vec![],
                     removed_models: vec![],
                     cancelled_versions: vec![],
+                    plans: vec![],
+                    removed_plans: vec![],
                 },
                 1_700_000_000,
             )
@@ -227,7 +231,7 @@ async fn configured_capabilities_reach_catalog_upstream_billing_and_usage() {
             assert_eq!(
                 resp.status(),
                 if quota == "none" {
-                    StatusCode::PAYMENT_REQUIRED
+                    StatusCode::BAD_REQUEST
                 } else {
                     StatusCode::TOO_MANY_REQUESTS
                 }
@@ -249,7 +253,8 @@ async fn configured_capabilities_reach_catalog_upstream_billing_and_usage() {
             .unwrap();
         let usage: kiro_wire::events::ContextUsageEvent = event.payload_as_json().unwrap();
         assert!(
-            (usage.context_usage_percentage - 106_000.0 / model_map.context_window as f64).abs()
+            (usage.context_usage_percentage - 106_000.0 * 100.0 / model_map.context_window as f64)
+                .abs()
                 < 1e-6
         );
         assert_eq!(billing.get_card("card-alias-1").unwrap().credit_reserved, 0);
