@@ -112,7 +112,8 @@ const server=http.createServer(async(req,res)=>{
     const picker=page.getByRole('group',{name:'可用模型'});
     const terra=picker.locator('li').filter({hasText:'gpt-5.6-terra'});
     await terra.getByText('未上架',{exact:true}).waitFor();
-    assert.equal(await picker.locator('li').filter({hasText:'gpt-5.6-sol'}).getByText('未上架',{exact:true}).count(),0,'the model just listed is no longer marked');
+    // The model just listed is no longer marked, once the page has read the models again after the listing.
+    await picker.locator('li').filter({hasText:'gpt-5.6-sol'}).getByText('未上架',{exact:true}).waitFor({state:'detached'});
     await terra.getByRole('button',{name:'去上架',exact:true}).click();
     await page.getByRole('status').filter({hasText:'没有打开“上架 gpt-5.6-terra”：先发布或放弃未发布的修改，再上架'}).waitFor();
     assert.equal(await page.locator('#listing-drawer').count(),0);

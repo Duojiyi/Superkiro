@@ -44,7 +44,9 @@ const model=id=>fixture.config.models.find(row=>row.id===id);
     await nav('模型与定价');
     // The list has one row per model across groups; picking a group lists it in Kiro's order to reorder it.
     const byGroup=async name=>{await page.getByLabel('按分组看',{exact:true}).selectOption(name?{label:`${name}（排序）`}:'');if(name)await group(name).waitFor();};
-    assert.equal(await page.getByRole('rowgroup',{name:'全部分组',exact:true}).getByRole('row').count(),4,'one row per customer model');
+    // The rows appear once the configuration has been read: wait for them before counting.
+    const everyGroup=page.getByRole('rowgroup',{name:'全部分组',exact:true});await everyGroup.getByRole('row').nth(3).waitFor();
+    assert.equal(await everyGroup.getByRole('row').count(),4,'one row per customer model');
     await byGroup('PRO+');assert.deepEqual(await names('PRO+'),['gpt-5'],'each group lists its own models');
     await byGroup('PRO');
     const header=group('PRO').locator('tr.group-row');
