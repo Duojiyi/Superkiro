@@ -2329,7 +2329,7 @@ mod tests {
         let points = "Plan points must be 1-10000000";
         let price = "Plan prices must be 0-100000 yuan, to the fen";
         let days = "Plan validity must be 1-3650 days";
-        let devices = "Plans allow 1-10 devices";
+        let devices = "Plans allow exactly 1 device, as cards bind one";
         let concurrency = "Plan concurrency must be 1-20";
         let kind = "Plan Kiro types are PRO, PRO_PLUS, PRO_MAX, POWER or CUSTOM";
         let cases: Vec<(Edit, &str)> = vec![
@@ -2349,6 +2349,7 @@ mod tests {
             (Box::new(|p| p.validity_days = 0), days),
             (Box::new(|p| p.validity_days = 3651), days),
             (Box::new(|p| p.max_devices = 0), devices),
+            (Box::new(|p| p.max_devices = 2), devices),
             (Box::new(|p| p.max_devices = 11), devices),
             (Box::new(|p| p.concurrency = 0), concurrency),
             (Box::new(|p| p.concurrency = 21), concurrency),
@@ -2392,7 +2393,7 @@ mod tests {
                 points: 10_000_000,
                 price_cny: 100_000.0,
                 validity_days: 3650,
-                max_devices: 10,
+                max_devices: 1,
                 concurrency: 20,
                 default_group_id: "vip".into(),
                 ..trial_plan()

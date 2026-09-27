@@ -2726,8 +2726,26 @@ async fn cards_are_issued_from_the_plan_catalog_and_keep_their_plan() {
         .map(|plan| plan["id"].as_str().unwrap().to_string())
         .collect();
     assert_eq!(ids, ["tier-1000", "tier-2000", "tier-5000", "tier-10000"]);
+    // A plan for more devices than a card binds would be on sale and never issue a card.
     let mut family = plan_json("family", "家庭卡", 20.0);
     family["max_devices"] = json!(2);
+    let (status, body) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/commercial-config",
+        Some(json!({
+            "expected_revision": billing.commercial_config().revision,
+            "reason": "套餐调整",
+            "plans": [family.clone()],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        body["error"],
+        "Invalid billing state: Plans allow exactly 1 device, as cards bind one: family"
+    );
+    family["max_devices"] = json!(1);
     let mut old = plan_json("old", "旧卡", 1.0);
     old["on_sale"] = json!(false);
     let config = publish_plans(
@@ -2739,6 +2757,14 @@ async fn cards_are_issued_from_the_plan_catalog_and_keep_their_plan() {
     assert_eq!(config["plans"][0]["id"], "family");
     assert_eq!(config["cards_by_plan"]["trial-7d"], 0);
 
+    // One stored before publication bounded it still issues no card.
+    let mut state = billing.export_snapshot();
+    for plan in state.plans.iter_mut().flatten() {
+        if plan.id == "family" {
+            plan.max_devices = 2;
+        }
+    }
+    billing.import_snapshot(state);
     let issue = |body: serde_json::Value| {
         let app = app.clone();
         async move { admin_call(&app, Method::POST, "/api/v1/admin/cards/batch", Some(body)).await }

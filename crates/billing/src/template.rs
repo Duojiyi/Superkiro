@@ -69,6 +69,8 @@ pub struct Plan {
     pub price_cny: f64,
     /// How long a card is valid from its activation.
     pub validity_days: u32,
+    /// Devices a card may bind: 1, the only number issuance takes. Kept so that cards with
+    /// more devices can raise it once they exist.
     pub max_devices: u32,
     /// Requests a card may have in flight at once.
     pub concurrency: u32,
@@ -154,8 +156,9 @@ impl Plan {
             Some("Plan prices must be 0-100000 yuan, to the fen")
         } else if !(1..=3650).contains(&self.validity_days) {
             Some("Plan validity must be 1-3650 days")
-        } else if !(1..=10).contains(&self.max_devices) {
-            Some("Plans allow 1-10 devices")
+        } else if self.max_devices != 1 {
+            // A plan for more would be on sale and never issue a card.
+            Some("Plans allow exactly 1 device, as cards bind one")
         } else if !(1..=20).contains(&self.concurrency) {
             Some("Plan concurrency must be 1-20")
         } else if !KIRO_PLAN_TYPES.contains(&self.kiro_plan_type.as_str()) {
