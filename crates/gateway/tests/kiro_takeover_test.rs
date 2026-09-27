@@ -279,6 +279,17 @@ async fn an_upstream_prompt_too_long_is_the_overflow_kiro_compacts_for() {
             json!({"error": {"code": "context_length_exceeded", "type": "invalid_request_error",
                 "message": "This model's maximum context length is 128000 tokens."}}),
         ),
+        // Input under the window, but not with room for the output as well.
+        (
+            ProviderFormat::Anthropic,
+            json!({"type": "error", "error": {"type": "invalid_request_error",
+                "message": "input length and `max_tokens` exceed context limit: 188240 + 21333 > 200000, decrease input length or `max_tokens` and try again"}}),
+        ),
+        // A relay's own wording.
+        (
+            ProviderFormat::OpenAi,
+            json!({"error": {"type": "invalid_request_error", "message": "请求的上下文长度超过模型限制"}}),
+        ),
     ] {
         let server = upstream(ResponseTemplate::new(400).set_body_json(refusal)).await;
         let billing = engine(
@@ -296,6 +307,7 @@ async fn an_upstream_prompt_too_long_is_the_overflow_kiro_compacts_for() {
         assert_overflow(&reply);
         // Its message is the gateway's, never the upstream's.
         assert!(!reply.text().contains("250000") && !reply.text().contains("128000"));
+        assert!(!reply.text().contains("188240") && !reply.text().contains("超过模型限制"));
         // Refused, not retried: the same prompt is as long the next time.
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
         nothing_charged(&billing);

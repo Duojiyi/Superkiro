@@ -86,17 +86,41 @@ pub enum ProviderError {
 }
 
 /// Whether an upstream's words say the prompt is longer than the model takes: Anthropic's
-/// "prompt is too long", OpenAI's `context_length_exceeded` and "maximum context length",
-/// and the phrasing of Kiro's own service. Only this is read from them; they never reach a
-/// client.
+/// "prompt is too long" and "input length and `max_tokens` exceed context limit", OpenAI's
+/// `context_length_exceeded` and "maximum context length", other vendors' and Chinese
+/// relays' wordings, and the phrasing of Kiro's own service. Only this is read from them;
+/// they never reach a client.
 pub(crate) fn says_input_too_long(text: &str) -> bool {
     let text = text.to_ascii_lowercase();
     [
         "prompt is too long",
+        "prompt too long",
         "input is too long",
+        "input too long",
         "context_length_exceeded",
+        "context length exceeded",
         "maximum context length",
         "input content length exceeds threshold",
+        "exceed context limit",
+        "exceeds the context window",
+        "exceeded model token limit",
+        "input length exceeds",
+        "range of input length should be",
+        "上下文长度超",
+        "超出上下文",
+        "超过上下文",
+        "最大上下文长度",
+        "上下文超限",
+        "上下文超长",
+        "上下文过长",
+        "输入过长",
+        "输入长度超",
+        "输入内容过长",
+        "提示词过长",
+        "prompt过长",
+        "prompt 过长",
+        "prompt超长",
+        "prompt 超长",
     ]
     .iter()
     .any(|phrase| text.contains(phrase))
@@ -689,5 +713,41 @@ mod endpoint_tests {
             endpoint_with_suffix("https://provider.example/v1/", "/v1", "/chat/completions"),
             "https://provider.example/v1/chat/completions"
         );
+    }
+}
+
+#[cfg(test)]
+mod overflow_tests {
+    use super::says_input_too_long;
+
+    #[test]
+    fn overflow_wordings_are_recognised() {
+        for text in [
+            "prompt is too long: 250000 tokens > 200000 maximum",
+            "input length and `max_tokens` exceed context limit: 188240 + 21333 > 200000, decrease input length or `max_tokens` and try again",
+            "This model's maximum context length is 128000 tokens.",
+            "Invalid request: Your request exceeded model token limit: 262144",
+            "Range of input length should be [1, 129024]",
+            "请求的上下文长度超过模型限制",
+            "输入超出上下文窗口",
+            "输入内容超过模型最大上下文长度",
+            "输入过长，请缩短后重试",
+            "Prompt 超长",
+        ] {
+            assert!(says_input_too_long(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn other_refusals_are_not_overflows() {
+        for text in [
+            "max_tokens: 200000 > 128000, which is the maximum allowed number of output tokens",
+            "Request too large for gpt-4o on tokens per min (TPM): Limit 30000",
+            "tools.0.custom.input_schema: JSON schema is invalid",
+            "当前分组上游负载已饱和，请稍后再试",
+            "该令牌额度已用尽",
+        ] {
+            assert!(!says_input_too_long(text), "{text}");
+        }
     }
 }

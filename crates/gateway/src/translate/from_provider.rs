@@ -35,12 +35,14 @@ impl StreamTranslationState {
     }
 
     /// Map provider finish/stop reason into Kiro expected stopReason string. A refusal or a
-    /// content filter is Kiro's `content_filtered`, which it shows as a refusal.
+    /// content filter is Kiro's `content_filtered`, which it shows as a refusal. An answer
+    /// cut off by the context window is cut off as by the output limit: Kiro treats a tool
+    /// call as truncated only under `max_tokens`, and ran a cut one as if it were whole.
     pub fn map_stop_reason(reason: &str) -> String {
         match reason {
             "stop" => "end_turn".to_string(),
             "tool_calls" | "tool_use" => "tool_use".to_string(),
-            "length" | "max_tokens" => "max_tokens".to_string(),
+            "length" | "max_tokens" | "model_context_window_exceeded" => "max_tokens".to_string(),
             "refusal" | "content_filter" => "content_filtered".to_string(),
             other => other.to_string(),
         }
@@ -138,4 +140,22 @@ pub fn translate_provider_event_to_frames(
     }
 
     frames
+}
+
+#[cfg(test)]
+mod stop_reason_tests {
+    use super::StreamTranslationState;
+
+    #[test]
+    fn an_answer_cut_off_by_the_context_window_is_cut_off_like_one_at_the_output_limit() {
+        for reason in ["max_tokens", "length", "model_context_window_exceeded"] {
+            assert_eq!(
+                StreamTranslationState::map_stop_reason(reason),
+                "max_tokens"
+            );
+            assert!(crate::stream::is_explicit_empty_stop(reason), "{reason}");
+        }
+        assert!(crate::stream::is_explicit_empty_stop("content_filter"));
+        assert!(!crate::stream::is_explicit_empty_stop("stop"));
+    }
 }
