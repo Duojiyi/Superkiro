@@ -202,7 +202,9 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .route-cost-form .field {width: 96px;}
 .route-cost-form input, .route-cost-form select {width: 100%; min-height: 30px;}
 /* 切换线路 and its 切回 */
-.drawer.switch-drawer {width: min(980px, 100vw);}
+/* Wide drawers leave the navigation and a strip of the page in view. */
+.drawer.switch-drawer {width: min(960px, calc(100vw - 240px));}
+@media (max-width: 700px) {.drawer.switch-drawer {width: 100vw;}}
 .switch-preview td {white-space: normal; vertical-align: top;}
 .switch-preview .tag {height: auto; min-height: 20px; white-space: normal;}
 .switch-preview input {width: 100%; min-width: 150px;}
@@ -494,6 +496,21 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .page-stack.has-drawer {padding-right: 0;}
 /* With the drawer open, speed and tokens give way so the result column stays readable. */
 .has-drawer .traces-table .col-speed, .has-drawer .traces-table .col-tokens {display: none;}
+/* From 1280px the request drawer takes its own column: the list moves aside instead of lying under
+   it (the page is centred up to 1760px, hence the correction past 2008px), and up to 1760px the
+   numbers after 结果 give way too. */
+@media (min-width: 1280px) {
+  :root {--trace-drawer: min(620px, calc(100vw - 800px));}
+  #trace-detail.drawer {width: var(--trace-drawer);}
+  .page-stack.has-drawer {padding-right: max(0px, calc(var(--trace-drawer) - 8px - max(0px, (100vw - 2008px) / 2)));}
+}
+@media (min-width: 1280px) and (max-width: 1760px) {
+  .has-drawer .traces-table .col-ttft, .has-drawer .traces-table .col-latency, .has-drawer .traces-table .col-charge, .has-drawer .traces-table .col-actions {display: none;}
+  .has-drawer .traces-table .clip-model {max-width: 140px;}
+  .has-drawer .traces-table .result-reason {display: inline-block; max-width: 96px; overflow: hidden; text-overflow: ellipsis; vertical-align: middle;}
+}
+#trace-detail.drawer {container-type: inline-size;}
+@container (max-width: 560px) {#trace-detail .metric-strip {grid-template-columns: repeat(3, minmax(0, 1fr));}}
 .history-block > summary {cursor: pointer; color: var(--brand); font-size: 13px; padding: 4px 0;}
 .history-block[open] > summary {margin-bottom: 8px;}
 
@@ -530,6 +547,9 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .kpi-value.is-warning {color: var(--warning);}
 .kpi-value.is-danger {color: var(--danger);}
 .kpi-sub {font-size: 12px; color: var(--text-2);}
+/* 17,201 / 18,400: the total is smaller and may take the next line rather than be cut off. */
+.kpi-value.kpi-fraction {display: flex; flex-wrap: wrap; align-items: baseline; column-gap: 6px; white-space: normal; overflow: visible;}
+.kpi-of {font-size: 16px; line-height: 1; font-weight: 500; color: var(--text-2); white-space: nowrap;}
 .kpi-sub .link {font-size: 12px;}
 .overview-grid {display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 16px;}
 .request-chart {display: flex; align-items: stretch; gap: 4px; height: 200px; padding-top: 8px;}
@@ -705,6 +725,8 @@ div.attention-item:hover {background: transparent;}
   .modal {padding: 16px;}
   .keys-table {min-width: 520px;}
   .kpi-row {grid-template-columns: repeat(2, minmax(0, 1fr));}
+  /* Two to a row on a phone: amounts in the hundreds of thousands still fit. */
+  .kpi-value {font-size: 24px; line-height: 32px;}
   /* Phones: card, balance, status and actions; the rest is one tap away in the card's details. */
   .cards-table .col-note, .cards-table .col-group, .cards-table .col-device {display: none;}
 }

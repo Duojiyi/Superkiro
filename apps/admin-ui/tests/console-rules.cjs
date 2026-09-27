@@ -97,4 +97,14 @@ const plain = value => JSON.parse(JSON.stringify(value));
   assert.deepEqual([NOW - 1, NOW - DAY + 1, NOW - DAY, NOW - 12 * DAY - 5, undefined].map(secs => display.formatExpired(secs, NOW * 1000)),
     ['已过期不到 1 天', '已过期不到 1 天', '已过期 1 天', '已过期 12 天', '—']);
   console.log('PASS expired cards: past its date an active or frozen card is expired, the server\'s effective status first, days since in whole days');
+
+  // A request still 进行中 more than 30 minutes after it started was most likely cut off.
+  assert.deepEqual([
+    {status: 'in_progress', ts: NOW - 1801}, {status: 'in_progress', ts: NOW - 1800}, {status: 'running', ts: NOW - 5 * 3600}, {status: 'pending', ts: NOW - 60},
+    {status: 'success', ts: NOW - 5 * 3600}, {status: 'error', ts: NOW - 5 * 3600}, {status: 'in_progress'}, {status: 'in_progress', ts: 0}, {status: 'in_progress', ts: 'x'},
+  ].map(trace => status.traceStuck(trace, NOW)), [true, false, true, false, false, false, false, false, false]);
+  assert.deepEqual(plain(status.traceStatusView('in_progress', true)), {label: '可能已中断', tone: 'warning'});
+  assert.deepEqual(plain(status.traceStatusView('running')), {label: '进行中', tone: 'info'});
+  assert.deepEqual(plain(status.traceStatusView('error', true)), {label: '失败', tone: 'danger'}, 'only a request still 进行中 can be 可能已中断');
+  console.log('PASS stuck requests: 进行中 past 30 minutes is 可能已中断, finished requests never');
 })().catch(error => {console.error(error); process.exitCode = 1;});

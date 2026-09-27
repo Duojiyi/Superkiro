@@ -111,6 +111,8 @@ const server=http.createServer(async(req,res)=>{
     const created=saved.groups.find(group=>group.id==='new-group');
     assert.deepEqual(created,{id:'new-group',name:'新分组',issuance_enabled:false,provider_binding_mode:'shared',rate_card_id:'fixture-rate',margin_multiplier:1.2,virtual_plan_name:'新分组',virtual_usage_limit:0,system_prompt_prefix:null});
     assert.deepEqual(errors,[]);assert.deepEqual(nativeDialogs,[],'no browser-native dialogs');
+    // The refresh after the last publication may still be passing through a route: let it go quietly.
+    await page.unrouteAll({behavior:'ignoreErrors'});
     console.log('PASS issuance: flag filtering, legacy/single auto-selection, explicit multiple selection, independent tiers, zero groups, summary, editor persistence');
   } finally {await browser.close();await new Promise(resolve=>server.close(resolve));}
 })().catch(error=>{console.error(error);process.exitCode=1;});

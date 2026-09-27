@@ -111,12 +111,23 @@ export function storageLevel(stats: {stateBytes?: unknown; stateWarningBytes?: u
 
 export const TRACE_IN_PROGRESS = ['pending', 'running', 'in_progress'];
 
-export function traceStatusView(status: unknown): StatusView {
+/** 进行中 for longer than this: no request runs that long, so it was most likely cut off (a restart, a lost connection). */
+export const TRACE_STUCK_SECS = 30 * 60;
+
+/** A request still 进行中 more than 30 minutes after it started. */
+export function traceStuck(trace: {status?: unknown; ts?: unknown}, nowSecs: number): boolean {
+  const started = Number(trace.ts);
+  return TRACE_IN_PROGRESS.includes(String(trace.status)) && Number.isFinite(started) && started > 0 && nowSecs - started > TRACE_STUCK_SECS;
+}
+
+export function traceStatusView(status: unknown, stuck = false): StatusView {
   switch (String(status)) {
     case 'success': return {label: '成功', tone: 'success'};
     case 'error': return {label: '失败', tone: 'danger'};
     case 'client_aborted': return {label: '客户端中断', tone: 'warning'};
-    default: return TRACE_IN_PROGRESS.includes(String(status)) ? {label: '进行中', tone: 'info'} : {label: String(status ?? '未知'), tone: 'outline'};
+    default: return TRACE_IN_PROGRESS.includes(String(status))
+      ? (stuck ? {label: '可能已中断', tone: 'warning'} : {label: '进行中', tone: 'info'})
+      : {label: String(status ?? '未知'), tone: 'outline'};
   }
 }
 

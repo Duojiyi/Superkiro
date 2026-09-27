@@ -693,7 +693,10 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
     <div className="toolbar">
       <div className="filter-bar" role="search" aria-label="卡密筛选">
         <label className="search-field"><IconSearch/>
-          <input type="text" aria-label="搜索卡密" placeholder="卡密原文、卡密 ID、备注或设备 ID" value={search} disabled={bulkBusy} onChange={event => changeSearch(event.target.value)}/>
+          <input type="text" aria-label="搜索卡密" placeholder="卡密原文、卡密 ID、备注或设备 ID" aria-keyshortcuts="/" title="按 / 搜索；只找到一张时按 Enter 打开"
+            value={search} disabled={bulkBusy} onChange={event => changeSearch(event.target.value)}
+            // Enter opens the one card found.
+            onKeyDown={event => {if (event.key === 'Enter' && !event.nativeEvent.isComposing && filtered.length === 1) {event.preventDefault(); setDetailId(filtered[0].id);}}}/>
         </label>
         <label className="inline-field"><span>分组</span>
           <select aria-label="分组筛选" value={groupFilter} disabled={bulkBusy} onChange={event => setGroupFilter(event.target.value)}>

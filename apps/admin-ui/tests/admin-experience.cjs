@@ -117,7 +117,7 @@ async function waitFor(ready) {
 
     await nav('调用追踪'); await button('下一页').click();
     await traceTab('in_progress');
-    assert.equal(await button('详情').count(), 1); await page.locator('tbody').getByText('进行中', {exact: true}).waitFor();
+    assert.equal(await button('详情').count(), 1); await page.locator('tbody').getByText('可能已中断', {exact: true}).waitFor();
     assert.equal(await button('上一页').count(), 0, 'a filter change returns to a single page');
     await page.getByLabel('搜索调用记录').fill('  fixture-trace-23  '); assert.equal(await button('详情').count(), 1);
     await traceTab('error');

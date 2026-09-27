@@ -10,12 +10,14 @@ import {toast} from '../components/toast';
 import {FilterTabs, IdCell, Pager, StatusBadge, TableState, TopbarActions, copyText, type TabOption} from '../components/ui';
 import {formatCharge, formatClock, formatCount, formatDateTime, formatDuration, formatFullDateTime, formatListTime, formatMoney, formatRelative, formatShortDate, formatSpeed, formatTokenCount} from '../format';
 import {cardCodeOf, cardIdForCode} from '../cardCode';
-import {errorClassLabel, TRACE_IN_PROGRESS, traceStatusView} from '../status';
+import {errorClassLabel, TRACE_IN_PROGRESS, traceStatusView, traceStuck} from '../status';
 import type {Intent, Refresh, ReportError, ReportRoute, Row, TraceTab, TraceWindow, WriteGuards} from '../types';
 import {ConversationView, RawView, ReplyView} from './TraceContent';
 
 const PAGE_SIZE = 50;
 const RETENTION = 86400;
+// Why a request 进行中 for over 30 minutes is marked 可能已中断 (status.ts TRACE_STUCK_SECS).
+const STUCK_NOTE = '超过 30 分钟仍没有结果，可能已经中断（例如服务重启或连接断开）';
 type SortKey = 'time' | 'ttft' | 'charge';
 
 const latency = (trace: AdminTrace) => (trace.attempt_chain ?? []).reduce((sum, attempt) => sum + Number(attempt.latency_ms ?? 0), 0);
@@ -200,7 +202,10 @@ export default function TracesPage({traces, cards, providers = [], loading, fail
     <div className="toolbar">
       <div className="filter-bar" role="search" aria-label="追踪筛选">
         <label className="search-field"><IconSearch/>
-          <input type="text" aria-label="搜索调用记录" placeholder="卡密原文、卡密 ID 或请求 ID" value={query} onChange={event => changeQuery(event.target.value)}/>
+          <input type="text" aria-label="搜索调用记录" placeholder="卡密原文、卡密 ID 或请求 ID" aria-keyshortcuts="/" title="按 / 搜索；只找到一条时按 Enter 打开"
+            value={query} onChange={event => changeQuery(event.target.value)}
+            // Enter opens the one request found.
+            onKeyDown={event => {if (event.key === 'Enter' && !event.nativeEvent.isComposing && filtered.length === 1) {event.preventDefault(); open(filtered[0]);}}}/>
         </label>
         <label className="inline-field"><span>模型</span>
           <select aria-label="模型筛选" value={model} onChange={event => setModel(event.target.value)}>
@@ -239,14 +244,15 @@ export default function TracesPage({traces, cards, providers = [], loading, fail
         <thead><tr>
           <th aria-sort={ariaSort('time')}><button type="button" className="th-sort" onClick={() => toggleSort('time')}>时间{sortIcon('time')}</button></th>
           <th>卡密</th><th>模型</th><th>结果</th>
-          <th className="num" aria-sort={ariaSort('ttft')}><button type="button" className="th-sort" onClick={() => toggleSort('ttft')}>首字{sortIcon('ttft')}</button></th>
-          <th className="num col-speed">速度</th><th className="num col-tokens">Tokens 入 / 出</th><th className="num">耗时</th>
-          <th className="num" aria-sort={ariaSort('charge')}><button type="button" className="th-sort" onClick={() => toggleSort('charge')}>扣费{sortIcon('charge')}</button></th>
+          <th className="num col-ttft" aria-sort={ariaSort('ttft')}><button type="button" className="th-sort" onClick={() => toggleSort('ttft')}>首字{sortIcon('ttft')}</button></th>
+          <th className="num col-speed">速度</th><th className="num col-tokens">Tokens 入 / 出</th><th className="num col-latency">耗时</th>
+          <th className="num col-charge" aria-sort={ariaSort('charge')}><button type="button" className="th-sort" onClick={() => toggleSort('charge')}>扣费{sortIcon('charge')}</button></th>
           <th className="col-actions"><span className="sr-only">操作</span></th>
         </tr></thead>
         <tbody>
           {rows.map(trace => {
-            const view = traceStatusView(trace.status);
+            const stuck = traceStuck(trace, nowSecs);
+            const view = traceStatusView(trace.status, stuck);
             const attempts = trace.attempt_chain?.length ?? 0;
             const recent = nowSecs - Number(trace.ts) < RETENTION;
             return <tr key={trace.id} className={`is-clickable${trace.id === selectedId ? ' is-selected' : ''}`} onClick={() => open(trace)}>
@@ -255,14 +261,15 @@ export default function TracesPage({traces, cards, providers = [], loading, fail
               <td className="col-model" title={trace.exposed_model}><span className="clip clip-model">{trace.exposed_model ?? '—'}</span></td>
               <td className="col-result"><span className="result-cell">
                 <StatusBadge view={view}/>
+                {stuck && <span className="result-reason" title={STUCK_NOTE}>{formatRelative(trace.ts)}开始</span>}
                 {trace.error_class && <span className="result-reason" title={trace.error_class}>{errorClassLabel(trace.error_class)}</span>}
                 {attempts > 1 && <span className="retry-count" title={`共尝试 ${attempts} 次`}>↻{attempts - 1}</span>}
               </span></td>
-              <td className={`num ${ttftTone(trace.ttft_ms)}`} title={trace.ttft_ms == null ? '此请求没有计时（旧记录或非流式输出）' : undefined}>{formatDuration(trace.ttft_ms)}</td>
+              <td className={`num col-ttft ${ttftTone(trace.ttft_ms)}`} title={trace.ttft_ms == null ? '此请求没有计时（旧记录或非流式输出）' : undefined}>{formatDuration(trace.ttft_ms)}</td>
               <td className={`num col-speed${typeof trace.tokens_per_second === 'number' && trace.tokens_per_second < 10 ? ' is-warning' : ''}`}>{formatSpeed(trace.tokens_per_second)}</td>
               <td className="num col-tokens" title={`输入 ${formatCount(trace.input_tokens ?? 0)} · 输出 ${formatCount(trace.output_tokens ?? 0)}`}>{formatTokenCount(trace.input_tokens ?? 0)} / {formatTokenCount(trace.output_tokens ?? 0)}</td>
-              <td className="num">{attempts ? formatDuration(latency(trace)) : '—'}</td>
-              <td className="num">{formatCharge(trace.credits_charged)}</td>
+              <td className="num col-latency">{attempts ? formatDuration(latency(trace)) : '—'}</td>
+              <td className="num col-charge">{formatCharge(trace.credits_charged)}</td>
               <td className="col-actions"><span className="row-actions">
                 {recent && trace.invocation_id && <span className="doc-hint" title="24 小时内可查看请求内容"><IconDoc/></span>}
                 <button type="button" className="btn-text" onClick={event => {event.stopPropagation(); open(trace);}}>详情</button>
@@ -296,7 +303,8 @@ function TraceDrawer({trace, providerName, hasPrev, hasNext, onMove, onClose, on
 }) {
   const [timing, setTiming] = useState<{id: string; reply: TraceReply | null} | null>(null);
   const reply = timing?.id === trace.id ? timing.reply : null;
-  const view = traceStatusView(trace.status);
+  const stuck = traceStuck(trace, Date.now() / 1000);
+  const view = traceStatusView(trace.status, stuck);
   const chain = trace.attempt_chain ?? [];
   const ttft = typeof trace.ttft_ms === 'number' ? trace.ttft_ms : reply?.ttftMs ?? null;
   const speed = typeof trace.tokens_per_second === 'number' ? trace.tokens_per_second : reply?.tokensPerSecond ?? null;
@@ -316,6 +324,7 @@ function TraceDrawer({trace, providerName, hasPrev, hasNext, onMove, onClose, on
       </div>
     </header>
     <div className="drawer-body">
+      {stuck && <p className="note-warning" role="note">{formatRelative(trace.ts)}开始，{STUCK_NOTE}</p>}
       <dl className="metric-strip">
         <div><dt>首字</dt><dd className={ttftTone(ttft)}>{formatDuration(ttft)}</dd></div>
         <div><dt>速度</dt><dd>{formatSpeed(speed)}</dd></div>

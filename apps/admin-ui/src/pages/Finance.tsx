@@ -76,7 +76,8 @@ export default function FinancePage({financials, loading, failed, refresh, repor
             <div className="kpi-sub">{estimates && typeof estimates.faceValueMarginPercentage === 'number' ? `毛利率 ${formatPercent(estimates.faceValueMarginPercentage)}` : ''}</div></>}
       </section>
       <section className="panel kpi"><p className="kpi-label">成本覆盖</p>
-        <strong className="kpi-value">{covered !== null && total !== null ? `${formatCount(covered)} / ${formatCount(total)}` : '—'}</strong>
+        <strong className="kpi-value kpi-fraction" title={covered !== null && total !== null ? `${formatCount(covered)} / ${formatCount(total)} 次请求已设成本` : undefined}>
+          {covered !== null && total !== null ? <>{formatCount(covered)}<span className="kpi-of">/ {formatCount(total)}</span></> : '—'}</strong>
         <div className="kpi-sub">{estimates?.uncostedRequests ? `${formatCount(estimates.uncostedRequests)} 次请求未设成本` : estimates ? '全部已设成本' : ''}</div></section>
     </div>
 

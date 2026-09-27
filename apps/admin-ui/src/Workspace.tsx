@@ -126,6 +126,22 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
   const [cardsLoaded, setCardsLoaded] = useState(false);
   // Changes whenever a refresh starts that should clear the card selection.
   const [selectionEpoch, setSelectionEpoch] = useState(0);
+  // "/" puts the cursor in the page's search (卡密资产, 调用追踪, the models and groups lists), unless
+  // something is being typed or a dialog is open.
+  useEffect(() => {
+    const keydown = (event: KeyboardEvent) => {
+      if (event.key !== '/' || event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey || isModalOpen()) return;
+      const target = event.target instanceof Element ? event.target : null;
+      if (target?.closest('input, textarea, select, [contenteditable="true"]')) return;
+      const search = document.querySelector<HTMLInputElement>('#admin-workspace .search-field input:not(:disabled)');
+      if (!search) return;
+      event.preventDefault();
+      search.focus();
+      search.select();
+    };
+    document.addEventListener('keydown', keydown);
+    return () => document.removeEventListener('keydown', keydown);
+  }, []);
   const [actionError, setActionError] = useState<{text: string; action?: ErrorAction} | null>(null);
   const reportError = useCallback((text: string, action?: ErrorAction) => setActionError(text ? {text, action} : null), []);
 

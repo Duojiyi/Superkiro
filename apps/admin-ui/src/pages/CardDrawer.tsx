@@ -7,7 +7,7 @@ import {IconChevronDown, IconChevronUp, IconClose, IconCopy} from '../components
 import {Drawer} from '../components/modal';
 import {copyText, IdCell, StatusBadge, Tag} from '../components/ui';
 import {formatBatchNote, formatCharge, formatCount, formatCredits, formatDateTime, formatExpired, formatFullDateTime, formatRemaining, shortId} from '../format';
-import {cardStatusView, traceStatusView} from '../status';
+import {cardStatusView, traceStatusView, traceStuck} from '../status';
 
 const ACTION_LABEL: Record<string, string> = {
   issued: '发卡', activated: '激活', topup: '充值', adjust: '调账', freeze: '冻结', unfreeze: '解冻',
@@ -135,7 +135,7 @@ export default function CardDrawer({card, state, groupName, hasPrev, hasNext, on
             <tbody>{recent.value.map(trace => <tr key={trace.id} className="is-clickable" title="查看这次请求" onClick={() => onOpenTrace(card.id, trace.id)}>
               <td title={formatFullDateTime(trace.ts)}>{formatDateTime(trace.ts)}</td>
               <td><span className="clip clip-model">{trace.exposed_model ?? '—'}</span></td>
-              <td className="col-status"><StatusBadge view={traceStatusView(trace.status)}/></td>
+              <td className="col-status"><StatusBadge view={traceStatusView(trace.status, traceStuck(trace, Date.now() / 1000))}/></td>
               <td className="num">{formatCharge(trace.credits_charged)}</td>
             </tr>)}</tbody>
           </table></div>
