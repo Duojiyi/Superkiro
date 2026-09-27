@@ -83,18 +83,77 @@ pub struct Plan {
     pub sort_order: i32,
 }
 
-/// The plan a card was issued from, as it was then: the card keeps it whatever the catalog
-/// becomes.
+/// The plan a card was issued from, as it was then, or the one an upgrade or a renewal put it
+/// on: the card keeps it whatever the catalog becomes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssuedPlan {
     pub id: String,
     pub name: String,
     pub points: i64,
     pub price_micro_cny: i64,
+    /// What the customer actually paid for it, when recorded: a reseller's price at issuance,
+    /// or an upgrade's payment. Sales count it instead of the plan's price.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paid_micro_cny: Option<i64>,
     pub validity_days: u32,
     pub max_devices: u32,
     pub concurrency: u32,
     pub kiro_plan_type: String,
+}
+
+impl IssuedPlan {
+    /// What it sold for: the price paid when recorded, else the plan's price then.
+    pub fn sale_price_micro_cny(&self) -> i64 {
+        self.paid_micro_cny.unwrap_or(self.price_micro_cny)
+    }
+}
+
+/// A plan snapshot as a card's history records it, in the console's field names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanRecord {
+    pub id: String,
+    pub name: String,
+    pub points: i64,
+    pub price_micro_cny: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paid_micro_cny: Option<i64>,
+    pub validity_days: u32,
+    pub max_devices: u32,
+    pub concurrency: u32,
+    pub kiro_plan_type: String,
+}
+
+impl From<&IssuedPlan> for PlanRecord {
+    fn from(plan: &IssuedPlan) -> Self {
+        Self {
+            id: plan.id.clone(),
+            name: plan.name.clone(),
+            points: plan.points,
+            price_micro_cny: plan.price_micro_cny,
+            paid_micro_cny: plan.paid_micro_cny,
+            validity_days: plan.validity_days,
+            max_devices: plan.max_devices,
+            concurrency: plan.concurrency,
+            kiro_plan_type: plan.kiro_plan_type.clone(),
+        }
+    }
+}
+
+impl From<PlanRecord> for IssuedPlan {
+    fn from(plan: PlanRecord) -> Self {
+        Self {
+            id: plan.id,
+            name: plan.name,
+            points: plan.points,
+            price_micro_cny: plan.price_micro_cny,
+            paid_micro_cny: plan.paid_micro_cny,
+            validity_days: plan.validity_days,
+            max_devices: plan.max_devices,
+            concurrency: plan.concurrency,
+            kiro_plan_type: plan.kiro_plan_type,
+        }
+    }
 }
 
 impl Plan {
@@ -110,6 +169,7 @@ impl Plan {
             name: self.name.clone(),
             points: self.points,
             price_micro_cny: self.price_micro_cny(),
+            paid_micro_cny: None,
             validity_days: self.validity_days,
             max_devices: self.max_devices,
             concurrency: self.concurrency,

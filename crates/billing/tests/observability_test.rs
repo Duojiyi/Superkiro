@@ -1842,10 +1842,19 @@ fn the_ledger_csv_adds_readable_columns_after_the_original_ones() {
             "operator",
             "reason",
             "rate_card_version",
-            "key_id"
+            "key_id",
+            "kind",
+            "cash_cny"
         ]
     );
     let usage = &rows[1];
+    // Usage is no balance adjustment: no kind, no money.
+    assert_eq!((usage[22].as_str(), usage[23].as_str()), ("", ""));
+    // An adjustment made without a kind is the one its sign gives.
+    assert_eq!(
+        (rows[2][22].as_str(), rows[2][23].as_str()),
+        ("correction", "")
+    );
     assert_eq!(usage[11], "2023-11-14T22:13:20Z");
     assert_eq!(usage[12], "Upstream One");
     assert_eq!((usage[13].as_str(), usage[14].as_str()), ("70", "30"));
@@ -1901,14 +1910,30 @@ fn adjustments_add_up_credits_given_and_taken_once_each() {
     ];
     let totals = billing::observability::compute_adjustments(live.iter().chain(&archived));
     assert_eq!(
-        totals,
-        billing::observability::AdjustmentTotals {
-            count: 4,
-            positive_micro_credits: 503_000_000,
-            negative_micro_credits: -1_500_000,
-            net_micro_credits: 501_500_000,
-        }
+        (
+            totals.count,
+            totals.positive_micro_credits,
+            totals.negative_micro_credits,
+            totals.net_micro_credits
+        ),
+        (4, 503_000_000, -1_500_000, 501_500_000)
     );
+    // Made before kinds, each is the kind its sign gives: credits given for no request are a
+    // gift, credits taken a correction.
+    let by_kind = &totals.by_kind;
+    assert_eq!(
+        (by_kind.gift.count, by_kind.gift.positive_micro_credits),
+        (3, 503_000_000)
+    );
+    assert_eq!(
+        (
+            by_kind.correction.count,
+            by_kind.correction.negative_micro_credits
+        ),
+        (1, -1_500_000)
+    );
+    assert_eq!(by_kind.compensation, Default::default());
+    assert_eq!(by_kind.refund, Default::default());
     assert_eq!(
         billing::observability::compute_adjustments([]),
         Default::default()
@@ -2145,5 +2170,66 @@ fn trace_search_filters_the_retained_traces_and_totals_every_match() {
         )
         .0,
         ["t2", "t1"]
+    );
+}
+
+/// Sales count each card at what was paid for it, else its plan's price, and an upgrade does
+/// not restate them: the card counts at what it was issued for, the upgrade's payment apart.
+#[test]
+fn sales_count_what_was_paid_and_an_upgrade_does_not_restate_them() {
+    let engine = BillingEngine::new();
+    let plans = engine.plans();
+    let pro = plans.iter().find(|plan| plan.id == "tier-1000").unwrap();
+    let mut reseller = pro.template("group-pro-plus");
+    reseller.plan.as_mut().unwrap().paid_micro_cny = Some(20_000_000);
+    let sold = Card::from_template("card-paid", "hash-paid", &reseller, None, 100);
+    let listed = Card::from_template(
+        "card-list",
+        "hash-list",
+        &pro.template("group-pro-plus"),
+        None,
+        100,
+    );
+    engine.upsert_cards_checked([sold, listed]).unwrap();
+    engine
+        .upgrade_card(billing::CardUpgrade {
+            card_id: "card-paid",
+            plan_id: "tier-5000",
+            credits_delta: 4_000_000_000,
+            cash_micro_cny: 100_000_000,
+            group_id: None,
+            extend_days: 0,
+            operator_id: "admin",
+            reason: "升级",
+            now_secs: 200,
+            idempotency_key: None,
+        })
+        .unwrap();
+    let snapshot = engine.export_snapshot();
+    let issued =
+        billing::observability::cards_as_issued(snapshot.cards.values(), snapshot.ledger.iter());
+    let sales = billing::observability::compute_sales(issued.iter(), &plans, Some(0), Some(300));
+    assert_eq!(sales.issued_cards, 2);
+    assert_eq!(sales.issued_value_micro_cny, 20_000_000 + 30_000_000);
+    let pro_row = sales
+        .by_plan
+        .iter()
+        .find(|row| row.plan_id == "tier-1000")
+        .unwrap();
+    assert_eq!(pro_row.issued_cards, 2);
+    let cash = billing::observability::compute_cash(&sales, snapshot.ledger.iter());
+    assert_eq!(
+        (
+            cash.sales_micro_cny,
+            cash.upgrades_micro_cny,
+            cash.refunds_micro_cny,
+            cash.net_micro_cny
+        ),
+        (50_000_000, 100_000_000, 0, 150_000_000)
+    );
+    // The card itself is on the plan it was upgraded to.
+    assert_eq!(
+        engine.get_card("card-paid").unwrap().plan_id(),
+        Some("tier-5000")
     );
 }

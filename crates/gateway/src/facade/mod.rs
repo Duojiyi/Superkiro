@@ -306,6 +306,7 @@ impl FacadeRegistry {
             admin::CardAction::ChangeGroup,
             admin::CardAction::Quotas,
             admin::CardAction::Rekey,
+            admin::CardAction::Upgrade,
         ] {
             self.register(admin::AdminCardActionHandler {
                 billing: billing.clone(),

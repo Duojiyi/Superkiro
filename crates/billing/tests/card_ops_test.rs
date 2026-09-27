@@ -944,6 +944,7 @@ fn an_adjustment_keeps_the_request_it_makes_up_for() {
         events[0].detail,
         Some(serde_json::json!({
             "invocationIds": ["card-comp:inv-broken"],
+            "kind": "compensation",
             "chargedMicroCredits": [5_000_000],
         }))
     );
@@ -1040,6 +1041,7 @@ fn event_detail_has_its_own_field_and_older_entries_still_read() {
                 Some(json!({
                     "invocationId": "card-detail:inv-1",
                     "invocationIds": ["card-detail:inv-1"],
+                    "kind": "compensation",
                     "chargedMicroCredits": [3_000_000],
                 }))
             ),
@@ -1066,6 +1068,7 @@ fn event_detail_has_its_own_field_and_older_entries_still_read() {
         adjusted.detail,
         Some(json!({
             "invocationIds": ["card-detail:inv-1"],
+            "kind": "compensation",
             "chargedMicroCredits": [3_000_000],
         }))
     );
@@ -1091,6 +1094,7 @@ fn event_detail_has_its_own_field_and_older_entries_still_read() {
         json!({
             "invocationId": "card-detail:inv-1",
             "invocationIds": ["card-detail:inv-1"],
+            "kind": "compensation",
             "chargedMicroCredits": [3_000_000],
         })
     );
@@ -1433,6 +1437,8 @@ fn a_compensation_of_several_requests_is_checked_for_each() {
             idempotency_key: Some(key),
             requests,
             allow_repeat,
+            kind: None,
+            cash_micro_cny: None,
         })
     };
     let refusal = |result: Result<billing::LedgerEntry, BillingError>| match result {
@@ -1501,6 +1507,7 @@ fn a_compensation_of_several_requests_is_checked_for_each() {
         history[0].detail,
         Some(serde_json::json!({
             "invocationIds": ["card-s:inv-1", "card-s:inv-2"],
+            "kind": "compensation",
             "chargedMicroCredits": [1_000_000, 3_000_000],
         }))
     );
@@ -1586,8 +1593,309 @@ fn a_compensation_of_several_requests_is_checked_for_each() {
         idempotency_key: Some("k-8"),
         requests: &["card-s:inv-2"],
         allow_repeat: false,
+        kind: None,
+        cash_micro_cny: None,
     });
     assert!(
         matches!(again, Err(BillingError::Compensation(refusal)) if refusal.kind == RefusalKind::Repeat)
     );
+}
+
+/// A balance adjustment records its kind, the one its sign and requests give when unsaid,
+/// and the money that went with it: a refund says what was returned, a compensation or a
+/// gift has none. The financials and the ledger export count them by kind.
+#[test]
+fn an_adjustment_records_its_kind_and_the_money_with_it() {
+    use billing::{AdjustmentKind, BalanceAdjustment};
+    let engine = BillingEngine::new();
+    engine.upsert_card(create_test_card("card-k", 1, 5, 0));
+    charged_request(&engine, "card-k", "card-k:inv-1", 2_000_000);
+    let adjust = |credits: i64,
+                  key: &str,
+                  requests: &[&str],
+                  kind: Option<AdjustmentKind>,
+                  cash: Option<i64>| {
+        engine.adjust_card_balance(BalanceAdjustment {
+            card_id: "card-k",
+            delta_micro_credits: credits,
+            operator_id: "admin",
+            reason: "客服处理",
+            now_secs: 1_700_000_100,
+            idempotency_key: Some(key),
+            requests,
+            allow_repeat: false,
+            kind,
+            cash_micro_cny: cash,
+        })
+    };
+    let refused = |result: Result<billing::LedgerEntry, BillingError>| match result {
+        Err(BillingError::InvalidAdjustment(message)) => message,
+        other => panic!("not refused: {other:?}"),
+    };
+    adjust(1_000_000, "k-comp", &["card-k:inv-1"], None, None).unwrap();
+    adjust(1_000_000, "k-gift", &[], None, None).unwrap();
+    adjust(-1_000_000, "k-corr", &[], None, None).unwrap();
+    let kinds: Vec<serde_json::Value> = history_of(&engine, "card-k", "adjust")
+        .iter()
+        .map(|event| event.detail.as_ref().unwrap()["kind"].clone())
+        .collect();
+    assert_eq!(kinds, ["correction", "gift", "compensation"]);
+
+    assert_eq!(
+        refused(adjust(
+            -1_000_000,
+            "k-r0",
+            &[],
+            Some(AdjustmentKind::Refund),
+            None
+        )),
+        "A refund needs cashMicroCny, the money returned to the customer"
+    );
+    for kind in [Some(AdjustmentKind::Gift), None] {
+        assert_eq!(
+            refused(adjust(1_000_000, "k-g", &[], kind, Some(5))),
+            "cashMicroCny is refused for a compensation or a gift"
+        );
+    }
+    assert_eq!(
+        refused(adjust(
+            -1_000_000,
+            "k-r1",
+            &[],
+            Some(AdjustmentKind::Refund),
+            Some(-1)
+        )),
+        "cashMicroCny must be 0-100000000000 micro-CNY"
+    );
+    adjust(
+        -5_000_000,
+        "k-refund",
+        &[],
+        Some(AdjustmentKind::Refund),
+        Some(15_000_000),
+    )
+    .unwrap();
+    adjust(
+        3_000_000,
+        "k-corr2",
+        &[],
+        Some(AdjustmentKind::Correction),
+        Some(9_000_000),
+    )
+    .unwrap();
+    let refund = &history_of(&engine, "card-k", "adjust")[1];
+    assert_eq!(
+        refund.detail,
+        Some(serde_json::json!({ "kind": "refund", "cashMicroCny": 15_000_000 }))
+    );
+    // A retry is the same adjustment only with the same kind and money.
+    assert!(refused(adjust(
+        -5_000_000,
+        "k-refund",
+        &[],
+        Some(AdjustmentKind::Correction),
+        Some(15_000_000)
+    ))
+    .starts_with("Idempotency conflict"));
+    adjust(
+        -5_000_000,
+        "k-refund",
+        &[],
+        Some(AdjustmentKind::Refund),
+        Some(15_000_000),
+    )
+    .unwrap();
+    assert_eq!(engine.get_card("card-k").unwrap().credit_total, 105_000_000);
+
+    let entries = engine.ledger_entries();
+    let totals = billing::observability::compute_adjustments(entries.iter());
+    let by_kind = &totals.by_kind;
+    assert_eq!(
+        (
+            by_kind.compensation.count,
+            by_kind.compensation.positive_micro_credits
+        ),
+        (1, 1_000_000)
+    );
+    assert_eq!(
+        (by_kind.gift.count, by_kind.gift.positive_micro_credits),
+        (1, 1_000_000)
+    );
+    assert_eq!(
+        (
+            by_kind.refund.count,
+            by_kind.refund.negative_micro_credits,
+            by_kind.refund.cash_micro_cny
+        ),
+        (1, -5_000_000, 15_000_000)
+    );
+    assert_eq!(
+        (
+            by_kind.correction.count,
+            by_kind.correction.positive_micro_credits,
+            by_kind.correction.negative_micro_credits,
+            by_kind.correction.cash_micro_cny
+        ),
+        (2, 3_000_000, -1_000_000, 9_000_000)
+    );
+    assert_eq!(totals.count, 5);
+    let cash = billing::observability::compute_cash(&Default::default(), entries.iter());
+    assert_eq!(
+        (cash.refunds_micro_cny, cash.net_micro_cny),
+        (15_000_000, -15_000_000)
+    );
+
+    // The export keeps its columns and adds each entry's kind and money.
+    let csv = engine.export_ledger_csv(Some("card-k"));
+    let mut lines = csv.lines();
+    assert!(lines.next().unwrap().ends_with(",key_id,kind,cash_cny"));
+    let refund_row = lines.find(|line| line.contains("k-refund")).unwrap();
+    assert!(refund_row.ends_with(",\"refund\",15"), "{refund_row}");
+}
+
+/// An upgrade puts a card on the plan the customer paid for, with its credits, group and
+/// days, in one history entry saying what the card had; the same plan again is a renewal.
+#[test]
+fn an_upgrade_puts_the_card_on_the_plan_it_was_paid_for() {
+    use billing::CardUpgrade;
+    let engine = BillingEngine::new();
+    let mut card = create_test_card("card-up", 1, 5, 0);
+    // Issued with PRO's credits before the plan catalog.
+    card.issued_credits = Some(1_000 * 1_000_000);
+    engine.upsert_card(card);
+    let before = engine.get_card("card-up").unwrap();
+    let upgrade = |plan: &str, credits: i64, cash: i64, days: u64, key: Option<&str>| {
+        engine.upgrade_card(CardUpgrade {
+            card_id: "card-up",
+            plan_id: plan,
+            credits_delta: credits,
+            cash_micro_cny: cash,
+            group_id: None,
+            extend_days: days,
+            operator_id: "admin",
+            reason: "升级 PRO Max",
+            now_secs: 50_000,
+            idempotency_key: key,
+        })
+    };
+    let card = upgrade("tier-5000", 4_000_000_000, 75_000_000, 30, Some("up-1")).unwrap();
+    assert_eq!(card.plan_id(), Some("tier-5000"));
+    assert_eq!(card.plan_name(), Some("PRO Max"));
+    assert_eq!(card.plan.as_ref().unwrap().paid_micro_cny, Some(75_000_000));
+    assert_eq!(card.credit_total, before.credit_total + 4_000_000_000);
+    // Into the plan's default group; its sessions end with the move.
+    assert_eq!(card.group_id, "group-pro-plus");
+    assert_eq!(card.token_version, before.token_version + 1);
+    assert_eq!(card.valid_until, Some(87_400 + 30 * 86_400));
+    let events = history_of(&engine, "card-up", "upgrade");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].credits, 4_000_000_000);
+    assert_eq!(events[0].operator.as_deref(), Some("admin"));
+    let detail = events[0].detail.clone().unwrap();
+    for (field, value) in [
+        ("planId", serde_json::json!("tier-5000")),
+        ("previousPlanId", serde_json::json!("tier-1000")),
+        ("previousPlanName", serde_json::json!("PRO")),
+        ("previousPlan", serde_json::Value::Null),
+        ("renewal", serde_json::json!(false)),
+        ("groupId", serde_json::json!("group-pro-plus")),
+        ("previousGroupId", serde_json::json!("grp-1")),
+        ("creditsDelta", serde_json::json!(4_000_000_000i64)),
+        ("previousCreditTotal", serde_json::json!(100_000_000)),
+        ("creditTotal", serde_json::json!(4_100_000_000i64)),
+        ("cashMicroCny", serde_json::json!(75_000_000)),
+        ("extendDays", serde_json::json!(30)),
+        ("previousValidUntil", serde_json::json!(87_400)),
+        ("validUntil", serde_json::json!(87_400 + 30 * 86_400)),
+    ] {
+        assert_eq!(detail[field], value, "{field}");
+    }
+    assert_eq!(detail["plan"]["paidMicroCny"], 75_000_000);
+    // Sent again under its key, it is the same upgrade; the key cannot name another.
+    upgrade("tier-5000", 4_000_000_000, 75_000_000, 30, Some("up-1")).unwrap();
+    assert!(matches!(
+        upgrade("tier-5000", 4_000_000_000, 80_000_000, 30, Some("up-1")),
+        Err(BillingError::InvalidAdjustment(message)) if message.starts_with("Idempotency conflict")
+    ));
+    assert_eq!(history_of(&engine, "card-up", "upgrade").len(), 1);
+
+    // The same plan again is a renewal, and records the plan it replaced.
+    upgrade("tier-5000", 5_000_000_000, 130_000_000, 0, None).unwrap();
+    let renewal = history_of(&engine, "card-up", "upgrade")[0]
+        .detail
+        .clone()
+        .unwrap();
+    assert_eq!(renewal["renewal"], true);
+    assert_eq!(renewal["previousPlan"]["id"], "tier-5000");
+    assert_eq!(renewal["previousPlan"]["paidMicroCny"], 75_000_000);
+    assert!(
+        engine
+            .reconcile_card_balance("card-up", 100_000_000)
+            .unwrap()
+            .is_balanced
+    );
+    // Upgrades are sales, not adjustments.
+    let entries = engine.ledger_entries();
+    assert_eq!(
+        billing::observability::compute_adjustments(entries.iter()).count,
+        0
+    );
+    let cash = billing::observability::compute_cash(&Default::default(), entries.iter());
+    assert_eq!(cash.upgrades_micro_cny, 205_000_000);
+
+    let refused = |result: Result<Card, BillingError>| match result {
+        Err(BillingError::InvalidState(message)) => message,
+        other => panic!("not refused: {other:?}"),
+    };
+    assert_eq!(
+        refused(upgrade("nope", 0, 0, 0, None)),
+        "Unknown plan: nope"
+    );
+    let mut closed = billing::Group::pro_plus("group-closed", "Closed");
+    closed.issuance_enabled = false;
+    engine.upsert_group(closed);
+    assert_eq!(
+        refused(engine.upgrade_card(CardUpgrade {
+            card_id: "card-up",
+            plan_id: "tier-5000",
+            credits_delta: 0,
+            cash_micro_cny: 0,
+            group_id: Some("group-closed"),
+            extend_days: 0,
+            operator_id: "admin",
+            reason: "换组",
+            now_secs: 50_000,
+            idempotency_key: None,
+        })),
+        "Group does not take cards: group-closed"
+    );
+    let mut forever = create_test_card("card-forever", 1, 5, 0);
+    forever.valid_until = None;
+    engine.upsert_card(forever);
+    let mut voided = create_test_card("card-void", 1, 5, 0);
+    voided.status = CardStatus::Voided;
+    engine.upsert_card(voided);
+    for (card, message) in [
+        (
+            "card-forever",
+            "Cards that never expire cannot be extended: card-forever",
+        ),
+        ("card-void", "Voided cards cannot be upgraded: card-void"),
+    ] {
+        assert_eq!(
+            refused(engine.upgrade_card(CardUpgrade {
+                card_id: card,
+                plan_id: "tier-5000",
+                credits_delta: 0,
+                cash_micro_cny: 0,
+                group_id: None,
+                extend_days: 1,
+                operator_id: "admin",
+                reason: "续费",
+                now_secs: 50_000,
+                idempotency_key: None,
+            })),
+            message
+        );
+    }
 }

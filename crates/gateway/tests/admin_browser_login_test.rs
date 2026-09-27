@@ -208,6 +208,11 @@ async fn production_cookie_login_csrf_reveal_logout_and_fail_closed() {
         ),
         ("cards/rekey", json!({"cardId": card_id, "reason": "泄露"})),
         (
+            "cards/upgrade",
+            json!({"cardId": card_id, "planId": "tier-5000", "creditsDelta": 0,
+                "cashMicroCny": 0, "reason": "续费"}),
+        ),
+        (
             "announcements/edit",
             json!({"id": "ann-1", "title": "维护改期"}),
         ),

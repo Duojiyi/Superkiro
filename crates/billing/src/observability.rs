@@ -750,7 +750,7 @@ pub fn compute_costed_margin(entries: &[LedgerEntry], settings: &BillingSettings
 
 /// Credits given and taken by balance adjustments over a period: compensations, promotions
 /// and corrections, which usage revenue does not show. A card event (a note, an extension)
-/// changes no balance and is not one.
+/// changes no balance and is not one; nor is an upgrade, which is a sale.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdjustmentTotals {
@@ -760,19 +760,59 @@ pub struct AdjustmentTotals {
     /// Credits taken, as a negative amount.
     pub negative_micro_credits: i64,
     pub net_micro_credits: i64,
+    /// The same by kind, each with the money recorded with it.
+    pub by_kind: AdjustmentsByKind,
+}
+
+/// Balance adjustments of one kind over a period.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KindTotals {
+    pub count: u64,
+    pub positive_micro_credits: i64,
+    /// As a negative amount.
+    pub negative_micro_credits: i64,
+    /// The money recorded with them: returned for refunds, as said for corrections.
+    pub cash_micro_cny: i64,
+}
+
+impl KindTotals {
+    fn add(&mut self, micro_credits: i64, cash_micro_cny: Option<i64>) {
+        self.count += 1;
+        if micro_credits > 0 {
+            self.positive_micro_credits = self.positive_micro_credits.saturating_add(micro_credits);
+        } else {
+            self.negative_micro_credits = self.negative_micro_credits.saturating_add(micro_credits);
+        }
+        self.cash_micro_cny = self
+            .cash_micro_cny
+            .saturating_add(cash_micro_cny.unwrap_or(0));
+    }
+}
+
+/// Balance adjustments by kind; one made before kinds counts as the kind its sign and
+/// requests give.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdjustmentsByKind {
+    pub compensation: KindTotals,
+    pub gift: KindTotals,
+    pub refund: KindTotals,
+    pub correction: KindTotals,
 }
 
 /// Adds up the balance adjustments among `entries`, each entry once by its ID.
 pub fn compute_adjustments<'a>(
     entries: impl IntoIterator<Item = &'a LedgerEntry>,
 ) -> AdjustmentTotals {
+    use crate::compensation::AdjustmentKind;
     let mut totals = AdjustmentTotals::default();
     let mut seen = std::collections::HashSet::new();
     for entry in entries {
-        if entry.kind != crate::ledger::LedgerKind::Adjustment
-            || entry.credits_charged == 0
-            || !seen.insert(entry.id.as_str())
-        {
+        let Some((kind, cash)) = crate::compensation::adjustment_kind(entry) else {
+            continue;
+        };
+        if !seen.insert(entry.id.as_str()) {
             continue;
         }
         totals.count += 1;
@@ -785,11 +825,96 @@ pub fn compute_adjustments<'a>(
                 .negative_micro_credits
                 .saturating_add(entry.credits_charged);
         }
+        let by_kind = match kind {
+            AdjustmentKind::Compensation => &mut totals.by_kind.compensation,
+            AdjustmentKind::Gift => &mut totals.by_kind.gift,
+            AdjustmentKind::Refund => &mut totals.by_kind.refund,
+            AdjustmentKind::Correction => &mut totals.by_kind.correction,
+        };
+        by_kind.add(entry.credits_charged, cash);
     }
     totals.net_micro_credits = totals
         .positive_micro_credits
         .saturating_add(totals.negative_micro_credits);
     totals
+}
+
+/// The money that came in and went out over a period, as recorded: cards sold at the price
+/// actually paid, upgrade and renewal payments, and refunds.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Cash {
+    /// Cards issued in the period, each at the price paid for it, else its plan's price.
+    pub sales_micro_cny: i64,
+    pub upgrades_micro_cny: i64,
+    pub refunds_micro_cny: i64,
+    /// Sales and upgrades less refunds.
+    pub net_micro_cny: i64,
+}
+
+/// The period's cash: `sales` as computed for it, and the upgrades and refunds among
+/// `entries`, each entry once by its ID.
+pub fn compute_cash<'a>(sales: &Sales, entries: impl IntoIterator<Item = &'a LedgerEntry>) -> Cash {
+    let mut cash = Cash {
+        sales_micro_cny: sales.issued_value_micro_cny,
+        ..Cash::default()
+    };
+    let mut seen = std::collections::HashSet::new();
+    for entry in entries {
+        if !seen.insert(entry.id.as_str()) {
+            continue;
+        }
+        if let Some(paid) = crate::compensation::upgrade_cash(entry) {
+            cash.upgrades_micro_cny = cash.upgrades_micro_cny.saturating_add(paid);
+        } else if let Some((crate::compensation::AdjustmentKind::Refund, returned)) =
+            crate::compensation::adjustment_kind(entry)
+        {
+            cash.refunds_micro_cny = cash.refunds_micro_cny.saturating_add(returned.unwrap_or(0));
+        }
+    }
+    cash.net_micro_cny = cash
+        .sales_micro_cny
+        .saturating_add(cash.upgrades_micro_cny)
+        .saturating_sub(cash.refunds_micro_cny);
+    cash
+}
+
+/// The cards as they were issued: one an upgrade or a renewal put on another plan is given
+/// back the plan its first one replaced, so its sale stays at what it was issued for.
+/// `entries` are the ledger's, live and archived, over all time.
+pub fn cards_as_issued<'a>(
+    cards: impl IntoIterator<Item = &'a crate::card::Card>,
+    entries: impl IntoIterator<Item = &'a LedgerEntry>,
+) -> Vec<crate::card::Card> {
+    let mut first: std::collections::HashMap<&str, (u64, Option<crate::template::IssuedPlan>)> =
+        std::collections::HashMap::new();
+    for entry in entries {
+        if crate::compensation::upgrade_cash(entry).is_none() {
+            continue;
+        }
+        if first
+            .get(entry.card_id.as_str())
+            .is_some_and(|(ts, _)| *ts <= entry.ts_secs)
+        {
+            continue;
+        }
+        let previous = entry
+            .event_detail()
+            .and_then(|detail| detail.get("previousPlan").cloned())
+            .and_then(|plan| serde_json::from_value::<crate::template::PlanRecord>(plan).ok())
+            .map(crate::template::IssuedPlan::from);
+        first.insert(entry.card_id.as_str(), (entry.ts_secs, previous));
+    }
+    cards
+        .into_iter()
+        .map(|card| {
+            let mut card = card.clone();
+            if let Some((_, plan)) = first.get(card.id.as_str()) {
+                card.plan = plan.clone();
+            }
+            card
+        })
+        .collect()
 }
 
 /// Cards of one plan issued and activated over a period, and what they sold for.
@@ -866,8 +991,14 @@ pub fn compute_sales<'a>(
         }
         sales.issued_cards += u64::from(issued);
         sales.activated_cards += u64::from(activated);
+        // At what was paid for it, when recorded.
         let sold = match (&card.plan, card.legacy_tier()) {
-            (Some(plan), _) => Some((&*plan.id, &*plan.name, plan.points, plan.price_micro_cny)),
+            (Some(plan), _) => Some((
+                &*plan.id,
+                &*plan.name,
+                plan.points,
+                plan.sale_price_micro_cny(),
+            )),
             (None, Some(tier)) => Some((
                 tier.template_id,
                 tier.name,
@@ -1026,13 +1157,15 @@ pub fn export_reconciliation_csv(entries: &[LedgerEntry]) -> String {
 /// readable ones follow: the time in UTC, the provider's name, cache reads and writes,
 /// credits as a decimal, and for usage its ¥ revenue at face value and ¥ cost. Then who made
 /// an adjustment or card event and why; for usage, `reason` says where its cost came from,
-/// then the price version that charged it and the Key that served it, when known.
+/// then the price version that charged it and the Key that served it, when known. Then a
+/// balance adjustment's kind (compensation, gift, refund or correction; `upgrade` for an
+/// upgrade or a renewal) and the ¥ recorded with it.
 pub fn export_ledger_csv(
     entries: &[LedgerEntry],
     provider_names: &std::collections::HashMap<String, String>,
     settings: &BillingSettings,
 ) -> String {
-    let mut csv = String::from("id,card_id,ts,kind,invocation_id,exposed_model,provider_id,input_tokens,output_tokens,credits_charged,provider_cost_micro_cny,time_utc,provider_name,cache_read_tokens,cache_write_tokens,credits,revenue_cny,cost_cny,operator,reason,rate_card_version,key_id\n");
+    let mut csv = String::from("id,card_id,ts,kind,invocation_id,exposed_model,provider_id,input_tokens,output_tokens,credits_charged,provider_cost_micro_cny,time_utc,provider_name,cache_read_tokens,cache_write_tokens,credits,revenue_cny,cost_cny,operator,reason,rate_card_version,key_id,kind,cash_cny\n");
     for e in entries {
         let usage = e.kind == crate::ledger::LedgerKind::Usage;
         let revenue = usage.then(|| {
@@ -1041,8 +1174,16 @@ pub fn export_ledger_csv(
                 entry_face_value(e, settings),
             ))
         });
+        let (money_kind, cash) = match (
+            crate::compensation::upgrade_cash(e),
+            crate::compensation::adjustment_kind(e),
+        ) {
+            (Some(paid), _) => ("upgrade", Some(paid)),
+            (None, Some((kind, cash))) => (kind.as_str(), cash),
+            (None, None) => ("", None),
+        };
         csv.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             csv_text(&e.id),
             csv_text(&e.card_id),
             e.ts_secs,
@@ -1076,6 +1217,8 @@ pub fn export_ledger_csv(
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or(""),
             ),
+            csv_text(money_kind),
+            cash.map(micro_decimal).unwrap_or_default(),
         ));
     }
     csv

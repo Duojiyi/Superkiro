@@ -189,6 +189,32 @@ pub struct BalanceAdjustment<'a> {
     pub requests: &'a [&'a str],
     /// Compensate them again, or by more than they were charged.
     pub allow_repeat: bool,
+    /// What it is; unsaid, the kind its sign and requests give.
+    pub kind: Option<crate::compensation::AdjustmentKind>,
+    /// The money that went with it: required for a refund, refused for a compensation or a
+    /// gift.
+    pub cash_micro_cny: Option<i64>,
+}
+
+/// An upgrade or a renewal an operator records for a card: the plan it is now on, what the
+/// customer paid, and the credits and days it adds.
+#[derive(Debug, Clone, Copy)]
+pub struct CardUpgrade<'a> {
+    pub card_id: &'a str,
+    pub plan_id: &'a str,
+    /// Micro-credits added, 0 or more.
+    pub credits_delta: i64,
+    /// What the customer paid, in micro-CNY.
+    pub cash_micro_cny: i64,
+    /// The group it moves to; the plan's default group when not given.
+    pub group_id: Option<&'a str>,
+    /// Days its validity is extended by, 0 for none.
+    pub extend_days: u64,
+    pub operator_id: &'a str,
+    pub reason: &'a str,
+    pub now_secs: u64,
+    /// A retry under the same key is the same upgrade.
+    pub idempotency_key: Option<&'a str>,
 }
 
 /// Where a request was charged: its card, the micro-credits and when.
@@ -4478,6 +4504,204 @@ impl BillingEngine {
         Ok((card, raw_code))
     }
 
+    /// Record an upgrade or a renewal an operator sold: the card is put on the plan (its
+    /// snapshot keeping what the customer paid), gains the credits, moves to the group (the
+    /// plan's default when not given; its sessions end when it changes, as a group change's
+    /// do) and is extended by the days asked, all in one history entry recording the plan,
+    /// group, credits and expiry it had. The same plan again is a renewal. Refused for an
+    /// unknown plan or a group that takes no cards, a voided or archived card, and days for a
+    /// card that never expires.
+    pub fn upgrade_card(&self, upgrade: CardUpgrade<'_>) -> Result<Card, BillingError> {
+        use crate::template::PlanRecord;
+        let operator_id = Self::named_operator(upgrade.operator_id, "upgrade card")?;
+        let reason = upgrade.reason.trim();
+        if reason.is_empty() {
+            return Err(BillingError::InvalidAdjustment(
+                "Reason is required to upgrade a card".into(),
+            ));
+        }
+        let CardUpgrade {
+            card_id,
+            plan_id,
+            credits_delta,
+            cash_micro_cny,
+            extend_days,
+            now_secs,
+            ..
+        } = upgrade;
+        if credits_delta < 0 || cash_micro_cny < 0 {
+            return Err(BillingError::InvalidAdjustment(
+                "creditsDelta and cashMicroCny cannot be negative".into(),
+            ));
+        }
+        let _state_guard = self.state_lock.write().unwrap();
+        if let Some(key) = upgrade.idempotency_key {
+            let existing = self
+                .ledger
+                .read()
+                .unwrap()
+                .iter()
+                .find(|e| {
+                    e.kind == LedgerKind::Adjustment && e.invocation_id.as_deref() == Some(key)
+                })
+                .cloned()
+                .or_else(|| {
+                    self.archived_ledger_summary
+                        .read()
+                        .unwrap()
+                        .adjustments
+                        .get(key)
+                        .cloned()
+                });
+            if let Some(existing) = existing {
+                let detail = existing.event_detail().unwrap_or_default();
+                let same = existing.card_id == card_id
+                    && existing.exposed_model == crate::compensation::UPGRADE_EVENT
+                    && existing.credits_charged == credits_delta
+                    && existing.operator_id.as_deref() == Some(operator_id)
+                    && existing.reason.as_deref() == Some(reason)
+                    && detail["planId"] == plan_id
+                    && detail["cashMicroCny"] == cash_micro_cny
+                    && detail["extendDays"] == extend_days
+                    && upgrade
+                        .group_id
+                        .is_none_or(|group| detail["groupId"] == group);
+                if !same {
+                    return Err(BillingError::InvalidAdjustment(format!(
+                        "Idempotency conflict: key '{key}' already used with different parameters"
+                    )));
+                }
+                return self
+                    .cards
+                    .read()
+                    .unwrap()
+                    .get(card_id)
+                    .cloned()
+                    .ok_or_else(|| BillingError::CardNotFound(card_id.to_string()));
+            }
+        }
+        let mut candidate = self.export_snapshot_locked(
+            self.snapshot_sequence
+                .load(Ordering::Acquire)
+                .saturating_add(1),
+            self.last_snapshot_checksum.read().unwrap().clone(),
+        );
+        let mut card = candidate
+            .cards
+            .get(card_id)
+            .cloned()
+            .ok_or_else(|| BillingError::CardNotFound(card_id.to_string()))?;
+        if card.status == CardStatus::Voided {
+            return Err(BillingError::InvalidState(format!(
+                "Voided cards cannot be upgraded: {card_id}"
+            )));
+        }
+        if card.archived_at.is_some() {
+            return Err(BillingError::InvalidState(format!(
+                "Archived cards must be unarchived before they are upgraded: {card_id}"
+            )));
+        }
+        let plan = crate::template::plan_catalog(candidate.plans.as_deref(), &candidate.groups)
+            .into_iter()
+            .find(|plan| plan.id == plan_id)
+            .ok_or_else(|| BillingError::InvalidState(format!("Unknown plan: {plan_id}")))?;
+        let group_id = upgrade.group_id.unwrap_or(&plan.default_group_id);
+        let group = candidate
+            .groups
+            .get(group_id)
+            .ok_or_else(|| BillingError::InvalidState(format!("Unknown group: {group_id}")))?;
+        if !group.issuance_enabled {
+            return Err(BillingError::InvalidState(format!(
+                "Group does not take cards: {group_id}"
+            )));
+        }
+
+        let before = card.clone();
+        let mut detail = serde_json::json!({
+            "planId": plan.id,
+            "previousPlanId": before.plan_id(),
+            "previousPlanName": before.plan_name(),
+            // Null for a card issued before the plan catalog.
+            "previousPlan": before.plan.as_ref().map(PlanRecord::from),
+            "renewal": before.plan_id() == Some(plan.id.as_str()),
+            "groupId": group_id,
+            "previousGroupId": before.group_id,
+            "creditsDelta": credits_delta,
+            "creditTotal": before.credit_total.saturating_add(credits_delta),
+            "previousCreditTotal": before.credit_total,
+            "cashMicroCny": cash_micro_cny,
+            "extendDays": extend_days,
+            "validUntil": before.valid_until,
+            "previousValidUntil": before.valid_until,
+        });
+        if extend_days > 0 {
+            let days = extend_days.saturating_mul(86_400);
+            let perpetual = || {
+                BillingError::InvalidState(format!(
+                    "Cards that never expire cannot be extended: {card_id}"
+                ))
+            };
+            if awaits_activation(&card) {
+                if card.activation_duration_secs == Some(0) {
+                    return Err(perpetual());
+                }
+                let previous = card
+                    .activation_duration_secs
+                    .unwrap_or(LEGACY_ACTIVATION_SECS);
+                let duration = previous.saturating_add(days);
+                card.activation_duration_secs = Some(duration);
+                detail["activationDurationSecs"] = duration.into();
+                detail["previousActivationDurationSecs"] = previous.into();
+            } else {
+                let current = card.valid_until.ok_or_else(perpetual)?;
+                let until = current.max(now_secs).saturating_add(days);
+                card.valid_until = Some(until);
+                if card.status == CardStatus::Expired {
+                    card.status = CardStatus::Active;
+                }
+                if card.frozen_from == Some(CardStatus::Expired) {
+                    card.frozen_from = Some(CardStatus::Active);
+                }
+                detail["validUntil"] = until.into();
+            }
+        }
+        card.credit_total = card.credit_total.saturating_add(credits_delta);
+        if card.group_id != group_id {
+            // Every token names the group it was issued for.
+            card.group_id = group_id.to_string();
+            card.token_version = card.token_version.saturating_add(1);
+        }
+        let mut snapshot = plan.snapshot();
+        snapshot.paid_micro_cny = Some(cash_micro_cny);
+        detail["plan"] = serde_json::json!(PlanRecord::from(&snapshot));
+        card.plan = Some(snapshot);
+
+        let mut entry = Self::card_event_entry(
+            candidate.ledger.len(),
+            card_id,
+            crate::compensation::UPGRADE_EVENT,
+            operator_id,
+            reason,
+            now_secs,
+        );
+        entry.credits_charged = credits_delta;
+        entry.detail = Some(detail);
+        if let Some(key) = upgrade.idempotency_key {
+            entry.id = format!("ledger-{key}");
+            entry.invocation_id = Some(key.to_string());
+        }
+        candidate.cards.insert(card_id.to_string(), card.clone());
+        candidate.ledger.push(entry.clone());
+        self.commit_candidate_snapshot(&candidate, || {
+            self.cards
+                .write()
+                .unwrap()
+                .insert(card_id.to_string(), card.clone());
+            self.ledger.write().unwrap().push(entry);
+            card
+        })
+    }
+
     // ==========================================
     // Top-up & Renewal Operations (Spec §14.9)
     // ==========================================
@@ -4913,6 +5137,8 @@ impl BillingEngine {
             idempotency_key,
             requests: &requests,
             allow_repeat: request.is_some_and(|r| r.allow_repeat),
+            kind: None,
+            cash_micro_cny: None,
         })
     }
 
@@ -4925,6 +5151,9 @@ impl BillingEngine {
     /// earlier positive one already made up for, nor give more than the requests were
     /// charged together, unless `allow_repeat` says the operator means it. A refusal names
     /// every request that caused it and what was found for each.
+    ///
+    /// It records its kind, the one its sign and requests give when unsaid, and the money
+    /// that went with it: a refund says what was returned; a compensation or a gift has none.
     pub fn adjust_card_balance(
         &self,
         adjustment: BalanceAdjustment<'_>,
@@ -4937,6 +5166,7 @@ impl BillingEngine {
             now_secs,
             idempotency_key,
             allow_repeat,
+            cash_micro_cny,
             ..
         } = adjustment;
         // Each request once, in the order given.
@@ -4966,6 +5196,15 @@ impl BillingEngine {
             return Err(BillingError::InvalidAdjustment(
                 "Adjustment delta cannot be zero".to_string(),
             ));
+        }
+        let kind = adjustment.kind.unwrap_or_else(|| {
+            crate::compensation::AdjustmentKind::default_for(
+                delta_micro_credits,
+                !requests.is_empty(),
+            )
+        });
+        if let Some(problem) = kind.cash_problem(cash_micro_cny) {
+            return Err(BillingError::InvalidAdjustment(problem.to_string()));
         }
 
         let _state_guard = self.state_lock.write().unwrap();
@@ -5002,6 +5241,8 @@ impl BillingEngine {
                     && existing.operator_id.as_deref() == Some(op)
                     && existing.reason.as_deref() == Some(res)
                     && named == asked
+                    && crate::compensation::adjustment_kind(&existing)
+                        == Some((kind, cash_micro_cny))
                 {
                     return Ok(existing);
                 } else {
@@ -5060,13 +5301,18 @@ impl BillingEngine {
         let adjustment_id = idempotency_key
             .map(ToString::to_string)
             .unwrap_or_else(|| format!("adj-{}-{}-{}", card_id, now_secs, candidate.ledger.len()));
-        // The requests it makes up for and what each was charged, which the card's history
-        // shows and the compensation is shared by.
+        // Its kind and money, and the requests it makes up for and what each was charged,
+        // which the card's history shows and the compensation is shared by.
         let charged_credits: Vec<i64> = charged
             .iter()
             .map(|found| found.as_ref().map_or(0, |found| found.credits))
             .collect();
-        let detail = crate::compensation::linked_detail(&requests, &charged_credits);
+        let detail = Some(crate::compensation::adjustment_detail(
+            kind,
+            cash_micro_cny,
+            &requests,
+            &charged_credits,
+        ));
 
         let entry = LedgerEntry {
             id: format!("ledger-{}", adjustment_id),
@@ -5486,6 +5732,7 @@ impl BillingEngine {
                 (LedgerKind::Adjustment, "change_group") => "group",
                 (LedgerKind::Adjustment, "change_quotas") => "quotas",
                 (LedgerKind::Adjustment, "rekey_card") => "rekey",
+                (LedgerKind::Adjustment, crate::compensation::UPGRADE_EVENT) => "upgrade",
                 (LedgerKind::Adjustment, _) => "adjust",
             };
             // A change that records more than who and why keeps it as a JSON object: in

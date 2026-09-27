@@ -44,14 +44,15 @@ pub use card_platform::{
     PullCardsResponse, RedeemAction, RedeemCallbackRequest, RedeemCallbackResponse,
 };
 pub use compensation::{
-    CompensationRefusal, RefusalKind, RefusedRequest, RequestCompensation, MAX_COMPENSATED_REQUESTS,
+    AdjustmentKind, CompensationRefusal, RefusalKind, RefusedRequest, RequestCompensation,
+    MAX_CASH_MICRO_CNY, MAX_COMPENSATED_REQUESTS,
 };
 pub use engine::{
     read_snapshot_anchor, verify_ledger_archive, verify_ledger_archive_with, ArchivedCardSummary,
     ArchivedLedgerPayload, ArchivedLedgerReceipt, ArchivedLedgerSummary, BalanceAdjustment,
-    BillingEngine, BillingError, BillingSnapshot, CardReconciliation, CompensatedRequest,
-    IssuanceOrder, PendingSettlement, SnapshotAnchor, SnapshotVerificationReport, UnpaidCharge,
-    ValidityExtension,
+    BillingEngine, BillingError, BillingSnapshot, CardReconciliation, CardUpgrade,
+    CompensatedRequest, IssuanceOrder, PendingSettlement, SnapshotAnchor,
+    SnapshotVerificationReport, UnpaidCharge, ValidityExtension,
 };
 pub use generator::{export_csv, export_json, generate_batch, generate_card, GeneratedCard};
 pub use group::{FallbackTarget, Group, ModelMap, ProviderBindingMode};

@@ -9,6 +9,7 @@
 //! - `POST /api/v1/admin/cards/adjust`: manual balance adjustment (persisted)
 //! - `POST /api/v1/admin/cards/devices/unbind`, `.../rebinds/reset`, `.../validity`,
 //!   `.../note`, `.../group`: support actions, each written to the card's history
+//! - `POST /api/v1/admin/cards/upgrade`: put a card on a plan the customer paid for
 //! - `POST /api/v1/admin/cards/batch`: batch generate cards from template
 //! - `GET /api/v1/admin/announcements`: list announcements, scheduled ones included
 //! - `POST /api/v1/admin/announcements`: publish announcement, from a start to an end, for groups
@@ -773,6 +774,14 @@ impl FacadeHandler for AdminFinancialsHandler {
             };
             // One snapshot keeps estimates, coverage and their settings consistent.
             let mut snapshot = self.billing.export_snapshot();
+            // Each card at what it was issued for, whatever plan an upgrade put it on since.
+            let issued_cards = billing::observability::cards_as_issued(
+                snapshot.cards.values(),
+                snapshot
+                    .ledger
+                    .iter()
+                    .chain(snapshot.archived_ledger_summary.adjustments.values()),
+            );
             snapshot
                 .ledger
                 .retain(|entry| within_period(entry.ts_secs, period));
@@ -808,6 +817,23 @@ impl FacadeHandler for AdminFinancialsHandler {
             let (from_secs, to_secs) = period;
             let plans =
                 billing::template::plan_catalog(snapshot.plans.as_deref(), &snapshot.groups);
+            let sales = billing::observability::compute_sales(
+                issued_cards.iter(),
+                &plans,
+                from_secs,
+                to_secs,
+            );
+            // What came in and went out, as recorded: sales, upgrades, refunds.
+            let cash = billing::observability::compute_cash(
+                &sales,
+                snapshot.ledger.iter().chain(
+                    snapshot
+                        .archived_ledger_summary
+                        .adjustments
+                        .values()
+                        .filter(|entry| within_period(entry.ts_secs, period)),
+                ),
+            );
             let plan_prices: Vec<serde_json::Value> = plans
                 .iter()
                 .map(|plan| {
@@ -832,7 +858,8 @@ impl FacadeHandler for AdminFinancialsHandler {
                     "margin": billing::observability::compute_costed_margin(&snapshot.ledger, &snapshot.settings),
                     // Credits given and taken by hand over the period, next to those earned.
                     "adjustments": adjustments,
-                    "sales": billing::observability::compute_sales(snapshot.cards.values(), &plans, from_secs, to_secs),
+                    "sales": sales,
+                    "cash": cash,
                     // Balances still owed, now, whatever the period.
                     "liability": billing::observability::compute_liability(snapshot.cards.values(), &snapshot.settings, now_secs()),
                     // The plan catalog's prices, in its order.
@@ -1249,6 +1276,9 @@ pub struct AdminBatchCardsRequest {
     pub template_id: Option<String>,
     pub group_id: Option<String>,
     pub note: Option<String>,
+    /// What each card actually sells for, in yuan to the fen, 0 to 100000: kept in each
+    /// card's plan, and counted by sales instead of the plan's price.
+    pub unit_price_cny: Option<f64>,
 }
 
 pub struct AdminBatchCardsHandler {
@@ -1348,8 +1378,27 @@ impl FacadeHandler for AdminBatchCardsHandler {
                     "cards have one device; issue from a plan with max_devices 1",
                 );
             }
+            let paid = match body.unit_price_cny {
+                None => None,
+                Some(price)
+                    if (0.0..=100_000.0).contains(&price)
+                        && ((price * 100.0).round() - price * 100.0).abs() <= 1e-6 =>
+                {
+                    Some((price * 1_000_000.0).round() as i64)
+                }
+                Some(_) => {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidRequestException",
+                        "unitPriceCny must be 0-100000 yuan, to the fen",
+                    )
+                }
+            };
             // Any group that takes cards, the plan's default or not.
-            let template = plan.template(&group_id);
+            let mut template = plan.template(&group_id);
+            if let Some(plan) = template.plan.as_mut() {
+                plan.paid_micro_cny = paid;
+            }
             if self
                 .billing
                 .get_group(&group_id)
@@ -1666,6 +1715,8 @@ pub struct CardPlanView {
     pub name: String,
     pub points: i64,
     pub price_micro_cny: i64,
+    /// What the customer actually paid for it, when recorded; null otherwise.
+    pub paid_micro_cny: Option<i64>,
     pub validity_days: u32,
     pub max_devices: u32,
     pub concurrency: u32,
@@ -1678,6 +1729,7 @@ fn card_plan_view(plan: &billing::template::IssuedPlan) -> CardPlanView {
         name: plan.name.clone(),
         points: plan.points,
         price_micro_cny: plan.price_micro_cny,
+        paid_micro_cny: plan.paid_micro_cny,
         validity_days: plan.validity_days,
         max_devices: plan.max_devices,
         concurrency: plan.concurrency,
@@ -2006,6 +2058,11 @@ pub struct AdminCardAdjustRequest {
     /// Compensate those requests again, or by more than they were charged; needs a reason.
     #[serde(default)]
     pub allow_repeat: bool,
+    /// compensation, gift, refund or correction; unsaid, the kind its sign and requests give.
+    pub kind: Option<String>,
+    /// The money that went with it, in micro-CNY: required for a refund, refused for a
+    /// compensation or a gift.
+    pub cash_micro_cny: Option<i64>,
 }
 
 /// Whether `id` is a request's key as a trace names it: 1-257 ASCII letters, digits, -_.:
@@ -2173,6 +2230,26 @@ impl FacadeHandler for AdminCardAdjustHandler {
                 (None, None) => Vec::new(),
             };
 
+            let kind = match req_data.kind.as_deref().map(str::trim) {
+                None => None,
+                Some(name) => match billing::AdjustmentKind::parse(name) {
+                    Some(kind) => Some(kind),
+                    None => {
+                        return failure(
+                            StatusCode::BAD_REQUEST,
+                            "kind must be compensation, gift, refund or correction",
+                        )
+                    }
+                },
+            };
+            // A refund says what was returned; a compensation or a gift returns nothing.
+            let resolved = kind.unwrap_or_else(|| {
+                billing::AdjustmentKind::default_for(delta_credits, !requests.is_empty())
+            });
+            if let Some(problem) = resolved.cash_problem(req_data.cash_micro_cny) {
+                return failure(StatusCode::BAD_REQUEST, problem);
+            }
+
             let now = now_secs();
             match self
                 .billing
@@ -2185,6 +2262,8 @@ impl FacadeHandler for AdminCardAdjustHandler {
                     idempotency_key: Some(idempotency_key),
                     requests: &requests,
                     allow_repeat: req_data.allow_repeat,
+                    kind,
+                    cash_micro_cny: req_data.cash_micro_cny,
                 }) {
                 Ok(_entry) => {
                     let card = self.billing.get_card(&req_data.card_id);
@@ -2277,6 +2356,8 @@ pub enum CardAction {
     Quotas,
     /// Give it a new code, returned once; the old code and every session end.
     Rekey,
+    /// Put it on a plan the customer paid for: credits, days and group with it.
+    Upgrade,
 }
 
 pub struct AdminCardActionHandler {
@@ -2342,6 +2423,22 @@ struct QuotasRequest {
 struct RekeyRequest {
     card_id: String,
     reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpgradeRequest {
+    card_id: String,
+    plan_id: String,
+    /// Micro-credits added.
+    credits_delta: i64,
+    /// What the customer paid, in micro-CNY.
+    cash_micro_cny: i64,
+    reason: Option<String>,
+    /// The plan's default group when left out.
+    group_id: Option<String>,
+    #[serde(default)]
+    extend_days: u64,
 }
 
 /// Requests a card may have in flight at once, as a plan's concurrency is bounded.
@@ -2574,6 +2671,67 @@ impl AdminCardActionHandler {
         }
     }
 
+    fn upgrade(&self, operator: &str, key: Option<&str>, body: UpgradeRequest) -> Response {
+        let plan_id = body.plan_id.trim();
+        if !valid_card_id(&body.card_id) || !valid_text(plan_id, 64) {
+            return failure(StatusCode::BAD_REQUEST, "cardId and planId are required");
+        }
+        if !(0..=MAX_CARD_CREDIT_LIMIT).contains(&body.credits_delta) {
+            return failure(
+                StatusCode::BAD_REQUEST,
+                "creditsDelta must be 0-10000000000000 micro-credits",
+            );
+        }
+        if !(0..=billing::MAX_CASH_MICRO_CNY).contains(&body.cash_micro_cny) {
+            return failure(
+                StatusCode::BAD_REQUEST,
+                "cashMicroCny must be 0-100000000000 micro-CNY",
+            );
+        }
+        if body.extend_days > MAX_EXTENSION_DAYS {
+            return failure(
+                StatusCode::BAD_REQUEST,
+                "extendDays must be between 0 and 3650",
+            );
+        }
+        let group_id = body.group_id.as_deref().map(str::trim);
+        if group_id.is_some_and(|id| !valid_group_id(id)) {
+            return failure(StatusCode::BAD_REQUEST, "groupId is invalid");
+        }
+        let Some(reason) = support_reason(body.reason.as_deref()) else {
+            return failure(
+                StatusCode::BAD_REQUEST,
+                "A reason of 1 to 200 bytes is required",
+            );
+        };
+        if self.billing.plan(plan_id).is_none() {
+            return failure(StatusCode::NOT_FOUND, &format!("Unknown plan: {plan_id}"));
+        }
+        if let Some(id) = group_id.filter(|id| self.billing.get_group(id).is_none()) {
+            return failure(StatusCode::NOT_FOUND, &format!("Unknown group: {id}"));
+        }
+        match self.billing.upgrade_card(billing::CardUpgrade {
+            card_id: body.card_id.trim(),
+            plan_id,
+            credits_delta: body.credits_delta,
+            cash_micro_cny: body.cash_micro_cny,
+            group_id,
+            extend_days: body.extend_days,
+            operator_id: operator,
+            reason,
+            now_secs: now_secs(),
+            idempotency_key: key,
+        }) {
+            Ok(card) => Self::one_card(Ok(card)),
+            Err(billing::BillingError::InvalidAdjustment(message))
+                if message.starts_with("Idempotency conflict") =>
+            {
+                failure(StatusCode::CONFLICT, &message)
+            }
+            Err(error) => card_action_refused(error),
+        }
+    }
+
     fn change_group(&self, operator: &str, body: GroupRequest) -> Response {
         if !valid_card_id(&body.card_id) || !valid_group_id(&body.group_id) {
             return failure(StatusCode::BAD_REQUEST, "cardId and groupId are required");
@@ -2613,6 +2771,7 @@ impl FacadeHandler for AdminCardActionHandler {
             CardAction::ChangeGroup => "/api/v1/admin/cards/group",
             CardAction::Quotas => "/api/v1/admin/cards/quotas",
             CardAction::Rekey => "/api/v1/admin/cards/rekey",
+            CardAction::Upgrade => "/api/v1/admin/cards/upgrade",
         }
     }
 
@@ -2621,6 +2780,25 @@ impl FacadeHandler for AdminCardActionHandler {
             let Some(operator) = self.auth.authenticated_operator(req.headers()) else {
                 return unauthorized_response();
             };
+            // An upgrade sent again under the same key is the same upgrade.
+            let key = req
+                .headers()
+                .get("idempotency-key")
+                .or_else(|| req.headers().get("x-idempotency-key"))
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.trim().to_string());
+            if key.as_deref().is_some_and(|key| {
+                key.is_empty()
+                    || key.len() > 128
+                    || !key
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b))
+            }) {
+                return failure(
+                    StatusCode::BAD_REQUEST,
+                    "Idempotency-Key must be 1-128 ASCII letters, digits, -_.:",
+                );
+            }
             let Ok(bytes) = axum::body::to_bytes(req.into_body(), 64 * 1024).await else {
                 return failure(StatusCode::BAD_REQUEST, "Invalid request body");
             };
@@ -2644,6 +2822,8 @@ impl FacadeHandler for AdminCardActionHandler {
                 CardAction::Rekey => {
                     card_action_body(&bytes).map(|body| self.rekey(operator, body))
                 }
+                CardAction::Upgrade => card_action_body(&bytes)
+                    .map(|body| self.upgrade(operator, key.as_deref(), body)),
             };
             response.unwrap_or_else(|message| failure(StatusCode::BAD_REQUEST, &message))
         })

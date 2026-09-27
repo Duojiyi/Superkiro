@@ -2411,10 +2411,24 @@ async fn financials_report_a_period_by_provider_with_sales_and_liability() {
         (Some(start), Some(end))
     );
     assert_eq!(body["dashboard"]["total_requests"], 1);
+    let adjustments = &body["adjustments"];
     assert_eq!(
-        body["adjustments"],
-        json!({"count": 2, "positiveMicroCredits": 5_000_000,
-            "negativeMicroCredits": -1_000_000, "netMicroCredits": 4_000_000})
+        json!([
+            adjustments["count"],
+            adjustments["positiveMicroCredits"],
+            adjustments["negativeMicroCredits"],
+            adjustments["netMicroCredits"]
+        ]),
+        json!([2, 5_000_000, -1_000_000, 4_000_000])
+    );
+    // Made without a kind: credits given for no request are a gift, credits taken a correction.
+    assert_eq!(
+        adjustments["byKind"]["gift"]["positiveMicroCredits"],
+        5_000_000
+    );
+    assert_eq!(
+        adjustments["byKind"]["correction"]["negativeMicroCredits"],
+        -1_000_000
     );
     let providers = body["byProvider"].as_array().unwrap();
     assert_eq!(providers.len(), 1, "{body}");
@@ -2498,7 +2512,7 @@ async fn financials_report_a_period_by_provider_with_sales_and_liability() {
         "id,card_id,ts,kind,invocation_id,exposed_model,provider_id,input_tokens,output_tokens,\
          credits_charged,provider_cost_micro_cny,time_utc,provider_name,cache_read_tokens,\
          cache_write_tokens,credits,revenue_cny,cost_cny,operator,reason,rate_card_version,\
-         key_id\n"
+         key_id,kind,cash_cny\n"
     ));
 }
 
@@ -2921,7 +2935,8 @@ async fn cards_are_issued_from_the_plan_catalog_and_keep_their_plan() {
     assert_eq!(
         issued["plan"],
         json!({"id": "trial-7d", "name": "体验卡", "points": 300, "priceMicroCny": 9_900_000,
-               "validityDays": 7, "maxDevices": 1, "concurrency": 1, "kiroPlanType": "CUSTOM"})
+               "paidMicroCny": null, "validityDays": 7, "maxDevices": 1, "concurrency": 1,
+               "kiroPlanType": "CUSTOM"})
     );
     let card_id = issued["cardId"].as_str().unwrap().to_string();
     // templateId still names a plan, and so does the old default.
@@ -3290,4 +3305,174 @@ async fn a_compensation_of_several_requests_names_each_refused_one() {
             .available_credits(),
         5_000_000 + 4_000_000
     );
+}
+
+/// Money that moves with a card is recorded in yuan: an adjustment's kind and cash, an
+/// upgrade's payment, a reseller's price at issuance; the financials add them up.
+#[tokio::test]
+async fn money_movements_carry_their_kind_and_the_yuan() {
+    let (billing, app) = setup_admin_app();
+    billing.set_master_kek(billing::MasterKek::from_bytes([41; 32]));
+    let adjustment = |points: f64, extra: serde_json::Value| {
+        let mut body =
+            json!({"cardId": "card-admin-02", "deltaPoints": points, "reason": "客户退款"});
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        body
+    };
+    for (key, body, message) in [
+        (
+            "kind-bad",
+            adjustment(1.0, json!({"kind": "bonus"})),
+            "kind must be compensation, gift, refund or correction",
+        ),
+        (
+            "kind-refund-no-cash",
+            adjustment(-1.0, json!({"kind": "refund"})),
+            "A refund needs cashMicroCny, the money returned to the customer",
+        ),
+        (
+            "kind-gift-cash",
+            adjustment(1.0, json!({"kind": "gift", "cashMicroCny": 5})),
+            "cashMicroCny is refused for a compensation or a gift",
+        ),
+    ] {
+        let (status, response) = adjust(&app, key, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{key}: {response}");
+        assert_eq!(response["error"], message, "{key}");
+    }
+    let (status, response) = adjust(
+        &app,
+        "kind-refund",
+        adjustment(-2.0, json!({"kind": "refund", "cashMicroCny": 6_000_000})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let event = newest_event(&app, "card-admin-02", "adjust").await;
+    assert_eq!(
+        event["detail"],
+        json!({"kind": "refund", "cashMicroCny": 6_000_000})
+    );
+
+    let upgrade = |body: serde_json::Value| {
+        let app = app.clone();
+        async move {
+            admin_call(
+                &app,
+                Method::POST,
+                "/api/v1/admin/cards/upgrade",
+                Some(body),
+            )
+            .await
+        }
+    };
+    let base = json!({"cardId": "card-admin-02", "planId": "tier-5000",
+        "creditsDelta": 4_000_000_000i64, "cashMicroCny": 75_000_000, "reason": "升级 PRO Max"});
+    let with = |extra: serde_json::Value| {
+        let mut body = base.clone();
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        body
+    };
+    for (body, status, message) in [
+        (
+            with(json!({"planId": "nope"})),
+            StatusCode::NOT_FOUND,
+            "Unknown plan: nope",
+        ),
+        (
+            with(json!({"groupId": "nope"})),
+            StatusCode::NOT_FOUND,
+            "Unknown group: nope",
+        ),
+        (
+            with(json!({"creditsDelta": -1})),
+            StatusCode::BAD_REQUEST,
+            "creditsDelta must be 0-10000000000000 micro-credits",
+        ),
+        (
+            with(json!({"cashMicroCny": -1})),
+            StatusCode::BAD_REQUEST,
+            "cashMicroCny must be 0-100000000000 micro-CNY",
+        ),
+        (
+            with(json!({"extendDays": 3651})),
+            StatusCode::BAD_REQUEST,
+            "extendDays must be between 0 and 3650",
+        ),
+        (
+            with(json!({"reason": " "})),
+            StatusCode::BAD_REQUEST,
+            "A reason of 1 to 200 bytes is required",
+        ),
+        (
+            with(json!({"cardId": "card-missing"})),
+            StatusCode::NOT_FOUND,
+            "Card card-missing not found",
+        ),
+    ] {
+        let (got, response) = upgrade(body).await;
+        assert_eq!(got, status, "{response}");
+        assert_eq!(response, json!({"success": false, "error": message}));
+    }
+    let (status, response) = upgrade(base.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["card"]["planId"], "tier-5000");
+    assert_eq!(response["card"]["plan"]["paidMicroCny"], 75_000_000);
+    assert_eq!(response["card"]["groupId"], "group-pro-plus");
+    let event = newest_event(&app, "card-admin-02", "upgrade").await;
+    assert_eq!(event["credits"], 4_000_000_000i64);
+    assert_eq!(event["reason"], "升级 PRO Max");
+    assert_eq!(event["detail"]["renewal"], false);
+    assert_eq!(event["detail"]["previousGroupId"], "group-admin");
+    assert_eq!(event["detail"]["cashMicroCny"], 75_000_000);
+
+    // A reseller's price, kept on each card and counted by sales.
+    let (status, response) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/cards/batch",
+        Some(
+            json!({"count": 2, "groupId": "group-pro-plus", "planId": "tier-2000",
+            "unitPriceCny": 38.0}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["cards"][0]["plan"]["paidMicroCny"], 38_000_000);
+    let (status, response) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/cards/batch",
+        Some(
+            json!({"count": 1, "groupId": "group-pro-plus", "planId": "tier-2000",
+            "unitPriceCny": 38.123}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+    assert_eq!(
+        response["message"],
+        "unitPriceCny must be 0-100000 yuan, to the fen"
+    );
+
+    let (status, financials) =
+        admin_call(&app, Method::GET, "/api/v1/admin/financials", None).await;
+    assert_eq!(status, StatusCode::OK, "{financials}");
+    assert_eq!(
+        financials["adjustments"]["byKind"]["refund"],
+        json!({"count": 1, "positiveMicroCredits": 0, "negativeMicroCredits": -2_000_000,
+            "cashMicroCny": 6_000_000})
+    );
+    assert_eq!(financials["adjustments"]["byKind"]["gift"]["count"], 0);
+    // The upgrade is not an adjustment.
+    assert_eq!(financials["adjustments"]["count"], 1);
+    assert_eq!(
+        financials["cash"],
+        json!({"salesMicroCny": 76_000_000, "upgradesMicroCny": 75_000_000,
+            "refundsMicroCny": 6_000_000, "netMicroCny": 145_000_000})
+    );
+    assert_eq!(financials["sales"]["issuedValueMicroCny"], 76_000_000);
 }

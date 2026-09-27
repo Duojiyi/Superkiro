@@ -216,6 +216,14 @@ impl Card {
             .find(|tier| tier.points.saturating_mul(crate::MICRO_CREDITS_PER_CREDIT) == credits)
     }
 
+    /// The tier the credits it was issued with name, whatever plan it is on now.
+    pub fn issued_tier(&self) -> Option<&'static PlanPrice> {
+        let credits = self.issued_credits?;
+        PLAN_PRICES
+            .iter()
+            .find(|tier| tier.points.saturating_mul(crate::MICRO_CREDITS_PER_CREDIT) == credits)
+    }
+
     /// The plan it was issued from, by ID: its own, or its tier's before the catalog.
     pub fn plan_id(&self) -> Option<&str> {
         match &self.plan {

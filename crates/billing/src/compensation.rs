@@ -6,10 +6,128 @@
 //! `chargedMicroCredits`, what each was charged, in the same order. A positive one names
 //! them as compensated. One naming several shares its amount among them in proportion to
 //! what each was charged (evenly when none was), so the shares add up to the amount.
+//!
+//! Every balance adjustment also records its kind and, for a refund or a correction, the
+//! money that went with it: `kind` and `cashMicroCny`.
 
 use crate::ledger::{LedgerEntry, LedgerKind};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+
+/// The card event an upgrade or a renewal writes; it moves credits, but is a sale, not an
+/// adjustment.
+pub const UPGRADE_EVENT: &str = "upgrade_card";
+
+/// The most money one adjustment or upgrade records: ¥100,000, the dearest plan.
+pub const MAX_CASH_MICRO_CNY: i64 = 100_000 * 1_000_000;
+
+/// What a balance adjustment is, as the financials count it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdjustmentKind {
+    /// Credits given back for requests.
+    Compensation,
+    /// Credits given for nothing owed.
+    Gift,
+    /// Money returned to the customer, the credits it paid for taken back.
+    Refund,
+    /// A balance set right.
+    Correction,
+}
+
+impl AdjustmentKind {
+    pub const ALL: [Self; 4] = [
+        Self::Compensation,
+        Self::Gift,
+        Self::Refund,
+        Self::Correction,
+    ];
+
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == name)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Compensation => "compensation",
+            Self::Gift => "gift",
+            Self::Refund => "refund",
+            Self::Correction => "correction",
+        }
+    }
+
+    /// The kind an adjustment is when none is said: a correction when it takes credits, a
+    /// compensation when it gives them for requests it names, else a gift.
+    pub fn default_for(delta_micro_credits: i64, names_requests: bool) -> Self {
+        if delta_micro_credits < 0 {
+            Self::Correction
+        } else if names_requests {
+            Self::Compensation
+        } else {
+            Self::Gift
+        }
+    }
+
+    /// Why money cannot go with this kind as asked, if it cannot: a refund says what was
+    /// returned, and a compensation or a gift returns none.
+    pub fn cash_problem(self, cash_micro_cny: Option<i64>) -> Option<&'static str> {
+        match (self, cash_micro_cny) {
+            (_, Some(cash)) if !(0..=MAX_CASH_MICRO_CNY).contains(&cash) => {
+                Some("cashMicroCny must be 0-100000000000 micro-CNY")
+            }
+            (Self::Refund, None) => {
+                Some("A refund needs cashMicroCny, the money returned to the customer")
+            }
+            (Self::Compensation | Self::Gift, Some(_)) => {
+                Some("cashMicroCny is refused for a compensation or a gift")
+            }
+            _ => None,
+        }
+    }
+}
+
+/// A kept balance adjustment's kind and the money it records: its own, or, for one made
+/// before kinds, the kind its sign and requests give. `None` for an entry that is not a
+/// balance adjustment: usage, a top-up, a card event, or an upgrade.
+pub fn adjustment_kind(entry: &LedgerEntry) -> Option<(AdjustmentKind, Option<i64>)> {
+    if entry.kind != LedgerKind::Adjustment
+        || entry.credits_charged == 0
+        || entry.exposed_model == UPGRADE_EVENT
+    {
+        return None;
+    }
+    let detail = entry.event_detail();
+    let cash = detail
+        .as_ref()
+        .and_then(|detail| detail.get("cashMicroCny"))
+        .and_then(serde_json::Value::as_i64);
+    let kind = detail
+        .as_ref()
+        .and_then(|detail| detail.get("kind"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(AdjustmentKind::parse)
+        .unwrap_or_else(|| {
+            AdjustmentKind::default_for(
+                entry.credits_charged,
+                !linked_requests(detail.as_ref()).is_empty(),
+            )
+        });
+    Some((kind, cash))
+}
+
+/// The money an upgrade or a renewal records the customer paid; `None` for another entry.
+pub fn upgrade_cash(entry: &LedgerEntry) -> Option<i64> {
+    (entry.kind == LedgerKind::Adjustment && entry.exposed_model == UPGRADE_EVENT).then(|| {
+        entry
+            .event_detail()
+            .and_then(|detail| {
+                detail
+                    .get("cashMicroCny")
+                    .and_then(serde_json::Value::as_i64)
+            })
+            .unwrap_or(0)
+    })
+}
 
 /// Most requests one adjustment makes up for.
 pub const MAX_COMPENSATED_REQUESTS: usize = 50;
@@ -54,20 +172,26 @@ pub fn linked_requests(detail: Option<&serde_json::Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The detail an adjustment making up for `ids` records, `charged` being what each was
-/// charged; `None` when it names none.
-pub(crate) fn linked_detail(ids: &[&str], charged: &[i64]) -> Option<serde_json::Value> {
-    if ids.is_empty() {
-        return None;
+/// The detail a balance adjustment records: its kind, the money that went with it, and the
+/// requests it makes up for, `charged` being what each was charged.
+pub(crate) fn adjustment_detail(
+    kind: AdjustmentKind,
+    cash_micro_cny: Option<i64>,
+    ids: &[&str],
+    charged: &[i64],
+) -> serde_json::Value {
+    let mut detail = serde_json::json!({ "kind": kind });
+    if let Some(cash) = cash_micro_cny {
+        detail["cashMicroCny"] = serde_json::json!(cash);
     }
-    let mut detail = serde_json::json!({
-        "invocationIds": ids,
-        "chargedMicroCredits": charged,
-    });
+    if !ids.is_empty() {
+        detail["invocationIds"] = serde_json::json!(ids);
+        detail["chargedMicroCredits"] = serde_json::json!(charged);
+    }
     if let [only] = ids {
         detail["invocationId"] = serde_json::json!(only);
     }
-    Some(detail)
+    detail
 }
 
 /// `amount` shared in proportion to `weights` (evenly when they add up to nothing), rounded
