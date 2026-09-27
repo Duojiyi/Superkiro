@@ -75,12 +75,44 @@ pub struct GetUsageLimitsResponse {
     pub usage_breakdown_list: Vec<UsageBreakdown>,
     pub overage_configuration: OverageConfiguration,
     pub user_info: UserInfo,
-    /// Prepaid credits never reset: these give the card's expiry, when it has one, and are
-    /// left out when it has none, which Kiro shows as no reset date.
+    /// Prepaid credits never reset: these give the card's expiry, or [`NEVER_EXPIRES`] for
+    /// a card that never expires. Kiro's account page prints "resets on MM/DD" from them
+    /// whatever they are, "NaN/NaN" when they are left out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub days_until_reset: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_date_reset: Option<u64>,
+}
+
+/// The date a card that never expires is given as its reset: 9999-12-31, which Kiro's
+/// account page shows as "12/31", no near reset.
+pub const NEVER_EXPIRES: u64 = 253_402_214_400;
+
+/// The plan name Kiro shows beside its usage in the status bar and beside the account
+/// page's "resets on" date: with how long the credits last, which that date cannot say.
+fn plan_title(plan: &str, valid_until: Option<u64>) -> String {
+    match valid_until {
+        Some(until) => format!(
+            "{plan} · 有效期至 {}",
+            &super::oauth::format_epoch_to_iso8601(until)[..10]
+        ),
+        None => format!("{plan} · 长期有效"),
+    }
+}
+
+/// Credits to the hundredth, as the rest of Kiro shows them.
+fn two_places(credits: f64) -> f64 {
+    (credits * 100.0).round() / 100.0
+}
+
+/// What Kiro shows as the signed-in account, and its initial as the avatar: the card, by
+/// the end of its ID, which the operator's console lists (not of its code, which the
+/// portal shows as "卡密 •••• …"). `<card id>@kiro-byok.local` read like an address that
+/// does not exist.
+fn account_label(card_id: &str) -> String {
+    let skip = card_id.chars().count().saturating_sub(4);
+    let tail: String = card_id.chars().skip(skip).collect();
+    format!("卡号 ····{tail}")
 }
 
 /// Handler for `POST /setUserPreference`, which Kiro sends to turn overages on or off. A
@@ -155,32 +187,38 @@ impl FacadeHandler for GetUsageLimitsHandler {
                 .store
                 .billing()
                 .and_then(|b| b.settled_usage(card_id, now_secs));
-            // A card's credits last until it expires; they never refill. "Resets in 30 days"
-            // was always wrong.
-            let next_reset = card.as_ref().and_then(|c| c.valid_until);
-            let days_until_reset = next_reset.map(|until| {
-                (until.saturating_sub(now_secs).div_ceil(86_400)).min(u32::MAX as u64) as u32
-            });
+            // A card's credits last until it expires; they never refill, and Kiro has no
+            // way to say so: its account page prints "resets on MM/DD" whatever it is sent,
+            // "NaN/NaN" without a date. It gets the card's expiry, or a date that is plainly
+            // no near refill for a card that never expires, and the plan name beside it
+            // says which ([`plan_title`]). The usage line itself carries no date: Kiro
+            // announced one that moved later as "Your usage is reset. You now have N
+            // Credits in the new month", so extending cards' validity read as a monthly
+            // refill to each of them. Without it, Kiro's low-credit warning ends with its
+            // words for no date, "resets at the end of the calendar month".
+            let valid_until = card.as_ref().and_then(|c| c.valid_until);
+            let next_reset = valid_until.unwrap_or(NEVER_EXPIRES);
+            let days_until_reset =
+                (next_reset.saturating_sub(now_secs).div_ceil(86_400)).min(u32::MAX as u64) as u32;
+            let plan = card
+                .as_ref()
+                .and_then(|c| c.plan_name())
+                .unwrap_or("Legacy service plan");
             let resp = GetUsageLimitsResponse {
                 available_credits: card
                     .as_ref()
                     .map(|c| c.available_credits() as f64 / 1_000_000.0),
-                virtual_plan_name: card
-                    .as_ref()
-                    .and_then(|c| c.plan_name())
-                    .unwrap_or("Legacy service plan")
-                    .to_string(),
-                valid_until: card.as_ref().and_then(|c| c.valid_until),
+                virtual_plan_name: plan.to_string(),
+                valid_until,
                 settled_usage_unavailable_reason: settled_usage
                     .is_none()
                     .then(|| "Settled ledger detail unavailable for this UTC window".to_string()),
                 settled_usage,
                 subscription_info: SubscriptionInfo {
-                    subscription_title: card
-                        .as_ref()
-                        .and_then(|c| c.plan_name())
-                        .unwrap_or("Legacy service plan")
-                        .to_string(),
+                    subscription_title: match card {
+                        Some(_) => plan_title(plan, valid_until),
+                        None => plan.to_string(),
+                    },
                     sub_type: card
                         .as_ref()
                         .map(|c| c.plan_type())
@@ -193,27 +231,28 @@ impl FacadeHandler for GetUsageLimitsHandler {
                     // Keep the native Kiro credit terminology independent of portal branding.
                     display_name: "Credit".to_string(),
                     display_name_plural: "Credits".to_string(),
-                    current_usage,
-                    current_usage_with_precision: current_usage,
-                    usage_limit,
-                    usage_limit_with_precision: usage_limit,
+                    // Kiro prints these as they come: "12.345678/100" in its status bar.
+                    current_usage: two_places(current_usage),
+                    current_usage_with_precision: two_places(current_usage),
+                    usage_limit: two_places(usage_limit),
+                    usage_limit_with_precision: two_places(usage_limit),
                     currency: Currency {
                         code: "USD".to_string(),
                         symbol: "$".to_string(),
                     },
                     unit: "INVOCATIONS".to_string(),
                     dimension_type: "CREDIT".to_string(),
-                    next_date_reset: next_reset,
+                    next_date_reset: None,
                 }],
                 overage_configuration: OverageConfiguration {
                     overage_status: "DISABLED".to_string(),
                     overage_enabled: false,
                 },
                 user_info: UserInfo {
-                    email: format!("{}@kiro-byok.local", card_id),
+                    email: account_label(card_id),
                 },
-                days_until_reset,
-                next_date_reset: next_reset,
+                days_until_reset: Some(days_until_reset),
+                next_date_reset: Some(next_reset),
             };
             let mut response = json_response(StatusCode::OK, &resp);
             response.headers_mut().insert(

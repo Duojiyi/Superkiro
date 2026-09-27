@@ -443,10 +443,14 @@ async fn test_audit_b_get_usage_limits_reflects_live_card_credits_and_plan() {
         serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
 
     // Spec §14.10.4:
-    // A legacy/custom card does not inherit a misleading group subscription name.
-    assert_eq!(
-        body.subscription_info.subscription_title,
-        "Legacy service plan"
+    // A legacy/custom card does not inherit a misleading group subscription name; the
+    // title adds how long its credits last.
+    assert!(
+        body.subscription_info
+            .subscription_title
+            .starts_with("Legacy service plan · 有效期至 "),
+        "{}",
+        body.subscription_info.subscription_title
     );
 
     // Limits reflect live card balances in credits

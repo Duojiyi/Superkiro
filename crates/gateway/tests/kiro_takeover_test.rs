@@ -914,8 +914,12 @@ async fn kiros_activity_log_is_accepted_and_never_kept() {
     assert_eq!(post(secured, None).await.status(), StatusCode::UNAUTHORIZED);
 }
 
-/// Prepaid credits never reset: the usage panel said "resets in 30 days" for every card.
-/// It now gives the card's expiry, or nothing for a card that never expires.
+/// Prepaid credits never reset, and Kiro has no way to say so: its account page prints
+/// "resets on MM/DD" from the date it is sent, "NaN/NaN" without one. It gets the card's
+/// expiry, or 9999-12-31 for a card that never expires, with the plan name saying which;
+/// the usage line carries no date, which Kiro announced as "Your usage is reset" each time
+/// a card's validity was extended. The usage is to the hundredth, and the account is the
+/// card, not an address.
 #[tokio::test]
 async fn usage_reports_the_cards_expiry_not_a_monthly_reset() {
     let billing = BillingEngine::new();
@@ -923,6 +927,7 @@ async fn usage_reports_the_cards_expiry_not_a_monthly_reset() {
     let now = gateway::now_secs();
     let mut expiring = Card::new("card-expiring", GROUP, billing::MICRO_CREDITS_PER_CREDIT);
     expiring.activate(now, 10 * 86_400).unwrap();
+    expiring.credit_used = 123_456;
     let until = expiring.valid_until.unwrap();
     billing.upsert_card(expiring);
     let mut lasting = Card::new("card-lasting", GROUP, billing::MICRO_CREDITS_PER_CREDIT);
@@ -959,13 +964,89 @@ async fn usage_reports_the_cards_expiry_not_a_monthly_reset() {
     let expiring = usage("card-expiring").await;
     assert_eq!(expiring["nextDateReset"], until);
     assert_eq!(expiring["daysUntilReset"], 10);
-    assert_eq!(expiring["usageBreakdownList"][0]["nextDateReset"], until);
+    assert!(expiring["usageBreakdownList"][0]
+        .get("nextDateReset")
+        .is_none());
+    assert_eq!(
+        expiring["subscriptionInfo"]["subscriptionTitle"],
+        format!(
+            "Legacy service plan · 有效期至 {}",
+            &gateway::facade::oauth::format_epoch_to_iso8601(until)[..10]
+        )
+    );
+    let breakdown = &expiring["usageBreakdownList"][0];
+    assert_eq!(breakdown["currentUsage"], json!(0.12));
+    assert_eq!(breakdown["currentUsageWithPrecision"], json!(0.12));
+    assert_eq!(breakdown["usageLimitWithPrecision"], json!(1.0));
+    assert_eq!(expiring["userInfo"]["email"], "卡号 ····ring");
+
     let lasting = usage("card-lasting").await;
-    assert!(lasting.get("nextDateReset").is_none(), "{lasting}");
-    assert!(lasting.get("daysUntilReset").is_none());
+    // 9999-12-31, which Kiro shows as "12/31".
+    assert_eq!(lasting["nextDateReset"], 253_402_214_400u64, "{lasting}");
+    assert!(lasting["daysUntilReset"].as_u64().unwrap() > 2_900_000);
     assert!(lasting["usageBreakdownList"][0]
         .get("nextDateReset")
         .is_none());
+    assert_eq!(
+        lasting["subscriptionInfo"]["subscriptionTitle"],
+        "Legacy service plan · 长期有效"
+    );
+}
+
+/// Kiro's "Manage Plan" opens the address CreateSubscriptionToken gives: the gateway's
+/// customer portal, at the host and scheme the client reached it by.
+#[tokio::test]
+async fn manage_plan_opens_the_customer_portal() {
+    let mut registry = FacadeRegistry::new();
+    registry.register(gateway::facade::subscriptions::CreateSubscriptionTokenHandler);
+    let app = registry.into_router();
+    let token = |headers: &'static [(&'static str, &'static str)]| {
+        let app = app.clone();
+        async move {
+            let mut request = Request::builder()
+                .method(Method::POST)
+                .uri("/CreateSubscriptionToken")
+                .header(header::CONTENT_TYPE, "application/json");
+            for (name, value) in headers {
+                request = request.header(*name, *value);
+            }
+            let response = app
+                .oneshot(
+                    request
+                        .body(Body::from(r#"{"provider":"STRIPE"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<Value>(&bytes).unwrap()
+        }
+    };
+
+    let behind_proxy = token(&[
+        ("host", "gateway:19820"),
+        ("x-forwarded-host", "kiro.example"),
+        ("x-forwarded-proto", "https"),
+    ])
+    .await;
+    assert_eq!(
+        behind_proxy["encodedVerificationUrl"],
+        "https://kiro.example/portal"
+    );
+    assert_eq!(behind_proxy["status"], "ACTIVE");
+    assert_eq!(behind_proxy["token"], behind_proxy["subscriptionToken"]);
+    assert!(!behind_proxy["token"].as_str().unwrap().is_empty());
+
+    let direct = token(&[("host", "127.0.0.1:19820")]).await;
+    assert_eq!(
+        direct["encodedVerificationUrl"],
+        "http://127.0.0.1:19820/portal"
+    );
+    let forged = token(&[("x-forwarded-host", "evil.example/phish?x=")]).await;
+    assert!(forged.get("encodedVerificationUrl").is_none(), "{forged}");
 }
 
 /// Kiro sends every image in a conversation again with each turn, so a long session with

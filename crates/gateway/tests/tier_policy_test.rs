@@ -65,7 +65,11 @@ async fn issued_tiers_reach_portal_usage_and_subscriptions() {
                     assert_eq!(value["maxDevices"], 1);
                 }
                 "/getUsageLimits" => {
-                    assert_eq!(value["subscriptionInfo"]["subscriptionTitle"], name);
+                    // The plan, and how long its credits last.
+                    assert!(value["subscriptionInfo"]["subscriptionTitle"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with(&format!("{name} · ")));
                     assert_eq!(value["subscriptionInfo"]["type"], kind);
                 }
                 _ => {
@@ -162,7 +166,10 @@ async fn a_card_reports_the_plan_it_was_issued_from() {
             "/api/v1/portal/query" => assert_eq!(value["virtualPlanName"], "体验卡"),
             "/getUsageLimits" => {
                 assert_eq!(value["virtualPlanName"], "体验卡");
-                assert_eq!(value["subscriptionInfo"]["subscriptionTitle"], "体验卡");
+                assert!(value["subscriptionInfo"]["subscriptionTitle"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("体验卡 · "));
                 assert_eq!(value["subscriptionInfo"]["type"], "PRO");
                 assert_eq!(value["usageBreakdownList"][0]["usageLimit"], 300.0);
             }
