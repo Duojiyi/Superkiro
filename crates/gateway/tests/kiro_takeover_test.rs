@@ -1335,17 +1335,31 @@ async fn a_relays_repeated_error_moves_to_another_key_and_cools_none() {
     nothing_charged(&billing);
 }
 
-/// An error in the stream that blames the request itself reaches Kiro as the same refusal
+/// An error in the stream that a retry would meet again reaches Kiro as the same refusal
 /// from an upstream's HTTP status would: a ValidationException in the gateway's words,
 /// sent once, uncharged and traced. Too large a request is the overflow Kiro compacts for.
-/// As a 502 it read "temporary error" and Kiro retried it unchanged.
+/// As a 502 it read "temporary error" and Kiro retried it unchanged. A key not allowed the
+/// model is the key's problem: it cools down, and the customer is told the operator has to
+/// fix it, as for a model the upstream does not know.
 #[tokio::test]
 async fn an_error_blaming_the_request_is_refused_as_a_validation_error() {
-    for (kind, class) in [
-        ("invalid_request_error", "upstream_refused"),
-        ("permission_error", "upstream_refused"),
-        ("not_found_error", "upstream_refused"),
-        ("request_too_large", "input_too_long"),
+    for (kind, class, told) in [
+        (
+            "invalid_request_error",
+            "upstream_refused",
+            "上游模型服务拒绝了本次请求（HTTP 400",
+        ),
+        (
+            "permission_error",
+            "upstream_refused",
+            "上游模型服务的账户余额或权限出了问题（HTTP 403），不是本次请求的问题",
+        ),
+        (
+            "not_found_error",
+            "upstream_refused",
+            "上游模型服务找不到这个模型（HTTP 404），是模型配置的问题，不是本次请求的问题",
+        ),
+        ("request_too_large", "input_too_long", ""),
     ] {
         let server = upstream(
             ResponseTemplate::new(200).set_body_raw(error_frame(kind), "text/event-stream"),
@@ -1375,10 +1389,7 @@ async fn an_error_blaming_the_request_is_refused_as_a_validation_error() {
             assert_overflow(&reply);
         } else {
             assert!(
-                refusal["message"]
-                    .as_str()
-                    .unwrap()
-                    .starts_with("上游模型服务拒绝了本次请求"),
+                refusal["message"].as_str().unwrap().starts_with(told),
                 "{kind}: {refusal}"
             );
         }
@@ -1387,7 +1398,13 @@ async fn an_error_blaming_the_request_is_refused_as_a_validation_error() {
         assert_eq!(server.received_requests().await.unwrap().len(), 1, "{kind}");
         nothing_charged(&billing);
         assert_eq!(trace_class(&billing, "inv-request-fault"), vec![class]);
-        keys_untouched(&runtime);
+        if kind == "permission_error" {
+            let health = runtime.key_health(gateway::now_secs());
+            assert_eq!(health["key"].health_state, "cooldown");
+            assert_eq!(health["key"].last_error.as_deref(), Some("http_403"));
+        } else {
+            keys_untouched(&runtime);
+        }
     }
 }
 

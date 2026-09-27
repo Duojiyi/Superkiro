@@ -1662,9 +1662,11 @@ fn no_route_for_group() -> Response {
     )
 }
 
-/// An upstream's refusal of the request itself, which a retry would meet again, in words
-/// Kiro shows as they are; never the upstream's own text. Its rate limits, an invalid key
-/// and a request timeout are the gateway's to handle.
+/// An upstream's refusal that a retry would meet again, in words Kiro shows as they are;
+/// never the upstream's own text. Its rate limits, an invalid key and a request timeout are
+/// the gateway's to handle. A key out of balance or not allowed the model (402, 403) and a
+/// model the upstream does not know (404) are the operator's to fix, and are told so: the
+/// request is not at fault.
 fn upstream_refusal(error: &ProviderError) -> Option<KiroError> {
     let ProviderError::Http(status, _) = error else {
         return None;
@@ -1673,18 +1675,25 @@ fn upstream_refusal(error: &ProviderError) -> Option<KiroError> {
     if !(400..500).contains(&status) || matches!(status, 401 | 408 | 429) {
         return None;
     }
-    let why = match status {
-        400 | 422 => "请求内容或参数不被该上游接受",
-        403 => "该上游拒绝处理本次请求",
-        404 => "该上游找不到这个模型",
-        _ => "该上游拒绝了本次请求",
+    let message = match status {
+        402 | 403 => format!(
+            "上游模型服务的账户余额或权限出了问题（HTTP {status}），不是本次请求的问题，需要管理员处理。可以稍后重试，或先换一个模型。"
+        ),
+        404 => "上游模型服务找不到这个模型（HTTP 404），是模型配置的问题，不是本次请求的问题，需要管理员处理。可以先换一个模型。".to_string(),
+        _ => {
+            let why = match status {
+                400 | 422 => "请求内容或参数不被该上游接受",
+                _ => "该上游拒绝了本次请求",
+            };
+            format!(
+                "上游模型服务拒绝了本次请求（HTTP {status}：{why}），重试不会改变结果。可以调整请求、换一个模型，或联系管理员。"
+            )
+        }
     };
     Some(KiroError::new(
         StatusCode::BAD_REQUEST,
         "ValidationException",
-        format!(
-            "上游模型服务拒绝了本次请求（HTTP {status}：{why}），重试不会改变结果。可以调整请求、换一个模型，或联系管理员。"
-        ),
+        message,
     ))
 }
 

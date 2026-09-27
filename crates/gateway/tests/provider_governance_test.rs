@@ -696,3 +696,279 @@ fn repeated_transient_failures_back_off_but_never_retire_a_key() {
     pool.mark_key_failure(&key.id, now, cooldown);
     assert_eq!(pool.list_keys()[0].cooldown_until.unwrap() - now, 60);
 }
+
+/// An upstream answering `status` for `secret`'s key and a streamed answer for any other.
+async fn failing_for(status: u16, secret: &str) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", format!("Bearer {secret}").as_str()))
+        .respond_with(ResponseTemplate::new(status).set_body_string("quota exhausted"))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(
+                    "data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\ndata: [DONE]\n\n",
+                ),
+        )
+        .mount(&server)
+        .await;
+    server
+}
+
+fn http_status(error: &GovernanceError) -> Option<u16> {
+    match error {
+        GovernanceError::NonRetryable(gateway::provider::ProviderError::Http(status, _)) => {
+            Some(status.as_u16())
+        }
+        _ => None,
+    }
+}
+
+// Relays answer 402 or 403 for a key out of balance or not allowed the model. That is the
+// key's problem: it cools down and the target's next key serves the model asked for.
+#[tokio::test]
+async fn a_key_out_of_balance_cools_down_and_gives_way_to_the_next_key() {
+    for status in [402, 403] {
+        for chained in [false, true] {
+            let primary = failing_for(status, "sk-broke").await;
+            let fallback = upstream(200).await;
+            let primary_pool = pool(
+                "primary",
+                &primary.uri(),
+                vec![
+                    ProviderKey::new("broke", "primary", "sk-broke").with_weight(10),
+                    ProviderKey::new("spare", "primary", "sk-spare").with_weight(1),
+                ],
+            );
+            let key = if chained {
+                let candidates = vec![
+                    (primary_pool.clone(), "primary-model".to_string()),
+                    (
+                        pool(
+                            "fallback",
+                            &fallback.uri(),
+                            vec![ProviderKey::new("fallback-key", "fallback", "sk-f")],
+                        ),
+                        "fallback-model".to_string(),
+                    ),
+                ];
+                let result = execute_stream_with_model_fallback(
+                    &candidates,
+                    &reqwest::Client::new(),
+                    &chat_request(),
+                    Duration::from_secs(60),
+                    3,
+                    gateway::now_secs(),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{status}: {error}"));
+                assert_eq!(result.target_model, "primary-model", "{status}");
+                result.key
+            } else {
+                execute_stream_with_failover(
+                    &primary_pool,
+                    &reqwest::Client::new(),
+                    "primary-model",
+                    &chat_request(),
+                    Duration::from_secs(60),
+                    3,
+                    gateway::now_secs(),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{status}: {error}"))
+                .0
+            };
+            assert_eq!(key.id, "spare", "{status}");
+            assert!(fallback.received_requests().await.unwrap().is_empty());
+            let broke = primary_pool
+                .list_keys()
+                .into_iter()
+                .find(|key| key.id == "broke")
+                .unwrap();
+            assert!(broke.cooldown_until.is_some(), "{status}: {broke:?}");
+            assert!(broke.enabled, "{status}: a cooled key is not retired");
+        }
+    }
+}
+
+// With every key out of balance there is nothing a retry could reach: the request ends on
+// the upstream's 402/403, which the gateway words as the operator's problem, rather than a
+// temporary error Kiro retries into cooled keys.
+#[tokio::test]
+async fn every_key_out_of_balance_ends_on_the_refusal() {
+    for status in [402, 403] {
+        let server = upstream(status).await;
+        let only = pool(
+            "only",
+            &server.uri(),
+            vec![
+                ProviderKey::new("a", "only", "sk-a"),
+                ProviderKey::new("b", "only", "sk-b"),
+            ],
+        );
+        let error = execute_stream_with_failover(
+            &only,
+            &reqwest::Client::new(),
+            "primary-model",
+            &chat_request(),
+            Duration::from_secs(60),
+            3,
+            gateway::now_secs(),
+        )
+        .await
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(http_status(&error), Some(status), "{error:?}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        assert!(only
+            .list_keys()
+            .iter()
+            .all(|key| key.cooldown_until.is_some()));
+    }
+
+    // A key that may recover in a moment keeps it a temporary failure.
+    let broke = upstream(403).await;
+    let busy = upstream(503).await;
+    let candidates = vec![
+        (
+            pool(
+                "broke",
+                &broke.uri(),
+                vec![ProviderKey::new("x", "broke", "sk-x")],
+            ),
+            "model-a".to_string(),
+        ),
+        (
+            pool(
+                "busy",
+                &busy.uri(),
+                vec![ProviderKey::new("y", "busy", "sk-y")],
+            ),
+            "model-b".to_string(),
+        ),
+    ];
+    let error = execute_stream_with_model_fallback(
+        &candidates,
+        &reqwest::Client::new(),
+        &chat_request(),
+        Duration::from_secs(60),
+        3,
+        gateway::now_secs(),
+    )
+    .await
+    .map(|_| ())
+    .unwrap_err();
+    assert!(
+        matches!(error, GovernanceError::AllCandidatesFailed { .. }),
+        "{error:?}"
+    );
+}
+
+// A target that does not know the model (404), or refuses the request as it stands (400),
+// is passed over for the chain's next target, without cooling its key or trying its other
+// keys. The refusal ends the request only once every target has refused.
+#[tokio::test]
+async fn a_chain_passes_over_a_target_that_refuses_and_refuses_after_every_target() {
+    for status in [404, 400] {
+        let refusing = upstream(status).await;
+        let healthy = upstream(200).await;
+        let refusing_pool = pool(
+            "refusing",
+            &refusing.uri(),
+            vec![
+                ProviderKey::new("r1", "refusing", "sk-r1"),
+                ProviderKey::new("r2", "refusing", "sk-r2"),
+            ],
+        );
+        let healthy_pool = pool(
+            "healthy",
+            &healthy.uri(),
+            vec![ProviderKey::new("h", "healthy", "sk-h")],
+        );
+        let result = execute_stream_with_model_fallback(
+            &[
+                (refusing_pool.clone(), "model-a".to_string()),
+                (healthy_pool, "model-b".to_string()),
+            ],
+            &reqwest::Client::new(),
+            &chat_request(),
+            Duration::from_secs(60),
+            3,
+            gateway::now_secs(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{status}: {error}"));
+        assert_eq!(result.target_model, "model-b", "{status}");
+        assert!(result.was_fallback);
+        assert_eq!(refusing.received_requests().await.unwrap().len(), 1);
+        assert!(refusing_pool
+            .list_keys()
+            .iter()
+            .all(|key| key.cooldown_until.is_none()));
+
+        let also_refusing = upstream(status).await;
+        let error = execute_stream_with_model_fallback(
+            &[
+                (refusing_pool.clone(), "model-a".to_string()),
+                (
+                    pool(
+                        "also",
+                        &also_refusing.uri(),
+                        vec![ProviderKey::new("a", "also", "sk-a")],
+                    ),
+                    "model-b".to_string(),
+                ),
+            ],
+            &reqwest::Client::new(),
+            &chat_request(),
+            Duration::from_secs(60),
+            3,
+            gateway::now_secs(),
+        )
+        .await
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(http_status(&error), Some(status), "{error:?}");
+        // One request to each target: their other keys would refuse too.
+        assert_eq!(refusing.received_requests().await.unwrap().len(), 2);
+        assert_eq!(also_refusing.received_requests().await.unwrap().len(), 1);
+    }
+
+    // The request refused as it stands says more than a model unknown elsewhere.
+    let unknown = upstream(404).await;
+    let refusing = upstream(400).await;
+    let error = execute_stream_with_model_fallback(
+        &[
+            (
+                pool(
+                    "refusing",
+                    &refusing.uri(),
+                    vec![ProviderKey::new("r", "refusing", "sk-r")],
+                ),
+                "model-a".to_string(),
+            ),
+            (
+                pool(
+                    "unknown",
+                    &unknown.uri(),
+                    vec![ProviderKey::new("u", "unknown", "sk-u")],
+                ),
+                "model-b".to_string(),
+            ),
+        ],
+        &reqwest::Client::new(),
+        &chat_request(),
+        Duration::from_secs(60),
+        3,
+        gateway::now_secs(),
+    )
+    .await
+    .map(|_| ())
+    .unwrap_err();
+    assert_eq!(http_status(&error), Some(400), "{error:?}");
+}
