@@ -40,7 +40,8 @@ pub struct UsageBreakdown {
     pub currency: Currency,
     pub unit: String,
     pub dimension_type: String,
-    pub next_date_reset: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_date_reset: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,8 +75,12 @@ pub struct GetUsageLimitsResponse {
     pub usage_breakdown_list: Vec<UsageBreakdown>,
     pub overage_configuration: OverageConfiguration,
     pub user_info: UserInfo,
-    pub days_until_reset: u32,
-    pub next_date_reset: u64,
+    /// Prepaid credits never reset: these give the card's expiry, when it has one, and are
+    /// left out when it has none, which Kiro shows as no reset date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub days_until_reset: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_date_reset: Option<u64>,
 }
 
 /// Handler for `GET /getUsageLimits`
@@ -102,10 +107,6 @@ impl FacadeHandler for GetUsageLimitsHandler {
     fn handle<'a>(&'a self, req: Request<Body>) -> BoxFuture<'a, Response> {
         Box::pin(async move {
             let now_secs = crate::now_secs();
-            let next_reset = now_secs
-                .saturating_div(86_400)
-                .saturating_add(30)
-                .saturating_mul(86_400);
             let claims = req.extensions().get::<AuthClaims>();
             let group = self.store.get_group(claims.map(|c| c.group_id.as_str()));
             let card_id = claims.map(|c| c.card_id.as_str()).unwrap_or("dev-user");
@@ -128,6 +129,12 @@ impl FacadeHandler for GetUsageLimitsHandler {
                 .store
                 .billing()
                 .and_then(|b| b.settled_usage(card_id, now_secs));
+            // A card's credits last until it expires; they never refill. "Resets in 30 days"
+            // was always wrong.
+            let next_reset = card.as_ref().and_then(|c| c.valid_until);
+            let days_until_reset = next_reset.map(|until| {
+                (until.saturating_sub(now_secs).div_ceil(86_400)).min(u32::MAX as u64) as u32
+            });
             let resp = GetUsageLimitsResponse {
                 available_credits: card
                     .as_ref()
@@ -179,7 +186,7 @@ impl FacadeHandler for GetUsageLimitsHandler {
                 user_info: UserInfo {
                     email: format!("{}@kiro-byok.local", card_id),
                 },
-                days_until_reset: 30,
+                days_until_reset,
                 next_date_reset: next_reset,
             };
             let mut response = json_response(StatusCode::OK, &resp);

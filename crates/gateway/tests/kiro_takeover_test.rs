@@ -859,3 +859,57 @@ async fn kiros_activity_log_is_accepted_and_never_kept() {
     ));
     assert_eq!(post(secured, None).await.status(), StatusCode::UNAUTHORIZED);
 }
+
+/// Prepaid credits never reset: the usage panel said "resets in 30 days" for every card.
+/// It now gives the card's expiry, or nothing for a card that never expires.
+#[tokio::test]
+async fn usage_reports_the_cards_expiry_not_a_monthly_reset() {
+    let billing = BillingEngine::new();
+    billing.upsert_group(Group::pro_plus(GROUP, "Takeover"));
+    let now = gateway::now_secs();
+    let mut expiring = Card::new("card-expiring", GROUP, billing::MICRO_CREDITS_PER_CREDIT);
+    expiring.activate(now, 10 * 86_400).unwrap();
+    let until = expiring.valid_until.unwrap();
+    billing.upsert_card(expiring);
+    let mut lasting = Card::new("card-lasting", GROUP, billing::MICRO_CREDITS_PER_CREDIT);
+    lasting.activate(now, 86_400).unwrap();
+    lasting.valid_until = None;
+    billing.upsert_card(lasting);
+
+    let mut registry = FacadeRegistry::new();
+    registry.register(gateway::facade::usage::GetUsageLimitsHandler::new(
+        gateway::facade::virtualization::VirtualizationStore::with_billing(billing.clone(), GROUP),
+    ));
+    let app = registry.into_router();
+    let usage = |card: &'static str| {
+        let app = app.clone();
+        async move {
+            let mut request = Request::builder()
+                .uri("/getUsageLimits")
+                .body(Body::empty())
+                .unwrap();
+            request.extensions_mut().insert(AuthClaims {
+                card_id: card.into(),
+                group_id: GROUP.into(),
+                token_version: 0,
+                exp: u64::MAX,
+                iat: 0,
+            });
+            let response = app.oneshot(request).await.unwrap();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<Value>(&bytes).unwrap()
+        }
+    };
+    let expiring = usage("card-expiring").await;
+    assert_eq!(expiring["nextDateReset"], until);
+    assert_eq!(expiring["daysUntilReset"], 10);
+    assert_eq!(expiring["usageBreakdownList"][0]["nextDateReset"], until);
+    let lasting = usage("card-lasting").await;
+    assert!(lasting.get("nextDateReset").is_none(), "{lasting}");
+    assert!(lasting.get("daysUntilReset").is_none());
+    assert!(lasting["usageBreakdownList"][0]
+        .get("nextDateReset")
+        .is_none());
+}
