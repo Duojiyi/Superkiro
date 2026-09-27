@@ -13,11 +13,20 @@ function discardDrafts() {
   } catch {/* nothing kept */}
 }
 
+/** Drops the page address (its filters and open details): the next session starts at 运营概览. */
+function forgetRoute() {
+  if (window.location.hash) window.history.replaceState(null, '', window.location.pathname + window.location.search);
+}
+
 export default function App() {
   const [recheckError, setRecheckError] = useState('');
   const [rechecking, setRechecking] = useState(false);
   const recheckPending = useRef(false);
   const [authState, setAuthState] = useState<AuthState>('checking');
+  // Whether this tab has shown the workspace: an address opened before signing in (a bookmark)
+  // is kept for after the login; one left by an ended session is not.
+  const shown = useRef(false);
+  if (authState === 'authenticated') shown.current = true;
   const [workspaceVersion, setWorkspaceVersion] = useState(0);
   const [username, setUsername] = useState('admin');
   const [password, setPassword] = useState('');
@@ -38,6 +47,7 @@ export default function App() {
     const version = ++attempt.current;
     adminApi.onUnauthorized = reason => {
       ++attempt.current;
+      if (shown.current) forgetRoute();
       setPassword(''); setTotpCode(''); setAuthState('unauthenticated'); setExpiring(false); setRecheckError('');
       setError(reason === 'expired' ? '会话已到期，请重新登录（草稿已保留）' : '');
     };
@@ -46,7 +56,7 @@ export default function App() {
       // The session was replaced underneath this tab, without a login here: nothing the
       // previous session was composing carries over. Only a session that expired and was
       // re-established by logging in again in this tab keeps its drafts.
-      discardDrafts();
+      discardDrafts(); forgetRoute();
       if (current) setWorkspaceVersion(value => value + 1);
     };
     adminApi.checkAuth().then(() => {
@@ -104,7 +114,7 @@ export default function App() {
     pending.current = true; setBusy(true); setPassword(''); setTotpCode(''); setError('');
     // An explicit logout ends the work, so unpublished drafts go with it; only a session
     // that expired keeps them for the next login in this tab.
-    discardDrafts();
+    discardDrafts(); forgetRoute();
     // logout clears the API session synchronously, before awaiting the server.
     const revocation = adminApi.logout(all);
     setAuthState('unauthenticated');
@@ -127,7 +137,8 @@ export default function App() {
 
   if (authState === 'checking') return <main className="auth-page"><p role="status" className="auth-checking">正在检查会话…</p></main>;
   if (authState === 'authenticated') return <>
-    <div className="workspace-shell" ref={node => {if (node) node.inert = !!recheckError;}} aria-hidden={recheckError ? true : undefined}>
+    {/* aria-busy while the session is re-checked: the workspace is replaced if it changed. */}
+    <div className="workspace-shell" ref={node => {if (node) node.inert = !!recheckError;}} aria-hidden={recheckError ? true : undefined} aria-busy={rechecking || undefined}>
       <AdminWorkspace key={workspaceVersion} onLogout={logout} operator={adminApi.authenticatedUsername} expiring={expiring} onReauthenticate={reauthenticate}/>
     </div>
     {recheckError && <div className="session-overlay" role="alertdialog" aria-label="无法确认登录状态">

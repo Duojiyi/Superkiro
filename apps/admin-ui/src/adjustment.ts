@@ -1,9 +1,15 @@
-export interface Adjustment {operator:string;cardId:string;delta:number;reason:string;key:string}
+/**
+ * `invocationId`: the request the adjustment makes up for (a trace's invocation_id), resent as it was on a retry;
+ * `allowRepeat`: 仍要补偿, compensating it again or by more than it charged (the reason says why).
+ */
+export interface Adjustment {operator:string;cardId:string;delta:number;reason:string;key:string;invocationId?:string;allowRepeat?:true}
 const storageKey=(operator:string)=>`superkiro.pending-adjustment.v1:${encodeURIComponent(operator)}`;
 function validate(value:unknown,operator:string):Adjustment {
   const v=value as Partial<Adjustment>|null;
-  if(!operator||operator.length>128||!v||v.operator!==operator||typeof v.cardId!=='string'||!v.cardId||v.cardId.length>256||typeof v.delta!=='number'||!Number.isFinite(v.delta)||v.delta===0||typeof v.reason!=='string'||!v.reason.trim()||v.reason.length>500||typeof v.key!=='string'||! /^[a-zA-Z0-9_.:-]{1,128}$/.test(v.key))throw new Error('保存的调账意图无效，请人工核对账本；未发送新请求');
-  return {operator,cardId:v.cardId,delta:v.delta,reason:v.reason,key:v.key};
+  if(!operator||operator.length>128||!v||v.operator!==operator||typeof v.cardId!=='string'||!v.cardId||v.cardId.length>256||typeof v.delta!=='number'||!Number.isFinite(v.delta)||v.delta===0||typeof v.reason!=='string'||!v.reason.trim()||v.reason.length>500||typeof v.key!=='string'||! /^[a-zA-Z0-9_.:-]{1,128}$/.test(v.key)
+    ||(v.invocationId!==undefined&&(typeof v.invocationId!=='string'||!/^[A-Za-z0-9_.:-]{1,257}$/.test(v.invocationId)))
+    ||(v.allowRepeat!==undefined&&(v.allowRepeat!==true||v.invocationId===undefined)))throw new Error('保存的调账意图无效，请人工核对账本；未发送新请求');
+  return {operator,cardId:v.cardId,delta:v.delta,reason:v.reason,key:v.key,...(v.invocationId!==undefined?{invocationId:v.invocationId}:{}),...(v.allowRepeat?{allowRepeat:true as const}:{})};
 }
 export function loadAdjustment(storage:Storage,operator:string):Adjustment|null {
   const raw=storage.getItem(storageKey(operator));
@@ -30,6 +36,10 @@ export function isUnsubmittedAdjustmentRejection(status:number,message:string,in
   if(status===400&&message==='Invalid balance adjustment: Adjustment delta cannot be zero'&&isZeroMicroAdjustment(intent))return true;
   // Existing idempotency receipts are replayed before the voided-card check.
   if(status===400&&message==='Invalid billing state: cannot adjust a voided card')return true;
+  // A compensation the server would not make (unknown request, another card's, already compensated,
+  // more than it charged) is refused before anything is written; a replay of one made answers as made.
+  if(intent.invocationId&&((status===404&&/^Request \S+ was not found$/.test(message))||(status===409&&/^Request \S+ was (made by card|charged) /.test(message))))return true;
+  if(status===400&&(message==='allowRepeat needs a reason'||message.startsWith('invocationId must be')))return true;
   // Only this exact insufficient-balance response is known to precede any commit.
   // A generic 409 also includes idempotency conflicts and must retain the intent.
   const insufficient=/^Card error: Insufficient credit: available (\d+) micro-credits, needed (\d+)$/.exec(message);

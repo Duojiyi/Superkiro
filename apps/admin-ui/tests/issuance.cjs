@@ -1,5 +1,6 @@
 // Final-build auth gate regression: localhost fixture only, no deployed services.
 const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
+const recordToasts=require('./toasts.cjs');
 const http=require('node:http'),fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
 const fixture=require('./fixture-api.cjs')();
 async function waitForRoute(ready){
@@ -22,6 +23,7 @@ const server=http.createServer(async(req,res)=>{
   const browser=await chromium.launch({headless:true,...(process.env.CHROME_PATH?{executablePath:process.env.CHROME_PATH}:{})});
   try {
     const page=await browser.newPage();
+    const toasts=await recordToasts(page);
     const origin=`http://127.0.0.1:${server.address().port}`, errors=[], posts=[];
     page.on('pageerror',error=>errors.push(error.message));
     const nativeDialogs=[];page.on('dialog',d=>{nativeDialogs.push(d.message());void d.dismiss();});
@@ -87,11 +89,11 @@ const server=http.createServer(async(req,res)=>{
       await route.fulfill({json:{success:true,config:{revision:'saved',groups,models:[],rate_cards:[{id:'fixture-rate',name:'测试价格表'}],versions:[],audit:[]}}});
     });
     await page.getByLabel('变更原因',{exact:true}).fill('测试禁止新发卡');
-    await button('发布').click();
+    toasts.mark();await button('发布').click();
     const publishBox=page.getByRole('alertdialog');await publishBox.waitFor();
     assert((await publishBox.innerText()).includes('测试禁止新发卡'),'the confirmation repeats the reason');
     await publishBox.locator('[data-confirm="accept"]').click();
-    await page.locator('.toast').filter({hasText:'已发布'}).waitFor();
+    await toasts.shown('已发布');
     assert.equal(saved.groups[0].issuance_enabled,false);assert.equal(saved.groups[1].issuance_enabled,false);
     assert.equal(saved.groups[0].rate_card_id,legacy.rate_card_id);
     // 新建分组: a small form that adds a row to the draft, published with the normal bar.
@@ -99,18 +101,20 @@ const server=http.createServer(async(req,res)=>{
     const form=page.getByRole('dialog',{name:'新建分组'});await form.waitFor();
     await form.getByLabel('分组 ID',{exact:true}).fill(legacy.id);await form.getByRole('button',{name:'加入草稿'}).click();await form.getByRole('alert').filter({hasText:'这个 ID 已存在'}).waitFor();
     await form.getByLabel('分组 ID',{exact:true}).fill('new-group');await form.getByRole('button',{name:'加入草稿'}).click();await form.getByRole('alert').filter({hasText:'请填写名称'}).waitFor();
-    await form.getByLabel('分组名称',{exact:true}).fill('新分组');await form.getByLabel('新分组扣费倍率',{exact:true}).fill('0');await form.getByRole('button',{name:'加入草稿'}).click();
-    await form.getByRole('alert').filter({hasText:'扣费倍率需大于 0'}).waitFor();
-    await form.getByLabel('新分组扣费倍率',{exact:true}).fill('1.2');await form.getByLabel('可发新卡',{exact:true}).uncheck();
+    await form.getByLabel('分组名称',{exact:true}).fill('新分组');await form.getByLabel('新分组的分组倍率',{exact:true}).fill('0');await form.getByRole('button',{name:'加入草稿'}).click();
+    await form.getByRole('alert').filter({hasText:'分组倍率需大于 0'}).waitFor();
+    await form.getByLabel('新分组的分组倍率',{exact:true}).fill('1.2');await form.getByLabel('可发新卡',{exact:true}).uncheck();
     await form.getByRole('button',{name:'加入草稿'}).click();await form.waitFor({state:'detached'});
     await page.getByRole('row').filter({hasText:'新分组'}).getByText('新建',{exact:true}).waitFor();
     assert.equal(saved.groups.length,2,'nothing is sent before 发布');
-    await page.getByLabel('变更原因',{exact:true}).fill('新建测试分组');await button('发布').click();
+    await page.getByLabel('变更原因',{exact:true}).fill('新建测试分组');toasts.mark();await button('发布').click();
     await page.getByRole('alertdialog').locator('[data-confirm="accept"]').click();
-    await page.locator('.toast').filter({hasText:'已发布'}).waitFor();
+    await toasts.shown('已发布');
     const created=saved.groups.find(group=>group.id==='new-group');
     assert.deepEqual(created,{id:'new-group',name:'新分组',issuance_enabled:false,provider_binding_mode:'shared',rate_card_id:'fixture-rate',margin_multiplier:1.2,virtual_plan_name:'新分组',virtual_usage_limit:0,system_prompt_prefix:null});
     assert.deepEqual(errors,[]);assert.deepEqual(nativeDialogs,[],'no browser-native dialogs');
+    // The refresh after the last publication may still be passing through a route: let it go quietly.
+    await page.unrouteAll({behavior:'ignoreErrors'});
     console.log('PASS issuance: flag filtering, legacy/single auto-selection, explicit multiple selection, independent tiers, zero groups, summary, editor persistence');
   } finally {await browser.close();await new Promise(resolve=>server.close(resolve));}
 })().catch(error=>{console.error(error);process.exitCode=1;});

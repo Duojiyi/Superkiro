@@ -60,6 +60,13 @@ export function formatTokenCount(value: unknown): string {
   return String(Math.round(value));
 }
 
+/** Stored sizes, in MB of 1,048,576 bytes as the server counts them: 820 KB · 71.3 MB · 256 MB. */
+export function formatBytes(bytes: unknown): string {
+  if (!isNumber(bytes) || bytes < 0) return '—';
+  if (bytes < 1_048_576) return `${bytes ? Math.max(1, Math.round(bytes / 1024)) : 0} KB`;
+  return `${oneDecimal(bytes / 1_048_576)} MB`;
+}
+
 /** Durations: under a second in ms, otherwise seconds with one decimal. 820 ms · 1.2 s */
 export function formatDuration(ms: unknown): string {
   if (!isNumber(ms) || ms < 0) return '—';
@@ -132,6 +139,13 @@ export function formatRemaining(secs: unknown, now = Date.now()): {text: string;
   if (left < 86400) return {text: `剩 ${Math.max(1, Math.ceil(left / 3600))} 小时`, tone: 'warning'};
   const days = Math.floor(left / 86400);
   return {text: `剩 ${days} 天`, tone: left <= 7 * 86400 ? 'warning' : 'normal'};
+}
+
+/** How long ago an expiry passed: 已过期 12 天, or 已过期不到 1 天. */
+export function formatExpired(secs: unknown, now = Date.now()): string {
+  if (!isNumber(secs)) return '—';
+  const days = Math.floor((now / 1000 - secs) / 86400);
+  return days >= 1 ? `已过期 ${days} 天` : '已过期不到 1 天';
 }
 
 /** Minutes left in a session: 剩余 12 分钟, or m:ss in the last two minutes. */

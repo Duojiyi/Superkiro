@@ -1,5 +1,6 @@
 // 测试, live Key health and the provider format: final build + loopback fixture, never production.
 const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
+const recordToasts=require('./toasts.cjs');
 const http=require('node:http'),fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
 const fixture=require('./fixture-api.cjs')();
 const root=path.resolve(__dirname,'../dist');
@@ -20,6 +21,7 @@ const writes=endpoint=>fixture.writes.filter(write=>write.endpoint===endpoint);
     browser=await chromium.launch({headless:true,...(process.env.CHROME_PATH?{executablePath:process.env.CHROME_PATH}:{})});
     const page=await browser.newPage({viewport:{width:1440,height:1000}}),errors=[];
     page.setDefaultTimeout(10000);
+    const toasts=await recordToasts(page);
     const origin=`http://127.0.0.1:${server.address().port}`;
     page.on('pageerror',error=>{errors.push(error.message);console.error('Browser error:',error.message);});
     const nativeDialogs=[];page.on('dialog',dialog=>{nativeDialogs.push(dialog.message());void dialog.dismiss();});
@@ -32,8 +34,32 @@ const writes=endpoint=>fixture.writes.filter(write=>write.endpoint===endpoint);
     await page.goto(origin+'/admin/');await page.getByLabel('密码',{exact:true}).fill('fixture-password');await button('登录').click();
     await button('刷新').waitFor();
     const attention=page.locator('.attention-list');
-    await attention.getByText('1 个 Key 冷却中（',{exact:false}).waitFor();await attention.getByText('1 个 Key 不可用',{exact:false}).waitFor();
+    await attention.getByText('Key fixture-backup（测试供应商 / Fixture）冷却中，',{exact:false}).waitFor();
+    await attention.getByText('Key fixture-openai-key-1（OpenAI 格式 / Fixture）不可用：HTTP 401 · Key 无效或被拒绝',{exact:false}).waitFor();
     assert.equal(await page.locator('#nav-badge-providers [aria-hidden="true"]').textContent(),'2');
+    // gpt-6-astra's only route is that Key: nothing can serve it. It is named in red with the reason,
+    // first in the list, with a way to the Key and to the model; the other pages show it broken too.
+    const dead=attention.locator('li').first();
+    assert.equal(await dead.locator('.attention-text').innerText(),'gpt-6-astra：唯一线路 OpenAI 格式 / Fixture 的 Key 返回 401');
+    assert((await dead.locator('.attention-item').getAttribute('class')).includes('is-danger'));
+    await page.getByRole('alert').filter({hasText:'1 个在售模型无可用线路，客户请求会失败：gpt-6-astra（OpenAI 格式 / Fixture 的 Key 返回 401）'}).waitFor();
+    assert.equal(await page.locator('#nav-badge-models [aria-hidden="true"]').textContent(),'1');
+    // Failures count every attempt and are coloured like the 成功率 KPI (fixture: 8 of 51 attempts in 24 hours failed, 15.7%).
+    const healthRow=page.getByRole('region',{name:'服务健康'}).getByRole('row').filter({hasText:'测试供应商 / Fixture'});
+    const rateCell=healthRow.locator('td.num').nth(1);
+    assert.deepEqual([await healthRow.locator('td.num').first().innerText(),await rateCell.innerText(),await rateCell.getAttribute('class')],['51','8（15.7%）','num is-danger']);
+    await dead.getByRole('button',{name:'查看 Key',exact:true}).click();
+    await page.getByRole('heading',{name:'供应商与 Key',level:2,exact:true}).waitFor();
+    assert.equal(await page.locator('tr.is-pointed').getAttribute('data-key-id'),'fixture-openai-key-1','the Key to fix is marked');
+    assert.equal(await page.evaluate(()=>location.hash),'#/providers?key=fixture-openai-key-1');
+    await page.evaluate(()=>history.back());await page.getByRole('heading',{name:'运营概览',level:2,exact:true}).waitFor();
+    await attention.locator('li').first().getByRole('button',{name:'去模型与定价',exact:true}).click();
+    // The model itself, marked, and named in the address.
+    await page.locator('tr[data-model="gpt-6-astra"].is-marked').waitFor();assert.equal(await page.evaluate(()=>location.hash),'#/models?model=gpt-6-astra');
+    const astraRow=page.getByRole('row').filter({has:page.getByRole('button',{name:'gpt-6-astra 的更多操作',exact:true})});
+    const mark=astraRow.getByText('无可用线路',{exact:true});await mark.waitFor();
+    assert.equal(await mark.getAttribute('title'),'OpenAI 格式 / Fixture 的 Key 返回 401');
+    await nav('运营概览');
     await nav('供应商与 Key');
     // The format comes from the server's `format` field.
     const card=name=>page.locator('.provider-card').filter({hasText:name});
@@ -44,18 +70,21 @@ const writes=endpoint=>fixture.writes.filter(write=>write.endpoint===endpoint);
     await keyRow('OpenAI 格式 / Fixture','fixture-openai-key-1').getByText('2 小时前 · HTTP 401 · Key 无效或被拒绝').waitFor();
     // The server names the failure's kind (http_529); the console says it in words.
     await keyRow('测试供应商 / Fixture','fixture-backup').getByText('5 分钟前 · HTTP 529 · 上游过载').waitFor();
-    assert.equal(await keyRow('测试供应商 / Fixture','fixture-key').getByRole('button',{name:'恢复',exact:true}).count(),0,'a healthy Key needs no 恢复');
-    // 恢复 clears the state; the badge follows.
-    await keyRow('测试供应商 / Fixture','fixture-backup').getByRole('button',{name:'恢复',exact:true}).click();
+    assert.equal(await keyRow('测试供应商 / Fixture','fixture-key').getByRole('button',{name:'解除冷却',exact:true}).count(),0,'a healthy Key needs no 解除冷却');
+    // A Key refused as invalid is not put back as it is: it needs a new secret.
+    assert.equal(await keyRow('OpenAI 格式 / Fixture','fixture-openai-key-1').getByRole('button',{name:'解除冷却',exact:true}).count(),0);
+    await keyRow('OpenAI 格式 / Fixture','fixture-openai-key-1').getByRole('button',{name:'更换密钥',exact:true}).waitFor();
+    // 解除冷却 clears the cooldown; the badge follows.
+    await keyRow('测试供应商 / Fixture','fixture-backup').getByRole('button',{name:'解除冷却',exact:true}).click();
     const box=page.getByRole('alertdialog');await box.waitFor();const facts=await box.innerText();
     assert(facts.includes('现在：冷却中')&&facts.includes('最近错误：HTTP 529 · 上游过载'),facts);
     await box.locator('[data-confirm="accept"]').click();
-    await page.locator('.toast').filter({hasText:'已恢复 Key fixture-backup'}).waitFor();
+    await toasts.shown('已解除 Key fixture-backup 的冷却');
     assert.deepEqual(writes('providers/keys/reset').map(write=>write.body),[{provider_id:'fixture-provider',key_id:'fixture-backup'}]);
     await keyRow('测试供应商 / Fixture','fixture-backup').getByText('正常',{exact:true}).waitFor();
     await keyRow('测试供应商 / Fixture','fixture-backup').getByText('5 分钟前 · HTTP 529 · 上游过载').waitFor();// the last error stays on record
     assert.equal(await page.locator('#nav-badge-providers [aria-hidden="true"]').textContent(),'1');
-    console.log('PASS: live Key health with the last error, 恢复 clears it and the badge follows; format tags from the server’s format');
+    console.log('PASS: live Key health with the last error, 解除冷却 clears a cooldown and the badge follows, a refused Key offers 更换密钥; format tags from the server’s format');
 
     // 测试 in a Key's model list: through that Key, nothing saved.
     key('fixture-key').allowed_models=[...key('fixture-key').allowed_models,'overloaded-model'];await refresh();

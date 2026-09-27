@@ -16,7 +16,7 @@ function load(file, imports = {}) {
 const plain = value => JSON.parse(JSON.stringify(value));
 
 // A target serves when its provider is enabled and an enabled Key of it allows the upstream model.
-const routes = load('routes.ts');
+const routes = load('routes.ts', {'./status': load('status.ts'), './format': load('format.ts')});
 const providers = [{id: 'a', name: 'A'}, {id: 'b', name: 'B'}, {id: 'off', name: 'Off', enabled: false}];
 const keys = [{id: 'ka', provider_id: 'a', enabled: true, allowed_models: ['m1', 'm2']}, {id: 'kb', provider_id: 'b', allowed_models: ['m1', 'm3']},
   {id: 'kb-off', provider_id: 'b', enabled: false, allowed_models: ['m4']}, {id: 'k-old', provider_id: 'off'}];
@@ -59,6 +59,47 @@ assert.equal(routes.modelName(both, [both, {...both, id: 'other', group_id: 'h'}
 assert.equal(routes.modelName(both, [both], groups), 'both');
 assert.equal(routes.nameList(['a', 'b', 'c'], 2), 'a、b 等 3 个');
 console.log('PASS routes: a target needs an enabled provider and an enabled allowing Key; backups take over; losses from a provider or Key change; model names');
+
+// Live Key health: a Key refused as invalid serves nothing, one cooling down serves again at its
+// cooldown's end (said with the time), one tried again after it (degraded) serves.
+{
+  const t = 1_800_000_000;
+  const hanyue = [{id: 'hy', name: '瀚月 Max'}, {id: 'km', name: 'Kimera 主线路'}];
+  const opus = model('opus-5-5', 'hy', 'claude-opus-5-5');
+  const health = (keys, target = opus) => {const data = {providers: hanyue, keys, nowSecs: t}; const route = routes.modelRoute(target, data); return {route, text: routes.targetProblem(route.primary, hanyue, t)};};
+  const key = (id, extra = {}) => ({id, provider_id: 'hy', enabled: true, allowed_models: ['claude-opus-5-5'], health_state: 'healthy', ...extra});
+  let {route, text} = health([key('hy-1', {health_state: 'unhealthy', last_error: 'http_401'})]);
+  assert.deepEqual([route.primary.ok, route.primary.problem, route.down, text], [false, 'key_unhealthy', true, '瀚月 Max 的 Key 返回 401']);
+  ({route, text} = health([key('hy-1', {health_state: 'unhealthy', last_error: 'http_401'}), key('hy-2', {health_state: 'unhealthy', last_error: 'http_401'})]));
+  assert.equal(text, '瀚月 Max 的 2 个 Key 都返回 401');
+  ({text} = health([key('hy-1', {health_state: 'unhealthy'})]));
+  assert.equal(text, '瀚月 Max 的 Key 不可用', 'without an HTTP status the words stay general');
+  const soon = t + 12 * 60;
+  ({route, text} = health([key('hy-1', {health_state: 'cooldown', cooldown_until: soon}), key('hy-2', {health_state: 'unhealthy', last_error: 'http_401'})]));
+  const clock = `${String(new Date(soon * 1000).getHours()).padStart(2, '0')}:${String(new Date(soon * 1000).getMinutes()).padStart(2, '0')}`;
+  assert.deepEqual([route.primary.problem, route.primary.until, text], ['key_cooldown', soon, `瀚月 Max 的 Key 冷却中，12 分钟后（${clock}）恢复`], 'the Key that comes back first decides');
+  assert.equal(health([key('hy-1', {health_state: 'cooldown', cooldown_until: t - 5})]).route.primary.ok, true, 'a cooldown that is over serves');
+  assert.equal(health([key('hy-1', {health_state: 'degraded', last_error: 'http_529'})]).route.primary.ok, true, 'tried again after a cooldown, it serves');
+  assert.equal(health([key('hy-1', {health_state: 'unhealthy'}), key('hy-2')]).route.primary.ok, true, 'one healthy Key is enough');
+  assert.equal(health([key('hy-1', {health_state: 'unhealthy', enabled: false})]).route.primary.problem, 'no_key', 'a disabled Key is no Key');
+  assert(routes.canRoute('hy', 'claude-opus-5-5', [key('hy-1', {health_state: 'unhealthy'})]), 'permission to call a model does not depend on health (listing uses it)');
+  // A backup whose Key is refused does not take over: stopping the primary leaves the model with nothing.
+  const both = model('opus-5', 'km', 'claude-opus-5', {fallback_chain: [{provider_id: 'hy', target_model: 'claude-opus-5'}]});
+  const keys = [{id: 'km-1', provider_id: 'km', enabled: true, allowed_models: ['claude-opus-5']}, key('hy-1', {allowed_models: ['claude-opus-5'], health_state: 'unhealthy', last_error: 'http_401'})];
+  const stopped = routes.routeLosses([both], {providers: hanyue, keys, nowSecs: t}, {providers: hanyue.map(p => p.id === 'km' ? {...p, enabled: false} : p), keys, nowSecs: t});
+  assert.deepEqual(plain(stopped.down.map(row => row.id)), ['opus-5'], 'not "改由备用线路服务"');
+  // The last Key that is only cooling down still counts: deleting it strands the model for good.
+  const cooling = [key('hy-1', {health_state: 'cooldown', cooldown_until: soon})];
+  assert.deepEqual(plain(routes.routeLosses([opus], {providers: hanyue, keys: cooling, nowSecs: t}, {providers: hanyue, keys: [], nowSecs: t}).down.map(row => row.id)), ['opus-5-5']);
+  // A model already without a route loses nothing more, but the server still refuses to delete its
+  // last enabled Key (its rule ignores health): deleteBlockers names it, so it can be hidden first.
+  const dead = [key('hy-1', {health_state: 'unhealthy', last_error: 'http_401'})];
+  assert.deepEqual(plain(routes.routeLosses([opus], {providers: hanyue, keys: dead, nowSecs: t}, {providers: hanyue, keys: [], nowSecs: t})), {down: [], takeover: [], backup: []});
+  assert.deepEqual(plain(routes.deleteBlockers([opus, {...opus, id: 'hidden', visible: false}], dead, dead[0]).map(row => row.id)), ['opus-5-5']);
+  assert.deepEqual(plain(routes.deleteBlockers([opus], [...dead, key('hy-2')], dead[0])), [], 'another enabled Key allowed the model: nothing blocks');
+  assert.equal(routes.brokenRoutes([opus], {providers: hanyue, keys: dead, nowSecs: t}).length, 1, 'the model looks broken wherever routes are shown');
+  console.log('PASS route health: 401 Keys serve nothing, cooldowns until their end (with the time), degraded Keys serve; losses and the delete guard follow');
+}
 
 // Refusals: nothing changed, in words that say what to fix, naming the models; everything else is unconfirmed.
 const refusal = load('refusal.ts');
@@ -129,11 +170,8 @@ assert.deepEqual(costIn('c', 'up-x', ownRow), ['upstream', 'v-up']);
 assert.deepEqual(costIn('c', 'other', ownRow), ['wildcard', 'v-any']);
 assert.deepEqual(costIn('a', 'none', {...ownRow, exposed_model_id: 'unpriced', target_model: 'none'}), ['wildcard', 'v-any'], "a model charged at the table's `*` costs what `*` says");
 assert.equal(change.costText(priced[1]), 'CNY 1 / 5 / 1.25 / 0.1');
-const staged = change.buildRouteCost({costs: {input_price_per_m: '1', output_price_per_m: '5', cache_creation_price_per_m: '1.25', cache_read_price_per_m: '0.1'}, currency: 'CNY'},
-  {providerId: 'b', targetModel: 'claude-x', rateCardId: 'r', nowSecs: t, taken: []});
-assert.equal(staged.model, 'b/claude-x');assert.equal(staged.effective_from_secs, 0);assert.equal(staged.margin_multiplier, 1);
-for (const field of ['fixed_input_credit_per_m', 'fixed_output_credit_per_m', 'fixed_cache_creation_credit_per_m', 'fixed_cache_read_credit_per_m', 'per_call_credit']) assert.equal(staged[field], 0, `${field}: never charged`);
-assert.throws(() => change.buildRouteCost({costs: {}, currency: 'CNY'}, {providerId: 'b', targetModel: 'x', rateCardId: 'r', nowSecs: t, taken: []}), /采购价需在/);
+// A draft version (the JSON editor's) marked 0 starts at once only as its table's first of that model.
+const staged = {id: 'staged-route', rate_card_id: 'r', model: 'b/claude-x', effective_from_secs: 0};
 assert.deepEqual(plain(change.routeCostOf(priced[1], [{id: 'b', name: 'B'}, {id: 'b2'}])), {provider: {id: 'b', name: 'B'}, target: 'claude-x'});
 assert.equal(change.routeCostOf(priced[0], [{id: 'b'}]), null, 'a customer price is not a route cost');
 // Marked 0: at once for a first version of that model in its table, otherwise at the later time.
@@ -144,10 +182,10 @@ const switched = routes.switchedRoute({target_provider_id: 'a', target_model: 'm
 assert.deepEqual(plain(switched), {target_provider_id: 'b', target_model: 'm1', fallback_chain: [{provider_id: 'a', target_model: 'm1'}, {provider_id: 'c', target_model: 'm1'}]}, 'the new primary leaves the backups; the old one leads them');
 assert.deepEqual(plain(routes.switchedRoute({target_provider_id: 'a', target_model: 'm1'}, {provider_id: 'b', target_model: 'm2'}, false).fallback_chain), []);
 assert.equal(routes.switchedRoute({target_provider_id: 'a', target_model: 'm', fallback_chain: Array.from({length: 8}, (_, i) => ({provider_id: `p${i}`, target_model: 'm'}))}, {provider_id: 'z', target_model: 'm'}, true).fallback_chain.length, 8);
-console.log('PASS route costs: own route first, then upstream, *, the model price; staged costs never charge; 0 made later when not first; switching keeps the old route as backup');
+console.log('PASS legacy route costs: own route version first, then upstream, *, the model price; 0 made later when not first; switching keeps the old route as backup');
 
 // List order: moving a model numbers its whole group again, so no tie remains; the default is the first shown model.
-const listingRules = load('listing.ts', {'./priceChange': change, './routes': routes});
+const listingRules = load('listing.ts', {'./priceChange': change, './routes': routes, './officialPricing': load('officialPricing.ts', {'./priceChange': change, './routes': routes})});
 const ordered = [{id: 'a', group_id: 'g', sort_order: 0, visible: false}, {id: 'b', group_id: 'g', sort_order: 0}, {id: 'c', group_id: 'g', sort_order: 5}, {id: 'x', group_id: 'h', sort_order: 0}];
 const placed = (to, id) => plain(listingRules.reorder(ordered, id, to).map(row => [row.id, row.sort_order]));
 assert.deepEqual(placed('first', 'c'), [['a', 1], ['b', 2], ['c', 0], ['x', 0]], 'to the top; another group is untouched');
@@ -188,7 +226,7 @@ assert.deepEqual(['http_429', 'http_503', 'http_418', 'timeout', 'transport', 'u
   ['HTTP 429 · 限流', 'HTTP 503 · 上游服务出错', 'HTTP 418', '超时', '网络连接失败', '上游服务报错', '上游回复无法解析', '上游返回空内容', 'HTTP 401 invalid key', ''], 'failure kinds in words; older free text as it is');
 assert.equal(status.keyStatusView({health_state: 'cooldown', cooldown_until: t + 120}, t).label, '冷却中 · 2 分钟');
 const degraded = status.keyStatusView({health_state: 'degraded', last_error: 'timeout'}, t);
-assert.deepEqual([degraded.label, degraded.tone, degraded.title], ['恢复中', 'warning', '冷却已结束，重新接请求，还没成功过\n最近错误：超时'], 'serving again after a cooldown is less severe than a cooldown');
+assert.deepEqual([degraded.label, degraded.tone, degraded.title], ['冷却后试用中', 'warning', '冷却已结束，重新接请求，还没成功过\n最近错误：超时'], 'serving again after a cooldown is less severe than a cooldown');
 assert.deepEqual([45, 89 * 60, 3 * 3600, 5 * 86400].map(status.cooldownText), ['1 分钟', '89 分钟', '约 3 小时', '约 5 天'], 'long cooldowns read in hours or days');
 assert.deepEqual([{format: 'open_ai'}, {format: 'anthropic'}, {api_type: 'openai'}, {}].map(provider => status.providerFormatLabel(provider)), ['OpenAI', 'Anthropic', 'OpenAI', null], 'format first, api_type from older data');
 assert.equal(status.probeView({ok: true, ttft_ms: 410.4, latency_ms: 620}).label, '成功 · 首字 410 ms');

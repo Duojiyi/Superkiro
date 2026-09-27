@@ -1,5 +1,6 @@
 // Route health regression: final build + loopback fixture, never production.
 const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
+const recordToasts=require('./toasts.cjs');
 const http=require('node:http'),fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
 const fixture=require('./fixture-api.cjs')();
 const root=path.resolve(__dirname,'../dist');
@@ -21,6 +22,7 @@ const writes=endpoint=>fixture.writes.filter(write=>write.endpoint===endpoint);
     browser=await chromium.launch({headless:true,...(process.env.CHROME_PATH?{executablePath:process.env.CHROME_PATH}:{})});
     const page=await browser.newPage({viewport:{width:1280,height:900}}),errors=[];
     page.setDefaultTimeout(10000);
+    const toasts=await recordToasts(page);
     const origin=`http://127.0.0.1:${server.address().port}`;
     page.on('pageerror',error=>{errors.push(error.message);console.error('Browser error:',error.message);});
     const nativeDialogs=[];page.on('dialog',dialog=>{nativeDialogs.push(dialog.message());void dialog.dismiss();});
@@ -76,14 +78,14 @@ const writes=endpoint=>fixture.writes.filter(write=>write.endpoint===endpoint);
     await button('关闭提示').click();
     const revision=fixture.config.revision;
     await toggle.click();await confirm({option:true});
-    await page.locator('.toast').filter({hasText:'已隐藏 claude-sonnet、gpt-5，并停用 测试供应商 / Fixture'}).waitFor();
+    await toasts.shown('已隐藏 claude-sonnet、gpt-5，并停用 测试供应商 / Fixture');
     const published=writes('commercial-config').at(-1).body;
     assert.equal(published.expected_revision,revision);assert(published.reason.includes('停用 测试供应商 / Fixture'),published.reason);
     assert.deepEqual(published.models.map(row=>[row.id,row.visible]),[['fixture-model-0',false],['fixture-model-1',false]]);
     const order=fixture.writes.map(write=>write.endpoint);
     assert(order.lastIndexOf('commercial-config')<order.lastIndexOf('providers/status'),'hidden first, then disabled');
     assert.deepEqual(writes('providers/status').at(-1).body,{providerId:'fixture-provider',enabled:false});
-    await toggle.click();await confirm();await page.locator('.toast').filter({hasText:'已启用 测试供应商 / Fixture'}).waitFor();
+    await toggle.click();await confirm();await toasts.shown('已启用 测试供应商 / Fixture');
     console.log('PASS: 停用供应商 lists losses by kind; 同时隐藏 publishes the hidden models first, revision-checked; a refused hide changes nothing');
 
     // A Key's save: the models it would strand are listed and can be hidden in the same step.
@@ -96,7 +98,7 @@ const writes=endpoint=>fixture.writes.filter(write=>write.endpoint===endpoint);
     const saveFacts=await confirm({option:true});
     for(const expected of ['将无可用线路（客户请求会失败）：gpt-6-astra','少一条备用线路（仍可服务）：gemini-pro','同时隐藏将无可用线路的 1 个模型（先隐藏，再保存）'])
       assert(saveFacts.includes(expected),`${expected}\n${saveFacts}`);
-    await page.locator('.toast').filter({hasText:'已隐藏 gpt-6-astra，并保存 Key fixture-openai-key-1'}).waitFor();
+    await toasts.shown('已隐藏 gpt-6-astra，并保存 Key fixture-openai-key-1');
     assert.deepEqual(writes('commercial-config').at(-1).body.models.map(row=>[row.id,row.visible]),[['fixture-model-3',false]]);
     assert.deepEqual(writes('providers/keys').at(-1).body.allowed_models,['gpt-5.6-sol','gpt-5.6-terra']);
     console.log('PASS: Key save lists stranded models and backups lost; 同时隐藏 hides them before saving');
@@ -106,7 +108,7 @@ const writes=endpoint=>fixture.writes.filter(write=>write.endpoint===endpoint);
     await openKey('测试供应商 / Fixture','fixture-backup');
     await button('删除 Key').click();
     const plain=await confirm();assert(!plain.includes('同时隐藏'),plain);
-    await page.locator('.toast').filter({hasText:'已删除 Key fixture-backup'}).waitFor();
+    await toasts.shown('已删除 Key fixture-backup');
     await page.locator('#key-editor').waitFor({state:'detached'});
     assert.equal(key('fixture-backup'),undefined);
     model('fixture-model-3').visible=true;key('fixture-openai-key-1').allowed_models=['gpt-6-astra'];fixture.config.revision='fixture-rev-30';await refresh();
@@ -120,7 +122,7 @@ const writes=endpoint=>fixture.writes.filter(write=>write.endpoint===endpoint);
     await button('删除 Key').click();
     const box=page.getByRole('alertdialog');await box.waitFor();assert(await box.getByRole('checkbox').isChecked(),'hiding is ticked when the delete needs it');
     await box.locator('[data-confirm="accept"]').click();
-    await page.locator('.toast').filter({hasText:'已隐藏 gpt-6-astra，并删除 Key fixture-openai-key-1'}).waitFor();
+    await toasts.shown('已隐藏 gpt-6-astra，并删除 Key fixture-openai-key-1');
     assert.equal(key('fixture-openai-key-1'),undefined);assert.equal(model('fixture-model-3').visible,false);
     // Hidden on the way, then the delete is not confirmed: the message says the model stays hidden.
     model('fixture-model-3').visible=true;fixture.keys.push({id:'fixture-openai-key-2',provider_id:'fixture-openai',allowed_models:['gpt-6-astra'],weight:1,enabled:true,health_state:'healthy'});
@@ -130,8 +132,28 @@ const writes=endpoint=>fixture.writes.filter(write=>write.endpoint===endpoint);
     await button('删除 Key').click();await confirm();
     await page.getByRole('status').filter({hasText:'已隐藏 gpt-6-astra；但没收到删除结果（Provider persistence failed）'}).waitFor();
     assert.equal(model('fixture-model-3').visible,false);assert(key('fixture-openai-key-2'));
-    assert.deepEqual(errors,[]);assert.deepEqual(nativeDialogs,[],'no browser-native dialogs');
     console.log('PASS: 删除 Key: no-loss delete, server refusal explained with the model named, hide-then-delete; a failure after hiding says the model stays hidden');
+
+    // Live health counts: gemini-pro's backup Key is refused as invalid (401), so it would not take
+    // over; stopping the primary provider leaves gemini-pro with nothing, and the dialog says so.
+    Object.assign(key('fixture-openai-key-2'),{health_state:'unhealthy',last_error:'http_401'});await refresh();
+    await page.getByRole('switch',{name:'启用 测试供应商 / Fixture',exact:true}).click();
+    const healthFacts=await confirm({accept:false});
+    const stranded=/将无可用线路（客户请求会失败）：(.+)/.exec(healthFacts)?.[1].split('、').sort();
+    assert.deepEqual(stranded,['claude-sonnet','gemini-pro','gpt-5'],healthFacts);assert(!healthFacts.includes('改由备用线路服务'),healthFacts);
+    // Deleting a Key that is refused changes nothing for customers, but the server still refuses to
+    // strand a shown model's last enabled Key: the model is named and hidden first.
+    model('fixture-model-3').visible=true;fixture.config.revision='fixture-rev-50';await refresh();
+    // (The editor still waits for the unconfirmed delete above to be checked: a fresh one starts clean.)
+    await page.locator('#key-editor').getByRole('button',{name:'关闭编辑器',exact:true}).click();await page.locator('#key-editor').waitFor({state:'detached'});
+    await openKey('OpenAI 格式 / Fixture','fixture-openai-key-2');
+    await button('删除 Key').click();
+    const deadBox=page.getByRole('alertdialog');await deadBox.waitFor();
+    assert((await deadBox.innerText()).includes('已经无可用线路，但删除前要先隐藏：gpt-6-astra'),await deadBox.innerText());
+    assert(await deadBox.getByRole('checkbox').isChecked());
+    await deadBox.getByRole('button',{name:'取消',exact:true}).click();await deadBox.waitFor({state:'detached'});
+    assert.deepEqual(errors,[]);assert.deepEqual(nativeDialogs,[],'no browser-native dialogs');
+    console.log('PASS: losses and the delete guard follow live Key health');
   }finally{
     await browser?.close();server.close();
   }
