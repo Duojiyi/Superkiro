@@ -38,9 +38,9 @@ fixture.traces.unshift(refusal(LOW,now-30,'insufficient_balance',{needed_micro_c
     const traceDrawer=page.locator('#trace-detail'),cardDrawer=page.locator('#card-detail');
     await page.goto(origin+'/admin/');await page.getByLabel('密码',{exact:true}).fill('fixture-password');await button('登录').click();await button('刷新').waitFor();
 
-    // 调用追踪: under 失败, each refusal in words, the balance one with what it needed and what the card had.
-    await nav('调用追踪');await page.getByRole('tablist',{name:'追踪状态筛选'}).locator('[data-value="error"]').click();
-    const chips=await page.getByRole('group',{name:'失败原因'}).getByRole('button').allInnerTexts();
+    // 调用追踪: under 拒绝, each refusal in words, the balance one with what it needed and what the card had.
+    await nav('调用追踪');await page.getByRole('tablist',{name:'追踪状态筛选'}).locator('[data-value="refused"]').click();
+    const chips=await page.getByRole('group',{name:'拒绝原因'}).getByRole('button').allInnerTexts();
     for(const chip of ['余额不足 1','超过并发上限 1','超过每日或每月用量上限 1'])assert(chips.some(text=>text.replace(/\s+/g,' ').trim()===chip),`${chip}: ${chips.join(' | ')}`);
     const low=page.locator('tbody tr').filter({hasText:'card-3c9e…4e60'});
     assert.equal(await low.locator('.result-reason').innerText(),'余额不足：需要 20.3 积分，余额 15 积分');
@@ -50,7 +50,7 @@ fixture.traces.unshift(refusal(LOW,now-30,'insufficient_balance',{needed_micro_c
     assert(facts.includes('请求开始前要按最大输出预留积分；余额不够预留，这次没有发给上游，也没有扣费。'),facts);
     await traceDrawer.getByText('没有记录尝试',{exact:true}).waitFor();
     assert.equal(await traceDrawer.getByRole('button',{name:'补偿这次扣费',exact:true}).count(),0,'nothing was charged');
-    await page.getByRole('group',{name:'失败原因'}).getByRole('button',{name:/超过并发上限/}).click();
+    await page.getByRole('group',{name:'拒绝原因'}).getByRole('button',{name:/超过并发上限/}).click();
     // Beside the open drawer the list keeps 结果; a row opens its request.
     await page.locator('tbody tr').first().click();
     await traceDrawer.getByText('这张卡同时进行的请求已到上限，这次没有发给上游，也没有扣费。',{exact:true}).waitFor();

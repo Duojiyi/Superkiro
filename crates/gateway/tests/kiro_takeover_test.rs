@@ -1587,10 +1587,10 @@ async fn an_error_blaming_the_request_is_refused_as_a_validation_error() {
     }
 }
 
-/// An `authentication_error` in the stream is the key's problem, as an HTTP 401 is: the key
-/// is set aside, and the customer is not told their request was at fault.
+/// A relay stream authentication error may concern its own upstream credentials.
+/// Retry it without retiring our relay key; a real HTTP 401 remains a key failure.
 #[tokio::test]
-async fn an_authentication_error_in_the_stream_retires_the_key_like_a_401() {
+async fn an_authentication_error_in_the_stream_retries_without_retiring_the_relay_key() {
     let server = upstream(
         ResponseTemplate::new(200)
             .set_body_raw(error_frame("authentication_error"), "text/event-stream"),
@@ -1610,10 +1610,8 @@ async fn an_authentication_error_in_the_stream_retires_the_key_like_a_401() {
     .await;
     assert_eq!(reply.status, StatusCode::BAD_GATEWAY, "{}", reply.text());
     assert_eq!(reply.json()["__type"], "InternalServerException");
-    assert_eq!(server.received_requests().await.unwrap().len(), 1);
-    let health = runtime.key_health(gateway::now_secs());
-    assert_eq!(health["key"].health_state, "unhealthy");
-    assert_eq!(health["key"].last_error.as_deref(), Some("http_401"));
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    keys_untouched(&runtime);
     nothing_charged(&billing);
 }
 
