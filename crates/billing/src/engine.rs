@@ -113,6 +113,10 @@ pub enum BillingError {
 
     #[error("{0}")]
     CompensationRefused(String),
+
+    /// A compensation refused for the requests it names: which, and what was found.
+    #[error("{}", .0.message)]
+    Compensation(Box<crate::compensation::CompensationRefusal>),
 }
 
 /// Card balance reconciliation details against the immutable usage ledger (Spec §5, §14.9, §14.10.5).
@@ -171,6 +175,22 @@ pub struct CompensatedRequest<'a> {
     pub allow_repeat: bool,
 }
 
+/// A balance adjustment an operator makes, and the requests it makes up for, if any.
+#[derive(Debug, Clone, Copy)]
+pub struct BalanceAdjustment<'a> {
+    pub card_id: &'a str,
+    pub delta_micro_credits: i64,
+    pub operator_id: &'a str,
+    pub reason: &'a str,
+    pub now_secs: u64,
+    /// A retry under the same key is the same adjustment.
+    pub idempotency_key: Option<&'a str>,
+    /// The requests it makes up for, each once; empty when it names none.
+    pub requests: &'a [&'a str],
+    /// Compensate them again, or by more than they were charged.
+    pub allow_repeat: bool,
+}
+
 /// Where a request was charged: its card, the micro-credits and when.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ChargedRequest {
@@ -208,6 +228,8 @@ pub struct BillingEngine {
     announcements: Arc<RwLock<Vec<Announcement>>>,
     providers: Arc<RwLock<HashMap<String, Provider>>>,
     provider_keys: Arc<RwLock<HashMap<String, ProviderKey>>>,
+    /// What positive adjustments gave each request: derived from the ledger, never saved.
+    compensations: Arc<RwLock<crate::compensation::CompensationIndex>>,
     default_rates: PricingRates,
     persistence_path: Arc<RwLock<Option<std::path::PathBuf>>>,
     master_kek: Arc<RwLock<Option<crate::crypto::MasterKek>>>,
@@ -690,6 +712,7 @@ impl BillingEngine {
             announcements: Arc::new(RwLock::new(Vec::new())),
             providers: Arc::new(RwLock::new(HashMap::new())),
             provider_keys: Arc::new(RwLock::new(HashMap::new())),
+            compensations: Arc::new(RwLock::new(Default::default())),
             default_rates: PricingRates::default(),
             persistence_path: Arc::new(RwLock::new(None)),
             master_kek: Arc::new(RwLock::new(master_kek)),
@@ -875,6 +898,12 @@ impl BillingEngine {
                     .saturating_add(reservation.reserved_micro_credits);
             }
         }
+        *self.compensations.write().unwrap() = crate::compensation::CompensationIndex::build(
+            snapshot
+                .ledger
+                .iter()
+                .chain(snapshot.archived_ledger_summary.adjustments.values()),
+        );
         *self.consumed_refresh_tokens.write().unwrap() = snapshot.consumed_refresh_tokens;
         *self.cards.write().unwrap() = cards;
         *self.reservations.write().unwrap() = reservations;
@@ -4861,12 +4890,8 @@ impl BillingEngine {
     }
 
     /// An idempotent adjustment that may name the request it makes up for; the card's
-    /// history keeps it. A replay under the same key must name the same request.
-    ///
-    /// The request must be this card's and must have been made: it is found in the ledger,
-    /// live or archived, or in the traces. A second positive adjustment for it, or one of
-    /// more than it was charged, is refused, naming what it charged and how it was already
-    /// compensated, unless `allow_repeat` says the operator means it.
+    /// history keeps it. A replay under the same key must name the same request. See
+    /// [`Self::adjust_card_balance`], which takes several.
     #[allow(clippy::too_many_arguments)]
     pub fn adjust_balance_linked(
         &self,
@@ -4878,10 +4903,51 @@ impl BillingEngine {
         idempotency_key: Option<&str>,
         request: Option<CompensatedRequest<'_>>,
     ) -> Result<LedgerEntry, BillingError> {
-        // The request the adjustment makes up for, which the card's history shows.
-        let detail = request.map(|r| serde_json::json!({ "invocationId": r.invocation_id }));
+        let requests: Vec<&str> = request.iter().map(|r| r.invocation_id).collect();
+        self.adjust_card_balance(BalanceAdjustment {
+            card_id,
+            delta_micro_credits,
+            operator_id,
+            reason,
+            now_secs,
+            idempotency_key,
+            requests: &requests,
+            allow_repeat: request.is_some_and(|r| r.allow_repeat),
+        })
+    }
+
+    /// An adjustment of a card's balance, idempotent under its key, that may name the
+    /// requests it makes up for; the card's history keeps them. A replay under the same key
+    /// must name the same requests.
+    ///
+    /// Each request must be this card's and must have been made: it is found in the ledger,
+    /// live or archived, or in the traces. A positive adjustment may not name a request an
+    /// earlier positive one already made up for, nor give more than the requests were
+    /// charged together, unless `allow_repeat` says the operator means it. A refusal names
+    /// every request that caused it and what was found for each.
+    pub fn adjust_card_balance(
+        &self,
+        adjustment: BalanceAdjustment<'_>,
+    ) -> Result<LedgerEntry, BillingError> {
+        let BalanceAdjustment {
+            card_id,
+            delta_micro_credits,
+            operator_id,
+            reason,
+            now_secs,
+            idempotency_key,
+            allow_repeat,
+            ..
+        } = adjustment;
+        // Each request once, in the order given.
+        let mut requests: Vec<&str> = Vec::with_capacity(adjustment.requests.len());
+        for id in adjustment.requests {
+            if !requests.contains(id) {
+                requests.push(id);
+            }
+        }
         // Looked up before the state lock: it may have to read the ledger archives.
-        let charged = request.map(|r| self.charged_request(r.invocation_id));
+        let charged = self.charged_requests(&requests);
         let op = operator_id.trim();
         if op.is_empty() {
             return Err(BillingError::InvalidAdjustment(
@@ -4924,12 +4990,18 @@ impl BillingEngine {
                     .cloned()
             });
             if let Some(existing) = existing {
+                // The requests it named, kept in `detail`, or in `target_model` by releases
+                // before it, one or several.
+                let mut named =
+                    crate::compensation::linked_requests(existing.event_detail().as_ref());
+                named.sort_unstable();
+                let mut asked = requests.clone();
+                asked.sort_unstable();
                 if existing.card_id == card_id
                     && existing.credits_charged == delta_micro_credits
                     && existing.operator_id.as_deref() == Some(op)
                     && existing.reason.as_deref() == Some(res)
-                    // Kept in `detail`, or in `target_model` by releases before it.
-                    && existing.event_detail() == detail
+                    && named == asked
                 {
                     return Ok(existing);
                 } else {
@@ -4947,12 +5019,18 @@ impl BillingEngine {
         let previous_checksum = self.last_snapshot_checksum.read().unwrap().clone();
         let mut candidate = self.export_snapshot_locked(sequence, previous_checksum);
 
-        if let (Some(request), Some(charged)) = (request, charged) {
-            // An unknown card is named as such before its request is looked at.
+        if !requests.is_empty() {
+            // An unknown card is named as such before its requests are looked at.
             if !candidate.cards.contains_key(card_id) {
                 return Err(BillingError::CardNotFound(card_id.to_string()));
             }
-            Self::check_compensation(&candidate, card_id, delta_micro_credits, request, charged)?;
+            self.check_compensation(
+                card_id,
+                delta_micro_credits,
+                &requests,
+                allow_repeat,
+                &charged,
+            )?;
         }
 
         let card = candidate
@@ -4982,6 +5060,13 @@ impl BillingEngine {
         let adjustment_id = idempotency_key
             .map(ToString::to_string)
             .unwrap_or_else(|| format!("adj-{}-{}-{}", card_id, now_secs, candidate.ledger.len()));
+        // The requests it makes up for and what each was charged, which the card's history
+        // shows and the compensation is shared by.
+        let charged_credits: Vec<i64> = charged
+            .iter()
+            .map(|found| found.as_ref().map_or(0, |found| found.credits))
+            .collect();
+        let detail = crate::compensation::linked_detail(&requests, &charged_credits);
 
         let entry = LedgerEntry {
             id: format!("ledger-{}", adjustment_id),
@@ -5014,119 +5099,258 @@ impl BillingEngine {
                 .unwrap()
                 .insert(card_id.to_string(), updated_card);
             self.ledger.write().unwrap().push(entry.clone());
+            self.compensations.write().unwrap().add(&entry);
             entry
         })
     }
 
-    /// Where a request was charged: its usage entry in the live ledger or still settling, its
-    /// trace, or its usage entry in a ledger archive. None when none of them has it.
-    fn charged_request(&self, invocation_id: &str) -> Option<ChargedRequest> {
-        let usage = |entry: &&LedgerEntry| {
-            entry.kind == LedgerKind::Usage && entry.invocation_id.as_deref() == Some(invocation_id)
+    /// Where each request was charged, in their order: its usage entry in the live ledger or
+    /// still settling, its trace, or its usage entry in a ledger archive. None for one that
+    /// none of them has.
+    fn charged_requests(&self, invocation_ids: &[&str]) -> Vec<Option<ChargedRequest>> {
+        let mut found: Vec<Option<ChargedRequest>> = vec![None; invocation_ids.len()];
+        if invocation_ids.is_empty() {
+            return found;
+        }
+        let positions: HashMap<&str, usize> = invocation_ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| (*id, index))
+            .collect();
+        let usage = |entry: &LedgerEntry| {
+            (entry.kind == LedgerKind::Usage)
+                .then_some(entry.invocation_id.as_deref())
+                .flatten()
+                .and_then(|id| positions.get(id).copied())
         };
         let of_entry = |entry: &LedgerEntry| ChargedRequest {
             card_id: entry.card_id.clone(),
             credits: entry.credits_charged,
             ts_secs: entry.ts_secs,
         };
-        if let Some(entry) = self.ledger.read().unwrap().iter().find(usage) {
-            return Some(of_entry(entry));
+        for entry in self.ledger.read().unwrap().iter() {
+            if let Some(index) = usage(entry) {
+                found[index].get_or_insert_with(|| of_entry(entry));
+            }
         }
-        if let Some(pending) = self.pending_settlements.read().unwrap().get(invocation_id) {
-            return Some(of_entry(&pending.entry));
+        {
+            let pending = self.pending_settlements.read().unwrap();
+            for (index, id) in invocation_ids.iter().enumerate() {
+                if let (None, Some(pending)) = (&found[index], pending.get(*id)) {
+                    found[index] = Some(of_entry(&pending.entry));
+                }
+            }
         }
-        let traced = self
-            .traces
-            .read()
-            .unwrap()
-            .iter()
-            .filter(|trace| trace.invocation_id == invocation_id)
-            .max_by_key(|trace| trace.credits_charged)
-            .map(|trace| ChargedRequest {
-                card_id: trace.card_id.clone(),
-                credits: trace.credits_charged,
-                ts_secs: trace.ts,
-            });
-        if traced.is_some() {
-            return traced;
+        // Of a request traced more than once, the trace that charged the most.
+        let mut traced: Vec<Option<ChargedRequest>> = vec![None; invocation_ids.len()];
+        for trace in self.traces.read().unwrap().iter() {
+            let Some(&index) = positions.get(trace.invocation_id.as_str()) else {
+                continue;
+            };
+            if traced[index]
+                .as_ref()
+                .is_none_or(|best| trace.credits_charged > best.credits)
+            {
+                traced[index] = Some(ChargedRequest {
+                    card_id: trace.card_id.clone(),
+                    credits: trace.credits_charged,
+                    ts_secs: trace.ts,
+                });
+            }
         }
-        // Slow on a large archive, so read only when nothing live has it.
-        let dir = self.ledger_archive_dir()?;
-        let kek = self.master_kek();
-        self.list_archived_ledger_receipts()
-            .iter()
-            .find_map(|receipt| {
-                let path = dir.join(&receipt.archive_file);
-                verify_ledger_archive_with(&path, &receipt.sha256_checksum, kek.as_ref())
-                    .ok()?
-                    .entries
-                    .iter()
-                    .find(usage)
-                    .map(of_entry)
-            })
+        for (slot, traced) in found.iter_mut().zip(traced) {
+            if slot.is_none() {
+                *slot = traced;
+            }
+        }
+        // Slow on a large archive, so read only for what nothing live has, each archive once.
+        if found.iter().any(Option::is_none) {
+            if let Some(dir) = self.ledger_archive_dir() {
+                let kek = self.master_kek();
+                for receipt in self.list_archived_ledger_receipts() {
+                    if found.iter().all(Option::is_some) {
+                        break;
+                    }
+                    let path = dir.join(&receipt.archive_file);
+                    let Ok(payload) =
+                        verify_ledger_archive_with(&path, &receipt.sha256_checksum, kek.as_ref())
+                    else {
+                        continue;
+                    };
+                    for entry in &payload.entries {
+                        if let Some(index) = usage(entry) {
+                            found[index].get_or_insert_with(|| of_entry(entry));
+                        }
+                    }
+                }
+            }
+        }
+        found
     }
 
-    /// Why a compensation for `request` cannot be made, if it cannot. The request must be
-    /// this card's; a positive compensation must neither repeat one already made for it nor
-    /// exceed what it was charged, unless the operator explicitly allows it.
+    /// Why a compensation for `requests` cannot be made, if it cannot, naming every request
+    /// that stops it. Each must be this card's; a positive compensation must neither repeat
+    /// one already made for any of them nor exceed what they were charged together, unless
+    /// the operator explicitly allows it. For one request the messages are the ones the
+    /// console has always read.
     fn check_compensation(
-        candidate: &BillingSnapshot,
+        &self,
         card_id: &str,
         delta_micro_credits: i64,
-        request: CompensatedRequest<'_>,
-        charged: Option<ChargedRequest>,
+        requests: &[&str],
+        allow_repeat: bool,
+        charged: &[Option<ChargedRequest>],
     ) -> Result<(), BillingError> {
+        use crate::compensation::{CompensationRefusal, RefusalKind, RefusedRequest};
         use crate::observability::{iso_utc, micro_decimal};
-        let id = request.invocation_id;
-        let charged = charged.ok_or_else(|| BillingError::RequestNotFound(id.to_string()))?;
-        if charged.card_id != card_id {
-            return Err(BillingError::CompensationRefused(format!(
-                "Request {id} was made by card {}, not {card_id}",
-                charged.card_id
-            )));
+        let refused = |kind: RefusalKind,
+                       message: String,
+                       requests: Vec<RefusedRequest>,
+                       over: Option<(i64, i64)>| {
+            BillingError::Compensation(Box::new(CompensationRefusal {
+                message,
+                kind,
+                requests,
+                asked_micro_credits: over.map(|(asked, _)| asked),
+                charged_total_micro_credits: over.map(|(_, total)| total),
+            }))
+        };
+        let of = |id: &str, found: &ChargedRequest| RefusedRequest {
+            invocation_id: id.to_string(),
+            card_id: Some(found.card_id.clone()),
+            charged_micro_credits: Some(found.credits),
+            charged_at_secs: Some(found.ts_secs),
+            ..RefusedRequest::default()
+        };
+        let single = requests.len() == 1;
+
+        let unknown: Vec<RefusedRequest> = requests
+            .iter()
+            .zip(charged)
+            .filter(|(_, found)| found.is_none())
+            .map(|(id, _)| RefusedRequest {
+                invocation_id: id.to_string(),
+                ..RefusedRequest::default()
+            })
+            .collect();
+        if !unknown.is_empty() {
+            let message = if single {
+                format!("Request {} was not found", requests[0])
+            } else {
+                format!("{} of the requests were not found", unknown.len())
+            };
+            return Err(refused(RefusalKind::Unknown, message, unknown, None));
         }
-        if delta_micro_credits <= 0 || request.allow_repeat {
+        let found: Vec<(&str, &ChargedRequest)> = requests
+            .iter()
+            .zip(charged)
+            .filter_map(|(id, found)| found.as_ref().map(|found| (*id, found)))
+            .collect();
+
+        let other: Vec<RefusedRequest> = found
+            .iter()
+            .filter(|(_, found)| found.card_id != card_id)
+            .map(|(id, found)| of(id, found))
+            .collect();
+        if !other.is_empty() {
+            let message = match found.as_slice() {
+                [(id, found)] if single => format!(
+                    "Request {id} was made by card {}, not {card_id}",
+                    found.card_id
+                ),
+                _ => format!("{} of the requests were made by another card", other.len()),
+            };
+            return Err(refused(RefusalKind::OtherCard, message, other, None));
+        }
+        if delta_micro_credits <= 0 || allow_repeat {
             return Ok(());
         }
-        let found = format!(
-            "Request {id} was charged {} credits at {}",
-            micro_decimal(charged.credits),
-            iso_utc(charged.ts_secs)
-        );
-        let compensated = candidate
-            .ledger
-            .iter()
-            .chain(candidate.archived_ledger_summary.adjustments.values())
-            .filter(|entry| {
-                entry.kind == LedgerKind::Adjustment
-                    && entry.card_id == card_id
-                    && entry.credits_charged > 0
-                    && entry.event_detail().is_some_and(|detail| {
-                        detail
-                            .get("invocationId")
-                            .and_then(serde_json::Value::as_str)
-                            == Some(id)
+
+        let charged_text = |id: &str, found: &ChargedRequest| {
+            format!(
+                "Request {id} was charged {} credits at {}",
+                micro_decimal(found.credits),
+                iso_utc(found.ts_secs)
+            )
+        };
+        let repeated: Vec<RefusedRequest> = {
+            let index = self.compensations.read().unwrap();
+            found
+                .iter()
+                .filter_map(|(id, found)| {
+                    let earlier = &index.get(card_id, id)?.latest;
+                    Some(RefusedRequest {
+                        compensated_micro_credits: Some(earlier.micro_credits),
+                        compensated_at_secs: Some(earlier.at_secs),
+                        operator: earlier.operator.clone(),
+                        reason: earlier.reason.clone(),
+                        ..of(id, found)
                     })
-            })
-            .max_by_key(|entry| entry.ts_secs);
-        if let Some(earlier) = compensated {
-            return Err(BillingError::CompensationRefused(format!(
-                "{found}, and was already compensated {} credits at {} by {} ({}); \
-                 send allowRepeat with a reason to compensate it again",
-                micro_decimal(earlier.credits_charged),
-                iso_utc(earlier.ts_secs),
-                earlier.operator_id.as_deref().unwrap_or("unknown"),
-                earlier.reason.as_deref().unwrap_or("no reason"),
-            )));
+                })
+                .collect()
+        };
+        if !repeated.is_empty() {
+            let message = match (found.as_slice(), repeated.as_slice()) {
+                ([(id, found)], [earlier]) if single => format!(
+                    "{}, and was already compensated {} credits at {} by {} ({}); \
+                     send allowRepeat with a reason to compensate it again",
+                    charged_text(id, found),
+                    micro_decimal(earlier.compensated_micro_credits.unwrap_or_default()),
+                    iso_utc(earlier.compensated_at_secs.unwrap_or_default()),
+                    earlier.operator.as_deref().unwrap_or("unknown"),
+                    earlier.reason.as_deref().unwrap_or("no reason"),
+                ),
+                _ => format!(
+                    "{} of the requests were already compensated; send allowRepeat with a \
+                     reason to compensate them again",
+                    repeated.len()
+                ),
+            };
+            return Err(refused(RefusalKind::Repeat, message, repeated, None));
         }
-        if delta_micro_credits > charged.credits {
-            return Err(BillingError::CompensationRefused(format!(
-                "{found}; a compensation of {} credits is more than that; \
-                 send allowRepeat with a reason to compensate more",
-                micro_decimal(delta_micro_credits)
-            )));
+
+        let total = found
+            .iter()
+            .fold(0i64, |sum, (_, found)| sum.saturating_add(found.credits));
+        if delta_micro_credits > total {
+            let message = match found.as_slice() {
+                [(id, found)] if single => format!(
+                    "{}; a compensation of {} credits is more than that; \
+                     send allowRepeat with a reason to compensate more",
+                    charged_text(id, found),
+                    micro_decimal(delta_micro_credits)
+                ),
+                _ => format!(
+                    "A compensation of {} credits is more than the {} credits these {} \
+                     requests were charged; send allowRepeat with a reason to compensate more",
+                    micro_decimal(delta_micro_credits),
+                    micro_decimal(total),
+                    found.len()
+                ),
+            };
+            let requests = found.iter().map(|(id, found)| of(id, found)).collect();
+            return Err(refused(
+                RefusalKind::Over,
+                message,
+                requests,
+                Some((delta_micro_credits, total)),
+            ));
         }
         Ok(())
+    }
+
+    /// What positive adjustments gave each of these requests, each named by its card and its
+    /// invocation ID, in their order: the shares added up and the latest, or `None` for one
+    /// never compensated. Read from the index kept beside the ledger, never the ledger.
+    pub fn request_compensations<'a>(
+        &self,
+        requests: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Vec<Option<crate::compensation::RequestCompensation>> {
+        let index = self.compensations.read().unwrap();
+        requests
+            .into_iter()
+            .map(|(card_id, invocation_id)| index.get(card_id, invocation_id).cloned())
+            .collect()
     }
 
     /// Audit & reconcile card balance against the immutable ledger (Spec §5, §14.9, §14.10.5).

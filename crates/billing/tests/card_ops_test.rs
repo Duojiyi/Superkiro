@@ -939,7 +939,14 @@ fn an_adjustment_keeps_the_request_it_makes_up_for() {
         events[0].invocation_id.as_deref(),
         Some("card-comp:inv-broken")
     );
-    assert_eq!(events[0].detail, None);
+    // Every request it names, and what each was charged.
+    assert_eq!(
+        events[0].detail,
+        Some(serde_json::json!({
+            "invocationIds": ["card-comp:inv-broken"],
+            "chargedMicroCredits": [5_000_000],
+        }))
+    );
     // An adjustment without one names none.
     engine
         .adjust_balance("card-comp", 1_000_000, "admin", "赠送", 1_200)
@@ -1030,7 +1037,11 @@ fn event_detail_has_its_own_field_and_older_entries_still_read() {
             ),
             (
                 "adjustment",
-                Some(json!({ "invocationId": "card-detail:inv-1" }))
+                Some(json!({
+                    "invocationId": "card-detail:inv-1",
+                    "invocationIds": ["card-detail:inv-1"],
+                    "chargedMicroCredits": [3_000_000],
+                }))
             ),
             (
                 "note_card",
@@ -1051,7 +1062,13 @@ fn event_detail_has_its_own_field_and_older_entries_still_read() {
     let now = history(&engine);
     let adjusted = now.0.iter().find(|e| e.action == "adjust").unwrap();
     assert_eq!(adjusted.invocation_id.as_deref(), Some("card-detail:inv-1"));
-    assert_eq!(adjusted.detail, None);
+    assert_eq!(
+        adjusted.detail,
+        Some(json!({
+            "invocationIds": ["card-detail:inv-1"],
+            "chargedMicroCredits": [3_000_000],
+        }))
+    );
     let unbound = now.0.iter().find(|e| e.action == "unbind").unwrap();
     assert_eq!(unbound.detail, Some(json!({ "deviceId": "device-old" })));
 
@@ -1071,7 +1088,11 @@ fn event_detail_has_its_own_field_and_older_entries_still_read() {
     assert_eq!(retried.detail, None);
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&retried.target_model).unwrap(),
-        json!({ "invocationId": "card-detail:inv-1" })
+        json!({
+            "invocationId": "card-detail:inv-1",
+            "invocationIds": ["card-detail:inv-1"],
+            "chargedMicroCredits": [3_000_000],
+        })
     );
     assert!(matches!(
         linked(&restored, "card-detail:inv-2"),
@@ -1260,8 +1281,9 @@ fn an_archived_request_is_found_and_its_compensation_still_counts() {
         Some(request("card-old:inv-1")),
     );
     assert!(
-        matches!(&again, Err(BillingError::CompensationRefused(message))
-            if message.contains("was charged 2 credits") && message.contains("already compensated 1 credits")),
+        matches!(&again, Err(BillingError::Compensation(refusal))
+            if refusal.message.contains("was charged 2 credits")
+                && refusal.message.contains("already compensated 1 credits")),
         "{again:?}"
     );
     let _ = std::fs::remove_dir_all(dir);
@@ -1386,4 +1408,186 @@ fn a_new_code_replaces_a_leaked_one() {
         ));
         assert_eq!(engine.get_card(id).unwrap(), before);
     }
+}
+
+/// A compensation may name several requests: each must be this card's, none may have been
+/// compensated before, and together they bound the amount. A refusal names every request
+/// that stops it; its message for one request is the one it always was.
+#[test]
+fn a_compensation_of_several_requests_is_checked_for_each() {
+    use billing::{BalanceAdjustment, RefusalKind};
+    let engine = BillingEngine::new();
+    engine.upsert_card(create_test_card("card-s", 1, 5, 0));
+    engine.upsert_card(create_test_card("card-t", 1, 5, 0));
+    charged_request(&engine, "card-s", "card-s:inv-1", 1_000_000);
+    charged_request(&engine, "card-s", "card-s:inv-2", 3_000_000);
+    charged_request(&engine, "card-s", "card-s:inv-3", 0);
+    charged_request(&engine, "card-t", "card-t:inv-9", 2_000_000);
+    let adjust = |credits: i64, key: &str, requests: &[&str], allow_repeat: bool| {
+        engine.adjust_card_balance(BalanceAdjustment {
+            card_id: "card-s",
+            delta_micro_credits: credits,
+            operator_id: "admin",
+            reason: "补偿中断",
+            now_secs: 1_700_000_100,
+            idempotency_key: Some(key),
+            requests,
+            allow_repeat,
+        })
+    };
+    let refusal = |result: Result<billing::LedgerEntry, BillingError>| match result {
+        Err(BillingError::Compensation(refusal)) => *refusal,
+        other => panic!("not a compensation refusal: {other:?}"),
+    };
+
+    let unknown = refusal(adjust(
+        1_000_000,
+        "k-1",
+        &["card-s:inv-1", "card-s:nope", "card-s:gone"],
+        false,
+    ));
+    assert_eq!(unknown.kind, RefusalKind::Unknown);
+    assert_eq!(unknown.message, "2 of the requests were not found");
+    let names: Vec<&str> = unknown
+        .requests
+        .iter()
+        .map(|r| r.invocation_id.as_str())
+        .collect();
+    assert_eq!(names, ["card-s:nope", "card-s:gone"]);
+    assert_eq!(unknown.requests[0].card_id, None);
+
+    let other = refusal(adjust(
+        1_000_000,
+        "k-2",
+        &["card-s:inv-1", "card-t:inv-9"],
+        false,
+    ));
+    assert_eq!(other.kind, RefusalKind::OtherCard);
+    assert_eq!(other.message, "1 of the requests were made by another card");
+    assert_eq!(other.requests.len(), 1);
+    assert_eq!(other.requests[0].card_id.as_deref(), Some("card-t"));
+    assert_eq!(other.requests[0].charged_micro_credits, Some(2_000_000));
+
+    let over = refusal(adjust(
+        4_500_000,
+        "k-3",
+        &["card-s:inv-1", "card-s:inv-2"],
+        false,
+    ));
+    assert_eq!(over.kind, RefusalKind::Over);
+    assert_eq!(
+        over.message,
+        "A compensation of 4.5 credits is more than the 4 credits these 2 requests were \
+         charged; send allowRepeat with a reason to compensate more"
+    );
+    assert_eq!(
+        (over.asked_micro_credits, over.charged_total_micro_credits),
+        (Some(4_500_000), Some(4_000_000))
+    );
+    assert_eq!(over.requests.len(), 2);
+    assert_eq!(engine.get_card("card-s").unwrap().credit_total, 100_000_000);
+
+    // Each once: a request named twice counts once.
+    adjust(
+        4_000_000,
+        "k-4",
+        &["card-s:inv-1", "card-s:inv-2", "card-s:inv-1"],
+        false,
+    )
+    .unwrap();
+    let history = history_of(&engine, "card-s", "adjust");
+    assert_eq!(history[0].invocation_id, None);
+    assert_eq!(
+        history[0].detail,
+        Some(serde_json::json!({
+            "invocationIds": ["card-s:inv-1", "card-s:inv-2"],
+            "chargedMicroCredits": [1_000_000, 3_000_000],
+        }))
+    );
+    // Each request is marked with its share, in proportion to its charge.
+    let marks = engine.request_compensations([
+        ("card-s", "card-s:inv-1"),
+        ("card-s", "card-s:inv-2"),
+        ("card-s", "card-s:inv-3"),
+    ]);
+    assert_eq!(
+        marks[0].as_ref().map(|c| c.total_micro_credits),
+        Some(1_000_000)
+    );
+    assert_eq!(
+        marks[1]
+            .as_ref()
+            .map(|c| (c.total_micro_credits, c.latest.at_secs)),
+        Some((3_000_000, 1_700_000_100))
+    );
+    assert!(marks[2].is_none());
+
+    // Asked again, with one request not yet compensated among them.
+    let repeat = refusal(adjust(
+        1_000_000,
+        "k-5",
+        &["card-s:inv-2", "card-s:inv-3", "card-s:inv-1"],
+        false,
+    ));
+    assert_eq!(repeat.kind, RefusalKind::Repeat);
+    assert_eq!(
+        repeat.message,
+        "2 of the requests were already compensated; send allowRepeat with a reason to \
+         compensate them again"
+    );
+    let earlier = &repeat.requests[0];
+    assert_eq!(earlier.invocation_id, "card-s:inv-2");
+    assert_eq!(earlier.compensated_micro_credits, Some(3_000_000));
+    assert_eq!(earlier.compensated_at_secs, Some(1_700_000_100));
+    assert_eq!(earlier.operator.as_deref(), Some("admin"));
+    assert_eq!(earlier.reason.as_deref(), Some("补偿中断"));
+    assert_eq!(earlier.charged_micro_credits, Some(3_000_000));
+    // The same one alone reads as it always did, with its own share.
+    let alone = refusal(adjust(1_000_000, "k-6", &["card-s:inv-1"], false));
+    assert_eq!(
+        alone.message,
+        "Request card-s:inv-1 was charged 1 credits at 1970-01-01T00:17:30Z, and was already \
+         compensated 1 credits at 2023-11-14T22:15:00Z by admin (补偿中断); send allowRepeat \
+         with a reason to compensate it again"
+    );
+    // Allowed, it is paid, and the marks add up.
+    adjust(1_000_000, "k-7", &["card-s:inv-1", "card-s:inv-2"], true).unwrap();
+    let marks =
+        engine.request_compensations([("card-s", "card-s:inv-1"), ("card-s", "card-s:inv-2")]);
+    assert_eq!(
+        marks[0].as_ref().map(|c| c.total_micro_credits),
+        Some(1_250_000)
+    );
+    assert_eq!(
+        marks[1].as_ref().map(|c| c.total_micro_credits),
+        Some(3_750_000)
+    );
+    // A retry of an adjustment naming several is the same adjustment, in any order.
+    adjust(4_000_000, "k-4", &["card-s:inv-2", "card-s:inv-1"], false).unwrap();
+    assert!(matches!(
+        adjust(4_000_000, "k-4", &["card-s:inv-2"], false),
+        Err(BillingError::InvalidAdjustment(message)) if message.starts_with("Idempotency conflict")
+    ));
+    assert_eq!(engine.get_card("card-s").unwrap().credit_total, 105_000_000);
+
+    // The marks are rebuilt from the ledger when the state loads.
+    let restored = BillingEngine::new();
+    restored.import_snapshot(engine.export_snapshot());
+    assert_eq!(
+        restored.request_compensations([("card-s", "card-s:inv-1"), ("card-s", "card-s:inv-2")]),
+        engine.request_compensations([("card-s", "card-s:inv-1"), ("card-s", "card-s:inv-2")])
+    );
+    let again = restored.adjust_card_balance(BalanceAdjustment {
+        card_id: "card-s",
+        delta_micro_credits: 1_000_000,
+        operator_id: "admin",
+        reason: "补偿中断",
+        now_secs: 1_700_000_200,
+        idempotency_key: Some("k-8"),
+        requests: &["card-s:inv-2"],
+        allow_repeat: false,
+    });
+    assert!(
+        matches!(again, Err(BillingError::Compensation(refusal)) if refusal.kind == RefusalKind::Repeat)
+    );
 }

@@ -3116,3 +3116,178 @@ async fn stats_name_each_groups_fast_model_and_why() {
     assert_eq!(fast["model"], "small-model", "{fast}");
     assert_eq!(fast["via"], "cheapest");
 }
+
+/// A compensation may name several requests. A refusal says which of them stopped it and
+/// what was found for each, beside the message; the traces mark each request compensated.
+#[tokio::test]
+async fn a_compensation_of_several_requests_names_each_refused_one() {
+    let (billing, app) = setup_admin_app();
+    billing.upsert_card(Card::new("card-other", "group-admin", 1_000));
+    charged_request(&billing, "card-admin-02", "card-admin-02:inv-1", 1_000_000);
+    charged_request(&billing, "card-admin-02", "card-admin-02:inv-2", 3_000_000);
+    charged_request(&billing, "card-other", "card-other:inv-9", 2_000_000);
+    let body = |points: f64, ids: serde_json::Value| {
+        json!({"cardId": "card-admin-02", "deltaPoints": points, "reason": "补偿中断",
+            "invocationIds": ids})
+    };
+
+    let (status, response) = adjust(
+        &app,
+        "several-both",
+        json!({"cardId": "card-admin-02", "deltaPoints": 1.0, "reason": "补偿中断",
+            "invocationId": "card-admin-02:inv-1", "invocationIds": ["card-admin-02:inv-2"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+    assert_eq!(
+        response["error"],
+        "Give invocationId or invocationIds, not both"
+    );
+    let too_many: Vec<String> = (0..51).map(|i| format!("card-admin-02:inv-{i}")).collect();
+    for ids in [json!([]), json!(too_many), json!(["card admin"])] {
+        let (status, response) = adjust(&app, "several-bad", body(1.0, ids)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(
+            response["error"],
+            "invocationIds must name 1 to 50 requests, each 1-257 ASCII letters, digits, -_.:"
+        );
+    }
+
+    let (status, response) = adjust(
+        &app,
+        "several-unknown",
+        body(1.0, json!(["card-admin-02:inv-1", "card-admin-02:nope"])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{response}");
+    assert_eq!(response["success"], false);
+    assert_eq!(response["error"], "1 of the requests were not found");
+    assert_eq!(
+        response["refusal"],
+        json!({"kind": "unknown", "requests": [{"invocationId": "card-admin-02:nope"}]})
+    );
+    // One request keeps the message it always had, and gains the same account of it.
+    let (status, response) = adjust(
+        &app,
+        "single-unknown",
+        json!({"cardId": "card-admin-02", "deltaPoints": 1.0, "reason": "补偿中断",
+            "invocationId": "card-admin-02:nope"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{response}");
+    assert_eq!(
+        response["error"],
+        "Request card-admin-02:nope was not found"
+    );
+    assert_eq!(response["refusal"]["kind"], "unknown");
+
+    let (status, response) = adjust(
+        &app,
+        "several-other",
+        body(1.0, json!(["card-admin-02:inv-1", "card-other:inv-9"])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    assert_eq!(
+        response["error"],
+        "1 of the requests were made by another card"
+    );
+    assert_eq!(
+        response["refusal"],
+        json!({"kind": "otherCard", "requests": [{"invocationId": "card-other:inv-9",
+            "cardId": "card-other", "chargedMicroCredits": 2_000_000,
+            "chargedAtSecs": 1_700_000_000u64}]})
+    );
+
+    let (status, response) = adjust(
+        &app,
+        "several-over",
+        body(5.0, json!(["card-admin-02:inv-1", "card-admin-02:inv-2"])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    assert_eq!(
+        response["error"],
+        "A compensation of 5 credits is more than the 4 credits these 2 requests were \
+         charged; send allowRepeat with a reason to compensate more"
+    );
+    assert_eq!(response["refusal"]["kind"], "over");
+    assert_eq!(response["refusal"]["askedMicroCredits"], 5_000_000);
+    assert_eq!(response["refusal"]["chargedTotalMicroCredits"], 4_000_000);
+    assert_eq!(response["refusal"]["requests"].as_array().unwrap().len(), 2);
+
+    let (status, response) = adjust(
+        &app,
+        "several-paid",
+        body(4.0, json!(["card-admin-02:inv-1", "card-admin-02:inv-2"])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let event = newest_event(&app, "card-admin-02", "adjust").await;
+    assert_eq!(event["invocationId"], serde_json::Value::Null);
+    assert_eq!(
+        event["detail"]["invocationIds"],
+        json!(["card-admin-02:inv-1", "card-admin-02:inv-2"])
+    );
+    assert_eq!(
+        event["detail"]["chargedMicroCredits"],
+        json!([1_000_000, 3_000_000])
+    );
+
+    // Each request is marked with its share of what was given back, and when.
+    let (status, listed) = admin_call(&app, Method::GET, "/api/v1/admin/traces", None).await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    let trace = |id: &str| {
+        listed["traces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|trace| trace["invocation_id"] == id)
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(
+        trace("card-admin-02:inv-1")["compensatedMicroCredits"],
+        1_000_000
+    );
+    assert_eq!(
+        trace("card-admin-02:inv-2")["compensatedMicroCredits"],
+        3_000_000
+    );
+    assert!(trace("card-admin-02:inv-2")["compensatedAtSecs"].is_u64());
+    let untouched = trace("card-other:inv-9");
+    assert_eq!(
+        untouched["compensatedMicroCredits"],
+        serde_json::Value::Null
+    );
+    assert_eq!(untouched["compensatedAtSecs"], serde_json::Value::Null);
+
+    let (status, response) = adjust(
+        &app,
+        "several-repeat",
+        body(1.0, json!(["card-admin-02:inv-2", "card-admin-02:inv-1"])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    assert_eq!(
+        response["error"],
+        "2 of the requests were already compensated; send allowRepeat with a reason to \
+         compensate them again"
+    );
+    let earlier = &response["refusal"]["requests"][0];
+    assert_eq!(response["refusal"]["kind"], "repeat");
+    assert_eq!(earlier["invocationId"], "card-admin-02:inv-2");
+    assert_eq!(earlier["cardId"], "card-admin-02");
+    assert_eq!(earlier["chargedMicroCredits"], 3_000_000);
+    assert_eq!(earlier["compensatedMicroCredits"], 3_000_000);
+    assert!(earlier["compensatedAtSecs"].is_u64());
+    assert_eq!(earlier["operator"], "admin");
+    assert_eq!(earlier["reason"], "补偿中断");
+    assert_eq!(
+        billing
+            .get_card("card-admin-02")
+            .unwrap()
+            .available_credits(),
+        5_000_000 + 4_000_000
+    );
+}

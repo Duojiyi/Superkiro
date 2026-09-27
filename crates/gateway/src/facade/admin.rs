@@ -912,6 +912,7 @@ impl FacadeHandler for AdminTracesHandler {
                 .unwrap_or(100)
                 .clamp(1, 500);
             let (traces, totals) = self.billing.search_traces(&filter, limit);
+            let traces = traces_view(&self.billing, traces);
             json_response(
                 StatusCode::OK,
                 &serde_json::json!({
@@ -924,6 +925,38 @@ impl FacadeHandler for AdminTracesHandler {
             )
         })
     }
+}
+
+/// Traces as the console lists them: each with what positive adjustments gave its request,
+/// `compensatedMicroCredits` (their shares added up) and `compensatedAtSecs` (the latest),
+/// both null for a request never compensated.
+fn traces_view(
+    billing: &BillingEngine,
+    traces: Vec<billing::RequestTrace>,
+) -> Vec<serde_json::Value> {
+    let compensations = billing.request_compensations(
+        traces
+            .iter()
+            .map(|trace| (trace.card_id.as_str(), trace.invocation_id.as_str())),
+    );
+    traces
+        .into_iter()
+        .zip(compensations)
+        .map(|(trace, compensation)| {
+            let mut view = serde_json::to_value(&trace).unwrap_or_default();
+            if let Some(fields) = view.as_object_mut() {
+                fields.insert(
+                    "compensatedMicroCredits".into(),
+                    serde_json::json!(compensation.as_ref().map(|c| c.total_micro_credits)),
+                );
+                fields.insert(
+                    "compensatedAtSecs".into(),
+                    serde_json::json!(compensation.as_ref().map(|c| c.latest.at_secs)),
+                );
+            }
+            view
+        })
+        .collect()
 }
 
 /// One request's content and the upstream model's reply, kept for 24 hours for tracing.
@@ -1968,9 +2001,20 @@ pub struct AdminCardAdjustRequest {
     pub idempotency_key: Option<String>,
     /// The request the adjustment makes up for, as its trace names it.
     pub invocation_id: Option<String>,
-    /// Compensate that request again, or by more than it was charged; needs a reason.
+    /// The requests it makes up for, 1 to 50, instead of `invocationId`.
+    pub invocation_ids: Option<Vec<String>>,
+    /// Compensate those requests again, or by more than they were charged; needs a reason.
     #[serde(default)]
     pub allow_repeat: bool,
+}
+
+/// Whether `id` is a request's key as a trace names it: 1-257 ASCII letters, digits, -_.:
+fn valid_invocation_key(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= billing::MAX_INVOCATION_KEY_BYTES
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b))
 }
 
 pub struct AdminCardAdjustHandler {
@@ -2098,33 +2142,50 @@ impl FacadeHandler for AdminCardAdjustHandler {
             }
             // As a trace names a request: the card, a colon and the client's invocation id.
             let invocation_id = req_data.invocation_id.as_deref().map(str::trim);
-            if invocation_id.is_some_and(|id| {
-                id.is_empty()
-                    || id.len() > billing::MAX_INVOCATION_KEY_BYTES
-                    || !id
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b))
-            }) {
+            if invocation_id.is_some_and(|id| !valid_invocation_key(id)) {
                 return error_response(
                     StatusCode::BAD_REQUEST,
                     "InvalidRequestException",
                     "invocationId must be 1-257 ASCII letters, digits, -_.:",
                 );
             }
+            let requests: Vec<&str> = match (invocation_id, req_data.invocation_ids.as_deref()) {
+                (Some(_), Some(_)) => {
+                    return failure(
+                        StatusCode::BAD_REQUEST,
+                        "Give invocationId or invocationIds, not both",
+                    )
+                }
+                (Some(id), None) => vec![id],
+                (None, Some(ids)) => {
+                    let ids: Vec<&str> = ids.iter().map(|id| id.trim()).collect();
+                    if ids.is_empty()
+                        || ids.len() > billing::MAX_COMPENSATED_REQUESTS
+                        || !ids.iter().all(|id| valid_invocation_key(id))
+                    {
+                        return failure(
+                            StatusCode::BAD_REQUEST,
+                            "invocationIds must name 1 to 50 requests, each 1-257 ASCII letters, digits, -_.:",
+                        );
+                    }
+                    ids
+                }
+                (None, None) => Vec::new(),
+            };
 
             let now = now_secs();
-            match self.billing.adjust_balance_linked(
-                &req_data.card_id,
-                delta_credits,
-                operator_id,
-                &reason,
-                now,
-                Some(idempotency_key),
-                invocation_id.map(|invocation_id| billing::CompensatedRequest {
-                    invocation_id,
+            match self
+                .billing
+                .adjust_card_balance(billing::BalanceAdjustment {
+                    card_id: &req_data.card_id,
+                    delta_micro_credits: delta_credits,
+                    operator_id,
+                    reason: &reason,
+                    now_secs: now,
+                    idempotency_key: Some(idempotency_key),
+                    requests: &requests,
                     allow_repeat: req_data.allow_repeat,
-                }),
-            ) {
+                }) {
                 Ok(_entry) => {
                     let card = self.billing.get_card(&req_data.card_id);
                     let new_available = card.as_ref().map(|c| c.available_credits()).unwrap_or(0);
@@ -2135,6 +2196,22 @@ impl FacadeHandler for AdminCardAdjustHandler {
                             "cardId": req_data.card_id,
                             "newAvailableCredits": new_available,
                             "newAvailablePoints": (new_available as f64) / (billing::MICRO_CREDITS_PER_CREDIT as f64),
+                        }),
+                    )
+                }
+                // Which requests stopped it and what was found for each, beside the message.
+                Err(billing::BillingError::Compensation(refusal)) => {
+                    let status = if refusal.kind == billing::RefusalKind::Unknown {
+                        StatusCode::NOT_FOUND
+                    } else {
+                        StatusCode::CONFLICT
+                    };
+                    json_response(
+                        status,
+                        &serde_json::json!({
+                            "success": false,
+                            "error": refusal.message,
+                            "refusal": refusal,
                         }),
                     )
                 }
