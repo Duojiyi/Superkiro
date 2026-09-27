@@ -1038,7 +1038,7 @@ async fn kiros_activity_log_is_accepted_and_never_kept() {
 
 /// Prepaid credits never reset, and Kiro has no way to say so: its account page prints
 /// "resets on MM/DD" from the date it is sent, "NaN/NaN" without one. It gets the card's
-/// expiry, or 9999-12-31 for a card that never expires, with the plan name saying which;
+/// expiry, or 9999-12-31 for a card that never expires, separate from the plan badge;
 /// the usage line carries no date, which Kiro announced as "Your usage is reset" each time
 /// a card's validity was extended. The usage is to the hundredth, and the account is the
 /// card, not an address.
@@ -1091,10 +1091,7 @@ async fn usage_reports_the_cards_expiry_not_a_monthly_reset() {
         .is_none());
     assert_eq!(
         expiring["subscriptionInfo"]["subscriptionTitle"],
-        format!(
-            "Legacy service plan · 有效期至 {}",
-            &gateway::facade::oauth::format_epoch_to_iso8601(until)[..10]
-        )
+        "Legacy service plan"
     );
     let breakdown = &expiring["usageBreakdownList"][0];
     assert_eq!(breakdown["currentUsage"], json!(0.12));
@@ -1102,7 +1099,9 @@ async fn usage_reports_the_cards_expiry_not_a_monthly_reset() {
     assert_eq!(breakdown["usageLimitWithPrecision"], json!(1.0));
     assert_eq!(expiring["userInfo"]["email"], "卡号 ····ring");
 
+    assert_eq!(expiring["validUntil"], until);
     let lasting = usage("card-lasting").await;
+    assert!(lasting["validUntil"].is_null());
     // 9999-12-31, which Kiro shows as "12/31".
     assert_eq!(lasting["nextDateReset"], 253_402_214_400u64, "{lasting}");
     assert!(lasting["daysUntilReset"].as_u64().unwrap() > 2_900_000);
@@ -1111,7 +1110,7 @@ async fn usage_reports_the_cards_expiry_not_a_monthly_reset() {
         .is_none());
     assert_eq!(
         lasting["subscriptionInfo"]["subscriptionTitle"],
-        "Legacy service plan · 长期有效"
+        "Legacy service plan"
     );
 }
 
