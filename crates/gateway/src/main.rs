@@ -474,7 +474,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "[√] Client Negotiate Endpoint: http://{}/client/negotiate",
         addr
     );
-    println!("[√] Global body limit: 10 MB, request timeout: 300s");
+    println!(
+        "[√] Body limit: 10 MB (conversations {} MB), request timeout: 300s",
+        gateway::security::ContentGuardrailConfig::default().max_body_bytes / (1024 * 1024)
+    );
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await

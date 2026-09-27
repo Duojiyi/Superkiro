@@ -913,3 +913,92 @@ async fn usage_reports_the_cards_expiry_not_a_monthly_reset() {
         .get("nextDateReset")
         .is_none());
 }
+
+/// Kiro sends every image in a conversation again with each turn, so a long session with
+/// screenshots outgrew the 10 MB the gateway read, and then every turn failed with
+/// "Failed to read request body". Up to 32 MB is read now; a larger body, whether its
+/// length is declared or found while reading, is the overflow Kiro compacts for.
+#[tokio::test]
+async fn a_large_conversation_is_read_and_a_larger_one_is_compacted() {
+    let server = upstream(
+        ResponseTemplate::new(200).set_body_raw(anthropic_answer("hi"), "text/event-stream"),
+    )
+    .await;
+    let billing = engine(
+        ProviderFormat::Anthropic,
+        &server.uri(),
+        vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+    );
+    // As served, with the router-wide default limit, which no facade handler reads.
+    let app = serve(&billing).layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024));
+    let post = |invocation: &str, length: Option<usize>, body: Body| {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/generateAssistantResponse")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("amz-sdk-invocation-id", invocation);
+        if let Some(length) = length {
+            request = request.header(header::CONTENT_LENGTH, length);
+        }
+        let mut request = request.body(body).unwrap();
+        request.extensions_mut().insert(claims());
+        let app = app.clone();
+        async move {
+            let response = app.oneshot(request).await.unwrap();
+            let status = response.status();
+            let headers = response.headers().clone();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec();
+            Reply {
+                status,
+                headers,
+                bytes,
+            }
+        }
+    };
+    let turn = body(json!({"content": "hello", "modelId": "model"}), vec![]).to_string();
+
+    // 12 MB, padded with JSON whitespace.
+    let large = format!("{turn}{}", " ".repeat(12 * 1024 * 1024));
+    let reply = post("inv-large", Some(large.len()), Body::from(large)).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    assert_eq!(usage_entries(&billing).len(), 1);
+
+    // Declared over the limit: refused before it is read.
+    let reply = post(
+        "inv-declared",
+        Some(33 * 1024 * 1024),
+        Body::from(turn.clone()),
+    )
+    .await;
+    assert_overflow(&reply);
+    assert!(reply.text().contains("32 MB"), "{}", reply.text());
+    assert_eq!(reply.headers["x-amzn-requestid"], "inv-declared");
+
+    // Sent without a length, and found over it while reading.
+    let padding = bytes::Bytes::from(vec![b' '; 1024 * 1024]);
+    let chunks = std::iter::once(bytes::Bytes::from(turn))
+        .chain(std::iter::repeat_n(padding, 33))
+        .map(Ok::<_, std::io::Error>);
+    let reply = post(
+        "inv-streamed",
+        None,
+        Body::from_stream(futures_util::stream::iter(chunks)),
+    )
+    .await;
+    assert_overflow(&reply);
+
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    assert_eq!(usage_entries(&billing).len(), 1);
+    assert_eq!(
+        trace_class(&billing, "inv-declared"),
+        vec!["input_too_long"]
+    );
+    assert_eq!(
+        trace_class(&billing, "inv-streamed"),
+        vec!["input_too_long"]
+    );
+}

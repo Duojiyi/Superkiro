@@ -258,9 +258,24 @@ impl GenerateAssistantResponseHandler {
                 }
             };
 
-            // 3. Buffer request body
-            let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
-                Ok(b) => b,
+            // 3. Buffer request body. One over the limit is refused as too long, which Kiro
+            // compacts the conversation for, whether its length is declared or found.
+            let body_limit = self.content_guardrail.max_body_bytes;
+            let declared_length = parts
+                .headers
+                .get(header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<u64>().ok());
+            if declared_length.is_some_and(|length| length > body_limit as u64) {
+                self.record_refusal(claims.as_ref(), &invocation_key, "", "input_too_long");
+                return body_too_large(body_limit);
+            }
+            let body_bytes = match read_body(body, body_limit, declared_length).await {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    self.record_refusal(claims.as_ref(), &invocation_key, "", "input_too_long");
+                    return body_too_large(body_limit);
+                }
                 Err(e) => {
                     return error_response(
                         StatusCode::BAD_REQUEST,
@@ -1493,6 +1508,36 @@ fn provider_input_too_long(error: &ProviderError) -> bool {
             ]
             .iter()
             .any(|phrase| body.contains(phrase))
+}
+
+/// A conversation larger than the gateway reads. Kiro sends every image in a conversation
+/// again with each turn, so that is mostly screenshots, which compacting it leaves behind.
+fn body_too_large(limit: usize) -> Response {
+    input_too_long(&format!(
+        "请求体超过网关 {} MB 的上限，多为对话中累积的图片",
+        limit / (1024 * 1024)
+    ))
+}
+
+/// A request body of at most `limit` bytes, or `None` when it is longer. Room for the
+/// length it declares is taken at once, so a large body is not copied while it arrives.
+async fn read_body(
+    body: Body,
+    limit: usize,
+    declared_length: Option<u64>,
+) -> Result<Option<bytes::Bytes>, axum::Error> {
+    use futures_util::StreamExt;
+    let capacity = declared_length.map_or(0, |length| length.min(limit as u64) as usize);
+    let mut data = bytes::BytesMut::with_capacity(capacity);
+    let mut chunks = body.into_data_stream();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk?;
+        if chunk.len() > limit - data.len() {
+            return Ok(None);
+        }
+        data.extend_from_slice(&chunk);
+    }
+    Ok(Some(data.freeze()))
 }
 
 /// A request whose every attempt came back empty. It was billed the input consumed, so it
