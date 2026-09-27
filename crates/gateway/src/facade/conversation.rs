@@ -486,13 +486,20 @@ impl GenerateAssistantResponseHandler {
                         )
                     });
                 let estimated_input_tokens = request_for_reservation
-                    .map(|request| estimate_input_tokens(request).saturating_add(prefix_tokens))
+                    .map(|request| {
+                        estimate_input_tokens(
+                            request,
+                            self.content_guardrail.max_images_per_request,
+                        )
+                        .saturating_add(prefix_tokens)
+                    })
                     .unwrap_or(2_000)
                     .max(1);
-                // Sent anyway, a prompt over the model's limit is refused upstream, and Kiro
-                // could not tell that refusal from an outage. Refused here, it compacts the
-                // conversation and tries again.
-                if estimated_input_tokens > input_limit {
+                // Refused before it is sent only beyond the estimate's own error: nearer
+                // the limit, the upstream's report of an overflow, which Kiro compacts for
+                // just the same, decides. Refused on the estimate alone, Chinese-heavy
+                // conversations that fit were compacted, and each compaction is billed.
+                if estimated_input_tokens > input_limit.saturating_mul(ESTIMATE_ERROR) {
                     self.record_refusal(
                         claims.as_ref(),
                         &invocation_key,
@@ -503,6 +510,9 @@ impl GenerateAssistantResponseHandler {
                         "本次请求估计约 {estimated_input_tokens} 个 token，超过该模型 {input_limit} 个 token 的输入上限"
                     ));
                 }
+                // Whatever the estimate, the model takes no more input than its limit, and
+                // no more is billed.
+                let estimated_input_tokens = estimated_input_tokens.min(input_limit);
                 reserved_estimated_input = estimated_input_tokens;
                 reserved_max_output = max_output_tokens_for_model(
                     requested_model_for_reservation,
@@ -1965,13 +1975,28 @@ fn valid_model_id(model: &str) -> bool {
     billing::group::valid_model_id(model.trim())
 }
 
-fn estimate_input_tokens(request: &GenerateAssistantResponseRequest) -> u64 {
+/// How far above a request's real size its estimate may be: it overcounts CJK and deep
+/// indentation at most about twofold.
+const ESTIMATE_ERROR: u64 = 2;
+
+/// The input tokens `request` is estimated to be sent as, when a vision model is sent its
+/// most recent `max_images` images.
+fn estimate_input_tokens(request: &GenerateAssistantResponseRequest, max_images: usize) -> u64 {
+    use crate::translate::to_provider::{
+        image_count, images_left_as_notes, older_image_note_tokens,
+    };
     // The whole request counts — tool schemas, tool results, history, editor state —
-    // except image payloads, which count at what a provider charges for an image.
-    // Provider usage still settles the final charge whenever it is reported.
-    serde_json::to_value(request)
+    // except image payloads, which count at what a provider charges for an image, and only
+    // for the images sent: Kiro resends every image of the conversation on each turn, and
+    // older ones go as a note. Provider usage still settles the final charge whenever it is
+    // reported.
+    let whole = serde_json::to_value(request)
         .map(|value| crate::usage_estimate::estimate_json_tokens(&value))
-        .unwrap_or(u64::MAX)
+        .unwrap_or(u64::MAX);
+    let notes = images_left_as_notes(image_count(request), max_images) as u64;
+    whole.saturating_sub(notes.saturating_mul(
+        crate::usage_estimate::IMAGE_TOKENS.saturating_sub(older_image_note_tokens()),
+    ))
 }
 
 /// The most input tokens `model` accepts: its group's configured limit when the model

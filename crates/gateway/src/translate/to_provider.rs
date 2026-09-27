@@ -102,6 +102,25 @@ fn images_in_order(req: &GenerateAssistantResponseRequest) -> Vec<(Turn, &KiroIm
         .collect()
 }
 
+/// How many images a request carries, in its history and its current message.
+pub fn image_count(req: &GenerateAssistantResponseRequest) -> usize {
+    images_in_order(req).len()
+}
+
+/// Of `total` images, oldest first, how many a request for a vision model sends as notes
+/// instead: it sends the most recent `max_images`.
+pub fn images_left_as_notes(total: usize, max_images: usize) -> usize {
+    total.saturating_sub(max_images)
+}
+
+/// The tokens of the note a vision model reads in place of an image left out for its age.
+pub fn older_image_note_tokens() -> u64 {
+    crate::usage_estimate::tokens_from_units(crate::usage_estimate::token_units(&omission_note(
+        1,
+        Omission::OverCount,
+    )))
+}
+
 /// Decide how each image of a request for a vision model reaches the provider.
 ///
 /// Only the most recent `max_images` go as images: a conversation resends every earlier
@@ -114,7 +133,7 @@ pub async fn prepare_images(
     budget: std::time::Duration,
 ) -> PreparedImages {
     let images = images_in_order(req);
-    let keep_from = images.len().saturating_sub(max_images);
+    let keep_from = images_left_as_notes(images.len(), max_images);
     let mut decided = Vec::with_capacity(images.len());
     let mut to_shrink = Vec::new();
     for (position, (_, image)) in images.iter().enumerate() {

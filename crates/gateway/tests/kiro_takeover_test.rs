@@ -339,6 +339,83 @@ async fn a_prompt_over_the_models_limit_is_refused_before_it_is_sent() {
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
 }
 
+/// A 1x1 PNG.
+const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+/// The estimate overcounts (CJK and deep indentation up to about twofold), so a prompt
+/// estimated over the limit but within that error is sent, and the upstream's report of an
+/// overflow is what Kiro compacts for. Refused on the estimate alone, conversations that
+/// fit were compacted, and each compaction is billed.
+#[tokio::test]
+async fn a_prompt_within_the_estimates_error_is_left_to_the_upstream() {
+    let server = upstream(ResponseTemplate::new(400).set_body_json(json!({
+        "type": "error",
+        "error": {"type": "invalid_request_error", "message": "prompt is too long: 1200 tokens > 1000 maximum"}
+    })))
+    .await;
+    let mut small = ModelMap::new("map", GROUP, "model", "prov", "up-model");
+    small.context_window = 1_000;
+    small.max_output = 500;
+    let billing = engine(ProviderFormat::Anthropic, &server.uri(), vec![small]);
+    let app = serve(&billing);
+
+    // About 1,300 tokens by the estimate.
+    let reply = send(
+        &app,
+        "inv-near",
+        body(
+            json!({"content": "word ".repeat(1_000), "modelId": "model"}),
+            vec![],
+        ),
+    )
+    .await;
+    assert_overflow(&reply);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    nothing_charged(&billing);
+    assert_eq!(trace_class(&billing, "inv-near"), vec!["input_too_long"]);
+}
+
+/// Kiro resends every image of a conversation on each turn, and only the most recent 20
+/// are sent; older ones go as a note. The pre-flight counts what is sent: counting every
+/// image refused a long UI session as too long, and Kiro compacted it early.
+#[tokio::test]
+async fn only_the_images_sent_count_toward_the_models_limit() {
+    let server = upstream(
+        ResponseTemplate::new(200).set_body_raw(anthropic_answer("hi"), "text/event-stream"),
+    )
+    .await;
+    let mut map = ModelMap::new("map", GROUP, "model", "prov", "up-model");
+    map.context_window = 100_000;
+    map.max_output = 1_000;
+    let billing = engine(ProviderFormat::Anthropic, &server.uri(), vec![map]);
+    let app = serve(&billing);
+    let image = json!({"format": "png", "source": {"bytes": PNG}});
+    // 130 screenshots: 208,000 tokens counted as images, over twice the limit; 32,000 sent.
+    let history: Vec<Value> = (0..130)
+        .flat_map(|turn| {
+            [
+                json!({"userInputMessage": {"content": format!("screenshot {turn}"),
+                    "images": [image.clone()]}}),
+                json!({"assistantResponseMessage": {"content": "noted"}}),
+            ]
+        })
+        .collect();
+    let reply = send(
+        &app,
+        "inv-screenshots",
+        body(
+            json!({"content": "what changed?", "modelId": "model"}),
+            history,
+        ),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let sent = String::from_utf8_lossy(&requests[0].body).into_owned();
+    assert_eq!(sent.matches("\"type\":\"image\"").count(), 20);
+}
+
 #[tokio::test]
 async fn the_gateways_own_length_limits_are_overflows_too() {
     let server = upstream(
