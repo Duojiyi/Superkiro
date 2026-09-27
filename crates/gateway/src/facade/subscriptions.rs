@@ -39,6 +39,36 @@ pub struct ListAvailableSubscriptionsResponse {
 pub struct CreateSubscriptionTokenResponse {
     pub subscription_token: String,
     pub expires_at: String,
+    /// What the "Manage Plan" button of Kiro's account page opens: the gateway's customer
+    /// portal, where the card is looked up. Without it the button did nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoded_verification_url: Option<String>,
+    /// Kiro's own names for the rest of the answer.
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub token: String,
+}
+
+/// The customer portal's address as the client reached the gateway: behind the proxy, the
+/// host it forwarded and the scheme it was reached by.
+fn portal_url(headers: &axum::http::HeaderMap) -> Option<String> {
+    let value = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.split(',').next().unwrap_or(value).trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let host = value("x-forwarded-host").or_else(|| value("host"))?;
+    if host.contains(['/', '?', '#', '@', ' ', '\\']) {
+        return None;
+    }
+    let local = host.starts_with("localhost") || host.starts_with("127.0.0.1");
+    let scheme = value("x-forwarded-proto")
+        .filter(|scheme| scheme == "http" || scheme == "https")
+        .unwrap_or_else(|| if local { "http" } else { "https" }.to_string());
+    Some(format!("{scheme}://{host}/portal"))
 }
 
 /// Handler for `POST /listAvailableSubscriptions`
@@ -105,8 +135,9 @@ impl FacadeHandler for CreateSubscriptionTokenHandler {
         "/CreateSubscriptionToken"
     }
 
-    fn handle<'a>(&'a self, _req: Request<Body>) -> BoxFuture<'a, Response> {
+    fn handle<'a>(&'a self, req: Request<Body>) -> BoxFuture<'a, Response> {
         Box::pin(async move {
+            let portal = portal_url(req.headers());
             let mut token_bytes = [0u8; 24];
             if SystemRandom::new().fill(&mut token_bytes).is_err() {
                 return super::error_response(
@@ -125,8 +156,11 @@ impl FacadeHandler for CreateSubscriptionTokenHandler {
             let expires_at =
                 super::oauth::format_epoch_to_iso8601(crate::now_secs().saturating_add(900));
             let resp = CreateSubscriptionTokenResponse {
-                subscription_token: token,
+                subscription_token: token.clone(),
                 expires_at,
+                encoded_verification_url: portal,
+                status: "ACTIVE".to_string(),
+                token,
             };
             json_response(StatusCode::OK, &resp)
         })

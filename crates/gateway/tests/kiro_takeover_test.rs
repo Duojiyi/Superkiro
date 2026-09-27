@@ -433,8 +433,11 @@ async fn kiros_fast_model_is_the_model_named_for_it_and_billed_as_it() {
     assert_eq!(listed(&billing), vec!["main-model"]);
 }
 
+/// Without an alias, the fast model is the group's cheapest listed model at the price in
+/// force, the first in the group's order among equals: sent to the group's first model it
+/// was often the flagship, at the flagship's price.
 #[tokio::test]
-async fn without_a_model_named_for_it_kiros_fast_model_is_the_group_default() {
+async fn without_a_model_named_for_it_kiros_fast_model_is_the_cheapest_listed() {
     let server = upstream(
         ResponseTemplate::new(200).set_body_raw(anthropic_answer("fix: typo"), "text/event-stream"),
     )
@@ -874,7 +877,8 @@ async fn a_billed_turn_reports_its_credits_before_it_ends() {
     let charged = usage_entries(&billing)[0].credits_charged;
     assert!(charged > 0);
     let event = &frames[metering].1;
-    assert_eq!(event["unit"], "Credit");
+    // Kiro's own unit: it adds a turn's usage up by it, and its telemetry knows only it.
+    assert_eq!(event["unit"], "credit");
     assert_eq!(event["unitPlural"], "Credits");
     assert!(
         (event["usage"].as_f64().unwrap() - charged as f64 / 1_000_000.0).abs() < 1e-9,
@@ -923,8 +927,12 @@ async fn kiros_activity_log_is_accepted_and_never_kept() {
     assert_eq!(post(secured, None).await.status(), StatusCode::UNAUTHORIZED);
 }
 
-/// Prepaid credits never reset: the usage panel said "resets in 30 days" for every card.
-/// It now gives the card's expiry, or nothing for a card that never expires.
+/// Prepaid credits never reset, and Kiro has no way to say so: its account page prints
+/// "resets on MM/DD" from the date it is sent, "NaN/NaN" without one. It gets the card's
+/// expiry, or 9999-12-31 for a card that never expires, with the plan name saying which;
+/// the usage line carries no date, which Kiro announced as "Your usage is reset" each time
+/// a card's validity was extended. The usage is to the hundredth, and the account is the
+/// card, not an address.
 #[tokio::test]
 async fn usage_reports_the_cards_expiry_not_a_monthly_reset() {
     let billing = BillingEngine::new();
@@ -932,6 +940,7 @@ async fn usage_reports_the_cards_expiry_not_a_monthly_reset() {
     let now = gateway::now_secs();
     let mut expiring = Card::new("card-expiring", GROUP, billing::MICRO_CREDITS_PER_CREDIT);
     expiring.activate(now, 10 * 86_400).unwrap();
+    expiring.credit_used = 123_456;
     let until = expiring.valid_until.unwrap();
     billing.upsert_card(expiring);
     let mut lasting = Card::new("card-lasting", GROUP, billing::MICRO_CREDITS_PER_CREDIT);
@@ -968,13 +977,89 @@ async fn usage_reports_the_cards_expiry_not_a_monthly_reset() {
     let expiring = usage("card-expiring").await;
     assert_eq!(expiring["nextDateReset"], until);
     assert_eq!(expiring["daysUntilReset"], 10);
-    assert_eq!(expiring["usageBreakdownList"][0]["nextDateReset"], until);
+    assert!(expiring["usageBreakdownList"][0]
+        .get("nextDateReset")
+        .is_none());
+    assert_eq!(
+        expiring["subscriptionInfo"]["subscriptionTitle"],
+        format!(
+            "Legacy service plan · 有效期至 {}",
+            &gateway::facade::oauth::format_epoch_to_iso8601(until)[..10]
+        )
+    );
+    let breakdown = &expiring["usageBreakdownList"][0];
+    assert_eq!(breakdown["currentUsage"], json!(0.12));
+    assert_eq!(breakdown["currentUsageWithPrecision"], json!(0.12));
+    assert_eq!(breakdown["usageLimitWithPrecision"], json!(1.0));
+    assert_eq!(expiring["userInfo"]["email"], "卡号 ····ring");
+
     let lasting = usage("card-lasting").await;
-    assert!(lasting.get("nextDateReset").is_none(), "{lasting}");
-    assert!(lasting.get("daysUntilReset").is_none());
+    // 9999-12-31, which Kiro shows as "12/31".
+    assert_eq!(lasting["nextDateReset"], 253_402_214_400u64, "{lasting}");
+    assert!(lasting["daysUntilReset"].as_u64().unwrap() > 2_900_000);
     assert!(lasting["usageBreakdownList"][0]
         .get("nextDateReset")
         .is_none());
+    assert_eq!(
+        lasting["subscriptionInfo"]["subscriptionTitle"],
+        "Legacy service plan · 长期有效"
+    );
+}
+
+/// Kiro's "Manage Plan" opens the address CreateSubscriptionToken gives: the gateway's
+/// customer portal, at the host and scheme the client reached it by.
+#[tokio::test]
+async fn manage_plan_opens_the_customer_portal() {
+    let mut registry = FacadeRegistry::new();
+    registry.register(gateway::facade::subscriptions::CreateSubscriptionTokenHandler);
+    let app = registry.into_router();
+    let token = |headers: &'static [(&'static str, &'static str)]| {
+        let app = app.clone();
+        async move {
+            let mut request = Request::builder()
+                .method(Method::POST)
+                .uri("/CreateSubscriptionToken")
+                .header(header::CONTENT_TYPE, "application/json");
+            for (name, value) in headers {
+                request = request.header(*name, *value);
+            }
+            let response = app
+                .oneshot(
+                    request
+                        .body(Body::from(r#"{"provider":"STRIPE"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<Value>(&bytes).unwrap()
+        }
+    };
+
+    let behind_proxy = token(&[
+        ("host", "gateway:19820"),
+        ("x-forwarded-host", "kiro.example"),
+        ("x-forwarded-proto", "https"),
+    ])
+    .await;
+    assert_eq!(
+        behind_proxy["encodedVerificationUrl"],
+        "https://kiro.example/portal"
+    );
+    assert_eq!(behind_proxy["status"], "ACTIVE");
+    assert_eq!(behind_proxy["token"], behind_proxy["subscriptionToken"]);
+    assert!(!behind_proxy["token"].as_str().unwrap().is_empty());
+
+    let direct = token(&[("host", "127.0.0.1:19820")]).await;
+    assert_eq!(
+        direct["encodedVerificationUrl"],
+        "http://127.0.0.1:19820/portal"
+    );
+    let forged = token(&[("x-forwarded-host", "evil.example/phish?x=")]).await;
+    assert!(forged.get("encodedVerificationUrl").is_none(), "{forged}");
 }
 
 /// Kiro sends every image in a conversation again with each turn, so a long session with
@@ -1177,4 +1262,669 @@ async fn a_large_conversations_place_is_given_back_on_every_path() {
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
     assert_eq!(gate.in_use(), 0);
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+/// Kiro's calls outside the conversation, at the paths and methods it uses, answered in
+/// forms it acts on or shows instead of the 404 fallback.
+#[tokio::test]
+async fn kiros_other_calls_are_answered_at_its_own_paths() {
+    let auth = gateway::auth::AuthState::with_default_dev_card();
+    let token = auth
+        .issue_token("card-dev-001", "group-pro-plus", 1, 3600)
+        .unwrap();
+    let app = FacadeRegistry::default().into_router_with_auth(auth);
+    let call = |method: Method, path: &'static str, signed_in: bool, body: &'static str| {
+        let app = app.clone();
+        let token = token.clone();
+        async move {
+            let mut request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json");
+            if signed_in {
+                request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            let response = app
+                .oneshot(request.body(Body::from(body)).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (
+                status,
+                serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+            )
+        }
+    };
+
+    // Autocomplete, which Kiro posts in lower case: no suggestions, and no error popup.
+    let (status, body) = call(Method::POST, "/generatecompletions", true, "{}").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["completions"], json!([]));
+    // Sign-out comes after Kiro has dropped its tokens, so it carries none.
+    let (status, _) = call(Method::POST, "/logout", false, r#"{"refreshToken":"r"}"#).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    // Kiro shows a 4xx's message after "Failed to delete account: ".
+    let (status, body) = call(Method::DELETE, "/account", true, "").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["message"].as_str().unwrap().contains("卡密"), "{body}");
+    // The overage toggle: "Unable to enable overages: {message}".
+    let (status, body) = call(
+        Method::POST,
+        "/setUserPreference",
+        true,
+        r#"{"overageConfiguration":{"overageStatus":"ENABLED"}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["__type"], "ValidationException");
+    assert!(
+        body["message"].as_str().unwrap().contains("预付费"),
+        "{body}"
+    );
+}
+
+/// 1x1 PNG.
+const PNG_1X1: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+/// The gateway's own refusals carry the reasons Kiro's service gives the same refusals:
+/// Kiro shows an image one as an image error with its detail. InvalidRequestException read
+/// "Something went wrong: [InvalidRequestException] ...".
+#[tokio::test]
+async fn the_gateways_own_refusals_carry_the_reasons_kiro_knows() {
+    let server = upstream(ResponseTemplate::new(200)).await;
+    let billing = engine(
+        ProviderFormat::Anthropic,
+        &server.uri(),
+        vec![ModelMap::new("map", GROUP, "model", "prov", "up")],
+    );
+    let app = serve(&billing);
+    let image = json!({"format": "png", "source": {"bytes": PNG_1X1}});
+    let refusal = |reply: &Reply| {
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text());
+        let body = reply.json();
+        assert_eq!(body["__type"], "ValidationException", "{body}");
+        (
+            body["reason"].as_str().unwrap_or_default().to_string(),
+            body["message"].as_str().unwrap_or_default().to_string(),
+        )
+    };
+
+    let images = vec![image.clone(); 21];
+    let reply = send(
+        &app,
+        "inv-images",
+        body(
+            json!({"content": "look", "modelId": "model", "images": images}),
+            vec![],
+        ),
+    )
+    .await;
+    let (reason, message) = refusal(&reply);
+    assert_eq!(reason, "IMAGE_COUNT_EXCEEDED");
+    assert!(
+        message.contains("21") && message.contains("20"),
+        "{message}"
+    );
+
+    let broken = json!({"format": "png", "source": {"bytes": base64(b"not an image")}});
+    let reply = send(
+        &app,
+        "inv-broken",
+        body(
+            json!({"content": "look", "modelId": "model", "images": [broken]}),
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(refusal(&reply).0, "IMAGE_FORMAT_UNSUPPORTED");
+
+    let mut empty_id = body(json!({"content": "hi", "modelId": "model"}), vec![]);
+    empty_id["conversationState"]["conversationId"] = json!("");
+    let reply = send(&app, "inv-conversation", empty_id).await;
+    assert_eq!(refusal(&reply).0, "INVALID_CONVERSATION_ID");
+
+    let reply = send(
+        &app,
+        "inv-model",
+        body(json!({"content": "hi", "modelId": "bad model!"}), vec![]),
+    )
+    .await;
+    assert_eq!(refusal(&reply).0, "INVALID_MODEL_ID");
+    nothing_charged(&billing);
+}
+
+/// With every upstream disabled nothing can serve the request until the operator acts:
+/// ServiceUnavailableException read "Too many requests, please wait" and was retried.
+#[tokio::test]
+async fn no_enabled_upstream_is_said_plainly_and_not_retried() {
+    let server = upstream(ResponseTemplate::new(200)).await;
+    let billing = engine(
+        ProviderFormat::Anthropic,
+        &server.uri(),
+        vec![ModelMap::new("map", GROUP, "model", "prov", "up")],
+    );
+    let mut provider = billing.get_provider("prov").unwrap();
+    provider.enabled = false;
+    billing.upsert_provider(provider);
+    let app = serve(&billing);
+
+    let reply = send(
+        &app,
+        "inv-no-upstream",
+        body(json!({"content": "hi", "modelId": "model"}), vec![]),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text());
+    assert_eq!(reply.json()["__type"], "ValidationException");
+    assert!(reply.json()["message"].as_str().unwrap().contains("上游"));
+    nothing_charged(&billing);
+}
+
+/// Kiro sends a turn again when it ends without a stop reason, taking it for cut short.
+#[tokio::test]
+async fn the_intent_answer_ends_with_a_stop_reason() {
+    let mut registry = FacadeRegistry::new();
+    registry.register(GenerateAssistantResponseHandler::default());
+    let app = registry.into_router();
+    let classifier = "You are an intent classifier for a language model. Return ONLY a JSON object with 3 properties (chat, do, spec).";
+    let reply = send(
+        &app,
+        "inv-intent",
+        json!({"systemPrompt": classifier, "conversationState": {"conversationId": "c",
+            "history": [], "currentMessage": {"userInputMessage": {"content": "fix the bug"}}}}),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let frames = frames(&reply.bytes);
+    let (kind, payload) = frames.last().unwrap();
+    assert_eq!(kind, "metadataEvent", "{frames:?}");
+    assert_eq!(payload["stopReason"], "end_turn");
+    assert!(frames
+        .iter()
+        .any(|(kind, payload)| kind == "assistantResponseEvent"
+            && payload["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("\"do\"")));
+}
+
+/// A body sent a chunk at a time, counting the chunks the server has read.
+fn counted_body(
+    prefix: &str,
+    chunks: usize,
+    read: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> Body {
+    let first = bytes::Bytes::from(prefix.to_string());
+    let rest = std::iter::repeat_n(bytes::Bytes::from(vec![b' '; 64 * 1024]), chunks);
+    Body::from_stream(
+        futures_util::stream::iter(std::iter::once(first).chain(rest)).map(move |chunk| {
+            read.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, std::io::Error>(chunk)
+        }),
+    )
+}
+
+/// A refusal answered while Kiro is still sending its body can reach it as a connection
+/// reset, which it reports as a network error and answers by sending it all again. What is
+/// refused before it is read is read and dropped first.
+#[tokio::test]
+async fn a_body_refused_before_it_is_read_is_read_before_the_answer() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let server = upstream(
+        ResponseTemplate::new(200).set_body_raw(anthropic_answer("ok"), "text/event-stream"),
+    )
+    .await;
+    let billing = engine(
+        ProviderFormat::Anthropic,
+        &server.uri(),
+        vec![ModelMap::new("map", GROUP, "model", "prov", "up")],
+    );
+    let runtime = ProviderRuntimeRegistry::new();
+    runtime.sync_from_billing(&billing);
+    let mut registry = FacadeRegistry::new().with_runtime(runtime.clone());
+    registry.register(GenerateAssistantResponseHandler {
+        billing: billing.clone(),
+        runtime: Some(runtime),
+        intercept_intent: false,
+        card_rate_limiter: gateway::ops::CardRateLimiter::new(1),
+        ..Default::default()
+    });
+    let app = registry.into_router();
+    // Takes the card's one request this second, and is refused as unreadable.
+    let first = post(&app, "inv-first", None, Body::from("not json")).await;
+    assert_eq!(first.status, StatusCode::BAD_REQUEST, "{}", first.text());
+
+    // Over the card's rate: refused before its body is read.
+    let read = Arc::new(AtomicUsize::new(0));
+    let reply = post(
+        &app,
+        "inv-second",
+        None,
+        counted_body(&turn(), 16, read.clone()),
+    )
+    .await;
+    assert_eq!(
+        reply.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "{}",
+        reply.text()
+    );
+    assert_eq!(
+        read.load(Ordering::SeqCst),
+        17,
+        "the whole body is read first"
+    );
+
+    // Kiro's activity log, which Kiro moves past only once a batch is answered.
+    let read = Arc::new(AtomicUsize::new(0));
+    let response = FacadeRegistry::default()
+        .into_router()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/agents/activity")
+                .body(counted_body("{\"payload\":[]}", 16, read.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(read.load(Ordering::SeqCst), 17);
+}
+
+/// The CBOR data items the web-account answers take, decoded independently of the
+/// gateway: (text, array or map, as JSON) and the bytes after it.
+fn cbor(bytes: &[u8]) -> (Value, &[u8]) {
+    let (major, info, mut rest) = (bytes[0] >> 5, bytes[0] & 0x1f, &bytes[1..]);
+    let length = match info {
+        0..=23 => info as usize,
+        24 => {
+            let n = rest[0] as usize;
+            rest = &rest[1..];
+            n
+        }
+        25 => {
+            let n = u16::from_be_bytes([rest[0], rest[1]]) as usize;
+            rest = &rest[2..];
+            n
+        }
+        _ => panic!("unexpected length form {info}"),
+    };
+    match major {
+        3 => (
+            Value::String(String::from_utf8(rest[..length].to_vec()).unwrap()),
+            &rest[length..],
+        ),
+        4 => {
+            let mut items = Vec::new();
+            for _ in 0..length {
+                let (item, after) = cbor(rest);
+                items.push(item);
+                rest = after;
+            }
+            (Value::Array(items), rest)
+        }
+        5 => {
+            let mut map = serde_json::Map::new();
+            for _ in 0..length {
+                let (key, after) = cbor(rest);
+                let (value, after) = cbor(after);
+                map.insert(key.as_str().unwrap().to_string(), value);
+                rest = after;
+            }
+            (Value::Object(map), rest)
+        }
+        _ => panic!("unexpected major type {major}"),
+    }
+}
+
+/// Kiro's web-account services, pointed at the gateway by the takeover: a cloud config
+/// that is not enabled is one Kiro shows nothing for, and no cloud sessions is an empty
+/// list, both in the RPC v2 CBOR form its client reads, and without a sign-in.
+#[tokio::test]
+async fn kiros_web_account_services_are_answered_as_not_enabled() {
+    let app = FacadeRegistry::default()
+        .into_router_with_auth(gateway::auth::AuthState::with_default_dev_card());
+    let call = |operation: &'static str| {
+        let app = app.clone();
+        async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!(
+                            "/service/KiroWebBearerService/operation/{operation}"
+                        ))
+                        .header(header::CONTENT_TYPE, "application/cbor")
+                        .header("smithy-protocol", "rpc-v2-cbor")
+                        .body(Body::from(vec![0xa0]))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.headers()["content-type"], "application/cbor");
+            assert_eq!(response.headers()["smithy-protocol"], "rpc-v2-cbor");
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let (value, rest) = cbor(&bytes);
+            assert!(rest.is_empty(), "trailing bytes after the body");
+            (status, value)
+        }
+    };
+
+    for operation in ["GetConfigManifest", "GetConfigContents"] {
+        let (status, body) = call(operation).await;
+        assert!(status.as_u16() >= 300, "{operation}: {status}");
+        // Kiro names the error by what follows the `#`, then finds its class by the name.
+        let name = body["__type"].as_str().unwrap().rsplit('#').next().unwrap();
+        assert_eq!(name, "CloudConfigNotEnabledException", "{body}");
+    }
+    for (operation, list) in [
+        ("ListSpaces", "spaces"),
+        ("ListAvailableProviders", "providers"),
+        ("ListProviderResources", "resources"),
+    ] {
+        let (status, body) = call(operation).await;
+        assert_eq!(status, StatusCode::OK, "{operation}");
+        assert_eq!(body, json!({list: []}), "{operation}");
+    }
+    let (status, body) = call("CreateSpace").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        body["message"].as_str().unwrap().contains("云端会话"),
+        "{body}"
+    );
+}
+
+/// A cheaper model later in the list is the fast model; Kiro's "auto", which a custom agent
+/// may pin, is the group's default model, the first its list shows.
+#[tokio::test]
+async fn the_fast_model_is_the_cheapest_and_auto_is_the_default() {
+    let server = upstream(
+        ResponseTemplate::new(200).set_body_raw(anthropic_answer("ok"), "text/event-stream"),
+    )
+    .await;
+    let main = ModelMap::new("map-main", GROUP, "main-model", "prov", "up-main");
+    let mut cheap = ModelMap::new("map-cheap", GROUP, "cheap-model", "prov", "up-cheap");
+    cheap.sort_order = 2;
+    let mut middle = ModelMap::new("map-middle", GROUP, "middle-model", "prov", "up-middle");
+    middle.sort_order = 1;
+    let billing = engine(
+        ProviderFormat::Anthropic,
+        &server.uri(),
+        vec![main, middle, cheap],
+    );
+    for (model, input, output) in [
+        ("main-model", 5_000_000, 25_000_000),
+        ("middle-model", 3_000_000, 15_000_000),
+        ("cheap-model", 1_000_000, 5_000_000),
+    ] {
+        let mut version = price(model);
+        version.fixed_input_credit_per_m = input;
+        version.fixed_output_credit_per_m = output;
+        billing.upsert_rate_card_version(version);
+    }
+    assert_eq!(
+        gateway::facade::models::simple_task_model(&billing, GROUP, gateway::now_secs())
+            .map(|(model, via)| (model.exposed_model_id, via)),
+        Some((
+            "cheap-model".to_string(),
+            gateway::facade::models::FastModelChoice::Cheapest
+        ))
+    );
+    let app = serve(&billing);
+
+    for (invocation, model) in [("inv-fast", "simple-task"), ("inv-auto", "auto")] {
+        let reply = send(
+            &app,
+            invocation,
+            body(json!({"content": "hi", "modelId": model}), vec![]),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK, "{model}: {}", reply.text());
+    }
+    assert_eq!(models_sent(&server).await, vec!["up-cheap", "up-main"]);
+    let usage = usage_entries(&billing);
+    assert_eq!(usage[0].exposed_model, "cheap-model");
+    assert_eq!(usage[1].exposed_model, "main-model");
+}
+
+/// Kiro's "Analyze Requirements" call as it builds it: the JSON-RPC `tools/call` of
+/// `spec_disambiguation` with the requirements document.
+fn analysis_call(tool: &str, requirements: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": "3f1c2a9e-5b7d-4c8e-9a0b-1d2e3f4a5b6c",
+        "method": "tools/call",
+        "params": {"name": tool, "arguments": {
+            "conversationId": "conversation-1790000000000",
+            "requirementsText": requirements,
+            "clientMetadata": {}
+        }}
+    })
+}
+
+const REQUIREMENTS: &str = "# Requirements Document\n\n### Requirement 1: Sign-in\n\n\
+    **User Story:** As a user, I want to sign in, so that I can see my projects.\n\n\
+    #### Acceptance Criteria\n\n1. WHEN a user signs in THE system SHALL show the projects\n\
+    2. WHEN a user fails to sign in repeatedly THE system SHALL lock the account\n";
+
+/// The analysis as Kiro reads it: frame by frame as its agent's reader parses them (string
+/// headers only, the event type naming the message), then each JSON-RPC message as both
+/// of its readers take it.
+#[derive(Default)]
+struct AsKiroReads {
+    progress: Vec<String>,
+    questions: Vec<Value>,
+    result: Option<Value>,
+    error: Option<Value>,
+}
+
+fn as_kiro_reads(bytes: &[u8]) -> AsKiroReads {
+    let mut read = AsKiroReads::default();
+    let mut at = 0;
+    while at + 12 <= bytes.len() {
+        let word = |from: usize| u32::from_be_bytes(bytes[from..from + 4].try_into().unwrap());
+        let (total, headers_length) = (word(at) as usize, word(at + 4) as usize);
+        let (mut cursor, headers_end) = (at + 12, at + 12 + headers_length);
+        let mut headers = std::collections::HashMap::new();
+        while cursor < headers_end {
+            let name_length = bytes[cursor] as usize;
+            let name = String::from_utf8(bytes[cursor + 1..cursor + 1 + name_length].to_vec());
+            cursor += 1 + name_length;
+            assert_eq!(bytes[cursor], 7, "Kiro's reader takes string headers only");
+            let value_length = u16::from_be_bytes([bytes[cursor + 1], bytes[cursor + 2]]) as usize;
+            let value = String::from_utf8(bytes[cursor + 3..cursor + 3 + value_length].to_vec());
+            cursor += 3 + value_length;
+            headers.insert(name.unwrap(), value.unwrap());
+        }
+        assert_eq!(headers[":event-type"], "message");
+        assert_eq!(headers[":message-type"], "event");
+        let message: Value = serde_json::from_slice(&bytes[headers_end..at + total - 4]).unwrap();
+        // The IDE's schema requires it.
+        assert_eq!(message["jsonrpc"], "2.0", "{message}");
+        let params = &message["params"];
+        if !message["error"].is_null() {
+            read.error = Some(message["error"].clone());
+        } else if !message["id"].is_null() && message.get("result").is_some() {
+            read.result = Some(message["result"].clone());
+        } else if message["method"] == "notifications/progress" {
+            if params["status"]
+                .as_str()
+                .is_some_and(|status| !status.is_empty())
+            {
+                read.progress
+                    .push(params["message"].as_str().unwrap_or_default().to_string());
+            }
+        } else if message["method"] == "notifications/partial_result"
+            && params["responseType"] == "CLARIFYING_QUESTIONS"
+            && params["requirementId"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+            && params["question"].is_object()
+        {
+            read.questions.push(params.clone());
+        }
+        at += total;
+    }
+    assert_eq!(at, bytes.len(), "a frame was cut short");
+    read
+}
+
+async fn analyse(app: &axum::Router, request: axum::http::request::Builder, call: Value) -> Reply {
+    let mut request = request
+        .method(Method::POST)
+        .body(Body::from(call.to_string()))
+        .unwrap();
+    request.extensions_mut().insert(claims());
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    Reply {
+        status,
+        headers,
+        bytes,
+    }
+}
+
+/// Kiro's spec "Analyze Requirements" met the 404 fallback and failed every time. It is one
+/// turn on the group's fast model, billed as one, streamed back as the questions Kiro shows:
+/// the IDE's call at /mcp/stream.
+#[tokio::test]
+async fn analyze_requirements_asks_its_questions_on_the_fast_model() {
+    let questions = json!({"questions": [
+        {"requirementId": "1.2", "question": "登录失败几次后锁定账户？",
+         "answers": [
+             {"answer": "3 次", "consequence": "第 3 次失败后锁定 15 分钟"},
+             {"answer": "5 次", "consequence": "第 5 次失败后锁定 15 分钟"}
+         ],
+         "autoResolvable": false, "recommendedAnswer": "3 次"},
+        {"requirementId": "REQ-1", "question": "项目列表按什么排序？", "answers": [],
+         "autoResolvable": true, "recommendedAnswer": "按最近打开时间"}
+    ]});
+    let server = upstream(ResponseTemplate::new(200).set_body_raw(
+        anthropic_answer(&questions.to_string()),
+        "text/event-stream",
+    ))
+    .await;
+    let main = ModelMap::new("map-main", GROUP, "main-model", "prov", "up-main");
+    let mut cheap = ModelMap::new("map-cheap", GROUP, "cheap-model", "prov", "up-cheap");
+    cheap.sort_order = 1;
+    let billing = engine(ProviderFormat::Anthropic, &server.uri(), vec![main, cheap]);
+    let mut flagship = price("main-model");
+    flagship.fixed_output_credit_per_m = 25_000_000;
+    billing.upsert_rate_card_version(flagship);
+    let app = serve(&billing);
+
+    let reply = analyse(
+        &app,
+        Request::builder()
+            .uri("/mcp/stream")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(
+                "x-amzn-kiro-profile-arn",
+                "arn:aws:codewhisperer:us-east-1:1:profile/P",
+            ),
+        analysis_call("spec_disambiguation", REQUIREMENTS),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(
+        reply.headers[header::CONTENT_TYPE],
+        "application/vnd.amazon.eventstream"
+    );
+    let read = as_kiro_reads(&reply.bytes);
+    assert!(read.error.is_none(), "{:?}", read.error);
+    assert_eq!(read.result.unwrap()["isError"], false);
+    assert!(!read.progress.is_empty());
+    assert_eq!(read.questions.len(), 2);
+    let first = &read.questions[0];
+    assert_eq!(first["requirementId"], "1.2");
+    assert_eq!(first["question"]["question"], "登录失败几次后锁定账户？");
+    assert_eq!(first["question"]["answerChoices"][1]["answer"], "5 次");
+    assert_eq!(
+        first["question"]["answerChoices"][0]["consequence"],
+        "第 3 次失败后锁定 15 分钟"
+    );
+    assert_eq!(first["question"]["autoResolvable"], false);
+    assert_eq!(first["question"]["defaultChoice"]["answer"], "3 次");
+    let settled = &read.questions[1];
+    assert_eq!(settled["requirementId"], "REQ-1");
+    assert_eq!(settled["question"]["autoResolvable"], true);
+    assert_eq!(settled["question"]["recommendedAnswer"], "按最近打开时间");
+
+    // One call, on the fast model, carrying the document and what to do with it.
+    assert_eq!(models_sent(&server).await, vec!["up-cheap"]);
+    let sent = server.received_requests().await.unwrap();
+    let sent = String::from_utf8_lossy(&sent[0].body);
+    assert!(sent.contains("lock the account"), "{sent}");
+    assert!(sent.contains("leave a decision open"), "{sent}");
+    until(|| !usage_entries(&billing).is_empty()).await;
+    let usage = usage_entries(&billing);
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].exposed_model, "cheap-model");
+}
+
+/// The agent's call by target reaches the same analysis; an answer that holds no questions
+/// is the error Kiro shows, and a tool the gateway does not offer is said so without a call.
+#[tokio::test]
+async fn analyze_requirements_by_target_and_its_errors() {
+    let server = upstream(ResponseTemplate::new(200).set_body_raw(
+        anthropic_answer("Everything looks clear to me."),
+        "text/event-stream",
+    ))
+    .await;
+    let billing = engine(
+        ProviderFormat::Anthropic,
+        &server.uri(),
+        vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+    );
+    let app = serve(&billing);
+    let by_target = || {
+        Request::builder()
+            .uri("/")
+            .header(header::CONTENT_TYPE, "application/x-amz-json-1.0")
+            .header("x-amz-target", "KiroRuntimeService.InvokeMCPStream")
+    };
+
+    let reply = analyse(
+        &app,
+        by_target(),
+        analysis_call("spec_disambiguation", REQUIREMENTS),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    let read = as_kiro_reads(&reply.bytes);
+    let error = read.error.expect("an error Kiro shows");
+    assert_eq!(error["code"], -32000);
+    assert!(
+        error["message"].as_str().unwrap().contains("无法读取"),
+        "{error}"
+    );
+    assert!(read.questions.is_empty() && read.result.is_none());
+    assert_eq!(models_sent(&server).await, vec!["up-model"]);
+
+    let reply = analyse(&app, by_target(), analysis_call("other_tool", REQUIREMENTS)).await;
+    let error = as_kiro_reads(&reply.bytes)
+        .error
+        .expect("an error Kiro shows");
+    assert_eq!(error["code"], -32601);
+    let reply = analyse(
+        &app,
+        by_target(),
+        analysis_call("spec_disambiguation", "  "),
+    )
+    .await;
+    assert_eq!(as_kiro_reads(&reply.bytes).error.unwrap()["code"], -32602);
+    assert_eq!(models_sent(&server).await.len(), 1, "no further model call");
 }

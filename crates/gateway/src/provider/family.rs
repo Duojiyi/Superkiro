@@ -73,11 +73,42 @@ impl ModelFamily {
     }
 }
 
+/// Every effort level, lowest first, as Kiro's picker lists them.
+const ALL_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+/// The effort levels Kiro offers for `model`, lowest first, and the one it starts at.
+///
+/// Kiro reads a model's levels and its default from the `enum` and `default` of the effort
+/// schema in the model list; with no `default` it starts at the first level, "low". The
+/// default is the model's own: medium for Opus 5.5, high for other Claude 4.6 and later,
+/// medium for OpenAI's reasoning models (their `reasoning_effort` default) and for models
+/// whose effort the gateway turns into a thinking budget. A level a model lacks is left
+/// out rather than shown and quietly lowered: `xhigh` before Claude 4.7, and `xhigh` and
+/// `max` for models that take at most "high".
+pub fn effort_levels(model: &str) -> (&'static [&'static str], &'static str) {
+    match family(model).reasoning {
+        Reasoning::Adaptive { xhigh: true, .. } => {
+            let name = normalized(model);
+            let opus_5_5 = claude_version(&name) == Some(("opus", 5, 5));
+            (ALL_EFFORTS, if opus_5_5 { "medium" } else { "high" })
+        }
+        Reasoning::Adaptive { xhigh: false, .. } => (&["low", "medium", "high", "max"], "high"),
+        Reasoning::Budget => (ALL_EFFORTS, "medium"),
+        Reasoning::OpenAi | Reasoning::Unknown => (&["low", "medium", "high"], "medium"),
+    }
+}
+
+/// A model name as the table reads it: lower case, `.` and `_` as `-`, no vendor prefix.
+fn normalized(model: &str) -> String {
+    let name = model.to_ascii_lowercase().replace(['.', '_'], "-");
+    name.rsplit('/').next().unwrap_or(&name).to_string()
+}
+
 /// The family of the model a request is sent to, from its name as an upstream knows it:
 /// `claude-opus-4-7`, `claude-sonnet-4.6`, `anthropic/claude-opus-5-5`, `o3-mini`, ...
 pub fn family(model: &str) -> ModelFamily {
-    let name = model.to_ascii_lowercase().replace(['.', '_'], "-");
-    let name = name.rsplit('/').next().unwrap_or(&name);
+    let name = normalized(model);
+    let name = name.as_str();
     if let Some(family) = claude_family(name) {
         return family;
     }
@@ -101,18 +132,28 @@ pub fn family(model: &str) -> ModelFamily {
     }
 }
 
-fn claude_family(name: &str) -> Option<ModelFamily> {
+/// A Claude model's line and version: ("opus", 4, 7) for "claude-opus-4-7-20260101", and
+/// no version for Fable and Mythos, which have none of the older lines' numbering.
+fn claude_version(name: &str) -> Option<(&'static str, u32, u32)> {
     let (word, at) = ["opus", "sonnet", "haiku", "fable", "mythos"]
         .iter()
         .find_map(|word| name.find(word).map(|at| (*word, at)))?;
     if matches!(word, "fable" | "mythos") {
-        return Some(adaptive(true, true));
+        return Some((word, 0, 0));
     }
     // "claude-opus-4-7-20260101" names its version after the model; "claude-3-5-sonnet"
     // before it. A date is not a version.
     let after = version(&name[at + word.len()..]);
     let before = version(&name[..at]);
     let (major, minor) = after.or(before)?;
+    Some((word, major, minor))
+}
+
+fn claude_family(name: &str) -> Option<ModelFamily> {
+    let (word, major, minor) = claude_version(name)?;
+    if matches!(word, "fable" | "mythos") {
+        return Some(adaptive(true, true));
+    }
     Some(match (major, minor) {
         (5.., _) => adaptive(true, true),
         (4, 7..) => adaptive(true, false),
@@ -269,6 +310,39 @@ mod tests {
                 },
                 "{model}"
             );
+        }
+    }
+
+    #[test]
+    fn each_family_offers_the_levels_it_takes_and_starts_at_its_own_default() {
+        for (model, levels, default) in [
+            ("claude-opus-5-5", ALL_EFFORTS, "medium"),
+            ("anthropic/claude-opus-5.5", ALL_EFFORTS, "medium"),
+            ("claude-opus-5", ALL_EFFORTS, "high"),
+            ("claude-sonnet-5", ALL_EFFORTS, "high"),
+            ("claude-fable-5-1", ALL_EFFORTS, "high"),
+            ("claude-opus-4-8", ALL_EFFORTS, "high"),
+            ("claude-opus-4-7-20260101", ALL_EFFORTS, "high"),
+            (
+                "claude-sonnet-4-6",
+                &["low", "medium", "high", "max"][..],
+                "high",
+            ),
+            (
+                "claude-opus-4.6",
+                &["low", "medium", "high", "max"][..],
+                "high",
+            ),
+            ("claude-sonnet-4-5", ALL_EFFORTS, "medium"),
+            ("o3-mini", &["low", "medium", "high"][..], "medium"),
+            ("gpt-5.6", &["low", "medium", "high"][..], "medium"),
+            (
+                "deepseek-reasoner",
+                &["low", "medium", "high"][..],
+                "medium",
+            ),
+        ] {
+            assert_eq!(effort_levels(model), (levels, default), "{model}");
         }
     }
 

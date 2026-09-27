@@ -101,6 +101,7 @@ impl ImportedProvider {
                     } else {
                         None
                     },
+                    effort_levels: Vec::new(),
                 }
             })
             .collect()

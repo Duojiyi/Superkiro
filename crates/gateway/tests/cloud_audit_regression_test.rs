@@ -421,7 +421,8 @@ async fn usage_reports_spendable_balance_after_reservations() {
         assert_eq!(credit["displayName"], "Credit");
         assert_eq!(credit["displayNamePlural"], "Credits");
         if card_id == "card" {
-            assert_eq!(credit["currentUsageWithPrecision"], json!(11.5958));
+            // Kiro prints these as they come: to the hundredth.
+            assert_eq!(credit["currentUsageWithPrecision"], json!(11.6));
             assert_eq!(credit["usageLimitWithPrecision"], json!(2000.0));
         }
     }

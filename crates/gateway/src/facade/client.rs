@@ -212,9 +212,17 @@ impl FacadeHandler for ClientBeaconHandler {
 /// activity log: every line of each session transcript (the customer's messages, the
 /// model's answers, tool inputs and results, file contents among them) every three
 /// seconds. Kiro 1.1 has no setting or variable that turns its publisher off, so the
-/// gateway answers that it took the batch without reading or keeping any of it. A 404
-/// changed nothing Kiro sends; it only logged a failure each time.
+/// gateway answers that it took the batch without keeping any of it. A 404 changed
+/// nothing Kiro sends; it only logged a failure each time.
+///
+/// The batch is read to its end and dropped before the answer: answered while Kiro was
+/// still sending a large batch, the connection could be reset, and Kiro, which moves on
+/// only once a batch is answered, sent the same batch again every three seconds.
 pub struct AgentActivityHandler;
+
+/// The most of one activity batch read before answering: 25 transcript lines, file
+/// contents among them.
+const ACTIVITY_BATCH_LIMIT: usize = 64 * 1024 * 1024;
 
 impl FacadeHandler for AgentActivityHandler {
     fn method(&self) -> Method {
@@ -225,8 +233,11 @@ impl FacadeHandler for AgentActivityHandler {
         "/agents/activity"
     }
 
-    fn handle<'a>(&'a self, _req: Request<Body>) -> BoxFuture<'a, Response> {
-        Box::pin(async move { StatusCode::NO_CONTENT.into_response() })
+    fn handle<'a>(&'a self, req: Request<Body>) -> BoxFuture<'a, Response> {
+        Box::pin(async move {
+            super::discard_body(req.into_body(), ACTIVITY_BATCH_LIMIT).await;
+            StatusCode::NO_CONTENT.into_response()
+        })
     }
 }
 

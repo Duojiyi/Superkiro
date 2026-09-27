@@ -14,6 +14,9 @@ pub struct OpenAiProvider;
 /// The longest description an OpenAI function takes.
 const MAX_FUNCTION_DESCRIPTION_LEN: usize = 1024;
 
+/// What a failed tool call's result opens with, as the model reads it.
+const TOOL_ERROR_MARKER: &str = "[工具调用失败 / tool call failed]";
+
 /// The tools as OpenAI functions, and the documentation of those whose description is
 /// longer than a function takes (several of Kiro's are). That documentation goes into the
 /// system prompt, with a pointer left in the function; Anthropic takes descriptions whole,
@@ -99,15 +102,35 @@ impl ModelProvider for OpenAiProvider {
         let mut messages: Vec<Value> = req
             .messages
             .iter()
-            .map(|m| {
+            .enumerate()
+            // After tool results the model continues on its own. Kiro's turn that carries
+            // them has no text of its own, and sent as an empty user message some models
+            // answered it ("your message seems to be empty").
+            .filter(|(position, m)| {
+                let empty = match &m.content {
+                    Value::String(text) => text.is_empty(),
+                    Value::Array(parts) => parts.is_empty(),
+                    Value::Null => true,
+                    _ => false,
+                };
+                let after_tool = position
+                    .checked_sub(1)
+                    .and_then(|previous| req.messages.get(previous))
+                    .is_some_and(|previous| previous.role == "tool");
+                !(m.role == "user" && empty && after_tool)
+            })
+            .map(|(_, m)| {
                 let mut obj = serde_json::json!({
                     "role": m.role,
                 });
-                if !m.content.is_null() {
-                    obj["content"] = m.content.clone();
-                } else {
-                    obj["content"] = Value::Null;
-                }
+                obj["content"] = match (&m.content, m.is_error) {
+                    // This format has no error flag for a tool result: a failed call would
+                    // read as a success unless its text said otherwise.
+                    (Value::String(text), Some(true)) if m.role == "tool" => {
+                        Value::String(format!("{TOOL_ERROR_MARKER}\n{text}"))
+                    }
+                    (content, _) => content.clone(),
+                };
                 if let Some(ref name) = m.name {
                     obj["name"] = Value::String(name.clone());
                 }

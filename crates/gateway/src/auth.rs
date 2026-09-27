@@ -729,10 +729,17 @@ pub async fn auth_middleware(
         }
         Err(err) => {
             let (status, err_type, msg) = err.to_aws_error();
+            // A token that expired while Kiro sends a large conversation: the refusal goes
+            // once the body is in, or Kiro may meet a reset connection instead of it.
+            crate::facade::discard_body(req.into_body(), REFUSED_BODY_LIMIT).await;
             error_response(status, err_type, &msg)
         }
     }
 }
+
+/// The most of a refused request's body read before the refusal: the largest body a
+/// Kiro route takes.
+const REFUSED_BODY_LIMIT: usize = 32 * 1024 * 1024;
 
 /// For a public route that shows a signed-in card more: a valid Bearer token's claims go
 /// into the request's extensions, as `auth_middleware` puts them; a missing or invalid one

@@ -173,6 +173,10 @@ pub struct ProviderOptions {
     /// prompt and history, and a cached prefix is read at a tenth of the input price. On
     /// unless the operator turns it off for an upstream that refuses them.
     pub prompt_cache: bool,
+    /// PDF attachments. On unless the operator turns them off for an upstream that ignores
+    /// them (kimera-primary answers "I can't read the PDF" and bills the turn): a PDF in
+    /// the current message is then refused, an earlier message's is a note.
+    pub documents: bool,
 }
 
 impl Default for ProviderOptions {
@@ -181,6 +185,7 @@ impl Default for ProviderOptions {
             replay_thinking: false,
             eager_tool_input: false,
             prompt_cache: true,
+            documents: true,
         }
     }
 }
@@ -192,11 +197,12 @@ pub struct ProviderOptionsTable {
     replay_thinking: Vec<String>,
     eager_tool_input: Vec<String>,
     prompt_cache_off: Vec<String>,
+    no_documents: Vec<String>,
 }
 
 impl ProviderOptionsTable {
-    /// PROVIDER_THINKING_REPLAY, PROVIDER_EAGER_TOOL_INPUT and PROVIDER_PROMPT_CACHE_OFF:
-    /// comma-separated provider IDs, or `*`.
+    /// PROVIDER_THINKING_REPLAY, PROVIDER_EAGER_TOOL_INPUT, PROVIDER_PROMPT_CACHE_OFF and
+    /// PROVIDER_NO_DOCUMENTS: comma-separated provider IDs, or `*`.
     pub fn from_env() -> Self {
         let ids = |name: &str| -> Vec<String> {
             std::env::var(name)
@@ -211,7 +217,14 @@ impl ProviderOptionsTable {
             replay_thinking: ids("PROVIDER_THINKING_REPLAY"),
             eager_tool_input: ids("PROVIDER_EAGER_TOOL_INPUT"),
             prompt_cache_off: ids("PROVIDER_PROMPT_CACHE_OFF"),
+            no_documents: ids("PROVIDER_NO_DOCUMENTS"),
         }
+    }
+
+    /// The table with `ids` reading no PDF attachments, as PROVIDER_NO_DOCUMENTS sets it.
+    pub fn with_no_documents(mut self, ids: &[&str]) -> Self {
+        self.no_documents = ids.iter().map(|id| id.to_string()).collect();
+        self
     }
 
     pub fn options_for(&self, provider_id: &str) -> ProviderOptions {
@@ -220,16 +233,18 @@ impl ProviderOptionsTable {
             replay_thinking: on(&self.replay_thinking),
             eager_tool_input: on(&self.eager_tool_input),
             prompt_cache: !on(&self.prompt_cache_off),
+            documents: !on(&self.no_documents),
         }
     }
 
     /// The providers each option is on for, as the start-up log prints them.
     pub fn describe(&self) -> String {
         format!(
-            "thinking replay: [{}], eager tool input: [{}], prompt cache off: [{}]",
+            "thinking replay: [{}], eager tool input: [{}], prompt cache off: [{}], no documents: [{}]",
             self.replay_thinking.join(", "),
             self.eager_tool_input.join(", "),
-            self.prompt_cache_off.join(", ")
+            self.prompt_cache_off.join(", "),
+            self.no_documents.join(", ")
         )
     }
 }
@@ -239,6 +254,14 @@ static PROVIDER_OPTIONS: std::sync::OnceLock<ProviderOptionsTable> = std::sync::
 /// Set the per-provider options, once, at start.
 pub fn install_provider_options(table: ProviderOptionsTable) {
     let _ = PROVIDER_OPTIONS.set(table);
+}
+
+/// The options of `provider_id`, outside its attempts: which providers a request with PDFs
+/// may go to is decided before any is tried.
+pub fn provider_options(provider_id: &str) -> ProviderOptions {
+    PROVIDER_OPTIONS
+        .get_or_init(ProviderOptionsTable::default)
+        .options_for(provider_id)
 }
 
 /// The options of the provider an upstream attempt is being made with, or those every

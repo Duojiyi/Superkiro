@@ -131,5 +131,34 @@ pub(super) fn register(handlers: &mut Vec<Arc<dyn FacadeHandler>>) {
             }
         }
     }
+    // The CodeWhisperer runtime's own paths, as Kiro 1.1 sends them. Routes match exactly,
+    // and Kiro's autocomplete posts `/generatecompletions`: served only under its old
+    // name, it met the 404 fallback and Kiro showed an error on every pause in typing.
+    for (legacy, path) in [("/GenerateCompletions", "/generatecompletions")] {
+        if let Some(inner) = handlers.iter().rev().find(|h| h.path() == legacy).cloned() {
+            handlers.push(Arc::new(Alias {
+                path,
+                inner,
+                models: false,
+            }));
+        }
+    }
+    // Kiro's spec "Analyze Requirements", which its IDE posts to /mcp/stream and its agent
+    // sends by target: a turn of the conversation handler, on the group's fast model.
+    if let Some(conversation) = handlers
+        .iter()
+        .rev()
+        .find(|h| h.path() == "/generateAssistantResponse")
+        .cloned()
+    {
+        let analysis: Arc<dyn FacadeHandler> = Arc::new(
+            super::spec_analysis::RequirementsAnalysis::new(conversation),
+        );
+        rpc.handlers.insert(
+            "KiroRuntimeService.InvokeMCPStream",
+            (Arc::clone(&analysis), false),
+        );
+        handlers.push(analysis);
+    }
     handlers.push(Arc::new(rpc));
 }
