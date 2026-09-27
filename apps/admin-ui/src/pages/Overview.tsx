@@ -85,6 +85,7 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
   const currentCards = data.cards.filter(card => card.archivedAt == null && cardState(card, nowSecs) !== 'voided');
   const activeCards = currentCards.filter(card => cardState(card, nowSecs) === 'active');
   const unactivated = currentCards.filter(card => cardState(card, nowSecs) === 'unactivated').length;
+  const expired = typeof data.stats?.expiredCards === 'number' ? data.stats.expiredCards : currentCards.filter(card => cardState(card, nowSecs) === 'expired').length;
   const usableBalance = currentCards.filter(card => ['active', 'unactivated', 'frozen'].includes(cardState(card, nowSecs))).reduce((sum, card) => sum + card.pointsAvailable, 0);
 
   // Hour by hour over the last day; the rightmost bar is the current hour.
@@ -252,7 +253,7 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
       <Kpi label="消耗积分" value={period ? formatCreditsMicro(period.creditsCharged) : '—'}
         sub={period && typeof faceValue === 'number' ? <span title="按积分面值折算">≈ {formatMoney(period.creditsCharged * faceValue)}</span> : undefined}/>
       <Kpi label="在用卡密" value={failures.cards && !data.cards.length ? '—' : `${formatCount(activeCards.length)} 张`}
-        sub={data.cards.length ? `未激活 ${formatCount(unactivated)} · 可用 ${formatCredits(usableBalance)} 积分` : undefined}/>
+        sub={data.cards.length ? <>未激活 {formatCount(unactivated)}{expired > 0 && <> · <button type="button" className="link" onClick={() => onNavigate('cards', {cards: {status: 'EXPIRED'}})}>已到期 {formatCount(expired)}</button></>} · 可用 {formatCredits(usableBalance)} 积分</> : undefined}/>
     </div>
 
     <div className="overview-grid">

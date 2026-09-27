@@ -69,6 +69,15 @@ assert.equal(support.historyDetail({action: 'extend', detail: {activationDuratio
 assert.equal(support.historyDetail({action: 'group', detail: {previousGroupId: 'g1', groupId: 'g2'}}, group), 'PRO → PRO Max');
 assert.equal(support.historyDetail({action: 'ban', detail: null}), '');
 assert.equal(support.historyDetail({action: 'note'}), '');
+// What a note or an extension replaced, and what 解封 made of the card, when the server says.
+assert.match(support.historyDetail({action: 'extend', detail: {validUntil: now + 7 * DAY, previousValidUntil: now}}), /^到期 \d{4}-\d{2}-\d{2} \d{2}:\d{2} → \d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
+assert.equal(support.historyDetail({action: 'extend', detail: {activationDurationSecs: 37 * DAY, previousActivationDurationSecs: 30 * DAY}}), '激活后有效 30 天 → 37 天');
+assert.equal(support.historyDetail({action: 'note', detail: {note: '老客户续费', previousNote: '淘宝 9 月'}}), '“淘宝 9 月” → “老客户续费”');
+assert.equal(support.historyDetail({action: 'note', detail: {note: null, previousNote: '代理 李四 9/27 · 批次 2026-09-27T12:21:23Z ff48'}}), '“代理 李四 9/27 · 批次 2026-09-…” → 无');
+assert.equal(support.historyDetail({action: 'unban', detail: {status: 'frozen'}}), '恢复为已冻结');
+assert.equal(support.unbanText('card-1', 'frozen'), '已解封 card-1：已恢复为冻结，需要解冻才能使用');
+assert.equal(support.unbanText('card-1', 'active'), '已解封 card-1，恢复为使用中');
+assert.equal(support.unbanText('card-1', undefined), '已解封 card-1', 'an older server says nothing of it');
 console.log('PASS: history actions and their details (device, previous allowance, new expiry, groups) in words');
 
 // 限额: requests at once, and credits a UTC day and over 30 days; blank is no limit; only what changes is sent.

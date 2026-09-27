@@ -453,7 +453,10 @@ module.exports = function fixtureApi() {
     if(endpoint==='cards/reveal') return reply({success:true,rawCode:cards.find(c=>c.id===body.cardId)?.rawCode??'FIXTURE-RECOVERED-CODE'});
     if(endpoint==='session/revoke') {authenticated=false; res.setHeader('Set-Cookie','fixture_session=; Max-Age=0; Path=/'); return reply({success:true});}
     if(endpoint==='stats') return reply({success:true,stateBytes:storage.bytes,stateWarningBytes:storage.warning,stateCeilingBytes:storage.ceiling,
-      lastSavedAtSecs:storage.savedAt,persistenceReady:!storage.persistenceError,persistenceError:storage.persistenceError,totalCards:cards.length,activeCards:2,unactivatedCards:1,frozenCards:1,bannedCards:1,totalCredits:12000000000,usedCredits:1500000000,remainingCredits:10500000000,totalPoints:12000,usedPoints:1500,remainingPoints:10500,activity:activity()});
+      lastSavedAtSecs:storage.savedAt,persistenceReady:!storage.persistenceError,persistenceError:storage.persistenceError,totalCards:cards.length,activeCards:2,unactivatedCards:1,frozenCards:1,bannedCards:1,
+      // As the customer meets them (card.rs effective_status): an active card past its date is expired.
+      expiredCards:cards.filter(card=>view(card).effectiveStatus==='expired').length,
+      totalCredits:12000000000,usedCredits:1500000000,remainingCredits:10500000000,totalPoints:12000,usedPoints:1500,remainingPoints:10500,activity:activity()});
     if(endpoint==='cards') return reply({success:true,count:cards.length,cards:cards.map(view),revision:cardRevision()});
     // One card's history, newest first: this session's changes, then realistic older events.
     if(endpoint==='cards/history') {
@@ -621,13 +624,18 @@ module.exports = function fixtureApi() {
       if(body.action==='unban'&&!support(body.reason))return cardFail(400,'A reason of 1 to 200 bytes is required');
       const card=cards.find(c=>c.id===body.cardId); if(!card)return cardFail(400,`Card ${body.cardId} not found`);
       const debug={active:'Active',unactivated:'Unactivated',frozen:'Frozen',banned:'Banned',voided:'Voided',expired:'Expired'}[card.status];
+      let detail=null;
       if(body.action==='unban'){
         if(card.status!=='banned')return cardFail(400,`Invalid billing state: cannot unban ${debug}`);
         if(card.archivedAt!=null)return cardFail(400,'Invalid billing state: Archived cards must be unarchived before they are unbanned');
-        card.status=card.activatedAt!=null?'active':'unactivated';
+        // Lifting a ban lifts no freeze (billing's frozen_from).
+        card.status=card.frozenFrom?'frozen':card.activatedAt!=null?'active':'unactivated';detail={status:card.status};
       } else if(body.action==='archive'||body.action==='unarchive')card.archivedAt=body.action==='archive'?Math.floor(Date.now()/1000):null;
-      else card.status=body.action==='freeze'?'frozen':body.action==='unfreeze'?'active':body.action==='void'?'voided':'banned';
-      record(card.id,body.action,body.reason);
+      else {
+        if(body.action==='freeze')card.frozenFrom=card.status;if(body.action==='unfreeze')delete card.frozenFrom;
+        card.status=body.action==='freeze'?'frozen':body.action==='unfreeze'?'active':body.action==='void'?'voided':'banned';
+      }
+      record(card.id,body.action,body.reason,detail?{detail}:{});
       return reply({success:true,cardId:card.id,newStatus:card.status,archivedAt:card.archivedAt??null,card:view(card)});
     }
     // A balance adjustment, as its handler answers: one idempotency key per intent (a replay with the
@@ -709,8 +717,10 @@ module.exports = function fixtureApi() {
         ??(until!==undefined?named(waiting,'An expiry date applies only to activated cards')??named(card=>card.validUntil>until,'The new expiry is earlier than the current one of'):null);
       if(refusal)return cardFail(409,refusal);
       for(const card of found){
-        if(waiting(card)){card.activationDurationSecs=(card.activationDurationSecs??2592000)+days*86400;record(card.id,'extend',body.reason,{detail:{activationDurationSecs:card.activationDurationSecs}});}
-        else{card.validUntil=until??Math.max(card.validUntil,t)+days*86400;if(card.status==='expired')card.status='active';record(card.id,'extend',body.reason,{detail:{validUntil:card.validUntil}});}
+        if(waiting(card)){const previous=card.activationDurationSecs??2592000;card.activationDurationSecs=previous+days*86400;
+          record(card.id,'extend',body.reason,{detail:{activationDurationSecs:card.activationDurationSecs,previousActivationDurationSecs:previous}});}
+        else{const previous=card.validUntil;card.validUntil=until??Math.max(card.validUntil,t)+days*86400;if(card.status==='expired')card.status='active';
+          record(card.id,'extend',body.reason,{detail:{validUntil:card.validUntil,previousValidUntil:previous}});}
       }
       return reply({success:true,count:found.length,cards:found.map(view)});
     }
@@ -720,7 +730,7 @@ module.exports = function fixtureApi() {
       const note=String(body.note??'').trim();
       if(Buffer.byteLength(note)>256||/[\x00-\x1f\x7f-\x9f]/.test(note))return cardFail(400,'note must be at most 256 bytes, without control characters');
       const card=cards.find(c=>c.id===body.cardId);if(!card)return cardFail(404,`Card ${body.cardId} not found`);
-      if((card.note??'')!==note){if(note)card.note=note;else delete card.note;record(card.id,'note','');}
+      if((card.note??'')!==note){const previous=card.note??null;if(note)card.note=note;else delete card.note;record(card.id,'note','',{detail:{note:note||null,previousNote:previous}});}
       return reply({success:true,card:view(card)});
     }
     if(endpoint==='cards/group') {

@@ -9,7 +9,7 @@ import {ask, confirmAction} from '../components/confirm';
 import {Modal} from '../components/modal';
 import {toast} from '../components/toast';
 import {IdCell} from '../components/ui';
-import {CARD_CHANGE_KEY, DAILY_WINDOW, DOWNLOAD_URL, endOfDay, explainCardRefusal, EXTENSION_DAYS, extension, extensionText, limitInput, MAX_CONCURRENCY, MAX_EXTEND_CARDS, MONTHLY_WINDOW, quotaChange,
+import {CARD_CHANGE_KEY, DAILY_WINDOW, DOWNLOAD_URL, endOfDay, unbanText, explainCardRefusal, EXTENSION_DAYS, extension, extensionText, limitInput, MAX_CONCURRENCY, MAX_EXTEND_CARDS, MONTHLY_WINDOW, quotaChange,
   REASON_MAX_CHARS, rebindText, rekeyHandout, unchanged, validReason, type QuotaChange} from '../cardSupport';
 import {formatCount, formatCredits, shortId} from '../format';
 import {cardState, cardStatusView} from '../status';
@@ -274,7 +274,7 @@ export function useCardSupport({cards, groups, groupName, guards, refresh, repor
    * Sends one change. The intent is kept first, so a reload before the reply still knows a
    * result is missing. Resolves to what went wrong (a refusal: nothing changed), or null.
    */
-  const send = async (label: string, cardIds: string[], request: () => Promise<{success: boolean; card?: AdminCardItem; cards?: AdminCardItem[]}>, done: string): Promise<string | null> => {
+  const send = async (label: string, cardIds: string[], request: () => Promise<{success: boolean; card?: AdminCardItem; cards?: AdminCardItem[]}>, done: string | (() => string)): Promise<string | null> => {
     if (writing.current || working) return '另一个操作还没完成，请稍候';
     if (pending) return '上次的卡密修改结果未确认，请先在列表上方核对';
     const intent: Pending = {label, cardIds: cardIds.slice(0, 500), at: new Date().toISOString()};
@@ -288,7 +288,7 @@ export function useCardSupport({cards, groups, groupName, guards, refresh, repor
       const changed = result.cards ?? (result.card ? [result.card] : []);
       if (mounted.current && changed.length) updateCards(latest.current.map(card => ({...card, ...changed.find(next => next.id === card.id)})));
       if (mounted.current) setRevision(value => value + 1);
-      toast.success(done);
+      toast.success(typeof done === 'function' ? done() : done);
       void refresh({keepSelection: true});
       return null;
     } catch (error) {
@@ -312,11 +312,15 @@ export function useCardSupport({cards, groups, groupName, guards, refresh, repor
     if (unavailable || pending) return;
     const answer = await ask({
       title: `解封卡密 ${shortId(card.id, 'card')}？`, facts: facts(card),
-      consequence: `恢复为${card.activatedAt ? '使用中' : '未激活'}，仍受有效期和余额限制。封禁时退出的登录不会恢复：客户需要重新登录。`,
+      consequence: `恢复为封禁前的状态：${card.activatedAt ? '使用中' : '未激活'}，封禁前已冻结的仍是冻结（要再解冻）。仍受有效期和余额限制；封禁时退出的登录不会恢复，客户需要重新登录。`,
       confirmLabel: '解封', reason: reasonField('例：误封，已核实', ['误封', '已核实，恢复使用', '客户申诉通过']),
     });
     if (!answer.confirmed || !mounted.current) return;
-    refused('解封')(await send('解封', [card.id], () => adminApi.updateCardStatus(card.id, 'unban', answer.reason), `已解封 ${shortId(card.id, 'card')}`));
+    // The toast says what it became: a card banned while frozen is frozen again.
+    let status: string | undefined;
+    const label = shortId(card.id, 'card');
+    refused('解封')(await send('解封', [card.id], async () => {const result = await adminApi.updateCardStatus(card.id, 'unban', answer.reason); status = result.newStatus; return result;},
+      () => unbanText(label, status)));
   };
 
   const unbind = async (card: AdminCardItem, deviceId: string) => {

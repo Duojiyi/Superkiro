@@ -17,6 +17,8 @@ export interface AdminStats {
   unactivatedCards: number;
   frozenCards: number;
   bannedCards: number;
+  /** Cards past their validity, as the customer meets them (newer servers). */
+  expiredCards?: number;
   totalCredits: number;
   usedCredits: number;
   remainingCredits: number;

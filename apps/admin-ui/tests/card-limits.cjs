@@ -111,6 +111,29 @@ const server=http.createServer(async(req,res)=>{
     assert.equal(fixture.cards[5].rawCode,code,'nothing changed');assert.equal(await page.getByRole('dialog',{name:'新卡密'}).count(),0);
     console.log('PASS: 更换卡密 is in the drawer\'s danger area behind a typed confirmation with a reason; the new code is shown once with the text for the customer, the history keeps fingerprints only, and a refusal is said in words');
 
+    // A card banned while it was frozen is frozen again when the ban is lifted, and says so.
+    await page.keyboard.press('Escape');await drawer.waitFor({state:'detached'});await open('fixture-card-0');
+    const reasonAndAccept=async reason=>{const box=page.getByRole('alertdialog');await box.waitFor();await box.locator('#confirm-reason').fill(reason);
+      const typed=box.getByLabel('确认输入',{exact:true});if(await typed.count())await typed.fill('fixture-card-0');await box.locator('[data-confirm="accept"]').click();await box.waitFor({state:'detached'});};
+    await drawer.getByRole('button',{name:'冻结',exact:true}).click();await reasonAndAccept('客户要求');await toasts.shown('已冻结 fixture-card-0');
+    await drawer.locator('.drawer-head').getByText('已冻结',{exact:true}).waitFor();await idle();
+    await drawer.getByRole('button',{name:'封禁',exact:true}).click();await reasonAndAccept('滥用');await drawer.locator('.drawer-head').getByText('已封禁',{exact:true}).waitFor();await idle();
+    await drawer.getByRole('button',{name:'解封',exact:true}).click();
+    const unban=page.getByRole('alertdialog');await unban.waitFor();assert((await unban.innerText()).includes('封禁前已冻结的仍是冻结（要再解冻）'));
+    await reasonAndAccept('误封，已核实');
+    await toasts.shown('已解封 fixture-card-0：已恢复为冻结，需要解冻才能使用');
+    await drawer.locator('.drawer-head').getByText('已冻结',{exact:true}).waitFor();
+    await history().first().filter({hasText:'解封'}).filter({hasText:'恢复为已冻结'}).waitFor();
+    await drawer.getByRole('button',{name:'解冻',exact:true}).waitFor();
+    // 运营概览 names the cards past their validity (the server's count), and leads to them.
+    await page.keyboard.press('Escape');await drawer.waitFor({state:'detached'});
+    await page.getByRole('navigation').getByRole('button',{name:'运营概览',exact:true}).click();
+    const inUse=page.locator('.kpi').filter({has:page.locator('.kpi-label',{hasText:'在用卡密'})});
+    await inUse.getByRole('button',{name:'已到期 1',exact:true}).click();
+    await page.getByRole('tablist',{name:'状态筛选'}).locator('[data-value="EXPIRED"][aria-selected="true"]').waitFor();
+    await row('fixture-card-4').waitFor();
+    console.log('PASS: 解封 of a card banned while frozen says it is frozen again and must be unfrozen, and its history says so; 运营概览 counts the cards past their validity and opens them');
+
     assert.deepEqual(errors,[]);assert.deepEqual(nativeDialogs,[],'no browser-native dialogs');
   }finally{
     await browser?.close();server.close();

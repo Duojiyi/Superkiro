@@ -178,6 +178,16 @@ export function quotaChange(card: CardLimits, draft: {concurrency: string; daily
   return {change, problems, lines};
 }
 
+/** A card status as the server names it in a view or a history entry, in words. */
+const STATUS_WORDS: Record<string, string> = {active: '使用中', unactivated: '未激活', frozen: '已冻结', banned: '已封禁', voided: '已作废', expired: '已到期'};
+
+/** What 解封 made of a card, for its toast: a card banned while frozen is frozen again. */
+export const unbanText = (cardLabel: string, status: string | undefined) => status === 'frozen'
+  ? `已解封 ${cardLabel}：已恢复为冻结，需要解冻才能使用` : `已解封 ${cardLabel}${status && STATUS_WORDS[status] ? `，恢复为${STATUS_WORDS[status]}` : ''}`;
+
+/** A note in a history line: quoted, shortened past 24 characters; 无 for none. */
+const noteWords = (note: unknown) => typeof note !== 'string' || !note ? '无' : `“${note.length > 24 ? `${note.slice(0, 24)}…` : note}”`;
+
 const HISTORY_LABEL: Record<string, string> = {
   issued: '发卡', activated: '激活', topup: '充值', adjust: '调账', freeze: '冻结', unfreeze: '解冻',
   ban: '封禁', unban: '解封', void: '永久作废', archive: '归档', unarchive: '取消归档',
@@ -198,10 +208,15 @@ export function historyDetail(event: {action: string; detail?: unknown}, groupNa
       const used = number(detail.previousRebinds), until = number(detail.previousCooldownUntil);
       return used === null ? '' : `原已换绑 ${used} 次${until ? `，冷却到 ${minuteText(until)}` : ''}`;
     }
+    // The new validity, and the one it replaced when the server says.
     case 'extend': {
       const until = number(detail.validUntil), duration = number(detail.activationDurationSecs);
-      return until ? `到期改为 ${minuteText(until)}` : duration ? `激活后有效 ${daysText(duration)}` : '';
+      const before = number(detail.previousValidUntil), beforeDuration = number(detail.previousActivationDurationSecs);
+      if (until) return before ? `到期 ${minuteText(before)} → ${minuteText(until)}` : `到期改为 ${minuteText(until)}`;
+      return duration ? (beforeDuration ? `激活后有效 ${daysText(beforeDuration)} → ${daysText(duration)}` : `激活后有效 ${daysText(duration)}`) : '';
     }
+    case 'note': return 'note' in detail || 'previousNote' in detail ? `${noteWords(detail.previousNote)} → ${noteWords(detail.note)}` : '';
+    case 'unban': return typeof detail.status === 'string' && STATUS_WORDS[detail.status] ? `恢复为${STATUS_WORDS[detail.status]}` : '';
     case 'group': return typeof detail.groupId === 'string'
       ? `${typeof detail.previousGroupId === 'string' ? groupName(detail.previousGroupId) : '—'} → ${groupName(detail.groupId)}` : '';
     // A fingerprint of the old and the new code (the first 8 hex digits of their hashes), never a code.
