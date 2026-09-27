@@ -99,9 +99,9 @@ const server=http.createServer(async(req,res)=>{
     const form=page.getByRole('dialog',{name:'新建分组'});await form.waitFor();
     await form.getByLabel('分组 ID',{exact:true}).fill(legacy.id);await form.getByRole('button',{name:'加入草稿'}).click();await form.getByRole('alert').filter({hasText:'这个 ID 已存在'}).waitFor();
     await form.getByLabel('分组 ID',{exact:true}).fill('new-group');await form.getByRole('button',{name:'加入草稿'}).click();await form.getByRole('alert').filter({hasText:'请填写名称'}).waitFor();
-    await form.getByLabel('分组名称',{exact:true}).fill('新分组');await form.getByLabel('新分组扣费倍率',{exact:true}).fill('0');await form.getByRole('button',{name:'加入草稿'}).click();
-    await form.getByRole('alert').filter({hasText:'扣费倍率需大于 0'}).waitFor();
-    await form.getByLabel('新分组扣费倍率',{exact:true}).fill('1.2');await form.getByLabel('可发新卡',{exact:true}).uncheck();
+    await form.getByLabel('分组名称',{exact:true}).fill('新分组');await form.getByLabel('新分组的分组倍率',{exact:true}).fill('0');await form.getByRole('button',{name:'加入草稿'}).click();
+    await form.getByRole('alert').filter({hasText:'分组倍率需大于 0'}).waitFor();
+    await form.getByLabel('新分组的分组倍率',{exact:true}).fill('1.2');await form.getByLabel('可发新卡',{exact:true}).uncheck();
     await form.getByRole('button',{name:'加入草稿'}).click();await form.waitFor({state:'detached'});
     await page.getByRole('row').filter({hasText:'新分组'}).getByText('新建',{exact:true}).waitFor();
     assert.equal(saved.groups.length,2,'nothing is sent before 发布');

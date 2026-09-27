@@ -145,10 +145,10 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
   const tokenFields = ['context_window', 'max_output'];
   const checkFields = ['issuance_enabled', 'visible', 'supports_tools', 'supports_vision', 'supports_reasoning'];
   const fields = kind === 'groups' ? ['name', 'issuance_enabled', 'virtual_plan_name', 'virtual_usage_limit', 'rate_card_id', 'margin_multiplier'] : ['exposed_model_id', 'aliases', 'display_name', 'description', 'rate_multiplier', 'target_provider_id', 'target_model', 'group_id', 'context_window', 'max_output', 'credit_multiplier', 'visible', 'supports_tools', 'supports_vision', 'supports_reasoning'];
-  const labels: Record<string, string> = {name: '名称', issuance_enabled: '可发新卡', virtual_plan_name: '对外套餐名', virtual_usage_limit: '显示用量上限', rate_card_id: '价格表', margin_multiplier: '扣费倍率', exposed_model_id: '模型 ID', aliases: '别名', target_provider_id: '供应商', target_model: '上游模型', group_id: '分组', context_window: '上下文', max_output: '最大输出', credit_multiplier: '模型倍率', display_name: '显示名称', description: '说明', rate_multiplier: '显示倍率', visible: '客户可见', supports_tools: '工具', supports_vision: '图片', supports_reasoning: '推理'};
+  const labels: Record<string, string> = {name: '名称', issuance_enabled: '可发新卡', virtual_plan_name: '对外套餐名', virtual_usage_limit: '显示用量上限', rate_card_id: '价格表', margin_multiplier: '分组倍率', exposed_model_id: '模型 ID', aliases: '别名', target_provider_id: '供应商', target_model: '上游模型', group_id: '分组', context_window: '上下文', max_output: '最大输出', credit_multiplier: '模型倍率', display_name: '显示名称', description: '说明', rate_multiplier: '显示倍率', visible: '客户可见', supports_tools: '工具', supports_vision: '图片', supports_reasoning: '推理'};
   // Accessible names the tests and screen readers already know; each contains its visible label.
-  const ariaLabels: Record<string, string> = {context_window: '上下文长度', max_output: '最大输出', margin_multiplier: kind === 'groups' ? '分组扣费倍率' : '扣费倍率', credit_multiplier: '模型倍率'};
-  const tips: Record<string, string> = {issuance_enabled: '关闭后不能再发新卡，已发的卡不受影响', virtual_plan_name: '客户端显示的套餐名，与发卡套餐无关', virtual_usage_limit: '只在客户端显示，不是卡内积分', rate_multiplier: 'Kiro 的模型列表里给客户看的倍率，只影响显示，不影响扣费；留空按价格自动换算', aliases: '客户用这些 ID 请求时也由这个模型服务，多个用逗号隔开', credit_multiplier: '这个模型自己的倍率，与分组倍率、版本倍率相乘；不加倍填 1', target_model: '可从列表选，也可直接输入'};
+  const ariaLabels: Record<string, string> = {context_window: '上下文长度', max_output: '最大输出', margin_multiplier: '分组倍率', credit_multiplier: '模型倍率'};
+  const tips: Record<string, string> = {issuance_enabled: '关闭后不能再发新卡，已发的卡不受影响', margin_multiplier: '这个分组的卡按它加倍扣费，与模型倍率、版本倍率相乘；不加倍填 1', virtual_plan_name: '客户端显示的套餐名，与发卡套餐无关', virtual_usage_limit: '只在客户端显示，不是卡内积分', rate_multiplier: 'Kiro 的模型列表里给客户看的倍率，只影响显示，不影响扣费；留空按价格自动换算', aliases: '客户用这些 ID 请求时也由这个模型服务，多个用逗号隔开', credit_multiplier: '这个模型自己的倍率，与分组倍率、版本倍率相乘；不加倍填 1', target_model: '可从列表选，也可直接输入'};
   const placeholders: Record<string, string> = {display_name: '留空用模型 ID', aliases: '如 claude-sonnet-latest', description: '留空自动生成', rate_multiplier: '如 1.3，留空自动换算', context_window: '如 272K', max_output: '如 128K', target_model: '选择或输入'};
   // An unpublished draft survives a session end, restored only onto the configuration it
   // was made from; the draft holds no secret.
@@ -235,7 +235,7 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
           ids.add(row.id);
           if (section === 'groups') {
             if (!validText(row.name, 256) || ('virtual_plan_name' in row && !validText(row.virtual_plan_name, 256))) throw new Error('名称和对外套餐名不能为空，且不得超过 256 字节');
-            if ('margin_multiplier' in row && !positive(row.margin_multiplier)) throw new Error('分组扣费倍率需大于 0、不超过 1000，空白不能作为 0');
+            if ('margin_multiplier' in row && !positive(row.margin_multiplier)) throw new Error('分组倍率需大于 0、不超过 1000，空白不能作为 0');
             if ('virtual_usage_limit' in row && (typeof row.virtual_usage_limit !== 'number' || !Number.isFinite(row.virtual_usage_limit) || row.virtual_usage_limit < 0)) throw new Error('显示用量上限需为非负数，不能留空');
           }
           if (section === 'models') {
@@ -568,7 +568,7 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
     if (rows.some(row => row.id === id) || configGroups.some(group => group.id === id)) {setNewGroupError('这个 ID 已存在'); return;}
     if (!validText(name, 256)) {setNewGroupError('请填写名称（不超过 256 字节）'); return;}
     if (!rateCards.some(card => card.id === newGroup.rateCard)) {setNewGroupError('请选择价格表'); return;}
-    if (!String(newGroup.multiplier ?? '').trim() || !positive(multiplierValue)) {setNewGroupError('扣费倍率需大于 0、不超过 1000'); return;}
+    if (!String(newGroup.multiplier ?? '').trim() || !positive(multiplierValue)) {setNewGroupError('分组倍率需大于 0、不超过 1000'); return;}
     const row = {id, name, issuance_enabled: newGroup.issuance === true, provider_binding_mode: 'shared', rate_card_id: String(newGroup.rateCard),
       margin_multiplier: multiplierValue, virtual_plan_name: name, virtual_usage_limit: 0, system_prompt_prefix: null};
     setDraft(JSON.stringify({...parsedDraft, groups: [...rows, row]}, null, 2));
@@ -614,8 +614,8 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
       {searchable && <div className="toolbar-row"><label className="search-field"><input aria-label="搜索分组" placeholder="分组名称或 ID" value={query} onChange={event => setQuery(event.target.value)}/></label>
         {needle && <span className="muted">匹配 {formatCount(listed.length)} 个</span>}</div>}
       <div className="table-scroll"><table className="table config-table">
-        <thead><tr>{['名称', '可发卡', '对外套餐名', '用量上限', '价格表', '倍率', '卡密数', ''].map((label, index) =>
-          <th key={index} className={['用量上限', '倍率', '卡密数'].includes(label) ? 'num' : label ? undefined : 'col-actions'}>{label || <span className="sr-only">操作</span>}</th>)}</tr></thead>
+        <thead><tr>{['名称', '可发卡', '对外套餐名', '用量上限', '价格表', '分组倍率', '卡密数', ''].map((label, index) =>
+          <th key={index} className={['用量上限', '分组倍率', '卡密数'].includes(label) ? 'num' : label ? undefined : 'col-actions'}>{label || <span className="sr-only">操作</span>}</th>)}</tr></thead>
         <tbody>{listed.map(renderGroupRow)}</tbody>
         {!listed.length && <tbody><tr className="state-row"><td colSpan={8}>{busy ? <div className="skeleton" role="status" aria-label="正在加载"><span className="skeleton-bar"/><span className="skeleton-bar"/></div> : <div className="list-state"><p>{needle ? '没有匹配的条目' : '暂无数据'}</p></div>}</td></tr></tbody>}
       </table></div>
@@ -717,7 +717,7 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
           {!rateCards.length && <option value="">没有价格表</option>}
           {rateCards.map(card => <option key={String(card.id)} value={String(card.id)}>{String(card.name ?? card.id)}</option>)}
         </select></label>
-        <label className="field"><span className="field-label">扣费倍率</span><span className="input-suffix"><input aria-label="新分组扣费倍率" inputMode="decimal" value={String(newGroup.multiplier)} onChange={event => setNewGroup({...newGroup, multiplier: event.target.value})}/><span>×</span></span></label>
+        <label className="field"><span className="field-label">分组倍率</span><span className="input-suffix"><input aria-label="新分组的分组倍率" inputMode="decimal" value={String(newGroup.multiplier)} onChange={event => setNewGroup({...newGroup, multiplier: event.target.value})}/><span>×</span></span></label>
         <label className="check-field field-span"><input type="checkbox" checked={newGroup.issuance === true} onChange={event => setNewGroup({...newGroup, issuance: event.target.checked})}/> 可发新卡</label>
       </div>
       <p className="muted">对外套餐名默认同名称，显示用量上限为 0，可在加入后修改。</p>

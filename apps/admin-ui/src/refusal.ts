@@ -20,7 +20,7 @@ const REFUSALS: Array<[RegExp, (ids: string) => string]> = [
   [/Empty publication/i, () => '没有要发布的修改'],
   [/Face value must be/i, () => '积分面值须在 0.0001–1000 元之间，美元汇率须大于 0、不超过 1000'],
   [/Invalid or duplicate rate card/i, () => '价格表的 ID 或名称无效，或有重复'],
-  [/Invalid group or unknown rate card/i, () => '分组信息无效（名称、对外套餐名、扣费倍率或显示用量上限），或它的价格表不存在'],
+  [/Invalid group or unknown rate card/i, () => '分组信息无效（名称、对外套餐名、分组倍率或显示用量上限），或它的价格表不存在'],
   [/Invalid or duplicate model mapping/i, () => '模型条目无效或重复：检查 ID、上下文与最大输出、模型倍率、显示倍率、别名（最多 32 个）、备用线路（最多 8 条）、显示名称（最多 64 字节）和说明（最多 256 字节）'],
   [/Cannot move mapping between groups/i, () => '已有模型不能改分组；要放到别的分组，请在那个分组上架'],
   [/Unknown model group/i, () => '模型所在的分组不存在'],
