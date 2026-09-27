@@ -1,6 +1,7 @@
 // Built UI + authenticated local fixture. No deployed services, added dependencies or production writes.
 // Run after npm run build: node tests/admin-experience.cjs
 const {chromium} = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
+const recordToasts = require('./toasts.cjs');
 const http = require('node:http'), fs = require('node:fs'), path = require('node:path'), assert = require('node:assert/strict');
 const fixture = require('./fixture-api.cjs')();
 const root = path.resolve(__dirname, '../dist');
@@ -24,6 +25,7 @@ async function waitFor(ready) {
   try {
     const page = await browser.newPage({viewport: {width: 1280, height: 900}});
     page.setDefaultTimeout(12000);
+    const toasts = await recordToasts(page);
     const origin = `http://127.0.0.1:${server.address().port}`, errors = [];
     page.on('pageerror', error => errors.push(error.message));
     const nativeDialogs = []; page.on('dialog', dialog => {nativeDialogs.push(dialog.message()); void dialog.dismiss();});
@@ -183,9 +185,9 @@ async function waitFor(ready) {
 
     await nav('供应商与 Key');
     await page.route('**/api/v1/admin/providers/status', route => route.fulfill({json: {success: false}}));
-    await page.getByRole('switch').first().click(); await answer(true);
+    toasts.mark(); await page.getByRole('switch').first().click(); await answer(true);
     await page.getByRole('alert').filter({hasText: '切换结果未确认'}).waitFor();
-    assert.equal(await page.locator('.toast').filter({hasText: '已停用'}).count(), 0);
+    assert(!(await toasts.since()).some(text => text.includes('已停用')), 'no success toast for a negative acknowledgement');
     await button('关闭提示').click(); await nav('调用追踪');
     let prunePosts = 0, heldPrune;
     await page.route('**/api/v1/admin/traces/prune', route => {prunePosts++; heldPrune = route;});
@@ -203,11 +205,11 @@ async function waitFor(ready) {
     await busyItem.evaluate(el => el.click()); assert.equal(prunePosts, 1); await page.keyboard.press('Escape');
     assert.equal(heldPrune.request().headers()['x-csrf-token'], 'fixture-csrf');
     assert(Math.abs(heldPrune.request().postDataJSON().cutoffSecs - (Date.now() / 1000 - 30 * 86400)) < 10);
-    await heldPrune.fulfill({json: {success: false}}); await page.getByRole('alert').filter({hasText: '清理结果未确认'}).waitFor();
-    assert.equal(await page.locator('.toast').filter({hasText: '已删除'}).count(), 0);
+    toasts.mark(); await heldPrune.fulfill({json: {success: false}}); await page.getByRole('alert').filter({hasText: '清理结果未确认'}).waitFor();
+    assert(!(await toasts.since()).some(text => text.includes('已删除')), 'no success toast for an unconfirmed prune');
     await button('关闭提示').click(); heldPrune = null;
     await openPrune(); await answer(true); await waitFor(() => heldPrune);
-    await heldPrune.fulfill({json: {success: true, pruned: 7}}); await page.getByRole('status').filter({hasText: '已删除 7 条记录'}).waitFor();
+    await heldPrune.fulfill({json: {success: true, pruned: 7}}); await toasts.shown('已删除 7 条记录');
     assert.equal(prunePosts, 2); await refreshed();
     console.log('PASS: provider negative acknowledgement; prune impact confirmation, CSRF, pending lock and accurate success/failure');
 

@@ -1,5 +1,6 @@
 // 上架模型 regression: final build + loopback fixture, never production.
 const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
+const recordToasts=require('./toasts.cjs');
 const http=require('node:http'),fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
 const fixture=require('./fixture-api.cjs')();
 const root=path.resolve(__dirname,'../dist');
@@ -18,6 +19,7 @@ const server=http.createServer(async(req,res)=>{
     browser=await chromium.launch({headless:true,...(process.env.CHROME_PATH?{executablePath:process.env.CHROME_PATH}:{})});
     const page=await browser.newPage({viewport:{width:1280,height:900}}),errors=[];
     page.setDefaultTimeout(10000);
+    const toasts=await recordToasts(page);
     const origin=`http://127.0.0.1:${server.address().port}`;
     page.on('pageerror',error=>{errors.push(error.message);console.error('Browser error:',error.message);});
     await page.route('**/*',route=>new URL(route.request().url()).origin===origin?route.continue():route.abort());
@@ -89,7 +91,7 @@ const server=http.createServer(async(req,res)=>{
     for(const expected of ['客户看到：GPT 5.6 Sol（gpt-5.6-sol）','PRO：排在 claude-sonnet 之后','线路：OpenAI 格式 / Fixture / gpt-5.6-sol','售价：官方价 $4 / $20 / $5 / $0.4 × 计费倍率 ×0.24 · 上架即生效','模型倍率 1'])
       assert(facts.includes(expected),`${expected}\n${facts}`);
     // One publication: shown at once with its first price in force now, the group numbered again from its place.
-    await page.locator('.toast').filter({hasText:'已上架 gpt-5.6-sol'}).waitFor();
+    await toasts.shown('已上架 gpt-5.6-sol');
     await drawer.waitFor({state:'detached'});
     assert.equal(posts.length,1);
     const first=posts[0];

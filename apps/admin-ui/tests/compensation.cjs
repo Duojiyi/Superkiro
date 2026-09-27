@@ -2,6 +2,7 @@
 // a reason naming the request and the request it makes up for; the card's history leads back to it,
 // and a retry names the same request. Final build + loopback fixture, never production.
 const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
+const recordToasts=require('./toasts.cjs');
 const http=require('node:http'),fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
 const fixture=require('./fixture-api.cjs')();
 const root=path.resolve(__dirname,'../dist');
@@ -26,6 +27,7 @@ const listTime=secs=>{const d=new Date(secs*1000),p=n=>String(n).padStart(2,'0')
     browser=await chromium.launch({headless:true,...(process.env.CHROME_PATH?{executablePath:process.env.CHROME_PATH}:{})});
     const page=await browser.newPage({viewport:{width:1440,height:1000}}),errors=[];
     page.setDefaultTimeout(10000);
+    const toasts=await recordToasts(page);
     const origin=`http://127.0.0.1:${server.address().port}`;
     page.on('pageerror',error=>{errors.push(error.message);console.error('Browser error:',error.message);});
     const nativeDialogs=[];page.on('dialog',dialog=>{nativeDialogs.push(dialog.message());void dialog.dismiss();});
@@ -54,7 +56,7 @@ const listTime=secs=>{const d=new Date(secs*1000),p=n=>String(n).padStart(2,'0')
     const review=await adjust.getByLabel('调账复核').innerText();
     assert(review.includes(`原因：${expected}`)&&review.includes('关联请求：')&&review.includes('可从记录打开这次请求'),review);
     await button('确认入账').click();await adjust.waitFor({state:'detached'});
-    await page.locator('.toast').filter({hasText:'已调整 fixture-card-0：+3.2 积分'}).waitFor();
+    await toasts.shown('已调整 fixture-card-0：+3.2 积分');
     const sent=adjusts().at(-1);
     assert.deepEqual({...sent,idempotencyKey:undefined},{cardId:'fixture-card-0',deltaPoints:3.2,reason:expected,idempotencyKey:undefined,invocationId:'fixture-card-0:fixture-inv-19'});
     // The card's history leads back to the request.

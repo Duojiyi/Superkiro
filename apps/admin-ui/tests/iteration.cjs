@@ -1,5 +1,6 @@
 // Final-build auth gate regression: localhost fixture only, no deployed services.
 const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
+const recordToasts=require('./toasts.cjs');
 const http=require('node:http'),fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
 const fixture=require('./fixture-api.cjs')();
 async function waitForRoute(ready){
@@ -22,6 +23,7 @@ const server=http.createServer(async(req,res)=>{
   const browser=await chromium.launch({headless:true,...(process.env.CHROME_PATH?{executablePath:process.env.CHROME_PATH}:{})});
   try {
     const page=await browser.newPage({viewport:{width:390,height:844}});
+    const toasts=await recordToasts(page);
     const origin=`http://127.0.0.1:${server.address().port}`, errors=[];
     page.on('pageerror',e=>errors.push(e.message));
     const nativeDialogs=[];page.on('dialog',d=>{nativeDialogs.push(d.message());void d.dismiss();});
@@ -64,7 +66,7 @@ const server=http.createServer(async(req,res)=>{
     const models=page.getByLabel('可用模型（每行一个）');await nav('手动输入');await models.fill('new-model');
     // Waits until exactly these models are ticked in the Key's checklist.
     const ticked=async expected=>{await page.waitForFunction(names=>{const boxes=[...document.querySelectorAll('#key-editor .model-checklist input[type=checkbox]')];return JSON.stringify(boxes.filter(box=>box.checked).map(box=>box.getAttribute('aria-label')))===JSON.stringify(names);},expected);return expected;};await page.getByLabel('启用',{exact:true}).uncheck();
-    await nav('保存');await answer(true);await page.getByRole('status').filter({hasText:'已保存 Key'}).waitFor();
+    toasts.mark();await nav('保存');await answer(true);await toasts.shown('已保存 Key');
     await page.waitForFunction(()=>document.querySelector('table')?.textContent.includes('new-model'));
     await nav('运营概览');await nav('供应商与 Key');await page.getByRole('group',{name:'可用模型'}).waitFor();
     await ticked(['new-model']);assert.equal(await page.getByLabel('启用',{exact:true}).isChecked(),false);
@@ -128,7 +130,7 @@ const server=http.createServer(async(req,res)=>{
     await drawer.getByRole('alert').filter({hasText:'采购价需在'}).waitFor();assert.equal(await page.getByRole('alertdialog').count(),0);assert.equal(publishBodies.length,0);
     for(const label of ['输入','输出','缓存写','缓存读'])await drawer.getByLabel(`采购${label}价`,{exact:true}).fill('0.001');
     await drawer.getByRole('button',{name:'预览调价',exact:true}).click();await answer(true);
-    await page.locator('.toast').filter({hasText:'已发布 claude-sonnet 的新价格'}).waitFor();
+    await toasts.shown('已发布 claude-sonnet 的新价格');
     assert.equal(publishBodies.length,1);assert.equal(publishBodies[0].expected_revision,config.revision);assert.equal(publishBodies[0].reason,'test new price');
     const version=publishBodies[0].versions[0];
     assert.match(version.id,/^claude-sonnet-\d{12}$/);assert.equal(version.margin_multiplier,1);assert.equal(version.fixed_input_credit_per_m,2500000);assert.equal(version.currency,'CNY');

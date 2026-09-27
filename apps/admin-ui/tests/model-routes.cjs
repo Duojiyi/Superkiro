@@ -1,5 +1,6 @@
 // 线路 regression (backups, route costs, 切换线路, 切回): final build + loopback fixture, never production.
 const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
+const recordToasts=require('./toasts.cjs');
 const http=require('node:http'),fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
 const fixture=require('./fixture-api.cjs')();
 const root=path.resolve(__dirname,'../dist');
@@ -20,6 +21,7 @@ const model=id=>fixture.config.models.find(row=>row.id===id);
     browser=await chromium.launch({headless:true,...(process.env.CHROME_PATH?{executablePath:process.env.CHROME_PATH}:{})});
     const page=await browser.newPage({viewport:{width:1440,height:1000}}),errors=[];
     page.setDefaultTimeout(10000);
+    const toasts=await recordToasts(page);
     const origin=`http://127.0.0.1:${server.address().port}`;
     page.on('pageerror',error=>{errors.push(error.message);console.error('Browser error:',error.message);});
     const nativeDialogs=[];page.on('dialog',dialog=>{nativeDialogs.push(dialog.message());void dialog.dismiss();});
@@ -63,9 +65,9 @@ const model=id=>fixture.config.models.find(row=>row.id===id);
     assert.equal(await page.locator('.mapping-editor').getByLabel('上游模型',{exact:true}).inputValue(),'claude-sonnet');
     const bar=page.getByRole('region',{name:'发布'});
     await bar.getByLabel('变更原因',{exact:true}).fill('加一条备用线路');
-    await button('发布').click();
+    toasts.mark();await button('发布').click();
     await confirm();
-    await page.locator('.toast').filter({hasText:'已发布'}).waitFor();
+    await toasts.shown('已发布');
     const sent=published().at(-1).body;
     assert.deepEqual(sent.models.map(row=>[row.id,row.fallback_chain]),[['fixture-model-0',[{provider_id:'fixture-openai',target_model:'gpt-6-astra'}]]]);
     assert.equal('versions' in sent,false,'no route cost version is made');
@@ -82,7 +84,7 @@ const model=id=>fixture.config.models.find(row=>row.id===id);
     const costFacts=await confirm();
     // Every model routed through it is in the preview: claude-sonnet's backup and gpt-6-astra's primary.
     assert(costFacts.includes('OpenAI 格式 / Fixture / gpt-6-astra：成本倍率 — → ×0.1')&&costFacts.includes('上游计费基准 官方价 → $0.1 / $0.5 / $0.1 / $0.01')&&costFacts.includes('备1 OpenAI 格式 / Fixture / gpt-6-astra')&&costFacts.includes('主 OpenAI 格式 / Fixture / gpt-6-astra'),costFacts);
-    await page.locator('.toast').filter({hasText:'已发布 OpenAI 格式 / Fixture / gpt-6-astra 的线路成本'}).waitFor();await costDrawer.waitFor({state:'detached'});
+    await toasts.shown('已发布 OpenAI 格式 / Fixture / gpt-6-astra 的线路成本');await costDrawer.waitFor({state:'detached'});
     const costSent=published().at(-1).body;
     assert.deepEqual(Object.keys(costSent).sort(),['expected_revision','reason','settings']);
     assert.deepEqual(costSent.settings,{credit_face_value_cny:0.01,usd_cny_rate:7.2,route_costs:{'fixture-openai/gpt-6-astra':{cost_multiplier:0.1,basis_usd_per_m:[0.1,0.5,0.1,0.01]}}});
@@ -118,7 +120,7 @@ const model=id=>fixture.config.models.find(row=>row.id===id);
     const switchFacts=await confirm();
     for(const expected of ['gpt-5：fixture-provider / gpt-5 → fixture-openai / gpt-5.6-sol','gemini-pro：fixture-provider / gemini-pro → fixture-openai / gpt-5.6-terra','新线路的成本按旧版采购价估算或未知：gpt-5、gemini-pro','保留原线路作为备用'])
       assert(switchFacts.includes(expected),`${expected}\n${switchFacts}`);
-    await page.locator('.toast').filter({hasText:'已把 2 个模型切换到 OpenAI 格式 / Fixture'}).waitFor();
+    await toasts.shown('已把 2 个模型切换到 OpenAI 格式 / Fixture');
     const switched=published().at(-1).body;
     assert.deepEqual(switched.models.map(row=>[row.id,row.target_provider_id,row.target_model,row.fallback_chain]).sort(),[
       ['fixture-model-1','fixture-openai','gpt-5.6-sol',[{provider_id:'fixture-provider',target_model:'gpt-5'}]],
@@ -129,7 +131,7 @@ const model=id=>fixture.config.models.find(row=>row.id===id);
     const note=page.getByRole('status').filter({hasText:'已把 gpt-5、gemini-pro 切换到 OpenAI 格式 / Fixture，原线路保留为第 1 条备用'});await note.waitFor();
     await note.getByRole('button',{name:'切回原线路',exact:true}).click();
     assert((await confirm()).includes('gpt-5：fixture-openai → fixture-provider / gpt-5'));
-    await page.locator('.toast').filter({hasText:'已切回 2 个模型的原线路'}).waitFor();
+    await toasts.shown('已切回 2 个模型的原线路');
     assert.deepEqual(published().at(-1).body.models.map(row=>[row.id,row.target_provider_id,row.target_model,row.fallback_chain]).sort(),[
       ['fixture-model-1','fixture-provider','gpt-5',[]],['fixture-model-2','fixture-provider','gemini-pro',[]]]);
     assert.equal(await note.count(),0);

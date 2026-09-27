@@ -3,6 +3,7 @@
 // detail; refusals in words; a result that did not come back locks further changes until checked.
 // Final build + loopback fixture, never production.
 const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
+const recordToasts=require('./toasts.cjs');
 const http=require('node:http'),fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
 const fixture=require('./fixture-api.cjs')();
 const root=path.resolve(__dirname,'../dist');
@@ -33,6 +34,7 @@ const localDate=secs=>minute(secs).slice(0,10);
     browser=await chromium.launch({headless:true,...(process.env.CHROME_PATH?{executablePath:process.env.CHROME_PATH}:{})});
     const page=await browser.newPage({viewport:{width:1440,height:1000}}),errors=[];
     page.setDefaultTimeout(10000);
+    const toasts=await recordToasts(page);
     const origin=`http://127.0.0.1:${server.address().port}`;
     page.on('pageerror',error=>{errors.push(error.message);console.error('Browser error:',error.message);});
     const nativeDialogs=[];page.on('dialog',dialog=>{nativeDialogs.push(dialog.message());void dialog.dismiss();});
@@ -45,7 +47,7 @@ const localDate=secs=>minute(secs).slice(0,10);
     const open=async id=>{await row(id).locator('.col-group').click();await drawer.locator('.drawer-head').getByText(id,{exact:true}).waitFor();};
     const history=()=>drawer.getByRole('region',{name:'操作记录'}).locator('tbody tr');
     const writes=endpoint=>fixture.writes.filter(write=>write.endpoint===endpoint).map(write=>write.body);
-    const toast=text=>page.locator('.toast').filter({hasText:text}).waitFor();
+    const toast=text=>toasts.shown(text);
     // A confirmation that needs a reason: accepting is disabled until one is given.
     const confirmWith=async(reason,expect=[])=>{
       const box=page.getByRole('alertdialog');await box.waitFor();const text=await box.innerText();

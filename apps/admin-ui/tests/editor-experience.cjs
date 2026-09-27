@@ -1,5 +1,6 @@
 // Editor experience regression: final build + loopback fixture, never production.
 const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
+const recordToasts=require('./toasts.cjs');
 const http=require('node:http'),fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
 const fixture=require('./fixture-api.cjs')();
 const root=path.resolve(__dirname,'../dist');
@@ -19,6 +20,7 @@ const until=async ready=>{const end=Date.now()+10000;while(!ready()){assert(Date
     browser=await chromium.launch({headless:true,...(process.env.CHROME_PATH?{executablePath:process.env.CHROME_PATH}:{})});
     const page=await browser.newPage({viewport:{width:1280,height:900}}),errors=[];
     page.setDefaultTimeout(10000);
+    const toasts=await recordToasts(page);
     const origin=`http://127.0.0.1:${server.address().port}`;
     page.on('pageerror',error=>{errors.push(error.message);console.error('Browser error:',error.message);});
     const nativeDialogs=[];page.on('dialog',dialog=>{nativeDialogs.push(dialog.message());void dialog.dismiss();});
@@ -32,7 +34,7 @@ const until=async ready=>{const end=Date.now()+10000;while(!ready()){assert(Date
       await (accept?box.locator('[data-confirm="accept"]'):box.getByRole('button',{name:'取消',exact:true})).click();
       await box.waitFor({state:'detached'});
     };
-    const toast=text=>page.locator('.toast').filter({hasText:text}).waitFor();
+    const toast=text=>toasts.shown(text);
     await page.goto(origin+'/admin/');await page.getByLabel('密码',{exact:true}).fill('fixture-password');await button('登录').click();
     await button('刷新').waitFor();
     let config=(await (await page.request.get(origin+'/api/v1/admin/commercial-config')).json()).config;

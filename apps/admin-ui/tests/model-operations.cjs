@@ -1,5 +1,6 @@
 // 模型与定价 operations (list order and default): final build + loopback fixture, never production.
 const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
+const recordToasts=require('./toasts.cjs');
 const http=require('node:http'),fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
 const fixture=require('./fixture-api.cjs')();
 const root=path.resolve(__dirname,'../dist');
@@ -20,6 +21,7 @@ const model=id=>fixture.config.models.find(row=>row.id===id);
     browser=await chromium.launch({headless:true,...(process.env.CHROME_PATH?{executablePath:process.env.CHROME_PATH}:{})});
     const page=await browser.newPage({viewport:{width:1440,height:1000}}),errors=[];
     page.setDefaultTimeout(10000);
+    const toasts=await recordToasts(page);
     const origin=`http://127.0.0.1:${server.address().port}`;
     page.on('pageerror',error=>{errors.push(error.message);console.error('Browser error:',error.message);});
     const nativeDialogs=[];page.on('dialog',dialog=>{nativeDialogs.push(dialog.message());void dialog.dismiss();});
@@ -34,7 +36,7 @@ const model=id=>fixture.config.models.find(row=>row.id===id);
       await box.locator('[data-confirm="accept"]').click();await box.waitFor({state:'detached'});return text;
     };
     const bar=page.getByRole('region',{name:'发布'});
-    const publish=async reason=>{await bar.getByLabel('变更原因',{exact:true}).fill(reason);await button('发布').click();await confirm();await page.locator('.toast').filter({hasText:'已发布'}).waitFor();return published().at(-1).body;};
+    const publish=async reason=>{await bar.getByLabel('变更原因',{exact:true}).fill(reason);toasts.mark();await button('发布').click();await confirm();await toasts.shown('已发布');return published().at(-1).body;};
     const group=name=>page.getByRole('rowgroup',{name,exact:true});
     const names=name=>group(name).locator('td.cell-strong').evaluateAll(cells=>cells.map(cell=>cell.firstChild.textContent));
     // gpt-6-astra shares claude-sonnet's place in PRO: which one is Kiro's default is the server's order.
@@ -96,7 +98,7 @@ const model=id=>fixture.config.models.find(row=>row.id===id);
     await bulk.getByRole('button',{name:'预览调价',exact:true}).click();
     const bulkFacts=await confirm({typed:'2'});
     assert(bulkFacts.includes('官方价 -10%，计费倍率不变')&&['claude-sonnet','gpt-6-astra'].every(name=>bulkFacts.split('改为按官方价表定价：')[1]?.split(String.fromCharCode(10))[0].includes(name)),bulkFacts);
-    await page.locator('.toast').filter({hasText:'已发布 2 个模型的新价格'}).waitFor();await bulk.waitFor({state:'detached'});
+    await toasts.shown('已发布 2 个模型的新价格');await bulk.waitFor({state:'detached'});
     const priced=published().at(-1).body;
     assert.deepEqual(Object.keys(priced).sort(),['expected_revision','reason','versions']);
     assert.deepEqual(priced.versions.map(version=>[version.model,version.official.input_usd_per_m,version.official.price_multiplier,version.fixed_input_credit_per_m,version.input_price_per_m,version.currency]).sort(),
@@ -116,14 +118,14 @@ const model=id=>fixture.config.models.find(row=>row.id===id);
     await (await menu('claude-sonnet','隐藏（已在用的客户仍可用）')).click();
     const hideFacts=await confirm({reason:'先不对新客户开放'});
     assert(hideFacts.includes('它是 PRO 的默认模型：之后默认变为 gpt-6-astra')&&hideFacts.includes('已经在用这个模型 ID 的客户仍可继续调用'),hideFacts);
-    await page.locator('.toast').filter({hasText:'已隐藏 claude-sonnet'}).waitFor();
+    await toasts.shown('已隐藏 claude-sonnet');
     let sentState=published().at(-1).body;
     assert.deepEqual([sentState.reason,sentState.models.map(row=>[row.id,row.visible,row.retired])],['先不对新客户开放',[['fixture-model-0',false,false]]]);
     assert.equal(await state('claude-sonnet').innerText(),'隐藏');
     await header.getByText('Kiro 默认：gpt-6-astra').waitFor();
     await (await menu('claude-sonnet','下架（停止服务）')).click();
     assert((await confirm({reason:'上游停止供应'})).includes('所有请求都会被拒绝，包括已经在用的客户'));
-    await page.locator('.toast').filter({hasText:'已下架 claude-sonnet'}).waitFor();
+    await toasts.shown('已下架 claude-sonnet');
     assert.deepEqual(published().at(-1).body.models.map(row=>[row.id,row.visible,row.retired]),[['fixture-model-0',false,true]]);
     assert.equal(await state('claude-sonnet').innerText(),'已下架');
     // A server that does not keep 已下架 is called out, not shown as retired.
@@ -140,7 +142,7 @@ const model=id=>fixture.config.models.find(row=>row.id===id);
     await button('刷新').click();await page.locator('.btn-refresh:not([disabled])').waitFor();
     // 重新上架 needs a route that serves and a price in force.
     await (await menu('claude-sonnet','重新上架')).click();await confirm({reason:'恢复供应'});
-    await page.locator('.toast').filter({hasText:'已重新上架 claude-sonnet'}).waitFor();
+    await toasts.shown('已重新上架 claude-sonnet');
     assert.deepEqual(published().at(-1).body.models.map(row=>[row.id,row.visible,row.retired]),[['fixture-model-0',true,false]]);
     assert.equal(await state('claude-sonnet').innerText(),'在售');
     const key=fixture.keys.find(row=>row.id==='fixture-key'),allowed=key.allowed_models;key.allowed_models=allowed.filter(name=>name!=='gemini-pro');
@@ -153,7 +155,7 @@ const model=id=>fixture.config.models.find(row=>row.id===id);
     // 删除: only hidden or retired entries, the word typed, and a reason.
     await (await menu('gemini-pro','删除（仅隐藏或已下架的条目）')).click();
     assert((await confirm({reason:'不再供应',typed:'删除'})).includes('不能撤销'));
-    await page.locator('.toast').filter({hasText:'已删除 gemini-pro'}).waitFor();
+    await toasts.shown('已删除 gemini-pro');
     assert.deepEqual(Object.keys(published().at(-1).body).sort(),['expected_revision','reason','removed_models']);
     assert.deepEqual(published().at(-1).body.removed_models,['fixture-model-2']);
     await page.getByRole('rowgroup',{name:'全部分组',exact:true}).getByRole('row').filter({hasText:'gemini-pro'}).waitFor({state:'detached'});

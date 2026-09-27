@@ -1,5 +1,6 @@
 // 测试, live Key health and the provider format: final build + loopback fixture, never production.
 const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
+const recordToasts=require('./toasts.cjs');
 const http=require('node:http'),fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
 const fixture=require('./fixture-api.cjs')();
 const root=path.resolve(__dirname,'../dist');
@@ -20,6 +21,7 @@ const writes=endpoint=>fixture.writes.filter(write=>write.endpoint===endpoint);
     browser=await chromium.launch({headless:true,...(process.env.CHROME_PATH?{executablePath:process.env.CHROME_PATH}:{})});
     const page=await browser.newPage({viewport:{width:1440,height:1000}}),errors=[];
     page.setDefaultTimeout(10000);
+    const toasts=await recordToasts(page);
     const origin=`http://127.0.0.1:${server.address().port}`;
     page.on('pageerror',error=>{errors.push(error.message);console.error('Browser error:',error.message);});
     const nativeDialogs=[];page.on('dialog',dialog=>{nativeDialogs.push(dialog.message());void dialog.dismiss();});
@@ -77,7 +79,7 @@ const writes=endpoint=>fixture.writes.filter(write=>write.endpoint===endpoint);
     const box=page.getByRole('alertdialog');await box.waitFor();const facts=await box.innerText();
     assert(facts.includes('现在：冷却中')&&facts.includes('最近错误：HTTP 529 · 上游过载'),facts);
     await box.locator('[data-confirm="accept"]').click();
-    await page.locator('.toast').filter({hasText:'已解除 Key fixture-backup 的冷却'}).waitFor();
+    await toasts.shown('已解除 Key fixture-backup 的冷却');
     assert.deepEqual(writes('providers/keys/reset').map(write=>write.body),[{provider_id:'fixture-provider',key_id:'fixture-backup'}]);
     await keyRow('测试供应商 / Fixture','fixture-backup').getByText('正常',{exact:true}).waitFor();
     await keyRow('测试供应商 / Fixture','fixture-backup').getByText('5 分钟前 · HTTP 529 · 上游过载').waitFor();// the last error stays on record

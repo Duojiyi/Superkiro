@@ -2,6 +2,7 @@
 // (seeded with official prices), never production. Every publication goes through the fixture's
 // copy of the server's rules.
 const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
+const recordToasts=require('./toasts.cjs');
 const http=require('node:http'),fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
 const fixture=require('./fixture-api.cjs')();
 require('./pricing-seed.cjs')(fixture);
@@ -25,13 +26,14 @@ const published=()=>fixture.writes.filter(write=>write.endpoint==='commercial-co
     browser=await chromium.launch({headless:true,...(process.env.CHROME_PATH?{executablePath:process.env.CHROME_PATH}:{})});
     const page=await browser.newPage({viewport:{width:1440,height:1000}}),errors=[];
     page.setDefaultTimeout(10000);
+    const toasts=await recordToasts(page);
     const origin=`http://127.0.0.1:${server.address().port}`;
     page.on('pageerror',error=>{errors.push(error.message);console.error('Browser error:',error.message);});
     const nativeDialogs=[];page.on('dialog',dialog=>{nativeDialogs.push(dialog.message());void dialog.dismiss();});
     await page.route('**/*',route=>new URL(route.request().url()).origin===origin?route.continue():route.abort());
     const button=name=>page.getByRole('button',{name,exact:true});
     const dialog=page.getByRole('alertdialog');
-    const toast=text=>page.locator('.toast').filter({hasText:text}).waitFor();
+    const toast=text=>toasts.shown(text);
     const sheet=page.getByRole('rowgroup',{name:'全部分组',exact:true});
     const row=name=>page.locator(`tr[data-model="${name}"]`);
     const shown=()=>sheet.locator('tr[data-model]').evaluateAll(rows=>rows.map(row=>row.dataset.model));

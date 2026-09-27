@@ -1,5 +1,6 @@
 // 定价设置 and 官方价表: final build + loopback fixture (seeded with official prices), never production.
 const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
+const recordToasts=require('./toasts.cjs');
 const http=require('node:http'),fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
 const fixture=require('./fixture-api.cjs')();
 const {promo}=require('./pricing-seed.cjs')(fixture);
@@ -20,6 +21,7 @@ const published=()=>fixture.writes.filter(write=>write.endpoint==='commercial-co
     browser=await chromium.launch({headless:true,...(process.env.CHROME_PATH?{executablePath:process.env.CHROME_PATH}:{})});
     const page=await browser.newPage({viewport:{width:1440,height:1000},acceptDownloads:true}),errors=[];
     page.setDefaultTimeout(10000);
+    const toasts=await recordToasts(page);
     const origin=`http://127.0.0.1:${server.address().port}`;
     page.on('pageerror',error=>{errors.push(error.message);console.error('Browser error:',error.message);});
     const nativeDialogs=[];page.on('dialog',dialog=>{nativeDialogs.push(dialog.message());void dialog.dismiss();});
@@ -60,7 +62,7 @@ const published=()=>fixture.writes.filter(write=>write.endpoint==='commercial-co
     for(const expected of ['积分面值 0.03 → 0.05 元/积分（1000 积分 = ¥50）','未消耗余额 7,200 积分：折合 ¥216 → ¥360','PRO+','¥0.0275','便宜 45.0%','这些模型没有官方价，积分不变','一起重算 4 个官方价版本，其中 1 个已排期的撤回后在原时间重新排期'])
       assert(faceText.includes(expected),`${expected}\n${faceText}`);
     await publishPreview({typed:'gemini-pro',ticks:1});
-    await page.locator('.toast').filter({hasText:'已发布定价设置'}).waitFor();
+    await toasts.shown('已发布定价设置');
     const face=published().at(-1).body;
     assert.deepEqual(Object.keys(face).sort(),['cancelled_versions','expected_revision','reason','settings','versions']);
     assert.deepEqual(face.settings,{credit_face_value_cny:0.05,usd_cny_rate:7.25},'only what changed, and the two the server always needs');
@@ -80,12 +82,12 @@ const published=()=>fixture.writes.filter(write=>write.endpoint==='commercial-co
     const costText=await publishPreview({option:false});
     for(const expected of ['默认计费倍率 ×0.24 → ×0.3（之后新定的价格用它）','供应商成本倍率：fixture-openai ×0.06 → ×0.08','gpt-6-astra','75% → 67%','同时把计费倍率调到保持毛利（gpt-6-astra ×0.24 → ×0.32'])
       assert(costText.includes(expected),`${expected}\n${costText}`);
-    await page.locator('.toast').filter({hasText:'已发布定价设置'}).waitFor();
+    await toasts.shown('已发布定价设置');
     assert.deepEqual(published().at(-1).body,{settings:{credit_face_value_cny:0.05,usd_cny_rate:7.25,default_price_multiplier:0.3,provider_cost_multipliers:{'fixture-provider':0.08,'fixture-openai':0.08}},
       expected_revision:published().at(-1).body.expected_revision,reason:'Astra 涨价'},'settings only: customer prices unchanged');
     await openai.fill('0.1');await reason.fill('Astra 再涨价，保持毛利');await open.click();
     await publishPreview({option:true});
-    await page.locator('.toast').filter({hasText:'已发布定价设置'}).waitFor();
+    await toasts.shown('已发布定价设置');
     const kept=published().at(-1).body;
     assert.deepEqual(kept.settings.provider_cost_multipliers,{'fixture-provider':0.08,'fixture-openai':0.1});
     assert.equal(kept.versions.length,1);const [astra]=kept.versions;
@@ -111,7 +113,7 @@ const published=()=>fixture.writes.filter(write=>write.endpoint==='commercial-co
     const officialText=await publishPreview({option:true});
     for(const expected of ['claude-sonnet：$3 / $15 / $3.75 / $0.3 → $3.3 / $15 / $3.75 / $0.3','新增 claude-opus-5：$5 / $25 / $6.25 / $0.5','同时按新官方价重算这些模型的售价（约 1 分钟后生效）：claude-sonnet','会覆盖这次修改'])
       assert(officialText.includes(expected),`${expected}\n${officialText}`);
-    await page.locator('.toast').filter({hasText:'已发布官方价表'}).waitFor();
+    await toasts.shown('已发布官方价表');
     const sentTable=published().at(-1).body;
     assert.deepEqual(Object.keys(sentTable.settings.official_prices).sort(),['claude-opus-5','claude-sonnet','gemini-pro','gpt-5','gpt-6-astra']);
     assert.deepEqual(sentTable.settings.official_prices['claude-opus-5'],{input_usd_per_m:5,output_usd_per_m:25,cache_creation_usd_per_m:6.25,cache_read_usd_per_m:0.5});

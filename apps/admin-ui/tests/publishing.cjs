@@ -1,5 +1,6 @@
 // Publication refusals and conflicts: final build + loopback fixture, never production.
 const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
+const recordToasts=require('./toasts.cjs');
 const http=require('node:http'),fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
 const fixture=require('./fixture-api.cjs')();
 const root=path.resolve(__dirname,'../dist');
@@ -22,6 +23,7 @@ const elsewhere=change=>{change();fixture.config.revision=`fixture-rev-${Number(
     browser=await chromium.launch({headless:true,...(process.env.CHROME_PATH?{executablePath:process.env.CHROME_PATH}:{})});
     const page=await browser.newPage({viewport:{width:1280,height:900}}),errors=[];
     page.setDefaultTimeout(10000);
+    const toasts=await recordToasts(page);
     const origin=`http://127.0.0.1:${server.address().port}`;
     page.on('pageerror',error=>{errors.push(error.message);console.error('Browser error:',error.message);});
     const nativeDialogs=[];page.on('dialog',dialog=>{nativeDialogs.push(dialog.message());void dialog.dismiss();});
@@ -50,8 +52,8 @@ const elsewhere=change=>{change();fixture.config.revision=`fixture-rev-${Number(
     assert.equal(await field('上下文长度').inputValue(),'300000','a field changed on the server keeps the server value');
     assert.equal(await field('最大输出').inputValue(),'16384');
     assert.equal(await bar.getByLabel('变更原因',{exact:true}).inputValue(),'上下文和显示名','the reason is kept');
-    await button('发布').click();await accept();
-    await page.locator('.toast').filter({hasText:'已发布'}).waitFor();
+    toasts.mark();await button('发布').click();await accept();
+    await toasts.shown('已发布');
     const sent=published().at(-1).body;
     assert.equal(sent.expected_revision,'fixture-rev-12');
     assert.deepEqual(sent.models.map(row=>[row.id,row.display_name,row.context_window,row.max_output]),[['fixture-model-0','Sonnet',300000,16384]],'only the model that changed is sent');
@@ -68,8 +70,8 @@ const elsewhere=change=>{change();fixture.config.revision=`fixture-rev-${Number(
     await button('发布').click();await accept();
     await bar.getByRole('status').filter({hasText:'服务器拒绝了这次发布：版本倍率 × 分组倍率 × 模型倍率超过了 100 倍'}).waitFor();
     assert(await button('发布').isEnabled());assert.equal(await field('最大输出').inputValue(),'32000');
-    await button('发布').click();await accept();
-    await page.locator('.toast').filter({hasText:'已发布'}).waitFor();
+    toasts.mark();await button('发布').click();await accept();
+    await toasts.shown('已发布');
     assert.deepEqual(published().at(-1).body.models.map(row=>row.id),['fixture-model-0'],'gpt-5, now without a route, is not part of this publication');
     console.log('PASS: refusals are explained in plain words and leave the draft editable; an unrelated model without a route does not block a publication');
 
@@ -95,7 +97,7 @@ const elsewhere=change=>{change();fixture.config.revision=`fixture-rev-${Number(
     assert.equal(published().length,count);
     fixture.keys.find(row=>row.id==='fixture-openai-key-1').allowed_models=['gpt-6-astra','gpt-5.6-sol'];
     await button('刷新').click();await page.locator('.btn-refresh:not([disabled])').waitFor();
-    await button('发布').click();await accept();await page.locator('.toast').filter({hasText:'已发布'}).waitFor();
+    toasts.mark();await button('发布').click();await accept();await toasts.shown('已发布');
     assert.deepEqual(published().at(-1).body.models.map(row=>[row.id,row.visible]),[['fixture-model-9',true]]);
     console.log('PASS: a model is shown only with a price in force and a primary route that serves; each refusal names the model before anything is sent');
 
@@ -113,7 +115,7 @@ const elsewhere=change=>{change();fixture.config.revision=`fixture-rev-${Number(
     await settings.getByRole('button',{name:'重新加载',exact:true}).click();await settings.getByRole('alert').waitFor({state:'detached'});
     assert.equal(await face.inputValue(),'0.03');assert.equal(await reason.inputValue(),'新面值','the typed values and reason stay');
     await settings.getByRole('button',{name:'预览并发布',exact:true}).click();await acceptPreview();
-    await page.locator('.toast').filter({hasText:'已发布定价设置'}).waitFor();
+    await toasts.shown('已发布定价设置');
     assert.equal(fixture.config.settings.credit_face_value_cny,0.03);
     assert.deepEqual(errors,[]);assert.deepEqual(nativeDialogs,[],'no browser-native dialogs');
     console.log('PASS: 定价设置: a conflict keeps the typed values and reason; reloaded, the same values publish');

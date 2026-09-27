@@ -5,6 +5,7 @@
 // unconfirmed publication locks editing; an older server's tiers are shown read-only. Final build +
 // loopback fixture, never production.
 const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
+const recordToasts=require('./toasts.cjs');
 const http=require('node:http'),fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
 const fixture=require('./fixture-api.cjs')();
 const root=path.resolve(__dirname,'../dist');
@@ -23,6 +24,7 @@ const server=http.createServer(async(req,res)=>{
     browser=await chromium.launch({headless:true,...(process.env.CHROME_PATH?{executablePath:process.env.CHROME_PATH}:{})});
     const page=await browser.newPage({viewport:{width:1440,height:1000},acceptDownloads:true}),errors=[];
     page.setDefaultTimeout(10000);
+    const toasts=await recordToasts(page);
     const origin=`http://127.0.0.1:${server.address().port}`;
     page.on('pageerror',error=>{errors.push(error.message);console.error('Browser error:',error.message);});
     const nativeDialogs=[];page.on('dialog',dialog=>{nativeDialogs.push(dialog.message());void dialog.dismiss();});
@@ -124,7 +126,7 @@ const server=http.createServer(async(req,res)=>{
     assert.deepEqual([issued.planId,issued.templateId,issued.groupId,issued.count],['trial-7d','trial-7d','fixture-group-2',2]);
     assert.equal(await done.locator('.modal-title').innerText(),'已生成 2 张 · 体验卡 300 积分');
     // The handout and the CSV name the plan and its validity.
-    await done.getByRole('button',{name:'复制发货文本',exact:true}).click();await page.getByRole('status').filter({hasText:'已复制 2 张卡的发货文本'}).waitFor();
+    await done.getByRole('button',{name:'复制发货文本',exact:true}).click();await toasts.shown('已复制 2 张卡的发货文本');
     const handout=i=>`卡密：FIXTURE-NOT-VALID-300-${i}\n套餐：体验卡（300 积分）\n有效期：激活后 7 天\n下载地址：https://kiro.rent`;
     assert.deepEqual(await page.evaluate(()=>window.copied),[handout(0)+'\n\n'+handout(1)]);
     const download=page.waitForEvent('download');await done.getByRole('button',{name:'下载 CSV',exact:true}).click();

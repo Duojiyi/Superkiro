@@ -1,5 +1,6 @@
 // Final-build auth gate regression: localhost fixture only, no deployed services.
 const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
+const recordToasts=require('./toasts.cjs');
 const http=require('node:http'),fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
 const fixture=require('./fixture-api.cjs')();
 // The console confirms in its own dialog (role alertdialog), never window.confirm.
@@ -28,6 +29,7 @@ const server=http.createServer(async(req,res)=>{
   const browser=await chromium.launch({headless:true,...(process.env.CHROME_PATH?{executablePath:process.env.CHROME_PATH}:{})});
   try{
     const page=await browser.newPage({viewport:{width:1440,height:1080}});page.setDefaultTimeout(15000);
+    const toasts=await recordToasts(page);
     const origin=`http://127.0.0.1:${server.address().port}`;
     const requests=[],errors=[];let initial=true,heldSession,holdLoginSession=false,heldRevoke;
     page.on('pageerror',e=>errors.push(e.message));
@@ -95,7 +97,7 @@ const server=http.createServer(async(req,res)=>{
     // The fixture's USD procurement price loses money on gpt-6-astra: named before anything is sent.
     await financeBox.getByLabel('确认输入').fill('gpt-6-astra');
     await confirmIn(page,true);
-    await page.getByRole('status').filter({hasText:'已发布定价设置'}).waitFor();
+    await toasts.shown('已发布定价设置');
     assert.deepEqual(fixture.writes.find(w=>w.endpoint==='commercial-config').body,{settings:{credit_face_value_cny:0.02,usd_cny_rate:7.3},expected_revision:'fixture-rev-2',reason:'fixture settings'});
     // A lost adjustment response keeps one intent key and immutable parameters.
     await page.getByRole('navigation').getByRole('button',{name:'卡密资产',exact:true}).click();

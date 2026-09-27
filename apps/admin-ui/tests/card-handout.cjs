@@ -1,6 +1,7 @@
 // 卡密资产: a card past its date, the single-card 封禁, 显示卡密 and handing a new batch out.
 // Final build + loopback fixture, never production.
 const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
+const recordToasts=require('./toasts.cjs');
 const http=require('node:http'),fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
 const fixture=require('./fixture-api.cjs')();
 const root=path.resolve(__dirname,'../dist');
@@ -26,6 +27,7 @@ fixture.cards.push({id:LONG,codeRecoverable:true,status:'active',creditTotal:100
     browser=await chromium.launch({headless:true,...(process.env.CHROME_PATH?{executablePath:process.env.CHROME_PATH}:{})});
     const page=await browser.newPage({viewport:{width:1440,height:1000}}),errors=[];
     page.setDefaultTimeout(10000);
+    const toasts=await recordToasts(page);
     const origin=`http://127.0.0.1:${server.address().port}`;
     page.on('pageerror',error=>{errors.push(error.message);console.error('Browser error:',error.message);});
     const nativeDialogs=[];page.on('dialog',dialog=>{nativeDialogs.push(dialog.message());void dialog.dismiss();});
@@ -102,7 +104,7 @@ fixture.cards.push({id:LONG,codeRecoverable:true,status:'active',creditTotal:100
     const line=i=>`"fixture-issued-${7+i}","FIXTURE-NOT-VALID-1000-${i}","PRO","1000","激活后 30 天","PRO+","淘宝 9 月"`;
     assert.equal(fs.readFileSync(await download.path(),'utf8'),'\uFEFF"卡密 ID","卡密","套餐","积分","有效期","分组","备注"\r\n'+line(0)+'\r\n'+line(1));
     await done.getByRole('button',{name:'复制发货文本',exact:true}).click();
-    await page.getByRole('status').filter({hasText:'已复制 2 张卡的发货文本'}).waitFor();
+    await toasts.shown('已复制 2 张卡的发货文本');
     const handout=i=>`卡密：FIXTURE-NOT-VALID-1000-${i}\n套餐：PRO（1,000 积分）\n有效期：激活后 30 天\n下载地址：https://kiro.rent`;
     assert.deepEqual(await page.evaluate(()=>window.copied),[handout(0)+'\n\n'+handout(1)]);
     await done.getByRole('button',{name:'完成',exact:true}).click();

@@ -1,6 +1,7 @@
 // Providers and Keys: 编辑 / 删除 a provider, the action that fixes a failing Key, names instead of
 // IDs, and the hints in the Key editor. Final build + loopback fixture, never production.
 const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
+const recordToasts=require('./toasts.cjs');
 const http=require('node:http'),fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
 const fixture=require('./fixture-api.cjs')();
 const root=path.resolve(__dirname,'../dist');
@@ -29,6 +30,7 @@ fixture.traces.unshift({id:'named-trace',card_id:'fixture-card-0',ts:now-30,invo
     browser=await chromium.launch({headless:true,...(process.env.CHROME_PATH?{executablePath:process.env.CHROME_PATH}:{})});
     const page=await browser.newPage({viewport:{width:1440,height:1000}}),errors=[];
     page.setDefaultTimeout(10000);
+    const toasts=await recordToasts(page);
     const origin=`http://127.0.0.1:${server.address().port}`;
     page.on('pageerror',error=>{errors.push(error.message);console.error('Browser error:',error.message);});
     const nativeDialogs=[];page.on('dialog',dialog=>{nativeDialogs.push(dialog.message());void dialog.dismiss();});
@@ -54,13 +56,13 @@ fixture.traces.unshift({id:'named-trace',card_id:'fixture-card-0',ts:now-30,invo
     const editFacts=await confirm();
     for(const expected of ['名称：OpenAI 格式 / Fixture → Astra（OpenAI 格式）','上游地址：https://openai.invalid/v1 → https://api.astra.invalid/v1','走这个供应商的模型：gpt-6-astra','改用新的地址和格式'])
       assert(editFacts.includes(expected),`${expected}\n${editFacts}`);
-    await page.locator('.toast').filter({hasText:'已保存供应商 Astra（OpenAI 格式）'}).waitFor();await dialog.waitFor({state:'detached'});
+    await toasts.shown('已保存供应商 Astra（OpenAI 格式）');await dialog.waitFor({state:'detached'});
     assert.deepEqual(writes('providers/update').at(-1).body,{id:'fixture-openai',name:'Astra（OpenAI 格式）',base_url:'https://api.astra.invalid/v1'});
     await card('Astra（OpenAI 格式）').getByText('https://api.astra.invalid/v1',{exact:true}).waitFor();
     // A format change alone.
     await menu('Astra（OpenAI 格式）','编辑名称、地址和格式');await dialog.getByLabel('接口格式',{exact:true}).selectOption('anthropic');
-    await dialog.getByRole('button',{name:'保存',exact:true}).click();assert((await confirm()).includes('接口格式：OpenAI → Anthropic'));
-    await page.locator('.toast').filter({hasText:'已保存供应商'}).waitFor();
+    toasts.mark();await dialog.getByRole('button',{name:'保存',exact:true}).click();assert((await confirm()).includes('接口格式：OpenAI → Anthropic'));
+    await toasts.shown('已保存供应商');
     assert.deepEqual(writes('providers/update').at(-1).body,{id:'fixture-openai',format:'anthropic'});
     console.log('PASS: 编辑供应商 changes the name, address and format, checks them, sends only what changed and says which models follow');
 
@@ -71,7 +73,7 @@ fixture.traces.unshift({id:'named-trace',card_id:'fixture-card-0',ts:now-30,invo
     await page.getByRole('alert').filter({hasText:'没能删除 测试供应商 / Fixture：还有模型的线路用这个供应商：claude-sonnet、gpt-5、gemini-pro'}).waitFor();
     assert(provider('fixture-provider'));await button('关闭提示').click();
     await menu('旧中转','删除供应商');assert((await confirm()).includes('删除后不能恢复'));
-    await page.locator('.toast').filter({hasText:'已删除供应商 旧中转'}).waitFor();
+    await toasts.shown('已删除供应商 旧中转');
     assert.equal(provider('old-relay'),undefined);await card('旧中转').waitFor({state:'detached'});
     console.log('PASS: 删除供应商 names the models and Keys that still use it, explains the refusal, deletes one nothing uses');
 
