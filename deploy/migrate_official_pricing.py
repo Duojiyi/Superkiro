@@ -15,7 +15,16 @@ The settings gain the policy's defaults: official_usd_cny 1.0, the retail and up
 multipliers, each provider's, and a route cost for every `upstream_price_basis` entry: the
 measured basis and that provider's multiplier, which cost those routes exactly what their
 versions do today. Without them a later official price for the route's model would re-cost the
-route from the list price. The official price table is left as it is.
+route from the list price.
+
+The official price table gains every upstream model a listed or hidden, non-retired mapping
+sends requests to, first or as a fallback, at the official prices the policy prices it from
+(`priced_as` applied), noted "官方价 · 迁移时写入"; an entry the server already has is kept as it
+is. Every route is then costed from official prices, so a provider's 成本倍率 reaches all of
+them. That must not change what any request costs today: each route of each mapping is costed
+as settlement costs it, before and after, and a route whose CNY per million tokens would differ
+in any class (or that is costed today at an estimate, or from a USD price) is named and nothing
+is published. The summary lists the prices added and every route shown unchanged.
 
 Revision-checked; the new versions start 30 seconds after the server's clock, and the live
 configuration is read back before and after they do. The server must already run the release
@@ -47,6 +56,8 @@ OUT = ROOT / '.acceptance'
 PRICES = ('input', 'output', 'cache_creation', 'cache_read')
 # CNY per official dollar: ¥1 = $1.
 OFFICIAL_USD_CNY = 1.0
+# Where an official price the migration adds comes from, as the console shows it.
+OFFICIAL_NOTE = '官方价 · 迁移时写入'
 ACTIVATION_DELAY_SECS = 30
 REASON = ('Record what every callable price is computed from: official USD x retail multiplier '
           'at the face value, cost x the provider multiplier, and what the measured routes '
@@ -158,10 +169,10 @@ def route_costs(policy):
     return routes
 
 
-def settings_defaults(policy, settings):
+def settings_defaults(policy, settings, official_prices=None):
     """The settings the policy gives, on top of the live `settings`: its route costs are added to
-    any the server already has."""
-    return {
+    any the server already has, and so is the official price table given."""
+    defaults = {
         'official_usd_cny': OFFICIAL_USD_CNY,
         'default_price_multiplier': float(policy['retail_multiplier']),
         'default_cost_multiplier': float(policy['upstream_multiplier']),
@@ -169,6 +180,111 @@ def settings_defaults(policy, settings):
                                       in policy['provider_upstream_multipliers'].items()},
         'route_costs': {**(settings.get('route_costs') or {}), **route_costs(policy)},
     }
+    if official_prices:
+        defaults['official_prices'] = official_prices
+    return defaults
+
+
+def routes_of(mapping):
+    """Every route a mapping sends requests to, as (provider, upstream model): its target first,
+    then its fallbacks."""
+    return [(mapping['target_provider_id'], mapping['target_model'])] + [
+        (fallback['provider_id'], fallback['target_model'])
+        for fallback in mapping.get('fallback_chain') or []]
+
+
+def official_price_table(config, policy):
+    """(the official price table the server is to have, the names added, the upstream models the
+    policy has no price for). Every upstream model a callable mapping (listed or hidden, not
+    retired) sends requests to, first or as a fallback, at the official prices the policy
+    prices it from; the live table's entries are kept as they are."""
+    live = config['settings'].get('official_prices') or {}
+    table, added, missing = dict(live), [], []
+    targets = {target for mapping in config['models'] if not mapping.get('retired')
+               for _, target in routes_of(mapping)}
+    for target in sorted(targets - set(live)):
+        priced_as = policy.get('priced_as', {}).get(target, target)
+        if priced_as not in policy['official_prices_per_m']:
+            missing.append(target)
+            continue
+        usd = four(policy['official_prices_per_m'][priced_as], priced_as)
+        table[target] = {**{f'{kind}_usd_per_m': value for kind, value in zip(PRICES, usd)},
+                         'note': OFFICIAL_NOTE, 'updated_at_secs': 0}
+        added.append(target)
+    return table, added, missing
+
+
+def route_cost(settings, versions, rate_card, mapping, provider, target, at):
+    """How settlement costs a request `mapping` sends to `provider`'s `target` at `at`, as
+    (where from, CNY per million tokens by class): from official prices (the route's own basis,
+    else the target's official price, times the route's 成本倍率, else the provider's, else the
+    default, at the official dollar rate) when they give both; else from the price version for
+    the route, the one the request is charged at when it is the mapping's own target, the
+    target's, or the rate card's '*'; else an estimate, (estimate, None). A USD version's prices
+    are its own, in dollars: settlement converts the sum, not each price."""
+    route = (settings.get('route_costs') or {}).get(f'{provider}/{target}') or {}
+    basis = route.get('basis_usd_per_m')
+    official = (settings.get('official_prices') or {}).get(target)
+    if basis is None and official is not None:
+        basis = [official[f'{kind}_usd_per_m'] for kind in PRICES]
+    multiplier = route.get('cost_multiplier')
+    if multiplier is None:
+        multiplier = (settings.get('provider_cost_multipliers') or {}).get(provider)
+    if multiplier is None:
+        multiplier = settings.get('default_cost_multiplier')
+    if basis is not None and multiplier is not None:
+        rate = settings.get('official_usd_cny')
+        rate = OFFICIAL_USD_CNY if rate is None else rate
+        # In the server's order: each price times the multiplier, times the dollar rate.
+        return 'official', [usd * multiplier * rate for usd in basis]
+
+    def latest(name):
+        found = [v for v in versions if v['rate_card_id'] == rate_card and v['model'] == name
+                 and v['effective_from_secs'] <= at]
+        return max(found, key=lambda v: v['effective_from_secs'], default=None)
+    version = latest(f'{provider}/{target}')
+    if (version is None and mapping['target_provider_id'] == provider
+            and mapping['target_model'] == target):
+        version = in_force(versions, rate_card, [mapping['exposed_model_id'], target], at)
+    version = version or latest(target) or latest('*')
+    if version is None:
+        return 'estimate', None
+    prices = [version[f'{kind}_price_per_m'] for kind in PRICES]
+    return ('version' if version['currency'] == 'CNY' else 'usd'), prices
+
+
+def cost_changes(config, update, now, stamp):
+    """(every route shown to cost exactly what it costs today, why the others would not).
+
+    Each route of each callable mapping is costed as settlement costs it: now with the live
+    settings and versions, and from the new versions' start with the settings and versions the
+    publication leaves. CNY per million tokens equal in every class, in binary floating point,
+    cost every request the same; a route costed today at an estimate or from a USD price
+    version that the publication would cost otherwise is named too."""
+    groups = {group['id']: group for group in config['groups']}
+    after_settings = update.get('settings') or config['settings']
+    after_versions = config['versions'] + update['versions']
+    unchanged, problems = set(), []
+    for mapping in config['models']:
+        if mapping.get('retired'):
+            continue
+        rate_card = groups[mapping['group_id']]['rate_card_id']
+        for provider, target in routes_of(mapping):
+            route = f'{provider}/{target}'
+            was = route_cost(config['settings'], config['versions'], rate_card, mapping,
+                             provider, target, now)
+            will = route_cost(after_settings, after_versions, rate_card, mapping, provider,
+                              target, stamp)
+            same = was == will or ('usd' not in (was[0], will[0]) and None not in (was[1], will[1])
+                                   and was[1] == will[1])
+            if same:
+                unchanged.add(route)
+                continue
+            today = {'estimate': 'an estimate', 'usd': f'USD {was[1]}'}.get(was[0], was[1])
+            problems.append(f"route {route} ({mapping['exposed_model_id']} in "
+                            f"{mapping['group_id']}): costs {today} today, {will[1]} after "
+                            'the official price table is filled')
+    return sorted(unchanged), problems
 
 
 def newer_server(config):
@@ -182,7 +298,15 @@ def newer_server(config):
 
 
 def publication(config, policy, now, stamp):
-    """(the publication, or None when nothing changes; the models it cannot republish).
+    """(the publication, or None when nothing changes; what stops it). See `plan`."""
+    update, problems, _ = plan(config, policy, now, stamp)
+    return update, problems
+
+
+def plan(config, policy, now, stamp):
+    """(the publication, or None when nothing changes; the models and routes it cannot publish;
+    what it shows: the official prices it adds, the upstream models the policy has no price for,
+    and every route whose cost it shows unchanged).
 
     Every callable model's price in force, listed or hidden, that carries no official block yet
     is republished with one, from `stamp`, keeping its credits and costs. One already computed
@@ -217,12 +341,31 @@ def publication(config, policy, now, stamp):
             versions[current['id']] = version
     update = {'expected_revision': config['revision'], 'reason': REASON,
               'versions': list(versions.values())}
-    defaults = settings_defaults(policy, config['settings'])
+    table, added, missing = official_price_table(config, policy)
+    defaults = settings_defaults(policy, config['settings'], table)
     if any(config['settings'].get(key) != value for key, value in defaults.items()):
         update['settings'] = {**config['settings'], **defaults}
+    unchanged, changed = cost_changes(config, update, now, stamp)
+    problems.extend(changed)
+    proof = {'official_prices_added': added, 'no_official_price': missing,
+             'costs_unchanged_on': unchanged}
     if not update['versions'] and 'settings' not in update:
-        return None, problems
-    return update, problems
+        return None, problems, proof
+    return update, problems, proof
+
+
+def same_settings(live, sent):
+    """Whether the settings read back are the ones sent: the server stamps when each official
+    price last changed, and when the settings did."""
+    def unstamped(settings):
+        settings = {key: value for key, value in settings.items() if key != 'rate_updated_at_secs'}
+        if settings.get('official_prices') is not None:
+            settings['official_prices'] = {
+                name: {key: value for key, value in price.items() if key != 'updated_at_secs'}
+                for name, price in settings['official_prices'].items()}
+        return settings
+    shown = unstamped(live)
+    return all(shown.get(key) == value for key, value in unstamped(sent).items())
 
 
 def migrate(call, record, dry_run=False, wait=time.sleep):
@@ -235,25 +378,23 @@ def migrate(call, record, dry_run=False, wait=time.sleep):
     before = reply['config']
     newer_server(before)
     stamp = now + ACTIVATION_DELAY_SECS
-    update, problems = publication(before, POLICY, now, stamp)
+    update, problems, proof = plan(before, POLICY, now, stamp)
     record(before, update, problems)
     if problems:
         raise PreconditionFailed('The pricing policy would change these prices; nothing was '
                                  'published: ' + '; '.join(problems))
     if update is None:
-        return {'status': 'unchanged', 'revision': before['revision']}
+        return {'status': 'unchanged', 'revision': before['revision'], **proof}
     models = sorted(version['model'] for version in update['versions'])
     if dry_run:
         return {'status': 'dry-run', 'revision': before['revision'], 'models': models,
-                'settings': 'settings' in update}
+                'settings': 'settings' in update, **proof}
     call('commercial-config', update)
     reply, now = call('commercial-config')
     after = reply['config']
     live = {version['id']: version for version in after['versions']}
     if (any(live.get(version['id']) != version for version in update['versions'])
-            or any(after['settings'].get(key) != value
-                   for key, value in update.get('settings', {}).items()
-                   if key != 'rate_updated_at_secs')):
+            or not same_settings(after['settings'], update.get('settings', {}))):
         raise RuntimeError('Readback differs from the intended publication')
     wait(max(0, stamp - now + 1))
     reply, now = call('commercial-config')
@@ -264,7 +405,7 @@ def migrate(call, record, dry_run=False, wait=time.sleep):
         if in_force(current['versions'], version['rate_card_id'], [version['model']], now) != version:
             raise RuntimeError(f"Unexpected price in force for {version['model']}")
     return {'status': 'active', 'effective_from_secs': stamp, 'revision': current['revision'],
-            'models': models}
+            'models': models, **proof}
 
 
 def main():

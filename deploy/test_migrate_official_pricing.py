@@ -50,6 +50,18 @@ def config(models, versions, settings=None, revision='old'):
 # hanyue's measured route, as the settings cost it after the migration.
 HANYUE_ROUTE = {'hanyue-max/claude-opus-5-5': {'basis_usd_per_m': [2.0, 25.0, 6.25, 0.5],
                                                'cost_multiplier': 0.22}}
+# Token counts seen in production, and the extremes.
+TOKENS_SEEN = [(1, 0, 0, 0), (0, 1, 0, 0), (84_657, 4_094, 0, 76_000),
+               (1_000_000, 1_000_000, 1_000_000, 1_000_000), (123_457, 9_999, 31_337, 7),
+               (10_000_000, 3, 2_500_000, 999_999)]
+
+
+def table_entry(model):
+    """The official price the migration adds for an upstream model: the one it is priced from."""
+    policy = script.POLICY
+    usd = policy['official_prices_per_m'][policy['priced_as'].get(model, model)]
+    return {**{f'{kind}_usd_per_m': float(value) for kind, value in zip(script.PRICES, usd)},
+            'note': script.OFFICIAL_NOTE, 'updated_at_secs': 0}
 
 
 def micro_cny(prices_per_m, tokens):
@@ -132,7 +144,11 @@ class PublicationTests(unittest.TestCase):
             'default_cost_multiplier': 0.08,
             'provider_cost_multipliers': {'kimera-primary': 0.08, 'kimera-direct': 0.06,
                                           'hanyue-max': 0.22},
-            'route_costs': HANYUE_ROUTE})
+            'route_costs': HANYUE_ROUTE,
+            # Every upstream model a callable mapping sends to; not the retired one's.
+            'official_prices': {model: table_entry(model) for model in
+                                ['claude-opus-5', 'claude-sonnet-5', 'claude-opus-5-5',
+                                 'claude-opus-4-6']}})
         # Once every price in force is official and the defaults are set, nothing is left.
         done = config(models, versions + update['versions'], update['settings'])
         self.assertEqual(script.publication(done, script.POLICY, 300, 330), (None, []))
@@ -153,9 +169,11 @@ class PublicationTests(unittest.TestCase):
             live_version('gpt-5.6-sol', 'kimera-direct'),
         ]
         update, problems = script.publication(config(models, versions), script.POLICY, 200, 230)
+        # The cost on hanyue's route is wrong too, and would move to its measured basis.
         self.assertEqual([problem.split(':')[0] for problem in problems],
                          ['claude-opus-5-5', 'claude-sonnet-5', 'claude-opus-5', 'claude-opus-4-6',
-                          'claude-opus-4-7', 'glm-5'])
+                          'claude-opus-4-7', 'glm-5',
+                          'route hanyue-max/claude-opus-5-5 (claude-opus-5-5 in group-pro-plus)'])
         for problem, reason in zip(problems, ['costs [1.1, 5.5, 1.375, 0.11], the policy gives [0.44',
                                               'credits [16000000, 81000000', 'a later price',
                                               'not a fixed CNY', 'charged at the price of *',
@@ -164,7 +182,10 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual([v['model'] for v in update['versions']], ['gpt-5.6-sol'])
         # And one with no price in force at all.
         _, problems = script.publication(config([mapping('claude-opus-5')], []), script.POLICY, 200, 230)
-        self.assertEqual(problems, ['claude-opus-5: no price in force'])
+        self.assertEqual(problems, [
+            'claude-opus-5: no price in force',
+            'route kimera-primary/claude-opus-5 (claude-opus-5 in group-pro-plus): costs an '
+            'estimate today, [0.4, 2.0, 0.5, 0.04] after the official price table is filled'])
 
     def test_a_hidden_price_it_would_change_or_a_multiplier_not_1_is_named(self):
         models = [mapping('claude-opus-4-6', visible=False), mapping('claude-opus-5'),
@@ -227,8 +248,12 @@ class MigrateTests(unittest.TestCase):
 
     def test_publishes_revision_checked_reads_back_and_waits_for_activation(self):
         update, _ = script.publication(self.before, script.POLICY, 1000, 1030)
+        # The server stamps when the settings and each new official price changed.
+        stamped = {name: {**price, 'updated_at_secs': 1001}
+                   for name, price in update['settings']['official_prices'].items()}
         after = {**copy.deepcopy(self.before), 'revision': 'new',
-                 'settings': {**update['settings'], 'rate_updated_at_secs': 1001},
+                 'settings': {**update['settings'], 'rate_updated_at_secs': 1001,
+                              'official_prices': stamped},
                  'versions': self.before['versions'] + update['versions']}
         replies = iter([({'config': self.before}, 1000), ({'config': after}, 1005),
                         ({'config': after}, 1031)])
@@ -246,7 +271,10 @@ class MigrateTests(unittest.TestCase):
         record.assert_called_once_with(self.before, update, [])
         wait.assert_called_once_with(26)
         self.assertEqual(summary, {'status': 'active', 'effective_from_secs': 1030,
-                                   'revision': 'new', 'models': ['claude-opus-5']})
+                                   'revision': 'new', 'models': ['claude-opus-5'],
+                                   'official_prices_added': ['claude-opus-5'],
+                                   'no_official_price': [],
+                                   'costs_unchanged_on': ['kimera-primary/claude-opus-5']})
 
     def test_a_dry_run_records_the_publication_and_sends_nothing(self):
         call, record = MagicMock(return_value=({'config': self.before}, 1000)), MagicMock()
@@ -290,6 +318,121 @@ class MigrateTests(unittest.TestCase):
         with self.assertRaises(RuntimeError) as raised:
             script.migrate(call, MagicMock(), wait=MagicMock())
         self.assertNotIsInstance(raised.exception, PreconditionFailed)
+
+
+class OfficialPriceTableTests(unittest.TestCase):
+    """The migration fills the official price table, and proves route by route that no request
+    costs more or less for it."""
+
+    @staticmethod
+    def world():
+        """Every model of the policy, sold through the provider it is sold through, at the
+        price published from the policy."""
+        models = [mapping(model, PROVIDERS.get(model, 'kimera-primary'))
+                  for model in script.POLICY['official_prices_per_m']]
+        versions = [live_version(model, PROVIDERS.get(model, 'kimera-primary'))
+                    for model in script.POLICY['official_prices_per_m']]
+        return config(models, versions)
+
+    def test_every_route_costs_what_it_did_and_now_follows_its_providers_multiplier(self):
+        before = self.world()
+        update, problems, proof = script.plan(before, script.POLICY, 200, 230)
+        self.assertEqual(problems, [])
+        models = sorted(script.POLICY['official_prices_per_m'])
+        table = update['settings']['official_prices']
+        self.assertEqual(table, {model: table_entry(model) for model in models})
+        # Claude Opus 5.5 is priced as Claude Opus 5, and costed at it off its measured route.
+        self.assertEqual(table['claude-opus-5-5']['input_usd_per_m'], 5.0)
+        self.assertEqual(proof['official_prices_added'], models)
+        self.assertEqual(proof['no_official_price'], [])
+        routes = sorted(f"{PROVIDERS.get(model, 'kimera-primary')}/{model}" for model in models)
+        self.assertEqual(proof['costs_unchanged_on'], routes)
+        after_versions = before['versions'] + update['versions']
+        for model in models:
+            provider = PROVIDERS.get(model, 'kimera-primary')
+            with self.subTest(route=f'{provider}/{model}'):
+                route = (mapping(model, provider), provider, model)
+                was = script.route_cost(before['settings'], before['versions'], 'default',
+                                        *route, 200)
+                will = script.route_cost(update['settings'], after_versions, 'default', *route, 230)
+                # Costed from official prices now, at exactly the CNY per million it was.
+                self.assertEqual(will[0], 'official')
+                self.assertEqual(will[1], was[1])
+                for tokens in TOKENS_SEEN:
+                    self.assertEqual(micro_cny(will[1], tokens), micro_cny(was[1], tokens))
+        # A provider's 成本倍率 now reaches a route that had only its version's cost.
+        raised = {**update['settings'], 'provider_cost_multipliers': {
+            **update['settings']['provider_cost_multipliers'], 'kimera-primary': 0.1}}
+        self.assertEqual(
+            script.route_cost(raised, after_versions, 'default', mapping('claude-opus-4-8'),
+                              'kimera-primary', 'claude-opus-4-8', 230),
+            ('official', [5 * 0.1 * 1.0, 25 * 0.1 * 1.0, 6.25 * 0.1 * 1.0, 0.5 * 0.1 * 1.0]))
+        # Run again, there is nothing left to do, and it still shows every route unchanged.
+        done = config(before['models'], after_versions, update['settings'])
+        again = script.plan(done, script.POLICY, 300, 330)
+        self.assertEqual(again[:2], (None, []))
+        self.assertEqual(again[2]['costs_unchanged_on'], routes)
+
+    def test_a_route_whose_cost_would_move_is_named_and_nothing_is_published(self):
+        cases = [
+            # 15 x 0.06 in binary is not the 0.9 the version was published with.
+            ([mapping('claude-sonnet-4-6', 'kimera-direct')],
+             [live_version('claude-sonnet-4-6', 'kimera-direct')],
+             'route kimera-direct/claude-sonnet-4-6 (claude-sonnet-4-6 in group-pro-plus): costs '
+             '[0.18, 0.9, 0.225, 0.018] today, [0.18, 0.8999999999999999, 0.22499999999999998, '
+             '0.018] after the official price table is filled'),
+            # A fallback on another provider is costed at its target's version today.
+            ([mapping('claude-opus-5', fallback_chain=[
+                {'provider_id': 'kimera-direct', 'target_model': 'claude-opus-5'}])],
+             [live_version('claude-opus-5')],
+             'route kimera-direct/claude-opus-5 (claude-opus-5 in group-pro-plus): costs '
+             '[0.4, 2.0, 0.5, 0.04] today, [0.3, 1.5, 0.375, 0.03] after the official price '
+             'table is filled'),
+            # A fallback to a model with no price is costed at an estimate today.
+            ([mapping('claude-opus-5', fallback_chain=[
+                {'provider_id': 'kimera-primary', 'target_model': 'claude-opus-4-8'}])],
+             [live_version('claude-opus-5')],
+             'route kimera-primary/claude-opus-4-8 (claude-opus-5 in group-pro-plus): costs an '
+             'estimate today, [0.4, 2.0, 0.5, 0.04] after the official price table is filled'),
+        ]
+        for models, versions, problem in cases:
+            with self.subTest(route=problem.split(' (')[0]):
+                before = config(models, versions)
+                _, problems = script.publication(before, script.POLICY, 200, 230)
+                self.assertEqual(problems, [problem])
+                call = MagicMock(return_value=({'config': before}, 1000))
+                with self.assertRaisesRegex(PreconditionFailed, problem.split(' (')[0]):
+                    script.migrate(call, MagicMock())
+                call.assert_called_once_with('commercial-config')
+
+    def test_an_official_price_the_server_has_is_kept_and_a_model_it_lacks_is_said(self):
+        own = {'input_usd_per_m': 5.0, 'output_usd_per_m': 25.0, 'cache_creation_usd_per_m': 6.25,
+               'cache_read_usd_per_m': 0.5, 'note': '厂商官网 9/20', 'updated_at_secs': 7}
+        before = config([mapping('claude-opus-5'), mapping('claude-sonnet-5'),
+                         mapping('glm-5', retired=True)],
+                        [live_version('claude-opus-5'), live_version('claude-sonnet-5')],
+                        settings={'credit_face_value_cny': FACE, 'usd_cny_rate': 7.25,
+                                  'official_prices': {'claude-opus-5': own}})
+        update, problems, proof = script.plan(before, script.POLICY, 200, 230)
+        self.assertEqual(problems, [])
+        self.assertEqual(update['settings']['official_prices'],
+                         {'claude-opus-5': own, 'claude-sonnet-5': table_entry('claude-sonnet-5')})
+        self.assertEqual(proof['official_prices_added'], ['claude-sonnet-5'])
+        # An upstream model the policy has no price for is left out and said.
+        lacking = config([mapping('claude-opus-5', fallback_chain=[
+            {'provider_id': 'kimera-primary', 'target_model': 'glm-5'}])],
+            [live_version('claude-opus-5'), {**live_version('claude-opus-4-8'), 'model': 'glm-5'}])
+        _, problems, proof = script.plan(lacking, script.POLICY, 200, 230)
+        self.assertEqual((problems, proof['no_official_price']), ([], ['glm-5']))
+        self.assertEqual(proof['costs_unchanged_on'],
+                         ['kimera-primary/claude-opus-5', 'kimera-primary/glm-5'])
+
+    def test_a_dry_run_says_what_it_adds_and_which_routes_it_shows_unchanged(self):
+        before = config([mapping('claude-opus-5')], [live_version('claude-opus-5')])
+        call = MagicMock(return_value=({'config': before}, 1000))
+        summary = script.migrate(call, MagicMock(), dry_run=True)
+        self.assertEqual((summary['official_prices_added'], summary['costs_unchanged_on']),
+                         (['claude-opus-5'], ['kimera-primary/claude-opus-5']))
 
 
 if __name__ == '__main__':
