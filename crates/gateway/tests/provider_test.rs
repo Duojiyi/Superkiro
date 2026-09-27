@@ -718,3 +718,49 @@ fn prompt_cache_breakpoints_follow_the_request_shape() {
         0
     );
 }
+
+/// Kiro's turn that carries tool results has no text of its own. The OpenAI format has no
+/// error flag for a tool result, and an empty user message after the results is one some
+/// models answer ("your message seems to be empty").
+#[test]
+fn openai_tool_results_carry_their_failure_and_no_empty_turn_follows() {
+    let mut assistant = ChatMessage::new("assistant", serde_json::json!(""));
+    assistant.tool_calls = vec![
+        gateway::provider::ToolCallEntry {
+            id: "call-ok".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({"path": "a.rs"}),
+        },
+        gateway::provider::ToolCallEntry {
+            id: "call-bad".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({"path": "missing.rs"}),
+        },
+    ];
+    let mut ok = ChatMessage::new("tool", serde_json::json!("fn main() {}"));
+    ok.tool_call_id = Some("call-ok".into());
+    ok.is_error = Some(false);
+    let mut failed = ChatMessage::new("tool", serde_json::json!("No such file: missing.rs"));
+    failed.tool_call_id = Some("call-bad".into());
+    failed.is_error = Some(true);
+    let mut req = create_test_request("gpt-4o");
+    req.messages.extend([
+        assistant,
+        ok,
+        failed,
+        ChatMessage::new("user", serde_json::json!("")),
+    ]);
+
+    let body = OpenAiProvider.translate_request(&req).unwrap();
+    let messages = body["messages"].as_array().unwrap();
+    let last = messages.last().unwrap();
+    assert_eq!(last["role"], "tool", "{messages:?}");
+    assert!(last["content"]
+        .as_str()
+        .unwrap()
+        .starts_with("[工具调用失败 / tool call failed]\nNo such file"));
+    let succeeded = &messages[messages.len() - 2];
+    assert_eq!(succeeded["content"], "fn main() {}");
+    // A user turn with words of its own is kept.
+    assert!(messages.iter().any(|m| m["content"] == "Hello!"));
+}

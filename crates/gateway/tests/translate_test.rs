@@ -706,5 +706,9 @@ fn tool_results_reach_both_providers_as_their_text() {
         .iter()
         .find(|message| message["role"] == "tool")
         .unwrap();
-    assert_eq!(tool["content"], expected.as_str());
+    // The OpenAI format has no error flag: the failure opens the text the model reads.
+    assert_eq!(
+        tool["content"],
+        format!("[工具调用失败 / tool call failed]\n{expected}").as_str()
+    );
 }
