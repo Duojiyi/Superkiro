@@ -5,7 +5,7 @@ import { ask, confirmAction } from './components/confirm';
 import { toast } from './components/toast';
 import { Drawer, Modal } from './components/modal';
 import { Menu } from './components/menu';
-import { InfoTip, StatusBadge, Tag, TopbarActions } from './components/ui';
+import { FilterTabs, InfoTip, StatusBadge, Tag, TopbarActions } from './components/ui';
 import { IconImage, IconSpark, IconTool } from './components/icons';
 import { formatClock, formatCount, formatTokenCount, shortHash } from './format';
 import { creditsText, currentVersion, timeDraftVersions } from './priceChange';
@@ -15,11 +15,16 @@ import BulkPriceDrawer from './BulkPriceDrawer';
 import ListModelDrawer from './ListModelDrawer';
 import Probe from './Probe';
 import { defaultModel, groupModels, reorder } from './listing';
+import { readSettings, sampleFor, type Four } from './officialPricing';
+import OfficialPriceTable from './OfficialPriceTable';
+import PricingSettings from './PricingSettings';
+import RouteCostDrawer from './RouteCostDrawer';
 import RouteEditor from './RouteEditor';
 import RouteSwitchDrawer, { type SwitchedRoute } from './RouteSwitchDrawer';
 import { rebaseDraft } from './rebase';
+import './pricing.css';
 import { publishFailure } from './refusal';
-import { authorizedModels, canRoute, isLive, modelName, modelRoute, nameList, targetProblem, targetsOf, targetState } from './routes';
+import { authorizedModels, canRoute, isLive, modelName, modelRoute, nameList, targetProblem, targetsOf, targetState, type Target } from './routes';
 import { modelStateView, providerFormatLabel } from './status';
 
 type Row = Record<string, unknown>;
@@ -53,7 +58,6 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
   const [busy, setBusy] = useState(false);
   useEffect(() => {onBusyChange(busy); return () => onBusyChange(false);}, [busy, onBusyChange]);
   const [selected, setSelected] = useState<string | null>(null);
-  useEffect(() => {onDirtyChange(draft !== loadedDraft || !!reason.trim());}, [draft, loadedDraft, reason, onDirtyChange]);
   const pending = useRef(false), alive = useRef(true);
   const [needsReview, setNeedsReview] = useState(false);
   const [messageTone, setMessageTone] = useState<'error' | 'warning' | 'info'>('error');
@@ -74,8 +78,17 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
   const [switching, setSwitching] = useState(false);
   const [lastSwitch, setLastSwitch] = useState<{provider: string; kept: boolean; routes: SwitchedRoute[]} | null>(null);
   const [bulkPricing, setBulkPricing] = useState(false);
+  // 模型 / 官方价表 / 定价设置: the page's three views; the last two keep their unpublished edits while hidden.
+  const [view, setView] = useState<'models' | 'official' | 'settings'>('models');
+  const [officialFocus, setOfficialFocus] = useState<{name: string} | null>(null);
+  const [settingsDirty, setSettingsDirty] = useState(false), [officialDirty, setOfficialDirty] = useState(false);
+  // 设置线路成本: the route whose own cost is being set.
+  const [routeTarget, setRouteTarget] = useState<Target | null>(null);
+  // Recent requests, for each model's typical request in margin samples.
+  const [traces, setTraces] = useState<Row[]>([]);
   const say = (text: string, tone: 'error' | 'warning' | 'info' = 'error') => {setMessage(text); setMessageTone(tone);};
   const dirty = draft !== loadedDraft || !!reason.trim();
+  useEffect(() => {onDirtyChange(dirty || settingsDirty || officialDirty);}, [dirty, settingsDirty, officialDirty, onDirtyChange]);
   const validText = (value: unknown, max: number) => typeof value === 'string' && !!value.trim() && new TextEncoder().encode(value).length <= max && !/[\x00-\x1f\x7f-\x9f]/.test(value);
   const positive = (value: unknown) => typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= 1000;
   let parsedDraft: Record<string, Array<Record<string, unknown>>> = {};
@@ -108,12 +121,6 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
     const [primary, ...backups] = targetsOf(selectedRow);
     const chosen = backups[index];
     if (chosen) updateFields({target_provider_id: chosen.provider_id, target_model: chosen.target_model, fallback_chain: backups.map((backup, i) => i === index ? primary : backup)});
-  };
-  // A route's 线路采购价, staged among the draft's new price versions (one per route and price table).
-  const draftVersions = Array.isArray(parsedDraft.versions) ? parsedDraft.versions : [];
-  const stageCost = (version: Row | null, costModel: string, rateCardId: unknown) => {
-    const kept = draftVersions.filter(row => !(row.rate_card_id === rateCardId && row.model === costModel));
-    setDraft(JSON.stringify({...parsedDraft, versions: version ? [...kept, version] : kept}, null, 2));
   };
   const numericFields = ['virtual_usage_limit', 'margin_multiplier', 'context_window', 'max_output', 'credit_multiplier', 'rate_multiplier'];
   // Shown in the customer's model list; left empty, the server derives them.
@@ -165,6 +172,13 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
     } finally {pending.current = false; if (alive.current) setBusy(false);}
   };
   useEffect(() => {alive.current = true; void load(); return () => {alive.current = false;};}, [kind]);
+  // The latest requests, read with the page and on every console refresh; without them samples are 1K/1K.
+  useEffect(() => {
+    if (kind !== 'models') return;
+    let current = true;
+    adminApi.getTraces(500).then(result => {if (current && result.success === true && Array.isArray(result.traces)) setTraces(result.traces as unknown as Row[]);}).catch(() => {/* samples fall back to 1K/1K */});
+    return () => {current = false;};
+  }, [kind, refreshEpoch]);
   // A console refresh reloads this page too, but never over unpublished edits.
   const seenEpoch = useRef(refreshEpoch);
   useEffect(() => {
@@ -302,7 +316,7 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
   // `done` is the confirmation shown on success; `check`, what to look for when the result is
   // not confirmed.
   // `verify` looks at the configuration the server returns and says what it did not keep, if anything.
-  const publishOne = async (update: {models?: Row[]; versions?: Row[]; removed_models?: string[]; cancelled_versions?: string[]}, updateReason: string, action: string, done?: string, check?: string, verify?: (next: CommercialConfig) => string): Promise<PublishOutcome> => {
+  const publishOne = async (update: {settings?: Row; models?: Row[]; versions?: Row[]; removed_models?: string[]; cancelled_versions?: string[]}, updateReason: string, action: string, done?: string, check?: string, verify?: (next: CommercialConfig) => string): Promise<PublishOutcome> => {
     if (!config || pending.current || needsReview || dirty) return {ok: false, message: '有未完成的发布或修改，请先处理'};
     pending.current = true; setBusy(true); setMessage('');
     try {
@@ -342,6 +356,8 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
   // 调价 and 上架 publish on their own, so only from a page with nothing else unpublished.
   const ownBlocked = (action: string) => needsReview ? '请先重新加载确认上次发布' : dirty ? `先发布或放弃未发布的修改，再${action}` : busy ? '正在处理' : undefined;
   const priceBlocked = ownBlocked('调价'), listingBlocked = ownBlocked('上架'), stateBlocked = ownBlocked('操作'), canListModels = kind === 'models';
+  const pricing = readSettings(config?.settings);
+  const sample = (model: string): Four => sampleFor(traces, model).tokens;
   const openListing = (preset: {providerId?: string; model?: string}) => {setJsonOpen(false); setPriceModel(null); setSwitching(false); setBulkPricing(false); setListing(preset);};
   // A link from 供应商与 Key opens the drawer for that provider's model, once, when the page has loaded.
   const intentUsed = useRef(false);
@@ -586,6 +602,12 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
         onClick={() => openListing({})}>＋ 上架模型</button>}
       <button type="button" className="btn" aria-expanded={jsonOpen} onClick={() => {setPriceModel(null); setListing(null); setJsonOpen(open => !open);}}>JSON</button>
     </TopbarActions>
+    {kind === 'models' && <FilterTabs label="模型与定价视图" value={view} onChange={setView} options={[
+      {value: 'models', label: '模型'},
+      {value: 'official', label: '官方价表', count: Object.keys(pricing.official).length, ...(officialDirty ? {tone: 'warning' as const} : {})},
+      {value: 'settings', label: settingsDirty ? '定价设置 · 未发布' : '定价设置'},
+    ]}/>}
+    <div className="page-stack" hidden={kind === 'models' && view !== 'models'}>
     {kind === 'models' && lastSwitch && <div className="note-info switch-note" role="status">
       <span>已把 {nameList(lastSwitch.routes.map(route => nameOfId(route.id)))} 切换到 {String(providers.find(provider => provider.id === lastSwitch.provider)?.name ?? lastSwitch.provider)}{lastSwitch.kept ? '，原线路保留为第 1 条备用' : ''}。</span>
       <button type="button" className="btn btn-small" disabled={!!bulkBlocked} title={bulkBlocked} onClick={() => void switchBack()}>切回原线路</button>
@@ -629,8 +651,8 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
         {kind === 'models' && selectedRow && <section className="field-span route-editor" aria-label="线路">
           <h4>线路 <span className="muted">主线路不能用时，按顺序改走备用线路</span></h4>
           <div className="form-grid form-grid-3">{editorFields.filter(field => routeFields.includes(field)).map(renderField)}</div>
-          <RouteEditor model={selectedRow} rateCardId={selectedRateCard} versions={configVersions} staged={draftVersions} providers={providers} keys={providerKeys} nowSecs={nowSecs}
-            onChain={backups => updateField('fallback_chain', backups)} onPromote={promote} onStage={(version, costModel) => stageCost(version, costModel, selectedRateCard)}/>
+          <RouteEditor model={selectedRow} rateCardId={selectedRateCard} versions={configVersions} settings={pricing} providers={providers} keys={providerKeys} nowSecs={nowSecs}
+            onChain={backups => updateField('fallback_chain', backups)} onPromote={promote} onEditRoute={setRouteTarget} editBlocked={ownBlocked('设置线路成本')}/>
         </section>}
         {editorFields.some(field => checkFields.includes(field)) && <div className="field field-span check-row">
           {editorFields.filter(field => checkFields.includes(field)).map(field => <span key={field} className="check-field">
@@ -643,6 +665,19 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
     </section>
 
     {kind === 'models' && <PriceVersions versions={configVersions} rateCards={rateCards} groups={configGroups} cards={cards} faceValue={config?.settings?.credit_face_value_cny} providers={providers} nowSecs={nowSecs}/>}
+    </div>
+
+    {kind === 'models' && config && <div className="page-stack" hidden={view !== 'official'}>
+      <OfficialPriceTable config={config} providers={providers} sample={sample} blocked={ownBlocked('发布官方价')} focus={officialFocus}
+        onPublish={(update, updateReason, action, done, check) => publishOne(update, updateReason, action, done, check)} onReload={() => load(false, true)} onDirtyChange={setOfficialDirty}/>
+    </div>}
+    {kind === 'models' && config && <div className="page-stack" hidden={view !== 'settings'}>
+      <PricingSettings config={config} providers={providers} cards={cards} sample={sample} blocked={ownBlocked('发布定价设置')}
+        onPublish={(update, updateReason, action, done, check) => publishOne(update, updateReason, action, done, check)} onReload={() => load(false, true)} onDirtyChange={setSettingsDirty}
+        onOpenOfficial={name => {setOfficialFocus({name}); setView('official');}} onEditRoute={setRouteTarget}/>
+    </div>}
+    {routeTarget && config && <RouteCostDrawer key={`${routeTarget.provider_id}/${routeTarget.target_model}`} target={routeTarget} config={config} providers={providers} sample={sample}
+      blocked={ownBlocked('设置线路成本')} onPublish={(update, updateReason, action, done, check) => publishOne(update, updateReason, action, done, check)} onClose={() => setRouteTarget(null)}/>}
 
     {jsonOpen && <Drawer id="config-json" label="JSON 配置" onClose={() => setJsonOpen(false)} className="json-drawer">
       <header className="drawer-head">

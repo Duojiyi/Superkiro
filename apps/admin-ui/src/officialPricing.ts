@@ -367,7 +367,8 @@ export function pricingImpact(before: {settings: PricingSettings; versions: Row[
       const was = priceState(before.settings, before.versions, rateCardId, mappings, context.groups, context.nowSecs, tokens);
       const will = priceState(after.settings, after.versions, rateCardId, mappings, context.groups, context.effectiveSecs, tokens);
       const names = [mappings[0].exposed_model_id, mappings[0].target_model];
-      const overriddenBy = after.versions.filter(version => version.rate_card_id === rateCardId && names.includes(version.model) && Number(version.effective_from_secs) > context.effectiveSecs)
+      // A price scheduled before this change that still stands (one the change itself withdraws or adds is part of it).
+      const overriddenBy = after.versions.filter(version => before.versions.includes(version) && version.rate_card_id === rateCardId && names.includes(version.model) && Number(version.effective_from_secs) > context.effectiveSecs)
         .sort((a, b) => Number(a.effective_from_secs) - Number(b.effective_from_secs))[0] ?? null;
       const changed = !same(was.credits, will.credits) || !same(rounded(was.yuanPerM), rounded(will.yuanPerM))
         || was.routes.some((route, index) => !same(rounded(route.cost.perM), rounded(will.routes[index]?.cost.perM ?? null)) || route.margin !== will.routes[index]?.margin);
@@ -375,6 +376,30 @@ export function pricingImpact(before: {settings: PricingSettings; versions: Row[
     }
   }
   return rows;
+}
+
+/**
+ * 同时把计费倍率调到 X 保持毛利: when a route's 成本倍率 changes, each official price whose primary
+ * route is costed from official prices gets a new version from `effectiveSecs` whose 计费倍率 moves
+ * in proportion (4 decimals), so its margin on that route stays as it was.
+ */
+export function keepMarginPlan(before: PricingSettings, after: PricingSettings, config: {models: Row[]; groups: Row[]; versions: Row[]}, nowSecs: number, effectiveSecs: number): Array<{version: Row; model: string; rateCardId: string; from: number; to: number}> {
+  const plan: Array<{version: Row; model: string; rateCardId: string; from: number; to: number}> = [], taken = config.versions.map(version => version.id), done = new Set<string>();
+  for (const entry of modelEntries(config.models, config.groups)) for (const mapping of entry.mappings) {
+    const rateCardId = config.groups.find(group => group.id === mapping.group_id)?.rate_card_id;
+    if (typeof rateCardId !== 'string' || done.has(`${rateCardId}\n${entry.id}`)) continue;
+    done.add(`${rateCardId}\n${entry.id}`);
+    const version = currentVersion(config.versions, rateCardId, [mapping.exposed_model_id, mapping.target_model], nowSecs), input = officialOf(version);
+    const [primary] = targetsOf(mapping), was = routeMultiplier(before, primary), will = routeMultiplier(after, primary);
+    if (!input || !version || !was || !will || was.value === will.value || !routeBasis(before, primary) || !routeBasis(after, primary)) continue;
+    const to = Math.round(input.priceMultiplier * will.value / was.value * 10_000) / 10_000;
+    if (!multiplierOk(to)) continue;
+    const id = versionIdFor(String(version.model), effectiveSecs, taken);
+    taken.push(id);
+    const next = {...input, priceMultiplier: to, costMultiplier: will.value, basis: primaryCost(after, mapping, input.official).basis, usdCny: after.usdCny, face: after.face ?? input.face};
+    plan.push({version: officialVersion(next, {id, rateCardId, model: String(version.model), effectiveSecs}), model: entry.id, rateCardId, from: input.priceMultiplier, to});
+  }
+  return plan;
 }
 
 /** The largest change among four prices, in percent (0 when none can be compared). */

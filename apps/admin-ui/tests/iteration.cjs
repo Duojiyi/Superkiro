@@ -84,11 +84,11 @@ const server=http.createServer(async(req,res)=>{
     assert.equal(await page.evaluate(()=>document.activeElement?.id),'trace-detail');
     // On a phone the detail covers the screen; Escape (or 关闭详情) returns to the list and navigation.
     await page.keyboard.press('Escape');await page.locator('#trace-detail').waitFor({state:'detached'});
-    await nav('财务对账');
+    await nav('模型与定价');await page.getByRole('tab',{name:'定价设置'}).click();
     const face=page.getByLabel('积分面值',{exact:true});await face.fill('0.8');
     await nav('运营概览');await answer(false);assert.equal(await face.inputValue(),'0.8');
-    await nav('放弃修改');await answer(true);
-    await page.waitForFunction(()=>!document.querySelector('fieldset')?.disabled);
+    await page.getByRole('region',{name:'定价设置'}).getByRole('button',{name:'放弃修改',exact:true}).click();await answer(true);
+    assert.equal(await face.inputValue(),'0.01');
     await nav('运营概览');await page.getByRole('heading',{name:'运营概览',exact:true}).waitFor();
     // A known pre-commit insufficient-balance rejection must not lock unrelated cards.
     await nav('安全与审计');await nav('退出登录');await login();

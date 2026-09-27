@@ -169,8 +169,9 @@ const Editor = load('CommercialEditor.tsx', {'./tokens': tokens, './api': {admin
   // Dialogs, drawers and messages only run from event handlers; the render tree just names the components.
   './components/confirm': {confirmAction: async () => true}, './components/toast': {toast: {success() {}, info() {}, error() {}}},
   './components/modal': {Drawer: 'Drawer', Modal: 'Modal'}, './components/icons': {IconImage: 'IconImage', IconSpark: 'IconSpark', IconTool: 'IconTool'},
-  './components/ui': {InfoTip: 'InfoTip', StatusBadge: 'StatusBadge', Tag: 'Tag', TopbarActions: 'TopbarActions'}, './status': load('status.ts'), './PriceDrawer': {default: 'PriceDrawer'}, './PriceVersions': {default: 'PriceVersions'}, './ListModelDrawer': {default: 'ListModelDrawer'},
+  './components/ui': {FilterTabs: 'FilterTabs', InfoTip: 'InfoTip', StatusBadge: 'StatusBadge', Tag: 'Tag', TopbarActions: 'TopbarActions'}, './status': load('status.ts'), './PriceDrawer': {default: 'PriceDrawer'}, './PriceVersions': {default: 'PriceVersions'}, './ListModelDrawer': {default: 'ListModelDrawer'},
   './RouteEditor': {default: 'RouteEditor'}, './RouteSwitchDrawer': {default: 'RouteSwitchDrawer'}, './BulkPriceDrawer': {default: 'BulkPriceDrawer'}, './Probe': {default: 'Probe'}, './components/menu': {Menu: 'Menu'},
+  './officialPricing': load('officialPricing.ts', {'./priceChange': change, './routes': routes}), './OfficialPriceTable': {default: 'OfficialPriceTable'}, './PricingSettings': {default: 'PricingSettings'}, './RouteCostDrawer': {default: 'RouteCostDrawer'},
   './listing': load('listing.ts', {'./priceChange': change, './routes': routes}),
   react, 'react/jsx-runtime': runtime}).default;
 const providers = [{id: 'p', name: '供应商 P'}, {id: 'openai', name: 'Astra', api_type: 'openai'}];

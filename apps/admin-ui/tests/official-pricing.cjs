@@ -139,8 +139,11 @@ assert.equal(impact[0].after.credits[1], 250000000);
 const provider = official.pricingImpact({settings, versions: priced}, {settings: {...settings, providers: {...settings.providers, 'hanyue-max': 0.3}}, versions: priced}, {...context, effectiveSecs: now});
 assert.deepEqual(plain(provider.filter(row => row.changed).map(row => row.model)), ['son'], 'only the model routed through hanyue');
 assert(provider[1].after.routes[0].margin < provider[1].before.routes[0].margin);
-const scheduledLater = official.pricingImpact({settings, versions: priced}, {settings, versions: [...priced, {...at('opus-3', 'opus', now + 60), rate_card_id: 'r'}, {...at('opus-4', 'opus', now + 9999), rate_card_id: 'r'}]}, context);
-assert.equal(scheduledLater[0].overriddenBy.id, 'opus-4', 'a scheduled price that takes over later is named');
+const promo = {...at('opus-4', 'opus', now + 9999), rate_card_id: 'r'};
+const scheduledLater = official.pricingImpact({settings, versions: [...priced, promo]}, {settings, versions: [...priced, promo, {...at('opus-3', 'opus', now + 60), rate_card_id: 'r'}]}, context);
+assert.equal(scheduledLater[0].overriddenBy.id, 'opus-4', 'a price already scheduled to take over later is named');
+const ownSchedule = official.pricingImpact({settings, versions: priced}, {settings, versions: [...priced, {...at('opus-3', 'opus', now + 60), rate_card_id: 'r'}, promo]}, context);
+assert.equal(ownSchedule[0].overriddenBy, null, 'one the change itself adds (a repriced schedule) is part of it');
 assert.equal(official.largestChange([10, 10, 10, 10], [10, 14, 10, 10]), 40); assert.equal(official.largestChange([10, 0, 10, 10], [10, 1, 10, 10]), Infinity);
 console.log('PASS preview impact: every group sharing the table in one row, a provider change touching only its routes, a later schedule named, the largest change');
 

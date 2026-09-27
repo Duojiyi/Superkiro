@@ -28,6 +28,15 @@ const REFUSALS: Array<[RegExp, (ids: string) => string]> = [
   [/Provider not accessible to model group/i, () => '这个分组不能使用线路上的供应商，或上游模型名无效'],
   [/Ambiguous model ID or alias/i, () => '同一分组里有重复的模型 ID 或别名'],
   [/Margins and model multipliers combine/i, () => '版本倍率 × 分组倍率 × 模型倍率超过了 100 倍'],
+  // Prices computed from official ones, and the pricing settings.
+  [/Official pricing is at a stale face value or rate/i, ids => `${ids ? `${ids} 的` : '有'}官方价版本还是按旧的积分面值或官方价 $1 折合的人民币算的：改面值要在同一次发布里一起重算（定价设置会自动带上），请重新加载后再试`],
+  [/Official pricing does not match the credits of/i, ids => `${ids ? `${ids} 的` : ''}积分和它的官方价算出来的不一致：请重新加载后再定价`],
+  [/Official pricing does not match the cost of/i, ids => `${ids ? `${ids} 的` : ''}成本和它的官方价、成本倍率算出来的不一致：请重新加载后再定价`],
+  [/Invalid official pricing/i, ids => `官方价无效${ids ? `：${ids}` : ''}（四项都要在 0–10,000 美元之间且不能都是 0，倍率大于 0、不超过 100，按官方价定价的版本不能再设版本倍率）`],
+  [/The official dollar rate must be positive/i, () => '官方价 $1 折合的人民币需大于 0、不超过 1000'],
+  [/Multipliers must be positive and at most 100/i, () => '计费倍率和成本倍率需大于 0、不超过 100；单独设成本倍率的供应商最多 200 个'],
+  [/Official prices: at most/i, () => '官方价表最多 1000 项：模型名 1–256 字节，价格 0–10,000 美元，备注最多 256 字节'],
+  [/Route costs: at most/i, () => '线路成本最多 1000 条：名称是“供应商/上游模型”，成本倍率大于 0、不超过 100，计费基准 0–10,000 美元'],
   [/Invalid or oversized body/i, () => '提交的内容无效或太大'],
   // A 测试 the server could not start, or a Key or provider that is gone.
   [/No enabled Key of this provider may call this model/i, () => '这个供应商没有启用的 Key 能调用这个模型：先在“供应商与 Key”里给一个启用的 Key 授权它'],
