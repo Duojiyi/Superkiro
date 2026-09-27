@@ -1269,6 +1269,57 @@ fn finance_by_provider_and_margin_over_costed_requests_only() {
 }
 
 #[test]
+fn a_cost_estimated_for_want_of_the_serving_route_is_not_costed() {
+    let labelled = |id: &str, source: &str, versioned: bool| {
+        let mut entry = usage_entry(id, "prov", (100, 10, 0, 0), 1_000_000, 1_000, versioned);
+        entry.reason = Some(format!("provider_cost:{source}"));
+        entry
+    };
+    let entries = vec![
+        labelled("official", "official=prov/target", false),
+        labelled("version", "rate_card_version=price-v1", true),
+        // A fallback without a price of its own, costed at the version it was charged at.
+        labelled("fallback", "estimated_missing_target_rate", true),
+        // From before costs were labelled: known when a price version charged it.
+        usage_entry("legacy", "prov", (100, 10, 0, 0), 1_000_000, 1_000, true),
+        usage_entry("unpriced", "prov", (100, 10, 0, 0), 1_000_000, 1_000, false),
+    ];
+    let classes: Vec<_> = entries
+        .iter()
+        .map(|entry| (entry.cost_is_known(), entry.cost_is_estimated()))
+        .collect();
+    assert_eq!(
+        classes,
+        [
+            (true, false),
+            (true, false),
+            (false, true),
+            (true, false),
+            (false, false)
+        ]
+    );
+    let settings = BillingSettings {
+        credit_face_value_cny: 0.01,
+        ..BillingSettings::default()
+    };
+    let margin = billing::observability::compute_costed_margin(&entries, &settings);
+    assert_eq!(
+        (
+            margin.costed_requests,
+            margin.uncosted_requests,
+            margin.uncosted_credits,
+            margin.estimated_requests
+        ),
+        (3, 2, 2_000_000, 1)
+    );
+    assert_eq!(margin.cost_micro_cny, 3_000);
+    // A card event is never a billed request.
+    let mut adjustment = labelled("adjust", "official=prov/target", false);
+    adjustment.kind = billing::ledger::LedgerKind::Adjustment;
+    assert!(!adjustment.cost_is_known() && !adjustment.cost_is_estimated());
+}
+
+#[test]
 fn sales_count_cards_issued_and_activated_in_the_period_at_list_price() {
     let tier = |id: &str, points: i64, created: u64, activated: Option<u64>| {
         let mut card = Card::new(id, "group", points * 1_000_000);

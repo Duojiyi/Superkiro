@@ -145,6 +145,32 @@ impl LedgerEntry {
                 .filter(serde_json::Value::is_object)
         })
     }
+
+    /// Whether a usage entry's cost is what the route that served it bills: settlement took
+    /// it from official prices or from a price version for that route, and says so in
+    /// `reason`. An estimate is not known; neither is an entry from before costs were
+    /// labelled unless a price version charged it.
+    pub fn cost_is_known(&self) -> bool {
+        match self.cost_source() {
+            Some(source) => {
+                source.starts_with("official=") || source.starts_with("rate_card_version=")
+            }
+            None => self.rate_card_version.is_some(),
+        }
+    }
+
+    /// Whether settlement estimated a usage entry's cost for want of the serving route's
+    /// own, as `provider_cost:estimated_missing_target_rate`.
+    pub fn cost_is_estimated(&self) -> bool {
+        self.cost_source().is_some() && !self.cost_is_known()
+    }
+
+    /// Where settlement took a usage entry's cost from, after `provider_cost:` in `reason`.
+    fn cost_source(&self) -> Option<&str> {
+        (self.kind == LedgerKind::Usage)
+            .then(|| self.reason.as_deref()?.strip_prefix("provider_cost:"))
+            .flatten()
+    }
 }
 
 /// Micro-credits added up by the face value (CNY per credit) they were earned at.

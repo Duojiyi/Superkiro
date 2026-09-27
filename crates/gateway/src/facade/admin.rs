@@ -759,14 +759,16 @@ impl FacadeHandler for AdminFinancialsHandler {
                 &snapshot.ledger,
                 &snapshot.settings,
             );
-            let costed_requests = snapshot
-                .ledger
-                .iter()
-                .filter(|entry| {
-                    entry.kind == billing::ledger::LedgerKind::Usage
-                        && entry.rate_card_version.is_some()
-                })
-                .count() as u64;
+            // Costed: the route that served it said what it cost; an estimate is not.
+            let usage = || {
+                snapshot
+                    .ledger
+                    .iter()
+                    .filter(|entry| entry.kind == billing::ledger::LedgerKind::Usage)
+            };
+            let costed_requests = usage().filter(|entry| entry.cost_is_known()).count() as u64;
+            let estimated_requests =
+                usage().filter(|entry| entry.cost_is_estimated()).count() as u64;
             let uncosted_requests = dashboard.total_requests.saturating_sub(costed_requests);
             let (from_secs, to_secs) = period;
             let plans =
@@ -811,6 +813,8 @@ impl FacadeHandler for AdminFinancialsHandler {
                         "faceValueMarginPercentage": if uncosted_requests == 0 && dashboard.revenue_micro_cny > 0 { Some(dashboard.gross_margin_percentage) } else { None },
                         "costedRequests": costed_requests,
                         "uncostedRequests": uncosted_requests,
+                        // Of the uncosted, those costed at an estimate.
+                        "estimatedRequests": estimated_requests,
                         "retainedLedgerOnly": true,
                     },
                 }),

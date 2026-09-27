@@ -2129,9 +2129,10 @@ async fn financials_report_a_period_by_provider_with_sales_and_liability() {
         cache_creation_tokens: 0,
         cache_read_tokens: 0,
     };
-    for (invocation, provider, at) in [
-        ("inv-in", "prov-a", start + 100),
-        ("inv-out", "prov-b", end),
+    // The second is served by a route with no price of its own: its cost is an estimate.
+    for (invocation, provider, target, at) in [
+        ("inv-in", "prov-a", "priced-model", start + 100),
+        ("inv-out", "prov-b", "target", end),
     ] {
         let params = billing::reservation::ReservationEstimateParams::new(1_000, 1_000)
             .with_model("priced-model");
@@ -2139,7 +2140,7 @@ async fn financials_report_a_period_by_provider_with_sales_and_liability() {
             .reserve("card-finance", invocation, &params, at, 60)
             .unwrap();
         billing
-            .settle(invocation, &tokens, "priced-model", provider, "target", at)
+            .settle(invocation, &tokens, "priced-model", provider, target, at)
             .unwrap();
     }
 
@@ -2184,6 +2185,25 @@ async fn financials_report_a_period_by_provider_with_sales_and_liability() {
     assert_eq!(body["dashboard"]["total_requests"], 2);
     assert_eq!(body["byProvider"].as_array().unwrap().len(), 2);
     assert_eq!(body["fromSecs"], serde_json::Value::Null);
+    // An estimated cost is not a known one, wherever requests are counted as costed.
+    assert_eq!(
+        (
+            &body["margin"]["costedRequests"],
+            &body["margin"]["uncostedRequests"],
+            &body["margin"]["uncostedCredits"],
+            &body["margin"]["estimatedRequests"]
+        ),
+        (&json!(1), &json!(1), &json!(2_000_000), &json!(1))
+    );
+    assert_eq!(
+        (
+            &body["estimates"]["costedRequests"],
+            &body["estimates"]["uncostedRequests"],
+            &body["estimates"]["estimatedRequests"],
+            &body["estimates"]["faceValueLessCostMicroCny"]
+        ),
+        (&json!(1), &json!(1), &json!(1), &serde_json::Value::Null)
+    );
     for (query, message) in [
         ("fromSecs=soon", "fromSecs and toSecs must be whole seconds"),
         ("fromSecs=10&toSecs=10", "fromSecs must be before toSecs"),

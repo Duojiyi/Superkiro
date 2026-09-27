@@ -631,20 +631,25 @@ pub struct CostedMargin {
     pub margin_percentage: Option<f64>,
     pub uncosted_requests: u64,
     pub uncosted_credits: i64,
+    /// Of the uncosted, those settlement costed at an estimate, for want of the serving
+    /// route's own cost: a fallback costed at its primary's price, say.
+    pub estimated_requests: u64,
 }
 
-/// A billed request is costed when it was priced by a published price version.
+/// A billed request is costed when its cost is what the route that served it bills, from
+/// official prices or a price version for that route; one costed at an estimate is not.
 pub fn compute_costed_margin(entries: &[LedgerEntry], settings: &BillingSettings) -> CostedMargin {
     let mut margin = CostedMargin::default();
     for entry in entries
         .iter()
         .filter(|entry| entry.kind == crate::ledger::LedgerKind::Usage)
     {
-        if entry.rate_card_version.is_none() {
+        if !entry.cost_is_known() {
             margin.uncosted_requests += 1;
             margin.uncosted_credits = margin
                 .uncosted_credits
                 .saturating_add(entry.credits_charged);
+            margin.estimated_requests += u64::from(entry.cost_is_estimated());
             continue;
         }
         margin.costed_requests += 1;
