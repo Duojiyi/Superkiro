@@ -84,23 +84,6 @@ export function costText(version: Row | null): string {
 }
 
 /**
- * 线路采购价: what one provider charges for one upstream model, kept as its own version: credit
- * prices 0 (never used to charge), effective at once (0) — made later when published, if the
- * table already has one (see timeDraftVersions). Throws with the reason, in the words shown.
- */
-export function buildRouteCost(input: {costs: Record<string, string>; currency: string}, context: {providerId: string; targetModel: string; rateCardId: string; nowSecs: number; taken: unknown[]}): Row {
-  if (!['USD', 'CNY'].includes(input.currency)) throw new Error('请选择采购价币种');
-  const costs = Object.fromEntries(COST_FIELDS.map(([field, label]) => {
-    const raw = (input.costs[field] ?? '').trim(), value = Number(raw);
-    if (!raw || !Number.isFinite(value) || value < 0 || value > 1_000_000) throw new Error(`${label}采购价需在 0–1,000,000 之间（免费填 0）`);
-    return [field, value];
-  }));
-  const model = routeCostModel(context.providerId, context.targetModel);
-  return {id: versionIdFor(model, context.nowSecs, context.taken), rate_card_id: context.rateCardId, model, pricing_mode: 'fixed', currency: input.currency, ...costs,
-    ...Object.fromEntries(PRICE_FIELDS.map(([field]) => [field, 0])), per_call_credit: 0, margin_multiplier: 1, effective_from_secs: 0};
-}
-
-/**
  * Draft versions as they are sent: one marked 0 (now) whose table already has a version of that
  * model cannot start now (the server refuses it), so it starts at `laterSecs` instead.
  */

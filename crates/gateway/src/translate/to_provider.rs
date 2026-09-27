@@ -8,12 +8,16 @@
 //! - Chronological orphan tool pairing repair without future foresight.
 //! - Preservation of tool call names, arguments, and execution statuses in history.
 
-use super::images::{inspect_image, shrink_image, Inspection, Omission, PreparedImage};
+use super::images::{
+    image_key, inspect_image, shrink_image_keyed, Inspection, Omission, PreparedImage,
+};
 use super::tools::{
     process_tools_for_provider, repair_orphan_tool_pairs, ConversationMessage, ToolRegistry,
 };
-use crate::provider::{ChatMessage, ChatRequest, ToolCallEntry};
-use kiro_wire::requests::conversation::{GenerateAssistantResponseRequest, KiroImage, Message};
+use crate::provider::{ChatMessage, ChatRequest, ThinkingBlock, ToolCallEntry};
+use kiro_wire::requests::conversation::{
+    GenerateAssistantResponseRequest, KiroDocument, KiroImage, Message,
+};
 
 use super::vision::{format_fallback_description, model_supports_vision};
 
@@ -79,8 +83,8 @@ impl PreparedImages {
     }
 }
 
-/// Every image of the request, oldest first.
-fn images_in_order(req: &GenerateAssistantResponseRequest) -> Vec<(Turn, &KiroImage)> {
+/// Every image of the request, oldest first, with its place in its message.
+fn images_in_order(req: &GenerateAssistantResponseRequest) -> Vec<(Turn, usize, &KiroImage)> {
     let history = req
         .conversation_state
         .history
@@ -96,26 +100,115 @@ fn images_in_order(req: &GenerateAssistantResponseRequest) -> Vec<(Turn, &KiroIm
     ));
     history
         .chain(current)
-        .flat_map(|(turn, input)| input.images.iter().map(move |image| (turn, image)))
+        .flat_map(|(turn, input)| {
+            input
+                .images
+                .iter()
+                .enumerate()
+                .map(move |(place, image)| (turn, place, image))
+        })
         .collect()
+}
+
+/// How long an image left out as busy stays out on its conversation's later steps, from
+/// the last step that sent its message: each step then sends what the step before sent.
+/// Shown on the next step, it rewrote the prompt a provider had cached from its message
+/// on; a conversation resting this long finds that cache expired anyway, and the image is
+/// shown then.
+const BUSY_KEPT_FOR: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// At most this many images are kept out as busy at once.
+const BUSY_PLACES: usize = 4_096;
+
+/// An image by its conversation, the message it is in (its place in the history, which the
+/// current message takes next), its place in that message, and its bytes.
+type BusyPlace = (String, usize, usize, [u8; 32]);
+
+fn busy_places(
+) -> &'static std::sync::Mutex<std::collections::HashMap<BusyPlace, tokio::time::Instant>> {
+    static PLACES: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<BusyPlace, tokio::time::Instant>>,
+    > = std::sync::LazyLock::new(Default::default);
+    &PLACES
+}
+
+/// Whether the image at `place` was left out as busy on a recent step; if so it stays out
+/// for another [`BUSY_KEPT_FOR`].
+fn still_busy(place: &BusyPlace, now: tokio::time::Instant) -> bool {
+    let Ok(mut places) = busy_places().lock() else {
+        return false;
+    };
+    match places.get_mut(place) {
+        Some(until) if *until > now => {
+            *until = now + BUSY_KEPT_FOR;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn keep_busy(place: BusyPlace, now: tokio::time::Instant) {
+    let Ok(mut places) = busy_places().lock() else {
+        return;
+    };
+    places.retain(|_, until| *until > now);
+    if places.len() >= BUSY_PLACES {
+        if let Some(soonest) = places
+            .iter()
+            .min_by_key(|(_, until)| **until)
+            .map(|(place, _)| place.clone())
+        {
+            places.remove(&soonest);
+        }
+    }
+    places.insert(place, now + BUSY_KEPT_FOR);
+}
+
+/// How many images a request carries, in its history and its current message.
+pub fn image_count(req: &GenerateAssistantResponseRequest) -> usize {
+    images_in_order(req).len()
+}
+
+/// Of `total` images, oldest first, how many a request for a vision model sends as notes
+/// instead. It sends at most the most recent `max_images`, and past that leaves out the
+/// oldest half of them at once: the prompt a provider cached changes where the first image
+/// becomes a note, and one image at a time that was on every new image.
+pub fn images_left_as_notes(total: usize, max_images: usize) -> usize {
+    if total <= max_images {
+        return 0;
+    }
+    let block = (max_images / 2).max(1);
+    (total - max_images).div_ceil(block) * block
+}
+
+/// The tokens of the note a vision model reads in place of an image left out for its age.
+pub fn older_image_note_tokens() -> u64 {
+    crate::usage_estimate::tokens_from_units(crate::usage_estimate::token_units(&omission_note(
+        1,
+        Omission::OverCount,
+    )))
 }
 
 /// Decide how each image of a request for a vision model reaches the provider.
 ///
-/// Only the most recent `max_images` go as images: a conversation resends every earlier
-/// image on every turn, and older ones become notes without being read at all. Of those
-/// kept, images too large to forward are shrunk under the process-wide decode limit,
-/// newest first, and any not done within `budget` become notes for this turn.
+/// Only the most recent images go as images (see [`images_left_as_notes`]): a
+/// conversation resends every earlier image on every turn, and older ones become notes
+/// without being read at all. Of those kept, images too large to forward are shrunk under
+/// the process-wide decode limit, newest first, and any not done within `budget` become
+/// notes, on this step and on the conversation's next ones while it keeps going.
 pub async fn prepare_images(
     req: &GenerateAssistantResponseRequest,
     max_images: usize,
     budget: std::time::Duration,
 ) -> PreparedImages {
     let images = images_in_order(req);
-    let keep_from = images.len().saturating_sub(max_images);
+    let keep_from = images_left_as_notes(images.len(), max_images);
+    let conversation = &req.conversation_state.conversation_id;
+    let history_len = req.conversation_state.history.len();
+    let now = tokio::time::Instant::now();
     let mut decided = Vec::with_capacity(images.len());
     let mut to_shrink = Vec::new();
-    for (position, (_, image)) in images.iter().enumerate() {
+    for (position, (turn, place, image)) in images.iter().enumerate() {
         if position < keep_from {
             decided.push(PreparedImage::Omitted(Omission::OverCount));
             continue;
@@ -124,20 +217,31 @@ pub async fn prepare_images(
             Inspection::Ready(prepared) => decided.push(prepared),
             Inspection::NeedsShrink(raw_bytes) => {
                 decided.push(PreparedImage::Omitted(Omission::Busy));
-                to_shrink.push((position, raw_bytes));
+                let message = match turn {
+                    Turn::History(message) => *message,
+                    Turn::Current => history_len,
+                };
+                let key = image_key(&raw_bytes);
+                let busy_place = (conversation.clone(), message, *place, key);
+                if !still_busy(&busy_place, now) {
+                    to_shrink.push((position, raw_bytes, key, busy_place));
+                }
             }
         }
     }
-    let deadline = tokio::time::Instant::now() + budget;
-    for (position, raw_bytes) in to_shrink.into_iter().rev() {
-        decided[position] = shrink_image(raw_bytes, deadline).await;
+    let deadline = now + budget;
+    for (position, raw_bytes, key, busy_place) in to_shrink.into_iter().rev() {
+        decided[position] = shrink_image_keyed(raw_bytes, key, deadline).await;
+        if decided[position] == PreparedImage::Omitted(Omission::Busy) {
+            keep_busy(busy_place, tokio::time::Instant::now());
+        }
     }
 
     let mut prepared = PreparedImages {
         history: vec![Vec::new(); req.conversation_state.history.len()],
         current: Vec::new(),
     };
-    for ((turn, _), image) in images.into_iter().zip(decided) {
+    for ((turn, _, _), image) in images.into_iter().zip(decided) {
         match turn {
             Turn::History(position) => prepared.history[position].push(image),
             Turn::Current => prepared.current.push(image),
@@ -172,18 +276,26 @@ fn omission_note(number: usize, omission: Omission) -> String {
 /// Transcriptions are used only for the current message. They are collected per request
 /// for that message alone, so indexing them from a history message would caption a past
 /// image with unrelated text.
+///
+/// Attachments come first, as providers advise, so a message with nothing but a file is
+/// still the user's turn: dropped, it left the request ending on the assistant's turn,
+/// which current models refuse as a prefill.
 fn format_user_content(
     content: &str,
     images: &[KiroImage],
+    documents: &[KiroDocument],
     ctx: &TranslationContext,
     turn: Turn,
 ) -> serde_json::Value {
-    if images.is_empty() {
+    if images.is_empty() && documents.is_empty() {
         return serde_json::Value::String(content.to_string());
     }
+    let attachments = documents
+        .iter()
+        .map(|document| super::documents::content_part(document, ctx.supports_vision));
 
     if ctx.supports_vision {
-        let mut parts = Vec::new();
+        let mut parts: Vec<serde_json::Value> = attachments.collect();
         if !content.is_empty() {
             parts.push(serde_json::json!({
                 "type": "text",
@@ -225,7 +337,11 @@ fn format_user_content(
         }
         serde_json::Value::Array(parts)
     } else {
-        let mut text = content.to_string();
+        // Without vision every attachment is text: a text file's own, or a note.
+        let mut text: String = attachments
+            .filter_map(|part| part["text"].as_str().map(|text| format!("{text}\n\n")))
+            .collect();
+        text.push_str(content);
         for (idx, img) in images.iter().enumerate() {
             let transcription = if turn == Turn::Current {
                 ctx.image_transcriptions.get(idx).and_then(|s| s.as_deref())
@@ -255,12 +371,31 @@ fn format_user_content(
     }
 }
 
+/// A tool result as the model should read it: its text blocks joined, a JSON block pretty
+/// printed. Sent as the JSON of the block list, every newline, quote and backslash of a
+/// file a tool read reached the model escaped, and a Windows path doubled, so an exact
+/// `oldStr` for str_replace had to be un-escaped by the model first.
+fn tool_result_text(blocks: &[serde_json::Value]) -> String {
+    blocks
+        .iter()
+        .map(|block| match block {
+            serde_json::Value::String(text) => text.clone(),
+            _ => match (block.get("text"), block.get("json")) {
+                (Some(serde_json::Value::String(text)), _) => text.clone(),
+                (_, Some(json)) => serde_json::to_string_pretty(json).unwrap_or_default(),
+                _ => block.to_string(),
+            },
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Translate Kiro's `GenerateAssistantResponseRequest` into generic `ChatRequest`.
 pub fn translate_kiro_to_chat_request(
     kiro_req: &GenerateAssistantResponseRequest,
     ctx: &mut TranslationContext,
 ) -> ChatRequest {
-    let mut system_prompts: Vec<String> = kiro_req
+    let system_prompts: Vec<String> = kiro_req
         .system_prompt
         .iter()
         .filter(|s| !s.trim().is_empty())
@@ -273,7 +408,7 @@ pub fn translate_kiro_to_chat_request(
         .current_message
         .user_input_message;
 
-    // 1. Process tools and extract long descriptions
+    // 1. Process tools (provider-safe names; descriptions stay whole)
     let mut processed_tools = Vec::new();
     if let Some(ref ctx_data) = current_input.user_input_message_context {
         if !ctx_data.tools.is_empty() {
@@ -283,12 +418,7 @@ pub fn translate_kiro_to_chat_request(
                 .map(|t| serde_json::to_value(t).unwrap_or_default())
                 .collect();
 
-            let (tools, doc_append) =
-                process_tools_for_provider(&tools_value, &mut ctx.tool_registry);
-            processed_tools = tools;
-            if let Some(doc) = doc_append {
-                system_prompts.push(doc);
-            }
+            processed_tools = process_tools_for_provider(&tools_value, &mut ctx.tool_registry);
         }
     }
 
@@ -307,12 +437,29 @@ pub fn translate_kiro_to_chat_request(
                     })
                     .collect();
 
+                // Kiro sends a turn's thinking back only with the signature it kept for it,
+                // tagged with the upstream model that wrote it; an untagged one is dropped.
+                let thinking = assistant_msg
+                    .reasoning_content
+                    .as_ref()
+                    .and_then(|reasoning| reasoning.reasoning_text.as_ref())
+                    .filter(|reasoning| !reasoning.text.is_empty())
+                    .and_then(|reasoning| {
+                        let (model, signature) =
+                            crate::provider::untag_signature(reasoning.signature.as_deref()?)?;
+                        Some(ThinkingBlock {
+                            text: reasoning.text.clone(),
+                            signature: signature.to_string(),
+                            model: model.to_string(),
+                        })
+                    });
                 raw_messages.push(ConversationMessage {
                     role: "assistant".to_string(),
                     content: serde_json::Value::String(assistant_msg.content.clone()),
                     tool_use_id: None,
                     tool_calls,
                     is_error: None,
+                    thinking,
                 });
             }
             Message::User(u) => {
@@ -320,7 +467,7 @@ pub fn translate_kiro_to_chat_request(
                 // Historical tool results in user context
                 if let Some(ref ctx_data) = user_msg.user_input_message_context {
                     for tr in &ctx_data.tool_results {
-                        let content_str = serde_json::to_string(&tr.content).unwrap_or_default();
+                        let content_str = tool_result_text(&tr.content);
                         let is_error = tr.status.as_deref().map(|s| s == "error" || s == "failed");
                         raw_messages.push(ConversationMessage {
                             role: "tool".to_string(),
@@ -328,14 +475,19 @@ pub fn translate_kiro_to_chat_request(
                             tool_use_id: Some(tr.tool_use_id.clone()),
                             tool_calls: Vec::new(),
                             is_error,
+                            thinking: None,
                         });
                     }
                 }
-                // Historical user message content (with image support)
-                if !user_msg.content.is_empty() || !user_msg.images.is_empty() {
+                // Historical user message content (with image and attachment support)
+                if !user_msg.content.is_empty()
+                    || !user_msg.images.is_empty()
+                    || !user_msg.documents.is_empty()
+                {
                     let content_val = format_user_content(
                         &user_msg.content,
                         &user_msg.images,
+                        &user_msg.documents,
                         ctx,
                         Turn::History(position),
                     );
@@ -345,6 +497,7 @@ pub fn translate_kiro_to_chat_request(
                         tool_use_id: None,
                         tool_calls: Vec::new(),
                         is_error: None,
+                        thinking: None,
                     });
                 }
             }
@@ -354,7 +507,7 @@ pub fn translate_kiro_to_chat_request(
     // 3. Process current user message: tool results and prompt content
     if let Some(ref ctx_data) = current_input.user_input_message_context {
         for tr in &ctx_data.tool_results {
-            let content_str = serde_json::to_string(&tr.content).unwrap_or_default();
+            let content_str = tool_result_text(&tr.content);
             let is_error = tr.status.as_deref().map(|s| s == "error" || s == "failed");
             raw_messages.push(ConversationMessage {
                 role: "tool".to_string(),
@@ -362,6 +515,7 @@ pub fn translate_kiro_to_chat_request(
                 tool_use_id: Some(tr.tool_use_id.clone()),
                 tool_calls: Vec::new(),
                 is_error,
+                thinking: None,
             });
         }
     }
@@ -369,6 +523,7 @@ pub fn translate_kiro_to_chat_request(
     let final_current_content = format_user_content(
         &current_input.content,
         &current_input.images,
+        &current_input.documents,
         ctx,
         Turn::Current,
     );
@@ -378,6 +533,7 @@ pub fn translate_kiro_to_chat_request(
         tool_use_id: None,
         tool_calls: Vec::new(),
         is_error: None,
+        thinking: None,
     });
 
     // 4. Run strictly chronological orphan repair on conversation messages
@@ -394,6 +550,7 @@ pub fn translate_kiro_to_chat_request(
             tool_call_id: None,
             tool_calls: Vec::new(),
             is_error: None,
+            thinking: None,
         });
     }
 
@@ -405,6 +562,7 @@ pub fn translate_kiro_to_chat_request(
             tool_call_id: rm.tool_use_id,
             tool_calls: rm.tool_calls,
             is_error: rm.is_error,
+            thinking: rm.thinking,
         });
     }
 

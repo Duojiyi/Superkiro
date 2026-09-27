@@ -365,3 +365,1537 @@ fn card_history_names_who_changed_a_card_and_why_newest_first() {
     );
     assert!(engine.card_history("no-such-card").is_none());
 }
+
+/// The events of `action` in a card's history, newest first.
+fn history_of(
+    engine: &BillingEngine,
+    card_id: &str,
+    action: &str,
+) -> Vec<billing::card::CardEvent> {
+    engine
+        .card_history(card_id)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.action == action)
+        .collect()
+}
+
+#[test]
+fn unbanning_restores_the_card_but_not_its_sessions() {
+    let engine = BillingEngine::new();
+    engine.upsert_card(create_test_card("card-unban", 1, 5, 0));
+    let mut never_used = Card::new("card-unban-new", "grp-1", 1_000_000);
+    never_used.status = CardStatus::Unactivated;
+    engine.upsert_card(never_used);
+    for id in ["card-unban", "card-unban-new"] {
+        engine.ban_card(id, "admin", "滥用", 1_100).unwrap();
+    }
+    let banned = engine.get_card("card-unban").unwrap();
+
+    let card = engine
+        .unban_card("card-unban", "admin", "误封", 1_200)
+        .unwrap();
+    assert_eq!(card.status, CardStatus::Active);
+    // The ban revoked its sessions; lifting it does not bring them back.
+    assert_eq!(card.token_version, banned.token_version);
+    // A card banned before it was ever used goes back to waiting for activation.
+    let card = engine
+        .unban_card("card-unban-new", "admin", "误封", 1_200)
+        .unwrap();
+    assert_eq!(card.status, CardStatus::Unactivated);
+    assert_eq!(card.valid_until, None);
+
+    let events = history_of(&engine, "card-unban", "unban");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].operator.as_deref(), Some("admin"));
+    assert_eq!(events[0].reason.as_deref(), Some("误封"));
+    assert_eq!(events[0].credits, 0);
+
+    // Only a banned card, and not an archived one, can be unbanned.
+    let before = engine.get_card("card-unban").unwrap();
+    assert!(matches!(
+        engine.unban_card("card-unban", "admin", "again", 1_300),
+        Err(BillingError::InvalidState(_))
+    ));
+    assert_eq!(engine.get_card("card-unban").unwrap(), before);
+    engine
+        .ban_card("card-unban", "admin", "滥用", 1_400)
+        .unwrap();
+    engine
+        .set_card_archived("card-unban", true, "admin", "清理", 1_500)
+        .unwrap();
+    assert!(matches!(
+        engine.unban_card("card-unban", "admin", "误封", 1_600),
+        Err(BillingError::InvalidState(message)) if message.contains("unarchived")
+    ));
+    assert_eq!(
+        engine.get_card("card-unban").unwrap().status,
+        CardStatus::Banned
+    );
+}
+
+#[test]
+fn an_operator_unbinding_frees_the_seat_without_using_the_customers_allowance() {
+    let engine = BillingEngine::new();
+    let mut card = create_test_card("card-seat", 1, 1, 86_400);
+    card.rebind_count = 1;
+    card.last_rebind_at = Some(1_000);
+    engine.upsert_card(card);
+    engine
+        .bind_device("card-seat", "device-old", 1_000)
+        .unwrap();
+    let before = engine.get_card("card-seat").unwrap();
+    // The customer has used their only unbinding: they cannot free the seat themselves.
+    assert!(engine.unbind_device("card-seat", "device-old").is_err());
+
+    let card = engine
+        .admin_unbind_device("card-seat", "device-old", "admin", "换电脑", 1_100)
+        .unwrap();
+    assert!(card.bound_devices.is_empty());
+    assert_eq!(card.token_version, before.token_version + 1);
+    assert_eq!((card.rebind_count, card.last_rebind_at), (1, Some(1_000)));
+    // The next sign-in binds the new device.
+    engine
+        .bind_device("card-seat", "device-new", 1_200)
+        .unwrap();
+    assert_eq!(
+        engine.get_card("card-seat").unwrap().bound_devices,
+        ["device-new"]
+    );
+
+    let events = history_of(&engine, "card-seat", "unbind");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].reason.as_deref(), Some("换电脑"));
+    assert_eq!(
+        events[0].detail,
+        Some(serde_json::json!({ "deviceId": "device-old" }))
+    );
+
+    let before = engine.get_card("card-seat").unwrap();
+    assert!(matches!(
+        engine.admin_unbind_device("card-seat", "device-old", "admin", "again", 1_300),
+        Err(BillingError::DeviceNotFound { .. })
+    ));
+    assert_eq!(engine.get_card("card-seat").unwrap(), before);
+}
+
+#[test]
+fn resetting_the_rebind_allowance_clears_the_count_and_the_cooldown() {
+    let engine = BillingEngine::new();
+    let mut card = create_test_card("card-rebinds", 1, 2, 86_400);
+    card.rebind_count = 2;
+    card.last_rebind_at = Some(1_000);
+    engine.upsert_card(card);
+    engine.bind_device("card-rebinds", "device", 1_000).unwrap();
+
+    let card = engine
+        .reset_rebinds("card-rebinds", "admin", "客户多次换机", 1_100)
+        .unwrap();
+    assert_eq!((card.rebind_count, card.last_rebind_at), (0, None));
+    assert_eq!(card.rebind_cooldown_until(1_100), None);
+    // The customer may unbind at once again.
+    engine.unbind_device("card-rebinds", "device").unwrap();
+
+    let events = history_of(&engine, "card-rebinds", "rebinds_reset");
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].detail,
+        Some(serde_json::json!({ "previousRebinds": 2, "previousCooldownUntil": 87_400 }))
+    );
+    // Nothing to reset writes nothing.
+    engine.upsert_card(create_test_card("card-clear", 1, 2, 86_400));
+    engine
+        .reset_rebinds("card-clear", "admin", "nothing", 1_100)
+        .unwrap();
+    assert!(history_of(&engine, "card-clear", "rebinds_reset").is_empty());
+}
+
+#[test]
+fn extending_validity_moves_expiries_and_revives_expired_cards() {
+    let engine = BillingEngine::new();
+    let now = 100_000;
+    let mut current = create_test_card("card-current", 1, 5, 0);
+    current.valid_until = Some(now + 86_400);
+    let mut lapsed = create_test_card("card-lapsed", 1, 5, 0);
+    lapsed.valid_until = Some(now - 86_400);
+    let mut expired = create_test_card("card-expired", 1, 5, 0);
+    expired.status = CardStatus::Expired;
+    expired.valid_until = Some(now - 10);
+    let mut frozen = create_test_card("card-frozen", 1, 5, 0);
+    frozen.valid_until = Some(now - 10);
+    let mut waiting = Card::new("card-waiting", "grp-1", 1_000_000);
+    waiting.activation_duration_secs = Some(30 * 86_400);
+    let legacy = Card::new("card-legacy", "grp-1", 1_000_000);
+    for card in [current, lapsed, expired, frozen, waiting, legacy] {
+        engine.upsert_card(card);
+    }
+    engine
+        .freeze_card("card-frozen", "admin", "暂停", now - 5)
+        .unwrap();
+    let ids: Vec<String> = [
+        "card-current",
+        "card-lapsed",
+        "card-expired",
+        "card-frozen",
+        "card-waiting",
+        "card-legacy",
+        "card-current",
+    ]
+    .iter()
+    .map(|id| id.to_string())
+    .collect();
+
+    let cards = engine
+        .extend_validity(
+            &ids,
+            billing::ValidityExtension::Days(10),
+            "admin",
+            "补偿停机",
+            now,
+        )
+        .unwrap();
+    assert_eq!(cards.len(), 6, "a card named twice is extended once");
+    let card = |id: &str| engine.get_card(id).unwrap();
+    // From its expiry while it runs, from now once it has ended.
+    assert_eq!(card("card-current").valid_until, Some(now + 11 * 86_400));
+    assert_eq!(card("card-lapsed").valid_until, Some(now + 10 * 86_400));
+    assert!(card("card-lapsed").check_active(now).is_ok());
+    assert_eq!(card("card-expired").status, CardStatus::Active);
+    assert!(card("card-expired").check_active(now).is_ok());
+    // A frozen card stays frozen, and unfreezes into a usable card.
+    assert_eq!(card("card-frozen").status, CardStatus::Frozen);
+    engine
+        .unfreeze_card("card-frozen", "admin", "恢复", now + 1)
+        .unwrap();
+    assert!(card("card-frozen").check_active(now + 1).is_ok());
+    // Not yet activated: valid that much longer from activation.
+    assert_eq!(
+        card("card-waiting").activation_duration_secs,
+        Some(40 * 86_400)
+    );
+    assert_eq!(card("card-waiting").valid_until, None);
+    assert_eq!(
+        card("card-legacy").activation_duration_secs,
+        Some(40 * 86_400)
+    );
+
+    let events = history_of(&engine, "card-current", "extend");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].reason.as_deref(), Some("补偿停机"));
+    // The new expiry and the one it replaced, so that a mistaken extension can be undone.
+    assert_eq!(
+        events[0].detail,
+        Some(serde_json::json!({
+            "validUntil": now + 11 * 86_400,
+            "previousValidUntil": now + 86_400,
+        }))
+    );
+    assert_eq!(
+        history_of(&engine, "card-waiting", "extend")[0].detail,
+        Some(serde_json::json!({
+            "activationDurationSecs": 40 * 86_400,
+            "previousActivationDurationSecs": 30 * 86_400,
+        }))
+    );
+    // A legacy card counted from the legacy validity.
+    assert_eq!(
+        history_of(&engine, "card-legacy", "extend")[0]
+            .detail
+            .as_ref()
+            .unwrap()["previousActivationDurationSecs"],
+        30 * 86_400
+    );
+
+    // To a time: activated cards only, and never earlier than their expiry.
+    let until = now + 20 * 86_400;
+    let cards = engine
+        .extend_validity(
+            &["card-current".to_string()],
+            billing::ValidityExtension::Until(until),
+            "admin",
+            "续期",
+            now,
+        )
+        .unwrap();
+    assert_eq!(cards[0].valid_until, Some(until));
+}
+
+#[test]
+fn a_validity_extension_is_refused_whole_naming_the_cards_it_cannot_extend() {
+    let engine = BillingEngine::new();
+    let now = 100_000;
+    let mut current = create_test_card("card-ok", 1, 5, 0);
+    current.valid_until = Some(now + 86_400);
+    let mut voided = create_test_card("card-voided", 1, 5, 0);
+    voided.status = CardStatus::Voided;
+    let mut archived = create_test_card("card-archived", 1, 5, 0);
+    archived.status = CardStatus::Banned;
+    archived.archived_at = Some(1);
+    let mut perpetual = create_test_card("card-perpetual", 1, 5, 0);
+    perpetual.valid_until = None;
+    let mut forever = Card::new("card-forever", "grp-1", 1_000_000);
+    forever.activation_duration_secs = Some(0);
+    let waiting = Card::new("card-waiting", "grp-1", 1_000_000);
+    for card in [current, voided, archived, perpetual, forever, waiting] {
+        engine.upsert_card(card);
+    }
+    let days = billing::ValidityExtension::Days(5);
+    let refused = |ids: &[&str], extension| {
+        let ids: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+        engine
+            .extend_validity(&ids, extension, "admin", "续期", now)
+            .unwrap_err()
+            .to_string()
+    };
+    let before = engine.export_snapshot();
+    assert_eq!(
+        refused(&["card-ok", "card-missing"], days),
+        "Card card-missing not found"
+    );
+    assert!(refused(&["card-ok", "card-voided"], days)
+        .ends_with("Voided cards cannot be extended: card-voided"));
+    assert!(refused(&["card-archived", "card-ok"], days)
+        .ends_with("Archived cards must be unarchived before they are extended: card-archived"));
+    assert!(refused(&["card-perpetual", "card-forever"], days)
+        .ends_with("Cards that never expire cannot be extended: card-perpetual, card-forever"));
+    let until = billing::ValidityExtension::Until(now + 3_600);
+    assert!(refused(&["card-ok", "card-waiting"], until)
+        .ends_with("An expiry date applies only to activated cards: card-waiting"));
+    assert!(refused(&["card-ok"], until)
+        .ends_with("The new expiry is earlier than the current one of: card-ok"));
+    for extension in [
+        billing::ValidityExtension::Days(0),
+        billing::ValidityExtension::Until(now),
+    ] {
+        assert!(matches!(
+            engine.extend_validity(&["card-ok".into()], extension, "admin", "x", now),
+            Err(BillingError::InvalidAdjustment(_))
+        ));
+    }
+    // Nothing changed, not even the cards that could have been extended.
+    let after = engine.export_snapshot();
+    assert_eq!(after.cards, before.cards);
+    assert_eq!(after.ledger.len(), before.ledger.len());
+}
+
+#[test]
+fn a_note_change_records_who_made_it() {
+    let engine = BillingEngine::new();
+    engine.upsert_card(create_test_card("card-noted", 1, 5, 0));
+    let card = engine
+        .set_card_note("card-noted", Some("VIP 续费客户"), "admin", 1_100)
+        .unwrap();
+    assert_eq!(card.note.as_deref(), Some("VIP 续费客户"));
+    // The same note again is no change.
+    engine
+        .set_card_note("card-noted", Some("VIP 续费客户"), "admin", 1_150)
+        .unwrap();
+    let card = engine
+        .set_card_note("card-noted", None, "admin", 1_200)
+        .unwrap();
+    assert_eq!(card.note, None);
+    let events = history_of(&engine, "card-noted", "note");
+    assert_eq!(events.len(), 2);
+    assert!(events
+        .iter()
+        .all(|event| event.operator.as_deref() == Some("admin") && event.reason.is_none()));
+    // Each records the note it wrote and the one it replaced, newest first.
+    let details: Vec<_> = events.iter().map(|event| event.detail.clone()).collect();
+    assert_eq!(
+        details,
+        [
+            Some(serde_json::json!({ "note": null, "previousNote": "VIP 续费客户" })),
+            Some(serde_json::json!({ "note": "VIP 续费客户", "previousNote": null })),
+        ]
+    );
+}
+
+/// Lifting a ban lifts no freeze, and takes back what the ban put before the note.
+#[test]
+fn unbanning_a_card_banned_while_frozen_leaves_it_frozen() {
+    let engine = BillingEngine::new();
+    let mut card = create_test_card("card-held", 1, 5, 0);
+    card.note = Some("VIP 客户".into());
+    engine.upsert_card(card);
+    engine
+        .freeze_card("card-held", "admin", "调查中", 1_000)
+        .unwrap();
+    // Banned twice, once for a reason with a bracket of its own.
+    engine
+        .ban_card("card-held", "admin", "滥用 [第二次]", 1_100)
+        .unwrap();
+    engine
+        .ban_card("card-held", "admin", "再次滥用", 1_150)
+        .unwrap();
+    assert_eq!(
+        engine.get_card("card-held").unwrap().note.as_deref(),
+        Some("[BANNED: 再次滥用] [BANNED: 滥用 [第二次]] [FROZEN: 调查中] VIP 客户")
+    );
+
+    let card = engine
+        .unban_card("card-held", "admin", "误封", 1_200)
+        .unwrap();
+    assert_eq!(card.status, CardStatus::Frozen);
+    assert_eq!(card.frozen_from, Some(CardStatus::Active));
+    assert_eq!(card.note.as_deref(), Some("[FROZEN: 调查中] VIP 客户"));
+    assert_eq!(
+        history_of(&engine, "card-held", "unban")[0].detail,
+        Some(serde_json::json!({ "status": "frozen" }))
+    );
+    // Unfrozen, it is what it was frozen from.
+    let card = engine
+        .unfreeze_card("card-held", "admin", "调查结束", 1_300)
+        .unwrap();
+    assert_eq!(card.status, CardStatus::Active);
+
+    // A ban's note alone leaves none; one no ban in the history wrote ends at its bracket.
+    let mut legacy = create_test_card("card-legacy-ban", 1, 5, 0);
+    legacy.status = CardStatus::Banned;
+    legacy.note = Some("[BANNED: 旧版封禁] 老客户".into());
+    engine.upsert_card(legacy);
+    let card = engine
+        .unban_card("card-legacy-ban", "admin", "误封", 1_400)
+        .unwrap();
+    assert_eq!(
+        (card.status, card.note.as_deref()),
+        (CardStatus::Active, Some("老客户"))
+    );
+    engine.upsert_card(create_test_card("card-bare", 1, 5, 0));
+    engine
+        .ban_card("card-bare", "admin", "滥用", 1_500)
+        .unwrap();
+    let card = engine
+        .unban_card("card-bare", "admin", "误封", 1_600)
+        .unwrap();
+    assert_eq!(card.note, None);
+    assert_eq!(
+        history_of(&engine, "card-bare", "unban")[0].detail,
+        Some(serde_json::json!({ "status": "active" }))
+    );
+}
+
+fn fixed_price(id: &str) -> billing::rate_card::RateCardVersion {
+    billing::rate_card::RateCardVersion {
+        id: id.to_string(),
+        rate_card_id: "default".to_string(),
+        model: "support-model".to_string(),
+        currency: billing::rate_card::Currency::Cny,
+        pricing_mode: billing::rate_card::PricingMode::Fixed,
+        input_price_per_m: 0.0,
+        output_price_per_m: 0.0,
+        cache_creation_price_per_m: 0.0,
+        cache_read_price_per_m: 0.0,
+        fixed_input_credit_per_m: 1_000_000,
+        fixed_output_credit_per_m: 1_000_000,
+        fixed_cache_creation_credit_per_m: 0,
+        fixed_cache_read_credit_per_m: 0,
+        per_call_credit: 0,
+        margin_multiplier: 1.0,
+        effective_from_secs: 0,
+        official: None,
+    }
+}
+
+#[test]
+fn a_group_change_ends_sessions_and_keeps_in_flight_requests_at_their_price() {
+    let engine = BillingEngine::new();
+    let mut dearer = billing::Group::pro_plus("group-dearer", "Dearer");
+    dearer.margin_multiplier = 3.0;
+    engine.upsert_group(dearer);
+    let mut closed = billing::Group::pro_plus("group-acceptance", "Acceptance");
+    closed.issuance_enabled = false;
+    engine.upsert_group(closed);
+    engine.upsert_rate_card_version(fixed_price("price-support"));
+    let mut card = create_test_card("card-moved", 1, 5, 0);
+    card.valid_until = None;
+    engine.upsert_card(card);
+    let tokens = billing::ledger::UsageTokens {
+        uncached_input_tokens: 1_000_000,
+        output_tokens: 1_000_000,
+        cache_creation_tokens: 0,
+        cache_read_tokens: 0,
+    };
+    let params = billing::reservation::ReservationEstimateParams::new(1_000, 1_000)
+        .with_model("support-model");
+    engine
+        .reserve("card-moved", "inv-in-flight", &params, 1_000, 600)
+        .unwrap();
+    let before = engine.get_card("card-moved").unwrap();
+
+    let card = engine
+        .change_card_group("card-moved", "group-dearer", "admin", "升级套餐", 1_100)
+        .unwrap();
+    assert_eq!(card.group_id, "group-dearer");
+    assert_eq!(card.token_version, before.token_version + 1);
+    // Reserved in the old group: charged as it was reserved.
+    let in_flight = engine
+        .settle(
+            "inv-in-flight",
+            &tokens,
+            "support-model",
+            "prov",
+            "target",
+            1_200,
+        )
+        .unwrap();
+    assert_eq!(in_flight.credits_charged, 2_000_000);
+    engine
+        .reserve("card-moved", "inv-after", &params, 1_300, 600)
+        .unwrap();
+    let after = engine
+        .settle(
+            "inv-after",
+            &tokens,
+            "support-model",
+            "prov",
+            "target",
+            1_300,
+        )
+        .unwrap();
+    assert_eq!(after.credits_charged, 6_000_000);
+
+    let events = history_of(&engine, "card-moved", "group");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].reason.as_deref(), Some("升级套餐"));
+    assert_eq!(
+        events[0].detail,
+        Some(serde_json::json!({ "previousGroupId": "grp-1", "groupId": "group-dearer" }))
+    );
+
+    let before = engine.get_card("card-moved").unwrap();
+    for (group, message) in [
+        ("group-missing", "Unknown group: group-missing"),
+        (
+            "group-acceptance",
+            "Group does not take cards: group-acceptance",
+        ),
+    ] {
+        assert!(matches!(
+            engine.change_card_group("card-moved", group, "admin", "x", 1_400),
+            Err(BillingError::InvalidState(refusal)) if refusal == message
+        ));
+    }
+    // Already there: nothing changes and nothing is written.
+    engine
+        .change_card_group("card-moved", "group-dearer", "admin", "again", 1_400)
+        .unwrap();
+    assert_eq!(engine.get_card("card-moved").unwrap(), before);
+    assert_eq!(history_of(&engine, "card-moved", "group").len(), 1);
+}
+
+/// A request the card made and was charged `credits` for, as its trace records it.
+fn charged_request(engine: &BillingEngine, card_id: &str, invocation_id: &str, credits: i64) {
+    engine.record_trace(billing::RequestTrace {
+        id: format!("trace-{invocation_id}"),
+        card_id: card_id.into(),
+        ts: 1_050,
+        invocation_id: invocation_id.into(),
+        exposed_model: "model".into(),
+        status: billing::TraceStatus::Success,
+        credits_charged: credits,
+        ..billing::RequestTrace::default()
+    });
+}
+
+fn request(invocation_id: &str) -> billing::CompensatedRequest<'_> {
+    billing::CompensatedRequest {
+        invocation_id,
+        allow_repeat: false,
+    }
+}
+
+#[test]
+fn an_adjustment_keeps_the_request_it_makes_up_for() {
+    let engine = BillingEngine::new();
+    engine.upsert_card(create_test_card("card-comp", 1, 5, 0));
+    charged_request(&engine, "card-comp", "card-comp:inv-broken", 5_000_000);
+    let adjust = |invocation: Option<&str>| {
+        engine.adjust_balance_linked(
+            "card-comp",
+            2_000_000,
+            "admin",
+            "补偿失败请求",
+            1_100,
+            Some("comp-1"),
+            invocation.map(request),
+        )
+    };
+    adjust(Some("card-comp:inv-broken")).unwrap();
+    // A retry is the same adjustment; the same key naming another request is not.
+    adjust(Some("card-comp:inv-broken")).unwrap();
+    for other in [None, Some("card-comp:inv-other")] {
+        assert!(matches!(
+            adjust(other),
+            Err(BillingError::InvalidAdjustment(message)) if message.starts_with("Idempotency conflict")
+        ));
+    }
+    assert_eq!(
+        engine.get_card("card-comp").unwrap().credit_total,
+        102_000_000
+    );
+    let events = history_of(&engine, "card-comp", "adjust");
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].invocation_id.as_deref(),
+        Some("card-comp:inv-broken")
+    );
+    // Every request it names, and what each was charged.
+    assert_eq!(
+        events[0].detail,
+        Some(serde_json::json!({
+            "invocationIds": ["card-comp:inv-broken"],
+            "kind": "compensation",
+            "chargedMicroCredits": [5_000_000],
+        }))
+    );
+    // An adjustment without one names none.
+    engine
+        .adjust_balance("card-comp", 1_000_000, "admin", "赠送", 1_200)
+        .unwrap();
+    assert_eq!(
+        history_of(&engine, "card-comp", "adjust")[0].invocation_id,
+        None
+    );
+}
+
+/// What a change records besides who and why is kept in the entry's own `detail`, and the
+/// history reads the same from entries written before it, which kept it as JSON where a
+/// usage entry names its model; a retried adjustment is still recognised across the two.
+#[test]
+fn event_detail_has_its_own_field_and_older_entries_still_read() {
+    use serde_json::json;
+    let engine = BillingEngine::new();
+    let mut card = create_test_card("card-detail", 1, 5, 0);
+    card.bound_devices = vec!["device-old".into()];
+    engine.upsert_card(card);
+    let mut waiting = Card::new("card-detail-new", "grp-1", 1_000_000);
+    waiting.activation_duration_secs = Some(86_400);
+    engine.upsert_card(waiting);
+    engine.upsert_group(billing::Group::pro_plus("grp-2", "Second"));
+    engine
+        .admin_unbind_device("card-detail", "device-old", "admin", "换电脑", 1_100)
+        .unwrap();
+    engine
+        .extend_validity(
+            &["card-detail".into(), "card-detail-new".into()],
+            billing::ValidityExtension::Days(2),
+            "admin",
+            "补偿",
+            1_200,
+        )
+        .unwrap();
+    engine
+        .change_card_group("card-detail", "grp-2", "admin", "升级", 1_300)
+        .unwrap();
+    charged_request(&engine, "card-detail", "card-detail:inv-1", 3_000_000);
+    let linked = |engine: &BillingEngine, invocation: &str| {
+        engine.adjust_balance_linked(
+            "card-detail",
+            1_000_000,
+            "admin",
+            "补偿失败请求",
+            1_400,
+            Some("comp-detail"),
+            Some(request(invocation)),
+        )
+    };
+    linked(&engine, "card-detail:inv-1").unwrap();
+    engine
+        .set_card_note("card-detail", Some("VIP"), "admin", 1_500)
+        .unwrap();
+    engine
+        .freeze_card("card-detail", "admin", "暂停", 1_600)
+        .unwrap();
+
+    let entries: Vec<_> = engine
+        .ledger_entries()
+        .into_iter()
+        .filter(|entry| entry.kind == LedgerKind::Adjustment)
+        .collect();
+    let written: Vec<_> = entries
+        .iter()
+        .map(|entry| (entry.target_model.as_str(), entry.detail.clone()))
+        .collect();
+    assert_eq!(
+        written,
+        [
+            ("unbind_device", Some(json!({ "deviceId": "device-old" }))),
+            // Its expiry, 87,400, two days later.
+            (
+                "extend_validity",
+                Some(json!({ "validUntil": 260_200, "previousValidUntil": 87_400 }))
+            ),
+            (
+                "extend_validity",
+                Some(json!({
+                    "activationDurationSecs": 259_200,
+                    "previousActivationDurationSecs": 86_400,
+                }))
+            ),
+            (
+                "change_group",
+                Some(json!({ "previousGroupId": "grp-1", "groupId": "grp-2" }))
+            ),
+            (
+                "adjustment",
+                Some(json!({
+                    "invocationId": "card-detail:inv-1",
+                    "invocationIds": ["card-detail:inv-1"],
+                    "kind": "compensation",
+                    "chargedMicroCredits": [3_000_000],
+                }))
+            ),
+            (
+                "note_card",
+                Some(json!({ "note": "VIP", "previousNote": null }))
+            ),
+            ("freeze_card", None),
+        ]
+    );
+    // Absent, the field is not written at all.
+    let freeze = serde_json::to_value(&entries[6]).unwrap();
+    assert!(freeze.get("detail").is_none());
+    let history = |engine: &BillingEngine| {
+        (
+            engine.card_history("card-detail").unwrap(),
+            engine.card_history("card-detail-new").unwrap(),
+        )
+    };
+    let now = history(&engine);
+    let adjusted = now.0.iter().find(|e| e.action == "adjust").unwrap();
+    assert_eq!(adjusted.invocation_id.as_deref(), Some("card-detail:inv-1"));
+    assert_eq!(
+        adjusted.detail,
+        Some(json!({
+            "invocationIds": ["card-detail:inv-1"],
+            "kind": "compensation",
+            "chargedMicroCredits": [3_000_000],
+        }))
+    );
+    let unbound = now.0.iter().find(|e| e.action == "unbind").unwrap();
+    assert_eq!(unbound.detail, Some(json!({ "deviceId": "device-old" })));
+
+    // The same state as a release before the field saved it.
+    let mut older = engine.export_snapshot();
+    for entry in &mut older.ledger {
+        if let Some(detail) = entry.detail.take() {
+            entry.target_model = detail.to_string();
+        }
+    }
+    let restored = BillingEngine::new();
+    restored.import_snapshot(older);
+    assert_eq!(history(&restored), now);
+    // A retry of the adjustment is recognised, and the same key naming another request
+    // is still refused.
+    let retried = linked(&restored, "card-detail:inv-1").unwrap();
+    assert_eq!(retried.detail, None);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&retried.target_model).unwrap(),
+        json!({
+            "invocationId": "card-detail:inv-1",
+            "invocationIds": ["card-detail:inv-1"],
+            "kind": "compensation",
+            "chargedMicroCredits": [3_000_000],
+        })
+    );
+    assert!(matches!(
+        linked(&restored, "card-detail:inv-2"),
+        Err(BillingError::InvalidAdjustment(message)) if message.starts_with("Idempotency conflict")
+    ));
+    assert_eq!(
+        restored.get_card("card-detail").unwrap().credit_total,
+        engine.get_card("card-detail").unwrap().credit_total
+    );
+}
+
+/// A compensation names a request of this card that was made. It is paid once, and never
+/// beyond what the request was charged, unless the operator explicitly allows it.
+#[test]
+fn a_request_is_compensated_once_and_at_most_what_it_was_charged() {
+    let engine = BillingEngine::new();
+    engine.upsert_card(create_test_card("card-a", 1, 5, 0));
+    engine.upsert_card(create_test_card("card-b", 1, 5, 0));
+    // Charged 3 credits, settled from the live ledger.
+    engine.upsert_rate_card_version(fixed_price("price-support"));
+    let params = billing::reservation::ReservationEstimateParams::new(1_000, 1_000)
+        .with_model("support-model");
+    engine
+        .reserve("card-a", "card-a:inv-1", &params, 1_000, 600)
+        .unwrap();
+    let tokens = billing::ledger::UsageTokens {
+        uncached_input_tokens: 1_000_000,
+        output_tokens: 2_000_000,
+        cache_creation_tokens: 0,
+        cache_read_tokens: 0,
+    };
+    engine
+        .settle(
+            "card-a:inv-1",
+            &tokens,
+            "support-model",
+            "prov",
+            "target",
+            1_700_000_000,
+        )
+        .unwrap();
+    charged_request(&engine, "card-b", "card-b:inv-9", 1_000_000);
+    let compensate = |card: &str, credits: i64, key: &str, request: billing::CompensatedRequest| {
+        engine
+            .adjust_balance_linked(
+                card,
+                credits,
+                "admin",
+                "补偿失败请求",
+                1_700_000_100,
+                Some(key),
+                Some(request),
+            )
+            .map_err(|error| error.to_string())
+    };
+
+    // A request that was never made, or another card's.
+    assert_eq!(
+        compensate("card-a", 1_000_000, "k-unknown", request("card-a:nope")).unwrap_err(),
+        "Request card-a:nope was not found"
+    );
+    assert_eq!(
+        compensate("card-a", 1_000_000, "k-other", request("card-b:inv-9")).unwrap_err(),
+        "Request card-b:inv-9 was made by card card-b, not card-a"
+    );
+    // A card that does not exist is named as such.
+    assert_eq!(
+        compensate("card-x", 1_000_000, "k-no-card", request("card-b:inv-9")).unwrap_err(),
+        "Card card-x not found"
+    );
+    // More than it was charged.
+    assert_eq!(
+        compensate("card-a", 3_500_000, "k-more", request("card-a:inv-1")).unwrap_err(),
+        "Request card-a:inv-1 was charged 3 credits at 2023-11-14T22:13:20Z; a compensation of \
+         3.5 credits is more than that; send allowRepeat with a reason to compensate more"
+    );
+    compensate("card-a", 2_000_000, "k-first", request("card-a:inv-1")).unwrap();
+    // A second one with a fresh key names the first.
+    assert_eq!(
+        compensate("card-a", 1_000_000, "k-second", request("card-a:inv-1")).unwrap_err(),
+        "Request card-a:inv-1 was charged 3 credits at 2023-11-14T22:13:20Z, and was already \
+         compensated 2 credits at 2023-11-14T22:15:00Z by admin (补偿失败请求); send \
+         allowRepeat with a reason to compensate it again"
+    );
+    // The first one's retry is the same adjustment, not a second.
+    compensate("card-a", 2_000_000, "k-first", request("card-a:inv-1")).unwrap();
+    assert_eq!(engine.get_card("card-a").unwrap().credit_total, 102_000_000);
+
+    // Explicitly allowed: again, and beyond the charge.
+    let allowed = billing::CompensatedRequest {
+        invocation_id: "card-a:inv-1",
+        allow_repeat: true,
+    };
+    compensate("card-a", 5_000_000, "k-allowed", allowed).unwrap();
+    assert_eq!(engine.get_card("card-a").unwrap().credit_total, 107_000_000);
+    // A negative correction for the request is not a compensation, but must name it rightly.
+    compensate(
+        "card-a",
+        -1_000_000,
+        "k-correction",
+        request("card-a:inv-1"),
+    )
+    .unwrap();
+    assert!(compensate("card-a", -1_000_000, "k-wrong", request("card-b:inv-9")).is_err());
+    // An adjustment naming no request is not checked against any.
+    engine
+        .adjust_balance_linked(
+            "card-a",
+            9_000_000,
+            "admin",
+            "赠送",
+            1_700_000_200,
+            Some("k-gift"),
+            None,
+        )
+        .unwrap();
+    let events = history_of(&engine, "card-a", "adjust");
+    assert_eq!(events.len(), 4);
+    assert!(events[1..]
+        .iter()
+        .all(|event| event.invocation_id.as_deref() == Some("card-a:inv-1")));
+}
+
+/// A request whose usage entry was archived can still be compensated, and still only once:
+/// the archive is read for the charge, and archived adjustments are kept for the check.
+#[test]
+fn an_archived_request_is_found_and_its_compensation_still_counts() {
+    let dir = std::env::temp_dir().join(format!(
+        "kiro-compensation-archive-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let engine = BillingEngine::new();
+    engine.set_persistence_path(dir.join("billing_state.json"));
+    engine.upsert_card(create_test_card("card-old", 1, 5, 0));
+    engine.upsert_rate_card_version(fixed_price("price-support"));
+    let params = billing::reservation::ReservationEstimateParams::new(1_000, 1_000)
+        .with_model("support-model");
+    engine
+        .reserve("card-old", "card-old:inv-1", &params, 1_000, 600)
+        .unwrap();
+    let tokens = billing::ledger::UsageTokens {
+        uncached_input_tokens: 1_000_000,
+        output_tokens: 1_000_000,
+        cache_creation_tokens: 0,
+        cache_read_tokens: 0,
+    };
+    engine
+        .settle(
+            "card-old:inv-1",
+            &tokens,
+            "support-model",
+            "prov",
+            "target",
+            1_001,
+        )
+        .unwrap();
+    engine
+        .adjust_balance_linked(
+            "card-old",
+            1_000_000,
+            "admin",
+            "补偿",
+            1_002,
+            Some("k-old"),
+            Some(request("card-old:inv-1")),
+        )
+        .unwrap();
+    engine.prune_traces(u64::MAX);
+    engine
+        .archive_ledger(2_000, &engine.ledger_archive_dir().unwrap())
+        .unwrap();
+    assert!(engine.ledger_entries().is_empty());
+
+    let again = engine.adjust_balance_linked(
+        "card-old",
+        1_000_000,
+        "admin",
+        "补偿",
+        3_000,
+        Some("k-again"),
+        Some(request("card-old:inv-1")),
+    );
+    assert!(
+        matches!(&again, Err(BillingError::Compensation(refusal))
+            if refusal.message.contains("was charged 2 credits")
+                && refusal.message.contains("already compensated 1 credits")),
+        "{again:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// An operator changes a card's concurrency and limits; the history keeps each value with the
+/// one it replaced, and a change to what is already set writes nothing.
+#[test]
+fn quota_changes_record_what_they_replaced() {
+    let engine = BillingEngine::new();
+    let mut card = create_test_card("card-quota", 1, 5, 0);
+    card.max_concurrency = 1;
+    card.daily_credit_limit = Some(1_000_000);
+    engine.upsert_card(card);
+
+    let card = engine
+        .change_card_quotas(
+            "card-quota",
+            Some(4),
+            Some(None),
+            Some(Some(30_000_000)),
+            "admin",
+            "大客户",
+            1_100,
+        )
+        .unwrap();
+    assert_eq!(
+        (
+            card.max_concurrency,
+            card.daily_credit_limit,
+            card.monthly_credit_limit
+        ),
+        (4, None, Some(30_000_000))
+    );
+    // Only what changes is recorded; the same values again write nothing.
+    engine
+        .change_card_quotas("card-quota", Some(4), None, None, "admin", "再次", 1_200)
+        .unwrap();
+    let events = history_of(&engine, "card-quota", "quotas");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].operator.as_deref(), Some("admin"));
+    assert_eq!(events[0].reason.as_deref(), Some("大客户"));
+    assert_eq!(
+        events[0].detail,
+        Some(serde_json::json!({
+            "maxConcurrency": 4, "previousMaxConcurrency": 1,
+            "dailyCreditLimit": null, "previousDailyCreditLimit": 1_000_000,
+            "monthlyCreditLimit": 30_000_000, "previousMonthlyCreditLimit": null,
+        }))
+    );
+    assert!(matches!(
+        engine.change_card_quotas("no-card", Some(2), None, None, "admin", "x", 1_300),
+        Err(BillingError::CardNotFound(_))
+    ));
+}
+
+/// A leaked code is replaced: the new one signs in, the old one no more, and every session
+/// ends. With a master key the new code can be revealed again; the history keeps only
+/// fingerprints.
+#[test]
+fn a_new_code_replaces_a_leaked_one() {
+    let engine = BillingEngine::new();
+    engine.set_master_kek(billing::MasterKek::from_bytes([9; 32]));
+    let old_code = "kiro-0000-1111-2222-3333-4444-5555-6666-7777";
+    let mut card = create_test_card("card-leaked", 1, 5, 0);
+    card.code_hash = billing::hash_card_code(old_code);
+    card.bound_devices = vec!["device-a".into()];
+    engine.upsert_card(card);
+    let before = engine.get_card("card-leaked").unwrap();
+
+    let (card, new_code) = engine
+        .rekey_card("card-leaked", "admin", "卡密泄露", 1_100)
+        .unwrap();
+    assert_ne!(new_code, old_code);
+    assert!(billing::verify_card_code(&new_code, &card.code_hash));
+    assert_eq!(
+        engine.find_card_by_secret(&new_code).map(|card| card.id),
+        Some("card-leaked".to_string())
+    );
+    assert!(engine.find_card_by_secret(old_code).is_none());
+    assert_eq!(card.token_version, before.token_version + 1);
+    // Its balance, devices and status stay.
+    assert_eq!(
+        (card.credit_total, card.bound_devices.clone(), card.status),
+        (before.credit_total, before.bound_devices, before.status)
+    );
+    assert_eq!(
+        engine.reveal_card_code("card-leaked").unwrap(),
+        Some(new_code.clone())
+    );
+    let events = history_of(&engine, "card-leaked", "rekey");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].reason.as_deref(), Some("卡密泄露"));
+    let detail = events[0].detail.clone().unwrap();
+    assert_eq!(
+        detail["previousCodeFingerprint"],
+        before.code_hash[..8].to_string()
+    );
+    assert_eq!(detail["codeFingerprint"], card.code_hash[..8].to_string());
+    assert!(!detail.to_string().contains(&new_code) && !detail.to_string().contains(old_code));
+
+    // Without a master key it is returned only then.
+    let plain = BillingEngine::new();
+    plain.upsert_card(create_test_card("card-plain", 1, 5, 0));
+    let (card, _) = plain
+        .rekey_card("card-plain", "admin", "泄露", 1_100)
+        .unwrap();
+    assert_eq!(card.code_encrypted, None);
+
+    // Not a voided card, nor an archived one until it is unarchived.
+    let mut voided = create_test_card("card-voided", 1, 5, 0);
+    voided.status = CardStatus::Voided;
+    engine.upsert_card(voided);
+    let mut archived = create_test_card("card-archived", 1, 5, 0);
+    archived.archived_at = Some(1_000);
+    engine.upsert_card(archived);
+    for id in ["card-voided", "card-archived"] {
+        let before = engine.get_card(id).unwrap();
+        assert!(matches!(
+            engine.rekey_card(id, "admin", "泄露", 1_200),
+            Err(BillingError::InvalidState(_))
+        ));
+        assert_eq!(engine.get_card(id).unwrap(), before);
+    }
+}
+
+/// A compensation may name several requests: each must be this card's, none may have been
+/// compensated before, and together they bound the amount. A refusal names every request
+/// that stops it; its message for one request is the one it always was.
+#[test]
+fn a_compensation_of_several_requests_is_checked_for_each() {
+    use billing::{BalanceAdjustment, RefusalKind};
+    let engine = BillingEngine::new();
+    engine.upsert_card(create_test_card("card-s", 1, 5, 0));
+    engine.upsert_card(create_test_card("card-t", 1, 5, 0));
+    charged_request(&engine, "card-s", "card-s:inv-1", 1_000_000);
+    charged_request(&engine, "card-s", "card-s:inv-2", 3_000_000);
+    charged_request(&engine, "card-s", "card-s:inv-3", 0);
+    charged_request(&engine, "card-t", "card-t:inv-9", 2_000_000);
+    let adjust = |credits: i64, key: &str, requests: &[&str], allow_repeat: bool| {
+        engine.adjust_card_balance(BalanceAdjustment {
+            card_id: "card-s",
+            delta_micro_credits: credits,
+            operator_id: "admin",
+            reason: "补偿中断",
+            now_secs: 1_700_000_100,
+            idempotency_key: Some(key),
+            requests,
+            allow_repeat,
+            kind: None,
+            cash_micro_cny: None,
+        })
+    };
+    let refusal = |result: Result<billing::LedgerEntry, BillingError>| match result {
+        Err(BillingError::Compensation(refusal)) => *refusal,
+        other => panic!("not a compensation refusal: {other:?}"),
+    };
+
+    let unknown = refusal(adjust(
+        1_000_000,
+        "k-1",
+        &["card-s:inv-1", "card-s:nope", "card-s:gone"],
+        false,
+    ));
+    assert_eq!(unknown.kind, RefusalKind::Unknown);
+    assert_eq!(unknown.message, "2 of the requests were not found");
+    let names: Vec<&str> = unknown
+        .requests
+        .iter()
+        .map(|r| r.invocation_id.as_str())
+        .collect();
+    assert_eq!(names, ["card-s:nope", "card-s:gone"]);
+    assert_eq!(unknown.requests[0].card_id, None);
+
+    let other = refusal(adjust(
+        1_000_000,
+        "k-2",
+        &["card-s:inv-1", "card-t:inv-9"],
+        false,
+    ));
+    assert_eq!(other.kind, RefusalKind::OtherCard);
+    assert_eq!(other.message, "1 of the requests were made by another card");
+    assert_eq!(other.requests.len(), 1);
+    assert_eq!(other.requests[0].card_id.as_deref(), Some("card-t"));
+    assert_eq!(other.requests[0].charged_micro_credits, Some(2_000_000));
+
+    let over = refusal(adjust(
+        4_500_000,
+        "k-3",
+        &["card-s:inv-1", "card-s:inv-2"],
+        false,
+    ));
+    assert_eq!(over.kind, RefusalKind::Over);
+    assert_eq!(
+        over.message,
+        "A compensation of 4.5 credits is more than the 4 credits these 2 requests were \
+         charged; send allowRepeat with a reason to compensate more"
+    );
+    assert_eq!(
+        (over.asked_micro_credits, over.charged_total_micro_credits),
+        (Some(4_500_000), Some(4_000_000))
+    );
+    assert_eq!(over.requests.len(), 2);
+    assert_eq!(engine.get_card("card-s").unwrap().credit_total, 100_000_000);
+
+    // Each once: a request named twice counts once.
+    adjust(
+        4_000_000,
+        "k-4",
+        &["card-s:inv-1", "card-s:inv-2", "card-s:inv-1"],
+        false,
+    )
+    .unwrap();
+    let history = history_of(&engine, "card-s", "adjust");
+    assert_eq!(history[0].invocation_id, None);
+    assert_eq!(
+        history[0].detail,
+        Some(serde_json::json!({
+            "invocationIds": ["card-s:inv-1", "card-s:inv-2"],
+            "kind": "compensation",
+            "chargedMicroCredits": [1_000_000, 3_000_000],
+        }))
+    );
+    // Each request is marked with its share, in proportion to its charge.
+    let marks = engine.request_compensations([
+        ("card-s", "card-s:inv-1"),
+        ("card-s", "card-s:inv-2"),
+        ("card-s", "card-s:inv-3"),
+    ]);
+    assert_eq!(
+        marks[0].as_ref().map(|c| c.total_micro_credits),
+        Some(1_000_000)
+    );
+    assert_eq!(
+        marks[1]
+            .as_ref()
+            .map(|c| (c.total_micro_credits, c.latest.at_secs)),
+        Some((3_000_000, 1_700_000_100))
+    );
+    assert!(marks[2].is_none());
+
+    // Asked again, with one request not yet compensated among them.
+    let repeat = refusal(adjust(
+        1_000_000,
+        "k-5",
+        &["card-s:inv-2", "card-s:inv-3", "card-s:inv-1"],
+        false,
+    ));
+    assert_eq!(repeat.kind, RefusalKind::Repeat);
+    assert_eq!(
+        repeat.message,
+        "2 of the requests were already compensated; send allowRepeat with a reason to \
+         compensate them again"
+    );
+    let earlier = &repeat.requests[0];
+    assert_eq!(earlier.invocation_id, "card-s:inv-2");
+    assert_eq!(earlier.compensated_micro_credits, Some(3_000_000));
+    assert_eq!(earlier.compensated_at_secs, Some(1_700_000_100));
+    assert_eq!(earlier.operator.as_deref(), Some("admin"));
+    assert_eq!(earlier.reason.as_deref(), Some("补偿中断"));
+    assert_eq!(earlier.charged_micro_credits, Some(3_000_000));
+    // The same one alone reads as it always did, with its own share.
+    let alone = refusal(adjust(1_000_000, "k-6", &["card-s:inv-1"], false));
+    assert_eq!(
+        alone.message,
+        "Request card-s:inv-1 was charged 1 credits at 1970-01-01T00:17:30Z, and was already \
+         compensated 1 credits at 2023-11-14T22:15:00Z by admin (补偿中断); send allowRepeat \
+         with a reason to compensate it again"
+    );
+    // Allowed, it is paid, and the marks add up.
+    adjust(1_000_000, "k-7", &["card-s:inv-1", "card-s:inv-2"], true).unwrap();
+    let marks =
+        engine.request_compensations([("card-s", "card-s:inv-1"), ("card-s", "card-s:inv-2")]);
+    assert_eq!(
+        marks[0].as_ref().map(|c| c.total_micro_credits),
+        Some(1_250_000)
+    );
+    assert_eq!(
+        marks[1].as_ref().map(|c| c.total_micro_credits),
+        Some(3_750_000)
+    );
+    // A retry of an adjustment naming several is the same adjustment, in any order.
+    adjust(4_000_000, "k-4", &["card-s:inv-2", "card-s:inv-1"], false).unwrap();
+    assert!(matches!(
+        adjust(4_000_000, "k-4", &["card-s:inv-2"], false),
+        Err(BillingError::InvalidAdjustment(message)) if message.starts_with("Idempotency conflict")
+    ));
+    assert_eq!(engine.get_card("card-s").unwrap().credit_total, 105_000_000);
+
+    // The marks are rebuilt from the ledger when the state loads.
+    let restored = BillingEngine::new();
+    restored.import_snapshot(engine.export_snapshot());
+    assert_eq!(
+        restored.request_compensations([("card-s", "card-s:inv-1"), ("card-s", "card-s:inv-2")]),
+        engine.request_compensations([("card-s", "card-s:inv-1"), ("card-s", "card-s:inv-2")])
+    );
+    let again = restored.adjust_card_balance(BalanceAdjustment {
+        card_id: "card-s",
+        delta_micro_credits: 1_000_000,
+        operator_id: "admin",
+        reason: "补偿中断",
+        now_secs: 1_700_000_200,
+        idempotency_key: Some("k-8"),
+        requests: &["card-s:inv-2"],
+        allow_repeat: false,
+        kind: None,
+        cash_micro_cny: None,
+    });
+    assert!(
+        matches!(again, Err(BillingError::Compensation(refusal)) if refusal.kind == RefusalKind::Repeat)
+    );
+}
+
+/// A balance adjustment records its kind, the one its sign and requests give when unsaid,
+/// and the money that went with it: a refund says what was returned, a compensation or a
+/// gift has none. The financials and the ledger export count them by kind.
+#[test]
+fn an_adjustment_records_its_kind_and_the_money_with_it() {
+    use billing::{AdjustmentKind, BalanceAdjustment};
+    let engine = BillingEngine::new();
+    engine.upsert_card(create_test_card("card-k", 1, 5, 0));
+    charged_request(&engine, "card-k", "card-k:inv-1", 2_000_000);
+    let adjust = |credits: i64,
+                  key: &str,
+                  requests: &[&str],
+                  kind: Option<AdjustmentKind>,
+                  cash: Option<i64>| {
+        engine.adjust_card_balance(BalanceAdjustment {
+            card_id: "card-k",
+            delta_micro_credits: credits,
+            operator_id: "admin",
+            reason: "客服处理",
+            now_secs: 1_700_000_100,
+            idempotency_key: Some(key),
+            requests,
+            allow_repeat: false,
+            kind,
+            cash_micro_cny: cash,
+        })
+    };
+    let refused = |result: Result<billing::LedgerEntry, BillingError>| match result {
+        Err(BillingError::InvalidAdjustment(message)) => message,
+        other => panic!("not refused: {other:?}"),
+    };
+    adjust(1_000_000, "k-comp", &["card-k:inv-1"], None, None).unwrap();
+    adjust(1_000_000, "k-gift", &[], None, None).unwrap();
+    adjust(-1_000_000, "k-corr", &[], None, None).unwrap();
+    let kinds: Vec<serde_json::Value> = history_of(&engine, "card-k", "adjust")
+        .iter()
+        .map(|event| event.detail.as_ref().unwrap()["kind"].clone())
+        .collect();
+    assert_eq!(kinds, ["correction", "gift", "compensation"]);
+
+    assert_eq!(
+        refused(adjust(
+            -1_000_000,
+            "k-r0",
+            &[],
+            Some(AdjustmentKind::Refund),
+            None
+        )),
+        "A refund needs cashMicroCny, the money returned to the customer"
+    );
+    for kind in [Some(AdjustmentKind::Gift), None] {
+        assert_eq!(
+            refused(adjust(1_000_000, "k-g", &[], kind, Some(5))),
+            "cashMicroCny is refused for a compensation or a gift"
+        );
+    }
+    assert_eq!(
+        refused(adjust(
+            -1_000_000,
+            "k-r1",
+            &[],
+            Some(AdjustmentKind::Refund),
+            Some(-1)
+        )),
+        "cashMicroCny must be 0-100000000000 micro-CNY"
+    );
+    adjust(
+        -5_000_000,
+        "k-refund",
+        &[],
+        Some(AdjustmentKind::Refund),
+        Some(15_000_000),
+    )
+    .unwrap();
+    adjust(
+        3_000_000,
+        "k-corr2",
+        &[],
+        Some(AdjustmentKind::Correction),
+        Some(9_000_000),
+    )
+    .unwrap();
+    let refund = &history_of(&engine, "card-k", "adjust")[1];
+    assert_eq!(
+        refund.detail,
+        Some(serde_json::json!({ "kind": "refund", "cashMicroCny": 15_000_000 }))
+    );
+    // A retry is the same adjustment only with the same kind and money.
+    assert!(refused(adjust(
+        -5_000_000,
+        "k-refund",
+        &[],
+        Some(AdjustmentKind::Correction),
+        Some(15_000_000)
+    ))
+    .starts_with("Idempotency conflict"));
+    adjust(
+        -5_000_000,
+        "k-refund",
+        &[],
+        Some(AdjustmentKind::Refund),
+        Some(15_000_000),
+    )
+    .unwrap();
+    assert_eq!(engine.get_card("card-k").unwrap().credit_total, 105_000_000);
+
+    let entries = engine.ledger_entries();
+    let totals = billing::observability::compute_adjustments(entries.iter());
+    let by_kind = &totals.by_kind;
+    assert_eq!(
+        (
+            by_kind.compensation.count,
+            by_kind.compensation.positive_micro_credits
+        ),
+        (1, 1_000_000)
+    );
+    assert_eq!(
+        (by_kind.gift.count, by_kind.gift.positive_micro_credits),
+        (1, 1_000_000)
+    );
+    assert_eq!(
+        (
+            by_kind.refund.count,
+            by_kind.refund.negative_micro_credits,
+            by_kind.refund.cash_micro_cny
+        ),
+        (1, -5_000_000, 15_000_000)
+    );
+    assert_eq!(
+        (
+            by_kind.correction.count,
+            by_kind.correction.positive_micro_credits,
+            by_kind.correction.negative_micro_credits,
+            by_kind.correction.cash_micro_cny
+        ),
+        (2, 3_000_000, -1_000_000, 9_000_000)
+    );
+    assert_eq!(totals.count, 5);
+    let cash = billing::observability::compute_cash(&Default::default(), entries.iter());
+    assert_eq!(
+        (cash.refunds_micro_cny, cash.net_micro_cny),
+        (15_000_000, -15_000_000)
+    );
+
+    // The export keeps its columns and adds each entry's kind and money.
+    let csv = engine.export_ledger_csv(Some("card-k"));
+    let mut lines = csv.lines();
+    assert!(lines.next().unwrap().ends_with(",key_id,kind,cash_cny"));
+    let refund_row = lines.find(|line| line.contains("k-refund")).unwrap();
+    assert!(refund_row.ends_with(",\"refund\",15"), "{refund_row}");
+}
+
+/// An upgrade puts a card on the plan the customer paid for, with its credits, group and
+/// days, in one history entry saying what the card had; the same plan again is a renewal.
+#[test]
+fn an_upgrade_puts_the_card_on_the_plan_it_was_paid_for() {
+    use billing::CardUpgrade;
+    let engine = BillingEngine::new();
+    let mut card = create_test_card("card-up", 1, 5, 0);
+    // Issued with PRO's credits before the plan catalog.
+    card.issued_credits = Some(1_000 * 1_000_000);
+    engine.upsert_card(card);
+    let before = engine.get_card("card-up").unwrap();
+    let upgrade = |plan: &str, credits: i64, cash: i64, days: u64, key: Option<&str>| {
+        engine.upgrade_card(CardUpgrade {
+            card_id: "card-up",
+            plan_id: plan,
+            credits_delta: credits,
+            cash_micro_cny: cash,
+            group_id: None,
+            extend_days: days,
+            operator_id: "admin",
+            reason: "升级 PRO Max",
+            now_secs: 50_000,
+            idempotency_key: key,
+        })
+    };
+    let card = upgrade("tier-5000", 4_000_000_000, 75_000_000, 30, Some("up-1")).unwrap();
+    assert_eq!(card.plan_id(), Some("tier-5000"));
+    assert_eq!(card.plan_name(), Some("PRO Max"));
+    assert_eq!(card.plan.as_ref().unwrap().paid_micro_cny, Some(75_000_000));
+    assert_eq!(card.credit_total, before.credit_total + 4_000_000_000);
+    // Into the plan's default group; its sessions end with the move.
+    assert_eq!(card.group_id, "group-pro-plus");
+    assert_eq!(card.token_version, before.token_version + 1);
+    assert_eq!(card.valid_until, Some(87_400 + 30 * 86_400));
+    let events = history_of(&engine, "card-up", "upgrade");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].credits, 4_000_000_000);
+    assert_eq!(events[0].operator.as_deref(), Some("admin"));
+    let detail = events[0].detail.clone().unwrap();
+    for (field, value) in [
+        ("planId", serde_json::json!("tier-5000")),
+        ("previousPlanId", serde_json::json!("tier-1000")),
+        ("previousPlanName", serde_json::json!("PRO")),
+        ("previousPlan", serde_json::Value::Null),
+        ("renewal", serde_json::json!(false)),
+        ("groupId", serde_json::json!("group-pro-plus")),
+        ("previousGroupId", serde_json::json!("grp-1")),
+        ("creditsDelta", serde_json::json!(4_000_000_000i64)),
+        ("previousCreditTotal", serde_json::json!(100_000_000)),
+        ("creditTotal", serde_json::json!(4_100_000_000i64)),
+        ("cashMicroCny", serde_json::json!(75_000_000)),
+        ("extendDays", serde_json::json!(30)),
+        ("previousValidUntil", serde_json::json!(87_400)),
+        ("validUntil", serde_json::json!(87_400 + 30 * 86_400)),
+    ] {
+        assert_eq!(detail[field], value, "{field}");
+    }
+    assert_eq!(detail["plan"]["paidMicroCny"], 75_000_000);
+    // Sent again under its key, it is the same upgrade; the key cannot name another.
+    upgrade("tier-5000", 4_000_000_000, 75_000_000, 30, Some("up-1")).unwrap();
+    assert!(matches!(
+        upgrade("tier-5000", 4_000_000_000, 80_000_000, 30, Some("up-1")),
+        Err(BillingError::InvalidAdjustment(message)) if message.starts_with("Idempotency conflict")
+    ));
+    assert_eq!(history_of(&engine, "card-up", "upgrade").len(), 1);
+
+    // The same plan again is a renewal, and records the plan it replaced.
+    upgrade("tier-5000", 5_000_000_000, 130_000_000, 0, None).unwrap();
+    let renewal = history_of(&engine, "card-up", "upgrade")[0]
+        .detail
+        .clone()
+        .unwrap();
+    assert_eq!(renewal["renewal"], true);
+    assert_eq!(renewal["previousPlan"]["id"], "tier-5000");
+    assert_eq!(renewal["previousPlan"]["paidMicroCny"], 75_000_000);
+    assert!(
+        engine
+            .reconcile_card_balance("card-up", 100_000_000)
+            .unwrap()
+            .is_balanced
+    );
+    // Upgrades are sales, not adjustments.
+    let entries = engine.ledger_entries();
+    assert_eq!(
+        billing::observability::compute_adjustments(entries.iter()).count,
+        0
+    );
+    let cash = billing::observability::compute_cash(&Default::default(), entries.iter());
+    assert_eq!(cash.upgrades_micro_cny, 205_000_000);
+
+    let refused = |result: Result<Card, BillingError>| match result {
+        Err(BillingError::InvalidState(message)) => message,
+        other => panic!("not refused: {other:?}"),
+    };
+    assert_eq!(
+        refused(upgrade("nope", 0, 0, 0, None)),
+        "Unknown plan: nope"
+    );
+    let mut closed = billing::Group::pro_plus("group-closed", "Closed");
+    closed.issuance_enabled = false;
+    engine.upsert_group(closed);
+    assert_eq!(
+        refused(engine.upgrade_card(CardUpgrade {
+            card_id: "card-up",
+            plan_id: "tier-5000",
+            credits_delta: 0,
+            cash_micro_cny: 0,
+            group_id: Some("group-closed"),
+            extend_days: 0,
+            operator_id: "admin",
+            reason: "换组",
+            now_secs: 50_000,
+            idempotency_key: None,
+        })),
+        "Group does not take cards: group-closed"
+    );
+    let mut forever = create_test_card("card-forever", 1, 5, 0);
+    forever.valid_until = None;
+    engine.upsert_card(forever);
+    let mut voided = create_test_card("card-void", 1, 5, 0);
+    voided.status = CardStatus::Voided;
+    engine.upsert_card(voided);
+    for (card, message) in [
+        (
+            "card-forever",
+            "Cards that never expire cannot be extended: card-forever",
+        ),
+        ("card-void", "Voided cards cannot be upgraded: card-void"),
+    ] {
+        assert_eq!(
+            refused(engine.upgrade_card(CardUpgrade {
+                card_id: card,
+                plan_id: "tier-5000",
+                credits_delta: 0,
+                cash_micro_cny: 0,
+                group_id: None,
+                extend_days: 1,
+                operator_id: "admin",
+                reason: "续费",
+                now_secs: 50_000,
+                idempotency_key: None,
+            })),
+            message
+        );
+    }
+}

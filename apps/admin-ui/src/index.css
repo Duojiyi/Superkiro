@@ -202,7 +202,9 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .route-cost-form .field {width: 96px;}
 .route-cost-form input, .route-cost-form select {width: 100%; min-height: 30px;}
 /* 切换线路 and its 切回 */
-.drawer.switch-drawer {width: min(980px, 100vw);}
+/* Wide drawers leave the navigation and a strip of the page in view. */
+.drawer.switch-drawer {width: min(960px, calc(100vw - 240px));}
+@media (max-width: 700px) {.drawer.switch-drawer {width: 100vw;}}
 .switch-preview td {white-space: normal; vertical-align: top;}
 .switch-preview .tag {height: auto; min-height: 20px; white-space: normal;}
 .switch-preview input {width: 100%; min-width: 150px;}
@@ -398,8 +400,76 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .drawer-foot {display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 10px 16px; border-top: 1px solid var(--border-subtle); background: var(--bg-surface);}
 .drawer-foot-id {margin-left: auto; font-family: var(--mono); font-size: 12px;}
 .device-list {display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 10px;}
+.device-item {display: inline-flex; align-items: center; gap: 6px;}
+/* The device allowance under the devices: 已换绑 2/5 次 · 冷却剩 5 小时 [重置换绑次数]. */
+.detail-list dd.device-block {flex-direction: column; align-items: flex-start; gap: 4px;}
+.rebind-line {display: inline-flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; font-size: 12px;}
+.note-editor {display: flex; flex-wrap: wrap; align-items: center; gap: 6px; width: 100%;}
+.note-editor input {flex: 1 1 200px; min-width: 0; height: 32px; padding: 0 8px; border: 1px solid var(--border); border-radius: 6px;}
+.note-editor .field-error {flex-basis: 100%;}
 .history-table td.num.is-negative {color: var(--danger);}
+.section-tools {display: inline-flex; align-items: center; flex-wrap: wrap; gap: 8px;}
+/* 余额不够开始 claude-opus-5（约需 20 积分）: the customer's last balance refusal, under the balance. */
+.balance-short {flex-basis: 100%; font-size: 12px; color: var(--warning);}
+/* What a refusal for the card's own limits means, under the reason in a request's details. */
+.refusal-note {flex-basis: 100%; font-size: 12px; color: var(--text-2);}
+.recent-table .col-check, .recent-table th.col-check {width: 28px; padding-right: 0;}
+/* An adjustment that made up for a request links back to it. */
+.history-link {display: block; height: auto; padding: 0; font-size: 12px;}
+/* What a change recorded (the device, the new expiry, the groups), under its action. */
+.history-detail {display: block; font-size: 12px; color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 220px;}
 .reason-chips {margin-top: 8px;}
+/* 调用追踪: a chosen time range, the failures by model and provider, and the totals of what is shown. */
+.span-fields {display: inline-flex; align-items: center; gap: 6px;}
+.span-fields input {min-height: 30px; height: 30px; padding: 0 8px; font-size: 13px;}
+.failure-breakdown {display: flex; flex-wrap: wrap; align-items: center; gap: 8px 20px; margin-top: 8px;}
+.chips-label {align-self: center; font-size: 12px; color: var(--text-3);}
+.chip.is-static {border-style: dashed;}
+/* 公告: the notice as the customer's client shows it (desktop-ui Announcements.css), its window and audience. */
+.client-notice {box-sizing: border-box; display: flex; flex-direction: column; gap: 12px; width: min(480px, 100%); height: 540px; padding: 20px; border: 1px solid #676456; border-radius: 18px;
+  color: #eeeae0; background: linear-gradient(145deg, #30332d, #1c2320 65%); box-shadow: inset 0 1px #e3d4ae20, 0 12px 40px #0004; overflow: hidden;}
+.client-notice.is-compact {height: auto; max-height: 360px; margin: 4px 0;}
+.client-notice-heading, .client-notice-pagination {display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-shrink: 0; min-width: 0;}
+.client-notice-title {font-size: 20px; font-weight: 600; color: #e1cfaa;}
+.client-notice-button {font: inherit; font-size: 12px; line-height: 1.4; min-height: 32px; padding: 6px 10px; border: 1px solid #676456; border-radius: 8px; color: #eeeae0; background: #33382f; flex-shrink: 0; display: inline-flex; align-items: center;}
+button.client-notice-button {cursor: pointer;}
+button.client-notice-button:disabled {opacity: .4; cursor: default;}
+.client-notice-meta, .client-notice-pagination span {font-size: 12px; color: #b8b9a9; flex-shrink: 0;}
+.client-notice-viewport {position: relative; flex: 1; min-height: 0; min-width: 0; overflow: hidden;}
+.client-notice.is-compact .client-notice-viewport {flex: none; max-height: 240px; overflow: auto;}
+.client-notice-text {box-sizing: border-box; width: 100%; margin: 0; padding: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 14px/1.8 system-ui, sans-serif; tab-size: 4;}
+.client-notice-text.placeholder {color: #8f9185;}
+.client-notice-measure {position: absolute; top: 0; left: 0; visibility: hidden; pointer-events: none;}
+.audience-groups {display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 4px 0 0; padding: 8px 10px; border: 1px solid var(--border-subtle); border-radius: 6px;}
+.audience-note {line-height: 1.6;}
+.notices-head {justify-content: flex-end; margin-bottom: 4px;}
+.notices-table .col-audience {max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;}
+.notice-edits {margin: 8px 0 0; padding-left: 18px; font-size: 12px; color: var(--text-2);}
+.notice-legacy {margin: 0; font-size: 12px;}
+.notice-editor {width: 640px;}
+.confirm-dialog .client-notice {width: 100%;}
+/* 套餐: the catalog, its editor, and what issuance says the customer sees. */
+.plans-table td {vertical-align: middle;}
+.plans-table .mono {font-size: 12px;}
+.plan-tag {margin-left: 6px;}
+.plans-note {margin: 10px 0 0; font-size: 12px;}
+.plan-editor {width: 640px;}
+.plan-editor .form-grid {grid-template-columns: repeat(2, minmax(0, 1fr));}
+.plan-sale {grid-column: 1 / -1;}
+.plan-preview, .batch-customer {margin: 0; padding: 8px 12px; border-radius: 6px; background: var(--info-bg); color: #0a4a8a; font-size: 13px;}
+.batch-mismatch {margin: 0;}
+.card-plan .muted {font-size: 12px;}
+@media (max-width: 640px) {.plan-editor .form-grid {grid-template-columns: minmax(0, 1fr);}}
+/* 存储与账本: a save that failed stops every change and request; otherwise when it last saved. */
+.storage-failure {margin: 0 0 12px; padding: 10px 14px; border: 1px solid #f5b5b0; border-radius: 6px; background: var(--danger-bg); color: #a40e26; font-size: 13px;}
+.storage-failure p {margin: 0;}
+.storage-failure p + p {margin-top: 4px;}
+.storage-saved {display: flex; flex-wrap: wrap; gap: 4px 10px; margin: 0 0 8px; font-size: 13px;}
+.storage-saved .is-ok {color: var(--success); font-weight: 500;}
+.traces-totals {display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 18px; padding: 10px 16px; border-top: 1px solid var(--border-subtle); font-size: 13px; color: var(--text-2);}
+.traces-totals b {color: var(--text-1); font-weight: 600; font-variant-numeric: tabular-nums;}
+.traces-totals b.is-danger {color: var(--danger);}
+.totals-label {font-weight: 600; color: var(--text-1);}
 .range-line {margin: 0 0 -4px; font-size: 12px; color: var(--text-3);}
 .bulk-report.is-skipped {border-color: #e9c46a; background: var(--warning-bg); color: #7a4d00;}
 .bulk-report .report-skipped {color: #7a4d00;}
@@ -431,6 +501,8 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .modal-actions {display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; margin-top: 4px;}
 .dialog-narrow {width: 480px;}
 .dialog-form {width: 520px;}
+/* A choice of a few (延长多久) keeps its own width in a dialog. */
+.modal > .segmented {align-self: flex-start;}
 .dialog-wide {width: 720px;}
 .confirm-dialog {width: 460px;}
 .confirm-facts {display: flex; flex-direction: column; gap: 4px; margin: 0; padding: 10px 12px; border-radius: 6px; background: var(--bg-muted); font-size: 13px; color: var(--text-1);}
@@ -438,6 +510,7 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .confirm-consequence.is-danger {color: var(--danger); font-weight: 500;}
 .confirm-option {align-items: flex-start; font-weight: 500;}
 .confirm-option input {margin-top: 2px; flex-shrink: 0;}
+.confirm-hint {margin: 0; font-size: 13px; color: var(--text-2);}
 .secret-block {width: 100%; min-height: 64px; padding: 12px; border-radius: 6px; background: var(--bg-muted); font-family: var(--mono); font-size: 16px; line-height: 24px; letter-spacing: .3px; resize: none;}
 .batch-summary {margin: 0; padding: 10px 12px; border-radius: 6px; background: var(--bg-muted); font-size: 13px; color: var(--text-1);}
 .adjust-balance {margin: 0; color: var(--text-2);}
@@ -493,6 +566,21 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .page-stack.has-drawer {padding-right: 0;}
 /* With the drawer open, speed and tokens give way so the result column stays readable. */
 .has-drawer .traces-table .col-speed, .has-drawer .traces-table .col-tokens {display: none;}
+/* From 1280px the request drawer takes its own column: the list moves aside instead of lying under
+   it (the page is centred up to 1760px, hence the correction past 2008px), and up to 1760px the
+   numbers after 结果 give way too. */
+@media (min-width: 1280px) {
+  :root {--trace-drawer: min(620px, calc(100vw - 800px));}
+  #trace-detail.drawer {width: var(--trace-drawer);}
+  .page-stack.has-drawer {padding-right: max(0px, calc(var(--trace-drawer) - 8px - max(0px, (100vw - 2008px) / 2)));}
+}
+@media (min-width: 1280px) and (max-width: 1760px) {
+  .has-drawer .traces-table .col-ttft, .has-drawer .traces-table .col-latency, .has-drawer .traces-table .col-charge, .has-drawer .traces-table .col-actions {display: none;}
+  .has-drawer .traces-table .clip-model {max-width: 140px;}
+  .has-drawer .traces-table .result-reason {display: inline-block; max-width: 96px; overflow: hidden; text-overflow: ellipsis; vertical-align: middle;}
+}
+#trace-detail.drawer {container-type: inline-size;}
+@container (max-width: 560px) {#trace-detail .metric-strip {grid-template-columns: repeat(3, minmax(0, 1fr));}}
 .history-block > summary {cursor: pointer; color: var(--brand); font-size: 13px; padding: 4px 0;}
 .history-block[open] > summary {margin-bottom: 8px;}
 
@@ -529,6 +617,9 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .kpi-value.is-warning {color: var(--warning);}
 .kpi-value.is-danger {color: var(--danger);}
 .kpi-sub {font-size: 12px; color: var(--text-2);}
+/* 17,201 / 18,400: the total is smaller and may take the next line rather than be cut off. */
+.kpi-value.kpi-fraction {display: flex; flex-wrap: wrap; align-items: baseline; column-gap: 6px; white-space: normal; overflow: visible;}
+.kpi-of {font-size: 16px; line-height: 1; font-weight: 500; color: var(--text-2); white-space: nowrap;}
 .kpi-sub .link {font-size: 12px;}
 .overview-grid {display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 16px;}
 .request-chart {display: flex; align-items: stretch; gap: 4px; height: 200px; padding-top: 8px;}
@@ -551,6 +642,10 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .attention-item.is-warning::before {background: #d4a72c;}
 .attention-item.is-info::before {background: var(--info);}
 .attention-item > span {margin-left: auto; color: var(--text-3);}
+/* An item about more than one place (a model and the Key to fix): its words, and a link to each. */
+div.attention-item:hover {background: transparent;}
+.attention-item > .attention-text {flex: 1; min-width: 0; margin-left: 0; color: inherit;}
+.attention-links {display: inline-flex; flex-wrap: wrap; justify-content: flex-end; gap: 2px; flex-shrink: 0;}
 .all-good {display: flex; align-items: center; gap: 8px; margin: 0; color: var(--success); font-weight: 500;}
 .key-summary {display: inline-flex; align-items: center; flex-wrap: nowrap;}
 
@@ -561,12 +656,36 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .provider-name h3 {margin: 0; font-size: 15px;}
 .provider-name .mono {font-size: 12px; overflow-wrap: anywhere;}
 .provider-foot {display: flex; justify-content: flex-start;}
+.provider-tools {display: inline-flex; align-items: center; gap: 8px;}
+/* What a link (运营概览's 需要关注) points to, marked until the operator turns to something else. */
+.provider-card.is-pointed {border-color: #d4a72c; box-shadow: 0 0 0 1px #d4a72c;}
+/* 近 24 小时 尝试 120 · 失败 7（5.8%）· 被备用接管 5 · HTTP 529 × 5: every attempt sent to the provider. */
+.provider-attempts {margin: -2px 0 0; font-size: 13px;}
+.keys-table .col-key-traffic {white-space: nowrap;}
+.health-table .col-kinds .clip-reason {max-width: 200px;}
+@media (max-width: 1440px) {.health-table .col-kinds .clip-reason {max-width: 150px;}}
+.panel-period {margin-left: 6px; font-size: 13px; font-weight: 400; color: var(--text-2);}
+/* 运营概览: today's revenue, cost and margin under the requests chart. */
+.today-money {display: flex; align-items: flex-end; flex-wrap: wrap; gap: 12px 28px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border-subtle);}
+.today-money > div {display: flex; flex-direction: column; gap: 2px;}
+.today-label {display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--text-2);}
+.today-money b {font-size: 18px; line-height: 24px; font-variant-numeric: tabular-nums;}
+.today-money small {font-size: 12px;}
+.today-money .btn-text {margin-left: auto;}
+/* 财务对账: the period picker, and the dates of a chosen one. */
+.period-bar {display: flex; align-items: center; flex-wrap: wrap; gap: 8px 16px;}
+.period-dates {display: inline-flex; align-items: center; gap: 6px;}
+.period-dates input {height: 32px; padding: 0 8px; border: 1px solid var(--border); border-radius: 6px;}
+.provider-costs tfoot td {font-weight: 600; border-top: 1px solid var(--border);}
+.sales-line {margin: 0 0 8px; display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 6px;}
+.table tr.is-pointed td {background: var(--warning-bg);}
+.table tr.is-pointed td:first-child {box-shadow: inset 3px 0 0 #d4a72c;}
 .keys-table {min-width: 720px; table-layout: fixed;}
 /* The same column widths in every provider's card, so the tables line up. */
 .keys-table .col-key {width: 260px; overflow: hidden; text-overflow: ellipsis;}
 .keys-table .col-weight {width: 72px;}
 .keys-table .col-status {width: 140px;}
-.keys-table .col-actions {width: 112px;}
+.keys-table .col-actions {width: 128px;}
 .model-tags {display: inline-flex; align-items: center; flex-wrap: wrap; gap: 4px;}
 .switch {display: inline-flex; align-items: center; gap: 8px; height: 28px; font-size: 13px; color: var(--text-2);}
 .switch-track {position: relative; width: 36px; height: 20px; border-radius: 10px; background: #c3cad3; transition: background .15s;}
@@ -639,7 +758,20 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .checklist li.is-warning {color: #6c4a00;}
 .checklist li.is-warning svg {color: #d4a72c;}
 .checklist li.is-unknown svg {color: var(--text-3);}
+.checklist li.is-neutral {color: var(--text-2);}
+.checklist li.is-neutral svg {color: var(--text-3);}
 .session-line {margin: 0 0 12px;}
+/* 存储与账本: the saved state against its ceiling, the two archive levels marked on the meter. */
+.storage-line {display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 8px; margin: 0 0 10px;}
+.storage-line b {font-size: 20px; line-height: 28px; font-variant-numeric: tabular-nums;}
+.storage-meter {position: relative; height: 8px; border-radius: 4px; background: var(--neutral-bg);}
+.storage-meter > span {display: block; max-width: 100%; height: 100%; border-radius: 4px; background: #8c959f;}
+.storage-meter > span.is-soon {background: #d4a72c;}
+.storage-meter > span.is-now {background: var(--danger);}
+.storage-meter > i {position: absolute; top: -3px; bottom: -3px; width: 2px; margin-left: -1px; background: var(--text-3);}
+.storage-note {margin: 8px 0 0; font-size: 12px;}
+.storage-archive {display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; margin-top: 12px;}
+.storage-receipt {margin: 12px 0 0; overflow-wrap: anywhere;}
 
 /* ---------- Login ---------- */
 .auth-page {min-height: 100dvh; display: grid; place-items: center; padding: 24px; background: var(--bg-page); color: var(--text-1);}
@@ -682,7 +814,18 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
   .modal {padding: 16px;}
   .keys-table {min-width: 520px;}
   .kpi-row {grid-template-columns: repeat(2, minmax(0, 1fr));}
+  /* Two to a row on a phone: amounts in the hundreds of thousands still fit. */
+  .kpi-value {font-size: 24px; line-height: 32px;}
   /* Phones: card, balance, status and actions; the rest is one tap away in the card's details. */
   .cards-table .col-note, .cards-table .col-group, .cards-table .col-device {display: none;}
 }
 @media (prefers-reduced-motion: reduce) {* {transition: none !important; animation: none !important; scroll-behavior: auto !important;}}
+
+/* ---------- Support, money and records (cards, 调用追踪, finance, notices) ---------- */
+/* A card's drawer: what cannot be undone, apart at its end. */
+.danger-zone {padding-top: 12px; border-top: 1px solid var(--border-subtle);}
+.danger-zone h4 {color: var(--danger);}
+.danger-actions {display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px;}
+.danger-actions .muted {font-size: 12px; line-height: 18px;}
+.quota-grid {grid-template-columns: repeat(3, minmax(0, 1fr));}
+@media (max-width: 640px) {.quota-grid {grid-template-columns: minmax(0, 1fr);}}

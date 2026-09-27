@@ -120,4 +120,76 @@ pub struct LedgerEntry {
     pub operator_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// CNY per credit in the settings a usage entry's request was reserved at: what its credits
+    /// were earned at. None on other entries, and on usage settled before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credit_face_value_cny: Option<f64>,
+    /// What a card event records besides who and why, as a JSON object: the device unbound,
+    /// the new expiry, the groups, the request an adjustment makes up for. Releases before
+    /// this field kept it as JSON in `target_model`; older ones ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<serde_json::Value>,
+}
+
+impl LedgerEntry {
+    /// What a card event records besides who and why, wherever it was kept: in `detail`, or
+    /// by releases before it as a JSON object in `target_model`, where a usage entry names
+    /// its upstream model.
+    pub fn event_detail(&self) -> Option<serde_json::Value> {
+        self.detail.clone().or_else(|| {
+            if self.target_model == self.exposed_model {
+                return None;
+            }
+            serde_json::from_str(&self.target_model)
+                .ok()
+                .filter(serde_json::Value::is_object)
+        })
+    }
+
+    /// Whether a usage entry's cost is what the route that served it bills: settlement took
+    /// it from official prices or from a price version for that route, and says so in
+    /// `reason`. An estimate is not known; neither is an entry from before costs were
+    /// labelled unless a price version charged it.
+    pub fn cost_is_known(&self) -> bool {
+        match self.cost_source() {
+            Some(source) => {
+                source.starts_with("official=") || source.starts_with("rate_card_version=")
+            }
+            None => self.rate_card_version.is_some(),
+        }
+    }
+
+    /// Whether settlement estimated a usage entry's cost for want of the serving route's
+    /// own, as `provider_cost:estimated_missing_target_rate`.
+    pub fn cost_is_estimated(&self) -> bool {
+        self.cost_source().is_some() && !self.cost_is_known()
+    }
+
+    /// Where settlement took a usage entry's cost from, after `provider_cost:` in `reason`.
+    fn cost_source(&self) -> Option<&str> {
+        (self.kind == LedgerKind::Usage)
+            .then(|| self.reason.as_deref()?.strip_prefix("provider_cost:"))
+            .flatten()
+    }
+}
+
+/// Micro-credits added up by the face value (CNY per credit) they were earned at.
+#[derive(Debug, Default)]
+pub(crate) struct EarnedCredits(Vec<(f64, i64)>);
+
+impl EarnedCredits {
+    pub(crate) fn add(&mut self, face_value_cny: f64, micro_credits: i64) {
+        match self.0.iter_mut().find(|(face, _)| *face == face_value_cny) {
+            Some((_, total)) => *total = total.saturating_add(micro_credits),
+            None => self.0.push((face_value_cny, micro_credits)),
+        }
+    }
+
+    /// Micro-credits × CNY per credit = micro-CNY, each total at its own face value. While the
+    /// face value never changes there is one total, priced as the whole ledger always was.
+    pub(crate) fn revenue_micro_cny(&self) -> i64 {
+        self.0.iter().fold(0i64, |sum, (face, credits)| {
+            sum.saturating_add((*credits as f64 * face).round() as i64)
+        })
+    }
 }

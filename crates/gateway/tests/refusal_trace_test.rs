@@ -2,7 +2,7 @@
 //! Such refusals left no trace, so the console could not tell a customer's failed requests
 //! from ones never made. A retired model is never listed, and a request for it is refused as
 //! for a model its group does not list. A fallback target may be disabled: requests pass it
-//! over.
+//! over. A primary that fails over to its backup counts as a failure taken over.
 
 use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
@@ -45,6 +45,7 @@ fn price(model: &str) -> RateCardVersion {
         per_call_credit: 0,
         margin_multiplier: 1.0,
         effective_from_secs: 0,
+        official: None,
     }
 }
 
@@ -165,6 +166,16 @@ type Refusal = (
     &'static str,
     &'static str,
     fn(&mut Value),
+    StatusCode,
+    &'static str,
+    &'static str,
+);
+
+/// A request refused by a limit of the card: its invocation, how the card is limited, and
+/// the status and error code it is refused with and the error class its trace records.
+type LimitRefusal = (
+    &'static str,
+    fn(&mut Card),
     StatusCode,
     &'static str,
     &'static str,
@@ -320,7 +331,7 @@ async fn each_refusal_before_routing_is_traced_and_charged_nothing() {
             "inv-offline",
             "offline-model",
             plain,
-            StatusCode::BAD_GATEWAY,
+            StatusCode::BAD_REQUEST,
             "no_route",
             "offline-model",
         ),
@@ -345,8 +356,12 @@ async fn each_refusal_before_routing_is_traced_and_charged_nothing() {
     assert_eq!(bodies["inv-alias"], bodies["inv-absent"]);
 
     let traces = billing.list_traces(Some(CARD), 100);
+    // The same refusal again within a minute adds no trace: the first of its reason
+    // counts it.
+    let mut first = std::collections::HashMap::new();
     for (invocation, _, _, _, class, exposed) in cases {
-        let invocation_id = format!("{CARD}:{invocation}");
+        let (kept, kept_model) = *first.entry(class).or_insert((invocation, exposed));
+        let invocation_id = format!("{CARD}:{kept}");
         let trace: Vec<_> = traces
             .iter()
             .filter(|trace| trace.invocation_id == invocation_id)
@@ -355,7 +370,7 @@ async fn each_refusal_before_routing_is_traced_and_charged_nothing() {
         let trace = trace[0];
         assert_eq!(trace.status, billing::TraceStatus::Error, "{invocation}");
         assert_eq!(trace.error_class.as_deref(), Some(class), "{invocation}");
-        assert_eq!(trace.exposed_model, exposed, "{invocation}");
+        assert_eq!(trace.exposed_model, kept_model, "{invocation}");
         assert_eq!(trace.provider_id, None, "{invocation}");
         assert!(trace.attempt_chain.is_empty(), "{invocation}");
         assert_eq!(
@@ -368,6 +383,24 @@ async fn each_refusal_before_routing_is_traced_and_charged_nothing() {
             "{invocation}"
         );
     }
+    let mut repeated: Vec<_> = traces
+        .iter()
+        .map(|trace| (trace.invocation_id.as_str(), trace.repeats))
+        .collect();
+    repeated.sort_unstable();
+    let id = |invocation: &str| format!("{CARD}:{invocation}");
+    let (retired, reasoning, offline) = (id("inv-retired"), id("inv-reasoning"), id("inv-offline"));
+    let (invalid, unpriced, absent) = (id("inv-invalid"), id("inv-unpriced"), id("inv-absent"));
+    let mut expected = vec![
+        (retired.as_str(), 1),
+        (reasoning.as_str(), 1),
+        (offline.as_str(), 1),
+        (invalid.as_str(), 0),
+        (unpriced.as_str(), 0),
+        (absent.as_str(), 0),
+    ];
+    expected.sort_unstable();
+    assert_eq!(repeated, expected);
     // Nothing reached the upstream, nothing is held and nothing was charged.
     assert!(models_sent(&upstream).await.is_empty());
     let card = billing.get_card(CARD).unwrap();
@@ -381,6 +414,175 @@ async fn each_refusal_before_routing_is_traced_and_charged_nothing() {
     let (status, body) = turn(&app, "inv-served", Some("listed-model"), plain).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(models_sent(&upstream).await, ["up-listed"]);
+}
+
+/// A request the card's own limits refuse — its balance, its concurrency, its daily or
+/// monthly limit — leaves a trace too, with what it needed for want of balance. The
+/// customer gets the form Kiro shows in words: a balance refusal and a limit reached by
+/// settled usage are ValidationExceptions Kiro shows as written (its own limit reasons
+/// read "return tomorrow"), the card's concurrency a throttle Kiro retries.
+#[tokio::test]
+async fn refusals_for_the_cards_own_limits_are_traced_and_charged_nothing() {
+    let upstream = upstream(200).await;
+    let billing = engine(
+        vec![Provider::new(
+            "prov",
+            "Upstream",
+            ProviderFormat::OpenAi,
+            upstream.uri(),
+        )],
+        vec![ProviderKey::new("key", "prov", "sk-test")],
+        vec![ModelMap::new(
+            "map-listed",
+            GROUP,
+            "listed-model",
+            "prov",
+            "up-listed",
+        )],
+        &["listed-model"],
+    );
+    let (app, _) = serve(&billing);
+    let funded = billing.get_card(CARD).unwrap();
+    let limit = |edit: fn(&mut Card)| {
+        let mut card = funded.clone();
+        edit(&mut card);
+        billing.upsert_card(card);
+    };
+    let cases: [LimitRefusal; 4] = [
+        (
+            "inv-broke",
+            |card| card.credit_total = 10,
+            StatusCode::BAD_REQUEST,
+            "积分余额不足",
+            "insufficient_balance",
+        ),
+        (
+            "inv-busy",
+            |card| card.max_concurrency = 0,
+            StatusCode::TOO_MANY_REQUESTS,
+            "CONCURRENCY_LIMIT_EXCEEDED",
+            "concurrency_limit",
+        ),
+        (
+            "inv-daily",
+            |card| card.daily_credit_limit = Some(0),
+            StatusCode::BAD_REQUEST,
+            "今日积分用量已达上限",
+            "usage_limit",
+        ),
+        (
+            "inv-monthly",
+            |card| card.monthly_credit_limit = Some(0),
+            StatusCode::BAD_REQUEST,
+            "近 30 天积分用量已达上限",
+            "usage_limit",
+        ),
+    ];
+    // The same refusal again within a minute adds no trace: the first of its reason counts
+    // it, as the monthly limit's is counted on the daily limit's.
+    let mut first = std::collections::HashMap::new();
+    for (invocation, edit, status, code, class) in cases {
+        limit(edit);
+        let (got, body) = turn(&app, invocation, Some("listed-model"), plain).await;
+        assert_eq!(got, status, "{invocation}: {body}");
+        assert!(body.contains(code), "{invocation}: {body}");
+        let traces = billing.list_traces(Some(CARD), 100);
+        let kept = *first.entry(class).or_insert(invocation);
+        let invocation_id = format!("{CARD}:{kept}");
+        let trace: Vec<_> = traces
+            .iter()
+            .filter(|trace| trace.invocation_id == invocation_id)
+            .collect();
+        assert_eq!(trace.len(), 1, "{invocation}");
+        let trace = trace[0];
+        assert_eq!(trace.repeats, u64::from(kept != invocation), "{invocation}");
+        assert_eq!(trace.status, billing::TraceStatus::Error);
+        assert_eq!(trace.error_class.as_deref(), Some(class), "{invocation}");
+        assert_eq!(trace.exposed_model, "listed-model");
+        assert_eq!(trace.provider_id, None);
+        assert!(trace.attempt_chain.is_empty());
+        assert_eq!((trace.credits_charged, trace.input_tokens), (0, 0));
+        if class == "insufficient_balance" {
+            // What the request needed to start, and what the card had.
+            assert_eq!(trace.available_micro_credits, Some(10));
+            let needed = trace.needed_micro_credits.unwrap();
+            assert!(needed > 10, "{needed}");
+            // In credits, as the customer reads them.
+            let needed_credits = format!("{:.2}", needed as f64 / 1_000_000.0);
+            assert!(
+                body.contains(&format!("本次请求需预留 {needed_credits}"))
+                    && body.contains("当前可用 0.00"),
+                "{body}"
+            );
+        } else {
+            assert_eq!(trace.needed_micro_credits, None);
+            assert_eq!(trace.available_micro_credits, None);
+        }
+    }
+    assert!(models_sent(&upstream).await.is_empty());
+    let card = billing.get_card(CARD).unwrap();
+    assert_eq!((card.credit_reserved, card.credit_used), (0, 0));
+}
+
+/// A primary refused with 429 whose backup answers: the request succeeded, and the
+/// primary's attempt counts as a failure taken over by another provider.
+#[tokio::test]
+async fn a_primary_failing_over_to_its_backup_counts_as_taken_over() {
+    let primary = upstream(429).await;
+    let backup = upstream(200).await;
+    let billing = engine(
+        vec![
+            Provider::new("prov", "Primary", ProviderFormat::OpenAi, primary.uri()),
+            Provider::new("prov-spare", "Spare", ProviderFormat::OpenAi, backup.uri()),
+        ],
+        vec![
+            ProviderKey::new("key", "prov", "sk-primary"),
+            ProviderKey::new("key-spare", "prov-spare", "sk-spare"),
+        ],
+        vec![
+            ModelMap::new("map-chained", GROUP, "chained-model", "prov", "up-primary")
+                .with_fallback("prov-spare", "up-spare"),
+        ],
+        &["chained-model"],
+    );
+    let (app, _) = serve(&billing);
+    let (status, body) = turn(&app, "inv-taken-over", Some("chained-model"), plain).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(models_sent(&primary).await, ["up-primary"]);
+    assert_eq!(models_sent(&backup).await, ["up-spare"]);
+
+    let activity = billing.activity(gateway::now_secs());
+    // By the provider that answered, the primary does not appear at all.
+    let answered: Vec<_> = activity
+        .providers
+        .iter()
+        .map(|row| row.provider_id.as_str())
+        .collect();
+    assert_eq!(answered, ["prov-spare"]);
+    let attempts = |id: &str| {
+        let row = activity
+            .provider_attempts
+            .iter()
+            .find(|row| row.provider_id == id)
+            .unwrap();
+        (
+            row.last_1h.attempts,
+            row.last_1h.failures,
+            row.last_1h.taken_over,
+            row.last_1h.failures_by_kind.get("http_429").copied(),
+        )
+    };
+    assert_eq!(attempts("prov"), (1, 1, 1, Some(1)));
+    assert_eq!(attempts("prov-spare"), (1, 0, 0, None));
+    let key = activity
+        .key_attempts
+        .iter()
+        .find(|row| row.key_id == "key")
+        .unwrap();
+    assert_eq!((key.last_24h.failures, key.last_24h.taken_over), (1, 1));
+    let model = &activity.model_health[0];
+    assert_eq!(model.model, "chained-model");
+    assert_eq!((model.last_1h.requests, model.last_1h.failures), (1, 0));
 }
 
 #[tokio::test]
@@ -477,6 +679,8 @@ async fn a_disabled_fallback_is_passed_over() {
                 versions: vec![],
                 removed_models: vec![],
                 cancelled_versions: vec![],
+                plans: vec![],
+                removed_plans: vec![],
             },
             gateway::now_secs(),
         )

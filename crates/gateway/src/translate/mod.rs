@@ -4,10 +4,10 @@
 //! - Conversation state translation to Provider ChatRequest.
 //! - Provider stream events translation to AWS EventStream binary frames.
 //! - Tool name shortening and restoration.
-//! - Tool documentation relocation.
 //! - Image compression and resizing.
 //! - Orphan tool call / tool result pair repair.
 
+pub mod documents;
 pub mod from_provider;
 pub mod images;
 pub mod to_provider;

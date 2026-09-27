@@ -16,7 +16,7 @@ export interface ConfirmOptions {
   /** A short reason; its text is returned with the answer. Required ones must be filled in first. */
   reason?: {label: string; placeholder?: string; suggestions?: string[]; maxLength?: number; required?: boolean};
   /** A choice made together with the action (同时隐藏这些模型); whether it is ticked is returned with the answer. */
-  option?: {label: string; checked?: boolean};
+  option?: {label: string; checked?: boolean; required?: boolean};
 }
 
 export interface ConfirmAnswer {confirmed: boolean; reason: string; option: boolean}
@@ -67,7 +67,8 @@ function ConfirmDialog({options, onFinish}: {options: ConfirmOptions; onFinish: 
   const [option, setOption] = useState(options.option?.checked === true);
   const typedReady = !options.typed || typed.trim() === options.typed;
   const reasonReady = !options.reason?.required || !!reason.trim();
-  const ready = typedReady && reasonReady;
+  const optionReady = !options.option?.required || option;
+  const ready = typedReady && reasonReady && optionReady;
   const accept = () => {if (ready) onFinish({confirmed: true, reason: reason.trim(), option: !!options.option && option});};
   return <Modal role="alertdialog" label={options.title} onClose={() => onFinish(NO)} className="confirm-dialog">
     <h3 className="modal-title">{options.title}</h3>
@@ -91,7 +92,7 @@ function ConfirmDialog({options, onFinish}: {options: ConfirmOptions; onFinish: 
     <div className="modal-actions">
       <button type="button" className="btn" data-autofocus onClick={() => onFinish(NO)}>取消</button>
       <button type="button" className={options.danger ? 'btn btn-danger-solid' : 'btn btn-primary'} data-confirm="accept"
-        disabled={!ready} title={ready ? undefined : !reasonReady ? `填写原因后可以${options.confirmLabel}` : `输入 ${options.typed} 后可以${options.confirmLabel}`} onClick={accept}>{options.confirmLabel}</button>
+        disabled={!ready} title={ready ? undefined : !optionReady ? `先勾选“${options.option?.label}”` : !reasonReady ? `填写原因后可以${options.confirmLabel}` : `输入 ${options.typed} 后可以${options.confirmLabel}`} onClick={accept}>{options.confirmLabel}</button>
     </div>
   </Modal>;
 }

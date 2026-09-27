@@ -2,7 +2,7 @@
 // when cards are selected, and the dialogs to issue, view and adjust cards.
 import {useEffect, useRef, useState, type MouseEvent as ReactMouseEvent} from 'react';
 import {clearAdjustment, isUnsubmittedAdjustmentRejection, isZeroMicroAdjustment, loadAdjustment, saveAdjustment, type Adjustment} from '../adjustment';
-import {adminApi, AdminApiError, type AdminCardItem, type GeneratedCard} from '../api';
+import {adminApi, AdminApiError, type AdminCardItem, type GeneratedCard, type Plan} from '../api';
 import {ask, confirmAction} from '../components/confirm';
 import {IconChevronDown, IconClose, IconSearch, IconSortDown, IconSortUp} from '../components/icons';
 import {Menu, type MenuItem} from '../components/menu';
@@ -10,32 +10,35 @@ import {isModalOpen, Modal} from '../components/modal';
 import {toast} from '../components/toast';
 import {FilterTabs, IdCell, Pager, StatusBadge, TableState, Tag, TopbarActions, type TabOption} from '../components/ui';
 import {formatBatchNote, formatCount, formatCredits, formatFullDateTime, formatMoney, formatRemaining, shortId} from '../format';
+import {cardCodeOf, cardIdForCode} from '../cardCode';
+import {compensation, compensationRefusal, MAX_ADJUST_REASON, refusalFacts, refusalTitle, repeatable, repeatReason, type Compensation, type CompensationRefusal} from '../compensation';
+import {customerView, issuable as planIssuable, MULTI_DEVICE_NOTE, priceMicro} from '../plans';
 import {adjustmentPointsToMicro} from '../pricing';
-import {cardStatusView} from '../status';
+import {explainRefusal} from '../refusal';
+import {DOWNLOAD_URL} from '../cardSupport';
+import {cardState, cardStatusView} from '../status';
 import CardDrawer from './CardDrawer';
-import type {CardQuickFilter, CardTab, ErrorAction, Refresh, ReportError, Row, WriteGuards} from '../types';
+import {useCardSupport} from './CardSupport';
+import type {CardQuickFilter, CardTab, ErrorAction, Intent, Refresh, ReportError, ReportRoute, Row, WriteGuards} from '../types';
 
-const TIERS = [
-  {id: 'tier-1000', name: 'PRO', points: 1000, price_cny: 30},
-  {id: 'tier-2000', name: 'PRO+', points: 2000, price_cny: 55},
-  {id: 'tier-5000', name: 'PRO Max', points: 5000, price_cny: 130},
-  {id: 'tier-10000', name: 'Power', points: 10000, price_cny: 250},
-];
 const PAGE_SIZE = 50;
 const DAY = 86400;
+/** A plan's validity as the handout words it: 激活后 30 天. */
+const validity = (days: number) => `激活后 ${days} 天`;
 const ISSUANCE_KEY = 'admin-pending-issuance:v1';
 const REASONS = ['测试卡清理', '退款', '滥用', '客户要求'];
 
 type BulkAction = 'freeze' | 'unfreeze' | 'ban' | 'void' | 'archive' | 'unarchive' | 'export';
 const VERB: Record<BulkAction, string> = {freeze: '冻结', unfreeze: '解冻', ban: '封禁', void: '永久作废', archive: '归档', unarchive: '取消归档', export: '导出明文'};
+const BAN_CONSEQUENCE = '客户马上不能使用，也不会自动退款；之后可以解封（要填原因）。';
 const BULK_CONSEQUENCE: Record<BulkAction, string> = {
   freeze: '客户将暂时无法使用，可随时解冻。',
   unfreeze: '恢复使用，仍受有效期和余额限制。',
-  ban: '封禁后不能恢复，也不会自动退款。',
+  ban: BAN_CONSEQUENCE,
   void: '不能恢复，余额作废不退款。正在使用的卡请先冻结。',
   archive: '只从列表隐藏，不改状态和余额。',
   unarchive: '重新显示在当前列表中，不会恢复使用权限。',
-  export: '文件含明文卡密，请妥善保管。',
+  export: '文件含卡密 ID 和明文卡密，请妥善保管。',
 };
 
 // A CSV cell a spreadsheet will not run as a formula.
@@ -60,22 +63,24 @@ function downloadCsv(name: string, rows: Array<Array<string | number>>) {
 const refused = (error: unknown) => error instanceof AdminApiError && [400, 403, 404, 409, 413, 422].includes(error.status);
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
-function matchesTab(card: AdminCardItem, tab: CardTab): boolean {
-  const archived = card.archivedAt != null;
+// Tabs, filters and actions go by the status as it works now: a card past its date is 已到期.
+function matchesTab(card: AdminCardItem, tab: CardTab, nowSecs: number): boolean {
+  const archived = card.archivedAt != null, state = cardState(card, nowSecs);
   switch (tab) {
-    case 'CURRENT': return !archived && card.status !== 'voided';
+    case 'CURRENT': return !archived && state !== 'voided';
     case 'ARCHIVED': return archived;
-    case 'VOIDED': return card.status === 'voided';
+    case 'VOIDED': return state === 'voided';
     case 'ALL': return true;
-    default: return !archived && card.status.toUpperCase() === tab;
+    default: return !archived && state.toUpperCase() === tab;
   }
 }
 
 function matchesQuick(card: AdminCardItem, quick: CardQuickFilter | null, nowSecs: number): boolean {
   if (!quick) return true;
   if (card.archivedAt != null) return false;
-  if (quick === 'expiring') return ['active', 'frozen'].includes(card.status) && card.validUntil != null && card.validUntil > nowSecs && card.validUntil <= nowSecs + 7 * DAY;
-  return card.status === 'active' && card.pointsTotal > 0 && card.pointsAvailable / card.pointsTotal < 0.1;
+  const state = cardState(card, nowSecs);
+  if (quick === 'expiring') return ['active', 'frozen'].includes(state) && card.validUntil != null && card.validUntil <= nowSecs + 7 * DAY;
+  return state === 'active' && card.pointsTotal > 0 && card.pointsAvailable / card.pointsTotal < 0.1;
 }
 
 function matchesSearch(card: AdminCardItem, query: string): boolean {
@@ -84,9 +89,9 @@ function matchesSearch(card: AdminCardItem, query: string): boolean {
   return card.id.toLowerCase().includes(text) || !!card.note?.toLowerCase().includes(text) || card.boundDevices.some(device => device.toLowerCase().includes(text));
 }
 
-function Balance({card}: {card: AdminCardItem}) {
+function Balance({card, nowSecs}: {card: AdminCardItem; nowSecs: number}) {
   const ratio = card.pointsTotal > 0 ? Math.max(0, Math.min(1, card.pointsAvailable / card.pointsTotal)) : 0;
-  const low = card.status === 'active' && card.pointsTotal > 0 && ratio < 0.1;
+  const low = cardState(card, nowSecs) === 'active' && card.pointsTotal > 0 && ratio < 0.1;
   return <span className="balance" title={`可用 ${formatCredits(card.pointsAvailable)} / 总额 ${formatCredits(card.pointsTotal)} 积分`}>
     <span className="balance-text"><b className={low ? 'is-warning' : undefined}>{formatCredits(card.pointsAvailable)}</b> / {formatCredits(card.pointsTotal)}</span>
     <span className={`meter${low ? ' is-low' : ''}`}><span style={{width: `${ratio * 100}%`}}/></span>
@@ -98,7 +103,9 @@ function Expiry({card, now}: {card: AdminCardItem; now: number}) {
   const date = new Date(card.validUntil * 1000);
   const day = `${date.getFullYear() === new Date(now).getFullYear() ? '' : `${date.getFullYear()}-`}${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
   const left = formatRemaining(card.validUntil, now);
-  const live = ['active', 'frozen', 'unactivated'].includes(card.status);
+  // Days left while a card can still be used; 已过期 once its date has passed.
+  const state = cardState(card, now / 1000);
+  const live = ['active', 'frozen', 'unactivated'].includes(state) || (state === 'expired' && card.validUntil * 1000 <= now);
   return <span title={formatFullDateTime(card.validUntil)}>{day}{live && <span className={`remaining is-${left.tone}`}>（{left.text}）</span>}</span>;
 }
 
@@ -110,11 +117,14 @@ function Devices({card}: {card: AdminCardItem}) {
   </span>;
 }
 
-interface Generated {cards: GeneratedCard[]; tier: string; points: number; groupName: string}
+/** A batch just issued, with what its handout needs: plan, points, validity, group and the note as typed. */
+interface Generated {cards: GeneratedCard[]; tier: string; points: number; days: number; groupName: string; note: string}
 
-export default function CardsPage({cards, groups, configFailed, loading, failed, operator, refresh, guards, reportError, actionError, onBusyChange, onReauthenticate, selectionEpoch, intent, updateCards, onOpenTrace}: {
+export default function CardsPage({cards, groups, plans, configFailed, loading, failed, operator, refresh, guards, reportError, actionError, onBusyChange, onReauthenticate, selectionEpoch, intent, intentRevision = 0, onRoute, updateCards, onOpenTrace}: {
   cards: AdminCardItem[];
   groups: Row[];
+  /** The plan catalog in its order: issuance offers those on sale. */
+  plans: Plan[];
   configFailed: boolean;
   loading: boolean;
   failed: boolean;
@@ -126,10 +136,13 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
   onBusyChange: (busy: boolean) => void;
   onReauthenticate: () => void;
   selectionEpoch: number;
-  intent?: {status?: CardTab; quick?: CardQuickFilter; search?: string};
+  intent?: Intent['cards'];
+  /** Changes when Back or Forward brings the page to another `intent`. */
+  intentRevision?: number;
+  onRoute?: ReportRoute;
   updateCards: (cards: AdminCardItem[]) => void;
-  /** Opens 调用追踪 for one card, with one request's details open when given. */
-  onOpenTrace: (cardId: string, traceId?: string) => void;
+  /** Opens 调用追踪 for one card, with one request's details open when given (by its ID, or its invocation ID). */
+  onOpenTrace: (cardId: string, traceId?: string, invocationId?: string) => void;
 }) {
   const {writing, mounted} = guards;
   const alive = useRef(true);
@@ -140,7 +153,7 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
   const [statusTab, setStatusTab] = useState<CardTab>(intent?.status ?? 'CURRENT');
   const [quick, setQuick] = useState<CardQuickFilter | null>(intent?.quick ?? null);
   const [search, setSearch] = useState(intent?.search ?? '');
-  const [groupFilter, setGroupFilter] = useState('ALL');
+  const [groupFilter, setGroupFilter] = useState(intent?.group ?? 'ALL');
   const [sort, setSort] = useState<{key: 'balance' | 'expiry'; direction: 1 | -1} | null>(null);
   const [page, setPage] = useState(0);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
@@ -157,7 +170,9 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
   const [showBatch, setShowBatch] = useState(false);
   const [batchCount, setBatchCount] = useState('10');
   const [batchGroup, setBatchGroup] = useState('');
-  const [batchTemplate, setBatchTemplate] = useState('tier-2000');
+  const [batchPlan, setBatchPlan] = useState('tier-2000');
+  // A group the operator picked stays when the plan changes; until then the plan's default is taken.
+  const groupChosen = useRef(false);
   const [batchNote, setBatchNote] = useState('');
   const [generating, setGenerating] = useState(false);
   const [generated, setGenerated] = useState<Generated | null>(null);
@@ -179,13 +194,19 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
   const [adjustAmount, setAdjustAmount] = useState('');
   const [adjustReason, setAdjustReason] = useState('');
   const [adjustStep, setAdjustStep] = useState<'form' | 'review'>('form');
+  // The requests a compensation gives back, when 调账 was opened from them.
+  const [adjustLink, setAdjustLink] = useState<Compensation | null>(null);
+  // The server would not make this compensation: what it found, until the adjustment is changed.
+  const [adjustRefusal, setAdjustRefusal] = useState<CompensationRefusal | null>(null);
   const adjustment = useRef<Adjustment | null>(null);
   const [pendingIntent, setPendingIntent] = useState<Adjustment | null>(null);
   const setIntent = (intent: Adjustment | null) => {adjustment.current = intent; setPendingIntent(intent);};
   const adjusting = useRef(false);
 
   // New card codes are shown once: while they are on screen, leaving or reloading asks first.
-  useEffect(() => {onBusyChange(bulkBusy || generating || !!generated); }, [bulkBusy, generating, generated, onBusyChange]);
+  // A new code from 更换卡密 is shown once too.
+  const [secretShown, setSecretShown] = useState(false);
+  useEffect(() => {onBusyChange(bulkBusy || generating || !!generated || secretShown); }, [bulkBusy, generating, generated, secretShown, onBusyChange]);
   useEffect(() => () => onBusyChange(false), [onBusyChange]);
 
   useEffect(() => {
@@ -196,17 +217,20 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [operator]);
 
-  // Any change of filter, page or a fresh refresh clears the selection, so nothing unseen is acted on.
-  useEffect(() => {setSelectedIds([]); setPage(0);}, [search, groupFilter, statusTab, quick, sort]);
+  // Every card the filter finds, on every page (选择全部 N 张筛选结果), rather than the ticked ones.
+  const [allFiltered, setAllFiltered] = useState(false);
+  // Any change of filter, page or a fresh refresh clears the selection, so nothing unseen is acted on;
+  // only a choice of all the filter's results carries across its pages.
+  useEffect(() => {setSelectedIds([]); setAllFiltered(false); setPage(0);}, [search, groupFilter, statusTab, quick, sort]);
   useEffect(() => {setSelectedIds([]);}, [page]);
-  useEffect(() => {setSelectedIds([]);}, [selectionEpoch]);
+  useEffect(() => {setSelectedIds([]); setAllFiltered(false);}, [selectionEpoch]);
 
   const groupName = (id: unknown) => {
     const group = groups.find(item => item.id === id);
     return String(group?.name ?? id ?? '—');
   };
   const scoped = cards.filter(card => (groupFilter === 'ALL' || card.groupId === groupFilter) && matchesSearch(card, search) && matchesQuick(card, quick, nowSecs));
-  const filtered = scoped.filter(card => matchesTab(card, statusTab));
+  const filtered = scoped.filter(card => matchesTab(card, statusTab, nowSecs));
   if (sort) {
     const value = (card: AdminCardItem) => sort.key === 'balance' ? card.pointsAvailable : card.validUntil ?? Number.MAX_SAFE_INTEGER;
     filtered.sort((a, b) => (value(a) - value(b)) * sort.direction);
@@ -217,8 +241,43 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
   const pageCardIds = JSON.stringify(pageCards.map(card => card.id));
 
   // ---- Card details: a row click opens them; ↑/↓ move through the rows in view ----
-  const [detailId, setDetailId] = useState<string | null>(null);
+  const [detailId, setDetailId] = useState<string | null>(intent?.open ?? null);
   const detailCard = detailId ? cards.find(card => card.id === detailId) ?? null : null;
+  // A card the address names that the list does not have (any more): its details stay closed.
+  useEffect(() => {if (detailId && !detailCard && !loading && !failed) setDetailId(null);}, [detailId, detailCard, loading, failed]);
+
+  // ---- The address: Back and Forward bring the filters and details they name; changes are reported ----
+  const appliedRevision = useRef(intentRevision);
+  useEffect(() => {
+    if (intentRevision === appliedRevision.current) return;
+    appliedRevision.current = intentRevision;
+    setStatusTab(intent?.status ?? 'CURRENT'); setQuick(intent?.quick ?? null); setSearch(intent?.search ?? '');
+    setGroupFilter(intent?.group ?? 'ALL'); setDetailId(intent?.open ?? null);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [intentRevision]);
+  useEffect(() => {onRoute?.({cards: {status: statusTab, quick: quick ?? undefined, search, group: groupFilter, open: detailId ?? undefined}});},
+    [onRoute, statusTab, quick, search, groupFilter, detailId]);
+
+  // ---- A card code in the search box: its card ID takes its place once known, and the card opens ----
+  const [codeLookup, setCodeLookup] = useState<{cardId: string} | {error: string} | null>(null);
+  const lookup = useRef(0);
+  const changeSearch = (text: string) => {
+    const code = cardCodeOf(text), attempt = ++lookup.current;
+    setCodeLookup(null);
+    if (!code) {setSearch(text); return;}
+    // The code itself is never shown, sent or kept.
+    setSearch('');
+    cardIdForCode(code).then(cardId => {
+      if (!alive.current || attempt !== lookup.current) return;
+      const card = cards.find(item => item.id === cardId);
+      setSearch(cardId); setCodeLookup({cardId}); setQuick(null); setGroupFilter('ALL');
+      setStatusTab(tab => card && matchesTab(card, tab, Date.now() / 1000) ? tab : 'ALL');
+      // Opened now if the card is known, or once the list arrives if it is still loading.
+      if (card || loading) setDetailId(cardId);
+    }, () => {if (alive.current && attempt === lookup.current) setCodeLookup({error: '这个浏览器不能在本机算出卡密 ID（控制台要用 HTTPS 打开）：请改用卡密 ID 搜索'});});
+  };
+  const codeNote = !codeLookup ? null : 'error' in codeLookup ? codeLookup.error : search !== codeLookup.cardId ? null
+    : cards.some(card => card.id === codeLookup.cardId) ? '按卡密找到 1 张' : loading ? '正在按卡密查找…' : `按卡密没有找到：没有卡密 ID 为 ${codeLookup.cardId} 的卡（换过卡密的卡按新卡密找不到，请用卡密 ID 或备注搜索）`;
   const detailIndex = detailId ? filtered.findIndex(card => card.id === detailId) : -1;
   const moveDetail = (step: number) => {
     const next = detailIndex >= 0 ? filtered[detailIndex + step] : undefined;
@@ -252,9 +311,9 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
     setSelectedIds(ids => ids.filter(id => visible.includes(id)));
   }, [pageCardIds]);
   const filtersActive = !!search.trim() || groupFilter !== 'ALL' || statusTab !== 'CURRENT' || !!quick;
-  const resetFilters = () => {setSelectedIds([]); setSearch(''); setGroupFilter('ALL'); setStatusTab('CURRENT'); setQuick(null); setPage(0);};
+  const resetFilters = () => {setSelectedIds([]); setAllFiltered(false); setSearch(''); setCodeLookup(null); setGroupFilter('ALL'); setStatusTab('CURRENT'); setQuick(null); setPage(0);};
 
-  const tabCount = (tab: CardTab) => scoped.filter(card => matchesTab(card, tab)).length;
+  const tabCount = (tab: CardTab) => scoped.filter(card => matchesTab(card, tab, nowSecs)).length;
   const tabs: TabOption<CardTab>[] = ([
     ['CURRENT', '当前'], ['UNACTIVATED', '未激活'], ['ACTIVE', '使用中'], ['FROZEN', '已冻结'], ['BANNED', '已封禁'],
     ['EXPIRED', '已到期'], ['ARCHIVED', '已归档'], ['VOIDED', '已作废'], ['ALL', '全部'],
@@ -264,17 +323,24 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
   const blocked = bulkBusy || loading || failed || mutationBusy;
   const staleTitle = failed ? '卡密列表没有刷新成功，暂不能操作' : undefined;
   const reauthenticate: ErrorAction = {label: '重新登录', run: onReauthenticate};
+  // 解封, 解绑设备, 重置换绑次数, 延长有效期, 备注 and 换分组, from the drawer, the row menu and the selection bar.
+  const support = useCardSupport({cards, groups, groupName: id => groupName(id), guards, refresh, reportError, updateCards, blocked: blocked || revealing,
+    onShowCards: ids => {setSearch(ids[0]); setCodeLookup(null); setGroupFilter('ALL'); setStatusTab('ALL'); setQuick(null); setDetailId(ids[0]);}, onSecretShown: setSecretShown});
+  const supportBlocked = blocked || !!support.blockedTitle;
 
   // ---- Single-card status changes ----
   const changeStatus = async (card: AdminCardItem, action: 'freeze' | 'unfreeze' | 'ban') => {
     if (writing.current || bulkBusy || loading || failed) return;
-    const verb = VERB[action];
+    const verb = VERB[action], state = cardState(card, Date.now() / 1000);
     const answer = await ask({
       title: `${verb}卡密 ${shortId(card.id, 'card')}？`,
-      facts: [`余额 ${formatCredits(card.pointsAvailable)} / ${formatCredits(card.pointsTotal)} 积分 · ${cardStatusView(card.status).label}`, ...(card.note ? [`备注：${formatBatchNote(card.note)}`] : [])],
-      consequence: {freeze: '客户将暂时无法使用，可随时解冻。', unfreeze: '恢复使用，仍受有效期和余额限制。', ban: '封禁后不能恢复，也不会自动退款。'}[action],
+      facts: [`余额 ${formatCredits(card.pointsAvailable)} / ${formatCredits(card.pointsTotal)} 积分 · ${cardStatusView(state).label}`, ...(card.note ? [`备注：${formatBatchNote(card.note)}`] : [])],
+      body: action === 'ban' && state === 'active' ? <p className="confirm-hint">只想暂停？用冻结，可随时解冻。</p> : undefined,
+      consequence: {freeze: '客户将暂时无法使用，可随时解冻。', unfreeze: '恢复使用，仍受有效期和余额限制。', ban: BAN_CONSEQUENCE}[action],
       confirmLabel: verb,
       danger: action === 'ban',
+      // Irreversible: its short ID is typed first; of a shortened one, the end after the ….
+      typed: action === 'ban' ? (shortId(card.id, 'card').includes('…') ? card.id.slice(-4) : card.id) : undefined,
       reason: {label: '原因', placeholder: '可不填', suggestions: action === 'unfreeze' ? ['核实无误', '客户要求'] : REASONS, maxLength: 100},
     });
     if (!answer.confirmed || !alive.current || writing.current) return;
@@ -289,10 +355,11 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
     } finally {writing.current = false; setMutationBusy(false);}
   };
 
-  // ---- Bulk actions: only the ticked cards on the page in view ----
+  // ---- Bulk actions: the ticked cards on the page in view, or all the filter's results ----
   const runBulk = async (action: BulkAction) => {
     if (writing.current || bulkBusy || loading || failed || mutationBusy || revealing) return;
-    const targets = pageCards.filter(card => selectedIds.includes(card.id));
+    const everyResult = allFiltered;
+    const targets = everyResult ? [...filtered] : pageCards.filter(card => selectedIds.includes(card.id));
     if (!targets.length) return;
     if (action === 'void') {
       if (!operator) {reportError('需要重新登录以确认操作人；本次未发送作废请求。', reauthenticate); return;}
@@ -307,11 +374,11 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
     const nowSecs = Date.now() / 1000;
     const skipReason = (card: AdminCardItem): string | null => {
       if (action === 'export') return card.codeRecoverable ? null : '历史卡密不可恢复';
-      const expired = card.validUntil != null && card.validUntil <= nowSecs;
-      if (action === 'archive') return card.archivedAt == null && (['banned', 'expired', 'voided'].includes(card.status) || expired) ? null : '不符合归档条件或已归档';
+      const state = cardState(card, nowSecs);
+      if (action === 'archive') return card.archivedAt == null && ['banned', 'expired', 'voided'].includes(state) ? null : '不符合归档条件或已归档';
       if (action === 'unarchive') return card.archivedAt != null ? null : '未归档';
-      if ((action === 'freeze' && card.status !== 'active') || (action === 'unfreeze' && card.status !== 'frozen')
-        || (action === 'ban' && ['banned', 'voided'].includes(card.status)) || (action === 'void' && card.status === 'voided')) return `${cardStatusView(card.status).label}，状态不适用`;
+      if ((action === 'freeze' && state !== 'active') || (action === 'unfreeze' && state !== 'frozen')
+        || (action === 'ban' && ['banned', 'voided'].includes(state)) || (action === 'void' && state === 'voided')) return `${cardStatusView(state).label}，状态不适用`;
       return null;
     };
     const skipped = targets.filter(card => skipReason(card)).map(card => ({id: card.id, result: `跳过（${skipReason(card)}）`}));
@@ -328,7 +395,7 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
     const irreversible = action === 'ban' || action === 'void';
     const answer = await ask({
       title: `${verb} ${eligible.length} 张卡密？`,
-      facts: [named, `其中 ${activated} 张已激活、${withBalance} 张有剩余额度`, ...(skipped.length ? [`另有 ${skipped.length} 张状态不适用，将跳过`] : [])],
+      facts: [...(everyResult ? [`全部 ${formatCount(targets.length)} 张筛选结果（不只本页）`] : []), named, `其中 ${activated} 张已激活、${withBalance} 张有剩余额度`, ...(skipped.length ? [`另有 ${skipped.length} 张状态不适用，将跳过`] : [])],
       consequence: BULK_CONSEQUENCE[action],
       confirmLabel: `${verb} ${eligible.length} 张`,
       danger: irreversible,
@@ -345,7 +412,8 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
     setProgress({done: 0, total: eligible.length});
     const failures: Array<{id: string; result: string}> = [];
     const keepSelected = new Set<string>();
-    const codes: string[] = [];
+    // Each exported code with its card's ID; nothing of it outlives the download.
+    const codes: Array<[string, string]> = [];
     let succeeded = 0;
     try {
       for (let index = 0; index < eligible.length; index++) {
@@ -359,7 +427,7 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
             const response = await adminApi.revealCard(card.id);
             if (!alive.current) break;
             if (!response.success || !response.rawCode) throw new Error('reveal failed');
-            codes.push(response.rawCode);
+            codes.push([card.id, response.rawCode]);
           } else {
             const response = await adminApi.updateCardStatus(card.id, action, statusReason);
             if (!response.success) throw new Error('status failed');
@@ -380,14 +448,8 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
         }
       }
       if (alive.current && action === 'export' && codes.length) {
-        const url = URL.createObjectURL(new Blob([codes.join('\n')], {type: 'text/plain;charset=utf-8'}));
-        try {
-          const link = document.createElement('a');
-          link.href = url;
-          link.download = `selected-cards-${new Date().toISOString().slice(0, 10)}.txt`;
-          link.click();
-          succeeded = codes.length;
-        } finally {setTimeout(() => URL.revokeObjectURL(url), 1000);}
+        downloadCsv(`selected-cards-${new Date().toISOString().slice(0, 10)}.csv`, [['卡密 ID', '卡密'], ...codes]);
+        succeeded = codes.length;
       }
     } catch {
       for (const target of targets) keepSelected.add(target.id);
@@ -402,7 +464,7 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
           setReport({summary: [succeeded ? summary : '', failures.length ? `${failures.length} 张未完成` : '', skipped.length ? `${skipped.length} 张跳过（状态不适用）` : ''].filter(Boolean).join(' · '), failures, skipped});
         }
         if (succeeded) toast.success(action === 'export' ? `${summary}，请核对下载文件` : summary);
-        setSelectedIds([...keepSelected]);
+        setSelectedIds([...keepSelected]); setAllFiltered(false);
         setProgress(null);
         await refresh({keepSelection: true});
         setBulkBusy(false);
@@ -420,7 +482,7 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
       if (!result.success || !result.rawCode) throw new Error('卡密不可恢复');
       if (alive.current) setRevealed({cardId: card.id, rawCode: result.rawCode});
     } catch (error) {
-      reportError(`查看失败：${errorText(error)}`);
+      reportError(`显示卡密失败：${errorText(error)}`);
     } finally {if (alive.current) setRevealing(false);}
   };
   const copyRevealed = async () => {
@@ -430,19 +492,34 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
   };
 
   // ---- Adjust ----
-  const openAdjust = (card: AdminCardItem) => {
+  // 补偿这次扣费 (from a request, or the requests ticked in a card's 最近调用): 调账 opens with the charge,
+  // a reason naming the requests and, for one, the request it makes up for.
+  const openAdjust = (card: AdminCardItem, prefill?: Compensation) => {
     if (bulkBusy || card.status === 'voided') return;
     if (!operator) {reportError('需要重新登录以确认操作人', reauthenticate); return;}
     try {
       const saved = loadAdjustment(sessionStorage, operator);
       if (saved && saved.cardId !== card.id) {reportError(`卡 ${saved.cardId} 的调账结果未确认，请先打开原卡核对。`); return;}
       reportError('');
-      setIntent(saved); setAdjustCard(card); setAdjustStep('form');
+      // A pending intent is retried as it was; a compensation only fills a new one.
+      const fill = saved ? null : prefill ?? null;
+      setIntent(saved); setAdjustCard(card); setAdjustStep('form'); setAdjustLink(fill); setAdjustRefusal(null);
       setAdjustDirection(saved && saved.delta < 0 ? 'deduct' : 'add');
-      setAdjustAmount(saved ? String(Math.abs(saved.delta)) : '');
-      setAdjustReason(saved?.reason ?? '');
+      setAdjustAmount(saved ? String(Math.abs(saved.delta)) : fill?.points ?? '');
+      setAdjustReason(saved?.reason ?? fill?.reason ?? '');
     } catch {reportError('调账恢复记录无法读取，请人工核对账本；未发送请求。');}
   };
+  // Arriving from 调用追踪's 补偿这次扣费: once the card is in the list, 调账 opens for it.
+  const compensating = useRef<Compensation | null>(null);
+  useEffect(() => {
+    const prefill = intent?.compensate;
+    if (!prefill || compensating.current === prefill) return;
+    const card = cards.find(item => item.id === prefill.cardId);
+    if (!card) return;
+    compensating.current = prefill;
+    openAdjust(card, prefill);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [intent?.compensate, cards]);
   const reviewPending = () => {
     try {
       if (!operator) return;
@@ -451,12 +528,12 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
       const card = cards.find(item => item.id === saved.cardId);
       if (!card) {reportError('未读取到原卡记录，请刷新或人工核对账本；原意图仍保留。'); return;}
       reportError('');
-      setIntent(saved); setAdjustCard(card); setAdjustStep('form');
+      setIntent(saved); setAdjustCard(card); setAdjustStep('form'); setAdjustRefusal(null);
       setAdjustDirection(saved.delta < 0 ? 'deduct' : 'add');
       setAdjustAmount(String(Math.abs(saved.delta))); setAdjustReason(saved.reason);
     } catch {reportError('调账恢复记录无法读取，请人工核对账本；未发送请求。');}
   };
-  const closeAdjust = () => {if (!mutationBusy) {setAdjustCard(null); setAdjustStep('form');}};
+  const closeAdjust = () => {if (!mutationBusy) {setAdjustCard(null); setAdjustStep('form'); setAdjustLink(null); setAdjustRefusal(null);}};
   const locked = !!pendingIntent;
   const zeroMicro = !!pendingIntent && isZeroMicroAdjustment(pendingIntent);
   const parsedAdjust = ((): {delta: number} | {error: string} => {
@@ -478,8 +555,15 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
   const adjustReady = adjustDelta !== null && reasonValid && !overdrawn;
   const adjustAfter = adjustCard && adjustDelta !== null ? adjustCard.pointsAvailable + adjustDelta : null;
   const signed = (value: number) => `${value > 0 ? '+' : ''}${formatCredits(value)}`;
+  // The request the adjustment makes up for: a pending intent's (retried as it was), or the compensation's.
+  const linkedRequest = pendingIntent ? pendingIntent.invocationId : adjustLink?.invocationId;
+  const linkLine = pendingIntent ? (pendingIntent.invocationId ? `这笔调账${pendingIntent.allowRepeat ? '仍要' : ''}补偿一次请求，重试时仍关联它` : '')
+    : !adjustLink ? '' : adjustLink.requests === 1
+      ? `补偿这次请求扣的 ${adjustLink.points} 积分${adjustLink.invocationId ? '' : '（这次请求的编号不能关联，只写在原因里）'}`
+      : `补偿 ${adjustLink.requests} 次请求扣的共 ${adjustLink.points} 积分。一笔调账只能关联一次请求，这几次写在原因里`;
 
-  const submitAdjust = async () => {
+  /** Sends the adjustment; `repeatWhy`: 仍要补偿 a request the server refused to compensate again, and why. */
+  const submitAdjust = async (repeatWhy?: string) => {
     if (!adjustCard || mutationBusy || adjusting.current) return;
     if (!operator) {reportError('需要重新登录以确认操作人', reauthenticate); return;}
     if (adjustment.current && isZeroMicroAdjustment(adjustment.current)) {reportError('该旧意图换算为零微积分，无法入账；请清除后更正金额。'); return;}
@@ -487,28 +571,50 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
     const delta = adjustment.current ? adjustment.current.delta : adjustDelta;
     if (delta === null) {reportError('请输入不为 0 的数量（最多 6 位小数），范围为 ±1,000,000；未发送请求。'); setAdjustStep('form'); return;}
     if (!reasonValid) {reportError('请填写 1–500 字的原因，不要包含密码或令牌'); setAdjustStep('form'); return;}
+    // 仍要补偿 says why in the reason the card's history keeps, after the adjustment's own.
+    const reason = repeatWhy === undefined ? reasonText : repeatReason(reasonText, repeatWhy);
+    if (reason === null) {reportError(`原因加上仍要补偿的理由超过 ${MAX_ADJUST_REASON} 字，请先缩短原因；未发送请求。`); return;}
     let sent = false;
     try {
       adjusting.current = true; setMutationBusy(true); reportError('');
-      const intent = loadAdjustment(sessionStorage, operator) ?? {operator, cardId: adjustCard.id, delta, reason: reasonText, key: crypto.randomUUID()};
-      if (intent.cardId !== adjustCard.id || intent.delta !== delta || intent.reason !== reasonText) throw new Error('上次调账结果尚未确认，请先用原参数重试');
-      saveAdjustment(sessionStorage, intent); setIntent(intent); sent = true;
-      const response = await adminApi.adjustBalance(intent.cardId, intent.delta, intent.reason, intent.key);
+      // The request it makes up for is kept with the intent: a retry names the same one, as the server requires.
+      const intent = loadAdjustment(sessionStorage, operator) ?? {operator, cardId: adjustCard.id, delta, reason, key: crypto.randomUUID(),
+        ...(adjustLink?.invocationId ? {invocationId: adjustLink.invocationId, ...(repeatWhy !== undefined ? {allowRepeat: true as const} : {})} : {})};
+      if (intent.cardId !== adjustCard.id || intent.delta !== delta || intent.reason !== reason) throw new Error('上次调账结果尚未确认，请先用原参数重试');
+      // The form shows what is kept and retried: 仍要补偿's reason with why.
+      saveAdjustment(sessionStorage, intent); setIntent(intent); setAdjustReason(intent.reason); setAdjustRefusal(null); sent = true;
+      const response = await adminApi.adjustBalance(intent.cardId, intent.delta, intent.reason, intent.key, intent.invocationId, intent.allowRepeat);
       if (!response.success) throw new Error('服务端未确认调账');
       clearAdjustment(sessionStorage, intent); setIntent(null);
       toast.success(`已调整 ${shortId(adjustCard.id, 'card')}：${signed(intent.delta)} 积分`);
-      setAdjustCard(null); setAdjustReason(''); setAdjustAmount(''); setAdjustStep('form');
+      setAdjustCard(null); setAdjustReason(''); setAdjustAmount(''); setAdjustStep('form'); setAdjustLink(null); setAdjustRefusal(null);
       void refresh();
     } catch (error) {
       if (sent && adjustment.current && error instanceof AdminApiError && isUnsubmittedAdjustmentRejection(error.status, error.message, adjustment.current)) {
         try {
-          clearAdjustment(sessionStorage, adjustment.current); setIntent(null); setAdjustStep('form');
-          reportError('服务器拒绝了这笔调账，未入账。请检查卡的状态和余额。');
+          clearAdjustment(sessionStorage, adjustment.current); setIntent(null);
+          // A compensation refused stays on its review, with what the server found and, where it can be, 仍要补偿.
+          const refusal = compensationRefusal(error.message, error.body.refusal);
+          if (refusal) {setAdjustRefusal(refusal); reportError(''); return;}
+          setAdjustStep('form');
+          reportError(error.message === 'allowRepeat needs a reason' ? '仍要补偿需要写明理由，未入账。'
+            : error.message.startsWith('invocationId must be') ? '关联的请求编号无效（最多 257 个字母、数字或 - _ . :），未入账。'
+              : '服务器拒绝了这笔调账，未入账。请检查卡的状态和余额。');
         } catch {reportError('该调账未入账，但本地记录未能清除，请检查浏览器存储。');}
         return;
       }
       reportError(sent ? `没收到调账结果（${errorText(error)}）。重新打开这张卡可按原参数重试。` : `尚未发送调账：${errorText(error)}。`);
     } finally {adjusting.current = false; setMutationBusy(false);}
+  };
+  const repeatCompensation = async () => {
+    if (!adjustRefusal || !repeatable(adjustRefusal) || adjustDelta === null || mutationBusy) return;
+    const answer = await ask({
+      title: '仍要补偿这次请求？', facts: refusalFacts(adjustRefusal),
+      consequence: `会再给这张卡 ${signed(adjustDelta)} 积分。你写的理由会跟在原因后面，写进这张卡的操作记录。`,
+      confirmLabel: '仍要补偿', danger: true,
+      reason: {label: '为什么仍要补偿', placeholder: '例：补偿后客户又遇到同样的失败', suggestions: ['上次补偿后又失败了', '上次补偿不足', '已与客户核实'], maxLength: 60, required: true},
+    });
+    if (answer.confirmed && alive.current) await submitAdjust(answer.reason);
   };
   const clearZeroMicro = async () => {
     const intent = adjustment.current;
@@ -527,10 +633,26 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
   }, [issuableKey]);
   const countValue = Number(batchCount);
   const validCount = /^\d+$/.test(batchCount) && Number.isInteger(countValue) && countValue >= 1 && countValue <= 500;
-  const tier = TIERS.find(item => item.id === batchTemplate);
+  // Plans on sale are offered; one of more than one device is shown but cannot be chosen.
+  const offered = plans.filter(plan => plan.on_sale);
+  const tier = offered.find(plan => plan.id === batchPlan && planIssuable(plan));
+  const offeredKey = offered.filter(planIssuable).map(plan => plan.id).join('\n');
+  useEffect(() => {
+    const ids = offeredKey ? offeredKey.split('\n') : [];
+    setBatchPlan(current => ids.includes(current) ? current : ids.includes('tier-2000') ? 'tier-2000' : ids[0] ?? '');
+  }, [offeredKey]);
+  // The plan's own group, when cards can be issued into it.
+  const presetGroup = (plan: Plan | undefined) => {
+    if (!plan || groupChosen.current || !issuable.some(group => group.id === plan.default_group_id)) return;
+    setBatchGroup(plan.default_group_id);
+  };
+  const choosePlan = (id: string) => {setBatchPlan(id); presetGroup(offered.find(plan => plan.id === id));};
+  const openBatch = () => {reportError(''); groupChosen.current = false; presetGroup(tier); setShowBatch(true);};
   const selectedGroup = issuable.find(group => group.id === batchGroup);
+  const defaultGroup = tier ? groups.find(group => group.id === tier.default_group_id) : undefined;
+  const mismatch = !!tier && !!selectedGroup && tier.default_group_id !== selectedGroup.id;
   const note = batchNote.trim();
-  const generateBlocked = !!issuanceRecovery ? '上次批量生成的结果未确认，请先核对' : !selectedGroup ? '请选择分组' : !validCount ? '请输入 1–500 的整数' : undefined;
+  const generateBlocked = !!issuanceRecovery ? '上次批量生成的结果未确认，请先核对' : !tier ? '没有在售的套餐' : !selectedGroup ? '请选择分组' : !validCount ? '请输入 1–500 的整数' : undefined;
 
   const refreshIssuanceForReview = async () => {
     if (issuanceChecking || writing.current) return;
@@ -553,8 +675,9 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
     if (issuanceRecovery || writing.current || loading || generating || !tier || !selectedGroup || !validCount) return;
     const confirmed = await confirmAction({
       title: `生成 ${countValue} 张 ${tier.name}（${formatCount(tier.points)} 积分）卡密？`,
-      facts: [`套餐：${tier.name} · ${formatCount(tier.points)} 积分`, `分组：${String(selectedGroup.name ?? selectedGroup.id)}`,
-        `合计 ${formatCount(tier.points * countValue)} 积分 · 有效期 30 天（激活起算）· 每张 1 台设备`, ...(note ? [`备注：${note}`] : [])],
+      facts: [`套餐：${tier.name} · ${formatCount(tier.points)} 积分 · 每张 ${formatMoney(priceMicro(tier))}`,
+        `分组：${String(selectedGroup.name ?? selectedGroup.id)}${mismatch ? `（套餐默认是 ${String(defaultGroup?.name ?? tier.default_group_id)}）` : ''}`,
+        `合计 ${formatCount(tier.points * countValue)} 积分 · 有效期 ${tier.validity_days} 天（激活起算）· 每张 1 台设备`, `客户看到：${customerView(tier)}`, ...(note ? [`备注：${note}`] : [])],
       confirmLabel: `生成 ${countValue} 张`,
     });
     if (!confirmed || !alive.current || writing.current || issuanceRecovery) return;
@@ -562,36 +685,36 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
       writing.current = true; setGenerating(true);
       const reference = `批次 ${new Date().toISOString()} ${crypto.randomUUID()}`;
       setIssuanceReference(reference);
-      sessionStorage.setItem(ISSUANCE_KEY, JSON.stringify({reference, count: countValue, group: batchGroup, template: batchTemplate, startedAt: new Date().toISOString()}));
+      sessionStorage.setItem(ISSUANCE_KEY, JSON.stringify({reference, count: countValue, group: batchGroup, template: tier.id, startedAt: new Date().toISOString()}));
       // The batch reference stays in the note, so an unconfirmed batch can still be found.
-      const response = await adminApi.batchCards(countValue, batchGroup, batchTemplate, note ? `${note} · ${reference}` : reference);
+      const response = await adminApi.batchCards(countValue, batchGroup, tier.id, note ? `${note} · ${reference}` : reference);
       if (!response.success) throw new Error('服务器未确认生成结果');
       sessionStorage.removeItem(ISSUANCE_KEY);
       toast.success(`已生成 ${response.cards.length} 张卡密`);
-      setGenerated({cards: response.cards, tier: tier.name, points: tier.points, groupName: String(selectedGroup.name ?? selectedGroup.id)});
+      // The handout names the plan as the cards keep it (the server's reply), else as it was chosen.
+      const kept = response.cards[0]?.plan;
+      setGenerated({cards: response.cards, tier: kept?.name ?? tier.name, points: kept?.points ?? tier.points, days: kept?.validityDays ?? tier.validity_days,
+        groupName: String(selectedGroup.name ?? selectedGroup.id), note});
       setGeneratedError(''); setShowBatch(false); setBatchNote('');
       await refresh();
     } catch (error) {
-      if (refused(error)) {sessionStorage.removeItem(ISSUANCE_KEY); reportError(`服务端已拒绝，未生成卡密：${errorText(error)}`); return;}
+      if (refused(error)) {sessionStorage.removeItem(ISSUANCE_KEY); reportError(`服务端已拒绝，未生成卡密：${explainRefusal(errorText(error))}`); return;}
       setIssuanceRecovery('refresh'); setShowBatch(false);
       reportError(`没收到生成结果（${errorText(error)}），请先核对列表，不要重复生成。`);
     } finally {writing.current = false; if (alive.current) setGenerating(false);}
   };
 
+  // The batch for handing out: each code with its plan, points, validity, group and note.
   const downloadGenerated = () => {
     if (!generated?.cards.length) return;
-    // Header kept unquoted, as before.
-    const csv = ['cardId,rawCode,groupId,creditTotal', ...generated.cards.map(card =>
-      [card.cardId, card.rawCode, card.groupId, card.creditTotal].map(csvCell).join(','))].join('\r\n');
-    const url = URL.createObjectURL(new Blob(['\uFEFF' + csv], {type: 'text/csv;charset=utf-8'}));
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `generated-cards-${new Date().toISOString().slice(0, 10)}.csv`;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    downloadCsv(`generated-cards-${new Date().toISOString().slice(0, 10)}.csv`, [['卡密 ID', '卡密', '套餐', '积分', '有效期', '分组', '备注'],
+      ...generated.cards.map(card => [card.cardId, card.rawCode, generated.tier, generated.points, validity(generated.days), generated.groupName, generated.note])]);
   };
+  // What a seller pastes to the buyer: per card its code, plan, validity and where to get the client.
+  const deliveryText = (batch: Generated) => batch.cards.map(card =>
+    [`卡密：${card.rawCode}`, `套餐：${batch.tier}（${formatCount(batch.points)} 积分）`, `有效期：${validity(batch.days)}`, `下载地址：${DOWNLOAD_URL}`].join('\n')).join('\n\n');
+  // Issuing needs the server's key, so every card issued keeps its code for 显示卡密; this checks it on the list.
+  const recoverable = !!generated && generated.cards.every(card => cards.find(item => item.id === card.cardId)?.codeRecoverable === true);
   // The list as filtered (every page), for reconciling with orders. Never any plaintext code.
   const exportList = () => {
     if (!filtered.length) {toast.info('当前筛选下没有卡密'); return;}
@@ -599,7 +722,7 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
       ['卡号', '备注', '分组', '余额', '总额', '到期', '状态', '激活时间'],
       ...filtered.map(card => [card.id, card.note ?? '', groupName(card.groupId), card.pointsAvailable, card.pointsTotal,
         card.validUntil ? formatFullDateTime(card.validUntil) : '激活后起算',
-        cardStatusView(card.status).label + (card.archivedAt != null ? '（已归档）' : ''),
+        cardStatusView(cardState(card, nowSecs)).label + (card.archivedAt != null ? '（已归档）' : ''),
         card.activatedAt ? formatFullDateTime(card.activatedAt) : '']),
     ]);
     toast.success(`已导出 ${formatCount(filtered.length)} 张卡的列表`);
@@ -609,7 +732,7 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
     catch {setGeneratedError('复制失败，请使用 CSV 下载');}
   };
   const finishGenerated = async () => {
-    if (await confirmAction({title: '已保存这些卡密？', consequence: '关闭后不再显示明文。', confirmLabel: '完成'})) {
+    if (await confirmAction({title: '已保存这些卡密？', consequence: recoverable ? '之后可在列表里重新查看（会记录）。' : '关闭后不再显示明文。', confirmLabel: '完成'})) {
       if (alive.current) setGenerated(null);
     }
   };
@@ -617,14 +740,15 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
   const toggleSort = (key: 'balance' | 'expiry') => setSort(current => current?.key !== key ? {key, direction: -1} : current.direction === -1 ? {key, direction: 1} : null);
   const sortIcon = (key: 'balance' | 'expiry') => sort?.key === key ? (sort.direction === 1 ? <IconSortUp/> : <IconSortDown/>) : null;
   const sortState = (key: 'balance' | 'expiry') => sort?.key === key ? (sort.direction === 1 ? 'ascending' : 'descending') : undefined;
-  const allSelected = pageCards.length > 0 && pageCards.every(card => selectedIds.includes(card.id));
-  const someSelected = selectedIds.length > 0;
+  const allSelected = allFiltered || (pageCards.length > 0 && pageCards.every(card => selectedIds.includes(card.id)));
+  const someSelected = allFiltered || selectedIds.length > 0;
+  const selectedCount = allFiltered ? filtered.length : selectedIds.length;
   const bulkDisabled = bulkBusy || failed || loading || mutationBusy || revealing;
 
   return <div className="page-stack">
     <TopbarActions><Menu label="卡密更多操作" className="btn btn-icon-only" items={[{label: '导出列表（不含明文）', onSelect: exportList}]}/>
       <button type="button" className="btn btn-primary" disabled={!!issuanceRecovery} title={issuanceRecovery ? '上次批量生成的结果未确认，请先在列表上方核对' : undefined}
-      onClick={() => {reportError(''); setShowBatch(true);}}>＋ 批量生成</button></TopbarActions>
+      onClick={openBatch}>＋ 批量生成</button></TopbarActions>
 
     {issuanceRecovery && <section className="recovery-panel" aria-label="制卡结果核对">
       <div>
@@ -638,6 +762,8 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
       </div>
     </section>}
 
+    {support.view}
+
     {pendingIntent && <section className="recovery-panel" aria-label="未确认调账恢复">
       <p>卡 <IdCell value={pendingIntent.cardId} kind="card"/> 有一笔调账结果未确认</p>
       <button type="button" className="btn btn-small" disabled={bulkBusy || mutationBusy || loading} onClick={reviewPending}>核对</button>
@@ -646,7 +772,10 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
     <div className="toolbar">
       <div className="filter-bar" role="search" aria-label="卡密筛选">
         <label className="search-field"><IconSearch/>
-          <input type="text" aria-label="搜索卡密" placeholder="卡密 ID、备注或设备 ID" value={search} disabled={bulkBusy} onChange={event => setSearch(event.target.value)}/>
+          <input type="text" aria-label="搜索卡密" placeholder="卡密原文、卡密 ID、备注或设备 ID" aria-keyshortcuts="/" title="按 / 搜索；只找到一张时按 Enter 打开"
+            value={search} disabled={bulkBusy} onChange={event => changeSearch(event.target.value)}
+            // Enter opens the one card found.
+            onKeyDown={event => {if (event.key === 'Enter' && !event.nativeEvent.isComposing && filtered.length === 1) {event.preventDefault(); setDetailId(filtered[0].id);}}}/>
         </label>
         <label className="inline-field"><span>分组</span>
           <select aria-label="分组筛选" value={groupFilter} disabled={bulkBusy} onChange={event => setGroupFilter(event.target.value)}>
@@ -666,15 +795,21 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
       <FilterTabs label="状态筛选" value={statusTab} options={tabs} onChange={setStatusTab} disabled={bulkBusy}/>
     </div>
 
-    {filtersActive && filtered.length > 0 && <p className="filter-summary">筛选出 {formatCount(filtered.length)} 张{failed ? '（可能不是最新）' : ''}
+    {codeNote && <p className="filter-summary" role="status">{codeNote}
+      {filtersActive && <button type="button" className="btn-text" disabled={bulkBusy} onClick={resetFilters}>清除筛选</button>}</p>}
+    {!codeNote && filtersActive && filtered.length > 0 && <p className="filter-summary">筛选出 {formatCount(filtered.length)} 张{failed ? '（可能不是最新）' : ''}
       <button type="button" className="btn-text" disabled={bulkBusy} onClick={resetFilters}>清除筛选</button></p>}
 
     {someSelected && <div className="selection-bar" role="region" aria-label="批量卡密管理">
-      <span className="selection-count">{progress ? `处理中 ${progress.done}/${progress.total}` : `已选 ${selectedIds.length} 张`}</span>
+      <span className="selection-count">{progress ? `处理中 ${progress.done}/${progress.total}` : `已选 ${formatCount(selectedCount)} 张${allFiltered ? '（全部筛选结果）' : ''}`}</span>
+      {!progress && !allFiltered && allSelected && filtered.length > pageCards.length &&
+        <button type="button" className="btn-text" disabled={bulkBusy} onClick={() => setAllFiltered(true)}>选择全部 {formatCount(filtered.length)} 张筛选结果</button>}
       <div className="button-row">
         <button type="button" className="btn btn-small" disabled={bulkDisabled} onClick={() => void runBulk('freeze')}>冻结</button>
         <button type="button" className="btn btn-small" disabled={bulkDisabled} onClick={() => void runBulk('unfreeze')}>解冻</button>
         <button type="button" className="btn btn-small" disabled={bulkDisabled} onClick={() => void runBulk('export')}>导出明文</button>
+        <button type="button" className="btn btn-small" disabled={bulkDisabled || !!support.blockedTitle} title={support.blockedTitle}
+          onClick={() => support.extend(allFiltered ? [...filtered] : pageCards.filter(card => selectedIds.includes(card.id)), allFiltered)}>延长有效期</button>
         <Menu label="更多批量操作" className="btn btn-small" disabled={bulkDisabled} items={[
           {label: '归档', onSelect: () => void runBulk('archive')},
           {label: '取消归档', onSelect: () => void runBulk('unarchive')},
@@ -682,7 +817,7 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
         ]}>更多<IconChevronDown/></Menu>
         <button type="button" className="btn btn-small btn-danger" disabled={bulkDisabled} onClick={() => void runBulk('void')}>永久作废</button>
       </div>
-      <button type="button" className="btn-text" disabled={bulkBusy} onClick={() => setSelectedIds([])}>取消选择</button>
+      <button type="button" className="btn-text" disabled={bulkBusy} onClick={() => {setSelectedIds([]); setAllFiltered(false);}}>取消选择</button>
     </div>}
 
     {report && <div className={`bulk-report${report.failures.length ? '' : ' is-skipped'}`} role="status" aria-label="批量操作结果">
@@ -697,7 +832,7 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
         <thead><tr>
           <th className="col-check"><input type="checkbox" aria-label="全选本页" checked={allSelected} disabled={bulkBusy || failed || loading || !pageCards.length}
             ref={element => {if (element) element.indeterminate = someSelected && !allSelected;}}
-            onChange={event => setSelectedIds(event.target.checked ? pageCards.map(card => card.id) : [])}/></th>
+            onChange={event => {setAllFiltered(false); setSelectedIds(event.target.checked ? pageCards.map(card => card.id) : []);}}/></th>
           <th>卡密</th><th className="col-note">备注</th><th className="col-group">分组</th>
           <th className="num" aria-sort={sortState('balance')}><button type="button" className="th-sort" onClick={() => toggleSort('balance')}>余额{sortIcon('balance')}</button></th>
           <th aria-sort={sortState('expiry')}><button type="button" className="th-sort" onClick={() => toggleSort('expiry')}>到期{sortIcon('expiry')}</button></th>
@@ -705,24 +840,30 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
         </tr></thead>
         <tbody>
           {pageCards.map(card => {
-            const selected = selectedIds.includes(card.id);
+            const selected = allFiltered || selectedIds.includes(card.id), state = cardState(card, nowSecs);
             const menuItems: MenuItem[] = [
-              ...(card.status === 'active' ? [{label: '冻结', onSelect: () => void changeStatus(card, 'freeze')}] : []),
-              ...(card.status === 'frozen' ? [{label: '解冻', onSelect: () => void changeStatus(card, 'unfreeze')}] : []),
-              ...(!['banned', 'voided'].includes(card.status) ? [{label: '封禁', danger: true, onSelect: () => void changeStatus(card, 'ban')}] : []),
+              ...(state === 'active' ? [{label: '冻结', onSelect: () => void changeStatus(card, 'freeze')}] : []),
+              ...(state === 'frozen' ? [{label: '解冻', onSelect: () => void changeStatus(card, 'unfreeze')}] : []),
+              ...(card.status === 'banned' && card.archivedAt == null ? [{label: '解封', disabled: supportBlocked, title: support.blockedTitle, onSelect: () => support.unban(card)}] : []),
+              ...(!['banned', 'voided'].includes(state) ? [{label: '封禁', danger: true, onSelect: () => void changeStatus(card, 'ban')}] : []),
             ];
             return <tr key={card.id} className={`is-clickable${selected ? ' is-selected' : ''}${card.id === detailId ? ' is-open' : ''}`} onClick={event => openDetail(event, card)}>
               <td className="col-check"><input type="checkbox" aria-label={`选择卡密 ${card.id}`} disabled={bulkBusy || failed || loading} checked={selected}
-                onChange={event => {const checked = event.currentTarget.checked; setSelectedIds(ids => checked ? [...ids, card.id] : ids.filter(id => id !== card.id));}}/></td>
+                onChange={event => {
+                  const checked = event.currentTarget.checked;
+                  // Unticking one of all the results goes back to this page's cards, less that one.
+                  if (allFiltered) {setAllFiltered(false); setSelectedIds(pageCards.map(item => item.id).filter(id => id !== card.id)); return;}
+                  setSelectedIds(ids => checked ? [...ids, card.id] : ids.filter(id => id !== card.id));
+                }}/></td>
               <td className="col-id"><IdCell value={card.id} kind="card" onOpen={() => setDetailId(card.id)} openTitle="查看详情"/></td>
               <td className="col-note" title={card.note || undefined}>{card.note ? <span className="clip clip-note">{formatBatchNote(card.note)}</span> : <span className="muted">—</span>}</td>
               <td className="col-group" title={card.groupId}><span className="clip clip-group">{groupName(card.groupId)}</span></td>
-              <td className="num"><Balance card={card}/></td>
+              <td className="num"><Balance card={card} nowSecs={nowSecs}/></td>
               <td className="col-expiry"><Expiry card={card} now={now}/></td>
               <td className="col-device"><Devices card={card}/></td>
-              <td className="col-status"><span className="status-cell"><StatusBadge view={cardStatusView(card.status)}/>{card.archivedAt != null && <Tag>已归档</Tag>}</span></td>
+              <td className="col-status"><span className="status-cell"><StatusBadge view={cardStatusView(state)}/>{card.archivedAt != null && <Tag>已归档</Tag>}</span></td>
               <td className="col-actions"><span className="row-actions">
-                <button type="button" className="btn-text" disabled={!card.codeRecoverable || revealing || bulkBusy} aria-label="查看卡密" title={card.codeRecoverable ? undefined : '此卡未保存明文'} onClick={() => void reveal(card)}>查看</button>
+                <button type="button" className="btn-text" disabled={!card.codeRecoverable || revealing || bulkBusy} title={card.codeRecoverable ? '显示这张卡的卡密原文（会记录）' : '此卡未保存明文'} onClick={() => void reveal(card)}>显示卡密</button>
                 <button type="button" className="btn-text" disabled={card.status === 'voided' || blocked} title={card.status === 'voided' ? '已作废，不能调账' : staleTitle} onClick={() => openAdjust(card)}>调账</button>
                 {menuItems.length ? <Menu label="更多操作" items={menuItems} disabled={blocked} title={staleTitle ?? '更多操作'}/> : <span className="menu-placeholder"/>}
               </span></td>
@@ -730,7 +871,7 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
           })}
           {!filtered.length && <TableState colSpan={9} loading={loading} failed={failed && !cards.length} onRetry={() => void refresh()}
             empty={!cards.length ? '还没有卡密' : '没有匹配的卡密'}
-            action={!cards.length ? <button type="button" className="btn btn-small" onClick={() => setShowBatch(true)}>批量生成</button> : <span className="button-row">
+            action={!cards.length ? <button type="button" className="btn btn-small" onClick={openBatch}>批量生成</button> : <span className="button-row">
               {filtersActive && (search.trim() || groupFilter !== 'ALL' || quick) && <button type="button" className="btn btn-small" disabled={bulkBusy} onClick={resetFilters}>清除筛选</button>}
               {statusTab !== 'ALL' && <button type="button" className="btn btn-small" disabled={bulkBusy} onClick={() => {setStatusTab('ALL');}}>查看全部</button>}
             </span>}/>}
@@ -739,10 +880,10 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
       <Pager page={currentPage} pageSize={PAGE_SIZE} total={filtered.length} disabled={bulkBusy || failed || loading} onPage={next => {setSelectedIds([]); setPage(next);}}/>
     </div>
 
-    {revealed && <Modal label="查看卡密" onClose={() => {setRevealed(null); setRevealError('');}} className="dialog-narrow">
+    {revealed && <Modal label="显示卡密" onClose={() => {setRevealed(null); setRevealError('');}} className="dialog-narrow">
       <h3 className="modal-title">卡密 <span className="mono">{shortId(revealed.cardId, 'card')}</span></h3>
       <textarea aria-label="卡密明文" readOnly rows={2} className="secret-block" value={revealed.rawCode} onFocus={event => event.currentTarget.select()}/>
-      <p className="muted">关闭后不再显示。</p>
+      <p className="muted">之后可在列表里重新查看（会记录）。</p>
       {revealError && <p role="alert" className="form-error">{revealError}</p>}
       <div className="modal-actions">
         <button type="button" className="btn" onClick={() => {setRevealed(null); setRevealError('');}}>关闭</button>
@@ -752,7 +893,7 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
 
     {generated && <Modal label="新生成的卡密" onClose={() => void finishGenerated()} className="dialog-wide">
       <h3 className="modal-title">已生成 {generated.cards.length} 张 · {generated.tier} {formatCount(generated.points)} 积分</h3>
-      <p className="note-warning">关闭后不再显示明文，请先下载或复制。分组：{generated.groupName}</p>
+      <p className={recoverable ? 'note-info' : 'note-warning'}>{recoverable ? '之后可在列表里重新查看（会记录）。' : '关闭后不再显示明文，请先下载或复制。'}分组：{generated.groupName}</p>
       {generatedError && <p role="alert" className="form-error">{generatedError}</p>}
       <div className="table-scroll generated-list"><table className="table table-compact">
         <thead><tr><th>卡密 ID</th><th>卡密</th><th className="col-actions"><span className="sr-only">操作</span></th></tr></thead>
@@ -763,6 +904,7 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
       </table></div>
       <div className="modal-actions">
         <button type="button" className="btn" onClick={() => void copyGenerated(generated.cards.map(card => card.rawCode).join('\n'), '已复制全部卡密')}>复制全部</button>
+        <button type="button" className="btn" title={`每张卡：卡密、套餐、有效期和下载地址 ${DOWNLOAD_URL}`} onClick={() => void copyGenerated(deliveryText(generated), `已复制 ${generated.cards.length} 张卡的发货文本`)}>复制发货文本</button>
         <button type="button" className="btn btn-primary" onClick={downloadGenerated}>下载 CSV</button>
         <button type="button" className="btn" onClick={() => void finishGenerated()}>完成</button>
       </div>
@@ -773,11 +915,14 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
       {actionError && <p role="alert" className="form-error">{actionError}</p>}
       <div className="form-grid">
         <label className="field"><span className="field-label">套餐</span>
-          <select aria-label="积分套餐" value={batchTemplate} disabled={generating} onChange={event => setBatchTemplate(event.target.value)}>
-            {TIERS.map(item => <option key={item.id} value={item.id}>{item.name} · {formatCount(item.points)} 积分 · ¥{item.price_cny}</option>)}
-          </select></label>
+          <select aria-label="积分套餐" value={tier ? batchPlan : ''} disabled={generating || !offered.length} onChange={event => choosePlan(event.target.value)}>
+            {!tier && <option value="" disabled>{offered.length ? '请选择套餐' : '没有在售的套餐'}</option>}
+            {offered.map(item => <option key={item.id} value={item.id} disabled={!planIssuable(item)} title={planIssuable(item) ? undefined : MULTI_DEVICE_NOTE}>
+              {item.name} · {formatCount(item.points)} 积分 · ¥{item.price_cny}{planIssuable(item) ? '' : `（${item.max_devices} 台设备，暂不能发卡）`}</option>)}
+          </select>
+          {!offered.length && <span className="field-hint">在“套餐”里上架一个套餐</span>}</label>
         <label className="field"><span className="field-label">分组</span>
-          <select aria-label="模型与计费分组" value={batchGroup} disabled={generating || !issuable.length} onChange={event => setBatchGroup(event.target.value)}>
+          <select aria-label="模型与计费分组" value={batchGroup} disabled={generating || !issuable.length} onChange={event => {groupChosen.current = true; setBatchGroup(event.target.value);}}>
             <option value="" disabled>{issuable.length ? '请选择分组' : '没有可发卡的分组'}</option>
             {issuable.map(group => <option key={String(group.id)} value={String(group.id)}>{String(group.name ?? group.id)}</option>)}
           </select>
@@ -791,7 +936,9 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
         <label className="field"><span className="field-label">备注</span>
           <input aria-label="备注" maxLength={60} placeholder="例：淘宝 9 月 / 客户张三（可选）" value={batchNote} disabled={generating} onChange={event => setBatchNote(event.target.value)}/></label>
       </div>
-      <p className="batch-summary" aria-label="发卡摘要">合计 {validCount && tier ? formatCount(tier.points * countValue) : '—'} 积分 · 面值 {validCount && tier ? formatMoney(tier.price_cny * countValue * 1_000_000) : '—'} · 每张 1 台设备 · 有效期 30 天（激活起算）</p>
+      {mismatch && tier && selectedGroup && <p className="field-warning batch-mismatch" role="note">这个套餐默认发到「{String(defaultGroup?.name ?? tier.default_group_id)}」{issuable.some(group => group.id === tier.default_group_id) ? '' : '（现在不能发卡）'}，这次发到「{String(selectedGroup.name ?? selectedGroup.id)}」：卡按这个分组的模型和扣费规则使用</p>}
+      <p className="batch-summary" aria-label="发卡摘要">合计 {validCount && tier ? formatCount(tier.points * countValue) : '—'} 积分 · 售价合计 {validCount && tier ? formatMoney(priceMicro(tier) * countValue) : '—'}（按套餐价） · 每张 1 台设备 · 有效期 {tier ? tier.validity_days : '—'} 天（激活起算）</p>
+      {tier && <p className="batch-customer" aria-label="客户看到">客户看到：{customerView(tier)}</p>}
       <div className="modal-actions">
         <button type="button" className="btn" disabled={generating} onClick={() => setShowBatch(false)}>取消</button>
         <button type="button" className="btn btn-primary" disabled={!!generateBlocked || generating || loading} title={generateBlocked} onClick={() => void generate()}>
@@ -799,10 +946,11 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
       </div>
     </Modal>}
 
-    {detailCard && <CardDrawer card={detailCard} groupName={id => groupName(id)} hasPrev={detailIndex > 0} hasNext={detailIndex >= 0 && detailIndex < filtered.length - 1}
-      onMove={moveDetail} onClose={() => setDetailId(null)} onReveal={card => void reveal(card)} onAdjust={openAdjust}
+    {detailCard && <CardDrawer card={detailCard} state={cardState(detailCard, nowSecs)} groupName={id => groupName(id)} hasPrev={detailIndex > 0} hasNext={detailIndex >= 0 && detailIndex < filtered.length - 1}
+      onMove={moveDetail} onClose={() => setDetailId(null)} onReveal={card => void reveal(card)} onAdjust={card => openAdjust(card)}
+      onCompensate={(card, requests) => {const prefill = compensation(card.id, requests); if (prefill) openAdjust(card, prefill);}}
       onStatus={(card, action) => void changeStatus(card, action)} onOpenTrace={onOpenTrace}
-      revealDisabled={revealing || bulkBusy} blocked={blocked} blockedTitle={staleTitle}/>}
+      revealDisabled={revealing || bulkBusy} blocked={blocked} blockedTitle={staleTitle} support={support}/>}
 
     {adjustCard && <Modal label="卡密调账" onClose={closeAdjust} busy={mutationBusy} className="dialog-form">
       <h3 className="modal-title">调整积分 · <span className="mono">{shortId(adjustCard.id, 'card')}</span></h3>
@@ -813,6 +961,7 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
         <button type="button" className="btn btn-small" disabled={mutationBusy} onClick={() => void clearZeroMicro()}>清除零微积分意图</button>
       </div>}
       <p className="adjust-balance">当前余额 <b>{formatCredits(adjustCard.pointsAvailable)}</b> 积分</p>
+      {linkLine && <p className="note-info adjust-link">{linkLine}</p>}
       <div className="adjust-row">
         <div className="segmented" role="radiogroup" aria-label="调账方向">
           {(['add', 'deduct'] as const).map(direction => <button key={direction} type="button" role="radio" aria-checked={adjustDirection === direction}
@@ -830,6 +979,15 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
       {adjustStep === 'review' && adjustDelta !== null && <div className="review-box" aria-label="调账复核">
         <p><span className="mono">{shortId(adjustCard.id, 'card')}</span>：{formatCredits(adjustCard.pointsAvailable)} → <b>{formatCredits(adjustCard.pointsAvailable + adjustDelta)}</b>（{signed(adjustDelta)}）</p>
         <p>原因：{reasonText}</p>
+        {linkedRequest && <p>关联请求：<span className="mono" title={linkedRequest}>{shortId(linkedRequest, 'trace')}</span>（写进这张卡的操作记录，可从记录打开这次请求）</p>}
+        {/* Without a request named, the server cannot tell whether these were already compensated. */}
+        {!pendingIntent && adjustLink && !adjustLink.invocationId && <p className="is-warning">
+          {adjustLink.requests > 1 ? `这 ${adjustLink.requests} 次请求不关联到调账` : '这次请求的编号不能关联'}：服务器不能检查{adjustLink.requests > 1 ? '它们' : '它'}是否已经补偿过，请先核对这张卡的操作记录。</p>}
+      </div>}
+      {adjustRefusal && <div role="alert" className="form-error compensation-refusal" aria-label="服务器拒绝补偿">
+        <p><b>{refusalTitle(adjustRefusal)}</b></p>
+        {refusalFacts(adjustRefusal).map(line => <p key={line}>{line}</p>)}
+        {repeatable(adjustRefusal) && <p>确实要再补偿，点“仍要补偿”并写明理由。</p>}
       </div>}
       <div className="modal-actions">
         {adjustStep === 'form' ? <>
@@ -837,12 +995,13 @@ export default function CardsPage({cards, groups, configFailed, loading, failed,
           <button type="button" className="btn btn-primary" disabled={!adjustReady || mutationBusy || zeroMicro}
             title={adjustReady ? undefined : overdrawn ? '余额不足' : !reasonValid && adjustDelta !== null ? '填写原因后继续' : '填写数量和原因后继续'} onClick={() => setAdjustStep('review')}>下一步</button>
         </> : <>
-          <button type="button" className="btn" disabled={mutationBusy} onClick={() => setAdjustStep('form')}>返回修改</button>
-          <button type="button" className="btn btn-primary" disabled={mutationBusy} onClick={() => void submitAdjust()}>{mutationBusy ? '提交中…' : '确认入账'}</button>
+          <button type="button" className="btn" disabled={mutationBusy} onClick={() => {setAdjustStep('form'); setAdjustRefusal(null);}}>返回修改</button>
+          {adjustRefusal ? repeatable(adjustRefusal) && <button type="button" className="btn btn-danger" disabled={mutationBusy} onClick={() => void repeatCompensation()}>{mutationBusy ? '提交中…' : '仍要补偿…'}</button>
+            : <button type="button" className="btn btn-primary" disabled={mutationBusy} onClick={() => void submitAdjust()}>{mutationBusy ? '提交中…' : '确认入账'}</button>}
         </>}
       </div>
     </Modal>}
   </div>;
 }
 
-export {TIERS};
+

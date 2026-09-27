@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextUsageEvent {
+    /// Share of the context window in use, from 0 to 100: Kiro compacts at 80 and 95.
     #[serde(default)]
     pub context_usage_percentage: f64,
 }

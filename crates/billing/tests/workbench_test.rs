@@ -89,6 +89,7 @@ fn test_pricing_simulator_over_historical_usage() {
         credit_face_value_cny: 0.01,
         usd_cny_rate: 7.20,
         rate_updated_at_secs: now_secs,
+        ..BillingSettings::default()
     };
     engine.update_settings(settings);
 
@@ -114,6 +115,7 @@ fn test_pricing_simulator_over_historical_usage() {
         per_call_credit: 0,
         margin_multiplier: 1.20,
         effective_from_secs: now_secs,
+        official: None,
     };
     engine.upsert_rate_card_version(v1);
 
@@ -167,6 +169,7 @@ fn test_pricing_simulator_over_historical_usage() {
         per_call_credit: 0,
         margin_multiplier: 1.50,
         effective_from_secs: now_secs + 100,
+        official: None,
     };
 
     let sim = engine.simulate_candidate_pricing(&candidate, None, now_secs + 50, 30.0);
@@ -238,6 +241,7 @@ fn test_one_click_publish_rate_card_version_with_audit_log() {
         per_call_credit: 0,
         margin_multiplier: 1.25,
         effective_from_secs: now_secs,
+        official: None,
     };
 
     // Publish v1
@@ -269,6 +273,7 @@ fn test_one_click_publish_rate_card_version_with_audit_log() {
         per_call_credit: 0,
         margin_multiplier: 1.30,
         effective_from_secs: now_secs + 100,
+        official: None,
     };
 
     let audit2 = engine.publish_rate_card_version(

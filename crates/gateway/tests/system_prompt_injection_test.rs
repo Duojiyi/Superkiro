@@ -253,10 +253,13 @@ async fn test_system_prompt_injection_anthropic_flow() {
     assert_eq!(requests.len(), 1);
 
     let body_val: Value = serde_json::from_slice(&requests[0].body).unwrap();
-    // In Anthropic wire format, system prompt is placed in the top-level "system" key
+    // In Anthropic wire format, system prompt is placed in the top-level "system" key: as
+    // plain text for a one-shot like this one, which writes no prompt cache, and as a text
+    // block carrying a prompt-cache breakpoint otherwise.
     let system_str = body_val["system"]
         .as_str()
-        .expect("Anthropic body must have system string");
+        .or_else(|| body_val["system"][0]["text"].as_str())
+        .expect("Anthropic body must have system text");
     assert!(system_str.contains("COMPLIANCE_HEADER: Audit ID=group-anthropic-1 for User="));
     assert!(system_str.contains(&card_id));
 }

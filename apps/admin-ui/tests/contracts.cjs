@@ -27,7 +27,8 @@ for (const input of ['', '-1', 'NaN', 'Infinity', '1e3', '1.0000001', '900719925
     await api.batchCards(2, group, templateId);
     const call = calls.at(-1);
     assert.equal(call.url, '/api/v1/admin/cards/batch');
-    assert.deepEqual(JSON.parse(call.options.body), {count: 2, groupId: group, templateId, maxDevices: 1});
+    // The plan by its ID, and by templateId, its older name, for a server before the plan catalog.
+    assert.deepEqual(JSON.parse(call.options.body), {count: 2, groupId: group, planId: templateId, templateId, maxDevices: 1});
     assert.equal(call.options.headers.has('Authorization'), false);
     assert.equal(call.options.headers.get('x-csrf-token'), 'test-csrf');
     assert.equal(call.options.credentials, 'same-origin');
@@ -42,14 +43,28 @@ for (const input of ['', '-1', 'NaN', 'Infinity', '1e3', '1.0000001', '900719925
   assert.deepEqual(JSON.parse(calls.at(-1).options.body), {cardId: 'card-1'});
   for (const [run, endpoint, expected] of [
     [() => api.adjustBalance('card-1', -10, 'refund'), '/cards/adjust', {cardId:'card-1',deltaPoints:-10,reason:'refund'}],
+    [() => api.adjustBalance('card-1', 3.2, '补偿', 'key-1', 'card-1:inv-9'), '/cards/adjust', {cardId:'card-1',deltaPoints:3.2,reason:'补偿',idempotencyKey:'key-1',invocationId:'card-1:inv-9'}],
     [() => api.updateCardStatus('card-1', 'ban', 'abuse'), '/cards/status', {cardId:'card-1',action:'ban',reason:'abuse'}],
     [() => api.updateCardStatus('card-2', 'void', 'unused inventory'), '/cards/status', {cardId:'card-2',action:'void',reason:'unused inventory'}],
     [() => api.updateCardStatus('card-2', 'archive', 'cleanup'), '/cards/status', {cardId:'card-2',action:'archive',reason:'cleanup'}],
     [() => api.updateCardStatus('card-2', 'unarchive', 'review'), '/cards/status', {cardId:'card-2',action:'unarchive',reason:'review'}],
+    [() => api.updateCardStatus('card-3', 'unban', '误封'), '/cards/status', {cardId:'card-3',action:'unban',reason:'误封'}],
+    [() => api.unbindDevice('card-3', 'dev_1', '旧电脑损坏'), '/cards/devices/unbind', {cardId:'card-3',deviceId:'dev_1',reason:'旧电脑损坏'}],
+    [() => api.resetRebinds('card-3', '客户要求'), '/cards/rebinds/reset', {cardId:'card-3',reason:'客户要求'}],
+    [() => api.extendValidity(['card-1', 'card-2'], {days: 7}, '服务中断补偿'), '/cards/validity', {cardIds:['card-1','card-2'],days:7,reason:'服务中断补偿'}],
+    [() => api.extendValidity(['card-1'], {validUntilSecs: 1790000000}, '续费'), '/cards/validity', {cardIds:['card-1'],validUntilSecs:1790000000,reason:'续费'}],
+    [() => api.setCardNote('card-1', ''), '/cards/note', {cardId:'card-1',note:''}],
+    [() => api.changeCardGroup('card-1', 'group-pro', '客户升级套餐'), '/cards/group', {cardId:'card-1',groupId:'group-pro',reason:'客户升级套餐'}],
     [() => api.createAnnouncement('notice', 'body', 'warning', 3600), '/announcements', {title:'notice',content:'body',level:'warning',ttlSecs:3600}],
+    [() => api.createAnnouncement('维护', '正文', 'info', undefined, {startsAtSecs: 1790000000, endsAtSecs: 1790007200, audience: ['group-pro-plus']}), '/announcements',
+      {title:'维护',content:'正文',level:'info',startsAtSecs:1790000000,endsAtSecs:1790007200,audience:['group-pro-plus']}],
+    [() => api.editAnnouncement({id: 'ann-1', title: '维护（延期）', endsAtSecs: null}), '/announcements/edit', {id:'ann-1',title:'维护（延期）',endsAtSecs:null}],
     [() => api.withdrawAnnouncement('ann-1'), '/announcements/withdraw', {id:'ann-1'}],
     [() => api.updateProviderStatus('provider-1', false), '/providers/status', {providerId:'provider-1',enabled:false}],
     [() => api.pruneTraces(123), '/traces/prune', {cutoffSecs:123}],
+    [() => api.archiveLedger(1788000000), '/ledger/archive', {beforeTsSecs:1788000000}],
+    [() => api.updateProvider({id:'provider-1',name:'瀚月 Max',format:'open_ai'}), '/providers/update', {id:'provider-1',name:'瀚月 Max',format:'open_ai'}],
+    [() => api.deleteProvider('provider-1'), '/providers/delete', {id:'provider-1'}],
     [() => api.manageKey('save', {provider_id:'p',key_id:'k',allowed_models:[]}), '/providers/keys', {provider_id:'p',key_id:'k',allowed_models:[]}],
     [() => api.manageKey('discover', {provider_id:'p',key_id:'k'}), '/providers/keys/discover', {provider_id:'p',key_id:'k'}],
     [() => api.importProvider({providers:[]}), '/providers/import', {format:'cc_switch',content:{providers:[]}}],
@@ -87,10 +102,23 @@ for (const input of ['', '-1', 'NaN', 'Infinity', '1e3', '1.0000001', '900719925
  clearAdjustment(storage,intent);assert.equal(values.size,0);
  assert.throws(()=>saveAdjustment({...storage,setItem(){throw Error('denied');}},intent));
  values.set('superkiro.pending-adjustment.v1:admin','invalid');assert.throws(()=>loadAdjustment(storage,'admin'));
- console.log('PASS adjustment storage: whitelist, operator isolation, stable retry, clear, corrupt/denied');
+ // A compensation keeps the request it makes up for, so a retry names the same one.
+ values.clear();const linked={...intent,invocationId:'card-1:3f1c9a2e-inv'};saveAdjustment(storage,linked);
+ assert.deepEqual(JSON.parse(JSON.stringify(loadAdjustment(storage,'admin'))),linked);
+ assert.throws(()=>saveAdjustment(storage,intent),/已有未确认调账/,'the same intent without its request is another one');
+ values.set('superkiro.pending-adjustment.v1:admin',JSON.stringify({...intent,invocationId:'card-1:bad id'}));assert.throws(()=>loadAdjustment(storage,'admin'));
+ // 仍要补偿 is kept with the intent, so a retry still says it is meant; only for a linked request.
+ values.clear();const repeat={...linked,allowRepeat:true};saveAdjustment(storage,repeat);
+ assert.deepEqual(JSON.parse(JSON.stringify(loadAdjustment(storage,'admin'))),repeat);
+ for(const bad of [{...linked,allowRepeat:false},{...linked,allowRepeat:'yes'},{...intent,allowRepeat:true}]){values.set('superkiro.pending-adjustment.v1:admin',JSON.stringify(bad));assert.throws(()=>loadAdjustment(storage,'admin'));}
+ values.clear();
+ console.log('PASS adjustment storage: whitelist, operator isolation, stable retry, clear, corrupt/denied, the linked request kept');
 }
 {
- const {parseFinancialSettings,financialEstimates}=load('financial.ts');
+ const {parseFinancialSettings,financialEstimates,uncostedText}=load('financial.ts');
+ // Left out of the margin: settled at an estimated cost, or without any cost.
+ assert.deepEqual([uncostedText(1),uncostedText(3,3),uncostedText(1200,200),uncostedText(2,5)],
+   ['另有 1 次未设成本','另有 3 次成本为估算，没算进毛利','另有 1,200 次没算进毛利：成本为估算 200 次、未设成本 1,000 次','另有 2 次成本为估算，没算进毛利']);
  assert.deepEqual(JSON.parse(JSON.stringify(parseFinancialSettings('0.01','7.2'))),{credit_face_value_cny:0.01,usd_cny_rate:7.2});
  for(const value of ['', '0', '-1', 'Infinity', '1001'])assert.throws(()=>parseFinancialSettings(value,'7'));
  const data={basis:'retained_usage_ledger_estimate_not_cash_revenue',estimates:{retainedLedgerOnly:true,costedRequests:2,uncostedRequests:1,faceValueLessCostMicroCny:123,faceValueMarginPercentage:50}};
@@ -124,6 +152,13 @@ for (const input of ['', '-1', 'NaN', 'Infinity', '1e3', '1.0000001', '900719925
  assert(isUnsubmittedAdjustmentRejection(400,message,old));assert(isUnsubmittedAdjustmentRejection(400,message,{...old,delta:-0.0000001}));
  for(const [status,text,intent] of [[400,'another error',old],[409,message,old],[503,message,old],[400,message,{...old,delta:10}],[400,message,{...old,delta:0.0000005}]])assert.equal(isUnsubmittedAdjustmentRejection(status,text,intent),false);
  clearAdjustment(storage,old);assert.equal(values.size,0);
+ // A compensation the server would not make wrote nothing; the same answer for an unlinked adjustment is not trusted.
+ const comp={...old,delta:3.2,invocationId:'card-1:inv-1'};
+ for(const [status,text] of [[404,'Request card-1:inv-1 was not found'],[409,'Request card-1:inv-1 was made by card card-2, not card-1'],
+   [409,'Request card-1:inv-1 was charged 3.2 credits at 2026-09-26T07:34:00Z; a compensation of 5 credits is more than that; send allowRepeat with a reason to compensate more'],
+   [400,'allowRepeat needs a reason'],[400,'invocationId must be 1-257 ASCII letters, digits, -_.:']])assert(isUnsubmittedAdjustmentRejection(status,text,comp),text);
+ assert.equal(isUnsubmittedAdjustmentRejection(409,'Request card-1:inv-1 was made by card card-2, not card-1',{...comp,invocationId:undefined}),false);
+ assert.equal(isUnsubmittedAdjustmentRejection(503,'Request card-1:inv-1 was not found',comp),false);
  const roundedLegacy={...old,delta:0.0000009};values.set('superkiro.pending-adjustment.v1:admin',JSON.stringify(roundedLegacy));saveAdjustment(storage,roundedLegacy);assert.equal(loadAdjustment(storage,'admin').delta,0.0000009);
  console.log('PASS signed microcredit precision/bounds, legacy zero-micro recovery, narrow rejection whitelist');
 }
@@ -168,10 +203,15 @@ for (const input of ['', '-1', 'NaN', 'Infinity', '1e3', '1.0000001', '900719925
   username = 'admin'; await api.checkAuth(); assert.equal(api.authenticatedUsername, 'admin');
   await api.getTraces(500, 'card-1');
   assert.equal(calls.at(-1).url, '/api/v1/admin/traces?limit=500&card_id=card-1');
+  // A search sends only what is set, the card by the name every server reads; a space is %20, never +.
+  await api.searchTraces({fromSecs: 100, toSecs: 200, cardId: 'card 1', model: 'gpt-5', provider: 'hanyue-max', status: 'error'});
+  assert.equal(calls.at(-1).url, '/api/v1/admin/traces?limit=500&fromSecs=100&toSecs=200&card_id=card%201&model=gpt-5&provider=hanyue-max&status=error');
+  await api.searchTraces({limit: 9999, model: ''});
+  assert.equal(calls.at(-1).url, '/api/v1/admin/traces?limit=500');
   await api.getTraceContent('card-1:inv/2 x');
   const read = calls.at(-1);
   assert.equal(read.url, '/api/v1/admin/traces/content?invocation_id=card-1%3Ainv%2F2%20x');
   assert.equal(read.options.method, undefined); assert.equal(read.options.body, undefined);
   assert.equal(read.options.credentials, 'same-origin'); assert.equal(read.options.cache, 'no-store');
-  console.log('PASS session operator name, trace card filter and on-demand trace content request');
+  console.log('PASS session operator name, trace card filter, trace search and on-demand trace content request');
 })().catch(error => {console.error(error); process.exitCode = 1;});

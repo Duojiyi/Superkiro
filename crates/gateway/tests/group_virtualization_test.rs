@@ -117,10 +117,10 @@ async fn test_audit_b_group_virtual_plan_and_quota_isolation() {
     )
     .await;
     assert_eq!(status_pro, StatusCode::OK);
-    assert_eq!(
-        json_pro["subscriptionInfo"]["subscriptionTitle"],
-        "Legacy service plan"
-    );
+    assert!(json_pro["subscriptionInfo"]["subscriptionTitle"]
+        .as_str()
+        .unwrap()
+        .starts_with("Legacy service plan · 有效期至 "));
     let breakdown_pro = json_pro["usageBreakdownList"].as_array().unwrap();
     assert_eq!(breakdown_pro[0]["usageLimit"].as_f64().unwrap(), 100.0);
     assert_eq!(json_pro["overageConfiguration"]["overageEnabled"], false);
@@ -135,10 +135,10 @@ async fn test_audit_b_group_virtual_plan_and_quota_isolation() {
     )
     .await;
     assert_eq!(status_ent, StatusCode::OK);
-    assert_eq!(
-        json_ent["subscriptionInfo"]["subscriptionTitle"],
-        "Legacy service plan"
-    );
+    assert!(json_ent["subscriptionInfo"]["subscriptionTitle"]
+        .as_str()
+        .unwrap()
+        .starts_with("Legacy service plan · 有效期至 "));
     let breakdown_ent = json_ent["usageBreakdownList"].as_array().unwrap();
     assert_eq!(breakdown_ent[0]["usageLimit"].as_f64().unwrap(), 200.0);
 }
@@ -384,7 +384,8 @@ async fn test_audit_b_provider_binding_mode_isolation_shared_vs_dedicated() {
         }
     });
 
-    // 1. Shared group attempts to call dedicated provider -> FORBIDDEN 403
+    // 1. Shared group attempts to call dedicated provider: refused as a route it has not,
+    // never as AccessDenied, which Kiro takes for an expired login.
     let (status_shared, json_shared) = send_req(
         app.clone(),
         Method::POST,
@@ -393,12 +394,12 @@ async fn test_audit_b_provider_binding_mode_isolation_shared_vs_dedicated() {
         Body::from(serde_json::to_vec(&req_body).unwrap()),
     )
     .await;
-    assert_eq!(status_shared, StatusCode::FORBIDDEN);
-    assert_eq!(json_shared["__type"], "AccessDeniedException");
+    assert_eq!(status_shared, StatusCode::BAD_REQUEST);
+    assert_eq!(json_shared["__type"], "ValidationException");
     assert!(json_shared["message"]
         .as_str()
         .unwrap()
-        .contains("cannot access provider"));
+        .contains("没有可用于该模型的上游服务"));
 
     // 2. Dedicated group calls its dedicated provider -> OK 200
     let (status_dedicated, _) = send_req(

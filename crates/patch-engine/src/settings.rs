@@ -58,6 +58,8 @@ impl SettingsError {
 pub const MANAGED_KEYS: &[&str] = &[
     "kiroAuthConfig",
     "codewhisperer.config",
+    CLOUD_CONFIG_ENDPOINT,
+    REMOTE_SESSIONS_ENDPOINT,
     "kiroAgent.enableTabAutocomplete",
     "update.mode",
     "telemetry.telemetryLevel",
@@ -282,6 +284,10 @@ impl SettingsManager {
                     "endpoints": [{ "region": region, "endpoint": gw }]
                 }),
             ),
+            // Kiro's web-account services, which the gateway answers as not enabled for
+            // the account, so Kiro stops asking and shows nothing.
+            (CLOUD_CONFIG_ENDPOINT, json!(gw)),
+            (REMOTE_SESSIONS_ENDPOINT, json!(gw)),
         ];
         values.extend(
             our_preferences()
@@ -840,8 +846,21 @@ fn plain_folder(folder: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
+/// Where Kiro syncs steering, hooks, powers and agents kept in a Kiro web account from.
+/// Kiro 1.1 always has this on and sends the gateway's token to app.kiro.dev unless the
+/// setting names another endpoint; the first turn of every session waits for the answer
+/// (up to a minute), and a failure is shown as "Couldn't fetch your cloud config.".
+const CLOUD_CONFIG_ENDPOINT: &str = "kiroAgent.cloudConfig.endpoint";
+/// Where Kiro lists and opens cloud sessions, also always on, also to app.kiro.dev.
+const REMOTE_SESSIONS_ENDPOINT: &str = "kiroAgent.remoteSessions.endpoint";
+
 /// The keys that point Kiro's own traffic at an endpoint.
-const REDIRECTION_KEYS: [&str; 2] = ["kiroAuthConfig", "codewhisperer.config"];
+const REDIRECTION_KEYS: [&str; 4] = [
+    "kiroAuthConfig",
+    "codewhisperer.config",
+    CLOUD_CONFIG_ENDPOINT,
+    REMOTE_SESSIONS_ENDPOINT,
+];
 
 /// Whether any URL inside `value` is on one of `hosts`.
 fn names_host(value: &Value, hosts: &[String]) -> bool {

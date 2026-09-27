@@ -200,3 +200,65 @@ fn test_dynamic_quota_updates_and_template_propagation() {
     );
     assert_eq!(stored.monthly_credit_limit, None);
 }
+
+#[test]
+fn a_limit_refusal_says_how_much_of_the_usage_is_held() {
+    let engine = BillingEngine::new();
+    let mut card = Card::new("card-held", "group-default", 500 * MICRO_CREDITS_PER_CREDIT);
+    card.status = CardStatus::Active;
+    card.daily_credit_limit = Some(MICRO_CREDITS_PER_CREDIT);
+    card.monthly_credit_limit = Some(1_500_000);
+    engine.upsert_card(card);
+
+    // 10,000 output tokens at 60 credits per million: 0.6 credits each.
+    let params = ReservationEstimateParams::new(0, 10_000);
+    engine
+        .reserve("card-held", "inv-held-1", &params, BASE_TIME, 300)
+        .unwrap();
+    assert_eq!(
+        engine.reserve("card-held", "inv-held-2", &params, BASE_TIME, 300),
+        Err(BillingError::DailyLimitExceeded {
+            limit: MICRO_CREDITS_PER_CREDIT,
+            current: 600_000,
+            held: 600_000,
+            needed: 600_000,
+        })
+    );
+
+    // Settled, the same usage is no longer held.
+    let tokens = UsageTokens {
+        uncached_input_tokens: 0,
+        output_tokens: 10_000,
+        cache_creation_tokens: 0,
+        cache_read_tokens: 0,
+    };
+    engine
+        .settle("inv-held-1", &tokens, "m", "p", "t", BASE_TIME + 1)
+        .unwrap();
+    assert_eq!(
+        engine.reserve("card-held", "inv-held-3", &params, BASE_TIME + 2, 300),
+        Err(BillingError::DailyLimitExceeded {
+            limit: MICRO_CREDITS_PER_CREDIT,
+            current: 600_000,
+            held: 0,
+            needed: 600_000,
+        })
+    );
+
+    // The 30-day limit reports its holds the same way.
+    engine
+        .update_card_quotas("card-held", None, Some(None), None)
+        .unwrap();
+    engine
+        .reserve("card-held", "inv-held-4", &params, BASE_TIME + 3, 300)
+        .unwrap();
+    assert_eq!(
+        engine.reserve("card-held", "inv-held-5", &params, BASE_TIME + 3, 300),
+        Err(BillingError::MonthlyLimitExceeded {
+            limit: 1_500_000,
+            current: 1_200_000,
+            held: 600_000,
+            needed: 600_000,
+        })
+    );
+}

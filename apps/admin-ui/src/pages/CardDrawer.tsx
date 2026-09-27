@@ -1,18 +1,50 @@
 // One card at a glance: its facts, what happened to it (who and why), and its latest
-// requests, with the everyday actions at the bottom. Actions reuse the list's handlers, so
-// every confirmation and guard stays exactly as it is in the table.
+// requests, with the everyday actions at the bottom and the support ones beside the facts they
+// change (备注, 分组, 到期, 设备). Actions reuse the list's handlers, so every confirmation and
+// guard stays exactly as it is in the table.
 import {useEffect, useRef, useState} from 'react';
 import {adminApi, AdminApiError, type AdminCardItem, type AdminTrace, type CardEvent} from '../api';
+import {DAILY_WINDOW, daysText, historyDetail, historyLabel, limitsText, MONTHLY_WINDOW, noteProblem, rebindsToReset, rebindText} from '../cardSupport';
 import {IconChevronDown, IconChevronUp, IconClose, IconCopy} from '../components/icons';
 import {Drawer} from '../components/modal';
 import {copyText, IdCell, StatusBadge, Tag} from '../components/ui';
-import {formatBatchNote, formatCharge, formatCount, formatCredits, formatDateTime, formatFullDateTime, formatRemaining, shortId} from '../format';
-import {cardStatusView, traceStatusView} from '../status';
+import {formatBatchNote, formatCharge, formatCount, formatCredits, formatDateTime, formatExpired, formatFullDateTime, formatMoney, formatRelative, formatRemaining, shortId} from '../format';
+import {kiroLabel} from '../plans';
+import {CARD_LIMIT_REFUSALS, cardStatusView, repeatedRefusal, traceView} from '../status';
+import type {CardSupport} from './CardSupport';
 
-const ACTION_LABEL: Record<string, string> = {
-  issued: '发卡', activated: '激活', topup: '充值', adjust: '调账', freeze: '冻结', unfreeze: '解冻',
-  ban: '封禁', void: '永久作废', archive: '归档', unarchive: '取消归档',
-};
+/** 编辑备注 in place: Enter saves, Escape puts the note back; a refusal stays to be corrected. */
+function NoteEditor({card, disabled, disabledTitle, onSave}: {card: AdminCardItem; disabled: boolean; disabledTitle?: string; onSave: (note: string) => Promise<string | null>}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const [error, setError] = useState('');
+  const [saving, setSaving] = useState(false);
+  useEffect(() => {setDraft(null); setError('');}, [card.id]);
+  const problem = draft === null ? '' : noteProblem(draft);
+  const save = async () => {
+    if (draft === null || saving) return;
+    if (problem) {setError(problem); return;}
+    if (draft.trim() === (card.note ?? '').trim()) {setDraft(null); return;}
+    setSaving(true); setError('');
+    const failure = await onSave(draft);
+    setSaving(false);
+    if (failure) setError(failure); else setDraft(null);
+  };
+  if (draft === null) return <>
+    {card.note ? <span title={card.note}>{formatBatchNote(card.note)}</span> : <span className="muted">—</span>}
+    <button type="button" className="btn-text" disabled={disabled} title={disabledTitle} onClick={() => setDraft(card.note ?? '')}>编辑</button>
+  </>;
+  return <span className="note-editor">
+    <input aria-label="备注" value={draft} autoFocus disabled={saving} placeholder="留空即清除备注" onChange={event => {setDraft(event.target.value); setError('');}}
+      onKeyDown={event => {
+        if (event.key === 'Enter' && !event.nativeEvent.isComposing) {event.preventDefault(); void save();}
+        // Escape leaves the note as it was, not the drawer.
+        if (event.key === 'Escape') {event.preventDefault(); setDraft(null); setError('');}
+      }}/>
+    <button type="button" className="btn btn-small btn-primary" disabled={saving || !!problem} onClick={() => void save()}>{saving ? '保存中…' : '保存'}</button>
+    <button type="button" className="btn btn-small" disabled={saving} onClick={() => {setDraft(null); setError('');}}>取消</button>
+    {(error || problem) && <span role="alert" className="field-error">{error || problem}</span>}
+  </span>;
+}
 
 type Load<T> = {status: 'loading'} | {status: 'loaded'; value: T} | {status: 'missing' | 'error'; message: string};
 
@@ -38,8 +70,10 @@ function points(event: CardEvent): string {
   return `${event.points > 0 ? '+' : ''}${formatCredits(event.points)}`;
 }
 
-export default function CardDrawer({card, groupName, hasPrev, hasNext, onMove, onClose, onReveal, onAdjust, onStatus, onOpenTrace, revealDisabled, blocked, blockedTitle}: {
+export default function CardDrawer({card, state, groupName, hasPrev, hasNext, onMove, onClose, onReveal, onAdjust, onCompensate, onStatus, onOpenTrace, revealDisabled, blocked, blockedTitle, support}: {
   card: AdminCardItem;
+  /** Its status as it works now (a card past its date is expired). */
+  state: AdminCardItem['status'];
   groupName: (id: string) => string;
   hasPrev: boolean;
   hasNext: boolean;
@@ -47,28 +81,57 @@ export default function CardDrawer({card, groupName, hasPrev, hasNext, onMove, o
   onClose: () => void;
   onReveal: (card: AdminCardItem) => void;
   onAdjust: (card: AdminCardItem) => void;
+  /** 调账 with what these requests charged (补偿选中的请求). */
+  onCompensate: (card: AdminCardItem, requests: AdminTrace[]) => void;
   onStatus: (card: AdminCardItem, action: 'freeze' | 'unfreeze' | 'ban') => void;
-  /** Opens 调用追踪 for this card, with one request's details open when given. */
-  onOpenTrace: (cardId: string, traceId?: string) => void;
+  /** Opens 调用追踪 for this card, with one request's details open when given (by its ID, or its invocation ID). */
+  onOpenTrace: (cardId: string, traceId?: string, invocationId?: string) => void;
   revealDisabled: boolean;
   blocked: boolean;
   blockedTitle?: string;
+  /** 解封, 解绑设备, 重置换绑次数, 延长有效期, 备注 and 换分组. */
+  support: CardSupport;
 }) {
-  const view = cardStatusView(card.status);
+  const view = cardStatusView(state);
   // Reloaded when the card changes (after an action from here or the list).
   const [history, retryHistory] = useLoad(async () => {
     const result = await adminApi.getCardHistory(card.id);
     if (result.success !== true || !Array.isArray(result.events)) throw new Error('服务器未确认读取成功');
     return result.events;
-  }, [card.id, card.status, card.pointsAvailable, card.archivedAt]);
+  }, [card.id, JSON.stringify([card.status, card.pointsAvailable, card.archivedAt, card.note, card.groupId, card.validUntil, card.activationDurationSecs, card.boundDevices, card.rebindsUsed, card.rebindCooldownUntil,
+    card.maxConcurrency, card.dailyCreditLimit, card.monthlyCreditLimit]), support.revision]);
   const [recent, retryRecent] = useLoad(async () => {
     const result = await adminApi.getTraces(20, card.id);
     if (result.success !== true) throw new Error('服务器未确认读取成功');
     return result.traces as AdminTrace[];
   }, [card.id]);
+  const nowSecs = Date.now() / 1000;
   const remaining = card.validUntil ? formatRemaining(card.validUntil) : null;
+  const lapsed = state === 'expired' && card.validUntil != null && card.validUntil * 1000 <= Date.now();
   const body = useRef<HTMLDivElement>(null);
   useEffect(() => {body.current?.scrollTo?.({top: 0});}, [card.id]);
+  // Support actions wait for the list and for a result still to be checked; a voided card has none.
+  const supportBlocked = blocked || !!support.blockedTitle;
+  const supportTitle = support.blockedTitle ?? blockedTitle;
+  const voided = card.status === 'voided';
+  // A card that never expires (no date once activated, a zero validity before) has nothing to extend.
+  const extendable = !voided && card.archivedAt == null && (card.validUntil != null || (card.activatedAt == null && card.activationDurationSecs !== 0));
+  const allowance = rebindText(card, nowSecs);
+  // Requests ticked in 最近调用 to give back what they charged; only charged ones can be.
+  const [picked, setPicked] = useState<string[]>([]);
+  useEffect(() => {setPicked([]);}, [card.id, recent]);
+  const pickedRequests = recent.status === 'loaded' ? recent.value.filter(trace => picked.includes(trace.id)) : [];
+  const pickedMicro = pickedRequests.reduce((sum, trace) => sum + Number(trace.credits_charged ?? 0), 0);
+  // The customer's latest refusal for the card's own limits: one for the balance, while the balance is
+  // still short of what that request needed to start, is said beside the balance.
+  const refusal = recent.status === 'loaded' ? recent.value.find(trace => CARD_LIMIT_REFUSALS.includes(String(trace.error_class ?? ''))) : undefined;
+  const shortOf = refusal?.error_class === 'insufficient_balance' && typeof refusal.needed_micro_credits === 'number'
+    && card.availableCredits < refusal.needed_micro_credits ? refusal : undefined;
+  // An adjustment that made up for a request leads back to it: the recent one here, else on 调用追踪.
+  const openRequest = (invocationId: string) => {
+    const trace = recent.status === 'loaded' ? recent.value.find(item => item.invocation_id === invocationId) : undefined;
+    onOpenTrace(card.id, trace?.id, trace ? undefined : invocationId);
+  };
 
   return <Drawer id="card-detail" label="卡密详情" onClose={onClose}>
     <header className="drawer-head">
@@ -85,16 +148,38 @@ export default function CardDrawer({card, groupName, hasPrev, hasNext, onMove, o
     </header>
     <div className="drawer-body" ref={body}>
       <dl className="detail-list">
-        <dt>备注</dt><dd title={card.note || undefined}>{card.note ? formatBatchNote(card.note) : <span className="muted">—</span>}</dd>
-        <dt>分组</dt><dd>{groupName(card.groupId)}</dd>
-        <dt>余额</dt><dd><b>{formatCredits(card.pointsAvailable)}</b> / {formatCredits(card.pointsTotal)} 积分</dd>
+        <dt>备注</dt><dd><NoteEditor card={card} disabled={supportBlocked || voided} disabledTitle={voided ? '已作废' : supportTitle} onSave={note => support.saveNote(card, note)}/></dd>
+        <dt>分组</dt><dd>{groupName(card.groupId)}
+          {!voided && <button type="button" className="btn-text" disabled={supportBlocked} title={supportTitle ?? '换到别的分组（客户需要重新登录）'} onClick={() => support.changeGroup(card)}>换分组</button>}</dd>
+        {(card.plan || card.planName) && <><dt>套餐</dt><dd className="card-plan">{card.plan
+          // As it was when the card was issued: a later change to the plan does not reach this card.
+          ? <><b>{card.plan.name}</b> <span className="muted">{formatCount(card.plan.points)} 积分 · {formatMoney(card.plan.priceMicroCny)} · {card.plan.validityDays} 天 · 同时 {card.plan.concurrency} 个请求 · {kiroLabel(card.plan.kiroPlanType)}</span></>
+          : <><b>{card.planName}</b> <span className="muted" title="套餐目录之前发的卡，按发卡积分对应的档位">{kiroLabel(card.kiroPlanType)} · 按发卡积分对应</span></>}</dd></>}
+        <dt>余额</dt><dd><b>{formatCredits(card.pointsAvailable)}</b> / {formatCredits(card.pointsTotal)} 积分
+          {shortOf && <span className="balance-short" title={`${formatFullDateTime(shortOf.ts)} 的请求被拒绝：请求开始前要按最大输出预留积分`}>
+            余额不够开始 {shortOf.exposed_model || '这个模型'}（约需 {formatCredits(Number(shortOf.needed_micro_credits) / 1_000_000)} 积分）· {formatRelative(shortOf.ts)}</span>}</dd>
+        {typeof card.maxConcurrency === 'number' && <><dt>限额</dt><dd className="card-limits">
+          <span title={`${DAILY_WINDOW}；${MONTHLY_WINDOW}`}>{limitsText(card)}</span>
+          {!voided && <button type="button" className="btn-text" disabled={supportBlocked} title={supportTitle ?? '修改同时请求数和每日、近 30 天的积分上限'} onClick={() => support.changeQuotas(card)}>修改</button>}</dd></>}
         <dt>到期</dt><dd>{card.validUntil
-          ? <span title={formatFullDateTime(card.validUntil)}>{formatDateTime(card.validUntil)}{remaining && <span className={`remaining is-${remaining.tone}`}>（{remaining.text}）</span>}</span>
-          : <span className="muted">激活后起算</span>}</dd>
+          ? <span title={formatFullDateTime(card.validUntil)}>{formatDateTime(card.validUntil)}{lapsed
+            // What the date means for the customer: how long ago, and the balance they can no longer use.
+            ? <span className="remaining is-danger">（{formatExpired(card.validUntil)}{card.pointsAvailable > 0 ? ` · ${formatCredits(card.pointsAvailable)} 积分已不可用` : ''}）</span>
+            : remaining && <span className={`remaining is-${remaining.tone}`}>（{remaining.text}）</span>}</span>
+          : <span className="muted">{typeof card.activationDurationSecs === 'number' && card.activationDurationSecs > 0 ? `激活后起算 · 有效 ${daysText(card.activationDurationSecs)}` : '激活后起算'}</span>}
+          {extendable && <button type="button" className="btn-text" disabled={supportBlocked} title={supportTitle ?? '延长这张卡的有效期'} onClick={() => support.extend([card])}>延长</button>}</dd>
         <dt>激活时间</dt><dd>{card.activatedAt ? <span title={formatFullDateTime(card.activatedAt)}>{formatDateTime(card.activatedAt)}</span> : <span className="muted">未激活</span>}</dd>
-        <dt>设备</dt><dd>{card.boundDevices?.length
-          ? <span className="device-list">{card.boundDevices.map(device => <IdCell key={device} value={device} kind="device"/>)}<span className="muted">（最多 {card.maxDevices} 台）</span></span>
-          : <span className="muted">未绑定</span>}</dd>
+        <dt>设备</dt><dd className="device-block">
+          {card.boundDevices?.length
+            ? <span className="device-list">{card.boundDevices.map(device => <span key={device} className="device-item"><IdCell value={device} kind="device"/>
+              <button type="button" className="btn-text" disabled={supportBlocked} title={supportTitle ?? '解绑这台设备（不占用客户的换绑次数）'} onClick={() => support.unbind(card, device)}>解绑</button></span>)}
+              <span className="muted">（最多 {card.maxDevices} 台）</span></span>
+            : <span className="muted">未绑定</span>}
+          {allowance && <span className="rebind-line">
+            <span className={Number(card.rebindCooldownUntil) > nowSecs || (card.rebindsUsed ?? 0) >= (card.maxRebinds ?? Infinity) ? 'is-warning' : 'muted'}>{allowance}</span>
+            {rebindsToReset(card, nowSecs) && <button type="button" className="btn-text" disabled={supportBlocked} title={supportTitle ?? '让客户重新有全部的自助换绑次数'} onClick={() => support.resetRebinds(card)}>重置换绑次数</button>}
+          </span>}
+        </dd>
       </dl>
 
       <section className="drawer-section" aria-label="操作记录">
@@ -105,13 +190,18 @@ export default function CardDrawer({card, groupName, hasPrev, hasNext, onMove, o
         {history.status === 'loaded' && (history.value.length
           ? <div className="table-scroll"><table className="table table-compact history-table">
             <thead><tr><th>时间</th><th>动作</th><th className="num">积分</th><th>操作人</th><th>原因</th></tr></thead>
-            <tbody>{history.value.map((event, index) => <tr key={index}>
-              <td title={formatFullDateTime(event.ts)}>{formatDateTime(event.ts)}</td>
-              <td>{ACTION_LABEL[event.action] ?? event.action}</td>
-              <td className={`num${event.action !== 'issued' && event.points < 0 ? ' is-negative' : ''}`}>{points(event)}</td>
-              <td>{event.operator === 'system' ? '系统自动' : event.operator ?? '—'}</td>
-              <td className="col-reason" title={event.reason ?? undefined}><span className="clip clip-reason">{event.reason ?? '—'}</span></td>
-            </tr>)}</tbody>
+            <tbody>{history.value.map((event, index) => {
+              // What the change recorded besides who and why: the device, the new expiry, the groups.
+              const detail = historyDetail(event, groupName);
+              return <tr key={index}>
+                <td title={formatFullDateTime(event.ts)}>{formatDateTime(event.ts)}</td>
+                <td>{historyLabel(event.action)}{detail && <span className="history-detail" title={typeof event.detail?.deviceId === 'string' ? event.detail.deviceId : detail}>{detail}</span>}
+                  {event.invocationId && <button type="button" className="btn-text history-link" title={`打开这笔调账补偿的请求（${event.invocationId}）`} onClick={() => openRequest(String(event.invocationId))}>查看请求</button>}</td>
+                <td className={`num${event.action !== 'issued' && event.points < 0 ? ' is-negative' : ''}`}>{points(event)}</td>
+                <td>{event.operator === 'system' ? '系统自动' : event.operator ?? '—'}</td>
+                <td className="col-reason" title={event.reason ?? undefined}><span className="clip clip-reason">{event.reason ?? '—'}</span></td>
+              </tr>;
+            })}</tbody>
           </table></div>
           : <p className="empty-note">没有记录</p>)}
       </section>
@@ -119,30 +209,50 @@ export default function CardDrawer({card, groupName, hasPrev, hasNext, onMove, o
       <section className="drawer-section" aria-label="最近调用">
         <div className="section-head">
           <h4>最近调用</h4>
-          <button type="button" className="btn-text" onClick={() => onOpenTrace(card.id)}>在调用追踪中查看</button>
+          <span className="section-tools">
+            {pickedRequests.length > 0 && <button type="button" className="btn btn-small" disabled={blocked || voided} title={voided ? '已作废，不能调账' : blockedTitle}
+              onClick={() => onCompensate(card, pickedRequests)}>补偿选中的 {pickedRequests.length} 次（{formatCharge(pickedMicro)} 积分）</button>}
+            <button type="button" className="btn-text" onClick={() => onOpenTrace(card.id)}>在调用追踪中查看</button>
+          </span>
         </div>
         {recent.status === 'loading' && <div className="skeleton" role="status" aria-label="正在加载"><span className="skeleton-bar"/></div>}
         {(recent.status === 'missing' || recent.status === 'error') && <div className="inline-state"><span>读取失败：{recent.message}</span><button type="button" className="btn btn-small" onClick={retryRecent}>重试</button></div>}
         {recent.status === 'loaded' && (recent.value.length
           ? <div className="table-scroll"><table className="table table-compact recent-table">
-            <thead><tr><th>时间</th><th>模型</th><th className="col-status">结果</th><th className="num">扣费</th></tr></thead>
-            <tbody>{recent.value.map(trace => <tr key={trace.id} className="is-clickable" title="查看这次请求" onClick={() => onOpenTrace(card.id, trace.id)}>
+            <thead><tr><th className="col-check"><span className="sr-only">补偿</span></th><th>时间</th><th>模型</th><th className="col-status">结果</th><th className="num">扣费</th></tr></thead>
+            <tbody>{recent.value.map(trace => {
+              const charged = Number(trace.credits_charged ?? 0) > 0;
+              // Ticking a request to compensate is not a request for its details.
+              return <tr key={trace.id} className="is-clickable" title="查看这次请求" onClick={event => {if (!(event.target instanceof Element && event.target.closest('input'))) onOpenTrace(card.id, trace.id);}}>
+              <td className="col-check"><input type="checkbox" aria-label={`补偿 ${formatDateTime(trace.ts)} 的请求`} disabled={!charged} title={charged ? '选中后可一起补偿扣费' : '这次请求没有扣费'}
+                checked={picked.includes(trace.id)} onChange={event => {const on = event.currentTarget.checked; setPicked(ids => on ? [...ids, trace.id] : ids.filter(id => id !== trace.id));}}/></td>
               <td title={formatFullDateTime(trace.ts)}>{formatDateTime(trace.ts)}</td>
               <td><span className="clip clip-model">{trace.exposed_model ?? '—'}</span></td>
-              <td className="col-status"><StatusBadge view={traceStatusView(trace.status)}/></td>
+              <td className="col-status"><StatusBadge view={traceView(trace, Date.now() / 1000)}/>{repeatedRefusal(trace) && <span className="repeat-count" title={repeatedRefusal(trace)!.title}>{repeatedRefusal(trace)!.text}</span>}</td>
               <td className="num">{formatCharge(trace.credits_charged)}</td>
-            </tr>)}</tbody>
+            </tr>;
+            })}</tbody>
           </table></div>
           : <p className="empty-note">还没有调用</p>)}
         {recent.status === 'loaded' && recent.value.length >= 20 && <p className="muted">只显示最近 {formatCount(20)} 次</p>}
       </section>
+      {!voided && <section className="drawer-section danger-zone" aria-label="危险操作">
+        <h4>危险操作</h4>
+        <div className="danger-actions">
+          <button type="button" className="btn btn-danger" disabled={supportBlocked || card.archivedAt != null}
+            title={card.archivedAt != null ? '已归档的卡要先取消归档，再更换卡密' : supportTitle ?? '卡密泄露或电脑丢失时换一个新卡密：旧卡密和所有登录马上失效'} onClick={() => support.rekey(card)}>更换卡密</button>
+          <span className="muted">旧卡密和这张卡的所有登录马上失效，客户用新卡密重新登录；余额和有效期不变。</span>
+        </div>
+      </section>}
     </div>
     <footer className="drawer-foot">
-      <button type="button" className="btn" disabled={revealDisabled || !card.codeRecoverable} title={card.codeRecoverable ? undefined : '此卡未保存明文'} onClick={() => onReveal(card)}>查看卡密</button>
+      <button type="button" className="btn" disabled={revealDisabled || !card.codeRecoverable} title={card.codeRecoverable ? '显示这张卡的卡密原文（会记录）' : '此卡未保存明文'} onClick={() => onReveal(card)}>显示卡密</button>
       <button type="button" className="btn" disabled={card.status === 'voided' || blocked} title={card.status === 'voided' ? '已作废，不能调账' : blockedTitle} onClick={() => onAdjust(card)}>调账</button>
-      {card.status === 'active' && <button type="button" className="btn" disabled={blocked} title={blockedTitle} onClick={() => onStatus(card, 'freeze')}>冻结</button>}
-      {card.status === 'frozen' && <button type="button" className="btn" disabled={blocked} title={blockedTitle} onClick={() => onStatus(card, 'unfreeze')}>解冻</button>}
-      {!['banned', 'voided'].includes(card.status) && <button type="button" className="btn btn-danger" disabled={blocked} title={blockedTitle} onClick={() => onStatus(card, 'ban')}>封禁</button>}
+      {state === 'active' && <button type="button" className="btn" disabled={blocked} title={blockedTitle} onClick={() => onStatus(card, 'freeze')}>冻结</button>}
+      {state === 'frozen' && <button type="button" className="btn" disabled={blocked} title={blockedTitle} onClick={() => onStatus(card, 'unfreeze')}>解冻</button>}
+      {card.status === 'banned' && <button type="button" className="btn" disabled={supportBlocked || card.archivedAt != null}
+        title={card.archivedAt != null ? '已归档的卡要先取消归档，再解封' : supportTitle ?? '恢复使用（需填写原因）'} onClick={() => support.unban(card)}>解封</button>}
+      {!['banned', 'voided'].includes(state) && <button type="button" className="btn btn-danger" disabled={blocked} title={blockedTitle} onClick={() => onStatus(card, 'ban')}>封禁</button>}
       <span className="muted drawer-foot-id">{shortId(card.id, 'card')}</span>
     </footer>
   </Drawer>;
