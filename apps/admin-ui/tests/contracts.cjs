@@ -185,10 +185,15 @@ for (const input of ['', '-1', 'NaN', 'Infinity', '1e3', '1.0000001', '900719925
   username = 'admin'; await api.checkAuth(); assert.equal(api.authenticatedUsername, 'admin');
   await api.getTraces(500, 'card-1');
   assert.equal(calls.at(-1).url, '/api/v1/admin/traces?limit=500&card_id=card-1');
+  // A search sends only what is set, the card by the name every server reads; a space is %20, never +.
+  await api.searchTraces({fromSecs: 100, toSecs: 200, cardId: 'card 1', model: 'gpt-5', provider: 'hanyue-max', status: 'error'});
+  assert.equal(calls.at(-1).url, '/api/v1/admin/traces?limit=500&fromSecs=100&toSecs=200&card_id=card%201&model=gpt-5&provider=hanyue-max&status=error');
+  await api.searchTraces({limit: 9999, model: ''});
+  assert.equal(calls.at(-1).url, '/api/v1/admin/traces?limit=500');
   await api.getTraceContent('card-1:inv/2 x');
   const read = calls.at(-1);
   assert.equal(read.url, '/api/v1/admin/traces/content?invocation_id=card-1%3Ainv%2F2%20x');
   assert.equal(read.options.method, undefined); assert.equal(read.options.body, undefined);
   assert.equal(read.options.credentials, 'same-origin'); assert.equal(read.options.cache, 'no-store');
-  console.log('PASS session operator name, trace card filter and on-demand trace content request');
+  console.log('PASS session operator name, trace card filter, trace search and on-demand trace content request');
 })().catch(error => {console.error(error); process.exitCode = 1;});

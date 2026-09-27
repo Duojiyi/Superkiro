@@ -64,7 +64,13 @@ const plain = value => JSON.parse(JSON.stringify(value));
   assert.equal(hash('traces', {traces: {search: 'trace-9', status: 'error', reason: 'no_route'}}), '#/traces?q=trace-9&status=error&reason=no_route');
   assert.equal(hash('providers', {providers: {key: 'k1', edit: 'k2'}}), '#/providers?key=k1&edit=k2');
   assert.equal(hash('reconciliation'), '#/finance');
-  for (const [tab, intent] of [['cards', {cards: {status: 'EXPIRED', quick: 'expiring', search: 'x y', open: 'card-2'}}], ['traces', {traces: {status: 'in_progress', window: 'hour', search: 'abc', provider: 'p', open: 't'}}]]) {
+  // 调用追踪's chosen range: local minutes, kept only with range=custom.
+  assert.deepEqual(parse('#/traces?range=custom&from=2026-09-26T08%3A30&to=2026-09-26T18:00'), {tab: 'traces', params: {range: 'custom', from: '2026-09-26T08:30', to: '2026-09-26T18:00'}});
+  assert.deepEqual(parse('#/traces?range=custom&from=yesterday&to=2026-09-26'), {tab: 'traces', params: {range: 'custom'}}, 'what is not a minute is dropped');
+  assert.equal(hash('traces', {traces: {window: 'custom', from: '2026-09-26T08:30', to: ''}}), '#/traces?range=custom&from=2026-09-26T08%3A30');
+  assert.equal(hash('traces', {traces: {window: 'day', from: '2026-09-26T08:30', to: '2026-09-26T18:00'}}), '#/traces?range=day', 'from and to belong to a chosen range');
+  for (const [tab, intent] of [['cards', {cards: {status: 'EXPIRED', quick: 'expiring', search: 'x y', open: 'card-2'}}], ['traces', {traces: {status: 'in_progress', window: 'hour', search: 'abc', provider: 'p', open: 't'}}],
+    ['traces', {traces: {status: 'error', window: 'custom', from: '2026-09-26T00:00', to: '2026-09-26T23:59', model: 'gpt-5'}}]]) {
     const again = route.intentOf(route.parseRoute(hash(tab, intent)));
     assert.equal(hash(tab, again), hash(tab, intent), `${tab}: an address read back gives the same address`);
   }

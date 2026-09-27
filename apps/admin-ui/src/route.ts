@@ -14,12 +14,13 @@ type Check = (value: string) => boolean;
 const text: Check = value => !!value && value.length <= 512 && !/[\x00-\x1f\x7f]/.test(value);
 const search: Check = value => text(value) && !looksLikeCardCode(value);
 const oneOf = (...values: string[]): Check => value => values.includes(value);
+const minute: Check = value => /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(value);
 
 // Each page's address, in this order; a default (当前, 全部) is left out.
 const PARAMS: Partial<Record<Tab, Record<string, Check>>> = {
   cards: {q: search, status: oneOf('UNACTIVATED', 'ACTIVE', 'FROZEN', 'BANNED', 'EXPIRED', 'ARCHIVED', 'VOIDED', 'ALL'),
     quick: oneOf('expiring', 'low'), group: text, open: text},
-  traces: {card: text, q: search, status: oneOf('error', 'client_aborted', 'in_progress', 'success'), range: oneOf('hour', 'day'),
+  traces: {card: text, q: search, status: oneOf('error', 'client_aborted', 'in_progress', 'success'), range: oneOf('hour', 'day', 'custom'), from: minute, to: minute,
     // An empty reason is 未分类: a filter of its own.
     reason: value => value === '' || text(value), model: text, provider: text, open: text},
   providers: {provider: text, key: text, edit: text},
@@ -54,7 +55,7 @@ export function routeHash({tab, params}: Route): string {
 /** Where a page starts from its address. */
 export function intentOf({tab, params}: Route): Intent {
   if (tab === 'cards') return {cards: {status: params.status as never, quick: params.quick as never, search: params.q, group: params.group, open: params.open}};
-  if (tab === 'traces') return {traces: {status: params.status as never, window: params.range as never, search: params.card ?? params.q,
+  if (tab === 'traces') return {traces: {status: params.status as never, window: params.range as never, from: params.from, to: params.to, search: params.card ?? params.q,
     card: params.card, reason: params.reason, model: params.model, provider: params.provider, open: params.open}};
   if (tab === 'providers') return {providers: {provider: params.provider, key: params.key, edit: params.edit}};
   return {};
@@ -66,7 +67,8 @@ export function routeOf(tab: Tab, intent: Intent = {}): Route {
   const raw: Record<string, string | undefined> = tab === 'cards' ? {q: cards?.search?.trim(), status: cards?.status === 'CURRENT' ? undefined : cards?.status,
       quick: cards?.quick, group: cards?.group === 'ALL' ? undefined : cards?.group, open: cards?.open}
     : tab === 'traces' ? {card: traces?.card, q: traces?.card ? undefined : traces?.search?.trim(), status: traces?.status === 'ALL' ? undefined : traces?.status,
-      range: traces?.window === 'all' ? undefined : traces?.window, reason: traces?.reason, model: traces?.model === 'ALL' ? undefined : traces?.model,
+      range: traces?.window === 'all' ? undefined : traces?.window, from: traces?.window === 'custom' ? traces.from : undefined, to: traces?.window === 'custom' ? traces.to : undefined,
+      reason: traces?.reason, model: traces?.model === 'ALL' ? undefined : traces?.model,
       provider: traces?.provider === 'ALL' ? undefined : traces?.provider, open: traces?.open}
     : tab === 'providers' ? {provider: providers?.provider, key: providers?.key, edit: providers?.edit} : {};
   return {tab, params: kept(tab, name => raw[name])};

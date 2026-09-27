@@ -9,7 +9,8 @@ export type Tab = 'overview' | 'cards' | 'traces' | 'groups' | 'models' | 'provi
 export type CardTab = 'CURRENT' | 'UNACTIVATED' | 'ACTIVE' | 'FROZEN' | 'BANNED' | 'EXPIRED' | 'ARCHIVED' | 'VOIDED' | 'ALL';
 export type CardQuickFilter = 'expiring' | 'low';
 export type TraceTab = 'ALL' | 'error' | 'client_aborted' | 'in_progress' | 'success';
-export type TraceWindow = 'hour' | 'day' | 'all';
+/** `custom`: from and to, local minutes (see traceQuery.ts). */
+export type TraceWindow = 'hour' | 'day' | 'all' | 'custom';
 
 /**
  * Where a page starts (from a link, or its address) and, reported back, where it is: its
@@ -18,8 +19,8 @@ export type TraceWindow = 'hour' | 'day' | 'all';
 export interface Intent {
   /** `compensate`: 调账 opens for that card with a request's charge (never kept in the address). */
   cards?: {status?: CardTab; quick?: CardQuickFilter; search?: string; group?: string; open?: string; compensate?: Compensation};
-  /** `card`: the search is exactly this card's ID. `reason`: a failure class under 失败. */
-  traces?: {status?: TraceTab; window?: TraceWindow; search?: string; card?: string; reason?: string; model?: string; provider?: string; open?: string};
+  /** `card`: the search is exactly this card's ID. `reason`: a failure class under 失败. `from`/`to`: a chosen range (2026-09-26T08:30). */
+  traces?: {status?: TraceTab; window?: TraceWindow; from?: string; to?: string; search?: string; card?: string; reason?: string; model?: string; provider?: string; open?: string};
   /** 上架模型 for this provider's upstream model (from 供应商与 Key). */
   models?: {list?: {providerId?: string; model?: string}};
   /** `provider` or `key`: what to point out; `edit`: the Key open in the editor. Key IDs are unique across providers. */

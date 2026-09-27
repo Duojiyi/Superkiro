@@ -1,6 +1,6 @@
 // The signed-in console: sidebar, topbar, the current page, and the data they share.
 import {useCallback, useEffect, useRef, useState} from 'react';
-import {adminApi, AdminApiError, type AdminAnnouncement, type AdminCardItem, type AdminFinancials, type AdminStats, type AdminTrace, type FinancialSettings} from './api';
+import {adminApi, AdminApiError, type AdminAnnouncement, type AdminCardItem, type AdminFinancials, type AdminStats, type AdminTrace, type FinancialSettings, type TraceTotals} from './api';
 import CommercialEditor from './CommercialEditor';
 import {ConfirmHost, confirmAction} from './components/confirm';
 import {IconClose, IconRefresh, IconWarning} from './components/icons';
@@ -39,6 +39,8 @@ export interface WorkspaceData {
   /** Today's (from local midnight), for 运营概览's 今日收入 / 成本 / 毛利; null when not read. */
   financialsToday: AdminFinancials | null;
   traces: AdminTrace[];
+  /** Over every kept request, of which `traces` are the latest (newer servers). */
+  tracesTotals: TraceTotals | null;
   providers: Row[];
   providerKeys: Row[];
   groups: Row[];
@@ -49,7 +51,7 @@ export interface WorkspaceData {
   revision?: string;
 }
 
-const EMPTY: WorkspaceData = {stats: null, cards: [], announcements: [], financials: null, financialsToday: null, traces: [], providers: [], providerKeys: [], groups: [], models: [], rateCards: []};
+const EMPTY: WorkspaceData = {stats: null, cards: [], announcements: [], financials: null, financialsToday: null, traces: [], tracesTotals: null, providers: [], providerKeys: [], groups: [], models: [], rateCards: []};
 
 type Section = 'stats' | 'cards' | 'announcements' | 'financials' | 'traces' | 'providers' | 'config';
 const SECTION_NAMES: Record<Section, string> = {stats: '统计', cards: '卡密', announcements: '公告', financials: '财务', traces: '调用追踪', providers: '供应商', config: '配置'};
@@ -199,6 +201,7 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
         financials: financials?.success ? financials : previous.financials,
         financialsToday: today?.success ? today : null,
         traces: traces?.success ? traces.traces : previous.traces,
+        tracesTotals: traces?.success ? traces.totals ?? null : previous.tracesTotals,
         providers: providers?.success ? providers.providers ?? [] : previous.providers,
         providerKeys: providers?.success ? providers.keys ?? [] : previous.providerKeys,
         groups: config?.success && config.config ? config.config.groups : previous.groups,
@@ -420,7 +423,7 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
               selectionEpoch={selectionEpoch} intent={intent.cards} intentRevision={intentRevision} onRoute={reportRoute}
               updateCards={cards => setData(previous => ({...previous, cards}))}
               onOpenTrace={(cardId, traceId, invocationId) => void navigate('traces', {traces: {search: cardId, card: cardId, open: traceId ?? invocationId}})}/>}
-            {activeTab === 'traces' && <TracesPage traces={data.traces} cards={data.cards} providers={data.providers} loading={loading} failed={!!failures.traces}
+            {activeTab === 'traces' && <TracesPage traces={data.traces} totals={data.tracesTotals} cards={data.cards} providers={data.providers} loading={loading} failed={!!failures.traces}
               refresh={refreshData} guards={guards} reportError={reportError} intent={intent.traces} intentRevision={intentRevision} onRoute={reportRoute}
               onOpenCard={cardId => void navigate('cards', {cards: {status: 'ALL', search: cardId, open: cardId}})}
               onCompensate={prefill => void navigate('cards', {cards: {status: 'ALL', search: prefill.cardId, open: prefill.cardId, compensate: prefill}})}/>}

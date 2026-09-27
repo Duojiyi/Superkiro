@@ -104,6 +104,10 @@ export interface AdminTrace {
   attempt_chain?: AdminTraceAttempt[];
 }
 
+/** Over every kept request a search matched, not only those returned; a failure is status error. */
+export interface TraceTotals {count: number; failures: number; creditsCharged: number; costMicroCny: number}
+export interface TraceSearch {fromSecs?: number; toSecs?: number; cardId?: string; model?: string; provider?: string; status?: string; limit?: number}
+
 export interface TraceReply {
   status: string;
   error: string | null;
@@ -587,9 +591,21 @@ export class AdminApiClient {
   }
 
   /** The latest traces, newest first; `cardId` narrows them to one card on the server. */
-  async getTraces(limit = 500, cardId?: string): Promise<{ success: boolean; traces: AdminTrace[] }> {
+  async getTraces(limit = 500, cardId?: string): Promise<{ success: boolean; traces: AdminTrace[]; totals?: TraceTotals }> {
     const count = Math.min(500, Math.max(1, Math.floor(limit)));
     return this.request(`/api/v1/admin/traces?limit=${count}${cardId ? `&card_id=${encodeURIComponent(cardId)}` : ''}`);
+  }
+
+  /**
+   * The latest requests the server finds by time (from inclusive, to exclusive), card, model,
+   * provider (the one that answered or any attempted) and status, with totals over every one it
+   * matched. An older server reads only the card and sends no totals.
+   */
+  async searchTraces(search: TraceSearch): Promise<{ success: boolean; traces: AdminTrace[]; totals?: TraceTotals }> {
+    const pairs: Array<[string, string | number | undefined]> = [['limit', Math.min(500, Math.max(1, Math.floor(search.limit ?? 500)))],
+      ['fromSecs', search.fromSecs], ['toSecs', search.toSecs], ['card_id', search.cardId], ['model', search.model], ['provider', search.provider], ['status', search.status]];
+    const query = pairs.filter(([, value]) => value !== undefined && value !== '').map(([name, value]) => `${name}=${encodeURIComponent(String(value))}`).join('&');
+    return this.request(`/api/v1/admin/traces?${query}`);
   }
 
   /** One request's content and reply. Every read is logged by the server, naming the operator. */

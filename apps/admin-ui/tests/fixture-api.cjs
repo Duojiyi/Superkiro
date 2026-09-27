@@ -267,7 +267,23 @@ module.exports = function fixtureApi() {
       older.push({ts:(card.activatedAt??t)-86400,action:'issued',credits:card.creditTotal,points:card.pointsTotal,operator:'admin',reason:null});
       return reply({success:true,cardId,card:view(card),events:[...recent,...older.map(event=>({invocationId:null,detail:null,...event}))]});
     }
-    if(endpoint==='traces') {const cardId=url.searchParams.get('card_id'),limit=Number(url.searchParams.get('limit')||100);return reply({success:true,traces:traces.filter(t=>!cardId||t.card_id===cardId).slice(0,limit)});}
+    if(endpoint==='traces') {
+      // As the server searches: [fromSecs, toSecs), the card, the model asked for, a provider that answered or was attempted, the status; newest first, with totals over every match.
+      const bound=name=>{const value=url.searchParams.get(name);return value===null?undefined:/^\d+$/.test(value)?Number(value):NaN;};
+      const from=bound('fromSecs'),to=bound('toSecs');
+      if(Number.isNaN(from)||Number.isNaN(to))return reply({success:false,error:'fromSecs and toSecs must be whole seconds'},400);
+      if(from!==undefined&&to!==undefined&&from>=to)return reply({success:false,error:'fromSecs must be before toSecs'},400);
+      const text=name=>(url.searchParams.get(name)??'').trim()||undefined;
+      const status=text('status');
+      if(status&&!['success','error','client_aborted','in_progress'].includes(status))return reply({success:false,error:'status must be success, error, client_aborted or in_progress'},400);
+      const cardId=text('cardId')??text('card_id'),model=text('model'),provider=text('provider'),raw=url.searchParams.get('limit')??'';
+      const limit=Math.min(500,Math.max(1,/^\d+$/.test(raw)?Number(raw):100));
+      const found=traces.filter(t=>(from===undefined||t.ts>=from)&&(to===undefined||t.ts<to)&&(!cardId||t.card_id===cardId)&&(!model||t.exposed_model===model)
+        &&(!provider||t.provider_id===provider||(t.attempt_chain??[]).some(attempt=>attempt.provider_id===provider))&&(!status||t.status===status));
+      const totals={count:found.length,failures:found.filter(t=>t.status==='error').length,creditsCharged:found.reduce((sum,t)=>sum+(t.credits_charged??0),0),costMicroCny:found.reduce((sum,t)=>sum+(t.provider_cost_micro_cny??0),0)};
+      const page=found.slice(0,limit);
+      return reply({success:true,count:page.length,traces:page,totals});
+    }
     if(endpoint==='traces/content') {const record=traceContent(url.searchParams.get('invocation_id'));return record?reply(record):reply({__type:'ResourceNotFoundException',message:'没有这次请求的内容（只保留 24 小时）'},404);}
     if(endpoint==='commercial-config') {
       if(req.method==='POST') {

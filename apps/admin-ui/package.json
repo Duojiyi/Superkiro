@@ -7,13 +7,13 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "test": "node tests/contracts.cjs && node tests/pricing-preview.cjs && node tests/model-rules.cjs && node tests/console-rules.cjs && node tests/auth-session.cjs && node tests/session-deadline.cjs && node tests/session-clock.cjs && node tests/cards-pagination.cjs && node tests/card-support-rules.cjs && node tests/period-rules.cjs && node tests/dev-proxy.cjs",
+    "test": "node tests/contracts.cjs && node tests/pricing-preview.cjs && node tests/model-rules.cjs && node tests/console-rules.cjs && node tests/auth-session.cjs && node tests/session-deadline.cjs && node tests/session-clock.cjs && node tests/cards-pagination.cjs && node tests/card-support-rules.cjs && node tests/period-rules.cjs && node tests/trace-rules.cjs && node tests/dev-proxy.cjs",
     "test:issuance": "node tests/issuance.cjs",
     "test:card-bulk": "node tests/card-bulk.cjs",
     "test:iteration": "node tests/iteration.cjs",
     "test:browser": "node tests/auth-gate.cjs",
     "test:usability": "node tests/public-login.cjs && node tests/usability.cjs",
-    "test:experience": "node tests/admin-experience.cjs && node tests/editor-experience.cjs && node tests/model-listing.cjs && node tests/route-health.cjs && node tests/publishing.cjs && node tests/model-routes.cjs && node tests/model-operations.cjs && node tests/provider-health.cjs && node tests/console-navigation.cjs && node tests/ledger-storage.cjs && node tests/providers-keys.cjs && node tests/card-handout.cjs && node tests/console-keyboard-layout.cjs && node tests/card-support.cjs && node tests/compensation.cjs && node tests/refusals.cjs && node tests/attempt-health.cjs && node tests/finance-period.cjs"
+    "test:experience": "node tests/admin-experience.cjs && node tests/editor-experience.cjs && node tests/model-listing.cjs && node tests/route-health.cjs && node tests/publishing.cjs && node tests/model-routes.cjs && node tests/model-operations.cjs && node tests/provider-health.cjs && node tests/console-navigation.cjs && node tests/ledger-storage.cjs && node tests/providers-keys.cjs && node tests/card-handout.cjs && node tests/console-keyboard-layout.cjs && node tests/card-support.cjs && node tests/compensation.cjs && node tests/refusals.cjs && node tests/attempt-health.cjs && node tests/finance-period.cjs && node tests/trace-search.cjs"
   },
   "dependencies": {
     "react": "^18.3.1",

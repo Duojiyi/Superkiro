@@ -1,21 +1,25 @@
 // 调用追踪: one line per request with the columns needed to find a problem, and details in
-// a drawer beside the list. Request content is read only when a content tab is opened.
+// a drawer beside the list. The server finds the requests by time, card, model, provider and
+// status among all it keeps, with totals; request content is read only when a content tab is opened.
 import {useEffect, useRef, useState} from 'react';
-import {adminApi, AdminApiError, type AdminCardItem, type AdminTrace, type TraceContent, type TraceReply} from '../api';
+import {adminApi, AdminApiError, type AdminCardItem, type AdminTrace, type TraceContent, type TraceReply, type TraceTotals} from '../api';
 import {confirmAction} from '../components/confirm';
 import {IconChevronDown, IconChevronUp, IconClose, IconCopy, IconDoc, IconSearch, IconSortDown, IconSortUp} from '../components/icons';
 import {Menu} from '../components/menu';
 import {Drawer, isModalOpen} from '../components/modal';
 import {toast} from '../components/toast';
 import {FilterTabs, IdCell, Pager, StatusBadge, TableState, TopbarActions, copyText, type TabOption} from '../components/ui';
-import {formatCharge, formatClock, formatCount, formatDateTime, formatDuration, formatFullDateTime, formatListTime, formatMoney, formatRelative, formatShortDate, formatSpeed, formatTokenCount} from '../format';
+import {formatCharge, formatClock, formatCount, formatDateTime, formatDuration, formatFullDateTime, formatListTime, formatMoney, formatMoneyExact, formatRelative, formatShortDate, formatSpeed, formatTokenCount} from '../format';
 import {cardCodeOf, cardIdForCode} from '../cardCode';
 import {compensation, type Compensation} from '../compensation';
 import {CARD_LIMIT_NOTE, CARD_LIMIT_REFUSALS, errorClassLabel, TRACE_IN_PROGRESS, traceFailureText, traceStatusView, traceStuck} from '../status';
+import {chargeTotal, failureBreakdown, inScope, minuteInput, spanText, traceBounds, traceTotals, type TraceScope, type TraceSpan} from '../traceQuery';
 import type {Intent, Refresh, ReportError, ReportRoute, Row, TraceTab, TraceWindow, WriteGuards} from '../types';
 import {ConversationView, RawView, ReplyView} from './TraceContent';
 
 const PAGE_SIZE = 50;
+// The most requests one search returns (the server's own limit).
+const LIMIT = 500;
 const RETENTION = 86400;
 // Why a request 进行中 for over 30 minutes is marked 可能已中断 (status.ts TRACE_STUCK_SECS).
 const STUCK_NOTE = '超过 30 分钟仍没有结果，可能已经中断（例如服务重启或连接断开）';
@@ -26,9 +30,16 @@ const statusMatches = (trace: AdminTrace, tab: TraceTab) =>
   tab === 'ALL' || (tab === 'in_progress' ? TRACE_IN_PROGRESS.includes(String(trace.status)) : trace.status === tab);
 const ttftTone = (ms: unknown) => typeof ms === 'number' ? (ms > 15000 ? 'is-danger' : ms > 5000 ? 'is-warning' : '') : '';
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
+const todayStart = () => {const now = new Date(); return minuteInput(new Date(now.getFullYear(), now.getMonth(), now.getDate()));};
+/** A server search's answer, for the filters it was asked with. */
+type Found = {key: string; traces: AdminTrace[]; totals: TraceTotals | null} | {key: string; failed: true};
+const answer = (found: Found | null, key: string) => (found && found.key === key && !('failed' in found) ? found : null);
 
-export default function TracesPage({traces, cards, providers = [], loading, failed, refresh, guards, reportError, intent, intentRevision = 0, onRoute, onOpenCard, onCompensate}: {
+export default function TracesPage({traces, totals = null, cards, providers = [], loading, failed, refresh, guards, reportError, intent, intentRevision = 0, onRoute, onOpenCard, onCompensate}: {
+  /** The latest requests, as the workspace reads them. */
   traces: AdminTrace[];
+  /** Over every request the server keeps (newer servers). */
+  totals?: TraceTotals | null;
   cards: AdminCardItem[];
   /** For providers' names; a trace names its provider by ID. */
   providers?: Row[];
@@ -56,6 +67,8 @@ export default function TracesPage({traces, cards, providers = [], loading, fail
   // Under 失败: one failure reason at a time.
   const [reason, setReason] = useState<string | null>(intent?.reason ?? null);
   const [range, setRange] = useState<TraceWindow>(intent?.window ?? 'all');
+  // 自定义: from its first minute to the end of its last; an empty end is open.
+  const [span, setSpan] = useState<TraceSpan>(() => ({from: intent?.from ?? todayStart(), to: intent?.to ?? ''}));
   const [sort, setSort] = useState<{key: SortKey; direction: 1 | -1}>({key: 'time', direction: -1});
   const [page, setPage] = useState(0);
   const [selectedId, setSelectedId] = useState<string | null>(intent?.open ?? null);
@@ -63,25 +76,53 @@ export default function TracesPage({traces, cards, providers = [], loading, fail
   const [followToken, setFollowToken] = useState(0);
   const [pruning, setPruning] = useState(false);
 
-  // A full card ID in the search box asks the server for that card's own latest requests,
-  // beyond the 500 kept in the global list.
+  // A full card ID in the search box, a time range, a model or a provider: the server finds the
+  // requests among all it keeps (not only the latest 500), with totals over every one it matched.
   const exactCard = cards.some(card => card.id === query.trim()) ? query.trim() : null;
-  const [cardScope, setCardScope] = useState<{cardId: string; traces: AdminTrace[] | null; failed?: boolean} | null>(null);
-  useEffect(() => {
-    if (!exactCard) {setCardScope(null); return;}
+  const nowSecs = Date.now() / 1000;
+  const bounds = traceBounds(range, span, nowSecs);
+  const scope: TraceScope | null = bounds ? {bounds, cardId: exactCard ?? undefined, model: model === 'ALL' ? undefined : model, provider: provider === 'ALL' ? undefined : provider} : null;
+  // 近 1 小时 and 近 24 小时 by name: their bounds move with the clock, and are taken when asking.
+  const scopeKey = JSON.stringify([range, range === 'custom' ? span : null, exactCard, model, provider]);
+  const unfiltered = range === 'all' && !exactCard && model === 'ALL' && provider === 'ALL';
+  const [found, setFound] = useState<Found | null>(null);
+  const [foundByStatus, setFoundByStatus] = useState<Found | null>(null);
+  const ask = (key: string, keep: (found: Found) => void, serverStatus?: TraceTab) => {
+    const at = traceBounds(range, span, Date.now() / 1000) ?? {};
     let current = true;
-    setCardScope({cardId: exactCard, traces: null});
-    adminApi.getTraces(500, exactCard).then(result => {
+    adminApi.searchTraces({...at, cardId: exactCard ?? undefined, model: model === 'ALL' ? undefined : model, provider: provider === 'ALL' ? undefined : provider,
+      status: serverStatus, limit: LIMIT}).then(result => {
       if (!current) return;
       if (result.success !== true) throw new Error('服务器未确认读取成功');
-      setCardScope({cardId: exactCard, traces: result.traces});
-    }).catch(() => {if (current) setCardScope({cardId: exactCard, traces: null, failed: true});});
+      keep({key, traces: result.traces, totals: result.totals ?? null});
+    }).catch(() => {if (current) keep({key, failed: true});});
     return () => {current = false;};
-  }, [exactCard, traces]);
-  const scopedToCard = !!cardScope && cardScope.cardId === exactCard && !!cardScope.traces;
-  const source = scopedToCard ? cardScope!.traces! : traces;
+  };
+  useEffect(() => {
+    if (unfiltered || !bounds) return;
+    return ask(scopeKey, setFound);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scopeKey, traces]);
+  const scopeData = unfiltered ? {traces, totals} : answer(found, scopeKey);
+  const scopeFailed = !unfiltered && !!bounds && found?.key === scopeKey && 'failed' in found;
+  const scopeLoading = !unfiltered && !!bounds && found?.key !== scopeKey;
+  // More matched than were returned: a status tab asks the server for its own latest requests.
+  const truncated = !!scopeData?.totals && scopeData.totals.count > scopeData.traces.length;
+  const statusKey = `${scopeKey}|${status}`;
+  useEffect(() => {
+    if (status === 'ALL' || !truncated || !bounds) return;
+    return ask(statusKey, setFoundByStatus, status);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [statusKey, truncated, traces]);
+  const byStatus = status !== 'ALL' && truncated ? answer(foundByStatus, statusKey) : null;
+  const statusLoading = status !== 'ALL' && truncated && foundByStatus?.key !== statusKey;
+  // Until the server answers, or when it cannot, the latest requests are narrowed here the same way;
+  // what an older server returns without reading the filters is too.
+  const scopeList = scopeData ?? {traces, totals};
+  const listedFrom = byStatus ?? scopeList;
+  const source = byStatus ? byStatus.traces.concat(scopeList.traces) : scopeList.traces;
 
-  useEffect(() => {setPage(0);}, [query, status, model, provider, reason, range, sort]);
+  useEffect(() => {setPage(0);}, [query, status, model, provider, reason, range, span, sort]);
   useEffect(() => {if (status !== 'error') setReason(null);}, [status]);
 
   // The address: Back and Forward bring the filters and details they name; changes are reported.
@@ -91,10 +132,11 @@ export default function TracesPage({traces, cards, providers = [], loading, fail
     appliedRevision.current = intentRevision;
     setQuery(intent?.search ?? ''); setStatus(intent?.status ?? 'ALL'); setModel(intent?.model ?? 'ALL'); setProvider(intent?.provider ?? 'ALL');
     setReason(intent?.reason ?? null); setRange(intent?.window ?? 'all'); setSelectedId(intent?.open ?? null);
+    if (intent?.window === 'custom') setSpan({from: intent.from ?? todayStart(), to: intent.to ?? ''});
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [intentRevision]);
-  useEffect(() => {onRoute?.({traces: {status, window: range, search: query, card: exactCard ?? undefined, reason: reason ?? undefined, model, provider, open: selectedId ?? undefined}});},
-    [onRoute, status, range, query, exactCard, reason, model, provider, selectedId]);
+  useEffect(() => {onRoute?.({traces: {status, window: range, from: span.from, to: span.to, search: query, card: exactCard ?? undefined, reason: reason ?? undefined, model, provider, open: selectedId ?? undefined}});},
+    [onRoute, status, range, span, query, exactCard, reason, model, provider, selectedId]);
 
   // A card code in the search box: its card ID takes its place once known.
   const [codeLookup, setCodeLookup] = useState<{cardId: string} | {error: string} | null>(null);
@@ -111,19 +153,26 @@ export default function TracesPage({traces, cards, providers = [], loading, fail
   const codeNote = !codeLookup ? null : 'error' in codeLookup ? codeLookup.error : query !== codeLookup.cardId ? null
     : cards.some(card => card.id === codeLookup.cardId) ? '按卡密找到 1 张' : loading ? '正在按卡密查找…' : `按卡密没有找到：没有卡密 ID 为 ${codeLookup.cardId} 的卡`;
 
-  const nowSecs = Date.now() / 1000;
   const text = query.trim().toLowerCase();
-  const scoped = source.filter(trace =>
-    (range === 'all' || Number(trace.ts) > nowSecs - (range === 'hour' ? 3600 : RETENTION)) &&
-    (model === 'ALL' || trace.exposed_model === model) &&
-    (provider === 'ALL' || trace.provider_id === provider) &&
-    (!text || [trace.id, trace.invocation_id, trace.card_id, trace.exposed_model].some(value => String(value ?? '').toLowerCase().includes(text))));
-  const filtered = scoped.filter(trace => statusMatches(trace, status) && (reason === null || String(trace.error_class ?? '') === reason));
+  const matches = (trace: AdminTrace) => !!scope && inScope(trace, scope) &&
+    (!text || [trace.id, trace.invocation_id, trace.card_id, trace.exposed_model].some(value => String(value ?? '').toLowerCase().includes(text)));
+  // The scope's requests of every status (for the tab counts), and those the status tab picks from.
+  const scoped = scopeList.traces.filter(matches);
+  const listed = byStatus ? byStatus.traces.filter(matches) : scoped;
+  const filtered = listed.filter(trace => statusMatches(trace, status) && (reason === null || String(trace.error_class ?? '') === reason));
   // Failure reasons among the failed requests in view, most frequent first.
-  const reasonCounts = [...scoped.filter(trace => trace.status === 'error').reduce((counts, trace) => {
+  const reasonCounts = [...listed.filter(trace => trace.status === 'error').reduce((counts, trace) => {
     const key = String(trace.error_class ?? '');
     return counts.set(key, (counts.get(key) ?? 0) + 1);
   }, new Map<string, number>())].sort((a, b) => b[1] - a[1]);
+  // Under 失败: which models and which providers they fail on.
+  const breakdown = failureBreakdown(status === 'error' ? filtered : []);
+  // Whether the list the filters ran over holds every match: the totals say, else fewer than a search returns.
+  const listedComplete = listedFrom.totals ? listedFrom.totals.count <= listedFrom.traces.length : listedFrom.traces.length < LIMIT;
+  // The totals of what is shown: the server's over every match, unless the search box or a reason narrows it further here.
+  const serverTotals = text || reason !== null ? null : status === 'ALL' ? scopeData?.totals ?? null : byStatus?.totals ?? null;
+  const footer = serverTotals ?? traceTotals(filtered);
+  const footerPartial = !serverTotals && !listedComplete;
   const sortValue = (trace: AdminTrace): number | null => sort.key === 'time' ? Number(trace.ts)
     : sort.key === 'ttft' ? (typeof trace.ttft_ms === 'number' ? trace.ttft_ms : null)
     : Number(trace.credits_charged ?? 0);
@@ -146,11 +195,22 @@ export default function TracesPage({traces, cards, providers = [], loading, fail
   const filtersActive = !!text || status !== 'ALL' || model !== 'ALL' || provider !== 'ALL' || reason !== null || range !== 'all';
   const resetFilters = () => {setQuery(''); setCodeLookup(null); setStatus('ALL'); setModel('ALL'); setProvider('ALL'); setReason(null); setRange('all'); setPage(0);};
   const providerName = (id: unknown) => String(providers.find(provider => provider.id === id)?.name || id);
-  const providerIds = Array.from(new Set(source.map(trace => String(trace.provider_id ?? '')).filter(Boolean))).sort();
-  const models = Array.from(new Set(source.map(trace => String(trace.exposed_model ?? '')).filter(Boolean))).sort();
-  const oldest = source.length ? Math.min(...source.map(trace => Number(trace.ts))) : null;
+  // Every provider a request was sent to (the filter matches attempts too), and every model asked for.
+  const seen = traces.concat(source);
+  const providerIds = Array.from(new Set([...seen.flatMap(trace => [trace.provider_id, ...(trace.attempt_chain ?? []).map(attempt => attempt.provider_id)])
+    .map(id => String(id ?? '')), provider === 'ALL' ? '' : provider].filter(Boolean))).sort();
+  const models = Array.from(new Set([...seen.map(trace => String(trace.exposed_model ?? '')), model === 'ALL' ? '' : model].filter(Boolean))).sort();
+  const oldest = listedFrom.traces.length ? Math.min(...listedFrom.traces.map(trace => Number(trace.ts))) : null;
+  const since = oldest ? `（${formatShortDate(oldest)} ${formatClock(oldest)} 起）` : '';
+  // With more matches than were returned, a tab's count is the server's where it has one.
+  const countOf = (value: TraceTab): number | undefined => {
+    if (!truncated || text || !scopeData?.totals) return scoped.filter(trace => statusMatches(trace, value)).length;
+    if (value === 'ALL') return scopeData.totals.count;
+    if (value === 'error') return scopeData.totals.failures;
+    return value === status && byStatus?.totals ? byStatus.totals.count : undefined;
+  };
   const tabs: TabOption<TraceTab>[] = ([['ALL', '全部'], ['error', '失败'], ['client_aborted', '中断'], ['in_progress', '进行中'], ['success', '成功']] as Array<[TraceTab, string]>)
-    .map(([value, label]) => ({value, label, count: scoped.filter(trace => statusMatches(trace, value)).length, tone: value === 'error' ? 'danger' : value === 'client_aborted' ? 'warning' : undefined}));
+    .map(([value, label]) => ({value, label, count: countOf(value), tone: value === 'error' ? 'danger' : value === 'client_aborted' ? 'warning' : undefined}));
 
   const open = (trace: AdminTrace) => {setSelectedId(trace.id); setFocusToken(token => token + 1);};
   const move = (step: number) => {
@@ -229,21 +289,45 @@ export default function TracesPage({traces, cards, providers = [], loading, fail
           </select>
         </label>}
         <div className="chips" role="group" aria-label="时间范围">
-          {([['hour', '近 1 小时'], ['day', '近 24 小时'], ['all', '全部']] as Array<[TraceWindow, string]>).map(([value, label]) =>
+          {([['hour', '近 1 小时'], ['day', '近 24 小时'], ['all', '全部'], ['custom', '自定义']] as Array<[TraceWindow, string]>).map(([value, label]) =>
             <button key={value} type="button" className="chip" aria-pressed={range === value} onClick={() => setRange(value)}>{label}</button>)}
         </div>
+        {range === 'custom' && <span className="span-fields" title="包含结束的那一分钟；不填结束时间就到现在">
+          <input type="datetime-local" aria-label="开始时间" value={span.from} max={span.to || undefined} onChange={event => setSpan(value => ({...value, from: event.target.value}))}/>
+          <span className="muted">至</span>
+          <input type="datetime-local" aria-label="结束时间" value={span.to} min={span.from || undefined} onChange={event => setSpan(value => ({...value, to: event.target.value}))}/>
+        </span>}
       </div>
       <FilterTabs label="追踪状态筛选" value={status} options={tabs} onChange={setStatus}/>
-      {status === 'error' && reasonCounts.length > 0 && <div className="chips reason-chips" role="group" aria-label="失败原因">
+      {status === 'error' && reasonCounts.length > 0 && <div className="chips reason-chips" role="group" aria-label="失败原因"><span className="chips-label">按原因</span>
         {reasonCounts.map(([key, count]) => <button key={key || 'none'} type="button" className="chip" aria-pressed={reason === key}
           onClick={() => setReason(current => current === key ? null : key)}>{key ? errorClassLabel(key) : '未分类'} <span className="chip-count">{count}</span></button>)}
+      </div>}
+      {status === 'error' && breakdown.models.length > 0 && <div className="failure-breakdown">
+        <div className="chips" role="group" aria-label="失败按模型"><span className="chips-label">按模型</span>
+          {breakdown.models.map(([name, count]) => name
+            ? <button key={name} type="button" className="chip" aria-pressed={model === name} title={model === name ? '再点一次看全部模型' : '只看这个模型'}
+              onClick={() => setModel(current => current === name ? 'ALL' : name)}>{name} <span className="chip-count">{count}</span></button>
+            : <span key="none" className="chip is-static">未记录模型 <span className="chip-count">{count}</span></span>)}
+        </div>
+        <div className="chips" role="group" aria-label="失败按供应商"><span className="chips-label" title="一次请求有几个供应商的尝试失败，就在每个供应商下各算一次">按供应商</span>
+          {breakdown.providers.map(([id, count]) => id
+            ? <button key={id} type="button" className="chip" aria-pressed={provider === id} title={provider === id ? '再点一次看全部供应商' : `只看发给 ${providerName(id)} 的请求（含改由备用完成的）`}
+              onClick={() => setProvider(current => current === id ? 'ALL' : id)}>{providerName(id)} <span className="chip-count">{count}</span></button>
+            : <span key="none" className="chip is-static" title="在发给上游之前就失败了（例如余额不足、没有可用线路）">未发给上游 <span className="chip-count">{count}</span></span>)}
+        </div>
+        {!listedComplete && <span className="muted">按已读取的最近 {formatCount(listedFrom.traces.length)} 次</span>}
       </div>}
     </div>
 
     <p className="filter-summary">
       {codeNote && <span role="status">{codeNote} · </span>}
-      {scopedToCard ? `这张卡最近 ${formatCount(source.length)} 次请求` : `最近 ${formatCount(source.length)} 次请求${oldest ? `（${formatShortDate(oldest)} ${formatClock(oldest)} 起）` : ''}`}
-      {cardScope?.failed && <span className="is-warning"> · 没能按这张卡查询，显示的是最近的请求</span>}
+      {!scope ? <span className="is-warning">时间范围不对：结束要晚于开始</span>
+        : scopeFailed ? <span className="is-warning">没能按筛选向服务器查询，显示的是最近 {formatCount(traces.length)} 次请求中匹配的</span>
+        : scopeLoading || statusLoading ? <span role="status">正在按筛选查询…</span>
+        : !listedFrom.totals || (unfiltered && !byStatus) ? <>最近 {formatCount(listedFrom.traces.length)} 次请求{since}{truncated && scopeData?.totals ? `，共保留 ${formatCount(scopeData.totals.count)} 次` : ''}</>
+        : listedFrom.totals.count > listedFrom.traces.length ? <>服务器按筛选找到 {formatCount(listedFrom.totals.count)} 次，显示最近 {formatCount(listedFrom.traces.length)} 次{since}</>
+        : <>服务器按筛选找到 {formatCount(listedFrom.totals.count)} 次{range === 'custom' ? `（${spanText(span)}）` : ''}</>}
       {filtersActive && <> · 匹配 {formatCount(filtered.length)} 条{filtered.length > 0 && <button type="button" className="btn-text" onClick={resetFilters}>清除筛选</button>}</>}
     </p>
 
@@ -285,11 +369,19 @@ export default function TracesPage({traces, cards, providers = [], loading, fail
               </span></td>
             </tr>;
           })}
-          {!filtered.length && <TableState colSpan={10} loading={loading || (!!exactCard && !cardScope?.traces && !cardScope?.failed)} failed={failed && !traces.length} onRetry={() => void refresh()}
-            empty={source.length ? '没有匹配的请求' : '暂无请求记录'}
-            action={source.length && filtersActive ? <button type="button" className="btn btn-small" onClick={resetFilters}>清除筛选</button> : undefined}/>}
+          {!filtered.length && <TableState colSpan={10} loading={loading || scopeLoading || statusLoading} failed={failed && !traces.length} onRetry={() => void refresh()}
+            empty={!scope ? '时间范围不对：结束要晚于开始' : unfiltered && !traces.length ? '暂无请求记录' : '没有匹配的请求'}
+            action={filtersActive && (traces.length || !unfiltered) ? <button type="button" className="btn btn-small" onClick={resetFilters}>清除筛选</button> : undefined}/>}
         </tbody>
       </table></div>
+      {scope && <div className="traces-totals" role="group" aria-label="合计">
+        <span className="totals-label">{filtersActive ? '筛选合计' : '合计'}</span>
+        <span>次数 <b>{formatCount(footer.count)}</b></span>
+        <span>失败 <b className={footer.failures ? 'is-danger' : undefined}>{formatCount(footer.failures)}</b></span>
+        <span>扣费 <b>{chargeTotal(footer.creditsCharged)}</b> 积分</span>
+        <span>成本 <b title={formatMoneyExact(footer.costMicroCny)}>{formatMoney(footer.costMicroCny)}</b></span>
+        {footerPartial && <span className="is-warning" title="匹配的请求比读取到的多：这里只加总了读取到的那些">只算已读取的 {formatCount(listedFrom.traces.length)} 次</span>}
+      </div>}
       <Pager page={currentPage} pageSize={PAGE_SIZE} total={filtered.length} onPage={setPage}/>
     </div>
 

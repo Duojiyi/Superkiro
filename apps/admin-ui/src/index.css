@@ -419,6 +419,16 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 /* What a change recorded (the device, the new expiry, the groups), under its action. */
 .history-detail {display: block; font-size: 12px; color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 220px;}
 .reason-chips {margin-top: 8px;}
+/* 调用追踪: a chosen time range, the failures by model and provider, and the totals of what is shown. */
+.span-fields {display: inline-flex; align-items: center; gap: 6px;}
+.span-fields input {min-height: 30px; height: 30px; padding: 0 8px; font-size: 13px;}
+.failure-breakdown {display: flex; flex-wrap: wrap; align-items: center; gap: 8px 20px; margin-top: 8px;}
+.chips-label {align-self: center; font-size: 12px; color: var(--text-3);}
+.chip.is-static {border-style: dashed;}
+.traces-totals {display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 18px; padding: 10px 16px; border-top: 1px solid var(--border-subtle); font-size: 13px; color: var(--text-2);}
+.traces-totals b {color: var(--text-1); font-weight: 600; font-variant-numeric: tabular-nums;}
+.traces-totals b.is-danger {color: var(--danger);}
+.totals-label {font-weight: 600; color: var(--text-1);}
 .range-line {margin: 0 0 -4px; font-size: 12px; color: var(--text-3);}
 .bulk-report.is-skipped {border-color: #e9c46a; background: var(--warning-bg); color: #7a4d00;}
 .bulk-report .report-skipped {color: #7a4d00;}
