@@ -1166,3 +1166,65 @@ async fn a_large_conversations_place_is_given_back_on_every_path() {
     assert_eq!(gate.in_use(), 0);
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
+
+/// Kiro's calls outside the conversation, at the paths and methods it uses, answered in
+/// forms it acts on or shows instead of the 404 fallback.
+#[tokio::test]
+async fn kiros_other_calls_are_answered_at_its_own_paths() {
+    let auth = gateway::auth::AuthState::with_default_dev_card();
+    let token = auth
+        .issue_token("card-dev-001", "group-pro-plus", 1, 3600)
+        .unwrap();
+    let app = FacadeRegistry::default().into_router_with_auth(auth);
+    let call = |method: Method, path: &'static str, signed_in: bool, body: &'static str| {
+        let app = app.clone();
+        let token = token.clone();
+        async move {
+            let mut request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json");
+            if signed_in {
+                request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            let response = app
+                .oneshot(request.body(Body::from(body)).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (
+                status,
+                serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+            )
+        }
+    };
+
+    // Autocomplete, which Kiro posts in lower case: no suggestions, and no error popup.
+    let (status, body) = call(Method::POST, "/generatecompletions", true, "{}").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["completions"], json!([]));
+    // Sign-out comes after Kiro has dropped its tokens, so it carries none.
+    let (status, _) = call(Method::POST, "/logout", false, r#"{"refreshToken":"r"}"#).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    // Kiro shows a 4xx's message after "Failed to delete account: ".
+    let (status, body) = call(Method::DELETE, "/account", true, "").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["message"].as_str().unwrap().contains("卡密"), "{body}");
+    // The overage toggle: "Unable to enable overages: {message}".
+    let (status, body) = call(
+        Method::POST,
+        "/setUserPreference",
+        true,
+        r#"{"overageConfiguration":{"overageStatus":"ENABLED"}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["__type"], "ValidationException");
+    assert!(
+        body["message"].as_str().unwrap().contains("预付费"),
+        "{body}"
+    );
+}

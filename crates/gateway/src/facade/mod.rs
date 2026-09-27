@@ -86,6 +86,29 @@ pub fn input_too_long(detail: &str) -> Response {
     )
 }
 
+/// How long a refusal waits for the rest of a request body it does not read.
+const DISCARD_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Reads and drops what is left of a request body, at most `limit` bytes and for at most
+/// 30 seconds, before a refusal is sent. Answered while the client is still sending, the
+/// refusal can reach it as a connection reset instead: the connection is closed with the
+/// body unread, and the proxy in front of the gateway resets it. Kiro then reports a
+/// network error and sends the whole body again.
+pub(crate) async fn discard_body(body: Body, limit: usize) {
+    use futures_util::StreamExt;
+    let mut chunks = body.into_data_stream();
+    let _ = tokio::time::timeout(DISCARD_WAIT, async {
+        let mut read = 0usize;
+        while let Some(Ok(chunk)) = chunks.next().await {
+            read = read.saturating_add(chunk.len());
+            if read > limit {
+                break;
+            }
+        }
+    })
+    .await;
+}
+
 /// Structured JSON success response helper.
 pub fn json_response<T: serde::Serialize>(status: StatusCode, data: &T) -> Response {
     (
@@ -152,6 +175,9 @@ impl FacadeRegistry {
         self.register(healthz::MetricsHandler::default())
             .register(oauth::OAuthTokenHandler::default())
             .register(oauth::RefreshTokenHandler::default())
+            .register(oauth::LogoutHandler)
+            .register(oauth::DeleteAccountHandler)
+            .register(usage::SetUserPreferenceHandler)
             .register(client::ClientNegotiateHandler)
             .register(client::ClientBeaconHandler)
             .register(client::ClientBrandHandler::default())
@@ -488,6 +514,7 @@ impl FacadeRegistry {
                 || path == "/oauth/token"
                 || path == "/oauth/token/refresh"
                 || path == "/refreshToken"
+                || path == "/logout"
                 || path == "/client/negotiate"
                 || path == "/api/v1/announcements"
                 || path == "/client/beacon"

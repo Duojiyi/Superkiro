@@ -131,5 +131,17 @@ pub(super) fn register(handlers: &mut Vec<Arc<dyn FacadeHandler>>) {
             }
         }
     }
+    // The CodeWhisperer runtime's own paths, as Kiro 1.1 sends them. Routes match exactly,
+    // and Kiro's autocomplete posts `/generatecompletions`: served only under its old
+    // name, it met the 404 fallback and Kiro showed an error on every pause in typing.
+    for (legacy, path) in [("/GenerateCompletions", "/generatecompletions")] {
+        if let Some(inner) = handlers.iter().rev().find(|h| h.path() == legacy).cloned() {
+            handlers.push(Arc::new(Alias {
+                path,
+                inner,
+                models: false,
+            }));
+        }
+    }
     handlers.push(Arc::new(rpc));
 }

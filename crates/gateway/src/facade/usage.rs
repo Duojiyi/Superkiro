@@ -83,6 +83,32 @@ pub struct GetUsageLimitsResponse {
     pub next_date_reset: Option<u64>,
 }
 
+/// Handler for `POST /setUserPreference`, which Kiro sends to turn overages on or off. A
+/// card is prepaid and has no overages; Kiro shows the message as "Unable to enable
+/// overages: {message}", where a 404 said only that the resource was not found.
+pub struct SetUserPreferenceHandler;
+
+impl FacadeHandler for SetUserPreferenceHandler {
+    fn method(&self) -> Method {
+        Method::POST
+    }
+
+    fn path(&self) -> &'static str {
+        "/setUserPreference"
+    }
+
+    fn handle<'a>(&'a self, req: Request<Body>) -> BoxFuture<'a, Response> {
+        Box::pin(async move {
+            super::discard_body(req.into_body(), 64 * 1024).await;
+            super::error_response(
+                StatusCode::BAD_REQUEST,
+                "ValidationException",
+                "本服务的积分为预付费，没有超额用量（overage）可以开启或关闭。",
+            )
+        })
+    }
+}
+
 /// Handler for `GET /getUsageLimits`
 #[derive(Clone, Default)]
 pub struct GetUsageLimitsHandler {
