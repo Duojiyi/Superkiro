@@ -587,17 +587,21 @@ export class AdminApiClient {
     return this.request('/api/v1/admin/cards/group', {method: 'POST', body: JSON.stringify({cardId, groupId, reason})});
   }
 
-  /** `invocationId`: the request the adjustment makes up for (a trace's invocation_id); the card's history keeps it. */
+  /**
+   * `invocationId`: the request the adjustment makes up for (a trace's invocation_id); the card's history keeps it.
+   * The server refuses to compensate a request twice or by more than it charged unless `allowRepeat` (with the reason).
+   */
   async adjustBalance(
     cardId: string,
     deltaPoints: number,
     reason: string,
     idempotencyKey: string,
-    invocationId?: string
+    invocationId?: string,
+    allowRepeat?: boolean
   ): Promise<AdminCardAdjustResponse> {
     return this.request('/api/v1/admin/cards/adjust', {
       method: 'POST',
-      body: JSON.stringify({ cardId, deltaPoints, reason, idempotencyKey, ...(invocationId ? {invocationId} : {}) }),
+      body: JSON.stringify({ cardId, deltaPoints, reason, idempotencyKey, ...(invocationId ? {invocationId} : {}), ...(invocationId && allowRepeat ? {allowRepeat: true} : {}) }),
     });
   }
 

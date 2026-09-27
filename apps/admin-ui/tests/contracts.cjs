@@ -107,6 +107,10 @@ for (const input of ['', '-1', 'NaN', 'Infinity', '1e3', '1.0000001', '900719925
  assert.deepEqual(JSON.parse(JSON.stringify(loadAdjustment(storage,'admin'))),linked);
  assert.throws(()=>saveAdjustment(storage,intent),/已有未确认调账/,'the same intent without its request is another one');
  values.set('superkiro.pending-adjustment.v1:admin',JSON.stringify({...intent,invocationId:'card-1:bad id'}));assert.throws(()=>loadAdjustment(storage,'admin'));
+ // 仍要补偿 is kept with the intent, so a retry still says it is meant; only for a linked request.
+ values.clear();const repeat={...linked,allowRepeat:true};saveAdjustment(storage,repeat);
+ assert.deepEqual(JSON.parse(JSON.stringify(loadAdjustment(storage,'admin'))),repeat);
+ for(const bad of [{...linked,allowRepeat:false},{...linked,allowRepeat:'yes'},{...intent,allowRepeat:true}]){values.set('superkiro.pending-adjustment.v1:admin',JSON.stringify(bad));assert.throws(()=>loadAdjustment(storage,'admin'));}
  values.clear();
  console.log('PASS adjustment storage: whitelist, operator isolation, stable retry, clear, corrupt/denied, the linked request kept');
 }
@@ -145,6 +149,13 @@ for (const input of ['', '-1', 'NaN', 'Infinity', '1e3', '1.0000001', '900719925
  assert(isUnsubmittedAdjustmentRejection(400,message,old));assert(isUnsubmittedAdjustmentRejection(400,message,{...old,delta:-0.0000001}));
  for(const [status,text,intent] of [[400,'another error',old],[409,message,old],[503,message,old],[400,message,{...old,delta:10}],[400,message,{...old,delta:0.0000005}]])assert.equal(isUnsubmittedAdjustmentRejection(status,text,intent),false);
  clearAdjustment(storage,old);assert.equal(values.size,0);
+ // A compensation the server would not make wrote nothing; the same answer for an unlinked adjustment is not trusted.
+ const comp={...old,delta:3.2,invocationId:'card-1:inv-1'};
+ for(const [status,text] of [[404,'Request card-1:inv-1 was not found'],[409,'Request card-1:inv-1 was made by card card-2, not card-1'],
+   [409,'Request card-1:inv-1 was charged 3.2 credits at 2026-09-26T07:34:00Z; a compensation of 5 credits is more than that; send allowRepeat with a reason to compensate more'],
+   [400,'allowRepeat needs a reason'],[400,'invocationId must be 1-257 ASCII letters, digits, -_.:']])assert(isUnsubmittedAdjustmentRejection(status,text,comp),text);
+ assert.equal(isUnsubmittedAdjustmentRejection(409,'Request card-1:inv-1 was made by card card-2, not card-1',{...comp,invocationId:undefined}),false);
+ assert.equal(isUnsubmittedAdjustmentRejection(503,'Request card-1:inv-1 was not found',comp),false);
  const roundedLegacy={...old,delta:0.0000009};values.set('superkiro.pending-adjustment.v1:admin',JSON.stringify(roundedLegacy));saveAdjustment(storage,roundedLegacy);assert.equal(loadAdjustment(storage,'admin').delta,0.0000009);
  console.log('PASS signed microcredit precision/bounds, legacy zero-micro recovery, narrow rejection whitelist');
 }

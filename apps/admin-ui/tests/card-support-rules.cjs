@@ -131,7 +131,30 @@ console.log('PASS: refused support actions are explained in words with their car
   const many = compensation.compensation('card-1', Array.from({length: 12}, (_, i) => ({...broken, ts: at + i * 60})), nowMs);
   assert.equal(many.reason, '补偿 12 次请求（09-26 15:34 至 09-26 15:45）', 'a long list is summed up by its times');
   assert.equal(many.points, '38.4');
+  // A trace names a request by its card, a colon and the client's ID: up to 257 characters.
+  assert.equal(compensation.linkableInvocation(`${'c'.repeat(128)}:${'i'.repeat(128)}`), true);
+  assert.equal(compensation.linkableInvocation(`${'c'.repeat(129)}:${'i'.repeat(128)}`), false);
   console.log('PASS: 补偿这次扣费 gives back the exact charge, names the request and its failure, links one request, and sums several in the reason');
+
+  // What the server found when it would not compensate a request (billing's check_compensation), in words.
+  const iso = secs => new Date(secs * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+  const id = 'card-1:3f1c9a2e-5b7d';
+  assert.deepEqual(plain(compensation.compensationRefusal(`Request ${id} was not found`)), {kind: 'unknown', invocationId: id});
+  assert.deepEqual(plain(compensation.compensationRefusal(`Request ${id} was made by card card-2, not card-1`)), {kind: 'otherCard', invocationId: id, cardId: 'card-2'});
+  const repeat = compensation.compensationRefusal(`Request ${id} was charged 3.2 credits at ${iso(at)}, and was already compensated 3.2 credits at ${iso(later)} by admin (补偿 (上游) 中断); send allowRepeat with a reason to compensate it again`);
+  assert.deepEqual(plain(repeat), {kind: 'repeat', invocationId: id, charged: '3.2', chargedAt: at, earlier: {credits: '3.2', at: later, operator: 'admin', reason: '补偿 (上游) 中断'}}, 'a reason may hold parentheses');
+  assert.deepEqual(plain(compensation.refusalFacts(repeat, nowMs)), ['这次请求 09-26 15:34 扣了 3.2 积分', '已在 09-26 16:34 由 admin 补偿过 3.2 积分（原因：补偿 (上游) 中断）']);
+  assert.equal(compensation.refusalTitle(repeat), '这次请求已经补偿过，没有入账');
+  const over = compensation.compensationRefusal(`Request ${id} was charged 0.5 credits at ${iso(at)}; a compensation of 5 credits is more than that; send allowRepeat with a reason to compensate more`);
+  assert.deepEqual(plain(over), {kind: 'over', invocationId: id, charged: '0.5', chargedAt: at, asked: '5'});
+  assert.deepEqual(plain(compensation.refusalFacts(over, nowMs)), ['这次请求 09-26 15:34 扣了 0.5 积分', '这次要补偿 5 积分，多于它扣的']);
+  assert.deepEqual([repeat, over, {kind: 'unknown', invocationId: id}, {kind: 'otherCard', invocationId: id, cardId: 'card-2'}].map(compensation.repeatable), [true, true, false, false], 'only a repeat or more than charged can be overridden');
+  assert.equal(compensation.compensationRefusal('Card card-1 not found'), null);
+  // 仍要补偿 keeps the adjustment's reason and adds why, within what the server takes.
+  assert.equal(compensation.repeatReason('补偿 09-26 15:34 gpt-5（输出中断）', ' 上次补偿后又失败了 '), '补偿 09-26 15:34 gpt-5（输出中断）；仍要补偿：上次补偿后又失败了');
+  assert.equal(compensation.repeatReason('补偿', ' '), null);
+  assert.equal(compensation.repeatReason('补'.repeat(490), '上次补偿不足'), null, 'longer than 500 characters together');
+  console.log('PASS: a compensation the server refuses is read with what it found (the charge, the earlier compensation); only a repeat or an over-charge is offered 仍要补偿, its reason kept with why');
 }
 
 // Requests the card's own balance or limits refused, in words.

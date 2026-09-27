@@ -173,7 +173,7 @@ const CARD_REFUSALS: Array<[RegExp, (rest: string, match: RegExpExecArray) => st
   [/The change could not be saved/i, () => '服务器没能保存这次修改，什么都没有改：请稍后重试'],
   [/cardId and deviceId are required|cardId and groupId are required|cardId is required|Invalid card ID in cardIds/i, () => '请求缺少卡密、设备或分组，请刷新后重试'],
   [/Invalid request body/i, () => '提交的内容无效，请刷新后重试'],
-  [/invocationId must be/i, () => '关联的请求编号无效'],
+  [/invocationId must be/i, () => '关联的请求编号无效（最多 257 个字母、数字或 - _ . :）'],
   [/Operator ID is required/i, () => '需要重新登录以确认操作人'],
 ];
 

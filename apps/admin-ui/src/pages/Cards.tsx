@@ -11,7 +11,7 @@ import {toast} from '../components/toast';
 import {FilterTabs, IdCell, Pager, StatusBadge, TableState, Tag, TopbarActions, type TabOption} from '../components/ui';
 import {formatBatchNote, formatCount, formatCredits, formatFullDateTime, formatMoney, formatRemaining, shortId} from '../format';
 import {cardCodeOf, cardIdForCode} from '../cardCode';
-import {compensation, type Compensation} from '../compensation';
+import {compensation, compensationRefusal, MAX_ADJUST_REASON, refusalFacts, refusalTitle, repeatable, repeatReason, type Compensation, type CompensationRefusal} from '../compensation';
 import {customerView, issuable as planIssuable, MULTI_DEVICE_NOTE, priceMicro} from '../plans';
 import {adjustmentPointsToMicro} from '../pricing';
 import {explainRefusal} from '../refusal';
@@ -197,6 +197,8 @@ export default function CardsPage({cards, groups, plans, configFailed, loading, 
   const [adjustStep, setAdjustStep] = useState<'form' | 'review'>('form');
   // The requests a compensation gives back, when 调账 was opened from them.
   const [adjustLink, setAdjustLink] = useState<Compensation | null>(null);
+  // The server would not make this compensation: what it found, until the adjustment is changed.
+  const [adjustRefusal, setAdjustRefusal] = useState<CompensationRefusal | null>(null);
   const adjustment = useRef<Adjustment | null>(null);
   const [pendingIntent, setPendingIntent] = useState<Adjustment | null>(null);
   const setIntent = (intent: Adjustment | null) => {adjustment.current = intent; setPendingIntent(intent);};
@@ -500,7 +502,7 @@ export default function CardsPage({cards, groups, plans, configFailed, loading, 
       reportError('');
       // A pending intent is retried as it was; a compensation only fills a new one.
       const fill = saved ? null : prefill ?? null;
-      setIntent(saved); setAdjustCard(card); setAdjustStep('form'); setAdjustLink(fill);
+      setIntent(saved); setAdjustCard(card); setAdjustStep('form'); setAdjustLink(fill); setAdjustRefusal(null);
       setAdjustDirection(saved && saved.delta < 0 ? 'deduct' : 'add');
       setAdjustAmount(saved ? String(Math.abs(saved.delta)) : fill?.points ?? '');
       setAdjustReason(saved?.reason ?? fill?.reason ?? '');
@@ -525,12 +527,12 @@ export default function CardsPage({cards, groups, plans, configFailed, loading, 
       const card = cards.find(item => item.id === saved.cardId);
       if (!card) {reportError('未读取到原卡记录，请刷新或人工核对账本；原意图仍保留。'); return;}
       reportError('');
-      setIntent(saved); setAdjustCard(card); setAdjustStep('form');
+      setIntent(saved); setAdjustCard(card); setAdjustStep('form'); setAdjustRefusal(null);
       setAdjustDirection(saved.delta < 0 ? 'deduct' : 'add');
       setAdjustAmount(String(Math.abs(saved.delta))); setAdjustReason(saved.reason);
     } catch {reportError('调账恢复记录无法读取，请人工核对账本；未发送请求。');}
   };
-  const closeAdjust = () => {if (!mutationBusy) {setAdjustCard(null); setAdjustStep('form'); setAdjustLink(null);}};
+  const closeAdjust = () => {if (!mutationBusy) {setAdjustCard(null); setAdjustStep('form'); setAdjustLink(null); setAdjustRefusal(null);}};
   const locked = !!pendingIntent;
   const zeroMicro = !!pendingIntent && isZeroMicroAdjustment(pendingIntent);
   const parsedAdjust = ((): {delta: number} | {error: string} => {
@@ -554,12 +556,13 @@ export default function CardsPage({cards, groups, plans, configFailed, loading, 
   const signed = (value: number) => `${value > 0 ? '+' : ''}${formatCredits(value)}`;
   // The request the adjustment makes up for: a pending intent's (retried as it was), or the compensation's.
   const linkedRequest = pendingIntent ? pendingIntent.invocationId : adjustLink?.invocationId;
-  const linkLine = pendingIntent ? (pendingIntent.invocationId ? '这笔调账补偿一次请求，重试时仍关联它' : '')
+  const linkLine = pendingIntent ? (pendingIntent.invocationId ? `这笔调账${pendingIntent.allowRepeat ? '仍要' : ''}补偿一次请求，重试时仍关联它` : '')
     : !adjustLink ? '' : adjustLink.requests === 1
       ? `补偿这次请求扣的 ${adjustLink.points} 积分${adjustLink.invocationId ? '' : '（这次请求的编号不能关联，只写在原因里）'}`
       : `补偿 ${adjustLink.requests} 次请求扣的共 ${adjustLink.points} 积分。一笔调账只能关联一次请求，这几次写在原因里`;
 
-  const submitAdjust = async () => {
+  /** Sends the adjustment; `repeatWhy`: 仍要补偿 a request the server refused to compensate again, and why. */
+  const submitAdjust = async (repeatWhy?: string) => {
     if (!adjustCard || mutationBusy || adjusting.current) return;
     if (!operator) {reportError('需要重新登录以确认操作人', reauthenticate); return;}
     if (adjustment.current && isZeroMicroAdjustment(adjustment.current)) {reportError('该旧意图换算为零微积分，无法入账；请清除后更正金额。'); return;}
@@ -567,30 +570,50 @@ export default function CardsPage({cards, groups, plans, configFailed, loading, 
     const delta = adjustment.current ? adjustment.current.delta : adjustDelta;
     if (delta === null) {reportError('请输入不为 0 的数量（最多 6 位小数），范围为 ±1,000,000；未发送请求。'); setAdjustStep('form'); return;}
     if (!reasonValid) {reportError('请填写 1–500 字的原因，不要包含密码或令牌'); setAdjustStep('form'); return;}
+    // 仍要补偿 says why in the reason the card's history keeps, after the adjustment's own.
+    const reason = repeatWhy === undefined ? reasonText : repeatReason(reasonText, repeatWhy);
+    if (reason === null) {reportError(`原因加上仍要补偿的理由超过 ${MAX_ADJUST_REASON} 字，请先缩短原因；未发送请求。`); return;}
     let sent = false;
     try {
       adjusting.current = true; setMutationBusy(true); reportError('');
       // The request it makes up for is kept with the intent: a retry names the same one, as the server requires.
-      const intent = loadAdjustment(sessionStorage, operator) ?? {operator, cardId: adjustCard.id, delta, reason: reasonText, key: crypto.randomUUID(),
-        ...(adjustLink?.invocationId ? {invocationId: adjustLink.invocationId} : {})};
-      if (intent.cardId !== adjustCard.id || intent.delta !== delta || intent.reason !== reasonText) throw new Error('上次调账结果尚未确认，请先用原参数重试');
-      saveAdjustment(sessionStorage, intent); setIntent(intent); sent = true;
-      const response = await adminApi.adjustBalance(intent.cardId, intent.delta, intent.reason, intent.key, intent.invocationId);
+      const intent = loadAdjustment(sessionStorage, operator) ?? {operator, cardId: adjustCard.id, delta, reason, key: crypto.randomUUID(),
+        ...(adjustLink?.invocationId ? {invocationId: adjustLink.invocationId, ...(repeatWhy !== undefined ? {allowRepeat: true as const} : {})} : {})};
+      if (intent.cardId !== adjustCard.id || intent.delta !== delta || intent.reason !== reason) throw new Error('上次调账结果尚未确认，请先用原参数重试');
+      // The form shows what is kept and retried: 仍要补偿's reason with why.
+      saveAdjustment(sessionStorage, intent); setIntent(intent); setAdjustReason(intent.reason); setAdjustRefusal(null); sent = true;
+      const response = await adminApi.adjustBalance(intent.cardId, intent.delta, intent.reason, intent.key, intent.invocationId, intent.allowRepeat);
       if (!response.success) throw new Error('服务端未确认调账');
       clearAdjustment(sessionStorage, intent); setIntent(null);
       toast.success(`已调整 ${shortId(adjustCard.id, 'card')}：${signed(intent.delta)} 积分`);
-      setAdjustCard(null); setAdjustReason(''); setAdjustAmount(''); setAdjustStep('form'); setAdjustLink(null);
+      setAdjustCard(null); setAdjustReason(''); setAdjustAmount(''); setAdjustStep('form'); setAdjustLink(null); setAdjustRefusal(null);
       void refresh();
     } catch (error) {
       if (sent && adjustment.current && error instanceof AdminApiError && isUnsubmittedAdjustmentRejection(error.status, error.message, adjustment.current)) {
         try {
-          clearAdjustment(sessionStorage, adjustment.current); setIntent(null); setAdjustStep('form');
-          reportError('服务器拒绝了这笔调账，未入账。请检查卡的状态和余额。');
+          clearAdjustment(sessionStorage, adjustment.current); setIntent(null);
+          // A compensation refused stays on its review, with what the server found and, where it can be, 仍要补偿.
+          const refusal = compensationRefusal(error.message);
+          if (refusal) {setAdjustRefusal(refusal); reportError(''); return;}
+          setAdjustStep('form');
+          reportError(error.message === 'allowRepeat needs a reason' ? '仍要补偿需要写明理由，未入账。'
+            : error.message.startsWith('invocationId must be') ? '关联的请求编号无效（最多 257 个字母、数字或 - _ . :），未入账。'
+              : '服务器拒绝了这笔调账，未入账。请检查卡的状态和余额。');
         } catch {reportError('该调账未入账，但本地记录未能清除，请检查浏览器存储。');}
         return;
       }
       reportError(sent ? `没收到调账结果（${errorText(error)}）。重新打开这张卡可按原参数重试。` : `尚未发送调账：${errorText(error)}。`);
     } finally {adjusting.current = false; setMutationBusy(false);}
+  };
+  const repeatCompensation = async () => {
+    if (!adjustRefusal || !repeatable(adjustRefusal) || adjustDelta === null || mutationBusy) return;
+    const answer = await ask({
+      title: '仍要补偿这次请求？', facts: refusalFacts(adjustRefusal),
+      consequence: `会再给这张卡 ${signed(adjustDelta)} 积分。你写的理由会跟在原因后面，写进这张卡的操作记录。`,
+      confirmLabel: '仍要补偿', danger: true,
+      reason: {label: '为什么仍要补偿', placeholder: '例：补偿后客户又遇到同样的失败', suggestions: ['上次补偿后又失败了', '上次补偿不足', '已与客户核实'], maxLength: 60, required: true},
+    });
+    if (answer.confirmed && alive.current) await submitAdjust(answer.reason);
   };
   const clearZeroMicro = async () => {
     const intent = adjustment.current;
@@ -956,6 +979,14 @@ export default function CardsPage({cards, groups, plans, configFailed, loading, 
         <p><span className="mono">{shortId(adjustCard.id, 'card')}</span>：{formatCredits(adjustCard.pointsAvailable)} → <b>{formatCredits(adjustCard.pointsAvailable + adjustDelta)}</b>（{signed(adjustDelta)}）</p>
         <p>原因：{reasonText}</p>
         {linkedRequest && <p>关联请求：<span className="mono" title={linkedRequest}>{shortId(linkedRequest, 'trace')}</span>（写进这张卡的操作记录，可从记录打开这次请求）</p>}
+        {/* Without a request named, the server cannot tell whether these were already compensated. */}
+        {!pendingIntent && adjustLink && !adjustLink.invocationId && <p className="is-warning">
+          {adjustLink.requests > 1 ? `这 ${adjustLink.requests} 次请求不关联到调账` : '这次请求的编号不能关联'}：服务器不能检查{adjustLink.requests > 1 ? '它们' : '它'}是否已经补偿过，请先核对这张卡的操作记录。</p>}
+      </div>}
+      {adjustRefusal && <div role="alert" className="form-error compensation-refusal" aria-label="服务器拒绝补偿">
+        <p><b>{refusalTitle(adjustRefusal)}</b></p>
+        {refusalFacts(adjustRefusal).map(line => <p key={line}>{line}</p>)}
+        {repeatable(adjustRefusal) && <p>确实要再补偿，点“仍要补偿”并写明理由。</p>}
       </div>}
       <div className="modal-actions">
         {adjustStep === 'form' ? <>
@@ -963,8 +994,9 @@ export default function CardsPage({cards, groups, plans, configFailed, loading, 
           <button type="button" className="btn btn-primary" disabled={!adjustReady || mutationBusy || zeroMicro}
             title={adjustReady ? undefined : overdrawn ? '余额不足' : !reasonValid && adjustDelta !== null ? '填写原因后继续' : '填写数量和原因后继续'} onClick={() => setAdjustStep('review')}>下一步</button>
         </> : <>
-          <button type="button" className="btn" disabled={mutationBusy} onClick={() => setAdjustStep('form')}>返回修改</button>
-          <button type="button" className="btn btn-primary" disabled={mutationBusy} onClick={() => void submitAdjust()}>{mutationBusy ? '提交中…' : '确认入账'}</button>
+          <button type="button" className="btn" disabled={mutationBusy} onClick={() => {setAdjustStep('form'); setAdjustRefusal(null);}}>返回修改</button>
+          {adjustRefusal ? repeatable(adjustRefusal) && <button type="button" className="btn btn-danger" disabled={mutationBusy} onClick={() => void repeatCompensation()}>{mutationBusy ? '提交中…' : '仍要补偿…'}</button>
+            : <button type="button" className="btn btn-primary" disabled={mutationBusy} onClick={() => void submitAdjust()}>{mutationBusy ? '提交中…' : '确认入账'}</button>}
         </>}
       </div>
     </Modal>}

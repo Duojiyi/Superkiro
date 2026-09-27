@@ -381,6 +381,17 @@ module.exports = function fixtureApi() {
   let authenticated = false, deadline = 0, loginAt = 0;
   const IDLE = 1800, MAX = 8 * 3600;
   const nowSecs = () => Math.floor(Date.now() / 1000);
+  // As billing writes them in its refusals: micro-credits as a decimal without trailing zeros, times as ISO UTC.
+  const microDecimal = micro => {const whole = Math.floor(Math.abs(micro) / 1e6), fraction = String(Math.abs(micro) % 1e6).padStart(6, '0').replace(/0+$/, '');
+    return `${micro < 0 ? '-' : ''}${whole}${fraction ? `.${fraction}` : ''}`;};
+  const isoUtc = secs => new Date(secs * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+  // Where a request was charged, as billing finds it: its usage entry in the ledger, else its trace (the largest charge).
+  const chargedRequest = id => {
+    const entry = ledger.find(row => row.kind === 'usage' && row.invocation_id === id);
+    if (entry) return {cardId: entry.card_id, credits: entry.credits_charged, ts: entry.ts};
+    const trace = traces.filter(row => row.invocation_id === id).sort((a, b) => b.credits_charged - a.credits_charged)[0];
+    return trace ? {cardId: trace.card_id, credits: trace.credits_charged, ts: trace.ts} : null;
+  };
   return {writes, cards, traces, providers, keys, config, storage, ledger, notices, publish, expire() {authenticated=false;}, get sessionDeadline() {return deadline;}, async handle(req,res) {
     const url = new URL(req.url, 'http://127.0.0.1');
     const endpoint = url.pathname.replace('/api/v1/admin/', '');
@@ -579,23 +590,42 @@ module.exports = function fixtureApi() {
       return reply({success:true,cardId:card.id,newStatus:card.status,archivedAt:card.archivedAt??null,card:view(card)});
     }
     // A balance adjustment, as its handler answers: one idempotency key per intent (a replay with the
-    // same parameters answers the same), and optionally the request it makes up for.
+    // same parameters answers the same, before any other check), and optionally the request it makes
+    // up for, which must be this card's; a second positive compensation of it, or one of more than it
+    // charged, is refused with what it found unless allowRepeat (with a reason) says it is meant.
     if(endpoint==='cards/adjust') {
       const invalid=message=>reply({__type:'InvalidRequestException',message},400);
       const key=String(req.headers['idempotency-key']??body.idempotencyKey??'').trim();
       if(!/^[A-Za-z0-9_.:-]{1,128}$/.test(key))return invalid('a valid idempotency_key is required (1-128 ASCII letters, digits, -_.:)');
       const delta=body.deltaPoints;
       if(typeof delta!=='number'||!Number.isFinite(delta)||delta===0||Math.abs(delta)>1000000||!String(body.cardId??'').trim())return invalid('delta_points must be finite, non-zero, bounded, and card_id must be valid');
-      if(body.invocationId!==undefined&&!/^[A-Za-z0-9_.:-]{1,128}$/.test(String(body.invocationId).trim()))return invalid('invocationId must be 1-128 ASCII letters, digits, -_.:');
-      const card=cards.find(c=>c.id===body.cardId);if(!card)return reply({success:false,error:`Card ${body.cardId} not found`},404);
-      const micro=Math.round(delta*1e6),invocationId=body.invocationId?.trim()??null,replay=log.find(event=>event.key===key);
+      if(body.allowRepeat===true&&body.reason==null)return invalid('allowRepeat needs a reason');
+      const reason=body.reason??'admin-manual-adjustment';
+      if(!String(reason).trim()||[...String(reason).trim()].length>512)return invalid('reason is invalid');
+      const invocationId=body.invocationId==null?null:String(body.invocationId).trim();
+      if(invocationId!==null&&!/^[A-Za-z0-9_.:-]{1,257}$/.test(invocationId))return invalid('invocationId must be 1-257 ASCII letters, digits, -_.:');
+      const micro=Math.round(delta*1e6),replay=log.find(event=>event.key===key);
       if(replay){
-        if(replay.cardId!==card.id||replay.credits!==micro||replay.reason!==body.reason||replay.invocationId!==invocationId)return reply({success:false,error:`Invalid balance adjustment: Idempotency conflict: ${key}`},409);
-      } else {
-        if(card.availableCredits+micro<0)return reply({success:false,error:`Card error: Insufficient credit: available ${card.availableCredits} micro-credits, needed ${-micro}`},409);
-        Object.assign(card,{creditTotal:card.creditTotal+micro,availableCredits:card.availableCredits+micro,pointsTotal:card.pointsTotal+delta,pointsAvailable:Math.round((card.pointsAvailable+delta)*1e6)/1e6});
-        record(card.id,'adjust',body.reason,{credits:micro,points:delta,invocationId,key});
+        if(replay.cardId!==body.cardId||replay.credits!==micro||replay.reason!==reason.trim()||replay.invocationId!==invocationId)return reply({success:false,error:`Invalid balance adjustment: Idempotency conflict: key '${key}' already used with different parameters`},409);
+        const card=cards.find(c=>c.id===replay.cardId);
+        return reply({success:true,cardId:card.id,newAvailableCredits:card.availableCredits,newAvailablePoints:card.availableCredits/1e6});
       }
+      const card=cards.find(c=>c.id===body.cardId);if(!card)return reply({success:false,error:`Card ${body.cardId} not found`},404);
+      if(invocationId){
+        const charged=chargedRequest(invocationId);
+        if(!charged)return reply({success:false,error:`Request ${invocationId} was not found`},404);
+        if(charged.cardId!==card.id)return reply({success:false,error:`Request ${invocationId} was made by card ${charged.cardId}, not ${card.id}`},409);
+        if(micro>0&&body.allowRepeat!==true){
+          const found=`Request ${invocationId} was charged ${microDecimal(charged.credits)} credits at ${isoUtc(charged.ts)}`;
+          const earlier=log.filter(event=>event.action==='adjust'&&event.cardId===card.id&&event.credits>0&&event.invocationId===invocationId).sort((a,b)=>b.ts-a.ts)[0];
+          if(earlier)return reply({success:false,error:`${found}, and was already compensated ${microDecimal(earlier.credits)} credits at ${isoUtc(earlier.ts)} by ${earlier.operator??'unknown'} (${earlier.reason??'no reason'}); send allowRepeat with a reason to compensate it again`},409);
+          if(micro>charged.credits)return reply({success:false,error:`${found}; a compensation of ${microDecimal(micro)} credits is more than that; send allowRepeat with a reason to compensate more`},409);
+        }
+      }
+      if(card.status==='voided')return reply({success:false,error:'Invalid billing state: cannot adjust a voided card'},400);
+      if(card.availableCredits+micro<0)return reply({success:false,error:`Card error: Insufficient credit: available ${card.availableCredits} micro-credits, needed ${-micro}`},409);
+      Object.assign(card,{creditTotal:card.creditTotal+micro,availableCredits:card.availableCredits+micro,pointsTotal:card.pointsTotal+delta,pointsAvailable:Math.round((card.pointsAvailable+delta)*1e6)/1e6});
+      record(card.id,'adjust',reason,{credits:micro,points:delta,invocationId,key});
       return reply({success:true,cardId:card.id,newAvailableCredits:card.availableCredits,newAvailablePoints:card.availableCredits/1e6});
     }
     if(endpoint==='cards/devices/unbind') {
