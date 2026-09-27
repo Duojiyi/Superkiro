@@ -370,6 +370,25 @@ impl ToolCalls {
         }
     }
 
+    /// Whether a fragment for call `position` (`None`: one not yet open) carries nothing
+    /// the call lacks: no arguments, and no id or name other than the call's own.
+    fn adds_nothing(
+        &self,
+        position: Option<usize>,
+        id: Option<&str>,
+        name: Option<&str>,
+        arguments: &str,
+    ) -> bool {
+        arguments.is_empty()
+            && match position {
+                Some(position) => {
+                    let call = &self.calls[position];
+                    id.is_none_or(|id| id == call.id) && name.is_none_or(|name| name == call.name)
+                }
+                None => id.is_none() && name.is_none(),
+            }
+    }
+
     fn open(&mut self, index: Option<usize>) -> usize {
         self.calls.push(ToolBuffer::default());
         let position = self.calls.len() - 1;
@@ -596,7 +615,16 @@ pub fn create_stream_guard_with_send_deadline(
                                     // An empty id or name on a continuation names nothing; it
                                     // must not blank the call it continues.
                                     let id = id.filter(|value| !value.is_empty());
-                                    let name = name.filter(|value| !value.is_empty());
+                                    let name = name
+                                        .filter(|value| !value.is_empty())
+                                        .map(|name| tool_registry.as_ref().map_or_else(|| name.clone(), |r| r.restore(&name)));
+                                    let position = tool_calls.find(index, id.as_deref());
+                                    // Relays repeat an empty fragment of a call after the next
+                                    // has begun; it tells Kiro nothing, and read as a call
+                                    // continued after its end it failed the whole response.
+                                    if tool_calls.adds_nothing(position, id.as_deref(), name.as_deref(), &arguments) {
+                                        continue 'stream;
+                                    }
                                     saw_output |= !arguments.is_empty() || id.is_some() || name.is_some();
                                     saw_answer |= !arguments.is_empty() || id.is_some() || name.is_some();
                                     output_units = output_units.saturating_add(crate::usage_estimate::token_units(&arguments))
@@ -604,7 +632,6 @@ pub fn create_stream_guard_with_send_deadline(
                                     // Truncated arguments would reach Kiro as a malformed tool
                                     // call, so a response over the limits ends instead, billed
                                     // for what it produced.
-                                    let position = tool_calls.find(index, id.as_deref());
                                     if position.is_none() && tool_calls.calls.len() >= MAX_TOOL_CALLS {
                                         failure = Some(Failure::oversized_tool_call(&format!(
                                             "一次最多 {MAX_TOOL_CALLS} 个调用"
@@ -626,7 +653,7 @@ pub fn create_stream_guard_with_send_deadline(
                                     }
                                     let buf = &mut tool_calls.calls[position];
                                     if let Some(name) = name {
-                                        buf.name = tool_registry.as_ref().map_or_else(|| name.clone(), |r| r.restore(&name));
+                                        buf.name = name;
                                     }
                                     buf.arguments.push_str(&arguments);
                                     match tool_calls.advance(position) {
