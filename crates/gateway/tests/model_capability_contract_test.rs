@@ -223,15 +223,9 @@ async fn configured_capabilities_reach_catalog_upstream_billing_and_usage() {
 
         let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
         if credits == 3_000_000 || quota != "none" {
-            // Enough for the old 32K cap, insufficient for the configured 128K budget.
-            assert_eq!(
-                resp.status(),
-                if quota == "none" {
-                    StatusCode::BAD_REQUEST
-                } else {
-                    StatusCode::TOO_MANY_REQUESTS
-                }
-            );
+            // Enough for the old 32K cap, insufficient for the configured 128K budget:
+            // refused however often it is retried, in words Kiro shows as written.
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
             assert!(mock_server.received_requests().await.unwrap().is_empty());
             assert_eq!(billing.get_card("card-alias-1").unwrap().credit_reserved, 0);
             continue;

@@ -536,42 +536,26 @@ impl GenerateAssistantResponseHandler {
                                 Some(2),
                             );
                         }
-                        // Kiro knows these reasons: it shows its usage-limit message and does
-                        // not retry. Unknown ones read "Too many requests" and were retried.
                         billing::engine::BillingError::DailyLimitExceeded {
                             limit,
                             current,
+                            held,
                             needed,
                         } => {
-                            return crate::guardrail::format_kiro_throttle_response(
-                                StatusCode::TOO_MANY_REQUESTS,
-                                "ThrottlingException",
-                                "DAILY_REQUEST_COUNT",
-                                &format!(
-                                    "今日积分用量已达上限：上限 {}，今日已用 {}，本次需预留 {}。请明天再试。",
-                                    credits(limit),
-                                    credits(current),
-                                    credits(needed)
-                                ),
-                                None,
-                            );
+                            return limit_refusal(LimitWindow::Day, limit, current, held, needed);
                         }
                         billing::engine::BillingError::MonthlyLimitExceeded {
                             limit,
                             current,
+                            held,
                             needed,
                         } => {
-                            return crate::guardrail::format_kiro_throttle_response(
-                                StatusCode::TOO_MANY_REQUESTS,
-                                "ThrottlingException",
-                                "MONTHLY_REQUEST_COUNT",
-                                &format!(
-                                    "近 30 天积分用量已达上限：上限 {}，已用 {}，本次需预留 {}。请稍后再试。",
-                                    credits(limit),
-                                    credits(current),
-                                    credits(needed)
-                                ),
-                                None,
+                            return limit_refusal(
+                                LimitWindow::ThirtyDays,
+                                limit,
+                                current,
+                                held,
+                                needed,
                             );
                         }
                         billing::engine::BillingError::Persistence(_) => {
@@ -1608,6 +1592,62 @@ fn reservation_refusal(error: &billing::engine::BillingError) -> Response {
                 "Credit reservation is temporarily unavailable",
             )
         }
+    };
+    error_response(StatusCode::BAD_REQUEST, "ValidationException", &message)
+}
+
+/// The card's fair-use window that refused a hold.
+#[derive(Clone, Copy)]
+enum LimitWindow {
+    /// The UTC calendar day.
+    Day,
+    /// The 30 days before the request, rolling.
+    ThirtyDays,
+}
+
+/// A hold the card's daily or 30-day credit limit refuses. The open holds of other
+/// requests settle within minutes, mostly for far less than they hold, so a refusal they
+/// alone cause is a throttle Kiro retries. Settled usage at the limit, or a hold larger than
+/// what the window has left, stays refused until the window frees up: a ValidationException
+/// without a reason, which Kiro shows as written, with the limit, the usage and when it
+/// frees up. Kiro's own limit reasons show its fixed "return tomorrow / next month" instead,
+/// and the window is neither.
+fn limit_refusal(
+    window: LimitWindow,
+    limit: i64,
+    current: i64,
+    held: i64,
+    needed: i64,
+) -> Response {
+    let settled = current.saturating_sub(held).max(0);
+    let left = limit.saturating_sub(settled);
+    if needed <= left {
+        return format_kiro_throttle_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "ThrottlingException",
+            "CREDIT_HOLDS_PENDING",
+            "卡密的用量额度正被其他进行中的请求暂时占用，请稍后重试。",
+            Some(1),
+        );
+    }
+    let (name, frees) = match window {
+        LimitWindow::Day => ("今日", "额度按 UTC 自然日计算，每天北京时间 8:00 重置。"),
+        LimitWindow::ThirtyDays => ("近 30 天", "额度按滚动 30 天计算，每笔用量满 30 天后释放。"),
+    };
+    let message = if left <= 0 {
+        format!(
+            "{name}积分用量已达上限：上限 {}，已用 {}。{frees}",
+            credits(limit),
+            credits(settled)
+        )
+    } else {
+        format!(
+            "{name}剩余积分额度 {} 不足以预留本次请求所需的 {}（按该模型的最大输出估算）：上限 {}，已用 {}。{frees}也可以换用更便宜的模型。",
+            credits(left),
+            credits(needed),
+            credits(limit),
+            credits(settled)
+        )
     };
     error_response(StatusCode::BAD_REQUEST, "ValidationException", &message)
 }
