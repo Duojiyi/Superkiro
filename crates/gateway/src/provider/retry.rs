@@ -87,7 +87,17 @@ pub(crate) fn stream_error(value: &serde_json::Value) -> ProviderError {
         "api_error" => {
             ProviderError::Http(reqwest::StatusCode::INTERNAL_SERVER_ERROR, String::new())
         }
-        _ => ProviderError::Service,
+        "rate_limit_error" => {
+            ProviderError::Http(reqwest::StatusCode::TOO_MANY_REQUESTS, String::new())
+        }
+        "invalid_request_error"
+        | "authentication_error"
+        | "permission_error"
+        | "not_found_error"
+        | "request_too_large" => ProviderError::Service,
+        // A relay's own failure: kimera-primary answers about one request in twenty with
+        // `upstream_error` ("当前模型暂时不可用") as its first frame, and the next succeeds.
+        _ => ProviderError::Unavailable,
     }
 }
 
@@ -96,7 +106,7 @@ pub(crate) fn stream_error(value: &serde_json::Value) -> ProviderError {
 pub(crate) fn failure_class(error: &ProviderError) -> String {
     match error {
         ProviderError::Http(status, _) => format!("http_{}", status.as_u16()),
-        ProviderError::Service => "upstream_service".into(),
+        ProviderError::Service | ProviderError::Unavailable => "upstream_service".into(),
         ProviderError::Parse(_) => "protocol".into(),
         ProviderError::Timeout | ProviderError::Watchdog(_) => "timeout".into(),
         ProviderError::EmptyCompletion => "empty".into(),
@@ -108,11 +118,14 @@ fn retryable(error: &ProviderError) -> bool {
     match error {
         // 429 is deliberately left to key cooldown: this adapter cannot yet retain Retry-After.
         ProviderError::Http(status, _) => matches!(status.as_u16(), 500 | 502 | 503 | 504),
+        // Only ever seen here before the model has started: an error after it reaches the
+        // answer, and is not retried.
         ProviderError::Network(_)
         | ProviderError::Timeout
         | ProviderError::StreamDisconnected
         | ProviderError::Watchdog(_)
-        | ProviderError::EmptyCompletion => true,
+        | ProviderError::EmptyCompletion
+        | ProviderError::Unavailable => true,
         _ => false,
     }
 }
@@ -227,6 +240,7 @@ pub async fn start_stream(
                     ProviderError::Http(s, _) => format!("http_{}", s.as_u16()),
                     ProviderError::Parse(_) => "protocol".into(),
                     ProviderError::Service => "service".into(),
+                    ProviderError::Unavailable => "unavailable".into(),
                     ProviderError::Timeout | ProviderError::Watchdog(_) => "timeout".into(),
                     ProviderError::EmptyCompletion => "empty".into(),
                     _ => "transport".into(),
@@ -463,5 +477,32 @@ mod tests {
         assert!(retryable(&stream_error(
             &serde_json::json!({"error":{"type":"overloaded_error"}})
         )));
+    }
+
+    #[test]
+    fn a_relays_own_failure_is_retried_and_a_fault_of_the_request_is_not() {
+        let event = |kind: &str| {
+            stream_error(&serde_json::json!({"type": "error", "error": {"type": kind}}))
+        };
+        assert!(matches!(
+            event("upstream_error"),
+            ProviderError::Unavailable
+        ));
+        assert!(retryable(&event("upstream_error")));
+        assert!(retryable(&event("")));
+        for fault in [
+            "invalid_request_error",
+            "authentication_error",
+            "permission_error",
+            "not_found_error",
+            "request_too_large",
+        ] {
+            assert!(matches!(event(fault), ProviderError::Service), "{fault}");
+            assert!(!retryable(&event(fault)), "{fault}");
+        }
+        assert!(matches!(
+            event("rate_limit_error"),
+            ProviderError::Http(status, _) if status.as_u16() == 429
+        ));
     }
 }

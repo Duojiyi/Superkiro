@@ -370,7 +370,7 @@ fn upstream_in_band_errors_are_not_silently_ignored() {
             let error = provider.parse_stream_line(line).unwrap_err();
             assert!(matches!(
                 error,
-                ProviderError::Http(_, _) | ProviderError::Service
+                ProviderError::Http(_, _) | ProviderError::Service | ProviderError::Unavailable
             ));
             assert!(!error.to_string().contains("private upstream diagnostic"));
         }

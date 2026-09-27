@@ -91,17 +91,25 @@ fn serve(billing: &BillingEngine) -> axum::Router {
 
 /// The conversation route, with `gate` for its large bodies.
 fn serve_gated(billing: &BillingEngine, gate: &LargeBodyGate) -> axum::Router {
+    routed(billing, gate).0
+}
+
+/// The conversation route, and the key pools it routes through.
+fn routed(
+    billing: &BillingEngine,
+    gate: &LargeBodyGate,
+) -> (axum::Router, ProviderRuntimeRegistry) {
     let runtime = ProviderRuntimeRegistry::new();
     runtime.sync_from_billing(billing);
     let mut registry = FacadeRegistry::new().with_runtime(runtime.clone());
     registry.register(GenerateAssistantResponseHandler {
         billing: billing.clone(),
-        runtime: Some(runtime),
+        runtime: Some(runtime.clone()),
         intercept_intent: false,
         large_bodies: gate.clone(),
         ..Default::default()
     });
-    registry.into_router()
+    (registry.into_router(), runtime)
 }
 
 fn claims() -> AuthClaims {
@@ -1164,4 +1172,155 @@ async fn a_large_conversations_place_is_given_back_on_every_path() {
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
     assert_eq!(gate.in_use(), 0);
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+/// An `error` frame of `kind`. With `upstream_error` it is the frame kimera-primary answers
+/// about one request in twenty with, as HTTP 200, 0.7 to 7 seconds in, before the model has
+/// started.
+fn error_frame(kind: &str) -> String {
+    let error = json!({"type": "error", "error": {"type": kind, "code": kind,
+        "message": "当前模型暂时不可用，请稍后重试或切换模型。"}});
+    format!("event: error\ndata: {error}\n\n")
+}
+
+/// No key of the provider was cooled down, retired or given a failure.
+fn keys_untouched(runtime: &ProviderRuntimeRegistry) {
+    let health = runtime.key_health(gateway::now_secs());
+    assert!(!health.is_empty());
+    for (key, health) in health {
+        assert_eq!(health.health_state, "healthy", "{key}");
+        assert_eq!(health.cooldown_until, None, "{key}");
+        assert_eq!(health.last_error, None, "{key}");
+    }
+}
+
+/// A relay's own failure before the model has started is retried, and the next attempt
+/// serves the turn; the key did nothing wrong and is not cooled.
+#[tokio::test]
+async fn a_relays_error_before_the_model_starts_is_retried_without_cooling_the_key() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(error_frame("upstream_error"), "text/event-stream"),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(anthropic_answer("hi"), "text/event-stream"),
+        )
+        .mount(&server)
+        .await;
+    let billing = engine(
+        ProviderFormat::Anthropic,
+        &server.uri(),
+        vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+    );
+    let (app, runtime) = routed(&billing, &LargeBodyGate::default());
+    let reply = send(
+        &app,
+        "inv-unavailable",
+        body(json!({"content": "hello", "modelId": "model"}), vec![]),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert!(frames(&reply.bytes)
+        .iter()
+        .any(|(kind, payload)| kind == "assistantResponseEvent" && payload["content"] == "hi"));
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    keys_untouched(&runtime);
+}
+
+/// One that keeps failing moves on to the provider's other key and still cools neither;
+/// Kiro gets the temporary error its SDK retries.
+#[tokio::test]
+async fn a_relays_repeated_error_moves_to_another_key_and_cools_none() {
+    let server = upstream(
+        ResponseTemplate::new(200).set_body_raw(error_frame("upstream_error"), "text/event-stream"),
+    )
+    .await;
+    let billing = engine(
+        ProviderFormat::Anthropic,
+        &server.uri(),
+        vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+    );
+    billing.upsert_provider_key(ProviderKey::new("key-2", "prov", "sk-test-2"));
+    let (app, runtime) = routed(&billing, &LargeBodyGate::default());
+    let reply = send(
+        &app,
+        "inv-unavailable-twice",
+        body(json!({"content": "hello", "modelId": "model"}), vec![]),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_GATEWAY, "{}", reply.text());
+    assert_eq!(reply.json()["__type"], "InternalServerException");
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    assert_eq!(runtime.key_health(gateway::now_secs()).len(), 2);
+    keys_untouched(&runtime);
+    nothing_charged(&billing);
+}
+
+/// An error that blames the request itself is not retried: every attempt would get it.
+#[tokio::test]
+async fn an_error_blaming_the_request_is_not_retried() {
+    let server = upstream(
+        ResponseTemplate::new(200)
+            .set_body_raw(error_frame("invalid_request_error"), "text/event-stream"),
+    )
+    .await;
+    let billing = engine(
+        ProviderFormat::Anthropic,
+        &server.uri(),
+        vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+    );
+    let (app, runtime) = routed(&billing, &LargeBodyGate::default());
+    let reply = send(
+        &app,
+        "inv-request-fault",
+        body(json!({"content": "hello", "modelId": "model"}), vec![]),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_GATEWAY, "{}", reply.text());
+    assert_eq!(reply.json()["__type"], "InternalServerException");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    keys_untouched(&runtime);
+}
+
+/// Once the model has started, the request is being worked on upstream: the same error then
+/// ends the answer and is not retried.
+#[tokio::test]
+async fn a_relays_error_after_the_model_starts_is_not_retried() {
+    let started = json!({"type": "message_start",
+        "message": {"usage": {"input_tokens": 10, "output_tokens": 1}}});
+    let events = format!(
+        "event: message_start\ndata: {started}\n\n{}",
+        error_frame("upstream_error")
+    );
+    let server =
+        upstream(ResponseTemplate::new(200).set_body_raw(events, "text/event-stream")).await;
+    let billing = engine(
+        ProviderFormat::Anthropic,
+        &server.uri(),
+        vec![ModelMap::new("map", GROUP, "model", "prov", "up-model")],
+    );
+    let (app, runtime) = routed(&billing, &LargeBodyGate::default());
+    let reply = send(
+        &app,
+        "inv-unavailable-late",
+        body(json!({"content": "hello", "modelId": "model"}), vec![]),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    let frames = frames(&reply.bytes);
+    assert!(
+        frames
+            .iter()
+            .any(|(kind, _)| kind == "InternalServerException"),
+        "{frames:?}"
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    keys_untouched(&runtime);
 }
