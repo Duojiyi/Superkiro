@@ -64,6 +64,13 @@ fn test_settings_safe_merge_and_revert() {
     );
     assert!(merged.contains_key("kiroAuthConfig"));
     assert!(merged.contains_key("codewhisperer.config"));
+    // Kiro's web-account services go to the gateway, not to app.kiro.dev with its token.
+    for key in [
+        "kiroAgent.cloudConfig.endpoint",
+        "kiroAgent.remoteSessions.endpoint",
+    ] {
+        assert_eq!(merged.get(key), Some(&json!(gateway_url)), "{key}");
+    }
 
     assert_eq!(
         merged.get("http.noProxy").unwrap(),
@@ -91,7 +98,44 @@ fn test_settings_safe_merge_and_revert() {
     assert!(!reverted.contains_key("kiroAuthConfig"));
     assert!(!reverted.contains_key("codewhisperer.config"));
     assert!(!reverted.contains_key("kiroAgent.enableTabAutocomplete"));
+    assert!(!reverted.contains_key("kiroAgent.cloudConfig.endpoint"));
+    assert!(!reverted.contains_key("kiroAgent.remoteSessions.endpoint"));
 
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+/// A customer's own endpoints for Kiro's web-account services are put back as they were.
+#[test]
+fn web_account_endpoints_are_restored_to_the_customers_own() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("kiro_test_web_endpoints_{}", std::process::id()));
+    let settings_file = temp_dir.join("settings.json");
+    fs::create_dir_all(&temp_dir).unwrap();
+    fs::write(
+        &settings_file,
+        r#"{"kiroAgent.cloudConfig.endpoint": "https://config.example", "editor.fontSize": 15}"#,
+    )
+    .unwrap();
+    let mgr = SettingsManager::at(&settings_file);
+    let gateway_url = "https://gateway.kiro-byok.test";
+
+    let prior = mgr.merge_byok(gateway_url).unwrap();
+    let merged = mgr.read_settings().unwrap();
+    assert_eq!(merged["kiroAgent.cloudConfig.endpoint"], json!(gateway_url));
+    assert_eq!(
+        merged["kiroAgent.remoteSessions.endpoint"],
+        json!(gateway_url)
+    );
+    assert!(mgr.names_gateway(&["gateway.kiro-byok.test".to_string()]));
+
+    mgr.revert(&prior, gateway_url).unwrap();
+    let reverted = mgr.read_settings().unwrap();
+    assert_eq!(
+        reverted["kiroAgent.cloudConfig.endpoint"],
+        json!("https://config.example")
+    );
+    assert!(!reverted.contains_key("kiroAgent.remoteSessions.endpoint"));
+    assert_eq!(reverted["editor.fontSize"], json!(15));
     let _ = fs::remove_dir_all(temp_dir);
 }
 

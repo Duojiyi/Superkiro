@@ -32,6 +32,7 @@ pub mod provider_import;
 pub mod subscriptions;
 pub mod usage;
 pub mod virtualization;
+pub mod web_bearer;
 
 pub use healthz::{HealthzHandler, MetricsHandler};
 
@@ -200,6 +201,9 @@ impl FacadeRegistry {
         self.register(conv)
             .register(completions::GenerateCompletionsHandler::default())
             .register(mcp::McpHandler::default());
+        for handler in web_bearer::WebBearerHandler::all() {
+            self.register(handler);
+        }
         // self.register_portal_facades(b, Some(store)); // ponytail: removed double registration
         self
     }
@@ -525,6 +529,7 @@ impl FacadeRegistry {
                 || path == "/client/brand"
                 || path == "/portal"
                 || path.starts_with("/api/v1/portal/")
+                || path.starts_with(web_bearer::PATH_PREFIX)
             {
                 public_routes.insert((path, h.method()), h);
             } else if path == "/metrics" || path.starts_with("/api/v1/admin/") {

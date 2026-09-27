@@ -1439,3 +1439,109 @@ async fn a_body_refused_before_it_is_read_is_read_before_the_answer() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(read.load(Ordering::SeqCst), 17);
 }
+
+/// The CBOR data items the web-account answers take, decoded independently of the
+/// gateway: (text, array or map, as JSON) and the bytes after it.
+fn cbor(bytes: &[u8]) -> (Value, &[u8]) {
+    let (major, info, mut rest) = (bytes[0] >> 5, bytes[0] & 0x1f, &bytes[1..]);
+    let length = match info {
+        0..=23 => info as usize,
+        24 => {
+            let n = rest[0] as usize;
+            rest = &rest[1..];
+            n
+        }
+        25 => {
+            let n = u16::from_be_bytes([rest[0], rest[1]]) as usize;
+            rest = &rest[2..];
+            n
+        }
+        _ => panic!("unexpected length form {info}"),
+    };
+    match major {
+        3 => (
+            Value::String(String::from_utf8(rest[..length].to_vec()).unwrap()),
+            &rest[length..],
+        ),
+        4 => {
+            let mut items = Vec::new();
+            for _ in 0..length {
+                let (item, after) = cbor(rest);
+                items.push(item);
+                rest = after;
+            }
+            (Value::Array(items), rest)
+        }
+        5 => {
+            let mut map = serde_json::Map::new();
+            for _ in 0..length {
+                let (key, after) = cbor(rest);
+                let (value, after) = cbor(after);
+                map.insert(key.as_str().unwrap().to_string(), value);
+                rest = after;
+            }
+            (Value::Object(map), rest)
+        }
+        _ => panic!("unexpected major type {major}"),
+    }
+}
+
+/// Kiro's web-account services, pointed at the gateway by the takeover: a cloud config
+/// that is not enabled is one Kiro shows nothing for, and no cloud sessions is an empty
+/// list, both in the RPC v2 CBOR form its client reads, and without a sign-in.
+#[tokio::test]
+async fn kiros_web_account_services_are_answered_as_not_enabled() {
+    let app = FacadeRegistry::default()
+        .into_router_with_auth(gateway::auth::AuthState::with_default_dev_card());
+    let call = |operation: &'static str| {
+        let app = app.clone();
+        async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!(
+                            "/service/KiroWebBearerService/operation/{operation}"
+                        ))
+                        .header(header::CONTENT_TYPE, "application/cbor")
+                        .header("smithy-protocol", "rpc-v2-cbor")
+                        .body(Body::from(vec![0xa0]))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.headers()["content-type"], "application/cbor");
+            assert_eq!(response.headers()["smithy-protocol"], "rpc-v2-cbor");
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let (value, rest) = cbor(&bytes);
+            assert!(rest.is_empty(), "trailing bytes after the body");
+            (status, value)
+        }
+    };
+
+    for operation in ["GetConfigManifest", "GetConfigContents"] {
+        let (status, body) = call(operation).await;
+        assert!(status.as_u16() >= 300, "{operation}: {status}");
+        // Kiro names the error by what follows the `#`, then finds its class by the name.
+        let name = body["__type"].as_str().unwrap().rsplit('#').next().unwrap();
+        assert_eq!(name, "CloudConfigNotEnabledException", "{body}");
+    }
+    for (operation, list) in [
+        ("ListSpaces", "spaces"),
+        ("ListAvailableProviders", "providers"),
+        ("ListProviderResources", "resources"),
+    ] {
+        let (status, body) = call(operation).await;
+        assert_eq!(status, StatusCode::OK, "{operation}");
+        assert_eq!(body, json!({list: []}), "{operation}");
+    }
+    let (status, body) = call("CreateSpace").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        body["message"].as_str().unwrap().contains("云端会话"),
+        "{body}"
+    );
+}
