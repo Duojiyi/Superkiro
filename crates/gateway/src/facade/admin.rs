@@ -1407,6 +1407,26 @@ impl FacadeHandler for AdminStatsHandler {
                     "remainingPoints": (remaining_credits as f64) / micro,
                     // Real totals for the overview, not a sample of the latest traces.
                     "activity": self.billing.activity(now_secs()),
+                    // Where each group's hidden Kiro background calls (commit messages,
+                    // spec sub-intents) go, and why: they are billed at that model's price.
+                    "simpleTaskModels": self
+                        .billing
+                        .list_groups()
+                        .iter()
+                        .map(|group| {
+                            let choice = super::models::simple_task_model(
+                                &self.billing,
+                                &group.id,
+                                now_secs(),
+                            );
+                            serde_json::json!({
+                                "groupId": group.id,
+                                "groupName": group.name,
+                                "model": choice.as_ref().map(|(model, _)| model.exposed_model_id.clone()),
+                                "via": choice.map(|(_, via)| via),
+                            })
+                        })
+                        .collect::<Vec<_>>(),
                 }),
             )
         })

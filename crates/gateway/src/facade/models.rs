@@ -124,6 +124,63 @@ pub const MODEL_RATE_UNIT: &str = "Credit";
 /// session recaps and titles. Its own service never lists it, and neither does the gateway.
 pub const SIMPLE_TASK_MODEL: &str = "simple-task";
 
+/// Kiro's "Auto (model selected dynamically on the server)", which a custom agent may pin.
+/// The gateway's choice is the group's default model, the one its model list names first
+/// and Kiro starts a session on: "auto" is the customer leaving the choice to the service.
+pub const AUTO_MODEL: &str = "auto";
+
+/// Why a group's `simple-task` requests go to the model they go to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FastModelChoice {
+    /// The mapping the operator gave the alias `simple-task`.
+    Alias,
+    /// No alias: the listed model that costs least at the price in force.
+    Cheapest,
+    /// No alias and no listed model with a price: the group's default model.
+    Default,
+}
+
+/// The mapping Kiro's fast model resolves to in `group_id`: the one the operator gave the
+/// alias `simple-task`, listed or hidden; else the listed model whose million input and
+/// million output tokens cost least at the price in force at `now`, the first in the list
+/// among equals; else the group's default. Kiro sends commit messages and one sub-intent
+/// per spec-mode message to it, each held at its maximum output: sent to the group's first
+/// model, that was often its flagship, at the flagship's price.
+pub fn simple_task_model(
+    billing: &billing::engine::BillingEngine,
+    group_id: &str,
+    now: u64,
+) -> Option<(billing::group::ModelMap, FastModelChoice)> {
+    let models = billing.list_models_for_group(group_id, false);
+    if let Some(aliased) = models
+        .iter()
+        .find(|model| !model.retired && model.matches_model(SIMPLE_TASK_MODEL))
+    {
+        return Some((aliased.clone(), FastModelChoice::Alias));
+    }
+    let listed: Vec<_> = models
+        .into_iter()
+        .filter(|model| model.is_listed())
+        .collect();
+    listed
+        .iter()
+        .filter_map(|model| {
+            let price = billing
+                .display_price(group_id, &model.exposed_model_id, now)
+                .filter(|price| *price > 0)?;
+            Some((price, model))
+        })
+        // The first of equals: the list is in the group's order.
+        .min_by_key(|(price, _)| *price)
+        .map(|(_, model)| (model.clone(), FastModelChoice::Cheapest))
+        .or_else(|| {
+            listed
+                .first()
+                .map(|model| (model.clone(), FastModelChoice::Default))
+        })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExposedModelItem {

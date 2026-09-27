@@ -2526,3 +2526,53 @@ async fn cards_are_issued_from_the_plan_catalog_and_keep_their_plan() {
     let (_, config) = admin_call(&app, Method::GET, "/api/v1/admin/commercial-config", None).await;
     assert_eq!(config["config"]["cards_by_plan"]["trial-7d"], 2);
 }
+
+/// The operator sees where each group's hidden Kiro background calls go, and why: they are
+/// billed at that model's price.
+#[tokio::test]
+async fn stats_name_each_groups_fast_model_and_why() {
+    let (billing, app) = setup_admin_app();
+    billing.upsert_group(billing::group::Group::pro_plus("group-fast", "Fast"));
+    for (order, model, credits) in [(0, "big-model", 9_000_000), (1, "small-model", 1_000_000)] {
+        let mut map = billing::group::ModelMap::new(
+            format!("map-{model}"),
+            "group-fast",
+            model,
+            "prov",
+            format!("up-{model}"),
+        );
+        map.sort_order = order;
+        billing.upsert_model_map(map);
+        billing.upsert_rate_card_version(billing::rate_card::RateCardVersion {
+            id: format!("price-{model}"),
+            rate_card_id: "default".into(),
+            model: model.into(),
+            currency: billing::rate_card::Currency::Cny,
+            pricing_mode: billing::rate_card::PricingMode::Fixed,
+            input_price_per_m: 0.0,
+            output_price_per_m: 0.0,
+            cache_creation_price_per_m: 0.0,
+            cache_read_price_per_m: 0.0,
+            fixed_input_credit_per_m: credits,
+            fixed_output_credit_per_m: credits,
+            fixed_cache_creation_credit_per_m: 0,
+            fixed_cache_read_credit_per_m: 0,
+            per_call_credit: 0,
+            margin_multiplier: 1.0,
+            effective_from_secs: 0,
+            official: None,
+        });
+    }
+
+    let (status, stats) = admin_call(&app, Method::GET, "/api/v1/admin/stats", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let fast = stats["simpleTaskModels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|group| group["groupId"] == "group-fast")
+        .cloned()
+        .unwrap();
+    assert_eq!(fast["model"], "small-model", "{fast}");
+    assert_eq!(fast["via"], "cheapest");
+}

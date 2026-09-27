@@ -10,7 +10,7 @@
 //! 5. Upstream provider streaming invocation (Spec §15.2).
 //! 6. Binary AWS EventStream encoding, 20s keepalive injection, and client disconnect cancellation (Spec §4.6, §6.3).
 
-use super::models::SIMPLE_TASK_MODEL;
+use super::models::{AUTO_MODEL, SIMPLE_TASK_MODEL};
 use super::{error_response, input_too_long, validation_error, BoxFuture, FacadeHandler, Response};
 use crate::auth::AuthClaims;
 use crate::guardrail::{format_kiro_throttle_response, CapacityGuardrail, LargeBodyGate};
@@ -1836,9 +1836,10 @@ fn valid_invocation_id(id: &str) -> bool {
 /// was priced as "default-model" and sent to the fallback model, so it was billed at the
 /// built-in default rates whatever its group's models cost.
 ///
-/// Kiro's fast model is the model given its name, as an alias as a rule, listed or hidden,
-/// or else the group's default; it is held, routed and billed as that model. Refused for want of a
-/// price, it failed Kiro's commit messages and its spec sub-intents.
+/// Kiro's "auto" is the default model too: the customer left the choice to the service.
+/// Kiro's fast model is the group's `simple-task` choice ([`simple_task_model`]): its
+/// alias, else its cheapest listed model. Either is held, routed and billed as the model
+/// it resolved to.
 fn requested_model_id(
     request: &GenerateAssistantResponseRequest,
     claims: Option<&AuthClaims>,
@@ -1851,29 +1852,24 @@ fn requested_model_id(
         .user_input_message
         .model_id
         .as_deref();
-    if let Some(model) = named.filter(|model| *model != SIMPLE_TASK_MODEL) {
-        return model.to_string();
-    }
     let group = claims.and_then(|claims| billing.get_group(&claims.group_id));
-    let fast_model = named.and(group.as_ref()).and_then(|group| {
-        billing
-            .list_models_for_group(&group.id, false)
-            .into_iter()
-            .find(|model| !model.retired && model.matches_model(SIMPLE_TASK_MODEL))
-    });
-    fast_model
-        .or_else(|| {
-            group.and_then(|group| {
-                billing
-                    .list_models_for_group(&group.id, true)
-                    .into_iter()
-                    .next()
-            })
-        })
-        .map_or_else(
-            || fallback_model.to_string(),
-            |model| model.exposed_model_id,
-        )
+    let resolved = match named {
+        Some(SIMPLE_TASK_MODEL) => group.and_then(|group| {
+            super::models::simple_task_model(billing, &group.id, crate::now_secs())
+                .map(|(model, _)| model)
+        }),
+        Some(model) if model != AUTO_MODEL => return model.to_string(),
+        _ => group.and_then(|group| {
+            billing
+                .list_models_for_group(&group.id, true)
+                .into_iter()
+                .next()
+        }),
+    };
+    resolved.map_or_else(
+        || fallback_model.to_string(),
+        |model| model.exposed_model_id,
+    )
 }
 
 /// The rule a published model ID and alias meet, around surrounding whitespace.

@@ -423,8 +423,11 @@ async fn kiros_fast_model_is_the_model_named_for_it_and_billed_as_it() {
     assert_eq!(listed(&billing), vec!["main-model"]);
 }
 
+/// Without an alias, the fast model is the group's cheapest listed model at the price in
+/// force, the first in the group's order among equals: sent to the group's first model it
+/// was often the flagship, at the flagship's price.
 #[tokio::test]
-async fn without_a_model_named_for_it_kiros_fast_model_is_the_group_default() {
+async fn without_a_model_named_for_it_kiros_fast_model_is_the_cheapest_listed() {
     let server = upstream(
         ResponseTemplate::new(200).set_body_raw(anthropic_answer("fix: typo"), "text/event-stream"),
     )
@@ -1544,4 +1547,57 @@ async fn kiros_web_account_services_are_answered_as_not_enabled() {
         body["message"].as_str().unwrap().contains("云端会话"),
         "{body}"
     );
+}
+
+/// A cheaper model later in the list is the fast model; Kiro's "auto", which a custom agent
+/// may pin, is the group's default model, the first its list shows.
+#[tokio::test]
+async fn the_fast_model_is_the_cheapest_and_auto_is_the_default() {
+    let server = upstream(
+        ResponseTemplate::new(200).set_body_raw(anthropic_answer("ok"), "text/event-stream"),
+    )
+    .await;
+    let main = ModelMap::new("map-main", GROUP, "main-model", "prov", "up-main");
+    let mut cheap = ModelMap::new("map-cheap", GROUP, "cheap-model", "prov", "up-cheap");
+    cheap.sort_order = 2;
+    let mut middle = ModelMap::new("map-middle", GROUP, "middle-model", "prov", "up-middle");
+    middle.sort_order = 1;
+    let billing = engine(
+        ProviderFormat::Anthropic,
+        &server.uri(),
+        vec![main, middle, cheap],
+    );
+    for (model, input, output) in [
+        ("main-model", 5_000_000, 25_000_000),
+        ("middle-model", 3_000_000, 15_000_000),
+        ("cheap-model", 1_000_000, 5_000_000),
+    ] {
+        let mut version = price(model);
+        version.fixed_input_credit_per_m = input;
+        version.fixed_output_credit_per_m = output;
+        billing.upsert_rate_card_version(version);
+    }
+    assert_eq!(
+        gateway::facade::models::simple_task_model(&billing, GROUP, gateway::now_secs())
+            .map(|(model, via)| (model.exposed_model_id, via)),
+        Some((
+            "cheap-model".to_string(),
+            gateway::facade::models::FastModelChoice::Cheapest
+        ))
+    );
+    let app = serve(&billing);
+
+    for (invocation, model) in [("inv-fast", "simple-task"), ("inv-auto", "auto")] {
+        let reply = send(
+            &app,
+            invocation,
+            body(json!({"content": "hi", "modelId": model}), vec![]),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK, "{model}: {}", reply.text());
+    }
+    assert_eq!(models_sent(&server).await, vec!["up-cheap", "up-main"]);
+    let usage = usage_entries(&billing);
+    assert_eq!(usage[0].exposed_model, "cheap-model");
+    assert_eq!(usage[1].exposed_model, "main-model");
 }
