@@ -144,7 +144,7 @@ assert.equal(routes.switchedRoute({target_provider_id: 'a', target_model: 'm', f
 console.log('PASS legacy route costs: own route version first, then upstream, *, the model price; 0 made later when not first; switching keeps the old route as backup');
 
 // List order: moving a model numbers its whole group again, so no tie remains; the default is the first shown model.
-const listingRules = load('listing.ts', {'./priceChange': change, './routes': routes});
+const listingRules = load('listing.ts', {'./priceChange': change, './routes': routes, './officialPricing': load('officialPricing.ts', {'./priceChange': change, './routes': routes})});
 const ordered = [{id: 'a', group_id: 'g', sort_order: 0, visible: false}, {id: 'b', group_id: 'g', sort_order: 0}, {id: 'c', group_id: 'g', sort_order: 5}, {id: 'x', group_id: 'h', sort_order: 0}];
 const placed = (to, id) => plain(listingRules.reorder(ordered, id, to).map(row => [row.id, row.sort_order]));
 assert.deepEqual(placed('first', 'c'), [['a', 1], ['b', 2], ['c', 0], ['x', 0]], 'to the top; another group is untouched');

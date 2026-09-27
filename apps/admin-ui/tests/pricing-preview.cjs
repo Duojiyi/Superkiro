@@ -172,7 +172,7 @@ const Editor = load('CommercialEditor.tsx', {'./tokens': tokens, './api': {admin
   './components/ui': {FilterTabs: 'FilterTabs', InfoTip: 'InfoTip', StatusBadge: 'StatusBadge', Tag: 'Tag', TopbarActions: 'TopbarActions'}, './status': load('status.ts'), './PriceDrawer': {default: 'PriceDrawer'}, './PriceVersions': {default: 'PriceVersions'}, './ListModelDrawer': {default: 'ListModelDrawer'},
   './RouteEditor': {default: 'RouteEditor'}, './RouteSwitchDrawer': {default: 'RouteSwitchDrawer'}, './BulkPriceDrawer': {default: 'BulkPriceDrawer'}, './Probe': {default: 'Probe'}, './components/menu': {Menu: 'Menu'},
   './officialPricing': load('officialPricing.ts', {'./priceChange': change, './routes': routes}), './OfficialPriceTable': {default: 'OfficialPriceTable'}, './PricingSettings': {default: 'PricingSettings'}, './RouteCostDrawer': {default: 'RouteCostDrawer'},
-  './listing': load('listing.ts', {'./priceChange': change, './routes': routes}),
+  './listing': load('listing.ts', {'./priceChange': change, './routes': routes, './officialPricing': load('officialPricing.ts', {'./priceChange': change, './routes': routes})}),
   react, 'react/jsx-runtime': runtime}).default;
 const providers = [{id: 'p', name: '供应商 P'}, {id: 'openai', name: 'Astra', api_type: 'openai'}];
 const providerKeys = [{id: 'k', provider_id: 'openai', allowed_models: ['gpt-6-astra', 'gpt-5.6-sol']}, {id: 'k2', provider_id: 'p', allowed_models: ['upstream']}];
@@ -226,23 +226,14 @@ assert.equal(states[1],duplicateDraft,'duplicate IDs cannot cause multiple rows 
 assert(states[4].includes('ID 重复或不存在'));
 
 // 上架模型: the rules in listing.ts, without a browser.
-const listing = load('listing.ts', {'./priceChange': change, './routes': routes});
+const officialRules = load('officialPricing.ts', {'./priceChange': change, './routes': routes});
+const listing = load('listing.ts', {'./priceChange': change, './routes': routes, './officialPricing': officialRules});
 // Values made inside the module's context compare by content, not by prototype.
 const plain = value => JSON.parse(JSON.stringify(value));
 assert.equal(listing.displayNameFor('claude-opus-5-5'), 'Claude Opus 5.5');
 assert.equal(listing.displayNameFor('claude-sonnet-4-5-20250929'), 'Claude Sonnet 4.5', 'a snapshot date is left out');
 assert.equal(listing.displayNameFor('gpt-5.6-sol'), 'GPT 5.6 Sol');
 assert.equal(listing.displayNameFor('deepseek-v3'), 'DeepSeek V3');
-// Official price x multiplier, exactly: CNY 0.24 per official dollar at CNY 0.03 a credit is 8 credits a dollar.
-assert.equal(listing.creditsFromOfficial('5', '0.24', 0.03), 40000000);
-assert.equal(listing.creditsFromOfficial('0.2', '0.24', 0.03), 1600000);
-assert.equal(listing.creditsFromOfficial('4', '0.35', 0.03), 46666667, 'rounded half up to one micro-credit');
-assert.equal(listing.creditsFromOfficial('12.5', '0.24', 0.025), 120000000);
-assert.equal(listing.costFromOfficial('4', '0.22'), 0.88);
-assert.equal(listing.costFromOfficial('0.2', '0.22'), 0.044);
-assert.equal(listing.costFromOfficial('6.25', '0.08'), 0.5);
-for (const bad of ['', '-1', '1e3', 'abc', '1.0000000001']) assert.throws(() => listing.creditsFromOfficial(bad, '0.24', 0.03));
-assert.throws(() => listing.creditsFromOfficial('5', '0.24', 0), /积分面值/);
 const listingConfig = {groups: [{id: 'g', name: 'G', rate_card_id: 'r', margin_multiplier: 1}], rate_cards: [{id: 'r', name: 'R'}], versions: [],
   models: [{id: 'm-a', group_id: 'g', exposed_model_id: 'model-a', target_provider_id: 'p', target_model: 'model-a', sort_order: 0},
     {id: 'm-b', group_id: 'g', exposed_model_id: 'model-b', target_provider_id: 'p', target_model: 'model-b', sort_order: 1, aliases: ['b-alias']},
@@ -277,7 +268,7 @@ assert.equal(listing.buildListing({...listingInput, creditMultiplier: '1.5'}, li
 assert.equal(listing.buildListing(listingInput, {...listingContext, config: {...listingConfig, models: [...listingConfig.models, {id: 'p-new-model', group_id: 'other', exposed_model_id: 'x', target_model: 'x', sort_order: 0}]}}).mapping.id, 'p-new-model-2');
 for (const [change_, pattern] of [[{providerId: 'off'}, /已停用/], [{targetModel: 'disabled-only'}, /还没有授权 disabled-only/], [{modelId: 'model-b'}, /已经有 model-b/],
   [{modelId: 'b-alias'}, /已经有 b-alias/], [{modelId: 'new model'}, /只能用英文字母/], [{modelId: '模型'}, /只能用英文字母/], [{modelId: 'x'.repeat(129)}, /最多 128 个字符/],
-  [{contextWindow: 1000, maxOutput: 2000}, /上下文/], [{contextWindow: null}, /上下文/], [{rateMultiplier: '0'}, /显示倍率/], [{creditMultiplier: ''}, /扣费倍率/], [{creditMultiplier: '1001'}, /扣费倍率/],
+  [{contextWindow: 1000, maxOutput: 2000}, /上下文/], [{contextWindow: null}, /上下文/], [{rateMultiplier: '0'}, /显示倍率/], [{creditMultiplier: ''}, /模型倍率/], [{creditMultiplier: '1001'}, /模型倍率/],
   [{prices: {...listingInput.prices, fixed_input_credit_per_m: '0', fixed_output_credit_per_m: '0'}}, /不能都是 0/], [{place: {at: 'after', id: 'missing'}}, /重新选择位置/],
   [{costs: {...listingInput.costs, output_price_per_m: ''}}, /采购价/], [{groupId: 'nope'}, /请选择分组/]]) {
   assert.throws(() => listing.buildListing({...listingInput, ...change_}, listingContext), pattern, JSON.stringify(change_));

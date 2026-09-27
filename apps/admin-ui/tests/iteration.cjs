@@ -119,16 +119,18 @@ const server=http.createServer(async(req,res)=>{
     await page.route('**/api/v1/admin/commercial-config',route=>{if(route.request().method()!=='POST')return route.continue();const body=route.request().postDataJSON();publishBodies.push(body);return route.fulfill({json:{success:true,config:{...config,revision:'fixture-after-price',versions:[...config.versions,...body.versions]}}});});
     await priceButton.click();
     const drawer=page.locator('#price-drawer');await drawer.waitFor();
+    // No official price in this configuration: the credits are typed under 高级.
+    await drawer.getByRole('checkbox',{name:/高级：直接填积分/}).check();
     await drawer.getByLabel('新输入售价',{exact:true}).fill('2.5');await drawer.getByLabel('调价原因',{exact:true}).fill('test new price');
     // The legacy fixture has no procurement prices: they are asked for, and nothing is sent until given.
-    await drawer.getByRole('button',{name:'发布调价',exact:true}).click();
+    await drawer.getByRole('button',{name:'预览调价',exact:true}).click();
     await drawer.getByRole('alert').filter({hasText:'采购价需在'}).waitFor();assert.equal(await page.getByRole('alertdialog').count(),0);assert.equal(publishBodies.length,0);
-    for(const label of ['输入','输出','缓存写','缓存读'])await drawer.getByLabel(`采购${label}价`,{exact:true}).fill('1');
-    await drawer.getByRole('button',{name:'发布调价',exact:true}).click();await answer(true);
+    for(const label of ['输入','输出','缓存写','缓存读'])await drawer.getByLabel(`采购${label}价`,{exact:true}).fill('0.001');
+    await drawer.getByRole('button',{name:'预览调价',exact:true}).click();await answer(true);
     await page.locator('.toast').filter({hasText:'已发布 claude-sonnet 的新价格'}).waitFor();
     assert.equal(publishBodies.length,1);assert.equal(publishBodies[0].expected_revision,config.revision);assert.equal(publishBodies[0].reason,'test new price');
     const version=publishBodies[0].versions[0];
-    assert.match(version.id,/^claude-sonnet-\d{12}$/);assert.equal(version.margin_multiplier,1);assert.equal(version.fixed_input_credit_per_m,2500000);assert.equal(version.currency,'USD');
+    assert.match(version.id,/^claude-sonnet-\d{12}$/);assert.equal(version.margin_multiplier,1);assert.equal(version.fixed_input_credit_per_m,2500000);assert.equal(version.currency,'CNY');
     console.log('PASS: definite insufficient-balance rejection clears only uncommitted intent; another card remains editable; price changes wait for page edits; missing procurement prices block the send; the new version carries the generated ID');
     assert.deepEqual(errors,[]);assert.deepEqual(nativeDialogs,[],'no browser-native dialogs');
     console.log('PASS: committed issuance lost response locks across reload; failed review cannot unlock; successful review never submits; saved Key remount uses latest permissions; same-Key edit preserves dirty guard; trace details receive focus');

@@ -147,6 +147,35 @@ assert.equal(ownSchedule[0].overriddenBy, null, 'one the change itself adds (a r
 assert.equal(official.largestChange([10, 10, 10, 10], [10, 14, 10, 10]), 40); assert.equal(official.largestChange([10, 0, 10, 10], [10, 1, 10, 10]), Infinity);
 console.log('PASS preview impact: every group sharing the table in one row, a provider change touching only its routes, a later schedule named, the largest change');
 
+// 上架 from an official price, into two groups at once, hidden first: one entry per group at its own
+// place, one price per price table (in force at once where the table has none, a minute on where
+// it already prices the model ID and a new price is asked for), the version recording its official block.
+const listing = load('listing.ts', {'./priceChange': change, './routes': routes, './officialPricing': official});
+const shelf = {rate_cards: [{id: 'r', name: 'R'}, {id: 'r2', name: 'R2'}],
+  groups: [{id: 'pro', name: 'PRO', rate_card_id: 'r'}, {id: 'max', name: 'MAX', rate_card_id: 'r'}, {id: 'vip', name: 'VIP', rate_card_id: 'r2'}],
+  models: [{id: 'a', group_id: 'pro', exposed_model_id: 'model-a', target_provider_id: 'p', target_model: 'model-a', sort_order: 0},
+    {id: 'b', group_id: 'pro', exposed_model_id: 'model-b', target_provider_id: 'p', target_model: 'model-b', sort_order: 1},
+    {id: 'c', group_id: 'max', exposed_model_id: 'model-c', target_provider_id: 'p', target_model: 'model-c', sort_order: 0}], versions: []};
+const shelfContext = {config: shelf, providers: [{id: 'p', name: 'P'}], keys: [{id: 'k', provider_id: 'p', enabled: true}], nowSecs: now, effectiveSecs: now + 60};
+const shelfInput = {providerId: 'p', targetModel: 'claude-opus-5-5', modelId: 'claude-opus-5-5', displayName: '', groupId: 'pro', place: {at: 'after', id: 'a'}, also: [{groupId: 'max', place: {at: 'first'}}],
+  hidden: true, contextWindow: 200000, maxOutput: 64000, tools: true, vision: true, reasoning: true, rateMultiplier: '', creditMultiplier: '1', keepPrice: true,
+  official: {...input, face: 0.03}, prices: {}, costs: {}, currency: 'CNY'};
+const shelved = listing.buildListing(shelfInput, shelfContext);
+assert.deepEqual(plain(shelved.mappings.map(row => [row.id, row.group_id, row.sort_order, row.visible])), [['p-claude-opus-5-5', 'pro', 1, false], ['p-claude-opus-5-5-2', 'max', -1, false]], 'hidden first, each group at its place');
+assert.deepEqual(plain(shelved.models.map(row => row.id)), ['b', 'p-claude-opus-5-5', 'p-claude-opus-5-5-2'], 'the group it goes into the middle of is numbered again');
+assert.equal(shelved.versions.length, 1, 'PRO and MAX share one price table: one price');
+assert.deepEqual(plain([shelved.version.rate_card_id, shelved.version.effective_from_secs, shelved.version.fixed_output_credit_per_m, shelved.version.official.price_multiplier]), ['r', 0, 200000000, 0.24]);
+const twoTables = listing.buildListing({...shelfInput, also: [{groupId: 'vip', place: {at: 'last'}}]}, {...shelfContext, config: {...shelf, versions: [{...version, id: 'v-r2', rate_card_id: 'r2', model: 'claude-opus-5-5', effective_from_secs: now - 10}]}});
+assert.deepEqual(plain(twoTables.versions.map(row => row.rate_card_id)), ['r'], 'a table that already prices the model ID keeps its price');
+const renewed = listing.buildListing({...shelfInput, keepPrice: false, also: [{groupId: 'vip', place: {at: 'last'}}]}, {...shelfContext, config: {...shelf, versions: [{...version, id: 'v-r2', rate_card_id: 'r2', model: 'claude-opus-5-5', effective_from_secs: now - 10}]}});
+assert.deepEqual(plain(renewed.versions.map(row => [row.rate_card_id, row.effective_from_secs])), [['r', 0], ['r2', now + 60]], 'a new price there starts a minute on');
+assert.throws(() => listing.buildListing({...shelfInput, also: [{groupId: 'pro', place: {at: 'last'}}]}, shelfContext), /只能选一次/);
+assert.throws(() => listing.buildListing({...shelfInput, official: {...input, face: 0.03, priceMultiplier: 0}}, shelfContext), /计费倍率/);
+assert.deepEqual(plain(listing.listingWarnings({targetModel: 'claude-opus-5-5', modelId: 'x', reasoning: false, contextWindow: 200000, maxOutput: 16000})), ['Opus 5.5 总是会思考，最大输出却不到 32K：思考也算输出，回答容易被截断']);
+assert.equal(listing.listingWarnings({targetModel: 'gpt-6-astra', modelId: 'x', reasoning: true, contextWindow: 272000, maxOutput: 128000}).length, 0, '272K is the base context of a GPT model');
+assert.match(listing.listingWarnings({targetModel: 'claude-sonnet', modelId: 'x', reasoning: false, contextWindow: 1000000, maxOutput: 8000})[0], /^上下文 1000K 超过 200K：价格没有长上下文档/);
+console.log('PASS 上架 from an official price into two groups, hidden first: an entry per group at its place, one price per price table, the existing one kept or renewed a minute on, the warnings');
+
 // The fixture refuses what the server refuses, in its words (crates/billing/src/commercial.rs).
 const fixture = require('./fixture-api.cjs')();
 const reason = 'official pricing';

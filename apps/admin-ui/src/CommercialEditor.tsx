@@ -336,7 +336,6 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
       return failure;
     } finally {pending.current = false; if (alive.current) setBusy(false);}
   };
-  const publishPrice = (version: Row, priceReason: string) => publishOne({versions: [version]}, priceReason, '调价', `已发布 ${String(version.model)} 的新价格`);
   const reload = async () => {
     if (dirty && !(await confirmAction({title: '放弃未发布的修改？', consequence: '会重新加载服务器上的配置。', confirmLabel: '放弃修改'}))) return;
     void load(false);
@@ -701,18 +700,20 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
     {priceModel && config && (() => {
       const model = configModels.find(item => item.id === priceModel);
       if (!model) return null;
-      return <PriceDrawer key={priceModel} model={model} group={configGroups.find(group => group.id === model.group_id) ?? null} config={config}
-        onClose={() => setPriceModel(null)} onPublish={publishPrice} onReload={() => load(false, true)}/>;
+      // Every group's entry of this model: groups sharing a price table are charged the one price.
+      const mappings = [model, ...configModels.filter(item => item !== model && item.exposed_model_id === model.exposed_model_id)];
+      return <PriceDrawer key={priceModel} mappings={mappings} config={config} providers={providers} sampleOf={name => sampleFor(traces, name)}
+        onClose={() => setPriceModel(null)} onPublish={(update, priceReason, done, check) => publishOne(update, priceReason, '调价', done, check)} onReload={() => load(false, true)}/>;
     })()}
 
     {switching && config && pickedModels.length > 0 && <RouteSwitchDrawer models={pickedModels} config={config} providers={providers} keys={providerKeys}
       onClose={() => setSwitching(false)} onPublish={(update, switchReason, check) => publishOne(update, switchReason, '切换线路', undefined, check)}
       onSwitched={(provider, kept, routes) => {setLastSwitch({provider, kept, routes}); setPicked([]);}}/>}
 
-    {bulkPricing && config && pickedModels.length > 0 && <BulkPriceDrawer models={pickedModels} config={config} onClose={() => setBulkPricing(false)}
+    {bulkPricing && config && pickedModels.length > 0 && <BulkPriceDrawer models={pickedModels} config={config} providers={providers} sampleOf={sample} onClose={() => setBulkPricing(false)}
       onPublish={async (update, priceReason, check) => {const outcome = await publishOne(update, priceReason, '批量调价', undefined, check); if (outcome.ok) setPicked([]); return outcome;}}/>}
 
-    {listing && config && <ListModelDrawer preset={listing} config={config} providers={providers} providerKeys={providerKeys}
+    {listing && config && <ListModelDrawer preset={listing} config={config} providers={providers} providerKeys={providerKeys} sampleOf={sample}
       onClose={() => setListing(null)} onPublish={(update, listingReason, check) => publishOne(update, listingReason, '上架', undefined, check)} onReload={() => load(false, true)}/>}
 
     {newGroup && <Modal label="新建分组" onClose={() => setNewGroup(null)} className="dialog-form">

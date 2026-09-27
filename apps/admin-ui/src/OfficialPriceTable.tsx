@@ -10,7 +10,7 @@ import {toast} from './components/toast';
 import {InfoTip} from './components/ui';
 import {formatDateTime} from './format';
 import {currentVersion, versionIdFor} from './priceChange';
-import {KINDS, modelEntries, officialOf, officialVersion, OFFICIAL_FIELDS, pricingImpact, primaryCost, readSettings, usdOk, type Four} from './officialPricing';
+import {freeTime, KINDS, modelEntries, officialOf, officialVersion, OFFICIAL_FIELDS, pricingImpact, primaryCost, readSettings, usdOk, type Four} from './officialPricing';
 import PricingPreview, {type PreviewPlan} from './PricingPreview';
 import type {Publish} from './PricingSettings';
 import {typedNumber, usdText} from './pricingText';
@@ -150,9 +150,9 @@ export default function OfficialPriceTable({config, providers, sample, blocked, 
         const version = currentVersion(config.versions, rateCardId, [mapping.exposed_model_id, mapping.target_model], now), input = officialOf(version);
         if (!version || !input || !input.official.every((value, index) => value === old[index])) continue;
         seen.add(`${rateCardId}\n${entry.id}`);
-        const id = versionIdFor(String(version.model), later, taken);
+        const at = freeTime(config.versions, [[rateCardId, version.model]], later), id = versionIdFor(String(version.model), at, taken);
         taken.push(id);
-        rederive.push({model: entry.id, version: officialVersion({...input, official: next, basis: primaryCost(after, mapping, next).basis, usdCny: after.usdCny, face: after.face ?? input.face}, {id, rateCardId, model: String(version.model), effectiveSecs: later})});
+        rederive.push({model: entry.id, version: officialVersion({...input, official: next, basis: primaryCost(after, mapping, next).basis, usdCny: after.usdCny, face: after.face ?? input.face}, {id, rateCardId, model: String(version.model), effectiveSecs: at})});
       }
     }
     const context = {models: config.models, groups: config.groups, nowSecs: now, effectiveSecs: now, sample};

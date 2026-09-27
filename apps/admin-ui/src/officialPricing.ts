@@ -237,6 +237,16 @@ export function modelEntries(models: Row[], groups: Row[]): ModelEntry[] {
   return [...entries].map(([id, mappings]) => ({id, mappings}));
 }
 
+/**
+ * The first time from `at`, a minute at a time, at which none of these price tables has a price
+ * of that model: the server keeps one price per table, model and time.
+ */
+export function freeTime(versions: Row[], prices: Array<[unknown, unknown]>, at: number): number {
+  let time = at;
+  while (prices.some(([rateCardId, model]) => versions.some(version => version.rate_card_id === rateCardId && version.model === model && Number(version.effective_from_secs) === time))) time += 60;
+  return time;
+}
+
 /** In force at this time, or scheduled: a version no later one in force has superseded. */
 export function isLiveVersion(version: Row, versions: Row[], nowSecs: number): boolean {
   const from = Number(version.effective_from_secs);
@@ -351,8 +361,9 @@ const rounded = (values: Four | null) => values && values.map(value => Math.roun
 
 /**
  * Every customer model a change touches, per price table: its credits, what customers pay, and
- * each route's cost and margin before (now) and after (when the change takes effect). `before`
- * and `after` are the settings and versions without and with the change.
+ * each route's cost and margin without and with the change (`before` and `after`: the settings
+ * and versions), both when the change takes effect, so a price already scheduled in between is
+ * not taken for part of this change.
  */
 export function pricingImpact(before: {settings: PricingSettings; versions: Row[]}, after: {settings: PricingSettings; versions: Row[]}, context: {models: Row[]; groups: Row[]; nowSecs: number; effectiveSecs: number; sample: (model: string) => Four}): ImpactRow[] {
   const rows: ImpactRow[] = [];
@@ -364,7 +375,7 @@ export function pricingImpact(before: {settings: PricingSettings; versions: Row[
     }
     for (const [rateCardId, mappings] of tables) {
       const tokens = context.sample(entry.id);
-      const was = priceState(before.settings, before.versions, rateCardId, mappings, context.groups, context.nowSecs, tokens);
+      const was = priceState(before.settings, before.versions, rateCardId, mappings, context.groups, context.effectiveSecs, tokens);
       const will = priceState(after.settings, after.versions, rateCardId, mappings, context.groups, context.effectiveSecs, tokens);
       const names = [mappings[0].exposed_model_id, mappings[0].target_model];
       // A price scheduled before this change that still stands (one the change itself withdraws or adds is part of it).
@@ -394,10 +405,10 @@ export function keepMarginPlan(before: PricingSettings, after: PricingSettings, 
     if (!input || !version || !was || !will || was.value === will.value || !routeBasis(before, primary) || !routeBasis(after, primary)) continue;
     const to = Math.round(input.priceMultiplier * will.value / was.value * 10_000) / 10_000;
     if (!multiplierOk(to)) continue;
-    const id = versionIdFor(String(version.model), effectiveSecs, taken);
+    const at = freeTime(config.versions, [[rateCardId, version.model]], effectiveSecs), id = versionIdFor(String(version.model), at, taken);
     taken.push(id);
     const next = {...input, priceMultiplier: to, costMultiplier: will.value, basis: primaryCost(after, mapping, input.official).basis, usdCny: after.usdCny, face: after.face ?? input.face};
-    plan.push({version: officialVersion(next, {id, rateCardId, model: String(version.model), effectiveSecs}), model: entry.id, rateCardId, from: input.priceMultiplier, to});
+    plan.push({version: officialVersion(next, {id, rateCardId, model: String(version.model), effectiveSecs: at}), model: entry.id, rateCardId, from: input.priceMultiplier, to});
   }
   return plan;
 }

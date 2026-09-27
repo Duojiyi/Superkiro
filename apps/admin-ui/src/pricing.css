@@ -47,3 +47,17 @@
 @media (max-width: 900px) {.admin-app .drawer.price-drawer {width: 100vw;}}
 .route-cost-drawer .pricing-result {margin: 0;}
 .route-cost {display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; font-size: 13px;}
+
+/* The official-price block 调价 and 上架 share, and the drawers around it. */
+.official-fields {display: flex; flex-direction: column; gap: 10px;}
+.official-fields .official-source {display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 16px;}
+.official-fields .priced-as {display: inline-flex; align-items: center; gap: 8px;}
+.official-fields .priced-as select {min-width: 220px;}
+.admin-app .price-drawer .pricing-result {display: flex; flex-direction: column; gap: 4px; margin: 0; padding: 10px 12px; border: 1px solid var(--border-subtle); border-radius: 6px; background: var(--bg-muted);}
+.admin-app .price-drawer .pricing-result p {margin: 0;}
+.price-drawer .scheduled-price {display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px 12px;}
+.price-drawer .restore-line {display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 10px; margin: 0;}
+.price-drawer .table-choice, .listing-drawer .listing-groups {display: flex; flex-direction: column; gap: 6px; margin: 0; padding: 0; border: 0;}
+.listing-drawer .listing-group {display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px; min-height: 34px;}
+.listing-drawer .listing-group .check-field {min-width: 104px;}
+.listing-drawer .listing-group select {width: 260px; max-width: 100%;}
