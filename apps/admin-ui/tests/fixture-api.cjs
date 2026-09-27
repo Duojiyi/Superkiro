@@ -116,7 +116,7 @@ module.exports = function fixtureApi() {
   const DAY = 86400, t0 = Math.floor(Date.now() / 1000);
   const usage = (i, ago, model, provider, credits, cost, extra = {}) => ({id: `fixture-ledger-${i}`, card_id: cards[i % 6].id, ts: t0 - ago, kind: 'usage', invocation_id: `${cards[i % 6].id}:ledger-${i}`,
     exposed_model: model, provider_id: provider, input_tokens: 40000 + i * 1000, output_tokens: 900 + i * 10, cache_read_tokens: 30000, cache_write_tokens: 2000,
-    credits_charged: credits, provider_cost_micro_cny: cost, rate_card_version: cost ? 'fixture-price-v1' : null, ...extra});
+    credits_charged: credits, provider_cost_micro_cny: cost, rate_card_version: cost ? 'fixture-price-v1' : null, key_id: provider === 'fixture-openai' ? 'fixture-openai-key-1' : 'fixture-key', ...extra});
   const ledger = [
     usage(0, 600, 'claude-sonnet', 'fixture-provider', 1500000, 4000), usage(1, 1200, 'claude-sonnet', 'fixture-provider', 2500000, 7000),
     usage(2, 1800, 'gpt-5', 'fixture-provider', 1000000, 3000), usage(3, 2400, 'gpt-6-astra', 'fixture-openai', 3000000, 40000),
@@ -142,13 +142,19 @@ module.exports = function fixtureApi() {
   const cardsByPlan = () => Object.fromEntries(catalog().map(plan => [plan.id, cards.filter(card => soldAs(card)?.id === plan.id).length]));
   // What GET commercial-config answers: the configuration with its catalog and the cards issued from each plan.
   const configView = () => ({...config, plans: catalog(), cards_by_plan: cardsByPlan()});
+  // Whether settlement knew a usage entry's cost (ledger.rs cost_is_known): from official prices or a price
+  // version for its route, as its reason says after provider_cost:, else by its price version; estimated when
+  // its reason names another source.
+  const costSource = entry => String(entry.reason ?? '').startsWith('provider_cost:') ? String(entry.reason).slice('provider_cost:'.length) : null;
+  const costKnown = entry => costSource(entry) !== null ? /^(official=|rate_card_version=)/.test(costSource(entry)) : !!entry.rate_card_version;
+  const costEstimated = entry => costSource(entry) !== null && !costKnown(entry);
   // GET /financials over [fromSecs, toSecs), as the server computes each block from the ledger and the cards.
   const financials = (from, to) => {
     const t = Math.floor(Date.now() / 1000), face = config.settings.credit_face_value_cny, within = ts => (from === undefined || ts >= from) && (to === undefined || ts < to);
     const entries = ledger.filter(entry => within(entry.ts)), revenue = entry => Math.round(entry.credits_charged * face);
     const total = key => entries.reduce((sum, entry) => sum + entry[key], 0);
     const credits = total('credits_charged'), cost = total('provider_cost_micro_cny'), income = entries.reduce((sum, entry) => sum + revenue(entry), 0);
-    const costed = entries.filter(entry => entry.rate_card_version), uncosted = entries.length - costed.length;
+    const costed = entries.filter(costKnown), uncosted = entries.length - costed.length, estimated = entries.filter(costEstimated).length;
     const costedIncome = costed.reduce((sum, entry) => sum + revenue(entry), 0), costedCost = costed.reduce((sum, entry) => sum + entry.provider_cost_micro_cny, 0);
     const group = key => [...entries.reduce((map, entry) => map.set(entry[key], [...(map.get(entry[key]) ?? []), entry]), new Map())];
     const rankings = group('exposed_model').map(([model, rows]) => {
@@ -184,22 +190,34 @@ module.exports = function fixtureApi() {
     liability.valueMicroCny = Math.round(liability.microCredits * face);
     return {success: true, fromSecs: from ?? null, toSecs: to ?? null, basis: 'retained_usage_ledger_estimate_not_cash_revenue', settings: config.settings, actualRevenueMicroCny: null, actualGrossProfitMicroCny: null,
       estimates: {retainedLedgerOnly: true, usageFaceValueMicroCny: income, configuredProviderCostMicroCny: cost, faceValueLessCostMicroCny: uncosted ? null : income - cost,
-        faceValueMarginPercentage: !uncosted && income > 0 ? (income - cost) / income * 100 : null, costedRequests: costed.length, uncostedRequests: uncosted},
+        faceValueMarginPercentage: !uncosted && income > 0 ? (income - cost) / income * 100 : null, costedRequests: costed.length, uncostedRequests: uncosted, estimatedRequests: estimated},
       dashboard: {total_requests: entries.length, total_credits_charged: credits, revenue_micro_cny: income, provider_cost_micro_cny: cost, gross_profit_micro_cny: income - cost, gross_margin_percentage: income > 0 ? (income - cost) / income * 100 : 0},
       modelRankings: rankings, byProvider, sales, liability,
       planPrices: catalog().map(plan => ({templateId: plan.id, planId: plan.id, name: plan.name, points: plan.points, priceMicroCny: Math.round(plan.price_cny * 1e6), onSale: plan.on_sale})),
       margin: {costedRequests: costed.length, costedCredits: costed.reduce((sum, entry) => sum + entry.credits_charged, 0), revenueMicroCny: costedIncome, costMicroCny: costedCost,
         grossProfitMicroCny: costedIncome - costedCost, marginPercentage: costedIncome > 0 ? (costedIncome - costedCost) / costedIncome * 100 : null,
-        uncostedRequests: uncosted, uncostedCredits: entries.filter(entry => !entry.rate_card_version).reduce((sum, entry) => sum + entry.credits_charged, 0)}};
+        uncostedRequests: uncosted, uncostedCredits: entries.filter(entry => !costKnown(entry)).reduce((sum, entry) => sum + entry.credits_charged, 0), estimatedRequests: estimated},
+      // Balance adjustments over the period (compute_adjustments): credits given, taken (negative) and the net.
+      adjustments: (() => {
+        const made = log.filter(event => event.action === 'adjust' && event.credits && within(event.ts));
+        const given = made.filter(event => event.credits > 0).reduce((sum, event) => sum + event.credits, 0), taken = made.filter(event => event.credits < 0).reduce((sum, event) => sum + event.credits, 0);
+        return {count: made.length, positiveMicroCredits: given, negativeMicroCredits: taken, netMicroCredits: given + taken};
+      })()};
   };
-  // The ledger CSV as the server writes it: every text cell quoted, the original columns first.
+  // The ledger CSV as the server writes it: every text cell quoted (one that a spreadsheet would run as a formula
+  // behind a '), the original columns first, then operator, reason, price version and the Key that served it.
+  // Adjustments are entries of their own; revenue and cost are only a usage entry's.
   const ledgerCsv = () => {
-    const quote = text => `"${String(text).replace(/"/g, '""')}"`, micro = value => String(value / 1e6);
+    const quote = text => `"${(/^[=+\-@\t\r]/.test(String(text)) ? `'${text}` : String(text)).replace(/"/g, '""')}"`, micro = value => String(value / 1e6);
     const names = Object.fromEntries(providers.map(provider => [provider.id, provider.name]));
-    const header = 'id,card_id,ts,kind,invocation_id,exposed_model,provider_id,input_tokens,output_tokens,credits_charged,provider_cost_micro_cny,time_utc,provider_name,cache_read_tokens,cache_write_tokens,credits,revenue_cny,cost_cny\n';
-    return header + ledger.map(entry => [quote(entry.id), quote(entry.card_id), entry.ts, quote(entry.kind), quote(entry.invocation_id), quote(entry.exposed_model), quote(entry.provider_id),
-      entry.input_tokens, entry.output_tokens, entry.credits_charged, entry.provider_cost_micro_cny, quote(new Date(entry.ts * 1000).toISOString().replace('.000', '')), quote(names[entry.provider_id] ?? entry.provider_id),
-      entry.cache_read_tokens, entry.cache_write_tokens, micro(entry.credits_charged), micro(Math.round(entry.credits_charged * config.settings.credit_face_value_cny)), micro(entry.provider_cost_micro_cny)].join(',') + '\n').join('');
+    const header = 'id,card_id,ts,kind,invocation_id,exposed_model,provider_id,input_tokens,output_tokens,credits_charged,provider_cost_micro_cny,time_utc,provider_name,cache_read_tokens,cache_write_tokens,credits,revenue_cny,cost_cny,operator,reason,rate_card_version,key_id\n';
+    const adjustments = log.filter(event => event.action === 'adjust').map(event => ({id: `ledger-${event.key}`, card_id: event.cardId, ts: event.ts, kind: 'adjustment', invocation_id: event.key, exposed_model: 'adjustment', provider_id: 'system',
+      input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, credits_charged: event.credits, provider_cost_micro_cny: 0, operator: event.operator, reason: event.reason}));
+    return header + [...ledger, ...adjustments].map(entry => {const usage = entry.kind === 'usage';
+      return [quote(entry.id), quote(entry.card_id), entry.ts, quote(entry.kind[0].toUpperCase() + entry.kind.slice(1)), quote(entry.invocation_id), quote(entry.exposed_model), quote(entry.provider_id),
+        entry.input_tokens, entry.output_tokens, entry.credits_charged, entry.provider_cost_micro_cny, quote(new Date(entry.ts * 1000).toISOString().replace('.000', '')), quote(names[entry.provider_id] ?? entry.provider_id),
+        entry.cache_read_tokens, entry.cache_write_tokens, micro(entry.credits_charged), usage ? micro(Math.round(entry.credits_charged * config.settings.credit_face_value_cny)) : '', usage ? micro(entry.provider_cost_micro_cny) : '',
+        quote(entry.operator ?? ''), quote(entry.reason ?? ''), quote(entry.rate_card_version ?? ''), quote(usage ? entry.key_id ?? '' : '')].join(',') + '\n';}).join('');
   };
   // Request content is kept for some requests only; the rest answer like an expired archive.
   const traceContent = invocationId => {
@@ -393,7 +411,7 @@ module.exports = function fixtureApi() {
     const trace = traces.filter(row => row.invocation_id === id).sort((a, b) => b.credits_charged - a.credits_charged)[0];
     return trace ? {cardId: trace.card_id, credits: trace.credits_charged, ts: trace.ts} : null;
   };
-  return {writes, cards, traces, providers, keys, config, storage, ledger, notices, publish, expire() {authenticated=false;}, get sessionDeadline() {return deadline;}, async handle(req,res) {
+  return {writes, cards, traces, providers, keys, config, storage, ledger, notices, publish, log, expire() {authenticated=false;}, get sessionDeadline() {return deadline;}, async handle(req,res) {
     const url = new URL(req.url, 'http://127.0.0.1');
     const endpoint = url.pathname.replace('/api/v1/admin/', '');
     const reply = (value, status=200) => {res.writeHead(status, {'Content-Type':'application/json'}); res.end(JSON.stringify(value));};

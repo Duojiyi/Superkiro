@@ -9,6 +9,7 @@ import type {AdminActivityWindow, AdminTrace} from '../api';
 import {EstimateTag, FilterTabs, StatusBadge, TableState, TopbarActions} from '../components/ui';
 import {IconCheck, IconWarning} from '../components/icons';
 import {formatBytes, formatCount, formatCredits, formatCreditsMicro, formatDuration, formatFullDateTime, formatMoney, formatMoneyExact, formatPercent, formatRemaining, shortId} from '../format';
+import {uncostedText} from '../financial';
 import {brokenRoutes, modelName, nameList, targetProblem} from '../routes';
 import {cardState, cooldownText, failureLabel, keyAlert, keyCooldownLeft, keyStatusView, persistence, storageLevel, TRACE_IN_PROGRESS} from '../status';
 import type {Intent, Row, Tab} from '../types';
@@ -275,7 +276,7 @@ export default function OverviewPage({data, loading, failures, providersLoaded, 
           <div><span className="today-label">成本</span><b title={typeof todayCost === 'number' ? formatMoneyExact(todayCost) : undefined}>{typeof todayCost === 'number' ? formatMoney(todayCost) : '—'}</b></div>
           <div><span className="today-label">毛利</span>
             <b className={todayMargin && todayMargin.grossProfitMicroCny < 0 ? 'is-danger' : undefined} title={todayMargin ? formatMoneyExact(todayMargin.grossProfitMicroCny) : undefined}>{todayMargin ? formatMoney(todayMargin.grossProfitMicroCny) : '—'}</b>
-            {todayMargin && <small className={todayMargin.uncostedRequests ? 'is-warning' : 'muted'}>{typeof todayMargin.marginPercentage === 'number' ? formatPercent(todayMargin.marginPercentage) : ''}{todayMargin.uncostedRequests ? `${typeof todayMargin.marginPercentage === 'number' ? ' · ' : ''}另有 ${formatCount(todayMargin.uncostedRequests)} 次未设成本` : ''}</small>}</div>
+            {todayMargin && <small className={todayMargin.uncostedRequests ? 'is-warning' : 'muted'}>{typeof todayMargin.marginPercentage === 'number' ? formatPercent(todayMargin.marginPercentage) : ''}{todayMargin.uncostedRequests ? `${typeof todayMargin.marginPercentage === 'number' ? ' · ' : ''}${uncostedText(todayMargin.uncostedRequests, todayMargin.estimatedRequests)}` : ''}</small>}</div>
           <button type="button" className="btn-text" onClick={() => onNavigate('reconciliation')}>财务对账 ›</button>
         </div>
       </section>

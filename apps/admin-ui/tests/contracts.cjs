@@ -115,7 +115,10 @@ for (const input of ['', '-1', 'NaN', 'Infinity', '1e3', '1.0000001', '900719925
  console.log('PASS adjustment storage: whitelist, operator isolation, stable retry, clear, corrupt/denied, the linked request kept');
 }
 {
- const {parseFinancialSettings,financialEstimates}=load('financial.ts');
+ const {parseFinancialSettings,financialEstimates,uncostedText}=load('financial.ts');
+ // Left out of the margin: settled at an estimated cost, or without any cost.
+ assert.deepEqual([uncostedText(1),uncostedText(3,3),uncostedText(1200,200),uncostedText(2,5)],
+   ['另有 1 次未设成本','另有 3 次成本为估算，没算进毛利','另有 1,200 次没算进毛利：成本为估算 200 次、未设成本 1,000 次','另有 2 次成本为估算，没算进毛利']);
  assert.deepEqual(JSON.parse(JSON.stringify(parseFinancialSettings('0.01','7.2'))),{credit_face_value_cny:0.01,usd_cny_rate:7.2});
  for(const value of ['', '0', '-1', 'Infinity', '1001'])assert.throws(()=>parseFinancialSettings(value,'7'));
  const data={basis:'retained_usage_ledger_estimate_not_cash_revenue',estimates:{retainedLedgerOnly:true,costedRequests:2,uncostedRequests:1,faceValueLessCostMicroCny:123,faceValueMarginPercentage:50}};

@@ -6,9 +6,9 @@ import {useEffect, useRef, useState} from 'react';
 import {adminApi, type AdminFinancials} from '../api';
 import {Menu} from '../components/menu';
 import {toast} from '../components/toast';
-import {EstimateTag, FilterTabs, TableState, TopbarActions} from '../components/ui';
+import {EstimateTag, FilterTabs, InfoTip, TableState, TopbarActions} from '../components/ui';
 import FinancialPanel from '../FinancialPanel';
-import {financialEstimates} from '../financial';
+import {financialEstimates, uncostedText} from '../financial';
 import {formatCount, formatCredits, formatCreditsMicro, formatMoney, formatMoneyExact, formatPercent} from '../format';
 import {dateInput, ledgerForPeriod, PERIOD_LABEL, periodRange, periodText, type PeriodKind, type PeriodRange} from '../period';
 import type {Refresh, ReportError, Row} from '../types';
@@ -109,7 +109,9 @@ export default function FinancePage({financials, providers = [], loading, failed
   const providerName = (id: string) => String(providers.find(provider => provider.id === id)?.name || id);
   const byProvider = data?.byProvider ?? [];
   const sum = (key: keyof (typeof byProvider)[number]) => byProvider.reduce((value, row) => value + Number(row[key] ?? 0), 0);
-  const sales = data?.sales, liability = data?.liability;
+  const sales = data?.sales, liability = data?.liability, adjustments = data?.adjustments;
+  // Of the requests without a known cost, those settled at an estimate (newer servers).
+  const estimated = margin?.estimatedRequests ?? estimates?.estimatedRequests ?? 0;
   const planRows = sales?.byPlan.filter(plan => plan.issuedCards || plan.activatedCards) ?? [];
 
   return <div className="page-stack">
@@ -136,6 +138,10 @@ export default function FinancePage({financials, providers = [], loading, failed
       <section className="panel kpi"><p className="kpi-label">面值收入<EstimateTag title={ESTIMATE}/></p>
         <strong className="kpi-value" title={estimates ? formatMoneyExact(estimates.usageFaceValueMicroCny) : undefined}>{estimates ? formatMoney(estimates.usageFaceValueMicroCny) : '—'}</strong>
         <div className="kpi-sub">{typeof face === 'number' ? `积分面值 ${face} 元/积分` : ''}</div></section>
+      {adjustments && <section className="panel kpi"><p className="kpi-label">调账送出<InfoTip text="这段时间手动调账补偿和赠送给客户的积分，不在面值收入里；扣回的另计"/></p>
+        <strong className="kpi-value">{adjustments.positiveMicroCredits > 0 ? `+${formatCreditsMicro(adjustments.positiveMicroCredits)}` : '0'}</strong>
+        <div className="kpi-sub">{typeof face === 'number' && adjustments.positiveMicroCredits > 0 ? `按面值约 ${formatMoney(adjustments.positiveMicroCredits * face)} · ` : ''}{formatCount(adjustments.count)} 笔调账
+          {adjustments.negativeMicroCredits < 0 && <> · 扣回 {formatCreditsMicro(-adjustments.negativeMicroCredits)} 积分</>}</div></section>}
       <section className="panel kpi"><p className="kpi-label">采购成本<EstimateTag title={ESTIMATE}/></p>
         <strong className="kpi-value" title={estimates ? formatMoneyExact(estimates.configuredProviderCostMicroCny) : undefined}>{estimates ? formatMoney(estimates.configuredProviderCostMicroCny) : '—'}</strong>
         <div className="kpi-sub">{estimates?.uncostedRequests ? '部分请求未设成本' : ''}</div></section>
@@ -144,7 +150,7 @@ export default function FinancePage({financials, providers = [], loading, failed
           // Over the requests whose cost is known: one model without a cost no longer blanks the whole.
           ? <><strong className={`kpi-value${margin.grossProfitMicroCny < 0 ? ' is-danger' : ''}`} title={formatMoneyExact(margin.grossProfitMicroCny)}>{formatMoney(margin.grossProfitMicroCny)}</strong>
             <div className="kpi-sub">{typeof margin.marginPercentage === 'number' ? <span className={margin.marginPercentage < 0 ? 'is-danger' : undefined}>毛利率 {formatPercent(margin.marginPercentage)}</span> : '没有收入'}
-              {margin.uncostedRequests > 0 && <div className="is-warning" title={`这些请求消耗 ${formatCreditsMicro(margin.uncostedCredits)} 积分，线路没有设采购价，没有算进毛利`}>另有 {formatCount(margin.uncostedRequests)} 次未设成本</div>}</div></>
+              {margin.uncostedRequests > 0 && <div className="is-warning" title={`这些请求消耗 ${formatCreditsMicro(margin.uncostedCredits)} 积分，${estimated ? '成本是结算时估的（服务它的线路没有自己的成本）或' : ''}线路没有设采购价，没有算进毛利`}>{uncostedText(margin.uncostedRequests, estimated)}</div>}</div></>
           : estimates && estimates.uncostedRequests > 0
             ? <><strong className="kpi-value">—</strong><div className="kpi-sub is-warning">{formatCount(estimates.uncostedRequests)} 次请求未设成本，毛利暂不计算</div></>
             : <><strong className="kpi-value" title={estimates ? formatMoneyExact(estimates.faceValueLessCostMicroCny) : undefined}>{estimates ? formatMoney(estimates.faceValueLessCostMicroCny) : '—'}</strong>
@@ -153,7 +159,9 @@ export default function FinancePage({financials, providers = [], loading, failed
       <section className="panel kpi"><p className="kpi-label">成本覆盖</p>
         <strong className="kpi-value kpi-fraction" title={covered !== null && total !== null ? `${formatCount(covered)} / ${formatCount(total)} 次请求已设成本` : undefined}>
           {covered !== null && total !== null ? <>{formatCount(covered)}<span className="kpi-of">/ {formatCount(total)}</span></> : '—'}</strong>
-        <div className="kpi-sub">{estimates?.uncostedRequests ? `${formatCount(estimates.uncostedRequests)} 次请求未设成本` : estimates ? '全部已设成本' : ''}</div></section>
+        <div className="kpi-sub">{estimates?.uncostedRequests
+          ? estimated ? `${formatCount(Math.min(estimated, estimates.uncostedRequests))} 次成本为估算${estimates.uncostedRequests > estimated ? ` · ${formatCount(estimates.uncostedRequests - estimated)} 次未设成本` : ''}` : `${formatCount(estimates.uncostedRequests)} 次请求未设成本`
+          : estimates ? '全部已设成本' : ''}</div></section>
     </div>
 
     {data?.byProvider && <section className="panel" aria-label="按供应商">

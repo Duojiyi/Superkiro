@@ -176,7 +176,9 @@ export interface AdminFinancials {
   settings?: FinancialSettings;
   actualRevenueMicroCny?: number|null;
   actualGrossProfitMicroCny?: number|null;
-  estimates?: {usageFaceValueMicroCny:number;configuredProviderCostMicroCny:number;faceValueLessCostMicroCny:number|null;faceValueMarginPercentage:number|null;costedRequests:number;uncostedRequests:number;retainedLedgerOnly:boolean};
+  estimates?: {usageFaceValueMicroCny:number;configuredProviderCostMicroCny:number;faceValueLessCostMicroCny:number|null;faceValueMarginPercentage:number|null;costedRequests:number;uncostedRequests:number;retainedLedgerOnly:boolean;
+    /** Of the uncosted, those settled at an estimated cost for want of the serving route's own (newer servers). */
+    estimatedRequests?:number};
   success: boolean;
   dashboard: {
     total_requests: number;
@@ -193,7 +195,11 @@ export interface AdminFinancials {
   /** What each upstream served over the period, and what it should bill for it. */
   byProvider?: Array<{providerId: string; requests: number; uncachedInputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; costMicroCny: number}>;
   /** The margin over the requests whose cost is known, and what is left out. */
-  margin?: {costedRequests: number; costedCredits: number; revenueMicroCny: number; costMicroCny: number; grossProfitMicroCny: number; marginPercentage: number | null; uncostedRequests: number; uncostedCredits: number};
+  margin?: {costedRequests: number; costedCredits: number; revenueMicroCny: number; costMicroCny: number; grossProfitMicroCny: number; marginPercentage: number | null; uncostedRequests: number; uncostedCredits: number;
+    /** Of the uncosted, those costed at an estimate (newer servers). */
+    estimatedRequests?: number};
+  /** Credits given (compensations, promotions) and taken by balance adjustments over the period (newer servers). */
+  adjustments?: {count: number; positiveMicroCredits: number; negativeMicroCredits: number; netMicroCredits: number};
   /** Cards issued and activated over the period, valued at their plan's price. */
   sales?: {issuedCards: number; issuedValueMicroCny: number; activatedCards: number; activatedValueMicroCny: number; unpricedIssuedCards: number; unpricedActivatedCards: number;
     byPlan: Array<{templateId: string; planId?: string; name: string; points: number; priceMicroCny: number; issuedCards: number; activatedCards: number; issuedValueMicroCny?: number; activatedValueMicroCny?: number}>};

@@ -22,6 +22,15 @@ const dateText=date=>`${date.getFullYear()}-${String(date.getMonth()+1).padStart
 const money=micro=>{const digits=micro&&Math.abs(micro)<10000?4:2;return `${micro<0?'-':''}¥${Math.abs(micro/1e6).toLocaleString('en-US',{minimumFractionDigits:digits,maximumFractionDigits:digits})}`;};
 // periodText: one day by its date, several as first 至 last.
 const rangeText=(start,end)=>{const first=dateText(new Date(start*1000)),last=dateText(new Date((end-1)*1000));return first===last?first:`${first} 至 ${last}`;};
+// One of today's requests was settled at an estimated cost (its route has none of its own); two adjustments
+// were made today, one with a comma and quotes in its reason.
+Object.assign(fixture.ledger[5],{reason:'provider_cost:estimated_missing_target_rate',provider_cost_micro_cny:3000});
+const madeAt=Math.floor(Date.now()/1000)-600;
+fixture.log.push({cardId:'fixture-card-0',ts:madeAt,action:'adjust',credits:21590000,points:21.59,operator:'admin',reason:'补偿 9/26 中断, 含逗号 "引号"',invocationId:null,key:'fixture-adjust-1'},
+  {cardId:'fixture-card-1',ts:madeAt+60,action:'adjust',credits:-5000000,points:-5,operator:'admin',reason:'扣回误补',invocationId:null,key:'fixture-adjust-2'});
+// The requests left out of the margin, in the page's words.
+const leftOut=list=>{const estimated=list.filter(entry=>entry.reason?.startsWith('provider_cost:')).length,uncosted=list.filter(entry=>!entry.rate_card_version).length;
+  return !estimated?`另有 ${uncosted} 次未设成本`:estimated===uncosted?`另有 ${uncosted} 次成本为估算，没算进毛利`:`另有 ${uncosted} 次没算进毛利：成本为估算 ${estimated} 次、未设成本 ${uncosted-estimated} 次`;};
 // What the fixture's ledger adds up to over [from, to), as the page should show it.
 const sums=(from,to)=>{
   const entries=fixture.ledger.filter(entry=>(from===undefined||entry.ts>=from)&&(to===undefined||entry.ts<to)),face=fixture.config.settings.credit_face_value_cny;
@@ -52,7 +61,7 @@ const sums=(from,to)=>{
     assert(periods.some(query=>query.fromSecs===String(from)&&query.toSecs===String(to)),JSON.stringify(periods));
     const figures=await strip.locator('b').allInnerTexts();
     assert.deepEqual(figures,[money(day.revenue),money(day.cost),money(day.gross)],figures.join(' | '));
-    if(day.uncosted)await strip.getByText(`另有 ${day.uncosted} 次未设成本`,{exact:false}).waitFor();
+    if(day.uncosted)await strip.getByText(leftOut(day.entries),{exact:false}).waitFor();
     if(day.entries.some(entry=>entry.exposed_model==='gpt-6-astra')){
       // One model: to its price on 模型与定价, or to 财务对账.
       const loss=page.locator('.attention-list li').filter({has:page.getByText(/^今天 gpt-6-astra 毛利 -\d+\.\d%：售价低于采购价，按成本在亏$/)});
@@ -65,7 +74,11 @@ const sums=(from,to)=>{
 
     // 累计 (the kept ledger) by default: the margin over costed requests, the one without a cost named.
     const all=sums();
-    await kpi('毛利').getByText(`另有 ${all.uncosted} 次未设成本`,{exact:true}).waitFor();
+    await kpi('毛利').getByText(leftOut(all.entries),{exact:true}).waitFor();
+    assert.equal(await kpi('成本覆盖').locator('.kpi-sub').innerText(),'1 次成本为估算');
+    // What adjustments gave away over the period, next to revenue, and what they took back.
+    assert.equal(await kpi('调账送出').locator('.kpi-value').innerText(),'+21.59');
+    assert.equal(await kpi('调账送出').locator('.kpi-sub').innerText(),'按面值约 ¥0.22 · 2 笔调账 · 扣回 5 积分');
     assert.equal(await kpi('毛利').locator('.kpi-value').innerText(),money(all.gross));
     assert.equal(await kpi('消耗积分').locator('.kpi-value').innerText(),'25');
     await page.getByText('统计区间：累计（全部保留账本）',{exact:true}).waitFor();
@@ -83,7 +96,7 @@ const sums=(from,to)=>{
     assert(sales.includes('发卡 6 张 · ¥330.00 · 激活 6 张 · ¥330.00')&&sales.includes('PRO+'),sales);
     const owed=await words('未消耗余额');
     assert(owed.includes('7,200 积分 ≈ ¥72.00')&&owed.includes('4 张卡，其中未激活 1 张 · 1,900 积分')&&owed.includes('现在，不随统计区间变化'),owed);
-    console.log('PASS: 累计 shows the margin over costed requests with 另有 1 次未设成本, 按供应商 with totals, a loss in red, sales at plan price and the balances still owed');
+    console.log('PASS: 累计 shows the margin over costed requests with the one costed at an estimate named, what adjustments gave away and took back, 按供应商 with totals, a loss in red, sales at plan price and the balances still owed');
 
     // Each period is read from the server with its local bounds.
     for(const [value,label] of [['today','今天'],['yesterday','昨天'],['month','本月'],['lastMonth','上月']]){
@@ -94,6 +107,8 @@ const sums=(from,to)=>{
       await kpi('消耗积分').locator('.kpi-sub').getByText(`${expected.count} 次结算`,{exact:true}).waitFor();
       assert.deepEqual(periods.at(-1),{fromSecs:String(start),toSecs:String(end)},`${label}: ${JSON.stringify(periods)}`);
       assert.equal(await kpi('毛利').locator('.kpi-value').innerText(),money(expected.gross),label);
+      const made=fixture.log.filter(event=>event.ts>=start&&event.ts<end&&event.credits>0).reduce((sum,event)=>sum+event.credits,0);
+      assert.equal(await kpi('调账送出').locator('.kpi-value').innerText(),made?`+${made/1e6}`:'0',label);
     }
     // 自定义: both days included; the last before the first is no period, and nothing is asked.
     await tab('custom');const first=page.getByLabel('开始日期',{exact:true}),last=page.getByLabel('结束日期',{exact:true});
@@ -117,14 +132,18 @@ const sums=(from,to)=>{
     let file=await download;assert.equal(file.suggestedFilename(),`ledger-${dateText(today)}.csv`);
     const cut=fs.readFileSync(await file.path(),'utf8');
     assert(cut.startsWith('\uFEFFid,card_id,ts,kind,'),cut.slice(0,40));
-    const lines=cut.trim().split('\n');assert.equal(lines.length,1+day.count);
+    const lines=cut.trim().split('\n');assert.equal(lines.length,1+day.count+2,'today\'s usage and its two adjustments');
     assert(lines.slice(1).every(line=>{const ts=Number(line.split(',')[2]);return ts>=from&&ts<to;}),'only today\'s entries');
+    // The server's newer columns come last, so the period's cut keeps working: who, why, the price version and the Key.
+    assert(lines[0].endsWith(',credits,revenue_cny,cost_cny,operator,reason,rate_card_version,key_id'),lines[0]);
+    assert(lines.some(line=>line.includes('"Adjustment"')&&line.endsWith('"admin","补偿 9/26 中断, 含逗号 ""引号""","",""')),'an adjustment with who and why, its reason quoted');
+    assert(lines.some(line=>line.includes('"Usage"')&&line.endsWith('"fixture-price-v1","fixture-key"')),'a usage entry with its price version and Key');
     // 累计, or 导出全部账本 CSV: the whole file as the server wrote it.
     download=page.waitForEvent('download');await page.getByRole('button',{name:'更多导出'}).click();await page.getByRole('menuitem',{name:'导出全部账本 CSV'}).click();
     file=await download;assert(file.suggestedFilename().startsWith('ledger-export-'));
-    assert.equal(fs.readFileSync(await file.path(),'utf8').trim().split('\n').length,1+fixture.ledger.length);
+    assert.equal(fs.readFileSync(await file.path(),'utf8').trim().split('\n').length,1+fixture.ledger.length+2);
     assert.deepEqual(errors,[]);assert.deepEqual(nativeDialogs,[],'no browser-native dialogs');
-    console.log('PASS: 导出 CSV cuts the ledger to the period (header kept, BOM for spreadsheets); 导出全部账本 CSV is the server\'s whole file');
+    console.log('PASS: 导出 CSV cuts the ledger to the period (header kept with the operator, reason, price version and Key columns, BOM for spreadsheets); 导出全部账本 CSV is the server\'s whole file');
   }finally{
     await browser?.close();server.close();
   }
