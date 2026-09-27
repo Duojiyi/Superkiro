@@ -1275,13 +1275,23 @@ impl GenerateAssistantResponseHandler {
             };
 
             // Pings and empty deltas count as liveness; a model that reasons first may go
-            // silent longer.
+            // silent longer, and longer still on an upstream that sends nothing meanwhile.
+            let format = self
+                .billing
+                .get_provider(&actual_provider_id)
+                .map(|provider| match provider.format {
+                    billing::provider::ProviderFormat::OpenAi => "openai",
+                    billing::provider::ProviderFormat::Anthropic => "anthropic",
+                })
+                .or_else(|| self.provider.as_ref().map(|provider| provider.name()))
+                .unwrap_or_default();
             let watchdog = self
                 .upstream_limits
                 .unwrap_or_else(|| {
-                    crate::provider::retry::UpstreamLimits::for_model(
+                    crate::provider::retry::UpstreamLimits::for_model_on(
                         &actual_target_model,
                         chat_req.reasoning_effort,
+                        format,
                     )
                 })
                 .watchdog();

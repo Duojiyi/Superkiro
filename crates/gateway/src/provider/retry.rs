@@ -71,8 +71,37 @@ impl UpstreamLimits {
         }
     }
 
+    /// An OpenAI-format upstream sends nothing at all while its model reasons, so its
+    /// silence is the model thinking. Once the answer to Kiro has begun, Kiro waits as long
+    /// as keepalives come (its own watchdog allows five minutes), so the thinking is given
+    /// that long too: cut at three minutes, it was retried from the start and unbilled.
+    const OPENAI_REASONING_IDLE: Duration = Duration::from_secs(300);
+
     pub fn for_request(request: &ChatRequest) -> Self {
         Self::for_model(&request.model, request.reasoning_effort)
+    }
+
+    /// The limits of `request` on an upstream of `format`, its adapter's name
+    /// ([`ModelProvider::name`]).
+    pub fn for_provider(request: &ChatRequest, format: &str) -> Self {
+        Self::for_model_on(&request.model, request.reasoning_effort, format)
+    }
+
+    /// The limits of `model` on an upstream of `format`.
+    pub fn for_model_on(
+        model: &str,
+        effort: Option<kiro_wire::requests::conversation::ReasoningEffort>,
+        format: &str,
+    ) -> Self {
+        let limits = Self::for_model(model, effort);
+        if format == "openai" && limits == Self::REASONING {
+            Self {
+                idle: Self::OPENAI_REASONING_IDLE,
+                ..limits
+            }
+        } else {
+            limits
+        }
     }
 
     pub fn for_model(
@@ -126,6 +155,12 @@ impl Route {
     pub(crate) fn limits_for(&self, request: &ChatRequest) -> UpstreamLimits {
         self.limits
             .unwrap_or_else(|| UpstreamLimits::for_request(request))
+    }
+
+    /// The limits an attempt of `request` keeps on an upstream of `format`.
+    fn limits_on(&self, request: &ChatRequest, format: &str) -> UpstreamLimits {
+        self.limits
+            .unwrap_or_else(|| UpstreamLimits::for_provider(request, format))
     }
 
     pub(crate) fn deadline(&self) -> tokio::time::Instant {
@@ -273,7 +308,7 @@ pub async fn start_stream(
     max_attempts: usize,
 ) -> Result<BoxStream<'static, Result<ProviderStreamEvent, ProviderError>>, ProviderError> {
     let route = Route::current(request);
-    let limits = route.limits_for(request);
+    let limits = route.limits_on(request, provider.name());
     let provider_id = ATTEMPT_KEY
         .try_with(|(provider_id, _)| provider_id.clone())
         .unwrap_or_else(|_| provider.name().to_string());
@@ -458,6 +493,28 @@ async fn prime(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // An OpenAI-format upstream sends nothing while its model reasons: the silence is given
+    // as long as Kiro waits once its answer has begun. Other upstreams and models keep
+    // theirs.
+    #[test]
+    fn an_openai_reasoning_model_may_think_silently_for_five_minutes() {
+        let idle =
+            |model: &str, format: &str| UpstreamLimits::for_model_on(model, None, format).idle;
+        assert_eq!(idle("o3", "openai"), Duration::from_secs(300));
+        assert_eq!(idle("gpt-5", "openai"), Duration::from_secs(300));
+        assert_eq!(idle("o3", "anthropic"), UpstreamLimits::REASONING.idle);
+        assert_eq!(idle("gpt-4o", "openai"), UpstreamLimits::STANDARD.idle);
+        assert_eq!(
+            UpstreamLimits::for_model_on(
+                "claude-sonnet-4-5",
+                Some(kiro_wire::requests::conversation::ReasoningEffort::High),
+                "openai"
+            )
+            .idle,
+            Duration::from_secs(300)
+        );
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
     struct Fake {
         calls: AtomicUsize,
