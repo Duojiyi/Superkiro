@@ -94,7 +94,7 @@ impl UpstreamLimits {
         format: &str,
     ) -> Self {
         let limits = Self::for_model(model, effort);
-        if format == "openai" && limits == Self::REASONING {
+        if format == "openai" && super::family::family(model).reasons(effort) {
             Self {
                 idle: Self::OPENAI_REASONING_IDLE,
                 ..limits
@@ -108,10 +108,25 @@ impl UpstreamLimits {
         model: &str,
         effort: Option<kiro_wire::requests::conversation::ReasoningEffort>,
     ) -> Self {
-        if super::family::family(model).reasons(effort) {
+        let family = super::family::family(model);
+        let limits = if family.reasons(effort) {
             Self::REASONING
         } else {
             Self::STANDARD
+        };
+        // Extend Claude startup for upstream queuing, preserving client and stream limits.
+        if matches!(
+            family.reasoning,
+            super::family::Reasoning::Adaptive { .. } | super::family::Reasoning::Budget
+        ) {
+            Self {
+                headers: Duration::from_secs(90),
+                attempt: Duration::from_secs(180),
+                total: Duration::from_secs(300),
+                ..limits
+            }
+        } else {
+            limits
         }
     }
 }
@@ -843,7 +858,56 @@ mod tests {
         assert!(reasoning.attempt > standard.attempt);
         assert!(reasoning.idle > standard.idle);
         request.reasoning_effort = Some(kiro_wire::requests::conversation::ReasoningEffort::Low);
-        assert_eq!(UpstreamLimits::for_request(&request), reasoning);
+        assert_eq!(
+            UpstreamLimits::for_request(&request),
+            UpstreamLimits::REASONING
+        );
+    }
+
+    #[test]
+    fn claude_startup_budget_preserves_stream_and_client_limits() {
+        use kiro_wire::requests::conversation::ReasoningEffort;
+        for model in ["claude-opus-5-5", "claude-sonnet-4-6", "claude-sonnet-4-5"] {
+            for effort in [None, Some(ReasoningEffort::Medium)] {
+                let reasons = super::super::family::family(model).reasons(effort);
+                let base = if reasons {
+                    UpstreamLimits::REASONING
+                } else {
+                    UpstreamLimits::STANDARD
+                };
+                let expected = UpstreamLimits {
+                    headers: Duration::from_secs(90),
+                    attempt: Duration::from_secs(180),
+                    total: Duration::from_secs(300),
+                    ..base
+                };
+                let mut req = request();
+                req.model = model.into();
+                req.reasoning_effort = effort;
+                assert_eq!(UpstreamLimits::for_request(&req), expected);
+                assert_eq!(limits_for(&req), expected);
+                assert_eq!(UpstreamLimits::for_provider(&req, "anthropic"), expected);
+                assert_eq!(
+                    UpstreamLimits::for_provider(&req, "openai"),
+                    UpstreamLimits {
+                        idle: if reasons {
+                            Duration::from_secs(300)
+                        } else {
+                            base.idle
+                        },
+                        ..expected
+                    }
+                );
+            }
+        }
+        assert_eq!(
+            UpstreamLimits::for_model("gpt-4o", None),
+            UpstreamLimits::STANDARD
+        );
+        assert_eq!(
+            UpstreamLimits::for_model("gpt-5", None),
+            UpstreamLimits::REASONING
+        );
     }
 
     #[test]
