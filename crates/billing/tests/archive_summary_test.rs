@@ -7,8 +7,8 @@
 use billing::{BillingEngine, Card, CardStatus, ReservationEstimateParams, UsageTokens};
 
 fn state_dir(name: &str) -> std::path::PathBuf {
-    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target/archive-summary-tests")
+    let dir = std::env::temp_dir()
+        .join("billing-archive-summary-tests")
         .join(format!(
             "{name}-{}-{}",
             std::process::id(),
@@ -69,6 +69,14 @@ fn a_summary_without_its_entry_count_is_rebuilt_from_the_archives() {
     assert_eq!(restored.get_card("card").unwrap().credit_used, used);
     // The archived usage still counts toward the card's windows.
     assert_eq!(restored.get_usage_since("card", 0), used);
+    assert!(
+        restored
+            .export_snapshot()
+            .archived_ledger_summary
+            .usage_invocation_ids
+            .is_empty(),
+        "legacy archive rebuild must not recreate lifetime ordinary invocation IDs"
+    );
     let reconciliation = restored.reconcile_card_balance("card", 1_000_000).unwrap();
     assert!(reconciliation.is_balanced, "{reconciliation:?}");
     // What it saves next loads without rebuilding.

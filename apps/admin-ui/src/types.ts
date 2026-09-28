@@ -1,22 +1,35 @@
 // Types shared by the workspace shell and its pages.
 import type {MutableRefObject} from 'react';
+import type {Compensation} from './compensation';
 
 export type Row = Record<string, unknown>;
 
-export type Tab = 'overview' | 'cards' | 'traces' | 'groups' | 'models' | 'providers' | 'announcements' | 'reconciliation' | 'security';
+export type Tab = 'overview' | 'cards' | 'traces' | 'groups' | 'plans' | 'models' | 'providers' | 'announcements' | 'templates' | 'reconciliation' | 'security';
 
 export type CardTab = 'CURRENT' | 'UNACTIVATED' | 'ACTIVE' | 'FROZEN' | 'BANNED' | 'EXPIRED' | 'ARCHIVED' | 'VOIDED' | 'ALL';
 export type CardQuickFilter = 'expiring' | 'low';
-export type TraceTab = 'ALL' | 'error' | 'client_aborted' | 'in_progress' | 'success';
-export type TraceWindow = 'hour' | 'day' | 'all';
+/** `refused`: requests refused for the card or the request itself, apart from `error` (the server's status for both). */
+export type TraceTab = 'ALL' | 'error' | 'refused' | 'client_aborted' | 'in_progress' | 'success';
+/** `custom`: from and to, local minutes (see traceQuery.ts). */
+export type TraceWindow = 'hour' | 'day' | 'all' | 'custom';
 
-/** Where a link from another page wants a list to start. */
+/**
+ * Where a page starts (from a link, or its address) and, reported back, where it is: its
+ * filters and the details open. `open` is a card or request ID.
+ */
 export interface Intent {
-  cards?: {status?: CardTab; quick?: CardQuickFilter; search?: string};
-  traces?: {status?: TraceTab; window?: TraceWindow; search?: string; open?: string};
+  /** `compensate`: 调账 opens for that card with a request's charge (never kept in the address). */
+  cards?: {status?: CardTab; quick?: CardQuickFilter; search?: string; group?: string; open?: string; compensate?: Compensation};
+  /** `card`: the search is exactly this card's ID. `reason`: a failure class under 失败. `from`/`to`: a chosen range (2026-09-26T08:30). */
+  traces?: {status?: TraceTab; window?: TraceWindow; from?: string; to?: string; search?: string; card?: string; reason?: string; model?: string; provider?: string; open?: string};
   /** 上架模型 for this provider's upstream model (from 供应商与 Key). */
-  models?: {list?: {providerId?: string; model?: string}};
+  models?: {list?: {providerId?: string; model?: string}; /** A model to show in the list (a link naming it). */ model?: string};
+  /** `provider` or `key`: what to point out; `edit`: the Key open in the editor. Key IDs are unique across providers. */
+  providers?: {provider?: string; key?: string; edit?: string};
 }
+
+/** A page's report of where it is, kept in the address. */
+export type ReportRoute = (intent: Intent) => void;
 
 export interface ErrorAction {label: string; run: () => void}
 

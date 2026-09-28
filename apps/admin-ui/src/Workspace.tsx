@@ -1,50 +1,63 @@
 // The signed-in console: sidebar, topbar, the current page, and the data they share.
 import {useCallback, useEffect, useRef, useState} from 'react';
-import {adminApi, AdminApiError, type AdminAnnouncement, type AdminCardItem, type AdminFinancials, type AdminStats, type AdminTrace, type FinancialSettings} from './api';
+import {adminApi, AdminApiError, type AdminAnnouncement, type AdminCardItem, type AdminFinancials, type AdminStats, type AdminTrace, type FinancialSettings, type Plan, type TraceTotals} from './api';
 import CommercialEditor from './CommercialEditor';
 import {ConfirmHost, confirmAction} from './components/confirm';
 import {IconClose, IconRefresh, IconWarning} from './components/icons';
 import {isModalOpen, ModalRootContext} from './components/modal';
 import {ToastHost, toast} from './components/toast';
 import {TopbarSlotContext} from './components/ui';
-import {formatClock, formatFullDateTime, formatSessionLeft} from './format';
+import {formatBytes, formatClock, formatFullDateTime, formatSessionLeft} from './format';
 import AnnouncementsPage from './pages/Announcements';
 import CardsPage from './pages/Cards';
 import FinancePage from './pages/Finance';
 import OverviewPage from './pages/Overview';
+import PlansPage from './pages/Plans';
+import ResponseTemplatesPage from './pages/ResponseTemplates';
 import ProvidersPage, {type KeyEditing} from './pages/Providers';
 import SecurityPage from './pages/Security';
 import TracesPage from './pages/Traces';
+import {periodRange} from './period';
+import {planCatalog} from './plans';
 import {publishFailure, type PublishOutcome} from './refusal';
+import {intentOf, OPEN_PARAM, parseRoute, routeHash, routeOf, type Route} from './route';
 import {brokenRoutes, modelName} from './routes';
-import {keyAlert} from './status';
+import {keyAlert, persistence, storageLevel} from './status';
 import type {ErrorAction, Intent, RefreshOptions, Row, Tab} from './types';
 
 const NAV: Array<{group: string; items: Array<{id: Tab; label: string}>}> = [
   {group: '日常', items: [{id: 'overview', label: '运营概览'}, {id: 'cards', label: '卡密资产'}, {id: 'traces', label: '调用追踪'}]},
-  {group: '配置', items: [{id: 'groups', label: '分组与权益'}, {id: 'models', label: '模型与定价'}, {id: 'providers', label: '供应商与 Key'}, {id: 'announcements', label: '公告管理'}]},
+  {group: '配置', items: [{id: 'groups', label: '分组与权益'}, {id: 'plans', label: '套餐'}, {id: 'models', label: '模型与定价'}, {id: 'providers', label: '供应商与 Key'}, {id: 'announcements', label: '公告管理'}, {id: 'templates', label: '响应模板'}]},
   {group: '财务与安全', items: [{id: 'reconciliation', label: '财务对账'}, {id: 'security', label: '安全与审计'}]},
 ];
 const TITLES = Object.fromEntries(NAV.flatMap(group => group.items.map(item => [item.id, item.label]))) as Record<Tab, string>;
 const WIDE_PAGES: Tab[] = ['cards', 'traces'];
+const DOCUMENT_TITLE = 'Superkiro · 管理工作台';
 
 export interface WorkspaceData {
   stats: AdminStats | null;
   cards: AdminCardItem[];
   announcements: AdminAnnouncement[];
   financials: AdminFinancials | null;
+  /** Today's (from local midnight), for 运营概览's 今日收入 / 成本 / 毛利; null when not read. */
+  financialsToday: AdminFinancials | null;
   traces: AdminTrace[];
+  /** Over every kept request, of which `traces` are the latest (newer servers). */
+  tracesTotals: TraceTotals | null;
   providers: Row[];
   providerKeys: Row[];
   groups: Row[];
   models: Row[];
   rateCards: Row[];
+  /** The plan catalog the server keeps (null from a server that sends none), and the cards issued from each. */
+  plans: Plan[] | null;
+  cardsByPlan: Record<string, number> | null;
   settings?: FinancialSettings;
   /** The configuration version the models above belong to: what a publication from outside the editors is checked against. */
   revision?: string;
 }
 
-const EMPTY: WorkspaceData = {stats: null, cards: [], announcements: [], financials: null, traces: [], providers: [], providerKeys: [], groups: [], models: [], rateCards: []};
+const EMPTY: WorkspaceData = {stats: null, cards: [], announcements: [], financials: null, financialsToday: null, traces: [], tracesTotals: null, providers: [], providerKeys: [], groups: [], models: [], rateCards: [], plans: null, cardsByPlan: null};
 
 type Section = 'stats' | 'cards' | 'announcements' | 'financials' | 'traces' | 'providers' | 'config';
 const SECTION_NAMES: Record<Section, string> = {stats: '统计', cards: '卡密', announcements: '公告', financials: '财务', traces: '调用追踪', providers: '供应商', config: '配置'};
@@ -86,8 +99,17 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
   const writing = useRef(false);
   const guards = {writing, mounted};
 
-  const [activeTab, setActiveTab] = useState<Tab>('overview');
-  const [intent, setIntent] = useState<Intent>({});
+  // The address names the page and what is open on it: read once here, then kept up to date.
+  const [start] = useState(() => parseRoute(window.location.hash));
+  const [activeTab, setActiveTab] = useState<Tab>(start.tab);
+  const [intent, setIntent] = useState<Intent>(() => intentOf(start));
+  // Bumped when Back or Forward changes what the page in view shows.
+  const [intentRevision, setIntentRevision] = useState(0);
+  const route = useRef<Route>(start);
+  // The page's next report describes where it just arrived: it replaces the address, never adds a step.
+  const settle = useRef(true);
+  const activeTabRef = useRef(activeTab);
+  activeTabRef.current = activeTab;
   const commercialDirty = useRef(false), providerDirty = useRef(false), editorBusy = useRef(false), pageBusy = useRef(false);
   const [busyPage, setBusyPage] = useState(false);
   const markCommercialDirty = useCallback((dirty: boolean) => {commercialDirty.current = dirty;}, []);
@@ -115,12 +137,28 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
   const [cardsLoaded, setCardsLoaded] = useState(false);
   // Changes whenever a refresh starts that should clear the card selection.
   const [selectionEpoch, setSelectionEpoch] = useState(0);
+  // "/" puts the cursor in the page's search (卡密资产, 调用追踪, the models and groups lists), unless
+  // something is being typed or a dialog is open.
+  useEffect(() => {
+    const keydown = (event: KeyboardEvent) => {
+      if (event.key !== '/' || event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey || isModalOpen()) return;
+      const target = event.target instanceof Element ? event.target : null;
+      if (target?.closest('input, textarea, select, [contenteditable="true"]')) return;
+      const search = document.querySelector<HTMLInputElement>('#admin-workspace .search-field input:not(:disabled)');
+      if (!search) return;
+      event.preventDefault();
+      search.focus();
+      search.select();
+    };
+    document.addEventListener('keydown', keydown);
+    return () => document.removeEventListener('keydown', keydown);
+  }, []);
   const [actionError, setActionError] = useState<{text: string; action?: ErrorAction} | null>(null);
   const reportError = useCallback((text: string, action?: ErrorAction) => setActionError(text ? {text, action} : null), []);
 
   const [modalRoot, setModalRoot] = useState<HTMLElement | null>(null);
   const [topbarSlot, setTopbarSlot] = useState<HTMLElement | null>(null);
-  const [keyEditing, setKeyEditing] = useState<KeyEditing | null>(null);
+  const [keyEditing, setKeyEditing] = useState<KeyEditing | null>(() => start.params.edit ? {keyId: start.params.edit} : null);
   // Bumped by the operator's 刷新, so pages that load on their own (the editors) reload too.
   const [refreshEpoch, setRefreshEpoch] = useState(0);
 
@@ -137,7 +175,7 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
       return null;
     };
     try {
-      const [stats, cards, notices, financials, traces, providers, config] = await Promise.all([
+      const [stats, cards, notices, financials, traces, providers, config, today] = await Promise.all([
         adminApi.getStats().catch(failed('stats')),
         adminApi.getCards().catch(failed('cards')),
         adminApi.getAnnouncements().catch(failed('announcements')),
@@ -145,6 +183,8 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
         adminApi.getTraces(500).catch(failed('traces')),
         adminApi.getProviders().catch(failed('providers')),
         adminApi.getCommercialConfig().catch(failed('config')),
+        // Only 运营概览's 今日 figures use it: without it they read —, nothing else is missing.
+        adminApi.getFinancials(periodRange('today') ?? {}).catch(() => null),
       ]);
       if (!mounted.current || seq !== refreshSeq.current) return;
       const unavailable: Failures = {
@@ -165,12 +205,16 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
         cards: cards?.success ? cards.cards : previous.cards,
         announcements: notices?.success ? notices.announcements : previous.announcements,
         financials: financials?.success ? financials : previous.financials,
+        financialsToday: today?.success ? today : null,
         traces: traces?.success ? traces.traces : previous.traces,
+        tracesTotals: traces?.success ? traces.totals ?? null : previous.tracesTotals,
         providers: providers?.success ? providers.providers ?? [] : previous.providers,
         providerKeys: providers?.success ? providers.keys ?? [] : previous.providerKeys,
         groups: config?.success && config.config ? config.config.groups : previous.groups,
         models: config?.success && config.config ? config.config.models : previous.models,
         rateCards: config?.success && config.config ? config.config.rate_cards : previous.rateCards,
+        plans: config?.success && config.config ? config.config.plans ?? null : previous.plans,
+        cardsByPlan: config?.success && config.config ? config.config.cards_by_plan ?? null : previous.cardsByPlan,
         settings: config?.success && config.config?.settings ? config.config.settings : previous.settings,
         revision: config?.success && config.config ? config.config.revision : previous.revision,
       }));
@@ -224,18 +268,79 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
     return () => clearInterval(timer);
   }, [autoRefresh, refreshData]);
 
+  const confirmLeaving = async () => {
+    if (providerDirty.current && !(await confirmAction({title: '有未保存的修改，确定离开？', consequence: 'Key 的修改还没有保存。', confirmLabel: '离开'}))) return false;
+    if (commercialDirty.current && !(await confirmAction({title: '有未发布的修改，确定离开？', consequence: '修改还没有发布。', confirmLabel: '离开'}))) return false;
+    return true;
+  };
+
+  const writeRoute = (next: Route, push: boolean) => {
+    const changed = routeHash(next) !== routeHash(route.current);
+    route.current = next;
+    if (changed) window.history[push ? 'pushState' : 'replaceState'](null, '', routeHash(next));
+  };
+
+  // Each page reports where it is. Opening or closing its details is a step Back undoes; a
+  // filter or ↑/↓ only updates the address, so Back leaves the page rather than every filter.
+  const reportRoute = useCallback((next: Intent) => {
+    const tab: Tab | null = next.cards ? 'cards' : next.traces ? 'traces' : next.providers ? 'providers' : null;
+    if (tab !== activeTabRef.current) return;
+    const target = routeOf(tab, next), here = route.current, open = OPEN_PARAM[tab];
+    const push = !settle.current && here.tab === tab && !!open && !!here.params[open] !== !!target.params[open];
+    settle.current = false;
+    writeRoute(target, push);
+  }, []);
+
   const navigate = async (tab: Tab, next?: Intent) => {
     if (pageBusy.current) return;
     if (tab === activeTab && !next) return;
     if (editorBusy.current) {toast.info('正在保存，请稍候'); return;}
-    if (providerDirty.current && !(await confirmAction({title: '有未保存的修改，确定离开？', consequence: 'Key 的修改还没有保存。', confirmLabel: '离开'}))) return;
-    if (commercialDirty.current && !(await confirmAction({title: '有未发布的修改，确定离开？', consequence: '修改还没有发布。', confirmLabel: '离开'}))) return;
+    if (!(await confirmLeaving())) return;
     if (!mounted.current || pageBusy.current || editorBusy.current) return;
     commercialDirty.current = false; providerDirty.current = false;
     setIntent(next ?? {});
     setActionError(null);
     setActiveTab(tab);
+    if (tab === activeTabRef.current) setIntentRevision(value => value + 1);
+    settle.current = true;
+    writeRoute(routeOf(tab, next), true);
   };
+
+  // Back and Forward (or an edited address): the same guards as the navigation. While something
+  // is being saved, a dialog is open or edits would be lost, the address first goes back to where
+  // the page is; once the operator agrees to leave, the step is taken again.
+  const followAddress = useRef<() => Promise<void>>();
+  followAddress.current = async () => {
+    // A fragment that is not a page address (an in-page anchor) leaves the page where it is.
+    if (window.location.hash && !window.location.hash.startsWith('#/')) {window.history.replaceState(null, '', routeHash(route.current)); return;}
+    const target = parseRoute(window.location.hash), here = route.current;
+    if (routeHash(target) === routeHash(here)) return;
+    const leaving = target.tab !== here.tab || (here.tab === 'providers' && target.params.edit !== here.params.edit);
+    const busy = pageBusy.current || editorBusy.current || isModalOpen();
+    if (busy || (leaving && (providerDirty.current || commercialDirty.current))) {
+      window.history.pushState(null, '', routeHash(here));
+      if (busy) {toast.info(isModalOpen() ? '先完成或关闭打开的对话框' : '正在保存，请稍候'); return;}
+      if (!(await confirmLeaving()) || !mounted.current) return;
+      commercialDirty.current = false; providerDirty.current = false;
+      window.history.back();
+      return;
+    }
+    route.current = target;
+    settle.current = true;
+    setActionError(null);
+    setIntent(intentOf(target));
+    if (target.tab === here.tab) setIntentRevision(value => value + 1);
+    else {commercialDirty.current = false; providerDirty.current = false; setActiveTab(target.tab);}
+  };
+  useEffect(() => {
+    const follow = () => void followAddress.current?.();
+    window.addEventListener('popstate', follow);
+    window.addEventListener('hashchange', follow);
+    return () => {window.removeEventListener('popstate', follow); window.removeEventListener('hashchange', follow);};
+  }, []);
+
+  useEffect(() => {document.title = `${TITLES[activeTab]} · Superkiro`;}, [activeTab]);
+  useEffect(() => () => {document.title = DOCUMENT_TITLE;}, []);
 
   const logoutAll = async () => {
     if (!(await confirmAction({title: '下线全部会话？', consequence: '所有管理员（包括你）都要重新登录。', confirmLabel: '下线全部', danger: true}))) return;
@@ -249,16 +354,24 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
   // Shown models whose primary route cannot serve (known only once the providers are loaded).
   const broken = providersLoaded ? brokenRoutes(data.models, {providers: data.providers, keys: data.providerKeys}) : [];
   const down = broken.filter(entry => entry.route.down).length;
+  const storage = storageLevel(data.stats);
+  const saving = persistence(data.stats);
+  // The plans cards are issued from: the server's catalog, or the four tiers from one that keeps none.
+  const catalog = planCatalog(data.plans, data.groups.map(group => String(group.id)));
   const badges: Partial<Record<Tab, {count: number; tone: 'danger' | 'warning'; text: string}>> = {
     ...(failedLastHour ? {traces: {count: failedLastHour, tone: 'danger' as const, text: `近 1 小时 ${failedLastHour} 次失败`}} : {}),
     ...(broken.length ? {models: {count: broken.length, tone: down ? 'danger' as const : 'warning' as const, text: down ? `${down} 个在售模型无可用线路` : `${broken.length} 个在售模型的主线路不可用`}} : {}),
-    ...(keyAlerts ? {providers: {count: keyAlerts, tone: 'warning' as const, text: `${keyAlerts} 个 Key 冷却中、恢复中或不可用`}} : {}),
+    ...(keyAlerts ? {providers: {count: keyAlerts, tone: 'warning' as const, text: `${keyAlerts} 个 Key 冷却中、冷却后试用中或不可用`}} : {}),
+    ...(saving?.problem ? {security: {count: 1, tone: 'danger' as const, text: `保存失败：${saving.problem.text}`}}
+      : storage && storage.level !== 'ok' ? {security: {count: 1, tone: storage.level === 'now' ? 'danger' as const : 'warning' as const,
+      text: `账本存储 ${formatBytes(storage.bytes)} / ${formatBytes(storage.ceiling)}，${storage.level === 'now' ? '请现在归档' : '建议归档'}`}} : {}),
   };
   const staleSections = loadErrors.filter(error => error.stale).map(error => error.section);
 
   return <ModalRootContext.Provider value={modalRoot}><TopbarSlotContext.Provider value={topbarSlot}>
     <div className="admin-app">
-      <a className="skip-link" href="#admin-workspace">跳到工作区</a>
+      {/* The address names the page, so the skip link moves focus without changing it. */}
+      <a className="skip-link" href="#admin-workspace" onClick={event => {event.preventDefault(); document.getElementById('admin-workspace')?.focus();}}>跳到工作区</a>
       <aside className="sidebar">
         <h1 className="brand">Superkiro</h1>
         <nav aria-label="管理导航">
@@ -316,34 +429,43 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
 
             {activeTab === 'overview' && <OverviewPage data={data} loading={loading} failures={failures} providersLoaded={providersLoaded}
               operator={operator} onNavigate={(tab, next) => void navigate(tab, next)} onRetry={() => void refreshData()}/>}
-            {activeTab === 'cards' && <CardsPage cards={data.cards} groups={data.groups} configFailed={!!failures.config} loading={loading}
+            {activeTab === 'cards' && <CardsPage cards={data.cards} groups={data.groups} plans={catalog} configFailed={!!failures.config} loading={loading}
               failed={!!failures.cards} operator={operator} refresh={refreshData} guards={guards} reportError={reportError}
               actionError={actionError?.text ?? ''} onBusyChange={markPageBusy} onReauthenticate={onReauthenticate}
-              selectionEpoch={selectionEpoch} intent={intent.cards}
+              selectionEpoch={selectionEpoch} intent={intent.cards} intentRevision={intentRevision} onRoute={reportRoute}
               updateCards={cards => setData(previous => ({...previous, cards}))}
-              onOpenTrace={(cardId, traceId) => void navigate('traces', {traces: {search: cardId, open: traceId}})}/>}
-            {activeTab === 'traces' && <TracesPage traces={data.traces} cards={data.cards} loading={loading} failed={!!failures.traces}
-              refresh={refreshData} guards={guards} reportError={reportError} intent={intent.traces}
-              onOpenCard={cardId => void navigate('cards', {cards: {status: 'ALL', search: cardId}})}/>}
+              onOpenTrace={(cardId, traceId, invocationId) => void navigate('traces', {traces: {search: cardId, card: cardId, open: traceId ?? invocationId}})}/>}
+            {activeTab === 'traces' && <TracesPage traces={data.traces} totals={data.tracesTotals} cards={data.cards} providers={data.providers} loading={loading} failed={!!failures.traces}
+              refresh={refreshData} guards={guards} reportError={reportError} intent={intent.traces} intentRevision={intentRevision} onRoute={reportRoute}
+              onOpenCard={cardId => void navigate('cards', {cards: {status: 'ALL', search: cardId, open: cardId}})}
+              onCompensate={prefill => void navigate('cards', {cards: {status: 'ALL', search: prefill.cardId, open: prefill.cardId, compensate: prefill}})}/>}
             {activeTab === 'groups' && <CommercialEditor key="groups" kind="groups" onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy}
-              cards={data.cards} onPublished={() => void refreshData({keepSelection: true})} refreshEpoch={refreshEpoch}/>}
+              cards={data.cards} onPublished={() => void refreshData({keepSelection: true})} refreshEpoch={refreshEpoch}
+              onOpenModel={model => void navigate('models', {models: {model}})}/>}
+            {activeTab === 'plans' && <PlansPage plans={catalog} editable={!!data.plans} cardsByPlan={data.cardsByPlan} groups={data.groups} revision={data.revision}
+              loading={loading} failed={!!failures.config} refresh={refreshData} guards={guards} reportError={reportError} onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy}/>}
             {activeTab === 'models' && <CommercialEditor key="models" kind="models" onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy}
               cards={cardsLoaded ? data.cards : undefined} onPublished={() => void refreshData({keepSelection: true})} refreshEpoch={refreshEpoch} providers={data.providers} providerKeys={data.providerKeys}
               routesKnown={providersLoaded} intent={intent.models}/>}
-            {activeTab === 'providers' && <ProvidersPage providers={data.providers} providerKeys={data.providerKeys} models={data.models}
+            {activeTab === 'providers' && <ProvidersPage providers={data.providers} providerKeys={data.providerKeys} models={data.models} activity={data.stats?.activity} traces={data.traces}
               loading={loading} failed={!!failures.providers} refresh={refreshData} guards={guards} reportError={reportError}
               editing={keyEditing} setEditing={setKeyEditing} providerDirty={providerDirty} editorBusy={editorBusy}
+              intent={intent.providers} intentRevision={intentRevision} onRoute={reportRoute}
               onDirtyChange={markProviderDirty} onBusyChange={markEditorBusy} groups={data.groups} onHideModels={hideModels}
               onListModel={(providerId, model) => void navigate('models', {models: {list: {providerId, model}}})}
               mergeKey={saved => setData(previous => ({...previous, providerKeys: previous.providerKeys.some(key => key.id === saved.id && key.provider_id === saved.provider_id)
                 ? previous.providerKeys.map(key => key.id === saved.id && key.provider_id === saved.provider_id ? {...key, ...saved} : key)
                 : [...previous.providerKeys, saved]}))}/>}
-            {activeTab === 'announcements' && <AnnouncementsPage announcements={data.announcements} loading={loading} failed={!!failures.announcements}
+            {activeTab === 'templates' && <ResponseTemplatesPage models={data.models} modelsFailed={!!failures.config} refreshEpoch={refreshEpoch}
+              guards={guards} onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy}/>}
+            {activeTab === 'announcements' && <AnnouncementsPage announcements={data.announcements} groups={data.groups} loading={loading} failed={!!failures.announcements}
+              // A server that says where each notice stands (or reports its saves, from the same release) takes a start, an end and an audience.
+              scheduling={data.announcements.some(notice => typeof notice.status === 'string') || typeof data.stats?.persistenceReady === 'boolean'}
               refresh={refreshData} guards={guards} reportError={reportError}
               updateAnnouncements={announcements => setData(previous => ({...previous, announcements}))}/>}
-            {activeTab === 'reconciliation' && <FinancePage financials={data.financials} loading={loading} failed={!!failures.financials}
+            {activeTab === 'reconciliation' && <FinancePage financials={data.financials} providers={data.providers} loading={loading} failed={!!failures.financials}
               refresh={refreshData} reportError={reportError} onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy} refreshEpoch={refreshEpoch}/>}
-            {activeTab === 'security' && <SecurityPage operator={operator} keyCount={providersLoaded ? data.providerKeys.length : null}
+            {activeTab === 'security' && <SecurityPage operator={operator} keyCount={providersLoaded ? data.providerKeys.length : null} stats={data.stats} refresh={refreshData} guards={guards}
               onLogout={() => void onLogout(false)} onLogoutAll={() => void logoutAll()}/>}
           </div>
         </div>

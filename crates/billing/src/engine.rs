@@ -16,6 +16,13 @@ use thiserror::Error;
 mod commercial;
 pub use commercial::{CommercialAudit, CommercialConfig, CommercialUpdate};
 
+#[path = "response_templates.rs"]
+mod response_templates;
+pub use response_templates::{
+    ResponseTemplateAudit, ResponseTemplateConfig, ResponseTemplateReceipt, ResponseTemplateRule,
+    ResponseTemplateUpdate, ResponseTemplateVariant,
+};
+
 #[cfg(test)]
 type SnapshotSaveHook = (Arc<std::sync::Barrier>, Arc<std::sync::Barrier>);
 
@@ -163,6 +170,8 @@ pub struct BillingEngine {
     rate_card_versions: Arc<RwLock<Vec<RateCardVersion>>>,
     rate_card_audit_logs: Arc<RwLock<Vec<RateCardAuditLog>>>,
     commercial_audit_logs: Arc<RwLock<Vec<CommercialAudit>>>,
+    response_templates: Arc<RwLock<ResponseTemplateConfig>>,
+    response_template_receipts: Arc<RwLock<Vec<ResponseTemplateReceipt>>>,
     settings: Arc<RwLock<BillingSettings>>,
     traces: Arc<RwLock<Vec<RequestTrace>>>,
     announcements: Arc<RwLock<Vec<Announcement>>>,
@@ -283,6 +292,10 @@ pub struct BillingSnapshot {
     pub rate_card_audit_logs: Vec<RateCardAuditLog>,
     #[serde(default)]
     pub commercial_audit_logs: Vec<CommercialAudit>,
+    #[serde(default)]
+    pub response_templates: ResponseTemplateConfig,
+    #[serde(default)]
+    pub response_template_receipts: Vec<ResponseTemplateReceipt>,
     pub settings: BillingSettings,
     #[serde(default)]
     pub traces: Vec<RequestTrace>,
@@ -349,7 +362,18 @@ pub struct ArchivedLedgerSummary {
     pub adjustments: HashMap<String, LedgerEntry>,
     #[serde(default)]
     pub entries_count: usize,
+    /// Permanent template-only invocation tombstones, never evicted. Legacy JSON
+    /// field name retained for compatibility; ordinary usage is not inserted.
+    #[serde(default)]
+    pub usage_invocation_ids: std::collections::BTreeSet<String>,
+    /// Legacy snapshots require a one-time verified archive migration at load.
+    #[serde(default)]
+    pub template_invocations_complete: bool,
 }
+
+/// Hard administrator capacity. Exhaustion refuses new templates, never evicts IDs.
+pub const MAX_TEMPLATE_INVOCATIONS: usize = 65_536;
+pub const MAX_TEMPLATE_INVOCATION_BYTES: usize = 4 * 1024 * 1024;
 
 impl ArchivedLedgerSummary {
     fn include(&mut self, entry: &LedgerEntry) {
@@ -357,6 +381,11 @@ impl ArchivedLedgerSummary {
         let card = self.cards.entry(entry.card_id.clone()).or_default();
         match entry.kind {
             LedgerKind::Usage => {
+                if let Some(id) = &entry.invocation_id {
+                    if entry.provider_id.starts_with("response-template:") {
+                        self.usage_invocation_ids.insert(id.clone());
+                    }
+                }
                 card.usage = card.usage.saturating_add(entry.credits_charged);
                 card.provider_cost_micro_cny = card
                     .provider_cost_micro_cny
@@ -635,6 +664,8 @@ impl BillingEngine {
             rate_card_versions: Arc::new(RwLock::new(Vec::new())),
             rate_card_audit_logs: Arc::new(RwLock::new(Vec::new())),
             commercial_audit_logs: Arc::new(RwLock::new(Vec::new())),
+            response_templates: Arc::new(RwLock::new(ResponseTemplateConfig::default())),
+            response_template_receipts: Arc::new(RwLock::new(Vec::new())),
             settings: Arc::new(RwLock::new(BillingSettings::default())),
             traces: Arc::new(RwLock::new(Vec::new())),
             announcements: Arc::new(RwLock::new(Vec::new())),
@@ -651,7 +682,10 @@ impl BillingEngine {
             state_lock: Arc::new(RwLock::new(())),
             injected_persistence_fault: Arc::new(RwLock::new(false)),
             archived_ledger_receipts: Arc::new(RwLock::new(Vec::new())),
-            archived_ledger_summary: Arc::new(RwLock::new(ArchivedLedgerSummary::default())),
+            archived_ledger_summary: Arc::new(RwLock::new(ArchivedLedgerSummary {
+                template_invocations_complete: true,
+                ..ArchivedLedgerSummary::default()
+            })),
             issuance_orders: Arc::new(RwLock::new(HashMap::new())),
             unpaid_ledger: Arc::new(RwLock::new(Vec::new())),
             pending_settlements: Arc::new(RwLock::new(HashMap::new())),
@@ -759,6 +793,8 @@ impl BillingEngine {
             rate_card_versions: self.rate_card_versions.read().unwrap().clone(),
             rate_card_audit_logs: self.rate_card_audit_logs.read().unwrap().clone(),
             commercial_audit_logs: self.commercial_audit_logs.read().unwrap().clone(),
+            response_templates: self.response_templates.read().unwrap().clone(),
+            response_template_receipts: self.response_template_receipts.read().unwrap().clone(),
             settings: self.settings.read().unwrap().clone(),
             traces: self.traces.read().unwrap().clone(),
             announcements: self.announcements.read().unwrap().clone(),
@@ -773,8 +809,9 @@ impl BillingEngine {
     }
 
     /// Import engine state from a snapshot, overwriting matching tables.
-    pub fn import_snapshot(&self, snapshot: BillingSnapshot) {
+    pub fn import_snapshot(&self, mut snapshot: BillingSnapshot) {
         let _state_guard = self.state_lock.write().unwrap();
+        restore_template_invocations(&mut snapshot);
         let mut cards = snapshot.cards;
         for card in cards.values_mut() {
             card.credit_reserved = 0;
@@ -835,6 +872,8 @@ impl BillingEngine {
         *self.rate_card_versions.write().unwrap() = snapshot.rate_card_versions;
         *self.rate_card_audit_logs.write().unwrap() = snapshot.rate_card_audit_logs;
         *self.commercial_audit_logs.write().unwrap() = snapshot.commercial_audit_logs;
+        *self.response_templates.write().unwrap() = snapshot.response_templates;
+        *self.response_template_receipts.write().unwrap() = snapshot.response_template_receipts;
         *self.settings.write().unwrap() = snapshot.settings;
         *self.traces.write().unwrap() = snapshot.traces;
         *self.announcements.write().unwrap() = snapshot.announcements;
@@ -1208,6 +1247,49 @@ impl BillingEngine {
     where
         F: FnOnce() -> R,
     {
+        // Commit new template tombstones atomically with their debit. No historical
+        // archive reads and no expiry/eviction of IDs when receipt bodies are pruned.
+        let current = self.response_template_receipts.read().unwrap();
+        let known: std::collections::HashSet<_> =
+            current.iter().map(|r| r.invocation_id.as_str()).collect();
+        let new_ids: Vec<_> = candidate
+            .response_template_receipts
+            .iter()
+            .filter(|r| !known.contains(r.invocation_id.as_str()))
+            .map(|r| r.invocation_id.clone())
+            .collect();
+        let update_template_index = !new_ids.is_empty();
+        let mut normalized;
+        let candidate = if !update_template_index {
+            candidate
+        } else {
+            if !candidate
+                .archived_ledger_summary
+                .template_invocations_complete
+                && !candidate.archived_ledger_receipts.is_empty()
+            {
+                return Err(BillingError::InvalidState(
+                    "template invocation index requires verified archive migration on load".into(),
+                ));
+            }
+            normalized = candidate.clone();
+            for id in new_ids {
+                if !normalized
+                    .archived_ledger_summary
+                    .usage_invocation_ids
+                    .insert(id.clone())
+                {
+                    return Err(BillingError::DuplicateInvocation(id));
+                }
+            }
+            validate_template_invocation_capacity(&normalized.archived_ledger_summary)?;
+            normalized
+                .archived_ledger_summary
+                .template_invocations_complete = true;
+            &normalized
+        };
+        drop(known);
+        drop(current);
         let path_opt = self.persistence_path.read().unwrap().clone();
         if let Some(path) = path_opt {
             if let Err(error) = self.persist_snapshot_to_file(candidate, &path) {
@@ -1217,6 +1299,18 @@ impl BillingEngine {
             }
         }
         let result = publish_fn();
+        // Caller closures publish the original candidate; update the normalized
+        // tombstones only after persistence succeeds.
+        if update_template_index {
+            let mut summary = self.archived_ledger_summary.write().unwrap();
+            summary.usage_invocation_ids = candidate
+                .archived_ledger_summary
+                .usage_invocation_ids
+                .clone();
+            summary.template_invocations_complete = candidate
+                .archived_ledger_summary
+                .template_invocations_complete;
+        }
         *self.last_persistence_error.write().unwrap() = None;
         Ok(result)
     }
@@ -1449,8 +1543,15 @@ impl BillingEngine {
             .iter()
             .try_fold(0usize, |sum, r| sum.checked_add(r.drained_entries_count));
         // Without receipts there is nothing to rebuild from; validation refuses it.
-        if receipts.is_empty() || counted == Some(snapshot.archived_ledger_summary.entries_count) {
-            return Ok(());
+        if receipts.is_empty()
+            || (counted == Some(snapshot.archived_ledger_summary.entries_count)
+                && snapshot
+                    .archived_ledger_summary
+                    .template_invocations_complete)
+        {
+            restore_template_invocations(snapshot);
+            return validate_template_invocation_capacity(&snapshot.archived_ledger_summary)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()));
         }
         let refused = |reason: String| {
             std::io::Error::new(
@@ -1464,6 +1565,16 @@ impl BillingEngine {
             .unwrap_or(std::path::Path::new("."));
         let kek = self.master_kek.read().unwrap().clone();
         let mut summary = ArchivedLedgerSummary::default();
+        // Financial-summary rebuilds must not discard already proven tombstones.
+        if snapshot
+            .archived_ledger_summary
+            .template_invocations_complete
+        {
+            summary.usage_invocation_ids = snapshot
+                .archived_ledger_summary
+                .usage_invocation_ids
+                .clone();
+        }
         for receipt in receipts {
             let name = &receipt.archive_file;
             if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', ':']) {
@@ -1489,8 +1600,11 @@ impl BillingEngine {
             "[kiro-billing] rebuilt the archive summary from {} verified ledger archives",
             receipts.len()
         );
+        summary.template_invocations_complete = true;
         snapshot.archived_ledger_summary = summary;
-        Ok(())
+        restore_template_invocations(snapshot);
+        validate_template_invocation_capacity(&snapshot.archived_ledger_summary)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
     }
 
     fn ensure_snapshot_not_rolled_back(
@@ -2233,6 +2347,25 @@ impl BillingEngine {
             if existing.state != ReservationState::Released
                 || pending_settlements.contains_key(invocation_id)
             {
+                return Err(BillingError::DuplicateInvocation(invocation_id.to_string()));
+            }
+        }
+
+        // Permanent template IDs also block ordinary fallback after receipt cleanup
+        // and rule disablement. Bounded O(log N), no ledger scan or archive I/O.
+        {
+            let summary = self.archived_ledger_summary.read().unwrap();
+            // import_snapshot cannot perform fallible archive migration. Unverified
+            // legacy imports must go through load_from_file before accepting traffic;
+            // otherwise forgotten template IDs could fall through to ordinary billing.
+            if !summary.template_invocations_complete
+                && !self.archived_ledger_receipts.read().unwrap().is_empty()
+            {
+                return Err(BillingError::InvalidState(
+                    "template invocation index requires verified archive migration on load".into(),
+                ));
+            }
+            if summary.usage_invocation_ids.contains(invocation_id) {
                 return Err(BillingError::DuplicateInvocation(invocation_id.to_string()));
             }
         }
@@ -5447,7 +5580,44 @@ fn atomic_replace(temp: &std::path::Path, target: &std::path::Path) -> std::io::
     }
 }
 
+/// Migration only. Archives are verified once by load_from_file, not on requests.
+fn restore_template_invocations(snapshot: &mut BillingSnapshot) {
+    let summary = &mut snapshot.archived_ledger_summary;
+    if !summary.template_invocations_complete && snapshot.archived_ledger_receipts.is_empty() {
+        summary.usage_invocation_ids.clear();
+        summary.template_invocations_complete = true;
+    }
+    summary.usage_invocation_ids.extend(
+        snapshot
+            .ledger
+            .iter()
+            .filter(|e| {
+                e.kind == LedgerKind::Usage && e.provider_id.starts_with("response-template:")
+            })
+            .filter_map(|e| e.invocation_id.clone()),
+    );
+}
+
+fn validate_template_invocation_capacity(
+    summary: &ArchivedLedgerSummary,
+) -> Result<(), BillingError> {
+    if summary.usage_invocation_ids.len() > MAX_TEMPLATE_INVOCATIONS
+        || serde_json::to_vec(&summary.usage_invocation_ids)
+            .map_err(|e| BillingError::InvalidState(e.to_string()))?
+            .len()
+            > MAX_TEMPLATE_INVOCATION_BYTES
+    {
+        return Err(BillingError::InvalidState(format!(
+            "template invocation capacity exhausted (maximum {MAX_TEMPLATE_INVOCATIONS} IDs / {MAX_TEMPLATE_INVOCATION_BYTES} serialized bytes); new template charges refused; administrator action required, do not clear history")));
+    }
+    Ok(())
+}
+
 fn validate_snapshot(snapshot: &BillingSnapshot) -> std::io::Result<()> {
+    validate_template_invocation_capacity(&snapshot.archived_ledger_summary)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
+    response_templates::validate_snapshot_state(snapshot)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
     if snapshot.version == 0
         || snapshot.cards.len() > 10_000_000
         || snapshot.ledger.len() > 50_000_000

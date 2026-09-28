@@ -223,12 +223,68 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                     );
                 }
                 Err(crate::idempotency::IdempotencyError::AlreadyCompleted(_)) => {
-                    // The completion cache contains billing metadata only, not the
-                    // original event stream. Never turn an unreplayable request
-                    // into a synthetic successful assistant answer.
+                    if let Some(caller) = claims.as_ref() {
+                        // Recovery also parses and validates the retry. A completed ID
+                        // cannot resend a write into another conversation or tool schema.
+                        let body_bytes = match read_body(
+                            body,
+                            self.content_guardrail.max_body_bytes,
+                            None,
+                            &self.large_bodies,
+                        )
+                        .await
+                        {
+                            Ok(BodyRead::Body(bytes)) => bytes,
+                            Ok(BodyRead::TooLarge) => {
+                                return body_too_large(self.content_guardrail.max_body_bytes)
+                            }
+                            Ok(BodyRead::Throttled) => {
+                                return self.large_bodies.throttled_response()
+                            }
+                            Err(_) => {
+                                return error_response(
+                                    StatusCode::BAD_REQUEST,
+                                    "SerializationException",
+                                    "Invalid retry body",
+                                )
+                            }
+                        };
+                        let parsed: GenerateAssistantResponseRequest =
+                            match serde_json::from_slice(&body_bytes) {
+                                Ok(parsed) => parsed,
+                                Err(_) => {
+                                    return error_response(
+                                        StatusCode::BAD_REQUEST,
+                                        "SerializationException",
+                                        "Invalid retry request",
+                                    )
+                                }
+                            };
+                        if let Err(error) =
+                            validate_conversation_request(&parsed, &self.content_guardrail)
+                        {
+                            return guardrail_refusal(&error);
+                        }
+                        let fallback = self
+                            .provider_config
+                            .as_ref()
+                            .map(|c| c.model.as_str())
+                            .unwrap_or("claude-3-5-sonnet-20241022");
+                        let model =
+                            requested_model_id(&parsed, claims.as_ref(), &self.billing, fallback);
+                        if let Some(response) = super::response_templates::replay_receipt(
+                            &self.billing,
+                            &parsed,
+                            &caller.card_id,
+                            &invocation_key,
+                            &model,
+                            crate::now_secs(),
+                        ) {
+                            return response;
+                        }
+                    }
                     return error_response(
-                        StatusCode::CONFLICT,
-                        "InvocationAlreadyCompletedException",
+                        StatusCode::CONFLICT, "InvocationAlreadyCompletedException",
                         "Request with amz-sdk-invocation-id has already completed; use a new invocation id",
                     );
                 }
@@ -357,6 +413,33 @@ impl FacadeHandler for GenerateAssistantResponseHandler {
                     return self.guardrail.build_retry_response();
                 }
             };
+
+            // Disclosed local templates bypass upstream/token reservation, but their
+            // atomic fixed-price transaction still enforces the card and model limits.
+            if let (Some(caller), Some(parsed)) = (claims.as_ref(), parsed_request.as_ref()) {
+                let model =
+                    requested_model_id(parsed, claims.as_ref(), &self.billing, fallback_model);
+                if valid_model_id(&model) {
+                    if let Some(response) = super::response_templates::respond(
+                        &self.billing,
+                        parsed,
+                        &caller.card_id,
+                        &invocation_key,
+                        &model,
+                        crate::now_secs(),
+                    ) {
+                        if response.status().is_success() {
+                            idempotency_guard.commit(crate::idempotency::CompletedInvocation {
+                                completed_at: std::time::Instant::now(),
+                                model_id: model,
+                                total_input_tokens: 0,
+                                total_output_tokens: 0,
+                            });
+                        }
+                        return response;
+                    }
+                }
+            }
 
             // 5. Credit Reservation (Spec §6.2)
             let fallback_model = self

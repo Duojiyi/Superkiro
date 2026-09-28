@@ -1,5 +1,9 @@
+import type {KeyAttempts, ModelHealth, ProviderAttempts} from './health';
+/** A refused request: the server's words, its status, and the rest of its answer (a refusal's `refusal` object, say). */
+import type {ResponseTemplateConfig, ResponseTemplateUpdate} from './responseTemplates';
+
 export class AdminApiError extends Error {
-  constructor(message:string, public readonly status:number){super(message);this.name='AdminApiError';}
+  constructor(message:string, public readonly status:number, public readonly body:Record<string, unknown> = {}){super(message);this.name='AdminApiError';}
 }
 /**
  * Kiro BYOK Admin Console Frontend API Contract & Client.
@@ -15,6 +19,8 @@ export interface AdminStats {
   unactivatedCards: number;
   frozenCards: number;
   bannedCards: number;
+  /** Cards past their validity, as the customer meets them (newer servers). */
+  expiredCards?: number;
   totalCredits: number;
   usedCredits: number;
   remainingCredits: number;
@@ -23,6 +29,25 @@ export interface AdminStats {
   remainingPoints: number;
   /** Real totals over the last 24 hours and 7 days (newer servers). */
   activity?: AdminActivity;
+  /** Size of the saved billing state (bytes), the level from which to archive the ledger, and the ceiling at which saves fail. */
+  stateBytes?: number;
+  stateWarningBytes?: number;
+  stateCeilingBytes?: number;
+  /** When the state was last saved (seconds), null before the first save; whether the latest change is saved, and if not, why (newer servers). */
+  lastSavedAtSecs?: number | null;
+  persistenceReady?: boolean;
+  persistenceError?: string | null;
+  /** Where each group's hidden Kiro background calls (`simple-task`) go, and why; billed at that model's price (newer servers). */
+  simpleTaskModels?: Array<{groupId: string; groupName: string; model: string | null; via: 'alias' | 'cheapest' | 'default' | null}>;
+}
+
+/** What POST /ledger/archive did: the entries moved into an archive file beside the saved state, and its size before and after. */
+export interface LedgerArchive {
+  success: boolean;
+  receipt: {archive_id: string; archive_file: string; drained_entries_count: number; sha256_checksum: string; before_ts_secs: number; created_at_secs: number};
+  stateBytesBefore: number;
+  stateBytesAfter: number;
+  stateCeilingBytes: number;
 }
 
 export interface AdminActivityWindow {
@@ -30,6 +55,8 @@ export interface AdminActivityWindow {
   succeeded: number;
   failed: number;
   clientAborted: number;
+  /** Requests refused for the card or the request itself (balance, limits, a prompt too long…), in neither requests nor failed (newer servers). */
+  refused?: number;
   /** Micro-credits: divide by 1,000,000 for credits. */
   creditsCharged: number;
   inputTokens: number;
@@ -47,11 +74,18 @@ export interface AdminActivity {
   last24h: AdminActivityWindow;
   last7d: AdminActivityWindow;
   /** The last 24 clock hours, oldest first; the last is the current hour. */
-  hourly: Array<{startSecs: number; requests: number; failed: number}>;
+  hourly: Array<{startSecs: number; requests: number; failed: number; refused?: number}>;
   /** The oldest trace kept: request counts reach back no further than this. */
   tracesCoverFromSecs?: number | null;
   /** The last 24 hours by provider, busiest first. */
-  providers?: Array<{providerId: string; requests: number; failed: number; ttftMedianMs: number | null}>;
+  providers?: Array<{providerId: string; requests: number; failed: number; refused?: number; ttftMedianMs: number | null}>;
+  /** Every upstream attempt by provider and by Key over the last hour, 24 hours and 7 days, a primary's failures included though its backup answered (newer servers). */
+  providerAttempts?: ProviderAttempts[];
+  keyAttempts?: KeyAttempts[];
+  /** Requests by the model customers asked for, and their failures, over the same periods. */
+  modelHealth?: ModelHealth[];
+  /** Billed requests and distinct cards by model over the last 7 days. */
+  modelUsage7d?: Array<{model: string; requests: number; cards: number}>;
 }
 
 export interface AdminTraceAttempt {
@@ -77,8 +111,18 @@ export interface AdminTrace {
   output_tokens?: number;
   credits_charged?: number;
   provider_cost_micro_cny?: number;
+  /** For a request refused for want of balance: the micro-credits it needed to start, and what the card had. */
+  needed_micro_credits?: number;
+  available_micro_credits?: number;
   attempt_chain?: AdminTraceAttempt[];
+  /** For a refusal: how many more times the card was refused for the same reason within a minute, and when the last was (newer servers). */
+  repeats?: number;
+  last_seen_secs?: number | null;
 }
+
+/** Over every kept request a search matched, not only those returned; a failure is status error. */
+export interface TraceTotals {count: number; failures: number; creditsCharged: number; costMicroCny: number}
+export interface TraceSearch {fromSecs?: number; toSecs?: number; cardId?: string; model?: string; provider?: string; status?: string; limit?: number}
 
 export interface TraceReply {
   status: string;
@@ -107,6 +151,13 @@ export interface CardEvent {
   points: number;
   operator: string | null;
   reason: string | null;
+  /** For an adjustment: the request it makes up for (a trace's invocation_id). */
+  invocationId?: string | null;
+  /**
+   * What else the change recorded: unbind {deviceId}; rebinds_reset {previousRebinds,
+   * previousCooldownUntil}; extend {validUntil} or {activationDurationSecs}; group {previousGroupId, groupId}.
+   */
+  detail?: Record<string, unknown> | null;
 }
 
 export interface TraceContent {
@@ -136,7 +187,9 @@ export interface AdminFinancials {
   settings?: FinancialSettings;
   actualRevenueMicroCny?: number|null;
   actualGrossProfitMicroCny?: number|null;
-  estimates?: {usageFaceValueMicroCny:number;configuredProviderCostMicroCny:number;faceValueLessCostMicroCny:number|null;faceValueMarginPercentage:number|null;costedRequests:number;uncostedRequests:number;retainedLedgerOnly:boolean};
+  estimates?: {usageFaceValueMicroCny:number;configuredProviderCostMicroCny:number;faceValueLessCostMicroCny:number|null;faceValueMarginPercentage:number|null;costedRequests:number;uncostedRequests:number;retainedLedgerOnly:boolean;
+    /** Of the uncosted, those settled at an estimated cost for want of the serving route's own (newer servers). */
+    estimatedRequests?:number};
   success: boolean;
   dashboard: {
     total_requests: number;
@@ -147,6 +200,23 @@ export interface AdminFinancials {
     gross_margin_percentage: number;
   };
   modelRankings: Array<{model_id?: string; requests?: number; total_tokens?: number; provider_cost_micro_cny?: number; credits_charged?: number; margin_percentage?: number}>;
+  /** The period covered (from inclusive, to exclusive), when one was asked for (newer servers). */
+  fromSecs?: number | null;
+  toSecs?: number | null;
+  /** What each upstream served over the period, and what it should bill for it. */
+  byProvider?: Array<{providerId: string; requests: number; uncachedInputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; costMicroCny: number}>;
+  /** The margin over the requests whose cost is known, and what is left out. */
+  margin?: {costedRequests: number; costedCredits: number; revenueMicroCny: number; costMicroCny: number; grossProfitMicroCny: number; marginPercentage: number | null; uncostedRequests: number; uncostedCredits: number;
+    /** Of the uncosted, those costed at an estimate (newer servers). */
+    estimatedRequests?: number};
+  /** Credits given (compensations, promotions) and taken by balance adjustments over the period (newer servers). */
+  adjustments?: {count: number; positiveMicroCredits: number; negativeMicroCredits: number; netMicroCredits: number};
+  /** Cards issued and activated over the period, valued at their plan's price. */
+  sales?: {issuedCards: number; issuedValueMicroCny: number; activatedCards: number; activatedValueMicroCny: number; unpricedIssuedCards: number; unpricedActivatedCards: number;
+    byPlan: Array<{templateId: string; planId?: string; name: string; points: number; priceMicroCny: number; issuedCards: number; activatedCards: number; issuedValueMicroCny?: number; activatedValueMicroCny?: number}>};
+  /** Balances still owed now (whatever the period), at the current face value; the part on cards not yet activated. */
+  liability?: {cards: number; microCredits: number; valueMicroCny: number; unactivatedCards: number; unactivatedMicroCredits: number};
+  planPrices?: Array<{templateId: string; planId?: string; name: string; points: number; priceMicroCny: number; onSale?: boolean}>;
 }
 
 export interface AdminCardItem {
@@ -165,7 +235,52 @@ export interface AdminCardItem {
   validUntil?: number;
   groupId: string;
   note?: string;
+  /** The status as it works now (an expired card is `expired`), from servers that send it. */
+  effectiveStatus?: AdminCardItem['status'];
+  /** Unbindings the customer has used of `maxRebinds`, and, while a cooldown runs, when they may unbind again (seconds). */
+  rebindsUsed?: number;
+  maxRebinds?: number;
+  rebindCooldownUntil?: number | null;
+  /** For a card not yet activated: how long it is valid from its activation (seconds). */
+  activationDurationSecs?: number | null;
+  /** The plan it was issued from (for a card issued before the plan catalog, the tier its credits name), what its client calls it and what Kiro is told (newer servers). */
+  planId?: string | null;
+  planName?: string | null;
+  kiroPlanType?: string;
+  /** The plan as it was when the card was issued; null for a card issued before the catalog. */
+  plan?: CardPlan | null;
+  /** Its limits (newer servers): requests at once, and credits in a UTC day and over 30 days (micro-credits; null: none). */
+  maxConcurrency?: number;
+  dailyCreditLimit?: number | null;
+  monthlyCreditLimit?: number | null;
 }
+
+/** A plan as a card keeps it from its issuance, whatever the catalog becomes. */
+export interface CardPlan {id: string; name: string; points: number; priceMicroCny: number; validityDays: number; maxDevices: number; concurrency: number; kiroPlanType: string}
+
+/**
+ * A plan (套餐) of the catalog cards are issued from: what a card sells for (yuan, to the fen) and
+ * gives, its default group, what Kiro is told it subscribes to, and whether it is on sale.
+ */
+export interface Plan {
+  id: string;
+  name: string;
+  points: number;
+  price_cny: number;
+  validity_days: number;
+  max_devices: number;
+  concurrency: number;
+  default_group_id: string;
+  kiro_plan_type: string;
+  on_sale: boolean;
+  sort_order: number;
+}
+
+/** What a card support action (解封, 解绑设备, 重置换绑次数, 备注, 换分组) answers: the card as it now is. */
+export interface AdminCardReply {success: boolean; card?: AdminCardItem}
+
+/** 延长有效期: by a number of days, or to a time (seconds). */
+export type ValidityChange = {days: number} | {validUntilSecs: number};
 
 export interface GeneratedCard {
   cardId: string;
@@ -173,6 +288,9 @@ export interface GeneratedCard {
   groupId: string;
   creditTotal: number;
   status: string;
+  /** The plan it was issued from, as the card keeps it (newer servers). */
+  planId?: string | null;
+  plan?: CardPlan | null;
 }
 
 export interface AdminCardsResponse {
@@ -188,6 +306,8 @@ export interface AdminCardStatusResponse {
   success: boolean;
   cardId: string;
   newStatus: string;
+  /** The card as it now is, from servers that send it. */
+  card?: AdminCardItem;
 }
 
 export interface AdminCardAdjustResponse {
@@ -218,7 +338,13 @@ export interface AdminAnnouncement {
   level: 'info' | 'warning' | 'critical';
   enabled: boolean;
   created_at: number;
-  expires_at?: number;
+  /** When it stops being shown; null or absent: until withdrawn. */
+  expires_at?: number | null;
+  /** When it is first shown, the groups whose cards see it (every customer when empty), its edits and where it stands (newer servers). */
+  starts_at?: number;
+  audience?: string[];
+  edits?: Array<{operator: string; at_secs: number; changed: string[]}>;
+  status?: 'scheduled' | 'active' | 'ended' | 'withdrawn';
 }
 
 // How long before the end of a session the operator is warned.
@@ -373,7 +499,7 @@ export class AdminApiClient {
         if (errorVersion !== this.sessionVersion) throw new Error('管理会话已改变，请重新加载');
         if(path==='/api/v1/admin/session' && errorVersion===this.sessionVersion){this.twoFactorEnabled=typeof error.twoFactorEnabled==='boolean'?error.twoFactorEnabled:undefined;this.totpRequired=error.totpRequired===true;}
         // Admin errors come as {error} or, from the shared handler, {__type, message}.
-        throw new AdminApiError(error.error || error.message || (res.status === 401 ? '用户名或密码错误' : `请求失败 (${res.status})`),res.status);
+        throw new AdminApiError(error.error || error.message || (res.status === 401 ? '用户名或密码错误' : `请求失败 (${res.status})`),res.status,error && typeof error === 'object' ? error : {});
       }
       const result = await (blob ? res.blob() : res.json());
       if (version !== this.sessionVersion) throw new Error('管理会话已改变，请重新加载');
@@ -416,6 +542,13 @@ export class AdminApiClient {
     return this.request('/api/v1/admin/cards/reveal', {method: 'POST', body: JSON.stringify({cardId})});
   }
 
+  async getResponseTemplates(): Promise<{success: boolean; config: ResponseTemplateConfig}> {
+    return this.request('/api/v1/admin/response-templates');
+  }
+  async publishResponseTemplates(update: ResponseTemplateUpdate): Promise<{success: boolean; config: ResponseTemplateConfig}> {
+    return this.request('/api/v1/admin/response-templates', {method: 'POST', body: JSON.stringify(update)});
+  }
+
   async getCommercialConfig(): Promise<{success: boolean; config: CommercialConfig}> {
     return this.request('/api/v1/admin/commercial-config');
   }
@@ -446,9 +579,10 @@ export class AdminApiClient {
     }
   }
 
+  /** `unban` needs a reason of 1–200 bytes; the sessions the ban ended stay ended. */
   async updateCardStatus(
     cardId: string,
-    action: 'freeze' | 'unfreeze' | 'ban' | 'void' | 'archive' | 'unarchive',
+    action: 'freeze' | 'unfreeze' | 'ban' | 'unban' | 'void' | 'archive' | 'unarchive',
     reason?: string
   ): Promise<AdminCardStatusResponse> {
     return this.request('/api/v1/admin/cards/status', {
@@ -457,49 +591,112 @@ export class AdminApiClient {
     });
   }
 
+  /** 解绑设备: frees the device's seat and ends the card's sessions; the customer's rebind allowance is untouched. */
+  async unbindDevice(cardId: string, deviceId: string, reason: string): Promise<AdminCardReply> {
+    return this.request('/api/v1/admin/cards/devices/unbind', {method: 'POST', body: JSON.stringify({cardId, deviceId, reason})});
+  }
+
+  /** 重置换绑次数: no unbindings used, no cooldown. */
+  async resetRebinds(cardId: string, reason: string): Promise<AdminCardReply> {
+    return this.request('/api/v1/admin/cards/rebinds/reset', {method: 'POST', body: JSON.stringify({cardId, reason})});
+  }
+
+  /** 延长有效期 of 1–500 cards: all of them or none; a refusal names the cards it refuses. */
+  async extendValidity(cardIds: string[], change: ValidityChange, reason: string): Promise<{success: boolean; count?: number; cards?: AdminCardItem[]}> {
+    return this.request('/api/v1/admin/cards/validity', {method: 'POST', body: JSON.stringify({cardIds, ...change, reason})});
+  }
+
+  /** Replaces a card's note (at most 256 bytes); an empty one clears it. */
+  async setCardNote(cardId: string, note: string): Promise<AdminCardReply> {
+    return this.request('/api/v1/admin/cards/note', {method: 'POST', body: JSON.stringify({cardId, note})});
+  }
+
+  /** 换分组: into a group that takes cards; the card's sessions end, so the customer signs in again. */
+  async changeCardGroup(cardId: string, groupId: string, reason: string): Promise<AdminCardReply> {
+    return this.request('/api/v1/admin/cards/group', {method: 'POST', body: JSON.stringify({cardId, groupId, reason})});
+  }
+
+  /** 修改限额: only the limits given change (micro-credits; null clears one); written to the card's history with the previous values. */
+  async changeCardQuotas(cardId: string, change: {maxConcurrency?: number; dailyCreditLimit?: number | null; monthlyCreditLimit?: number | null}, reason: string): Promise<AdminCardReply> {
+    return this.request('/api/v1/admin/cards/quotas', {method: 'POST', body: JSON.stringify({cardId, ...change, reason})});
+  }
+
+  /** 更换卡密: a new code, returned this once; the old code and every session of the card stop working. */
+  async rekeyCard(cardId: string, reason: string): Promise<{success: boolean; card?: AdminCardItem; rawCode: string}> {
+    return this.request('/api/v1/admin/cards/rekey', {method: 'POST', body: JSON.stringify({cardId, reason})});
+  }
+
+  /**
+   * `invocationId`: the request the adjustment makes up for (a trace's invocation_id); the card's history keeps it.
+   * The server refuses to compensate a request twice or by more than it charged unless `allowRepeat` (with the reason).
+   */
   async adjustBalance(
     cardId: string,
     deltaPoints: number,
     reason: string,
-    idempotencyKey: string
+    idempotencyKey: string,
+    invocationId?: string,
+    allowRepeat?: boolean
   ): Promise<AdminCardAdjustResponse> {
     return this.request('/api/v1/admin/cards/adjust', {
       method: 'POST',
-      body: JSON.stringify({ cardId, deltaPoints, reason, idempotencyKey }),
+      body: JSON.stringify({ cardId, deltaPoints, reason, idempotencyKey, ...(invocationId ? {invocationId} : {}), ...(invocationId && allowRepeat ? {allowRepeat: true} : {}) }),
     });
   }
 
-  async getAnnouncements(): Promise<{
+  /** Scheduled and shown ones, newest first; `all`: ended and withdrawn ones too (newer servers). */
+  async getAnnouncements(all = false): Promise<{
     success: boolean;
     announcements: AdminAnnouncement[];
   }> {
-    return this.request('/api/v1/admin/announcements');
+    return this.request(`/api/v1/admin/announcements${all ? '?all=true' : ''}`);
   }
 
+  /** Shown from `startsAtSecs` (now when left out) for `ttlSecs`, up to `endsAtSecs`, or until withdrawn; `audience`: the groups whose cards see it. */
   async createAnnouncement(
     title: string,
     content: string,
     level: 'info' | 'warning' | 'critical' = 'info',
-    ttlSecs?: number
+    ttlSecs?: number,
+    schedule: {startsAtSecs?: number; endsAtSecs?: number; audience?: string[]} = {},
   ): Promise<{ success: boolean; announcement: AdminAnnouncement }> {
     return this.request('/api/v1/admin/announcements', {
       method: 'POST',
-      body: JSON.stringify({ title, content, level, ttlSecs }),
+      body: JSON.stringify({ title, content, level, ttlSecs, ...schedule }),
     });
+  }
+
+  /** Changes a published one: each field sent replaces its value (endsAtSecs null: until withdrawn). */
+  async editAnnouncement(edit: {id: string} & Record<string, unknown>): Promise<{ success: boolean; announcement: AdminAnnouncement }> {
+    return this.request('/api/v1/admin/announcements/edit', {method: 'POST', body: JSON.stringify(edit)});
   }
 
   async withdrawAnnouncement(id: string): Promise<{ success: boolean; id: string }> {
     return this.request('/api/v1/admin/announcements/withdraw', {method: 'POST', body: JSON.stringify({id})});
   }
 
-  async getFinancials(): Promise<AdminFinancials> {
-    return this.request('/api/v1/admin/financials');
+  /** Over the whole kept ledger, or from `fromSecs` (inclusive) to `toSecs` (exclusive). */
+  async getFinancials(range: {fromSecs?: number; toSecs?: number} = {}): Promise<AdminFinancials> {
+    const query = [range.fromSecs !== undefined ? `fromSecs=${range.fromSecs}` : '', range.toSecs !== undefined ? `toSecs=${range.toSecs}` : ''].filter(Boolean).join('&');
+    return this.request(`/api/v1/admin/financials${query ? `?${query}` : ''}`);
   }
 
   /** The latest traces, newest first; `cardId` narrows them to one card on the server. */
-  async getTraces(limit = 500, cardId?: string): Promise<{ success: boolean; traces: AdminTrace[] }> {
+  async getTraces(limit = 500, cardId?: string): Promise<{ success: boolean; traces: AdminTrace[]; totals?: TraceTotals }> {
     const count = Math.min(500, Math.max(1, Math.floor(limit)));
     return this.request(`/api/v1/admin/traces?limit=${count}${cardId ? `&card_id=${encodeURIComponent(cardId)}` : ''}`);
+  }
+
+  /**
+   * The latest requests the server finds by time (from inclusive, to exclusive), card, model,
+   * provider (the one that answered or any attempted) and status, with totals over every one it
+   * matched. An older server reads only the card and sends no totals.
+   */
+  async searchTraces(search: TraceSearch): Promise<{ success: boolean; traces: AdminTrace[]; totals?: TraceTotals }> {
+    const pairs: Array<[string, string | number | undefined]> = [['limit', Math.min(500, Math.max(1, Math.floor(search.limit ?? 500)))],
+      ['fromSecs', search.fromSecs], ['toSecs', search.toSecs], ['card_id', search.cardId], ['model', search.model], ['provider', search.provider], ['status', search.status]];
+    const query = pairs.filter(([, value]) => value !== undefined && value !== '').map(([name, value]) => `${name}=${encodeURIComponent(String(value))}`).join('&');
+    return this.request(`/api/v1/admin/traces?${query}`);
   }
 
   /** One request's content and reply. Every read is logged by the server, naming the operator. */
@@ -507,9 +704,14 @@ export class AdminApiClient {
     return this.request(`/api/v1/admin/traces/content?invocation_id=${encodeURIComponent(invocationId)}`);
   }
 
-  /** What happened to one card, newest first: who did it and why. */
-  async getCardHistory(cardId: string): Promise<{success: boolean; cardId: string; events: CardEvent[]}> {
+  /** What happened to one card, newest first: who did it and why; newer servers add the card as it is. */
+  async getCardHistory(cardId: string): Promise<{success: boolean; cardId: string; card?: AdminCardItem | null; events: CardEvent[]}> {
     return this.request(`/api/v1/admin/cards/history?card_id=${encodeURIComponent(cardId)}`);
+  }
+
+  /** Moves ledger entries older than `beforeTsSecs` into an archive file; balances and quotas stay as they are. */
+  async archiveLedger(beforeTsSecs: number): Promise<LedgerArchive> {
+    return this.request('/api/v1/admin/ledger/archive', {method: 'POST', body: JSON.stringify({beforeTsSecs})});
   }
 
   async pruneTraces(cutoffSecs: number): Promise<{ success: boolean; pruned: number }> {
@@ -519,11 +721,12 @@ export class AdminApiClient {
     });
   }
 
-  async batchCards(count: number, groupId: string, templateId = 'tier-2000', note?: string): Promise<{ success: boolean; cards: GeneratedCard[] }> {
+  /** Cards issued from a plan; templateId, its older name, is sent too for servers before the catalog. */
+  async batchCards(count: number, groupId: string, planId = 'tier-2000', note?: string): Promise<{ success: boolean; cards: GeneratedCard[] }> {
     if (!groupId?.trim()) throw new Error('请选择模型与计费分组');
     return this.request('/api/v1/admin/cards/batch', {
       method: 'POST',
-      body: JSON.stringify({ count, groupId, templateId, maxDevices: 1, ...(note ? {note} : {}) }),
+      body: JSON.stringify({ count, groupId, planId, templateId: planId, maxDevices: 1, ...(note ? {note} : {}) }),
     });
   }
 
@@ -560,6 +763,16 @@ export class AdminApiClient {
     return this.request('/api/v1/admin/providers');
   }
 
+  /** A provider's name, address or API format (`open_ai` | `anthropic`); only the fields given change. */
+  async updateProvider(edit: {id: string; name?: string; base_url?: string; format?: 'open_ai' | 'anthropic'}): Promise<{success: boolean; provider?: Record<string, unknown>}> {
+    return this.request('/api/v1/admin/providers/update', {method: 'POST', body: JSON.stringify(edit)});
+  }
+
+  /** Refused (409) while any model routes through it (primary or backup) or it still has Keys. */
+  async deleteProvider(providerId: string): Promise<{success: boolean}> {
+    return this.request('/api/v1/admin/providers/delete', {method: 'POST', body: JSON.stringify({id: providerId})});
+  }
+
   async updateProviderStatus(providerId: string, enabled: boolean): Promise<{ success: boolean; providerId: string; enabled: boolean }> {
     return this.request('/api/v1/admin/providers/status', {
       method: 'POST',
@@ -589,4 +802,7 @@ export interface CommercialConfig {
   rate_cards: Array<Record<string, unknown>>;
   versions: Array<Record<string, unknown>>;
   audit: Array<Record<string, unknown>>;
+  /** The plan catalog in force, by sort order then ID, and the cards issued from each (newer servers). */
+  plans?: Plan[];
+  cards_by_plan?: Record<string, number>;
 }
