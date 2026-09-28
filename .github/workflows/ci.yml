@@ -109,7 +109,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y fonts-noto-cjk
       - run: node tests/visual.cjs
       - run: node tests/visual-authenticated.cjs
-      - run: node tests/auth-gate.cjs
+      - run: npm run test:browser
       - run: npm run test:usability
       - run: npm run test:card-bulk
       - run: npm run test:iteration

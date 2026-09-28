@@ -829,3 +829,19 @@ div.attention-item:hover {background: transparent;}
 .danger-actions .muted {font-size: 12px; line-height: 18px;}
 .quota-grid {grid-template-columns: repeat(3, minmax(0, 1fr));}
 @media (max-width: 640px) {.quota-grid {grid-template-columns: minmax(0, 1fr);}}
+
+/* Response templates are plain text editors; never mount template HTML in this console. */
+.template-intro, .template-editor, .template-list {padding: 16px;}
+.template-intro > p {margin: 8px 0 12px;}
+.template-layout {display: grid; grid-template-columns: minmax(200px, 260px) minmax(0, 1fr); gap: 16px; align-items: start;}
+.template-list ol {list-style: none; padding: 0; margin: 0 0 16px;}
+.template-list li {padding: 8px 0; border-bottom: 1px solid var(--border-subtle);}
+.template-rule-select {width: 100%; text-align: left; height: auto; white-space: normal; overflow-wrap: anywhere;}
+.template-rule-select[aria-pressed="true"] {border-color: var(--brand); background: var(--neutral-bg);}
+.template-empty {margin: 12px 0; color: var(--text-2);}
+.template-variant {border-top: 1px solid var(--border); margin: 20px 0; padding-top: 12px;}
+.template-code, .template-server-code {font-family: ui-monospace, Consolas, monospace; font-size: 12px; tab-size: 2;}
+.template-code {min-height: 320px; white-space: pre; overflow: auto;}
+.template-server-code {max-height: 360px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 12px;}
+.response-templates .panel-head {flex-wrap: wrap;}
+@media (max-width: 960px) {.template-layout {grid-template-columns: minmax(0, 1fr);}}
