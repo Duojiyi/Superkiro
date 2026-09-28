@@ -13,6 +13,7 @@ import CardsPage from './pages/Cards';
 import FinancePage from './pages/Finance';
 import OverviewPage from './pages/Overview';
 import PlansPage from './pages/Plans';
+import ResponseTemplatesPage from './pages/ResponseTemplates';
 import ProvidersPage, {type KeyEditing} from './pages/Providers';
 import SecurityPage from './pages/Security';
 import TracesPage from './pages/Traces';
@@ -26,7 +27,7 @@ import type {ErrorAction, Intent, RefreshOptions, Row, Tab} from './types';
 
 const NAV: Array<{group: string; items: Array<{id: Tab; label: string}>}> = [
   {group: '日常', items: [{id: 'overview', label: '运营概览'}, {id: 'cards', label: '卡密资产'}, {id: 'traces', label: '调用追踪'}]},
-  {group: '配置', items: [{id: 'groups', label: '分组与权益'}, {id: 'plans', label: '套餐'}, {id: 'models', label: '模型与定价'}, {id: 'providers', label: '供应商与 Key'}, {id: 'announcements', label: '公告管理'}]},
+  {group: '配置', items: [{id: 'groups', label: '分组与权益'}, {id: 'plans', label: '套餐'}, {id: 'models', label: '模型与定价'}, {id: 'providers', label: '供应商与 Key'}, {id: 'announcements', label: '公告管理'}, {id: 'templates', label: '响应模板'}]},
   {group: '财务与安全', items: [{id: 'reconciliation', label: '财务对账'}, {id: 'security', label: '安全与审计'}]},
 ];
 const TITLES = Object.fromEntries(NAV.flatMap(group => group.items.map(item => [item.id, item.label]))) as Record<Tab, string>;
@@ -455,6 +456,8 @@ export default function AdminWorkspace({onLogout, operator, expiring, onReauthen
               mergeKey={saved => setData(previous => ({...previous, providerKeys: previous.providerKeys.some(key => key.id === saved.id && key.provider_id === saved.provider_id)
                 ? previous.providerKeys.map(key => key.id === saved.id && key.provider_id === saved.provider_id ? {...key, ...saved} : key)
                 : [...previous.providerKeys, saved]}))}/>}
+            {activeTab === 'templates' && <ResponseTemplatesPage models={data.models} modelsFailed={!!failures.config} refreshEpoch={refreshEpoch}
+              guards={guards} onDirtyChange={markCommercialDirty} onBusyChange={markEditorBusy}/>}
             {activeTab === 'announcements' && <AnnouncementsPage announcements={data.announcements} groups={data.groups} loading={loading} failed={!!failures.announcements}
               // A server that says where each notice stands (or reports its saves, from the same release) takes a start, an end and an audience.
               scheduling={data.announcements.some(notice => typeof notice.status === 'string') || typeof data.stats?.persistenceReady === 'boolean'}

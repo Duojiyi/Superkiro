@@ -1,5 +1,7 @@
 import type {KeyAttempts, ModelHealth, ProviderAttempts} from './health';
 /** A refused request: the server's words, its status, and the rest of its answer (a refusal's `refusal` object, say). */
+import type {ResponseTemplateConfig, ResponseTemplateUpdate} from './responseTemplates';
+
 export class AdminApiError extends Error {
   constructor(message:string, public readonly status:number, public readonly body:Record<string, unknown> = {}){super(message);this.name='AdminApiError';}
 }
@@ -538,6 +540,13 @@ export class AdminApiClient {
 
   async revealCard(cardId: string): Promise<{ success: boolean; rawCode: string }> {
     return this.request('/api/v1/admin/cards/reveal', {method: 'POST', body: JSON.stringify({cardId})});
+  }
+
+  async getResponseTemplates(): Promise<{success: boolean; config: ResponseTemplateConfig}> {
+    return this.request('/api/v1/admin/response-templates');
+  }
+  async publishResponseTemplates(update: ResponseTemplateUpdate): Promise<{success: boolean; config: ResponseTemplateConfig}> {
+    return this.request('/api/v1/admin/response-templates', {method: 'POST', body: JSON.stringify(update)});
   }
 
   async getCommercialConfig(): Promise<{success: boolean; config: CommercialConfig}> {
