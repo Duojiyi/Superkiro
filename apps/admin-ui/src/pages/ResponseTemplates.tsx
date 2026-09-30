@@ -162,6 +162,7 @@ export default function ResponseTemplatesPage({models, modelsFailed, refreshEpoc
                 <span className="field-hint">0–1000，最多 6 位小数；{templatePrice(variant.price_credits) === null ? '价格格式无效' : `${templatePrice(variant.price_credits)} microcredits${templatePrice(variant.price_credits) === 0 ? ' · 免费' : ' · 收费'}`}。成功或失败回执均免费。</span></label>
               <label className="field field-span"><span className="field-label">完整 HTML 代码</span><textarea className="template-code" rows={16} spellCheck={false} value={variant.content} onChange={event => updateVariant(index, {content: event.target.value})}/>
                 <span className="field-hint">完整代码可编辑，只作为文本保存；管理后台不会渲染或执行。UTF-8：{new TextEncoder().encode(variant.content).length} / 262144 字节。</span></label>
+              <label className="field"><span className="field-label">响应延迟（毫秒，0–30000）</span><input type="number" min="0" max="30000" step="1" value={variant.delay_ms ?? 0} onChange={event => updateVariant(index, {delay_ms: Number(event.target.value)})}/></label>
               <label className="field"><span className="field-label">前置消息</span><textarea value={variant.preamble} onChange={event => updateVariant(index, {preamble: event.target.value})}/></label>
               <label className="field"><span className="field-label">完成消息</span><textarea value={variant.completion} onChange={event => updateVariant(index, {completion: event.target.value})}/></label>
             </div>

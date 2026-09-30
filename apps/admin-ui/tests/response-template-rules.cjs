@@ -5,7 +5,7 @@ const plain = value => JSON.parse(JSON.stringify(value));
 function load(file, extra = {}) {
   const exports = {};
   const code = ts.transpileModule(fs.readFileSync(path.join(__dirname, '../src', file), 'utf8'), {compilerOptions: {module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022}}).outputText;
-  vm.runInNewContext(code, {exports, TextEncoder, crypto: require('node:crypto').webcrypto, Headers, AbortController, setTimeout, clearTimeout, ...extra});
+  vm.runInNewContext(code, {exports, require: name => {if (name === './pelicanTemplate') return load('pelicanTemplate.ts'); throw new Error('Unexpected import: ' + name);}, TextEncoder, crypto: require('node:crypto').webcrypto, Headers, AbortController, setTimeout, clearTimeout, ...extra});
   return exports;
 }
 const t = load('responseTemplates.ts');
@@ -45,7 +45,7 @@ rule=valid();rule.variants=Array.from({length:9},(_,i)=>({...rule.variants[0],mo
 rule=valid();rule.variants[0].preamble='中'.repeat(700000);assert.match(t.parseTemplateRules([rule]).error,/4096 字节/,'messages bounded before total');
 const first=valid(),second=valid();second.match_mode='contains';assert.deepEqual(plain(t.parseTemplateRules([second,first]).rules.map(x=>x.id)),[second.id,first.id]);
 assert.deepEqual(plain(t.templateModels([{id:'internal',exposed_model_id:'visible'},{id:'other',exposed_model_id:'visible'},{id:'not-client-visible'}])),[{id:'visible',label:'visible'}]);
-const example=t.pelicanTemplateRule();assert.equal(example.enabled,false);assert.equal(example.variants[0].price_credits,'0');assert.equal(example.variants[0].model_id,'');assert(example.variants[0].content.includes('鹈鹕'));
+const example=t.pelicanTemplateRule();assert.equal(example.enabled,false);assert.equal(example.variants[0].price_credits,'0');assert.equal(example.variants[0].model_id,'claude-opus-5-5');assert(example.variants[0].content.includes('鹈鹕'));
 console.log('PASS: template validation, UTF-8 limits, safe paths, exact microcredits, unique models and inert/disabled/free defaults');
 (async()=>{
   const calls=[];let status=200;
@@ -69,3 +69,7 @@ console.log('PASS: template validation, UTF-8 limits, safe paths, exact microcre
   assert.equal(calls.length,4,'conflicts are not automatically retried');
   console.log('PASS: response-template GET/POST reuse auth, CSRF, snake_case and typed conflict handling');
 })().catch(error=>{console.error(error);process.exitCode=1;});
+
+for (const delay of [-1, 30001, 0.1, Infinity, NaN]) {const d=valid();d.variants[0].delay_ms=delay;assert.ok(t.parseTemplateRules([d]).error);}
+const opusExample=t.pelicanTemplateRule();assert.equal(opusExample.variants[0].model_id,'claude-opus-5-5');assert.equal(opusExample.variants[0].delay_ms,1500);assert.ok(opusExample.variants[0].content.includes('<svg'));
+console.log('PASS: template delay bounds and embedded Opus 5.5 HTML');

@@ -485,7 +485,11 @@ pub fn validate_card(card: &str) -> Result<(), String> {
         Ok(())
     }
 }
+#[cfg(test)]
 fn validate_authorization(value: &Value, now: f64) -> Result<(), String> {
+    validate_card_query(value, now, false)
+}
+fn validate_card_query(value: &Value, now: f64, allow_expired: bool) -> Result<(), String> {
     // A card the gateway knows but that cannot be used says why, so the customer is
     // told to renew or to ask about the card instead of being sent to support.
     if value["success"] == true {
@@ -495,9 +499,10 @@ fn validate_authorization(value: &Value, now: f64) -> Result<(), String> {
         ) {
             return Err("[auth:access-denied] Card is frozen, banned or voided".into());
         }
-        if value["status"] == "expired"
-            || value["isExpired"] == true
-            || value["validUntil"].as_f64().is_some_and(|n| n <= now)
+        if !allow_expired
+            && (value["status"] == "expired"
+                || value["isExpired"] == true
+                || value["validUntil"].as_f64().is_some_and(|n| n <= now))
         {
             return Err("[auth:expired] Card has expired".into());
         }
@@ -509,15 +514,16 @@ fn validate_authorization(value: &Value, now: f64) -> Result<(), String> {
     };
     if value["success"] != true
         || !matches!(value["status"].as_str(), Some("active" | "unactivated"))
-        || value["isExpired"] != false
+            && !(allow_expired && value["status"] == "expired")
+        || !(value["isExpired"] == false || allow_expired && value["isExpired"] == true)
         || !["remainingPoints", "totalPoints", "maxDevices"]
             .iter()
             .all(|k| number(k))
         || !value["boundDevices"].is_array()
         || !(value["validUntil"].is_null()
-            || value["validUntil"]
-                .as_f64()
-                .is_some_and(|n| n > now && n <= 8640000000000.0))
+            || value["validUntil"].as_f64().is_some_and(|n| {
+                n.is_finite() && n >= 0.0 && (allow_expired || n > now) && n <= 8640000000000.0
+            }))
     {
         return Err("Card authorization invalid or expired".into());
     }
@@ -603,23 +609,51 @@ async fn verify_card(gateway: &str, card: &str) -> Result<Value, String> {
         .await
         .map_err(|_| "Invalid card response")?
     {
-        if bytes.len() + chunk.len() > 65536 {
+        if bytes.len() + chunk.len() > 4 * 1024 * 1024 {
             return Err("Card response too large".into());
         }
         bytes.extend_from_slice(&chunk);
     }
     let value: Value = serde_json::from_slice(&bytes).map_err(|_| "Invalid card response")?;
-    validate_authorization(
+    validate_card_query(
         &value,
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| "Invalid system clock")?
             .as_secs_f64(),
+        true,
     )?;
     Ok(
-        json!({"success":true,"authorization":select_fields(&value, &["virtualPlanName","remainingPoints","totalPoints","validUntil","isExpired","status","maxDevices"]),"gateway_url":gateway}),
+        json!({"success":true,"authorization":select_fields(&value, &["virtualPlanName","remainingPoints","totalPoints","validUntil","isExpired","status","maxDevices"]),"gateway_url":gateway,"cardUsage":usage_output(json!({"settledUsage":value["settledUsage"],"availableCredits":value["remainingPoints"],"virtualPlanName":value["virtualPlanName"],"validUntil":value["validUntil"],"isExpired":value["isExpired"],"usageBreakdownList":[{"dimensionType":"CREDIT","currentUsageWithPrecision":value["totalPoints"].as_f64().unwrap_or(0.0)-value["remainingPoints"].as_f64().unwrap_or(0.0),"usageLimitWithPrecision":value["totalPoints"]}]}))}),
     )
 }
+async fn portal_post(gateway: &str, path: &str, body: Value) -> Result<Value, String> {
+    let mut response = gateway_client(gateway)?
+        .post(format!("{gateway}/api/v1/portal/{path}"))
+        .json(&body)
+        .send()
+        .await
+        .map_err(network_error)?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Card renewal HTTP {}. Check the card and refresh balance before retrying.",
+            response.status().as_u16()
+        ));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(network_error)? {
+        if chunk.len() > 65536usize.saturating_sub(bytes.len()) {
+            return Err("Portal response too large".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| "Invalid portal response")?;
+    if value["success"] != true {
+        return Err("Portal request failed".into());
+    }
+    Ok(value)
+}
+
 // Dispatch only passes the host-configured gateway, never IPC input.
 async fn fetch_announcements(gateway: &str) -> Result<Value, String> {
     const MAX_BYTES: usize = 1024 * 1024;
@@ -705,6 +739,16 @@ fn announcements_output(value: Value, now: u64) -> Result<Value, String> {
     Ok(json!({"success":true,"announcements":announcements}))
 }
 
+fn usage_daily(rows: &Value) -> Value {
+    Value::Array(
+        rows.as_array()
+            .into_iter()
+            .flatten()
+            .map(|row| select_fields(row, &["date", "points", "tokens"]))
+            .collect(),
+    )
+}
+
 fn usage_output(usage: Value) -> Value {
     // Server-authoritative balance includes reservations. Preserve null/missing;
     // never reconstruct it from the display-only usage limit and consumed total.
@@ -732,6 +776,8 @@ fn usage_output(usage: Value) -> Value {
             &usage["settledUsage"],
             &[
                 "totalTokens",
+                "activatedAt",
+                "totalPoints",
                 "todayPoints",
                 "todayTokens",
                 "timezone",
@@ -744,15 +790,22 @@ fn usage_output(usage: Value) -> Value {
     };
     if settled.is_object() {
         if usage["settledUsage"].get("daily").is_some() {
-            settled["daily"] = select_rows(
-                &usage["settledUsage"]["daily"],
-                &["date", "points", "tokens"],
-            );
+            settled["daily"] = usage_daily(&usage["settledUsage"]["daily"]);
         }
         if usage["settledUsage"].get("models").is_some() {
-            settled["models"] = select_rows(
-                &usage["settledUsage"]["models"],
-                &["name", "points", "tokens"],
+            settled["models"] = Value::Array(
+                usage["settledUsage"]["models"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|model| {
+                        let mut safe = select_fields(model, &["name", "points", "tokens"]);
+                        if model.get("daily").is_some() {
+                            safe["daily"] = usage_daily(&model["daily"]);
+                        }
+                        safe
+                    })
+                    .collect(),
             );
         }
     }
@@ -841,6 +894,30 @@ pub async fn dispatch(host: &Host, path: &str, method: &str, body: Value) -> Res
                 body["card_key"].as_str().unwrap_or(""),
             )
             .await
+        }
+        ("POST", "/api/renew-card") => {
+            let gateway = gateway(body["gateway_url"].as_str())?;
+            let card = body["card_key"].as_str().unwrap_or("").trim();
+            let source = body["renewal_card"].as_str().unwrap_or("").trim();
+            validate_card(card)?;
+            validate_card(source)?;
+            if card == source {
+                return Err("Renewal requires a different unused card".into());
+            }
+            let challenge = portal_post(&gateway, "challenge", json!({"action":"topup"})).await?;
+            let token = challenge["challengeToken"]
+                .as_str()
+                .ok_or("Invalid challenge")?;
+            let result = portal_post(
+                &gateway,
+                "topup",
+                json!({"card":card,"topup_code":source,"renew_card":true,"challenge_token":token}),
+            )
+            .await?;
+            Ok(select_fields(
+                &result,
+                &["success", "addedPoints", "remainingPoints"],
+            ))
         }
         ("POST", "/api/activate") => {
             if host.recovery_pending() {
@@ -994,6 +1071,16 @@ mod tests {
             .starts_with("[auth:expired]"));
         value["remainingPoints"] = json!("1");
         assert!(validate_authorization(&value, 100.0).is_err());
+    }
+    #[test]
+    fn expired_cards_can_query_but_blocked_cards_cannot() {
+        let mut value = json!({"success":true,"status":"expired","isExpired":true,"remainingPoints":1,"totalPoints":2,"maxDevices":1,"boundDevices":[],"validUntil":50});
+        assert!(validate_card_query(&value, 100.0, true).is_ok());
+        assert!(validate_card_query(&value, 100.0, false).is_err());
+        for status in ["frozen", "banned", "voided"] {
+            value["status"] = json!(status);
+            assert!(validate_card_query(&value, 100.0, true).is_err());
+        }
     }
     #[test]
     fn external_urls_are_allowlisted() {
@@ -1460,7 +1547,17 @@ mod operation_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
     #[test]
-    fn usage_rows_are_bounded_without_changing_totals() {
+    fn usage_preserves_activation_and_sanitizes_model_days() {
+        let result = usage_output(
+            json!({"settledUsage":{"activatedAt":100,"totalPoints":2,"models":[{"name":"public","points":2,"daily":[{"date":"2026-09-30","points":2,"apiKey":"secret"}]}]}}),
+        );
+        assert_eq!(result["settledUsage"]["activatedAt"], 100);
+        assert_eq!(result["settledUsage"]["totalPoints"], 2);
+        assert_eq!(result["settledUsage"]["models"][0]["daily"][0]["points"], 2);
+        assert!(!result.to_string().contains("secret"));
+    }
+    #[test]
+    fn usage_preserves_history_beyond_ninety_days() {
         let rows: Vec<_> = (0..1000)
             .map(|i| json!({"date":i,"name":i,"tokens":1}))
             .collect();
@@ -1469,11 +1566,11 @@ mod operation_tests {
         assert_eq!(result["settledUsage"]["totalTokens"], 1000);
         assert_eq!(
             result["settledUsage"]["daily"].as_array().unwrap().len(),
-            90
+            1000
         );
         assert_eq!(
             result["settledUsage"]["models"].as_array().unwrap().len(),
-            90
+            1000
         );
     }
 }

@@ -123,7 +123,6 @@ select:focus-visible,.path-box:focus-visible{outline:2px solid #dfc291;outline-o
 .page-settings .path-box:focus{white-space:normal;max-height:none;overflow-wrap:anywhere}
 @media(max-height:600px){
  .login:has(input[aria-invalid="true"]) .wave{height:64px}
- .login-shell:has(.notice) .login .wave{height:24px;margin-bottom:10px}
  .shell:not(.login-shell){padding:12px 18px}
  .shell:not(.login-shell)>header{margin-bottom:6px;height:34px}
  .shell>nav{margin-bottom:6px}
@@ -218,7 +217,7 @@ header{gap:10px}
 header .website-button,header .announcements-trigger{height:34px;min-height:34px;padding:6px 11px;border:1px solid #d9dfd51c;border-radius:10px;background:#d9dfd508;color:#cdd5cd;font-size:12px;line-height:20px;white-space:nowrap}
 header .website-button:hover,header .announcements-trigger:hover{background:#d9dfd512;border-color:#d9dfd545;color:#f1f4ed}
 header .window-controls{margin-left:4px;gap:4px}
-nav{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}
+nav{display:grid;grid-template-columns:repeat(3,minmax(0,1fr))}
 .login-shell .page-login{padding-top:0}
 .login-shell .login .wave{height:clamp(76px,calc(100dvh - 360px),180px);margin:4px auto 22px}
 .content-scroll:has(.page-overview){display:flex;flex-direction:column}
@@ -232,7 +231,6 @@ nav{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}
 .page-overview .overview-dashboard>.full{flex-shrink:0}
 @media(max-height:600px){
  header{gap:8px}
- .login-shell:has(.notice) .login .wave{height:24px;margin:4px auto 10px}
  .page-overview .overview-dashboard>.wave{flex:0;min-height:18px;height:18px;margin:0}
  .page-overview .overview-dashboard>.balance{padding:0}
  .page-overview .overview-dashboard>.full{display:block;width:100%;margin:4px 0}
@@ -271,8 +269,6 @@ nav{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}
 @media(max-height:600px){.page-settings .memory-card{padding:10px 12px}.memory-visual{grid-template-columns:120px minmax(0,1fr);gap:16px;min-height:136px;padding:6px 0}.memory-ring{width:120px}.memory-ring-label strong{font-size:20px}.memory-footer{padding-top:6px}.memory-controls{gap:6px}}
 @media(prefers-reduced-motion:reduce){.memory-ring-app{transition:none}}
 
-@media(min-height:601px){.content-scroll:has(>.notice) .page-settings>section>.row:first-child{display:none}}
-.content-scroll:has(>.notice) .page-settings .memory-card{padding-top:10px;padding-bottom:10px}
 
 /* Keep focused controls clear of fractional-pixel scrollport clipping. */
 .content-scroll{scroll-padding-block:4px}
@@ -300,3 +296,18 @@ header .update-offer:hover{border-color:#9fd3b0aa;color:#f1f4ed}
 .update-stat{font-size:32px;font-weight:600;letter-spacing:.5px;color:#eef3ec}
 .update-spinner{width:34px;height:34px;border:3px solid #bed5c740;border-top-color:#e3dfcf;border-radius:50%;animation:pending-spin .8s linear infinite}
 @media (prefers-reduced-motion:reduce){.update-bar-fill.sliding{animation:none;width:100%!important}.update-spinner{animation-duration:2s}}
+.usage-panel table{width:100%;border-collapse:collapse;table-layout:fixed;font-size:13px}
+.usage-panel th,.usage-panel td{padding:9px 0;border-bottom:1px solid #ffffff18;text-align:left;overflow-wrap:anywhere}
+.usage-panel th:last-child,.usage-panel td:last-child{text-align:right;width:38%;font-variant-numeric:tabular-nums}
+.usage-panel h2{font-size:15px;margin:20px 0 10px}
+.usage-totals{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:14px 0;border-block:1px solid #ffffff20}
+.usage-totals span{font-size:12px;color:#a8b1ab}
+.usage-totals strong{display:block;font-size:20px;margin-top:8px;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
+.usage-totals small{font-size:12px;font-weight:400}
+.usage-daily-heading{gap:12px;flex-wrap:wrap;margin-top:10px}
+.usage-daily-heading select{max-width:220px;min-width:0}
+.usage-pagination{margin-top:12px;font-size:12px}
+
+
+.shell .toast,.shell:has(>nav) .toast{top:auto;bottom:10px;left:16px;right:16px;max-height:100px;overflow:auto}
+.app-version{margin-top:12px;color:var(--muted);font-size:12px;text-align:center}

@@ -31,6 +31,7 @@ pub mod profiles;
 pub mod provider_import;
 mod response_templates;
 pub mod response_templates_admin;
+pub mod runtime_settings_admin;
 pub mod spec_analysis;
 pub mod subscriptions;
 pub mod usage;
@@ -357,6 +358,16 @@ impl FacadeRegistry {
                 publish: false,
             })
             .register(commercial::CommercialHandler {
+                billing: billing.clone(),
+                auth: auth.clone(),
+                publish: true,
+            })
+            .register(runtime_settings_admin::RuntimeSettingsHandler {
+                billing: billing.clone(),
+                auth: auth.clone(),
+                publish: false,
+            })
+            .register(runtime_settings_admin::RuntimeSettingsHandler {
                 billing: billing.clone(),
                 auth: auth.clone(),
                 publish: true,

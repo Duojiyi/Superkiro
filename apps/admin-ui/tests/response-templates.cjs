@@ -62,7 +62,7 @@ const server = http.createServer(async (req, res) => {
     await button('添加鹈鹕示例（停用、免费）').click();
     assert.equal(await page.getByRole('switch',{name:'启用规则'}).getAttribute('aria-checked'),'false');
     assert.equal(await variant(1).getByLabel(/^固定服务费/).inputValue(),'0');
-    assert.equal(await variant(1).getByLabel(/^商业模型/).inputValue(),'');
+    assert.equal(await variant(1).getByLabel(/^商业模型/).inputValue(),'claude-opus-5-5');
     await page.getByRole('switch',{name:'启用规则'}).click();
     await variant(1).getByLabel(/^商业模型/).selectOption('gpt-5');
     const code='<!doctype html><script>document.documentElement.dataset.templateExecuted="yes"</script><h1>opaque template</h1>';

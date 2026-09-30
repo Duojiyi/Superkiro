@@ -131,6 +131,7 @@ pub struct PortalQueryRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PortalQueryResponse {
+    pub settled_usage: Option<billing::settled_usage::SettledUsage>,
     pub success: bool,
     pub card_id: String,
     pub status: String,
@@ -199,6 +200,8 @@ pub struct PortalUnbindResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PortalTopupRequest {
+    #[serde(default)]
+    pub renew_card: bool,
     pub card: String,
     pub topup_code: String,
     #[serde(alias = "challengeToken")]
@@ -276,6 +279,7 @@ impl FacadeHandler for PortalQueryHandler {
                 .to_string();
 
             let resp = PortalQueryResponse {
+                settled_usage: self.billing.settled_usage(&card.id, now),
                 success: true,
                 card_id: card.id.clone(),
                 status: match card.status {
@@ -717,29 +721,31 @@ impl FacadeHandler for PortalTopupHandler {
             };
 
             let now = now_secs();
-            let entry =
-                match self
-                    .billing
+            let entry = match if req_data.renew_card {
+                self.billing
+                    .renew_with_card(&card.id, &req_data.topup_code, now)
+            } else {
+                self.billing
                     .redeem_topup(&card.id, &req_data.topup_code, now, "web-portal")
-                {
-                    Ok(e) => e,
-                    Err(e) => {
-                        let _ = self.protector.record_failure(&ip, now);
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            [(header::CONTENT_TYPE, "application/json")],
-                            axum::Json(serde_json::json!({
-                                "success": false,
-                                "error": if e == BillingError::InvalidOrRedeemedTopupCode {
-                                    e.to_string()
-                                } else {
-                                    "Topup failed".to_string()
-                                },
-                            })),
-                        )
-                            .into_response();
-                    }
-                };
+            } {
+                Ok(e) => e,
+                Err(e) => {
+                    let _ = self.protector.record_failure(&ip, now);
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        axum::Json(serde_json::json!({
+                            "success": false,
+                            "error": if e == BillingError::InvalidOrRedeemedTopupCode {
+                                e.to_string()
+                            } else {
+                                "Topup failed".to_string()
+                            },
+                        })),
+                    )
+                        .into_response();
+                }
+            };
 
             // Success resets consecutive failure counter
             self.protector.record_success(&ip);

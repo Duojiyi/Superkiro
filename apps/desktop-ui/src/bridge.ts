@@ -3,7 +3,7 @@ import { ClientError, toClientError } from './errors';
 export interface Authorization { virtualPlanName?: string; remainingPoints?: number; totalPoints?: number; validUntil?: number; isExpired?: boolean; status?: string }
 export const MINIMUM_KIRO_VERSION = '1.1.14';
 export interface Status { kiro_compatible?: boolean; minimum_kiro_version?: typeof MINIMUM_KIRO_VERSION; gateway_url?: string; authenticated?: boolean; has_snapshot?: boolean; recovery_pending?: boolean; recovery_blocked?: 'reinstall_kiro' | null; kiro_installed?: boolean; kiro_version?: string; kiro_install_path?: string; process_state?: string; model_service_available?: boolean | null; portal_url?: string; platform?: string; app_version?: string; authorization?: Authorization; tray_available?: boolean; memory_maintenance?: Maintenance }
-export interface Usage { usage?: { availableCredits?:number|null; usageBreakdownList?: {dimensionType: string; currentUsageWithPrecision: number; usageLimitWithPrecision: number}[]; virtualPlanName?: string; validUntil?: number; isExpired?: boolean }; settledUsage?: {windowStart?: string|number; windowEnd?: string|number; timezone?: string; totalTokens?: number; todayPoints?: number; todayTokens?: number; referencePrice?: number; daily?: {date: string; points?: number; tokens?: number; usd?: number}[]; models?: {name: string; tokens?: number; points?: number}[]} }
+export interface Usage { usage?: { availableCredits?:number|null; usageBreakdownList?: {dimensionType: string; currentUsageWithPrecision: number; usageLimitWithPrecision: number}[]; virtualPlanName?: string; validUntil?: number; isExpired?: boolean }; settledUsage?: {activatedAt?: number|null; totalPoints?: number; windowStart?: string|number; windowEnd?: string|number; timezone?: string; totalTokens?: number; todayPoints?: number; todayTokens?: number; referencePrice?: number; daily?: {date: string; points?: number; tokens?: number; usd?: number}[]; models?: {name: string; tokens?: number; points?: number; daily?: {date:string; points?:number}[]}[]} }
 export interface Memory { total_memory_mb?: number; total_process_count?: number; ide_memory_mb?: number; agent_memory_mb?: number; success_count?: number; failed_count?: number }
 export const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0;
 export const number = (v: unknown) => finite(v) ? v.toLocaleString('zh-CN', {maximumFractionDigits: 1}) : '—';
@@ -104,4 +104,3 @@ export function maintenanceText(value: Maintenance | undefined) {
 }
 
 export const recoveryPending = (s: Status) => !configured(s) && (s.recovery_pending === true || s.has_snapshot === true);
-

@@ -60,16 +60,17 @@ export function useUpdater(blocked: boolean, onUpdated: (version: string) => voi
   const confirmed = useRef(false);
   const updatedLatest = useRef(onUpdated);
   updatedLatest.current = onUpdated;
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (manual = false) => {
     try {
       const result = parseCheck(await native('update_check'));
-      if (!result) return;
+      if (!result) throw new Error("Invalid update response");
       setCheck(result);
       if (result.updated && result.current && !notified.current) {
         notified.current = true;
         updatedLatest.current(result.current);
       }
-    } catch { /* A failed check changes nothing; the next one tries again. */ }
+      return result;
+    } catch (error) { if (manual) throw error; }
   }, []);
   useEffect(() => {
     void refresh();
@@ -149,6 +150,7 @@ export function useUpdater(blocked: boolean, onUpdated: (version: string) => voi
   const retry = useCallback(() => { networkRetries.current = 0; void install(); }, [install]);
   const available = check?.state === 'available' ? check : null;
   return {
+    checkNow: () => refresh(true),
     check, phase, progress, error, install, retry, dismiss, start, confirm, postponed, resumed, autoRetry, mandatory,
     /** An update the customer can start from the header: an optional one, or a mandatory one
      * that was put off. */

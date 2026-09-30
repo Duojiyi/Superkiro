@@ -208,6 +208,11 @@ fn charge_error(error: BillingError) -> Response {
             "InternalServerException",
             "模板扣费未能持久保存，本次未发送写入指令。",
         ),
+        BillingError::ConcurrencyLimitExceeded { .. } => error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "ThrottlingException",
+            "模板请求超过卡并发限制，本次未执行且未扣费。",
+        ),
         BillingError::DuplicateInvocation(_) => error_response(
             StatusCode::CONFLICT,
             "InvocationAlreadyCompletedException",
@@ -278,7 +283,7 @@ pub(super) fn replay_receipt(
 
 /// None preserves the ordinary model pipeline. A matched but unsupported tool request
 /// returns a clear, free refusal instead of silently charging a model fallback.
-pub(super) fn respond(
+pub(super) async fn respond(
     billing: &BillingEngine,
     request: &GenerateAssistantResponseRequest,
     card_id: &str,
@@ -371,6 +376,13 @@ pub(super) fn respond(
     }
     let config = billing.response_template_config();
     let (rule, variant) = matching_variant(&config.rules, &user.content, model)?;
+    if variant.content.trim().is_empty() {
+        return Some(error_response(
+            StatusCode::BAD_REQUEST,
+            "ValidationException",
+            "命中的历史模板内容为空，请联系管理员修正；本次未调用上游或扣费。",
+        ));
+    }
     let tools = context.map(|ctx| ctx.tools.as_slice()).unwrap_or_default();
     let Some((tool_name, input)) = file_tool(tools, &variant.file_path, &variant.content) else {
         return Some(error_response(
@@ -390,7 +402,12 @@ pub(super) fn respond(
             .map(|b| format!("{b:02x}"))
             .collect::<String>()
     );
-    let text = format!("[固定模板服务，非模型实时生成；不调用上游，token 用量为 0；本次写入指令收费 {:.6} 积分，回执不重复收费]\n{}\n准备向客户端发送 {} 的文件写入指令，尚未确认文件已创建。", variant.price_microcredits as f64 / 1_000_000.0, variant.preamble, variant.file_path);
+    let text = format!(
+        "[固定模板服务，非模型实时生成；不调用上游，token 用量为 0；本次写入指令收费 {:.6} 积分，回执不重复收费]\n{}\n准备向客户端发送 {} 的文件写入指令，尚未确认文件已创建。",
+        variant.price_microcredits as f64 / 1_000_000.0,
+        variant.preamble,
+        variant.file_path
+    );
     // Encode everything before the durable debit; even a response construction error is free.
     let bytes = match frames(
         &state.conversation_id,
@@ -402,6 +419,24 @@ pub(super) fn respond(
         Ok(bytes) => bytes,
         Err(_) => return Some(encoding_error()),
     };
+    // This process-local slot shares the card limit with ordinary reservations.
+    // Keep it alive through the final debit; cancellation releases it without billing.
+    let _wait_slot = match billing.begin_response_template_wait(
+        &config.revision,
+        &rule.id,
+        model,
+        card_id,
+        invocation_id,
+        crate::now_secs(),
+    ) {
+        Ok(slot) => slot,
+        Err(error) => return Some(charge_error(error)),
+    };
+    // Waiting is cancellable and precedes the durable debit. Invalid tool schemas never wait.
+    if variant.delay_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(variant.delay_ms as u64)).await;
+    }
+    let now = crate::now_secs();
     let receipt = ResponseTemplateReceipt {
         tool_use_id: tool_id,
         invocation_id: invocation_id.into(),
@@ -452,6 +487,7 @@ mod tests {
     use kiro_wire::requests::tool::ToolSpecification;
     fn variant(model: &str) -> ResponseTemplateVariant {
         ResponseTemplateVariant {
+            delay_ms: 0,
             model_id: model.into(),
             file_path: "index.html".into(),
             content: format!("<svg>{model}</svg>"),

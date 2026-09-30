@@ -42,6 +42,33 @@ pub struct UpstreamLimits {
 }
 
 impl UpstreamLimits {
+    /// Apply the operator's persisted timeout profile to a new request. Active requests keep their snapshot.
+    pub fn with_runtime_settings(
+        mut self,
+        settings: &billing::engine::RuntimeSettings,
+        model: &str,
+        effort: Option<kiro_wire::requests::conversation::ReasoningEffort>,
+    ) -> Self {
+        let family = super::family::family(model);
+        let p = if matches!(
+            family.reasoning,
+            super::family::Reasoning::Adaptive { .. } | super::family::Reasoning::Budget
+        ) {
+            &settings.claude
+        } else if family.reasons(effort) {
+            &settings.reasoning
+        } else {
+            &settings.standard
+        };
+        self.headers = Duration::from_secs(p.headers_secs);
+        self.attempt = Duration::from_secs(p.attempt_secs);
+        self.total = Duration::from_secs(p.total_secs);
+        self.commit = Duration::from_secs(p.commit_secs);
+        self.started = Duration::from_secs(p.started_secs);
+        self.idle = Duration::from_secs(p.idle_secs);
+        self
+    }
+
     const STANDARD: Self = Self {
         headers: Duration::from_secs(15),
         attempt: Duration::from_secs(65),
@@ -67,7 +94,7 @@ impl UpstreamLimits {
         WatchdogConfig {
             ttfb_timeout: self.attempt,
             idle_timeout: self.idle,
-            ..WatchdogConfig::default()
+            hard_timeout: self.started,
         }
     }
 
@@ -140,6 +167,7 @@ pub struct Route {
     deadline: std::sync::Mutex<tokio::time::Instant>,
     /// Limits for every attempt in place of each target model's own, when set.
     limits: Option<UpstreamLimits>,
+    settings: Option<billing::engine::RuntimeSettings>,
     /// Whether the request's prompt may be read again soon, which a prompt-cache write pays
     /// for.
     read_again: std::sync::atomic::AtomicBool,
@@ -151,6 +179,20 @@ impl Route {
         std::sync::Arc::new(Self {
             deadline: std::sync::Mutex::new(tokio::time::Instant::now() + total),
             limits: None,
+            settings: None,
+            read_again: true.into(),
+        })
+    }
+
+    /// Freeze persisted settings for this request, including any fallback attempts.
+    pub fn with_settings(
+        total: Duration,
+        settings: billing::engine::RuntimeSettings,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            deadline: std::sync::Mutex::new(tokio::time::Instant::now() + total),
+            limits: None,
+            settings: Some(settings),
             read_again: true.into(),
         })
     }
@@ -160,6 +202,7 @@ impl Route {
         std::sync::Arc::new(Self {
             deadline: std::sync::Mutex::new(tokio::time::Instant::now() + limits.total),
             limits: Some(limits),
+            settings: None,
             read_again: true.into(),
         })
     }
@@ -185,14 +228,30 @@ impl Route {
 
     /// The limits an attempt of `request` keeps.
     pub(crate) fn limits_for(&self, request: &ChatRequest) -> UpstreamLimits {
-        self.limits
-            .unwrap_or_else(|| UpstreamLimits::for_request(request))
+        self.limits.unwrap_or_else(|| {
+            let defaults = UpstreamLimits::for_request(request);
+            self.settings.as_ref().map_or(defaults, |settings| {
+                defaults.with_runtime_settings(settings, &request.model, request.reasoning_effort)
+            })
+        })
     }
 
     /// The limits an attempt of `request` keeps on an upstream of `format`.
-    fn limits_on(&self, request: &ChatRequest, format: &str) -> UpstreamLimits {
-        self.limits
-            .unwrap_or_else(|| UpstreamLimits::for_provider(request, format))
+    pub(crate) fn limits_on(&self, request: &ChatRequest, format: &str) -> UpstreamLimits {
+        self.limits.unwrap_or_else(|| {
+            if let Some(settings) = &self.settings {
+                let mut limits = self.limits_for(request);
+                if format == "openai"
+                    && super::family::family(&request.model).reasons(request.reasoning_effort)
+                {
+                    limits.idle = Duration::from_secs(settings.openai_reasoning_idle_secs)
+                        .min(limits.started);
+                }
+                limits
+            } else {
+                UpstreamLimits::for_provider(request, format)
+            }
+        })
     }
 
     pub(crate) fn deadline(&self) -> tokio::time::Instant {
@@ -603,6 +662,30 @@ mod tests {
             })
         }
     }
+    #[tokio::test]
+    async fn runtime_snapshot_reaches_fallback_and_format_specific_watchdogs() {
+        let mut settings = billing::engine::RuntimeSettings::default();
+        settings.claude.headers_secs = 120;
+        settings.claude.attempt_secs = 240;
+        settings.claude.started_secs = 1200;
+        settings.openai_reasoning_idle_secs = 400;
+        let route = Route::with_settings(Duration::from_secs(300), settings.clone());
+        settings.claude.headers_secs = 90; // subsequent publications cannot mutate the route
+        assert_eq!(settings.claude.headers_secs, 90);
+        let mut req = request();
+        req.model = "claude-opus-5-5".into();
+        let anthropic = route.limits_on(&req, "anthropic");
+        assert_eq!(anthropic.headers, Duration::from_secs(120));
+        assert_eq!(anthropic.idle, Duration::from_secs(180));
+        assert_eq!(anthropic.watchdog().hard_timeout, Duration::from_secs(1200));
+        assert_eq!(
+            route.limits_on(&req, "openai").idle,
+            Duration::from_secs(400)
+        );
+        req.model = "test".into();
+        assert_eq!(route.limits_for(&req).headers, Duration::from_secs(15));
+    }
+
     fn request() -> ChatRequest {
         ChatRequest {
             model: "test".into(),

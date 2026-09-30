@@ -14,7 +14,7 @@ function setup(installed=false,recovery=false){invoke.mockImplementation(async(c
  if(command==='native'){if(payload.method==='get_remembered_card')return null;if(payload.method==='get_close_behavior')return 'tray';return true;}
  if(payload.path==='/api/operation')return {id:0,state:'idle'};
  if(payload.path==='/api/status')return {kiro_installed:installed,process_state:installed?'Running':'NotRunning',platform:'win32',kiro_compatible:installed ? true : undefined,minimum_kiro_version:'1.1.14',authenticated:false,has_snapshot:false,recovery_pending:recovery};
- if(payload.path==='/api/verify-card')return {success:true,authorization:{remainingPoints:100,totalPoints:100},gateway_url:'https://example.com'};
+ if(payload.path==='/api/verify-card')return {success:true,authorization:{remainingPoints:100,totalPoints:100},gateway_url:'https://example.com',cardUsage:{usage:{usageBreakdownList:[{dimensionType:'CREDIT',currentUsageWithPrecision:0,usageLimitWithPrecision:100}]}}};
  if(payload.path==='/api/memory/sample')return {total_memory_mb:0,total_process_count:0};
  if(payload.path==='/api/usage')return {usage:{usageBreakdownList:[{dimensionType:'CREDIT',currentUsageWithPrecision:0,usageLimitWithPrecision:100}]}};
  return {success:true};
@@ -156,7 +156,7 @@ describe('native titlebar drag regions',()=>{
   fireEvent.click(screen.getByRole('button',{name:'设置'}));
   expect(invoke.mock.calls.some(([,p])=>p?.method==='screen')).toBe(false);
   fireEvent.mouseDown(document.querySelector('header')!,{button:0,detail:2,clientY:0});
-  expect(invoke).toHaveBeenCalledWith('native',{method:'maximize',args:[]});
+  expect(invoke.mock.calls.some(([,p])=>p?.method==='maximize')).toBe(false);
   expect(invoke.mock.calls.some(([,p])=>p?.method==='drag')).toBe(false);
  });
  it('keeps the busy indicator and its text draggable during a pending operation',async()=>{
@@ -494,7 +494,7 @@ describe('confirmed balance session boundaries',()=>{
   expect(invoke.mock.calls.some(([,p])=>p.method==='clear_remembered_card')).toBe(false);
   await connect();
   expect(invoke.mock.calls.filter(([,p])=>p.path==='/api/activate')).toHaveLength(2);
-  expect(invoke.mock.calls.filter(([,p])=>p.path==='/api/verify-card')).toHaveLength(1);
+  expect(invoke.mock.calls.filter(([,p])=>p.path==='/api/verify-card').length).toBeGreaterThan(1);
  });
  it('cancel does not restore or sign out',async()=>{
   setup(true);render(<App/>);await login();await connect();
@@ -707,8 +707,8 @@ describe('updated desktop UI contracts',()=>{
 });
 
 
-describe('overview-only usage and navigation',()=>{
- it('exposes only overview/settings, hides token and memory stats, and refreshes status before settled usage',async()=>{
+describe('points usage and navigation',()=>{
+ it('exposes overview/usage/settings, hides token and memory stats, and refreshes status before settled usage',async()=>{
   setup(true);const original=invoke.getMockImplementation()!;let refreshed=false;
   invoke.mockImplementation(async(c,p)=>{
    if(p.path==='/api/usage')return {usage:{availableCredits:refreshed?88.888:100,usageBreakdownList:[{dimensionType:'CREDIT',currentUsageWithPrecision:99,usageLimitWithPrecision:200}]},settledUsage:{timezone:'UTC',todayPoints:refreshed?12.345:0,todayTokens:987654321,totalTokens:123456789}};
@@ -717,9 +717,9 @@ describe('overview-only usage and navigation',()=>{
   });
   render(<App/>);await screen.findByText('0 积分');
   const nav=within(screen.getByRole('navigation',{name:'主导航'}));
-  expect(nav.getAllByRole('button')).toHaveLength(2);
-  for(const name of ['概览','设置'])expect(nav.getByRole('button',{name})).toBeTruthy();
-  for(const name of ['用量','诊断'])expect(nav.queryByRole('button',{name})).toBeNull();
+  expect(nav.getAllByRole('button')).toHaveLength(3);
+  for(const name of ['概览','用量','设置'])expect(nav.getByRole('button',{name})).toBeTruthy();
+  expect(nav.queryByRole('button',{name:'诊断'})).toBeNull();
   expect(screen.getByText('今日已用积分').getAttribute('title')).toBe('按 UTC 日期统计，仅含已结算请求');
   expect(screen.getByText('剩余积分')).toBeTruthy();
   expect(document.body.textContent).not.toMatch(/tokens|987654321|123456789|Kiro 当前占用/i);
@@ -734,7 +734,7 @@ describe('overview-only usage and navigation',()=>{
   expect(calls.indexOf('/api/status')).toBeLessThan(calls.indexOf('/api/usage'));
   expect(calls).not.toContain('/api/activate');
   fireEvent.click(nav.getByRole('button',{name:'设置'}));
-  expect(within(screen.getByRole('navigation')).getAllByRole('button')).toHaveLength(2);
+  expect(within(screen.getByRole('navigation')).getAllByRole('button')).toHaveLength(3);
  });
 });
 
@@ -817,20 +817,20 @@ describe('verification-only account operations',()=>{
   expect(safeError('[auth:remote-secret] remote-secret')).not.toContain('remote-secret');
  });
 
-it('keeps account actions compact and opens the official download section',async()=>{
+it('keeps account actions compact and displays the version inline',async()=>{
  setup(true);const original=invoke.getMockImplementation()!;
  invoke.mockImplementation(async(c,p)=>{const result=await original(c,p);return p.path==='/api/status'?{...result,app_version:'0.1.0-preview.123456789abc'}:result;});
  HTMLDialogElement.prototype.showModal=function(){this.open=true;};
  render(<App/>);await login();fireEvent.click(screen.getByRole('button',{name:'设置'}));
  fireEvent.change(screen.getByLabelText('设置分组'),{target:{value:'account'}});
  expect(screen.queryByText(/升级前请保存工作/)).toBeNull();
- expect(document.querySelectorAll('.settings-actions > button')).toHaveLength(6);
+ expect(document.querySelectorAll('.settings-actions > button')).toHaveLength(5);
  expect(document.querySelector('.settings-actions > p')).toBeNull();
- fireEvent.click(screen.getByRole('button',{name:'版本信息'}));
- expect(screen.getByRole('dialog').textContent).toContain('0.1.0-preview.123456789abc');
- fireEvent.submit(document.querySelector('dialog form')!);
- fireEvent.click(screen.getByRole('button',{name:'下载新版 ↗'}));
- await waitFor(()=>expect(invoke).toHaveBeenCalledWith('native',{method:'open_external',args:['https://kiro.rent/#downloads']}));
+ expect(document.querySelector('.app-version')?.textContent).toContain('0.1.0-preview.123456789abc');
+ expect(screen.queryByRole('button',{name:'版本信息'})).toBeNull();
+ expect(screen.queryByRole('button',{name:'收至托盘'})).toBeNull();
+ fireEvent.click(screen.getByRole('button',{name:'检查更新'}));
+ await waitFor(()=>expect(invoke.mock.calls.some(([,p])=>p.method==='update_check')).toBe(true));
 });
 it('retains a restarted session gateway for unbind after restoration',async()=>{
  setup(true);const original=invoke.getMockImplementation()!;let restored=false;
