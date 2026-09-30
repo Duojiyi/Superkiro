@@ -1,0 +1,90 @@
+{
+  "groups": [
+    [
+      "创建",
+      "生成",
+      "制作",
+      "绘制",
+      "画一个",
+      "画一只",
+      "画只",
+      "做一个",
+      "做个",
+      "create",
+      "build",
+      "make",
+      "draw"
+    ],
+    [
+      "鹈鹕骑",
+      "鹈鹕在骑",
+      "鹈鹕正在骑",
+      "鵜鶘騎",
+      "鹈鹕蹬",
+      "骑自行车的鹈鹕",
+      "骑着自行车的鹈鹕",
+      "骑单车的鹈鹕",
+      "骑着单车的鹈鹕",
+      "骑脚踏车的鹈鹕",
+      "骑着脚踏车的鹈鹕",
+      "騎自行車的鵜鶘",
+      "pelican riding",
+      "pelican is riding",
+      "pelican on a bicycle",
+      "pelican on a bike",
+      "pelican cycling",
+      "cycling pelican",
+      "pelican pedals",
+      "pelican pedaling",
+      "pelican that rides",
+      "pelican rides"
+    ],
+    [
+      "自行车",
+      "单车",
+      "脚踏车",
+      "腳踏車",
+      "bicycle",
+      "bike",
+      "cycling"
+    ],
+    [
+      "html",
+      "svg",
+      "网页",
+      "webpage"
+    ],
+    [
+      "动画",
+      "动效",
+      "動畫",
+      "animation",
+      "animated"
+    ]
+  ],
+  "exclude": [
+    "老虎",
+    "骑虎",
+    "熊猫",
+    "人类",
+    "猴子",
+    "男孩",
+    "女孩",
+    "男人",
+    "女人",
+    "汽车",
+    "摩托",
+    "tiger",
+    "panda",
+    "monkey",
+    "boy",
+    "girl",
+    "man",
+    "woman",
+    "motorcycle",
+    "python",
+    "react",
+    "three.js",
+    "canvas"
+  ]
+}

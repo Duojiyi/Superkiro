@@ -372,6 +372,9 @@ impl FacadeRegistry {
                 auth: auth.clone(),
                 publish: true,
             })
+            .register(response_templates_admin::ResponseTemplatePreviewHandler {
+                auth: auth.clone(),
+            })
             .register(response_templates_admin::ResponseTemplatesHandler {
                 billing: billing.clone(),
                 auth: auth.clone(),

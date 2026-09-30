@@ -75,3 +75,69 @@ impl FacadeHandler for ResponseTemplatesHandler {
         })
     }
 }
+
+/// Read-only preview of the draft, using exactly the production matcher. No debit or upstream.
+pub struct ResponseTemplatePreviewHandler {
+    pub auth: Arc<AdminAuthState>,
+}
+impl FacadeHandler for ResponseTemplatePreviewHandler {
+    fn method(&self) -> Method {
+        Method::POST
+    }
+    fn path(&self) -> &'static str {
+        "/api/v1/admin/response-templates/preview"
+    }
+    fn handle<'a>(&'a self, req: Request<Body>) -> BoxFuture<'a, Response> {
+        Box::pin(async move {
+            use billing::engine::{
+                preview_template_match, validate_response_template_rules, ResponseTemplateRule,
+            };
+            use serde::Deserialize;
+            use serde_json::json;
+            if !self.auth.verify(req.headers()) {
+                return json_response(
+                    StatusCode::UNAUTHORIZED,
+                    &json!({"success":false,"error":"Unauthorized"}),
+                );
+            }
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Preview {
+                rules: Vec<ResponseTemplateRule>,
+                prompt: String,
+                model: String,
+            }
+            let parsed = match axum::body::to_bytes(req.into_body(), 3 * 1024 * 1024).await {
+                Ok(bytes) => serde_json::from_slice::<Preview>(&bytes).ok(),
+                Err(_) => None,
+            };
+            let Some(p) = parsed else {
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"success":false,"error":"Invalid preview body"}),
+                );
+            };
+            if p.prompt.len() > 65_536 || p.model.len() > 128 {
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"success":false,"error":"Preview input too long"}),
+                );
+            }
+            if let Err(e) = validate_response_template_rules(&p.rules) {
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"success":false,"error":e.to_string()}),
+                );
+            }
+            let matches: Vec<_> = p.rules.iter().map(|r| json!({"rule_id":r.id,"name":r.name,"result":preview_template_match(r, &p.prompt, &p.model)})).collect();
+            let winner = matches
+                .iter()
+                .find(|m| m["result"]["matched"] == true)
+                .map(|m| m["rule_id"].clone());
+            json_response(
+                StatusCode::OK,
+                &json!({"success":true,"winner":winner,"matches":matches}),
+            )
+        })
+    }
+}

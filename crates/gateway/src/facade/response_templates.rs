@@ -1,5 +1,6 @@
 //! Opt-in, disclosed local file templates. No provider request or fabricated token usage.
 use super::{error_response, Response};
+use axum::body::{Body, Bytes};
 use axum::{
     http::{header, StatusCode},
     response::IntoResponse,
@@ -8,6 +9,7 @@ use billing::engine::{
     BillingEngine, BillingError, ResponseTemplateReceipt, ResponseTemplateRule,
     ResponseTemplateVariant,
 };
+use futures_util::StreamExt;
 use kiro_wire::{
     encoder::encode_event,
     events::{AssistantResponseEvent, MetadataEvent, TokenUsage, ToolUseEvent},
@@ -15,6 +17,80 @@ use kiro_wire::{
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{json, Value};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
+#[derive(Clone)]
+struct DeliveryCommitted(Arc<AtomicBool>);
+
+/// The HTTP headers are not completion. Keep both guards alive until the body
+/// completes or is cancelled. A debit has its own durable replay record.
+pub(super) fn protect_response(
+    response: Response,
+    guard: crate::idempotency::IdempotencyGuard,
+    capacity: crate::guardrail::CapacityPermit,
+    model: String,
+) -> Response {
+    if !response.status().is_success() {
+        return response;
+    }
+    let committed = response.extensions().get::<DeliveryCommitted>().cloned();
+    let (parts, body) = response.into_parts();
+    let state = (
+        body.into_data_stream(),
+        Some(guard),
+        capacity,
+        model,
+        committed,
+    );
+    let stream = futures_util::stream::unfold(
+        state,
+        |(mut body, mut guard, capacity, model, committed)| async move {
+            match body.next().await {
+                Some(chunk) => Some((chunk, (body, guard, capacity, model, committed))),
+                None => {
+                    if committed
+                        .as_ref()
+                        .is_none_or(|c| c.0.load(Ordering::Acquire))
+                    {
+                        if let Some(g) = guard.take() {
+                            g.commit(crate::idempotency::CompletedInvocation {
+                                completed_at: std::time::Instant::now(),
+                                model_id: model,
+                                total_input_tokens: 0,
+                                total_output_tokens: 0,
+                            });
+                        }
+                    }
+                    None
+                }
+            }
+        },
+    );
+    Response::from_parts(parts, Body::from_stream(stream))
+}
+
+fn render_message(text: &str, path: &str, price: i64) -> String {
+    // Only named text substitutions, never expressions or recursive templates.
+    text.split("{file_path}")
+        .map(|s| s.replace("{price}", &format!("{:.6}", price as f64 / 1_000_000.0)))
+        .collect::<Vec<_>>()
+        .join(path)
+}
+fn random_delay(min: u32, max: u32) -> Result<u32, ring::error::Unspecified> {
+    let width = u64::from(max - min) + 1;
+    let limit = (u64::from(u32::MAX) + 1) / width * width;
+    loop {
+        let mut b = [0u8; 4];
+        SystemRandom::new().fill(&mut b)?;
+        let n = u64::from(u32::from_le_bytes(b));
+        if n < limit {
+            return Ok(min + (n % width) as u32);
+        }
+    }
+}
 
 /// Only the current user turn can match; historical prompts and tool output cannot retrigger it.
 fn matching_variant<'a>(
@@ -22,17 +98,8 @@ fn matching_variant<'a>(
     prompt: &str,
     model: &str,
 ) -> Option<(&'a ResponseTemplateRule, &'a ResponseTemplateVariant)> {
-    let prompt = prompt.trim();
-    if prompt.is_empty() {
-        return None;
-    }
-    rules.iter().filter(|rule| rule.enabled).find_map(|rule| {
-        let matched = match rule.match_mode.as_str() {
-            "exact" => prompt == rule.match_text.trim(),
-            "contains" => prompt.contains(rule.match_text.trim()),
-            _ => false,
-        };
-        if !matched {
+    rules.iter().find_map(|rule| {
+        if !billing::engine::preview_template_match(rule, prompt, model).matched {
             return None;
         }
         rule.variants
@@ -273,7 +340,13 @@ pub(super) fn replay_receipt(
     let bytes = frames(
         &receipt.conversation_id,
         &receipt.model_id,
-        "[固定模板服务恢复；本次请求已扣费，重放原文件写入指令，不重复扣费]",
+        &receipt
+            .delivery
+            .as_ref()
+            .map(|d| render_message(&d.replay, &receipt.file_path, receipt.price_microcredits))
+            .unwrap_or_else(|| {
+                "[固定模板服务恢复；本次请求已扣费，重放原文件写入指令，不重复扣费]".into()
+            }),
         Some((&receipt.tool_name, &receipt.tool_use_id, &input)),
         0,
     )
@@ -344,17 +417,33 @@ pub(super) async fn respond(
                 "模板回执混有其他工具结果，本轮未调用上游或扣费。请单独发送后续请求。",
             ));
         }
-        let mut text = String::from("[固定模板回执；本轮不调用上游、不再扣费]\n");
+        let mut text = String::new();
         for (result, receipt) in &receipts {
-            match result.status.as_deref() {
-                Some("success") => text.push_str(&format!("客户端报告已写入 {}。{}\n", receipt.file_path, receipt.completion)),
-                Some("error") => text.push_str(&format!("客户端报告写入 {} 失败。请检查客户端工具返回的错误；不会自动重试或再次扣费。\n", receipt.file_path)),
-                _ => text.push_str(&format!("已收到 {} 的工具回执，但未确认写入成功。请检查客户端文件。\n", receipt.file_path)),
+            if let Some(d) = &receipt.delivery {
+                let message = match result.status.as_deref() {
+                    Some("success") => &d.success,
+                    Some("error") => &d.failure,
+                    _ => &d.unknown,
+                };
+                text.push_str(&render_message(
+                    message,
+                    &receipt.file_path,
+                    receipt.price_microcredits,
+                ));
+                text.push('\n');
+            } else {
+                text.push_str("[固定模板回执；本轮不调用上游、不再扣费]\n");
+                match result.status.as_deref() {
+                    Some("success") => text.push_str(&format!("客户端报告已写入 {}。{}\n", receipt.file_path, receipt.completion)),
+                    Some("error") => text.push_str(&format!("客户端报告写入 {} 失败。请检查客户端工具返回的错误；不会自动重试或再次扣费。\n", receipt.file_path)),
+                    _ => text.push_str(&format!("已收到 {} 的工具回执，但未确认写入成功。请检查客户端文件。\n", receipt.file_path)),
+                }
             }
         }
         if !user.content.trim().is_empty() || !user.images.is_empty() || !user.documents.is_empty()
         {
-            text.push_str("本轮仅确认模板工具回执，附带的新指令或附件未执行；如需继续处理，请另发一条消息。\n");
+            let receipt = &receipts[0].1;
+            text.push_str(&receipt.delivery.as_ref().map(|d| render_message(&d.continuation, &receipt.file_path, receipt.price_microcredits)).unwrap_or_else(|| "本轮仅确认模板工具回执，附带的新指令或附件未执行；如需继续处理，请另发一条消息。\n".into()));
         }
         let receipt_model = &receipts[0].1.model_id;
         return Some(
@@ -402,12 +491,17 @@ pub(super) async fn respond(
             .map(|b| format!("{b:02x}"))
             .collect::<String>()
     );
-    let text = format!(
+    let legacy_text = format!(
         "[固定模板服务，非模型实时生成；不调用上游，token 用量为 0；本次写入指令收费 {:.6} 积分，回执不重复收费]\n{}\n准备向客户端发送 {} 的文件写入指令，尚未确认文件已创建。",
         variant.price_microcredits as f64 / 1_000_000.0,
         variant.preamble,
         variant.file_path
     );
+    let text = variant
+        .delivery
+        .as_ref()
+        .map(|d| render_message(&d.dispatch, &variant.file_path, variant.price_microcredits))
+        .unwrap_or(legacy_text);
     // Encode everything before the durable debit; even a response construction error is free.
     let bytes = match frames(
         &state.conversation_id,
@@ -432,6 +526,120 @@ pub(super) async fn respond(
         Ok(slot) => slot,
         Err(error) => return Some(charge_error(error)),
     };
+    if let Some(delivery) = &variant.delivery {
+        let write_at = match random_delay(delivery.write_min_ms, delivery.write_max_ms) {
+            Ok(at) => at,
+            Err(_) => return Some(encoding_error()),
+        };
+        let mut events = Vec::new();
+        for m in &delivery.messages {
+            let text = render_message(&m.text, &variant.file_path, variant.price_microcredits);
+            let event =
+                match encode_event("assistantResponseEvent", &AssistantResponseEvent::new(text)) {
+                    Ok(b) => b,
+                    Err(_) => return Some(encoding_error()),
+                };
+            events.push((m.at_ms, event, false));
+        }
+        // Independent protocol keepalives also cover empty/sparse display timelines.
+        // Snapshot the validated runtime interval for this request. These bounded,
+        // non-billable events use the same lazy body and cancellation guards as the
+        // file dispatch; no background task can outlive a disconnected client.
+        let keepalive_ms = billing.runtime_settings_config().settings.keepalive_secs * 1_000;
+        let mut at = keepalive_ms;
+        while at < u64::from(write_at) {
+            events.push((at as u32, kiro_wire::encoder::encode_keepalive(), false));
+            at += keepalive_ms;
+        }
+        events.push((write_at, bytes, true));
+        events.sort_by_key(|(at, _, _)| *at);
+        let receipt = ResponseTemplateReceipt {
+            tool_use_id: tool_id,
+            invocation_id: invocation_id.into(),
+            card_id: card_id.into(),
+            conversation_id: state.conversation_id.clone(),
+            model_id: model.into(),
+            file_path: variant.file_path.clone(),
+            completion: variant.completion.clone(),
+            tool_name: tool_name.clone(),
+            path_key: tool_keys(&tool_name).unwrap().0.into(),
+            content_key: tool_keys(&tool_name).unwrap().1.into(),
+            content: variant.content.clone(),
+            price_microcredits: variant.price_microcredits,
+            delivery: variant.delivery.clone(),
+            created_at_secs: 0,
+        };
+        let committed = DeliveryCommitted(Arc::new(AtomicBool::new(false)));
+        let body_state = (
+            events.into_iter(),
+            tokio::time::Instant::now(),
+            billing.clone(),
+            config.revision.clone(),
+            rule.id.clone(),
+            receipt,
+            _wait_slot,
+            committed.clone(),
+        );
+        let body = futures_util::stream::unfold(
+            body_state,
+            |(mut events, start, billing, revision, rule, mut receipt, slot, committed)| async move {
+                let (at, mut bytes, debit) = events.next()?;
+                tokio::time::sleep_until(start + std::time::Duration::from_millis(at as u64)).await;
+                if debit {
+                    let now = crate::now_secs();
+                    receipt.created_at_secs = now;
+                    match billing.charge_response_template(
+                        &revision,
+                        &rule,
+                        &receipt.model_id,
+                        receipt.clone(),
+                        now,
+                    ) {
+                        Ok(entry) => {
+                            committed.0.store(true, Ordering::Release);
+                            billing.record_trace(billing::observability::RequestTrace {
+                                id: format!("template-{}", receipt.invocation_id),
+                                card_id: receipt.card_id.clone(),
+                                ts: now,
+                                invocation_id: receipt.invocation_id.clone(),
+                                exposed_model: receipt.model_id.clone(),
+                                status: billing::observability::TraceStatus::Success,
+                                provider_id: Some(entry.provider_id),
+                                credits_charged: entry.credits_charged,
+                                ..Default::default()
+                            });
+                        }
+                        Err(_) => {
+                            bytes = kiro_wire::encoder::encode_exception(
+                                "ValidationException",
+                                "模板配置、卡状态或余额已变化，未下发文件且未扣费。请重新请求。",
+                            );
+                        }
+                    }
+                }
+                Some((
+                    Ok::<Bytes, std::convert::Infallible>(Bytes::from(bytes)),
+                    (
+                        events, start, billing, revision, rule, receipt, slot, committed,
+                    ),
+                ))
+            },
+        );
+        let mut response = (
+            [
+                (header::CONTENT_TYPE, "application/vnd.amazon.eventstream"),
+                (header::CACHE_CONTROL, "no-store"),
+                (
+                    axum::http::HeaderName::from_static("x-accel-buffering"),
+                    "no",
+                ),
+            ],
+            Body::from_stream(body),
+        )
+            .into_response();
+        response.extensions_mut().insert(committed);
+        return Some(response);
+    }
     // Waiting is cancellable and precedes the durable debit. Invalid tool schemas never wait.
     if variant.delay_ms > 0 {
         tokio::time::sleep(std::time::Duration::from_millis(variant.delay_ms as u64)).await;
@@ -450,6 +658,7 @@ pub(super) async fn respond(
         content_key: tool_keys(&tool_name).expect("validated file tool").1.into(),
         content: variant.content.clone(),
         price_microcredits: variant.price_microcredits,
+        delivery: None,
         created_at_secs: now,
     };
     let entry =
@@ -478,6 +687,7 @@ mod tests {
     fn variant(model: &str) -> ResponseTemplateVariant {
         ResponseTemplateVariant {
             delay_ms: 0,
+            delivery: None,
             model_id: model.into(),
             file_path: "index.html".into(),
             content: format!("<svg>{model}</svg>"),
@@ -492,6 +702,7 @@ mod tests {
             name: model.into(),
             enabled: true,
             match_mode: "exact".into(),
+            intent: None,
             match_text: "create pelican".into(),
             variants: vec![variant(model)],
         }

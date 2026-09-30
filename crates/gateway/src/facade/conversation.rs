@@ -528,15 +528,12 @@ impl GenerateAssistantResponseHandler {
                     )
                     .await
                     {
-                        if response.status().is_success() {
-                            idempotency_guard.commit(crate::idempotency::CompletedInvocation {
-                                completed_at: std::time::Instant::now(),
-                                model_id: model,
-                                total_input_tokens: 0,
-                                total_output_tokens: 0,
-                            });
-                        }
-                        return response;
+                        return super::response_templates::protect_response(
+                            response,
+                            idempotency_guard,
+                            capacity_permit,
+                            model,
+                        );
                     }
                 }
             }

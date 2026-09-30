@@ -41,6 +41,36 @@ const INITIAL_REVISION: &str = "response-template:v1:empty";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ResponseTemplateIntent {
+    /// AND across groups; OR across explicit synonyms inside each group.
+    pub groups: Vec<Vec<String>>,
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseTemplateMessage {
+    pub at_ms: u32,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseTemplateDelivery {
+    pub write_min_ms: u32,
+    pub write_max_ms: u32,
+    pub messages: Vec<ResponseTemplateMessage>,
+    pub dispatch: String,
+    pub success: String,
+    pub failure: String,
+    pub unknown: String,
+    pub replay: String,
+    pub continuation: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResponseTemplateVariant {
     pub model_id: String,
     pub file_path: String,
@@ -50,6 +80,8 @@ pub struct ResponseTemplateVariant {
     pub price_microcredits: i64,
     #[serde(default)]
     pub delay_ms: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<ResponseTemplateDelivery>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +93,8 @@ pub struct ResponseTemplateRule {
     pub match_mode: String,
     pub match_text: String,
     pub variants: Vec<ResponseTemplateVariant>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<ResponseTemplateIntent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,6 +152,8 @@ pub struct ResponseTemplateReceipt {
     pub content: String,
     #[serde(default)]
     pub price_microcredits: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<ResponseTemplateDelivery>,
     pub created_at_secs: u64,
 }
 
@@ -174,7 +210,9 @@ fn message(s: &str) -> bool {
             .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
 }
 
-fn validate_rules(rules: &[ResponseTemplateRule]) -> Result<(), BillingError> {
+pub fn validate_response_template_rules(
+    rules: &[ResponseTemplateRule],
+) -> Result<(), BillingError> {
     if rules.len() > 32 {
         return Err(invalid("at most 32 rules are allowed"));
     }
@@ -184,7 +222,7 @@ fn validate_rules(rules: &[ResponseTemplateRule]) -> Result<(), BillingError> {
         if !crate::valid_id(&rule.id, 128)
             || !ids.insert(&rule.id)
             || !crate::valid_id(&rule.name, 256)
-            || !matches!(rule.match_mode.as_str(), "exact" | "contains")
+            || !matches!(rule.match_mode.as_str(), "exact" | "contains" | "intent")
             || rule.match_text.trim().is_empty()
             || !message(&rule.match_text)
             || rule.variants.is_empty()
@@ -193,6 +231,21 @@ fn validate_rules(rules: &[ResponseTemplateRule]) -> Result<(), BillingError> {
             return Err(invalid(
                 "invalid or duplicate rule, matcher, or variant count",
             ));
+        }
+        if rule.match_mode == "intent" && rule.intent.is_none() {
+            return Err(invalid("intent mode requires concept groups"));
+        }
+        if let Some(intent) = &rule.intent {
+            if !(2..=12).contains(&intent.groups.len())
+                || intent
+                    .groups
+                    .iter()
+                    .any(|g| g.is_empty() || g.len() > 32 || g.iter().any(|s| !valid_term(s)))
+                || intent.exclude.len() > 64
+                || intent.exclude.iter().any(|s| !valid_term(s))
+            {
+                return Err(invalid("intent requires 2–12 groups, 1–32 synonyms per group and at most 64 exclusions (2–128 characters)"));
+            }
         }
         let mut models = HashSet::new();
         for variant in &rule.variants {
@@ -208,6 +261,9 @@ fn validate_rules(rules: &[ResponseTemplateRule]) -> Result<(), BillingError> {
                 return Err(invalid(
                     "invalid or duplicate model variant, HTML path, content, message, or price",
                 ));
+            }
+            if let Some(delivery) = &variant.delivery {
+                validate_delivery(delivery)?;
             }
             total += variant.content.len();
             if total > 2 * 1024 * 1024 {
@@ -227,7 +283,39 @@ fn validate_rules(rules: &[ResponseTemplateRule]) -> Result<(), BillingError> {
     Ok(())
 }
 
+fn valid_term(s: &str) -> bool {
+    (2..=128).contains(&s.trim().chars().count())
+        && message(s)
+        && s.chars().any(char::is_alphanumeric)
+}
+fn validate_delivery(d: &ResponseTemplateDelivery) -> Result<(), BillingError> {
+    if d.write_min_ms > d.write_max_ms
+        || d.write_max_ms > 300_000
+        || d.messages.len() > 16
+        || d.messages
+            .iter()
+            .any(|m| m.at_ms > d.write_min_ms || m.text.trim().is_empty() || !message(&m.text))
+        || d.messages.windows(2).any(|w| w[0].at_ms >= w[1].at_ms)
+        || [
+            &d.dispatch,
+            &d.success,
+            &d.failure,
+            &d.unknown,
+            &d.replay,
+            &d.continuation,
+        ]
+        .iter()
+        .any(|s| !message(s))
+    {
+        return Err(invalid("invalid delivery: 0–300000ms, ordered absolute message times before earliest dispatch, up to 16 messages"));
+    }
+    Ok(())
+}
+
 fn validate_receipt(receipt: &ResponseTemplateReceipt) -> Result<(), BillingError> {
+    if let Some(d) = &receipt.delivery {
+        validate_delivery(d)?;
+    }
     if [
         &receipt.tool_use_id,
         &receipt.invocation_id,
@@ -269,7 +357,7 @@ fn live(receipt: &ResponseTemplateReceipt, now: u64) -> bool {
 pub(super) fn validate_snapshot_state(s: &BillingSnapshot) -> Result<(), BillingError> {
     validate_receipt_budget(&s.response_template_receipts)?;
     let config = &s.response_templates;
-    validate_rules(&config.rules)?;
+    validate_response_template_rules(&config.rules)?;
     if !crate::valid_id(&config.revision, 128)
         || !config.revision.starts_with("response-template:v1:")
         || config.audit.len() > MAX_AUDIT
@@ -361,7 +449,7 @@ impl BillingEngine {
         update: ResponseTemplateUpdate,
         now: u64,
     ) -> Result<ResponseTemplateConfig, BillingError> {
-        validate_rules(&update.rules)?;
+        validate_response_template_rules(&update.rules)?;
         // Old snapshots may contain enabled empty variants; keep them loadable, but
         // refuse new publications and execution of such variants.
         if update
@@ -540,6 +628,7 @@ impl BillingEngine {
         }
         if receipt.model_id != model_id
             || receipt.file_path != variant.file_path
+            || receipt.delivery != variant.delivery
             || receipt.completion != variant.completion
             || receipt.content != variant.content
             || receipt.price_microcredits != variant.price_microcredits
@@ -710,9 +799,11 @@ mod tests {
             name: "Landing page".into(),
             enabled: true,
             match_mode: "contains".into(),
+            intent: None,
             match_text: "make a page".into(),
             variants: vec![ResponseTemplateVariant {
                 delay_ms: 0,
+                delivery: None,
                 model_id: "model-a".into(),
                 file_path: "pages/index.html".into(),
                 content: "<html>model A</html>".into(),
@@ -721,6 +812,46 @@ mod tests {
                 price_microcredits: price,
             }],
         }]
+    }
+
+    #[test]
+    fn optional_template_fields_do_not_expand_legacy_capacity() {
+        let mut legacy = rules(0);
+        let v = legacy[0].variants[0].clone();
+        legacy[0].variants = (0..8)
+            .map(|i| {
+                let mut v = v.clone();
+                v.model_id = format!("model-{i}");
+                v.content = "a".repeat(256 * 1024);
+                v
+            })
+            .collect();
+        let limit = 2 * 1024 * 1024;
+        let size = serde_json::to_vec(&legacy).unwrap().len();
+        legacy[0].variants[0]
+            .content
+            .truncate(256 * 1024 - (size - (limit - 1)));
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        assert_eq!(bytes.len(), limit - 1);
+        let shape: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(shape[0].get("intent").is_none());
+        assert!(shape[0]["variants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|v| v.get("delivery").is_none()));
+        let loaded: Vec<ResponseTemplateRule> = serde_json::from_slice(&bytes).unwrap();
+        validate_response_template_rules(&loaded).unwrap();
+        assert_eq!(serde_json::to_vec(&loaded).unwrap(), bytes);
+        let r = serde_json::to_value(receipt("legacy-fields")).unwrap();
+        assert!(r.get("delivery").is_none());
+        assert_eq!(
+            serde_json::to_value(
+                serde_json::from_value::<ResponseTemplateReceipt>(r.clone()).unwrap()
+            )
+            .unwrap(),
+            r
+        );
     }
 
     fn update(e: &BillingEngine, rules: Vec<ResponseTemplateRule>) -> ResponseTemplateUpdate {
@@ -764,6 +895,7 @@ mod tests {
             content_key: "text".into(),
             content: "<html>model A</html>".into(),
             price_microcredits: 10,
+            delivery: None,
             created_at_secs: 0,
         }
     }
@@ -1380,7 +1512,10 @@ mod tests {
         ] {
             let mut r = rules(0);
             r[0].variants[0].file_path = path.into();
-            assert!(validate_rules(&r).is_err(), "accepted {path:?}");
+            assert!(
+                validate_response_template_rules(&r).is_err(),
+                "accepted {path:?}"
+            );
         }
         for path in [
             "index.html",
@@ -1473,10 +1608,10 @@ mod tests {
             object["unknown"] = true.into();
             assert!(serde_json::from_value::<ResponseTemplateUpdate>(v).is_err());
         }
-        assert!(validate_rules(&rules(1_000_000_000)).is_ok());
+        assert!(validate_response_template_rules(&rules(1_000_000_000)).is_ok());
         let mut r = rules(0);
         r[0].variants[0].content = "x".repeat(256 * 1024);
-        assert!(validate_rules(&r).is_ok());
+        assert!(validate_response_template_rules(&r).is_ok());
     }
 
     #[test]

@@ -73,3 +73,25 @@ console.log('PASS: template validation, UTF-8 limits, safe paths, exact microcre
 for (const delay of [-1, 30001, 0.1, Infinity, NaN]) {const d=valid();d.variants[0].delay_ms=delay;assert.ok(t.parseTemplateRules([d]).error);}
 const opusExample=t.pelicanTemplateRule();assert.equal(opusExample.variants[0].model_id,'claude-opus-5-5');assert.equal(opusExample.variants[0].delay_ms,1500);assert.ok(opusExample.variants[0].content.includes('<svg'));
 console.log('PASS: template delay bounds and embedded Opus 5.5 HTML');
+
+const intentDraft = valid(); intentDraft.match_mode = 'intent'; intentDraft.intent = t.pelicanIntent();
+assert.ok(t.parseTemplateRules([intentDraft]).rules);
+intentDraft.intent.groups = [[]]; assert.ok(t.parseTemplateRules([intentDraft]).error);
+const timelineDraft = valid(); timelineDraft.variants[0].delivery = t.newTemplateDelivery();
+assert.ok(t.parseTemplateRules([timelineDraft]).rules);
+for (const patch of [{write_min_ms: -1}, {write_max_ms: 300001}, {write_min_ms: 240000}, {messages: [{at_ms: 0, text: 'a'}, {at_ms: 0, text: 'b'}]}, {messages: [{at_ms: 240000, text: 'late'}]}]) {
+ timelineDraft.variants[0].delivery = {...t.newTemplateDelivery(), ...patch}; assert.ok(t.parseTemplateRules([timelineDraft]).error);
+}
+console.log('PASS: intent groups and bounded editable timeline validation');
+
+assert.deepEqual(plain(t.pelicanIntent()), JSON.parse(fs.readFileSync(path.join(__dirname, '../../../crates/billing/tests/fixtures/pelican_intent.json'), 'utf8')), 'admin defaults must match production matcher regression fixture');
+
+const saved = t.parseTemplateRules([valid()]).rules;
+const reordered = saved.map(r => Object.fromEntries(Object.entries({...r, intent: null, variants: r.variants.map(v => ({...v, delivery: null}))}).reverse()));
+assert(t.sameTemplateRules(saved,reordered), 'uncertain save compares semantic rules regardless of JSON order or omitted optional fields');
+reordered[0].variants[0].price_microcredits = 1;
+assert(!t.sameTemplateRules(saved,reordered), 'uncertain save must detect a different charge');
+
+const omitted = JSON.parse(JSON.stringify(saved));
+delete omitted[0].intent; delete omitted[0].variants[0].delivery;
+assert(t.sameTemplateRules(saved,omitted), 'absent optional fields preserve save equality');

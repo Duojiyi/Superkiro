@@ -1,7 +1,7 @@
 import type {RuntimeConfig, RuntimeUpdate} from './runtimeSettings';
 import type {KeyAttempts, ModelHealth, ProviderAttempts} from './health';
 /** A refused request: the server's words, its status, and the rest of its answer (a refusal's `refusal` object, say). */
-import type {ResponseTemplateConfig, ResponseTemplateUpdate} from './responseTemplates';
+import type {ResponseTemplateConfig, ResponseTemplateUpdate, ResponseTemplateRule} from './responseTemplates';
 
 export class AdminApiError extends Error {
   constructor(message:string, public readonly status:number, public readonly body:Record<string, unknown> = {}){super(message);this.name='AdminApiError';}
@@ -550,6 +550,9 @@ export class AdminApiClient {
     return this.request('/api/v1/admin/runtime-settings', {method: 'POST', body: JSON.stringify(update)});
   }
 
+  async previewResponseTemplates(rules: ResponseTemplateRule[], prompt: string, model: string): Promise<{success: boolean; winner: string | null; matches: Array<{rule_id: string; name: string; result: {matched: boolean; reason: string; missing_groups: number[]}}>}> {
+    return this.request('/api/v1/admin/response-templates/preview', {method: 'POST', body: JSON.stringify({rules, prompt, model})});
+  }
   async getResponseTemplates(): Promise<{success: boolean; config: ResponseTemplateConfig}> {
     return this.request('/api/v1/admin/response-templates');
   }

@@ -1,9 +1,10 @@
+import {TemplateDeliveryEditor} from '../components/TemplateDeliveryEditor';
 import {useEffect, useRef, useState} from 'react';
 import {adminApi, AdminApiError} from '../api';
 import {confirmAction} from '../components/confirm';
 import {toast} from '../components/toast';
 import {Switch, TopbarActions} from '../components/ui';
-import {MAX_TEMPLATE_ITEMS, newTemplateRule, newTemplateVariant, parseTemplateRules, pelicanTemplateRule, templateDrafts, templateModels, templatePrice,
+import {MAX_TEMPLATE_ITEMS, pelicanIntent, newTemplateRule, sameTemplateRules, newTemplateVariant, parseTemplateRules, pelicanTemplateRule, templateDrafts, templateModels, templatePrice,
   type ResponseTemplateConfig, type ResponseTemplateRule, type TemplateRuleDraft, type TemplateVariantDraft} from '../responseTemplates';
 import type {Row, WriteGuards} from '../types';
 
@@ -17,6 +18,11 @@ export default function ResponseTemplatesPage({models, modelsFailed, refreshEpoc
   const [drafts, setDrafts] = useState<TemplateRuleDraft[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [reason, setReason] = useState('');
+  const [previewPrompt, setPreviewPrompt] = useState('');
+  const [previewModel, setPreviewModel] = useState('');
+  const [previewResult, setPreviewResult] = useState('');
+  const [previewBusy, setPreviewBusy] = useState(false);
+  const previewEpoch = useRef(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [blocked, setBlocked] = useState<'conflict' | 'uncertain' | ''>('');
@@ -32,6 +38,17 @@ export default function ResponseTemplatesPage({models, modelsFailed, refreshEpoc
   useEffect(() => {onDirtyChange(dirty); return () => onDirtyChange(false);}, [dirty, onDirtyChange]);
   useEffect(() => {onBusyChange(busy); return () => onBusyChange(false);}, [busy, onBusyChange]);
 
+  useEffect(() => {previewEpoch.current++; setPreviewResult(''); setPreviewBusy(false);}, [drafts, previewPrompt, previewModel]);
+  const preview = async () => {
+    if (!parsed.rules || !previewPrompt.trim() || !previewModel) return;
+    const epoch = ++previewEpoch.current; setPreviewBusy(true);
+    try {
+      const r = await adminApi.previewResponseTemplates(parsed.rules, previewPrompt, previewModel);
+      if (!alive.current || epoch !== previewEpoch.current) return;
+      setPreviewResult((r.winner ? `最终命中：${r.winner}` : '不命中模板，继续正常上游服务') + '\n' + r.matches.map(m => `${m.name}: ${m.result.matched ? '匹配' : '不匹配'} / ${m.result.reason}${m.result.missing_groups.length ? ' / 缺少词组 ' + m.result.missing_groups.join(', ') : ''}`).join('\n'));
+    } catch (e) { if (alive.current && epoch === previewEpoch.current) setPreviewResult('预览失败：' + message(e)); }
+    finally { if (alive.current && epoch === previewEpoch.current) setPreviewBusy(false); }
+  };
   const adopt = (next: ResponseTemplateConfig) => {
     const nextDrafts = templateDrafts(next.rules);
     setConfig(next); setDrafts(nextDrafts); setSelected(previous => nextDrafts.some(item => item.id === previous) ? previous : nextDrafts[0]?.id ?? null);
@@ -45,7 +62,7 @@ export default function ResponseTemplatesPage({models, modelsFailed, refreshEpoc
       if (!result.success || !result.config || typeof result.config.revision !== 'string' || !result.config.revision || !Array.isArray(result.config.rules) || !Array.isArray(result.config.audit)) throw new Error('服务器没有返回有效的模板配置版本');
       templateDrafts(result.config.rules);
       if (!alive.current) return;
-      if (state.current.blocked === 'uncertain' && submitted.current && JSON.stringify(result.config.rules) === JSON.stringify(submitted.current)) {
+      if (state.current.blocked === 'uncertain' && submitted.current && sameTemplateRules(result.config.rules, submitted.current)) {
         adopt(result.config); toast.success('已核对：服务器已保存这次发布');
       } else if (state.current.dirty || state.current.blocked) {
         setLatest(result.config); setError('');
@@ -116,7 +133,7 @@ export default function ResponseTemplatesPage({models, modelsFailed, refreshEpoc
       <p>固定服务费按每条生成文件指令在下发时收取一次；成功或失败的工具结果回执均免费，不重复收费。新变体默认 <strong>0 credits（免费）</strong>，不会自动套用模型的 token 单价。</p>
       <p>实际写出文件需要客户端声明兼容工具：<code>fsWrite(path,text)</code>、<code>Write(file_path,content)</code>、<code>write_file(path,content)</code> 或 <code>writeFile(path,content)</code>。下发指令不代表文件已写入成功。</p>
       <p>未匹配到模型变体时，继续正常模型服务。后端默认没有任何规则，示例只加入本地草稿，不自动启用或发布。</p>
-      <p className="muted">从上到下为规则优先级；完整匹配或包含匹配。最多 32 条规则，每条最多 32 个不同模型变体；每份代码 ≤256 KiB，总配置 ≤2 MiB。</p>
+      <p className="muted">从上到下为规则优先级；完整匹配、包含匹配或保守意图匹配。最多 32 条规则，每条最多 32 个不同模型变体；每份代码 ≤256 KiB，总配置 ≤2 MiB。</p>
       <div className="button-row"><button type="button" className="btn" disabled={busy} onClick={() => void read()}>{busy ? '处理中…' : '读取服务器版本'}</button>
         <span className="muted">{config ? `当前基准版本：${config.revision}${dirty ? ' · 有未发布的修改' : ''}` : '尚未读取配置，禁止发布'}</span></div>
     </section>
@@ -146,9 +163,14 @@ export default function ResponseTemplatesPage({models, modelsFailed, refreshEpoc
             <button type="button" className="btn-text" onClick={() => void removeRule()}>删除规则</button></div>
           <div className="form-grid form-grid-2">
             <label className="field"><span className="field-label">规则名称</span><input value={rule.name} onChange={event => updateRule({name: event.target.value})}/></label>
-            <label className="field"><span className="field-label">匹配方式</span><select value={rule.match_mode} onChange={event => updateRule({match_mode: event.target.value as TemplateRuleDraft['match_mode']})}><option value="exact">完整匹配</option><option value="contains">包含匹配</option></select></label>
+            <label className="field"><span className="field-label">匹配方式</span><select value={rule.match_mode} onChange={event => updateRule({match_mode: event.target.value as TemplateRuleDraft['match_mode'], ...(event.target.value === 'intent' ? {intent: rule.intent ?? pelicanIntent()} : {})})}><option value="exact">完整匹配</option><option value="contains">包含匹配</option><option value="intent">意图匹配（同义词组）</option></select></label>
             <label className="field field-span"><span className="field-label">匹配文本</span><textarea value={rule.match_text} onChange={event => updateRule({match_text: event.target.value})}/></label>
           </div>
+          {rule.match_mode === 'intent' && <section className="panel template-intro">
+            <p>每行是一组必须出现的概念；同组同义词用 | 分隔。主体与动作应放在同一组短语中（如“鹈鹕骑”“骑自行车的鹈鹕”），不要拆成互不关联的关键词。缺少概念、否定、引用或修改类请求保守交给上游。不会自动猜测错别字，也不能保证任意语义零误判。</p>
+            <label className="field"><span>必须概念（组间 AND、组内 OR）</span><textarea rows={8} value={(rule.intent?.groups ?? []).map(g => g.join('|')).join('\n')} onChange={e => updateRule({intent: {groups: e.target.value.split('\n').map(line => line.split('|')), exclude: rule.intent?.exclude ?? []}})}/></label>
+            <label className="field"><span>排除词（每行一个）</span><textarea value={(rule.intent?.exclude ?? []).join('\n')} onChange={e => updateRule({intent: {groups: rule.intent?.groups ?? [], exclude: e.target.value ? e.target.value.split('\n') : []}})}/></label>
+          </section>}
           {rule.variants.map((variant, index) => <section className="template-variant" aria-label={`模型变体 ${index + 1}`} key={`${rule.id}-${index}`}>
             <div className="panel-head"><h4>模型变体 {index + 1}</h4><button type="button" className="btn-text" onClick={() => void removeVariant(index)}>删除变体</button></div>
             <div className="form-grid form-grid-2">
@@ -162,15 +184,24 @@ export default function ResponseTemplatesPage({models, modelsFailed, refreshEpoc
                 <span className="field-hint">0–1000，最多 6 位小数；{templatePrice(variant.price_credits) === null ? '价格格式无效' : `${templatePrice(variant.price_credits)} microcredits${templatePrice(variant.price_credits) === 0 ? ' · 免费' : ' · 收费'}`}。成功或失败回执均免费。</span></label>
               <label className="field field-span"><span className="field-label">完整 HTML 代码</span><textarea className="template-code" rows={16} spellCheck={false} value={variant.content} onChange={event => updateVariant(index, {content: event.target.value})}/>
                 <span className="field-hint">完整代码可编辑，只作为文本保存；管理后台不会渲染或执行。UTF-8：{new TextEncoder().encode(variant.content).length} / 262144 字节。</span></label>
-              <label className="field"><span className="field-label">响应延迟（毫秒，0–30000）</span><input type="number" min="0" max="30000" step="1" value={variant.delay_ms ?? 0} onChange={event => updateVariant(index, {delay_ms: Number(event.target.value)})}/></label>
-              <label className="field"><span className="field-label">前置消息</span><textarea value={variant.preamble} onChange={event => updateVariant(index, {preamble: event.target.value})}/></label>
-              <label className="field"><span className="field-label">完成消息</span><textarea value={variant.completion} onChange={event => updateVariant(index, {completion: event.target.value})}/></label>
+              {!variant.delivery && <label className="field"><span className="field-label">响应延迟（毫秒，0–30000）</span><input type="number" min="0" max="30000" step="1" value={variant.delay_ms ?? 0} onChange={event => updateVariant(index, {delay_ms: Number(event.target.value)})}/></label>}
+              {!variant.delivery && <label className="field"><span className="field-label">前置消息</span><textarea value={variant.preamble} onChange={event => updateVariant(index, {preamble: event.target.value})}/></label>}
+              {!variant.delivery && <label className="field"><span className="field-label">完成消息</span><textarea value={variant.completion} onChange={event => updateVariant(index, {completion: event.target.value})}/></label>}
             </div>
+            <TemplateDeliveryEditor value={variant.delivery} onChange={delivery => updateVariant(index, {delivery})}/>
           </section>)}
           <button type="button" className="btn" disabled={rule.variants.length >= MAX_TEMPLATE_ITEMS || !choices.some(model => !rule.variants.some(variant => variant.model_id === model.id))} onClick={() => updateRule({variants: [...rule.variants, newTemplateVariant()]})}>新增模型变体</button>
           {!choices.length && <p className="muted">暂无可选商业模型，请先在“模型与定价”配置模型，再刷新。</p>}
         </section>}
       </fieldset>
+      <section className="panel template-intro" aria-label="匹配预览">
+        <h3>草稿命中预览（不扣费、不调用上游）</h3>
+        <p className="muted">使用服务器实际匹配器；停用规则不参与命中。预览仅判断文本和模型，实际发送还会检查工具、卡状态和余额。</p>
+        <label className="field"><span>请求模型</span><select aria-label="请求模型" value={previewModel} onChange={e => setPreviewModel(e.target.value)}><option value="">选择模型</option>{choices.map(c => <option key={c.id} value={c.id}>{c.label}</option>)}</select></label>
+        <label className="field"><span>用户请求</span><textarea value={previewPrompt} onChange={e => setPreviewPrompt(e.target.value)}/></label>
+        <button type="button" className="btn" disabled={previewBusy || !parsed.rules || !previewModel || !previewPrompt.trim()} onClick={() => void preview()}>{previewBusy ? '预览中…' : '预览命中结果'}</button>
+        <pre role="status" style={{whiteSpace: 'pre-wrap'}}>{previewResult}</pre>
+      </section>
       <section className="panel template-intro" aria-label="发布设置">
         <label className="field"><span className="field-label">发布原因（必填）</span><textarea maxLength={500} disabled={busy || !!blocked || !!latest} value={reason} onChange={event => setReason(event.target.value)} placeholder="说明本次匹配规则、代码或固定服务费的变更原因"/></label>
         {parsed.error && dirty && <p className="field-error" role="status">{parsed.error}</p>}
