@@ -30,7 +30,7 @@ window.calls = []; window.isTauri = true; window.__TAURI_INTERNALS__ = {invoke: 
   if (args.path === '/api/operation') return {id:0,state:'idle'};
   if(args.path === '/api/status') return {kiro_installed:state!=='missing',kiro_compatible:true,kiro_version:'1.1.14',app_version:'0.1.0',process_state:state==='connected'?'Running':'NotRunning',platform:'win32',recovery_pending:state==='recovery'||window.activateFailed===true,authenticated:['connected','usage-data','usage-error'].includes(state),has_snapshot:state==='recovery'||window.activateFailed===true||['connected','usage-data','usage-error'].includes(state),model_service_available:null,memory_maintenance:window.mockMaintenance};
   if(args.path === '/api/verify-card') {if(state==='login-error')throw 'secret upstream error';return {success:true,authorization:{virtualPlanName:'PRO',remainingPoints:180,totalPoints:200,isExpired:state==='expired'},gateway_url:'https://example.com'};}
-  if(args.path === '/api/usage') {if(state==='usage-error')throw 'network';return {usage:{usageBreakdownList:[{dimensionType:'CREDIT',currentUsageWithPrecision:state==='usage-data'?20:0,usageLimitWithPrecision:200}]},settledUsage:state==='usage-data'?{todayPoints:20,todayTokens:1000,timezone:'UTC',totalTokens:1000,daily:[{date:'2026-09-19',points:20,tokens:1000}],models:[{name:'Mock model',tokens:1000,points:20}]}:null};}
+  if(args.path === '/api/usage') {if(state==='usage-error')throw 'network';return {usage:{availableCredits:state==='usage-data'?180:200,usageBreakdownList:[{dimensionType:'CREDIT',currentUsageWithPrecision:state==='usage-data'?20:0,usageLimitWithPrecision:200}]},settledUsage:state==='usage-data'?{activatedAt:1789776000,totalPoints:20,todayPoints:20,todayTokens:1000,timezone:'UTC',totalTokens:1000,daily:[{date:'2026-09-19',points:20,tokens:1000}],models:[{name:'Mock model',tokens:1000,points:20,daily:[{date:'2026-09-19',points:20}]}]}:null};}
   if(args.path.startsWith('/api/doctor')) throw 'unexpected diagnostics request';
   if(args.path === '/api/activate') {if(state==='connect-error'||state==='connect-legacy'){window.activateFailed=true;if(state==='connect-legacy')throw '[connection:apply] secret upstream error https://private.example/token';throw {code:'SK-CONNECT-003',feedback_id:'TEST-CONNECT-001',stage:'apply',outcome:'failed',occurred_at:'2026-09-21T00:00:00Z',message:'secret upstream error https://private.example/token'};}return new Promise(()=>{});}
   if(args.path === '/api/restore') throw {code:'SK-RESTORE-001',feedback_id:'TEST-RESTORE-001',stage:'restore',outcome:'failed',occurred_at:'2026-09-21T00:00:00Z',message:'secret upstream error https://private.example/token'};
@@ -99,11 +99,27 @@ window.calls = []; window.isTauri = true; window.__TAURI_INTERNALS__ = {invoke: 
         shot('11-login-error')
         page.set_viewport_size({'width':620,'height':820})
         start('connected');page.get_by_role('heading',name='连接配置已应用').wait_for();shot('02-configured-unverified')
-        start('usage-data');page.get_by_role('button',name='刷新 ↻',exact=True).click();page.get_by_text('20 积分',exact=True).wait_for();shot('04-usage-data')
+        start('usage-data');page.get_by_role('button',name='刷新 ↻',exact=True).click();page.get_by_text('180',exact=True).wait_for()
+        assert page.get_by_text('今日已用积分',exact=True).count() == 0
+        assert page.get_by_text('总积分 200',exact=True).count() == 0
+        shot('04-overview-balance-only')
+        for width,height in [(480,540),(620,820)]:
+            page.set_viewport_size({'width':width,'height':height})
+            page.get_by_role('navigation').get_by_role('button',name='用量',exact=True).click()
+            page.get_by_role('img',name='每日积分消耗趋势').wait_for()
+            assert page.locator('.content-scroll').evaluate('(e)=>e.scrollWidth<=e.clientWidth')
+            page.get_by_label('每日消耗模型').select_option('Mock model')
+            assert page.get_by_label('2026-09-19：20 积分',exact=True).count() == 1
+            page.locator('.usage-details summary').click()
+            assert page.locator('.usage-details table').is_visible()
+            assert not any(x in page.locator('.usage-panel').inner_text().lower() for x in ['token','usd','美元'])
+            shot(f'04-usage-data-{width}')
+            page.locator('.usage-details summary').click()
+            page.get_by_role('navigation').get_by_role('button',name='概览',exact=True).click()
         start('pending');shot('03-pending')
         page.get_by_role('button',name='启用连接',exact=True).click();shot('14-confirm');page.get_by_role('button',name='取消',exact=True).click()
-        start('connected');page.get_by_role('button',name='刷新 ↻',exact=True).click();page.get_by_text('今日已用积分',exact=True).wait_for();shot('12-usage-empty')
-        page.evaluate("window.mockState='usage-error'");page.get_by_role('button',name='刷新 ↻',exact=True).click();page.get_by_text('用量刷新失败，保留最近确认余额；今日用量暂不可用。').wait_for();shot('04-usage-error')
+        start('connected');page.get_by_role('button',name='刷新 ↻',exact=True).click();page.get_by_text('剩余积分',exact=True).wait_for();shot('12-usage-empty')
+        page.evaluate("window.mockState='usage-error'");page.get_by_role('button',name='刷新 ↻',exact=True).click();page.get_by_text('余额刷新失败，保留最近确认余额。').wait_for();shot('04-usage-error')
         start('recovery',False);page.get_by_role('heading',name='本机配置待恢复').wait_for();shot('05-recovery')
         page.get_by_role('button',name='还原 Kiro 配置',exact=True).click();page.get_by_role('button',name='确认并继续').click()
         page.get_by_role('heading',name='恢复未完成').wait_for();safe_error('SK-RESTORE-001','TEST-RESTORE-001')
