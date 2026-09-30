@@ -513,8 +513,8 @@ fn validate_card_query(value: &Value, now: f64, allow_expired: bool) -> Result<(
             .is_some_and(|n| n.is_finite() && n >= 0.0)
     };
     if value["success"] != true
-        || !matches!(value["status"].as_str(), Some("active" | "unactivated"))
-            && !(allow_expired && value["status"] == "expired")
+        || !(matches!(value["status"].as_str(), Some("active" | "unactivated"))
+            || allow_expired && value["status"] == "expired")
         || !(value["isExpired"] == false || allow_expired && value["isExpired"] == true)
         || !["remainingPoints", "totalPoints", "maxDevices"]
             .iter()
