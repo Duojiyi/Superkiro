@@ -318,6 +318,7 @@ async fn all_file_tools_replay_identical_arguments_after_durable_restart_without
     let upstream = unused_upstream().await;
     for (name, path_key, content_key) in [
         ("fsWrite", "path", "text"),
+        ("fs_write", "path", "text"),
         ("Write", "file_path", "content"),
         ("write_file", "path", "content"),
         ("writeFile", "path", "content"),
