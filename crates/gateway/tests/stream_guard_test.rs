@@ -121,11 +121,11 @@ async fn test_stream_guard_keepalive_injection_during_idle() {
     assert_eq!(text_evt.content, "Hello after delay");
 }
 
-// A tool call is forwarded only once complete, so nothing else reaches the client while
-// the model writes it. Keepalives must keep flowing meanwhile, or Kiro's watchdog and
-// idle proxies drop a turn that writes a large file.
+// A tool call's input reaches Kiro as the model writes it: Kiro shows a file being
+// written, and hears of the call at once. Held back until the response ended, a long write
+// was minutes of silence, and a failure in it was retried as if nothing had begun.
 #[tokio::test]
-async fn keepalives_continue_while_a_tool_call_is_generated() {
+async fn a_tool_calls_input_streams_as_it_is_written() {
     let (tx, rx) = mpsc::channel(16);
     tokio::spawn(async move {
         for n in 0..40 {
@@ -140,7 +140,6 @@ async fn keepalives_continue_while_a_tool_call_is_generated() {
                     },
                 )))
                 .await;
-            tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let _ = tx
             .send(Ok(ProviderStreamEvent::Delta(
@@ -155,30 +154,145 @@ async fn keepalives_continue_while_a_tool_call_is_generated() {
         let _ = tx.send(Ok(ProviderStreamEvent::Done)).await;
     });
 
-    let config = StreamGuardConfig {
-        keepalive_interval: Duration::from_millis(50),
-        model_id: "test-model".to_string(),
-        context_window: None,
-    };
-    let stream = create_stream_guard(ReceiverStream::new(rx), config, None, None, None);
-    let frames = collect_and_decode_frames(stream).await;
+    let stream = create_stream_guard(
+        ReceiverStream::new(rx),
+        StreamGuardConfig::default(),
+        None,
+        None,
+        None,
+    );
+    let tool_frames: Vec<ToolUseEvent> = collect_and_decode_frames(stream)
+        .await
+        .into_iter()
+        .filter(|(name, _)| name == "toolUseEvent")
+        .map(|(_, payload)| decode_single_event(&payload))
+        .collect();
+    // Each fragment as it came, then the end of the call.
+    assert_eq!(tool_frames.len(), 42);
+    assert!(tool_frames
+        .iter()
+        .all(|frame| frame.tool_use_id == "call-write" && frame.name == "fsWrite"));
+    assert!(tool_frames[..41].iter().all(|frame| !frame.stop));
+    assert!(tool_frames[41].stop && tool_frames[41].input.is_empty());
+    let input: String = tool_frames
+        .iter()
+        .map(|frame| frame.input.as_str())
+        .collect();
+    assert_eq!(input, format!("{{\"text\":\"{}\"}}", "line ".repeat(39)));
+}
 
-    let tool_at = frames
-        .iter()
-        .position(|(name, _)| name == "toolUseEvent")
-        .expect("the tool call is forwarded");
-    let keepalives = frames[..tool_at]
-        .iter()
-        .filter(|(name, payload)| {
-            name == "assistantResponseEvent"
-                && decode_single_event::<AssistantResponseEvent>(payload)
-                    .content
-                    .is_empty()
+/// (toolUseId, input, stop) of each toolUseEvent frame.
+async fn tool_frames(events: Vec<ProviderStreamEvent>) -> Vec<(String, String, bool)> {
+    let stream = create_stream_guard(
+        futures_util::stream::iter(events.into_iter().map(Ok::<_, ProviderError>)),
+        StreamGuardConfig::default(),
+        None,
+        None,
+        None,
+    );
+    collect_and_decode_frames(stream)
+        .await
+        .into_iter()
+        .filter(|(name, _)| name == "toolUseEvent")
+        .map(|(_, payload)| {
+            let event: ToolUseEvent = decode_single_event(&payload);
+            (event.tool_use_id, event.input, event.stop)
         })
-        .count();
-    assert!(
-        keepalives >= 3,
-        "{keepalives} keepalives while the tool call was generated"
+        .collect()
+}
+
+fn chunk(
+    index: usize,
+    id: Option<&str>,
+    name: Option<&str>,
+    arguments: &str,
+) -> ProviderStreamEvent {
+    ProviderStreamEvent::Delta(ProviderDelta::ToolCallChunk {
+        index: Some(index),
+        id: id.map(str::to_string),
+        name: name.map(str::to_string),
+        arguments: arguments.to_string(),
+    })
+}
+
+// Kiro adds a fragment to the call it heard of last, so calls stream one at a time: the
+// next begins once the one before has whole JSON arguments.
+#[tokio::test]
+async fn tool_calls_stream_one_after_another() {
+    let frames = tool_frames(vec![
+        chunk(0, Some("call-a"), Some("readFile"), ""),
+        chunk(0, None, None, "{\"path\":"),
+        chunk(0, None, None, "\"a.py\"}"),
+        chunk(1, Some("call-b"), Some("listDir"), ""),
+        chunk(1, None, None, "{}"),
+        ProviderStreamEvent::Done,
+    ])
+    .await;
+    let frame = |id: &str, input: &str, stop: bool| (id.to_string(), input.to_string(), stop);
+    assert_eq!(
+        frames,
+        vec![
+            frame("call-a", "", false),
+            frame("call-a", "{\"path\":", false),
+            frame("call-a", "\"a.py\"}", false),
+            frame("call-a", "", true),
+            frame("call-b", "", false),
+            frame("call-b", "{}", false),
+            frame("call-b", "", true),
+        ]
+    );
+}
+
+// A fragment for a call Kiro was told had ended would be read as another call's: the
+// response ends instead of handing Kiro a wrong call.
+#[tokio::test]
+async fn a_call_continued_after_the_next_began_ends_the_response() {
+    let stream = create_stream_guard(
+        futures_util::stream::iter(
+            vec![
+                chunk(0, Some("call-a"), Some("readFile"), "{\"path\":\"a.py\"}"),
+                chunk(1, Some("call-b"), Some("listDir"), "{}"),
+                chunk(0, None, None, "{}"),
+                ProviderStreamEvent::Done,
+            ]
+            .into_iter()
+            .map(Ok::<_, ProviderError>),
+        ),
+        StreamGuardConfig::default(),
+        None,
+        None,
+        None,
+    );
+    let frames = collect_and_decode_frames(stream).await;
+    let (name, payload) = frames.last().unwrap();
+    assert_eq!(name, "InternalServerException");
+    assert!(String::from_utf8_lossy(payload).contains("continued a tool call"));
+}
+
+// Relays repeat an empty fragment of a call after the next has begun, sometimes naming the
+// call again. It tells Kiro nothing, so it is passed over; read as the call continued after
+// its end, it failed every response with parallel tools.
+#[tokio::test]
+async fn an_empty_fragment_of_an_ended_call_is_passed_over() {
+    let frames = tool_frames(vec![
+        chunk(0, Some("call-a"), Some("readFile"), "{\"path\":\"a.py\"}"),
+        chunk(1, Some("call-b"), Some("listDir"), ""),
+        chunk(0, None, None, ""),
+        chunk(0, Some("call-a"), Some("readFile"), ""),
+        chunk(1, None, None, "{}"),
+        ProviderStreamEvent::Done,
+    ])
+    .await;
+    let frame = |id: &str, input: &str, stop: bool| (id.to_string(), input.to_string(), stop);
+    assert_eq!(
+        frames,
+        vec![
+            frame("call-a", "{\"path\":\"a.py\"}", false),
+            frame("call-a", "", true),
+            frame("call-b", "", false),
+            frame("call-b", "{}", false),
+            frame("call-b", "", true),
+        ]
     );
 }
 
@@ -200,15 +314,20 @@ async fn tool_calls_from_openai(lines: &[&str]) -> Vec<(String, String, String)>
         None,
         None,
     );
-    collect_and_decode_frames(stream)
+    // As Kiro reads them: each call's fragments joined, in the order the calls began.
+    let mut calls: Vec<(String, String, String)> = Vec::new();
+    for (_, payload) in collect_and_decode_frames(stream)
         .await
         .into_iter()
         .filter(|(name, _)| name == "toolUseEvent")
-        .map(|(_, payload)| {
-            let event: ToolUseEvent = decode_single_event(&payload);
-            (event.tool_use_id, event.name, event.input)
-        })
-        .collect()
+    {
+        let event: ToolUseEvent = decode_single_event(&payload);
+        match calls.iter_mut().find(|call| call.0 == event.tool_use_id) {
+            Some(call) => call.2.push_str(&event.input),
+            None => calls.push((event.tool_use_id, event.name, event.input)),
+        }
+    }
+    calls
 }
 
 fn call(id: &str, name: &str, input: &str) -> (String, String, String) {
@@ -506,22 +625,14 @@ async fn test_audit_b_mid_stream_provider_error_friendly_presentation() {
     let stream = create_stream_guard(ReceiverStream::new(rx), config, None, None, None);
     let frames = collect_and_decode_frames(stream).await;
 
-    // Must contain the user-friendly Markdown error text chunk
-    let friendly_frame = frames
+    // The failure ends the turn as an exception, not as text in the answer, which would
+    // stay in the conversation the model reads from then on.
+    let answer: String = frames
         .iter()
-        .find(|(name, payload)| {
-            if name == "assistantResponseEvent" {
-                let e: AssistantResponseEvent = decode_single_event(payload);
-                e.content.contains("上游模型服务异常")
-            } else {
-                false
-            }
-        })
-        .expect("Must emit user-friendly markdown error event");
-    let friendly_evt: AssistantResponseEvent = decode_single_event(&friendly_frame.1);
-    // Vendor response bodies are intentionally redacted at the client
-    // boundary; only the stable upstream category/status is exposed.
-    assert!(friendly_evt.content.contains("upstream HTTP status 429"));
+        .filter(|(name, _)| name == "assistantResponseEvent")
+        .map(|(_, payload)| decode_single_event::<AssistantResponseEvent>(payload).content)
+        .collect();
+    assert_eq!(answer, "Starting...");
 
     // Must also contain structured AWS exception frame
     let exc_frame = frames

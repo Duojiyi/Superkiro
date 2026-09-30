@@ -25,6 +25,23 @@ def check_version(version):
         raise ValueError('Release version must be MAJOR.MINOR.PATCH, e.g. 0.1.1')
 
 
+def publication_metadata(item, receipt):
+    """Disclose informed beta authorization without claiming native acceptance."""
+    basis = receipt.get('approvalBasis')
+    if basis == 'user-directed-beta-publication':
+        if (receipt.get('runtimeAcceptance') is not False
+                or not re.fullmatch(r'[0-9a-f]{40}', str(receipt.get('sourceCommit', '')))
+                or not re.fullmatch(r'[0-9]+', str(receipt.get('buildRun', '')))):
+            raise ValueError('Beta approval requires source/run identity and runtimeAcceptance=false')
+        item = dict(item, approvalBasis=basis, runtimeAcceptance=False,
+                    sourceCommit=receipt['sourceCommit'], buildRun=str(receipt['buildRun']),
+                    channel='beta', systemRequirements=item['systemRequirements']
+                    + ' · 测试版 · 真机运行验收未完成')
+    elif receipt.get('runtimeAcceptance') is False:
+        raise ValueError('Missing explicit beta publication authorization')
+    return item
+
+
 def prepare(source, version, acceptance, key, mandatory=True):
     check_version(version)
     data = Path(source).read_bytes()
@@ -47,7 +64,7 @@ def prepare(source, version, acceptance, key, mandatory=True):
     item = dict(expected, url=f'/downloads/Superkiro-{version}-Windows.exe',
                 signature='unsigned',
                 systemRequirements='Windows 10/11 x64 · WebView2 · 单文件免安装 · Rust + Tauri')
-    return data, update_signing.signed_entry(item, key, mandatory)
+    return data, update_signing.signed_entry(publication_metadata(item, receipt), key, mandatory)
 
 
 def merge_manifest(previous, item):

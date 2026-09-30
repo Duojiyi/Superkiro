@@ -11,7 +11,7 @@ import struct
 import sys
 import tarfile
 
-from publish_native_windows import ROOT, check_version, publish
+from publish_native_windows import ROOT, check_version, publish, publication_metadata
 import update_signing
 
 
@@ -76,7 +76,7 @@ def prepare(source, version, acceptance, arch, key, mandatory=True):
                 signature='unsigned',
                 systemRequirements='macOS · ' + ('Apple Silicon' if arch == 'arm64' else 'Intel x64')
                 + ' · 无 Developer ID 签名或 Apple 公证 · 解压后运行 .app')
-    return data, update_signing.signed_entry(item, key, mandatory)
+    return data, update_signing.signed_entry(publication_metadata(item, receipt), key, mandatory)
 
 
 def main():

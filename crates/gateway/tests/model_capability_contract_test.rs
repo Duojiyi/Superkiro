@@ -125,6 +125,8 @@ async fn configured_capabilities_reach_catalog_upstream_billing_and_usage() {
                         versions: vec![],
                         removed_models: vec![],
                         cancelled_versions: vec![],
+                        plans: vec![],
+                        removed_plans: vec![],
                     },
                     1_700_000_000
                 )
@@ -142,6 +144,8 @@ async fn configured_capabilities_reach_catalog_upstream_billing_and_usage() {
                     versions: vec![],
                     removed_models: vec![],
                     cancelled_versions: vec![],
+                    plans: vec![],
+                    removed_plans: vec![],
                 },
                 1_700_000_000,
             )
@@ -223,15 +227,9 @@ async fn configured_capabilities_reach_catalog_upstream_billing_and_usage() {
 
         let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
         if credits == 3_000_000 || quota != "none" {
-            // Enough for the old 32K cap, insufficient for the configured 128K budget.
-            assert_eq!(
-                resp.status(),
-                if quota == "none" {
-                    StatusCode::PAYMENT_REQUIRED
-                } else {
-                    StatusCode::TOO_MANY_REQUESTS
-                }
-            );
+            // Enough for the old 32K cap, insufficient for the configured 128K budget:
+            // refused however often it is retried, in words Kiro shows as written.
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
             assert!(mock_server.received_requests().await.unwrap().is_empty());
             assert_eq!(billing.get_card("card-alias-1").unwrap().credit_reserved, 0);
             continue;
@@ -248,8 +246,10 @@ async fn configured_capabilities_reach_catalog_upstream_billing_and_usage() {
             .find(|f| f.event_type() == Some("contextUsageEvent"))
             .unwrap();
         let usage: kiro_wire::events::ContextUsageEvent = event.payload_as_json().unwrap();
+        // The prompt, and the answer the next request sends back: six tokens of text.
         assert!(
-            (usage.context_usage_percentage - 106_000.0 / model_map.context_window as f64).abs()
+            (usage.context_usage_percentage - 100_006.0 * 100.0 / model_map.context_window as f64)
+                .abs()
                 < 1e-6
         );
         assert_eq!(billing.get_card("card-alias-1").unwrap().credit_reserved, 0);

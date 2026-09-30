@@ -19,6 +19,7 @@ fn test_pricing_mode_cost_plus_with_tiered_cache_tokens() {
         credit_face_value_cny: 0.01,
         usd_cny_rate: 7.20,
         rate_updated_at_secs: now_secs,
+        ..BillingSettings::default()
     };
     engine.update_settings(settings);
 
@@ -55,6 +56,7 @@ fn test_pricing_mode_cost_plus_with_tiered_cache_tokens() {
         per_call_credit: 0,
         margin_multiplier: 1.25,
         effective_from_secs: now_secs,
+        official: None,
     };
     engine.upsert_rate_card_version(version);
 
@@ -123,6 +125,7 @@ fn test_pricing_mode_fixed_decoupled_from_cost_with_cost_ledger() {
         credit_face_value_cny: 0.01,
         usd_cny_rate: 7.20,
         rate_updated_at_secs: now_secs,
+        ..BillingSettings::default()
     };
     engine.update_settings(settings);
 
@@ -156,6 +159,7 @@ fn test_pricing_mode_fixed_decoupled_from_cost_with_cost_ledger() {
         per_call_credit: 0,
         margin_multiplier: 1.0,
         effective_from_secs: now_secs,
+        official: None,
     };
     engine.upsert_rate_card_version(version);
 
@@ -216,6 +220,7 @@ fn test_pricing_mode_per_call_flat_fee_and_reservation() {
         credit_face_value_cny: 0.01,
         usd_cny_rate: 7.00,
         rate_updated_at_secs: now_secs,
+        ..BillingSettings::default()
     };
     engine.update_settings(settings);
 
@@ -245,6 +250,7 @@ fn test_pricing_mode_per_call_flat_fee_and_reservation() {
         per_call_credit: 500_000,
         margin_multiplier: 1.0,
         effective_from_secs: now_secs,
+        official: None,
     };
     engine.upsert_rate_card_version(version);
 
@@ -315,6 +321,7 @@ fn test_rate_card_versioning_and_historical_immutability() {
         per_call_credit: 0,
         margin_multiplier: 1.0,
         effective_from_secs: 100,
+        official: None,
     };
     engine.upsert_rate_card_version(v1);
 
@@ -337,6 +344,7 @@ fn test_rate_card_versioning_and_historical_immutability() {
         per_call_credit: 0,
         margin_multiplier: 1.0,
         effective_from_secs: 200,
+        official: None,
     };
     engine.upsert_rate_card_version(v2);
 
@@ -358,6 +366,7 @@ fn test_rate_card_versioning_and_historical_immutability() {
         per_call_credit: 0,
         margin_multiplier: 1.0,
         effective_from_secs: 500,
+        official: None,
     };
     engine.upsert_rate_card_version(v3);
 
@@ -444,6 +453,7 @@ fn test_gross_margin_report_and_manual_adjustment() {
         credit_face_value_cny: 0.01,
         usd_cny_rate: 7.00,
         rate_updated_at_secs: now_secs,
+        ..BillingSettings::default()
     };
     engine.update_settings(settings);
 
@@ -469,6 +479,7 @@ fn test_gross_margin_report_and_manual_adjustment() {
         per_call_credit: 0,
         margin_multiplier: 1.5,
         effective_from_secs: now_secs,
+        official: None,
     };
     engine.upsert_rate_card_version(version);
 
@@ -548,6 +559,7 @@ fn test_stacked_multipliers_model_map_group_and_rate_card() {
         credit_face_value_cny: 0.01,
         usd_cny_rate: 1.0, // 1:1 for simple math
         rate_updated_at_secs: now_secs,
+        ..BillingSettings::default()
     };
     engine.update_settings(settings);
 
@@ -575,6 +587,7 @@ fn test_stacked_multipliers_model_map_group_and_rate_card() {
         per_call_credit: 0,
         margin_multiplier: 1.5,
         effective_from_secs: now_secs,
+        official: None,
     };
     engine.upsert_rate_card_version(version);
 
@@ -695,6 +708,7 @@ fn test_audit_b_fractional_sub_cent_rounding_precision() {
         per_call_credit: 0,
         margin_multiplier: 1.0,
         effective_from_secs: now_secs,
+        official: None,
     };
     engine.upsert_rate_card_version(version);
 
@@ -755,6 +769,7 @@ fn test_audit_b_wildcard_model_fallback() {
         per_call_credit: 250_000,
         margin_multiplier: 1.0,
         effective_from_secs: now_secs,
+        official: None,
     };
     engine.upsert_rate_card_version(wildcard_version);
 
@@ -794,6 +809,7 @@ fn test_audit_b_cross_group_rate_card_isolation() {
         per_call_credit: 50_000_000, // 50 credits
         margin_multiplier: 1.0,
         effective_from_secs: now_secs,
+        official: None,
     };
     engine.upsert_rate_card_version(v_standard);
 
@@ -820,6 +836,7 @@ fn test_audit_b_cross_group_rate_card_isolation() {
         per_call_credit: 10_000_000, // 10 credits
         margin_multiplier: 1.0,
         effective_from_secs: now_secs,
+        official: None,
     };
     engine.upsert_rate_card_version(v_ent);
 
@@ -897,6 +914,7 @@ fn a_version_priced_only_on_cache_tokens_still_reserves() {
         per_call_credit: 0,
         margin_multiplier: 1.0,
         effective_from_secs: 0,
+        official: None,
     };
     let reserve = version.calculate_reserve_amount(10_000, 0, 1.0, 1.0, &settings);
     let charge = version.calculate_charge(
@@ -938,6 +956,7 @@ fn output_price(id: &str, rate_card_id: &str, model: &str, credits_per_m: i64) -
         per_call_credit: 0,
         margin_multiplier: 1.0,
         effective_from_secs: 0,
+        official: None,
     }
 }
 

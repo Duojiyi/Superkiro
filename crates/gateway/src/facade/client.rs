@@ -4,6 +4,7 @@ use super::{json_response, BoxFuture, FacadeHandler, Response};
 use axum::{
     body::Body,
     http::{Method, Request, StatusCode},
+    response::IntoResponse,
 };
 use serde::{Deserialize, Serialize};
 
@@ -207,6 +208,39 @@ impl FacadeHandler for ClientBeaconHandler {
     }
 }
 
+/// Handler for `POST /agents/activity`, where the takeover's endpoint also sends Kiro's
+/// activity log: every line of each session transcript (the customer's messages, the
+/// model's answers, tool inputs and results, file contents among them) every three
+/// seconds. Kiro 1.1 has no setting or variable that turns its publisher off, so the
+/// gateway answers that it took the batch without keeping any of it. A 404 changed
+/// nothing Kiro sends; it only logged a failure each time.
+///
+/// The batch is read to its end and dropped before the answer: answered while Kiro was
+/// still sending a large batch, the connection could be reset, and Kiro, which moves on
+/// only once a batch is answered, sent the same batch again every three seconds.
+pub struct AgentActivityHandler;
+
+/// The most of one activity batch read before answering: 25 transcript lines, file
+/// contents among them.
+const ACTIVITY_BATCH_LIMIT: usize = 64 * 1024 * 1024;
+
+impl FacadeHandler for AgentActivityHandler {
+    fn method(&self) -> Method {
+        Method::POST
+    }
+
+    fn path(&self) -> &'static str {
+        "/agents/activity"
+    }
+
+    fn handle<'a>(&'a self, req: Request<Body>) -> BoxFuture<'a, Response> {
+        Box::pin(async move {
+            super::discard_body(req.into_body(), ACTIVITY_BATCH_LIMIT).await;
+            StatusCode::NO_CONTENT.into_response()
+        })
+    }
+}
+
 /// Handler for `GET /client/brand` (Spec §14.6, P4-8)
 pub struct ClientBrandHandler {
     pub config: WhiteLabelConfig,
@@ -243,7 +277,9 @@ impl FacadeHandler for ClientBrandHandler {
     }
 }
 
-/// Public, read-only announcements; display fields and Unix-second timestamps only.
+/// Public, read-only announcements; display fields and Unix-second timestamps only. Only
+/// those whose window holds now are shown, and one for some groups only to a caller signed
+/// in with a card of one of them.
 pub struct AnnouncementsHandler {
     pub billing: billing::BillingEngine,
 }
@@ -255,16 +291,22 @@ impl FacadeHandler for AnnouncementsHandler {
     fn path(&self) -> &'static str {
         "/api/v1/announcements"
     }
-    fn handle<'a>(&'a self, _req: Request<Body>) -> BoxFuture<'a, Response> {
+    fn handle<'a>(&'a self, req: Request<Body>) -> BoxFuture<'a, Response> {
         Box::pin(async move {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
+            // Put there by the optional sign-in in front of this route.
+            let group = req
+                .extensions()
+                .get::<crate::auth::AuthClaims>()
+                .map(|claims| claims.group_id.as_str());
             let announcements: Vec<_> = self
                 .billing
                 .list_active_announcements(now)
                 .into_iter()
+                .filter(|item| item.is_for(group))
                 .map(|item| {
                     serde_json::json!({
                         "id": item.id, "level": item.level, "title": item.title,

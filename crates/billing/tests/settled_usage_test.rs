@@ -96,7 +96,11 @@ fn aggregates_only_committed_usage_in_utc_window_without_retry_or_cache_double_c
         output_tokens: 999,
         credits_charged: 999,
         provider_cost_micro_cny: 999,
+        needed_micro_credits: None,
+        available_micro_credits: None,
         attempt_chain: vec![],
+        repeats: 0,
+        last_seen_secs: None,
     });
     let stats = engine.settled_usage("card", now).unwrap();
     assert_eq!(stats.total_tokens, 30); // (1 uncached + 3 creation + 4 cached + 2 output) * 3

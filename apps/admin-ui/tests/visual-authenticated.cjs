@@ -34,10 +34,10 @@ const server=http.createServer(async(req,res)=>{
   assert.equal(await page.locator('.chart-column').count(),24);
   const bars=await page.locator('.chart-column').evaluateAll(nodes=>nodes.map(n=>[Number(n.dataset.requests),Number(n.dataset.failed)]));
   assert(bars.reduce((a,[r])=>a+r,0)>0);assert.equal(bars.reduce((a,[,f])=>a+f,0),3);
-  // A cooling Key of a disabled provider raises nothing: one badge, one attention item, for the enabled provider's Key.
+  // A cooling Key of a disabled provider raises nothing: one badge, one attention item, for the enabled provider's Key, named.
   assert.equal(await page.locator('#nav-badge-providers [aria-hidden="true"]').textContent(),'1');
   const coolingItems=await page.locator('.attention-list li').filter({hasText:'冷却中'}).allInnerTexts();
-  assert.equal(coolingItems.length,1);assert(coolingItems[0].startsWith('1 个 Key 冷却中'),coolingItems[0]);
+  assert.equal(coolingItems.length,1);assert(coolingItems[0].startsWith('Key fixture-backup（测试供应商 / Fixture）冷却中'),coolingItems[0]);
   // Add screenshot-only provenance. No application code or production assets know about fixtures.
   await page.evaluate(()=>{const b=document.createElement('div');b.textContent='LOCAL FIXTURE · 已认证测试数据 · 非生产';Object.assign(b.style,{position:'fixed',bottom:'8px',right:'12px',zIndex:'9999',background:'#23272b',color:'white',padding:'6px 10px',fontSize:'11px',borderRadius:'4px',pointerEvents:'none'});document.body.append(b);});
   const pages=[['overview','运营概览'],['cards','卡密资产'],['providers','供应商与 Key'],['pricing','模型与定价'],['groups','分组与权益'],['trace','调用追踪'],['finance','财务对账'],['security','安全与审计'],['announcements','公告管理']];
@@ -52,9 +52,9 @@ const server=http.createServer(async(req,res)=>{
     assert((await astra.innerText()).includes('272K / 128K'));assert((await astra.innerText()).includes('1.25 / 10'));
     await astra.getByRole('button',{name:'调价',exact:true}).click();
     const priceDrawer=page.locator('#price-drawer');await priceDrawer.waitFor();
-    assert.equal(await priceDrawer.getByLabel('新输入售价',{exact:true}).inputValue(),'1.25');
-    await priceDrawer.getByLabel('新输出售价',{exact:true}).fill('8');
-    await priceDrawer.locator('.price-change').getByText('−20%',{exact:true}).waitFor();
+    // No official price yet for this legacy price: it is priced from the official one typed here.
+    for(const [label,value] of [['官方输入价','10'],['官方输出价','50'],['官方缓存写价','12.5'],['官方缓存读价','1'],['计费倍率','0.24'],['成本倍率','0.06']])await priceDrawer.getByLabel(label,{exact:true}).fill(value);
+    await priceDrawer.getByRole('table',{name:'按官方价算出的价格'}).getByText('1.25 → ',{exact:false}).first().waitFor();
     assert(/≈ ¥/.test(await priceDrawer.getByRole('status').innerText()),'the sample shows yuan');
     await shot('price-drawer-desktop.png');
     await page.keyboard.press('Escape');await priceDrawer.waitFor({state:'detached'});
@@ -65,13 +65,13 @@ const server=http.createServer(async(req,res)=>{
   }
   await nav('卡密资产');
   const cardRow=id=>page.getByRole('row').filter({has:page.getByLabel(`选择卡密 ${id}`,{exact:true})});
-  assert.equal(await cardRow('fixture-card-1').getByRole('button',{name:'查看卡密',exact:true}).isDisabled(),true,'a card without kept plaintext cannot be revealed');
+  assert.equal(await cardRow('fixture-card-1').getByRole('button',{name:'显示卡密',exact:true}).isDisabled(),true,'a card without kept plaintext cannot be revealed');
   await page.getByRole('textbox',{name:'搜索卡密',exact:true}).fill('fixture-card-0');
   assert.equal(await page.locator('tbody tr').count(),1);
-  await page.getByRole('button',{name:'查看卡密',exact:true}).click();
+  await page.getByRole('button',{name:'显示卡密',exact:true}).click();
   await page.getByLabel('卡密明文',{exact:true}).waitFor();
   assert.equal(await page.getByLabel('卡密明文',{exact:true}).inputValue(),'FIXTURE-RECOVERED-CODE');
-  await page.getByRole('dialog',{name:'查看卡密'}).getByRole('button',{name:'关闭',exact:true}).click();
+  await page.getByRole('dialog',{name:'显示卡密'}).getByRole('button',{name:'关闭',exact:true}).click();
   assert.equal(await page.getByLabel('卡密明文',{exact:true}).count(),0);
   await cardRow('fixture-card-0').getByRole('button',{name:'更多操作'}).click();await page.getByRole('menuitem',{name:'冻结'}).click();await confirm();
   await cardRow('fixture-card-0').getByText('已冻结',{exact:true}).waitFor();

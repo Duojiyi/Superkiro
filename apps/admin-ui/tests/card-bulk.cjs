@@ -90,6 +90,31 @@ const server=http.createServer(async(req,res)=>{
     await results.getByText('bulk-1：失败或结果未确认，请刷新核对后再操作',{exact:true}).waitFor();
     await idle();
     assert.deepEqual(statusCalls.map(c=>c.cardId),['bulk-0','bulk-1']);assert.equal(await checked().count(),1);assert(await check(1).isChecked());await button('取消选择').click();
+    // 选择全部 N 张筛选结果: offered once the whole page is ticked, it takes every card the filter finds, on every page.
+    const everyResult=()=>bar.getByRole('button',{name:'选择全部 55 张筛选结果',exact:true});
+    await check(0).check();assert.equal(await everyResult().count(),0,'offered only with the whole page ticked');
+    await page.getByLabel('全选本页',{exact:true}).check();await everyResult().click();
+    await bar.getByText('已选 55 张（全部筛选结果）',{exact:true}).waitFor();
+    await check(3).uncheck();await bar.getByText('已选 49 张',{exact:true}).waitFor();
+    assert.equal(await checked().count(),49,'unticking one of them goes back to this page, less that card');
+    await page.getByLabel('全选本页',{exact:true}).check();await everyResult().click();
+    await page.getByLabel('搜索卡密',{exact:true}).fill('bulk');await bar.waitFor({state:'detached'});// a change of filter drops the choice
+    await page.getByLabel('搜索卡密',{exact:true}).fill('');
+    await page.getByLabel('全选本页',{exact:true}).check();await everyResult().click();
+    await button('下一页').click();assert.equal(await checked().count(),5,'the choice carries across the pages');
+    // An irreversible action over all of them still names a sample and needs the count typed.
+    await barButton('永久作废').click();
+    const allBox=page.getByRole('alertdialog');await allBox.waitFor();const allText=await allBox.innerText();
+    for(const part of ['永久作废 55 张卡密？','全部 55 张筛选结果（不只本页）','bulk-0、bulk-1','等 55 张'])assert(allText.includes(part),`confirmation mentions ${part}: ${allText}`);
+    assert.equal(await allBox.locator('.field-label b').innerText(),'55');
+    await allBox.getByRole('button',{name:'取消',exact:true}).click();await allBox.waitFor({state:'detached'});
+    const beforeAll=statusCalls.length;
+    await barButton('冻结').click();await confirmation(true,['冻结 55 张卡密？','全部 55 张筛选结果（不只本页）']);await idle();
+    const sentToAll=statusCalls.slice(beforeAll);
+    assert.equal(sentToAll.length,55);assert(sentToAll.every(call=>call.action==='freeze'));
+    assert(sentToAll.some(call=>call.cardId==='bulk-54')&&sentToAll.some(call=>call.cardId==='bulk-0'),'cards on both pages');
+    await bar.getByText('已选 1 张',{exact:true}).waitFor();// bulk-1 fails here: it alone stays selected
+    await button('取消选择').click();await button('上一页').click();
     for(const [action,run] of [['unfreeze',()=>barButton('解冻').click()],['ban',()=>more('封禁')]]){
       cards[3].status=action==='unfreeze'?'frozen':'active';await button('刷新').click();await idle();
       await check(3).check();await run();await confirmation(true);
@@ -99,7 +124,9 @@ const server=http.createServer(async(req,res)=>{
     await check(0).check();await check(1).check();await check(2).check();
     const downloadPromise=page.waitForEvent('download');await barButton('导出明文').click();await confirmation(true,['明文']);
     const download=await downloadPromise;
-    assert.equal(fs.readFileSync(await download.path(),'utf8'),'TEST-ONLY-bulk-0');
+    // A spreadsheet file: each code beside its card's ID, so the codes can be matched to orders.
+    assert.equal(download.suggestedFilename().endsWith('.csv'),true);
+    assert.equal(fs.readFileSync(await download.path(),'utf8'),'\uFEFF"卡密 ID","卡密"\r\n"bulk-0","TEST-ONLY-bulk-0"');
     await idle();
     assert.deepEqual(revealCalls,['bulk-0','bulk-1']);
     assert((await results.innerText()).includes('历史卡密不可恢复'));
@@ -169,6 +196,9 @@ const server=http.createServer(async(req,res)=>{
     await page.evaluate(intent=>sessionStorage.setItem('superkiro.pending-adjustment.v1:admin',JSON.stringify(intent)),pendingAdjustment);
     // The server names the operator, so the reload needs no second sign-in to find the intent.
     await page.reload();await page.getByRole('navigation').getByRole('button',{name:'卡密资产',exact:true}).click();
+    // The reload keeps the page and its filters (全部); 当前 no longer lists a voided card.
+    assert.equal(await page.getByRole('tablist',{name:'状态筛选'}).locator('[aria-selected="true"]').getAttribute('data-value'),'ALL');
+    await statusTab('CURRENT');
     await check(5).check();
     assert(await barButton('永久作废').isVisible());
     const beforePendingVoid=statusCalls.length;

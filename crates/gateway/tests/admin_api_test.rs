@@ -56,7 +56,12 @@ async fn test_admin_unauthorized_without_valid_key() {
 
 #[tokio::test]
 async fn test_admin_stats_and_cards_query() {
-    let (_billing, app) = setup_admin_app();
+    let (billing, app) = setup_admin_app();
+    // Active in its status, but past its expiry: expired, as the customer meets it.
+    let mut lapsed = Card::new("card-admin-lapsed", "group-admin", 5_000_000);
+    lapsed.status = CardStatus::Active;
+    lapsed.valid_until = Some(1);
+    billing.upsert_card(lapsed);
 
     // 1. GET /api/v1/admin/stats
     let req = Request::builder()
@@ -73,8 +78,9 @@ async fn test_admin_stats_and_cards_query() {
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(json["totalCards"], 2);
+    assert_eq!(json["totalCards"], 3);
     assert_eq!(json["activeCards"], 1);
+    assert_eq!(json["expiredCards"], 1);
     assert_eq!(json["unactivatedCards"], 1);
 
     // 2. GET /api/v1/admin/cards
@@ -92,8 +98,8 @@ async fn test_admin_stats_and_cards_query() {
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(json["count"], 2);
-    assert!(json["cards"].as_array().unwrap().len() >= 2);
+    assert_eq!(json["count"], 3);
+    assert!(json["cards"].as_array().unwrap().len() >= 3);
 }
 
 #[tokio::test]
@@ -1112,6 +1118,11 @@ async fn the_operator_can_archive_the_ledger_to_shrink_the_saved_state() {
     let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(result["receipt"]["drained_entries_count"], 1);
     assert!(result["stateBytesAfter"].as_u64().unwrap() > 0);
+    // The receipt: what moved, where to, and the saved state's size before and after.
+    assert_eq!(result["movedEntries"], 1);
+    assert_eq!(result["archiveFile"], result["receipt"]["archive_file"]);
+    assert!(result["stateBytesBefore"].as_u64().unwrap() > 0);
+    assert!(result["stateCeilingBytes"].as_u64().unwrap() > 0);
 
     // The balance is unchanged, and the archive is not readable without the key.
     assert_eq!(billing.get_card("card-archive").unwrap().credit_used, used);
@@ -1398,6 +1409,7 @@ async fn publication_takes_first_prices_from_now_retirement_and_removals() {
             per_call_credit: 0,
             margin_multiplier: 1.0,
             effective_from_secs: from,
+            official: None,
         })
         .unwrap()
     };
@@ -1450,4 +1462,2018 @@ async fn publication_takes_first_prices_from_now_retirement_and_removals() {
         .map(|v| v["id"].as_str().unwrap())
         .collect();
     assert_eq!(ids, ["v-now"]);
+}
+
+/// The console publishes the official pricing settings and a price with the official price it
+/// was computed from, and reads both back. A new face value that leaves that price at the old
+/// one is refused with 409, naming it.
+#[tokio::test]
+async fn official_pricing_publishes_and_reads_back_through_the_admin_api() {
+    use tower::ServiceExt;
+    let (billing, app) = setup_admin_app();
+    let send = |body: Option<serde_json::Value>| {
+        let app = app.clone();
+        let revision = billing.commercial_config().revision;
+        async move {
+            let request = Request::builder()
+                .uri("/api/v1/admin/commercial-config")
+                .header("x-admin-key", TEST_ADMIN_KEY);
+            let request = match body {
+                Some(mut update) => {
+                    update["expected_revision"] = json!(revision);
+                    update["reason"] = json!("official pricing");
+                    request
+                        .method(Method::POST)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(update.to_string()))
+                }
+                None => request.body(Body::empty()),
+            };
+            let response = app.oneshot(request.unwrap()).await.unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            )
+        }
+    };
+    // Claude Opus 5's official prices, billed by the upstream at others: 8 credits an
+    // official dollar at 0.03 CNY a credit, and 0.22 of what the upstream bills.
+    let official = json!({
+        "input_usd_per_m": 5.0,
+        "output_usd_per_m": 25.0,
+        "cache_creation_usd_per_m": 6.25,
+        "cache_read_usd_per_m": 0.5,
+        "price_multiplier": 0.24,
+        "cost_multiplier": 0.22,
+        "cost_basis_usd_per_m": [2.0, 25.0, 6.25, 0.5],
+        "usd_cny": 1.0,
+        "credit_face_value_cny": 0.03
+    });
+    let settings = json!({
+        "credit_face_value_cny": 0.03,
+        "usd_cny_rate": 7.25,
+        "official_usd_cny": 1.0,
+        "default_price_multiplier": 0.24,
+        "default_cost_multiplier": 0.08,
+        "provider_cost_multipliers": {"hanyue-max": 0.22, "kimera-primary": 0.08},
+        "official_prices": {"claude-opus-5-5": {
+            "input_usd_per_m": 4.0, "output_usd_per_m": 20.0,
+            "cache_creation_usd_per_m": 5.0, "cache_read_usd_per_m": 0.2, "note": "list price"
+        }},
+        "route_costs": {"hanyue-max/claude-opus-5-5": {"basis_usd_per_m": [2.0, 25.0, 6.25, 0.5]}}
+    });
+    let before = gateway::now_secs();
+    let (status, body) = send(Some(json!({
+        "settings": settings,
+        "versions": [{
+            "id": "opus-5-5-official", "rate_card_id": "default", "model": "claude-opus-5-5",
+            "currency": "CNY", "pricing_mode": "fixed",
+            "input_price_per_m": 0.44, "output_price_per_m": 5.5,
+            "cache_creation_price_per_m": 1.375, "cache_read_price_per_m": 0.11,
+            "fixed_input_credit_per_m": 40_000_000, "fixed_output_credit_per_m": 200_000_000,
+            "fixed_cache_creation_credit_per_m": 50_000_000,
+            "fixed_cache_read_credit_per_m": 4_000_000,
+            "per_call_credit": 0, "margin_multiplier": 1.0, "effective_from_secs": 0,
+            "official": official
+        }]
+    })))
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = send(None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let config = &body["config"];
+    for field in [
+        "official_usd_cny",
+        "default_price_multiplier",
+        "default_cost_multiplier",
+        "provider_cost_multipliers",
+        "route_costs",
+    ] {
+        assert_eq!(config["settings"][field], settings[field], "{field}");
+    }
+    // The server stamps when an official price changed.
+    let mut price = config["settings"]["official_prices"]["claude-opus-5-5"].clone();
+    let stamped = price
+        .as_object_mut()
+        .unwrap()
+        .remove("updated_at_secs")
+        .unwrap();
+    assert!(stamped.as_u64().unwrap() >= before, "{stamped}");
+    assert_eq!(price, settings["official_prices"]["claude-opus-5-5"]);
+    assert_eq!(config["versions"][0]["official"], official);
+
+    // What the console sends today: the face value alone.
+    let (status, body) = send(Some(json!({
+        "settings": {"credit_face_value_cny": 0.05, "usd_cny_rate": 7.25}
+    })))
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .ends_with("Official pricing is at a stale face value or rate: claude-opus-5-5"),
+        "{body}"
+    );
+}
+
+/// An administrator's request to `uri`: its status and JSON body.
+async fn admin_call(
+    app: &axum::Router,
+    method: Method,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("x-admin-key", TEST_ADMIN_KEY)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body.map_or_else(Body::empty, |body| Body::from(body.to_string())))
+        .unwrap();
+    let response = tower::ServiceExt::oneshot(app.clone(), request)
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap_or_default())
+}
+
+/// The newest event of `action` in a card's history, as the console reads it.
+async fn newest_event(app: &axum::Router, card_id: &str, action: &str) -> serde_json::Value {
+    let (status, body) = admin_call(
+        app,
+        Method::GET,
+        &format!("/api/v1/admin/cards/history?card_id={card_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    body["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["action"] == action)
+        .cloned()
+        .unwrap_or_else(|| panic!("no {action} event: {body}"))
+}
+
+/// A balance adjustment sent under an idempotency key: its status and JSON body.
+async fn adjust(
+    app: &axum::Router,
+    idempotency_key: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/admin/cards/adjust")
+        .header("x-admin-key", TEST_ADMIN_KEY)
+        .header("idempotency-key", idempotency_key)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = tower::ServiceExt::oneshot(app.clone(), request)
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap_or_default())
+}
+
+/// A request the card made and was charged `credits` micro-credits for, as its trace keeps it.
+fn charged_request(billing: &BillingEngine, card_id: &str, invocation_id: &str, credits: i64) {
+    billing.record_trace(billing::RequestTrace {
+        id: format!("trace-{invocation_id}"),
+        card_id: card_id.into(),
+        ts: 1_700_000_000,
+        invocation_id: invocation_id.into(),
+        exposed_model: "claude-opus-5".into(),
+        status: billing::TraceStatus::Success,
+        credits_charged: credits,
+        ..billing::RequestTrace::default()
+    });
+}
+
+/// A publication as large as the largest settings the validation allows is read; one over
+/// the limit is refused unread.
+#[tokio::test]
+async fn a_publication_the_size_of_the_largest_settings_is_read() {
+    use tower::ServiceExt;
+    let (billing, app) = setup_admin_app();
+    let update = json!({
+        "expected_revision": billing.commercial_config().revision,
+        "reason": "large publication",
+        "groups": [billing::Group::pro_plus("new-tier", "New tier")],
+        "rate_cards": [billing::RateCard::new("default", "Default", 100)],
+    });
+    let publish = |padding: usize| {
+        // Whitespace, which JSON allows anywhere between values.
+        let body = format!("{}{update}", " ".repeat(padding));
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/admin/commercial-config")
+            .header("x-admin-key", TEST_ADMIN_KEY)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        app.clone().oneshot(request)
+    };
+    let response = publish(430 * 1024).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = publish(billing::engine::MAX_COMMERCIAL_UPDATE_BYTES)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// A group or card ID has one bound, in bytes, wherever it is named: a group a publication
+/// may create can receive cards and be issued from.
+#[tokio::test]
+async fn a_group_or_card_id_has_one_bound_everywhere() {
+    let (billing, app) = setup_admin_app();
+    billing.set_master_kek(billing::MasterKek::from_bytes([37; 32]));
+    let longest = "g".repeat(billing::MAX_GROUP_ID_BYTES);
+    billing.upsert_group(billing::Group::pro_plus(&longest, "Longest"));
+    let (status, body) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/cards/group",
+        Some(json!({"cardId": "card-admin-02", "groupId": longest, "reason": "升级"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["card"]["groupId"], longest.as_str());
+    let (status, body) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/cards/batch",
+        Some(json!({"count": 1, "groupId": longest})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["count"], 1);
+
+    let too_long = "g".repeat(billing::MAX_GROUP_ID_BYTES + 1);
+    let (status, _) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/cards/group",
+        Some(json!({"cardId": "card-admin-02", "groupId": too_long, "reason": "升级"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/cards/batch",
+        Some(json!({"count": 1, "groupId": too_long})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // Bytes, not characters: 43 three-byte characters are 129 bytes.
+    let (status, _) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/cards/note",
+        Some(json!({"cardId": "卡".repeat(43), "note": "VIP"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn a_compensation_names_a_request_of_the_card_and_is_paid_once() {
+    let (billing, app) = setup_admin_app();
+    billing.upsert_card(Card::new("card-other", "group-admin", 1_000));
+    charged_request(&billing, "card-admin-02", "card-admin-02:inv-1", 3_000_000);
+    charged_request(&billing, "card-other", "card-other:inv-2", 3_000_000);
+    let body = |points: f64, invocation: &str| {
+        json!({"cardId": "card-admin-02", "deltaPoints": points, "reason": "补偿失败请求",
+            "invocationId": invocation})
+    };
+    let before = billing
+        .get_card("card-admin-02")
+        .unwrap()
+        .available_credits();
+    for (key, request, expected, message) in [
+        (
+            "comp-unknown",
+            body(1.0, "card-admin-02:inv-missing"),
+            StatusCode::NOT_FOUND,
+            "Request card-admin-02:inv-missing was not found".to_string(),
+        ),
+        (
+            "comp-other-card",
+            body(1.0, "card-other:inv-2"),
+            StatusCode::CONFLICT,
+            "Request card-other:inv-2 was made by card card-other, not card-admin-02".to_string(),
+        ),
+        (
+            "comp-too-much",
+            body(4.0, "card-admin-02:inv-1"),
+            StatusCode::CONFLICT,
+            "Request card-admin-02:inv-1 was charged 3 credits at 2023-11-14T22:13:20Z; a \
+             compensation of 4 credits is more than that; send allowRepeat with a reason to \
+             compensate more"
+                .to_string(),
+        ),
+        (
+            "comp-long-id",
+            body(1.0, &format!("card-admin-02:{}", "x".repeat(245))),
+            StatusCode::BAD_REQUEST,
+            "invocationId must be 1-257 ASCII letters, digits, -_.:".to_string(),
+        ),
+        (
+            "comp-repeat-no-reason",
+            json!({"cardId": "card-admin-02", "deltaPoints": 1.0, "allowRepeat": true,
+                "invocationId": "card-admin-02:inv-1"}),
+            StatusCode::BAD_REQUEST,
+            "allowRepeat needs a reason".to_string(),
+        ),
+    ] {
+        let (status, response) = adjust(&app, key, request).await;
+        assert_eq!(status, expected, "{key}: {response}");
+        // Malformed requests are refused in the older shape, with a message.
+        let error = response["error"].as_str().or(response["message"].as_str());
+        assert_eq!(error, Some(message.as_str()), "{key}");
+    }
+    assert_eq!(
+        billing
+            .get_card("card-admin-02")
+            .unwrap()
+            .available_credits(),
+        before
+    );
+
+    let (status, response) = adjust(&app, "comp-1", body(2.0, "card-admin-02:inv-1")).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    // A second compensation under a fresh key is refused and names the first.
+    let (status, response) = adjust(&app, "comp-2", body(1.0, "card-admin-02:inv-1")).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    let error = response["error"].as_str().unwrap();
+    assert!(
+        error.contains("was already compensated 2 credits at")
+            && error.contains("by admin (补偿失败请求)"),
+        "{error}"
+    );
+    // The operator can compensate again, with a reason.
+    let mut repeat = body(1.0, "card-admin-02:inv-1");
+    repeat["allowRepeat"] = json!(true);
+    let (status, response) = adjust(&app, "comp-3", repeat).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    // An adjustment that names no request is not checked against one.
+    let (status, response) = adjust(
+        &app,
+        "comp-plain",
+        json!({"cardId": "card-admin-02", "deltaPoints": 10.0, "reason": "活动赠送"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(
+        billing
+            .get_card("card-admin-02")
+            .unwrap()
+            .available_credits(),
+        before + 13_000_000
+    );
+}
+
+#[tokio::test]
+async fn card_support_actions_are_written_to_the_history_with_the_operator() {
+    let (billing, app) = setup_admin_app();
+    let now = gateway::now_secs();
+    let mut card = Card::new("card-support", "group-admin", 10_000_000);
+    card.status = CardStatus::Active;
+    card.activated_at = Some(now - 86_400);
+    card.valid_until = Some(now + 86_400);
+    card.max_rebinds = 2;
+    card.rebind_count = 2;
+    card.rebind_cooldown_secs = 86_400;
+    card.last_rebind_at = Some(now - 60);
+    card.bound_devices = vec!["device-old".into()];
+    billing.upsert_card(card);
+    billing.upsert_group(billing::Group::pro_plus("group-new", "New"));
+    let post = |path: &str, body: serde_json::Value| {
+        let app = app.clone();
+        let uri = format!("/api/v1/admin/cards/{path}");
+        async move { admin_call(&app, Method::POST, &uri, Some(body)).await }
+    };
+
+    let (status, body) = post(
+        "devices/unbind",
+        json!({"cardId": "card-support", "deviceId": "device-old", "reason": "换电脑"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["card"]["boundDevices"], json!([]));
+    assert_eq!(
+        body["card"]["rebindsUsed"], 2,
+        "the customer's allowance is untouched"
+    );
+    let event = newest_event(&app, "card-support", "unbind").await;
+    assert_eq!(event["operator"], "admin");
+    assert_eq!(event["reason"], "换电脑");
+    assert_eq!(event["detail"], json!({"deviceId": "device-old"}));
+
+    let (status, body) = post(
+        "rebinds/reset",
+        json!({"cardId": "card-support", "reason": "客户多次换机"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["card"]["rebindsUsed"], 0);
+    assert_eq!(body["card"]["rebindCooldownUntil"], serde_json::Value::Null);
+    let event = newest_event(&app, "card-support", "rebinds_reset").await;
+    assert_eq!(event["reason"], "客户多次换机");
+    assert_eq!(event["detail"]["previousRebinds"], 2);
+
+    let (status, body) = post(
+        "validity",
+        json!({"cardIds": ["card-support"], "days": 30, "reason": "补偿停机"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["count"], 1);
+    let until = now + 31 * 86_400;
+    assert_eq!(body["cards"][0]["validUntil"], until);
+    let event = newest_event(&app, "card-support", "extend").await;
+    assert_eq!(
+        event["detail"],
+        json!({"validUntil": until, "previousValidUntil": now + 86_400})
+    );
+    let (status, body) = post(
+        "validity",
+        json!({"cardIds": ["card-support"], "validUntilSecs": until + 86_400, "reason": "续期"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["cards"][0]["validUntil"], until + 86_400);
+
+    let (status, body) = post(
+        "note",
+        json!({"cardId": "card-support", "note": "VIP 客户"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["card"]["note"], "VIP 客户");
+    let event = newest_event(&app, "card-support", "note").await;
+    assert_eq!(event["operator"], "admin");
+    assert_eq!(event["reason"], serde_json::Value::Null);
+    assert_eq!(
+        event["detail"],
+        json!({"note": "VIP 客户", "previousNote": null})
+    );
+
+    let (status, body) = post(
+        "group",
+        json!({"cardId": "card-support", "groupId": "group-new", "reason": "升级套餐"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["card"]["groupId"], "group-new");
+    let event = newest_event(&app, "card-support", "group").await;
+    assert_eq!(
+        event["detail"],
+        json!({"previousGroupId": "group-admin", "groupId": "group-new"})
+    );
+
+    // Unban through the status endpoint, with a reason, keeping the ban's revocation.
+    let (status, _) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/cards/status",
+        Some(json!({"cardId": "card-support", "action": "ban", "reason": "滥用"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let banned = billing.get_card("card-support").unwrap();
+    let (status, body) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/cards/status",
+        Some(json!({"cardId": "card-support", "action": "unban", "reason": "误封"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["newStatus"], "active");
+    assert_eq!(body["card"]["effectiveStatus"], "active");
+    // The note loses what the ban put before it.
+    assert_eq!(body["card"]["note"], "VIP 客户");
+    assert_eq!(
+        billing.get_card("card-support").unwrap().token_version,
+        banned.token_version
+    );
+    let event = newest_event(&app, "card-support", "unban").await;
+    assert_eq!(event["reason"], "误封");
+
+    // A compensation names the request it makes up for.
+    charged_request(
+        &billing,
+        "card-support",
+        "card-support:inv-failed-1",
+        3_000_000,
+    );
+    let (status, body) = adjust(
+        &app,
+        "comp-support-1",
+        json!({"cardId": "card-support", "deltaPoints": 2.0, "reason": "补偿失败请求",
+            "invocationId": "card-support:inv-failed-1"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let event = newest_event(&app, "card-support", "adjust").await;
+    assert_eq!(event["invocationId"], "card-support:inv-failed-1");
+    assert_eq!(event["credits"], 2_000_000);
+
+    // The history carries the card as it now is.
+    let (_, history) = admin_call(
+        &app,
+        Method::GET,
+        "/api/v1/admin/cards/history?card_id=card-support",
+        None,
+    )
+    .await;
+    assert_eq!(history["card"]["id"], "card-support");
+    assert_eq!(history["card"]["groupId"], "group-new");
+}
+
+/// A card's concurrency and limits, and a new code for a leaked one, are support actions:
+/// bounded, and written to the history with who, why and what they replaced.
+#[tokio::test]
+async fn quotas_and_a_new_code_are_support_actions_in_the_history() {
+    let (billing, app) = setup_admin_app();
+    billing.set_master_kek(billing::MasterKek::from_bytes([21; 32]));
+    let old_code = "kiro-aaaa-bbbb-cccc-dddd-eeee-ffff-0000-1111";
+    billing
+        .set_card_code_hash("card-admin-02", &billing::hash_card_code(old_code))
+        .unwrap();
+    let post = |path: &str, body: serde_json::Value| {
+        let app = app.clone();
+        let uri = format!("/api/v1/admin/cards/{path}");
+        async move { admin_call(&app, Method::POST, &uri, Some(body)).await }
+    };
+    let before = billing.get_card("card-admin-02").unwrap();
+    let limits =
+        "dailyCreditLimit and monthlyCreditLimit must be null or 0-10000000000000 micro-credits";
+    for (body, status, message) in [
+        (
+            json!({"cardId": "card-admin-02", "reason": "调整"}),
+            StatusCode::BAD_REQUEST,
+            "Give maxConcurrency, dailyCreditLimit or monthlyCreditLimit",
+        ),
+        (
+            json!({"cardId": "card-admin-02", "maxConcurrency": 0, "reason": "调整"}),
+            StatusCode::BAD_REQUEST,
+            "maxConcurrency must be between 1 and 20",
+        ),
+        (
+            json!({"cardId": "card-admin-02", "maxConcurrency": 21, "reason": "调整"}),
+            StatusCode::BAD_REQUEST,
+            "maxConcurrency must be between 1 and 20",
+        ),
+        (
+            json!({"cardId": "card-admin-02", "dailyCreditLimit": -1, "reason": "调整"}),
+            StatusCode::BAD_REQUEST,
+            limits,
+        ),
+        (
+            json!({"cardId": "card-admin-02", "monthlyCreditLimit": 10_000_000_000_001i64,
+                "reason": "调整"}),
+            StatusCode::BAD_REQUEST,
+            limits,
+        ),
+        (
+            json!({"cardId": "card-admin-02", "maxConcurrency": 2}),
+            StatusCode::BAD_REQUEST,
+            "A reason of 1 to 200 bytes is required",
+        ),
+        (
+            json!({"cardId": "no-such-card", "maxConcurrency": 2, "reason": "调整"}),
+            StatusCode::NOT_FOUND,
+            "Card no-such-card not found",
+        ),
+    ] {
+        let (got, response) = post("quotas", body.clone()).await;
+        assert_eq!(got, status, "{body}: {response}");
+        assert_eq!(response["error"], message, "{body}");
+    }
+    assert_eq!(billing.get_card("card-admin-02").unwrap(), before);
+
+    let (status, body) = post(
+        "quotas",
+        json!({"cardId": "card-admin-02", "maxConcurrency": 3, "dailyCreditLimit": 5_000_000,
+            "reason": "大客户"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        (
+            &body["card"]["maxConcurrency"],
+            &body["card"]["dailyCreditLimit"]
+        ),
+        (&json!(3), &json!(5_000_000))
+    );
+    // Null clears a limit; what is left out stays.
+    let (status, body) = post(
+        "quotas",
+        json!({"cardId": "card-admin-02", "dailyCreditLimit": null, "reason": "取消日限额"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["card"]["dailyCreditLimit"], serde_json::Value::Null);
+    assert_eq!(body["card"]["maxConcurrency"], 3);
+    let event = newest_event(&app, "card-admin-02", "quotas").await;
+    assert_eq!(
+        (&event["operator"], &event["reason"]),
+        (&json!("admin"), &json!("取消日限额"))
+    );
+    assert_eq!(
+        event["detail"],
+        json!({"dailyCreditLimit": null, "previousDailyCreditLimit": 5_000_000})
+    );
+
+    // A new code, this once and never cached: it signs in, the old one no more, and every
+    // session ends.
+    let (status, _) = post("rekey", json!({"cardId": "card-admin-02"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/admin/cards/rekey")
+        .header("x-admin-key", TEST_ADMIN_KEY)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({"cardId": "card-admin-02", "reason": "卡密泄露"}).to_string(),
+        ))
+        .unwrap();
+    let response = tower::ServiceExt::oneshot(app.clone(), request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let new_code = body["rawCode"].as_str().unwrap().to_string();
+    assert!(new_code.starts_with("kiro-"), "{new_code}");
+    assert_eq!(body["card"]["codeRecoverable"], true);
+    assert_eq!(
+        billing.find_card_by_secret(&new_code).map(|card| card.id),
+        Some("card-admin-02".to_string())
+    );
+    assert!(billing.find_card_by_secret(old_code).is_none());
+    assert_eq!(
+        billing.get_card("card-admin-02").unwrap().token_version,
+        before.token_version + 1
+    );
+    let event = newest_event(&app, "card-admin-02", "rekey").await;
+    assert_eq!(event["reason"], "卡密泄露");
+    assert!(event["detail"]["previousCodeFingerprint"].is_string());
+    assert!(!event.to_string().contains(&new_code));
+    let (status, _) = post("rekey", json!({"cardId": "no-such-card", "reason": "泄露"})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn card_support_actions_refuse_with_a_message_and_change_nothing() {
+    let (billing, app) = setup_admin_app();
+    let mut voided = Card::new("card-voided", "group-admin", 1_000);
+    voided.status = CardStatus::Voided;
+    billing.upsert_card(voided);
+    let mut closed = billing::Group::pro_plus("group-closed", "Acceptance");
+    closed.issuance_enabled = false;
+    billing.upsert_group(closed);
+    let long_reason = "x".repeat(201);
+    let before = billing.export_snapshot();
+    for (path, body, expected, message) in [
+        (
+            "devices/unbind",
+            json!({"cardId": "card-admin-02", "deviceId": "device-x", "reason": "换电脑"}),
+            StatusCode::NOT_FOUND,
+            "Device device-x not found for card card-admin-02",
+        ),
+        (
+            "devices/unbind",
+            json!({"cardId": "card-admin-02", "deviceId": "device-x"}),
+            StatusCode::BAD_REQUEST,
+            "A reason of 1 to 200 bytes is required",
+        ),
+        (
+            "rebinds/reset",
+            json!({"cardId": "card-admin-02", "reason": long_reason}),
+            StatusCode::BAD_REQUEST,
+            "A reason of 1 to 200 bytes is required",
+        ),
+        (
+            "rebinds/reset",
+            json!({"cardId": "no-such-card", "reason": "x"}),
+            StatusCode::NOT_FOUND,
+            "Card no-such-card not found",
+        ),
+        (
+            "validity",
+            json!({"cardIds": ["card-admin-02", "card-voided"], "days": 5, "reason": "续期"}),
+            StatusCode::CONFLICT,
+            "Voided cards cannot be extended: card-voided",
+        ),
+        (
+            "validity",
+            json!({"cardIds": ["card-admin-02"], "days": 5, "validUntilSecs": 4_000_000_000u64, "reason": "续期"}),
+            StatusCode::BAD_REQUEST,
+            "Give exactly one of days and validUntilSecs",
+        ),
+        (
+            "validity",
+            json!({"cardIds": ["card-admin-02"], "days": 3651, "reason": "续期"}),
+            StatusCode::BAD_REQUEST,
+            "days must be between 1 and 3650",
+        ),
+        (
+            "validity",
+            json!({"cardIds": [], "days": 5, "reason": "续期"}),
+            StatusCode::BAD_REQUEST,
+            "cardIds must name 1 to 500 cards",
+        ),
+        (
+            "note",
+            json!({"cardId": "card-admin-02", "note": "a\nb"}),
+            StatusCode::BAD_REQUEST,
+            "note must be at most 256 bytes, without control characters",
+        ),
+        (
+            "note",
+            json!({"cardId": "card-admin-02", "note": "字".repeat(86)}),
+            StatusCode::BAD_REQUEST,
+            "note must be at most 256 bytes, without control characters",
+        ),
+        (
+            "group",
+            json!({"cardId": "card-admin-02", "groupId": "group-missing", "reason": "x"}),
+            StatusCode::CONFLICT,
+            "Unknown group: group-missing",
+        ),
+        (
+            "group",
+            json!({"cardId": "card-admin-02", "groupId": "group-closed", "reason": "x"}),
+            StatusCode::CONFLICT,
+            "Group does not take cards: group-closed",
+        ),
+    ] {
+        let (status, body) = admin_call(
+            &app,
+            Method::POST,
+            &format!("/api/v1/admin/cards/{path}"),
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, expected, "{path}: {body}");
+        assert_eq!(body["success"], false, "{path}");
+        assert_eq!(body["error"], message, "{path}");
+    }
+    // An unknown field is refused rather than ignored.
+    let (status, body) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/cards/note",
+        Some(json!({"cardId": "card-admin-02", "note": "x", "reason": "x"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .starts_with("Invalid request body"));
+    // Unbanning needs a reason, and a banned card.
+    for (body, message) in [
+        (
+            json!({"cardId": "card-admin-02", "action": "unban"}),
+            "A reason of 1 to 200 bytes is required",
+        ),
+        (
+            json!({"cardId": "card-admin-02", "action": "unban", "reason": "误封"}),
+            "Invalid billing state: cannot unban Active",
+        ),
+    ] {
+        let (status, body) =
+            admin_call(&app, Method::POST, "/api/v1/admin/cards/status", Some(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], message);
+    }
+    let after = billing.export_snapshot();
+    assert_eq!(after.cards, before.cards);
+    assert_eq!(after.ledger.len(), before.ledger.len());
+
+    // Only an administrator.
+    for path in [
+        "devices/unbind",
+        "rebinds/reset",
+        "validity",
+        "note",
+        "group",
+    ] {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/v1/admin/cards/{path}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({"cardId": "card-admin-02"}).to_string()))
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app.clone(), request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn card_views_show_the_rebind_allowance_and_the_effective_status() {
+    let (billing, app) = setup_admin_app();
+    let now = gateway::now_secs();
+    let mut lapsed = Card::new("card-lapsed", "group-admin", 1_000);
+    lapsed.status = CardStatus::Active;
+    lapsed.activated_at = Some(now - 40 * 86_400);
+    lapsed.valid_until = Some(now - 1);
+    lapsed.rebind_count = 1;
+    lapsed.max_rebinds = 3;
+    lapsed.last_rebind_at = Some(now - 100);
+    lapsed.rebind_cooldown_secs = 3_600;
+    billing.upsert_card(lapsed);
+    let mut waiting = Card::new("card-waiting", "group-admin", 1_000);
+    waiting.activation_duration_secs = Some(30 * 86_400);
+    billing.upsert_card(waiting);
+
+    let (status, body) = admin_call(&app, Method::GET, "/api/v1/admin/cards", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let card = |id: &str| {
+        body["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|card| card["id"] == id)
+            .cloned()
+            .unwrap()
+    };
+    let lapsed = card("card-lapsed");
+    assert_eq!(lapsed["status"], "active");
+    assert_eq!(lapsed["effectiveStatus"], "expired");
+    assert_eq!(lapsed["rebindsUsed"], 1);
+    assert_eq!(lapsed["maxRebinds"], 3);
+    assert_eq!(lapsed["rebindCooldownUntil"], now - 100 + 3_600);
+    assert_eq!(lapsed["activationDurationSecs"], serde_json::Value::Null);
+    let waiting = card("card-waiting");
+    assert_eq!(waiting["effectiveStatus"], "unactivated");
+    assert_eq!(waiting["rebindCooldownUntil"], serde_json::Value::Null);
+    assert_eq!(waiting["activationDurationSecs"], 30 * 86_400);
+}
+
+#[tokio::test]
+async fn financials_report_a_period_by_provider_with_sales_and_liability() {
+    let (billing, app) = setup_admin_app();
+    billing.upsert_rate_card_version(billing::RateCardVersion {
+        id: "price-finance".to_string(),
+        rate_card_id: "default".to_string(),
+        model: "priced-model".to_string(),
+        currency: billing::Currency::Cny,
+        pricing_mode: billing::PricingMode::Fixed,
+        input_price_per_m: 7.0,
+        output_price_per_m: 7.0,
+        cache_creation_price_per_m: 0.0,
+        cache_read_price_per_m: 0.0,
+        fixed_input_credit_per_m: 1_000_000,
+        fixed_output_credit_per_m: 1_000_000,
+        fixed_cache_creation_credit_per_m: 0,
+        fixed_cache_read_credit_per_m: 0,
+        per_call_credit: 0,
+        margin_multiplier: 1.0,
+        effective_from_secs: 0,
+        official: None,
+    });
+    let (start, end) = (1_000_000, 2_000_000);
+    let mut card = Card::new("card-finance", "group-admin", 1_000_000_000);
+    card.status = CardStatus::Active;
+    card.created_at = start;
+    card.activated_at = Some(start + 10);
+    billing.upsert_card(card);
+    let tokens = billing::ledger::UsageTokens {
+        uncached_input_tokens: 1_000_000,
+        output_tokens: 1_000_000,
+        cache_creation_tokens: 0,
+        cache_read_tokens: 0,
+    };
+    // The second is served by a route with no price of its own: its cost is an estimate.
+    for (invocation, provider, target, at) in [
+        ("inv-in", "prov-a", "priced-model", start + 100),
+        ("inv-out", "prov-b", "target", end),
+    ] {
+        let params = billing::reservation::ReservationEstimateParams::new(1_000, 1_000)
+            .with_model("priced-model");
+        billing
+            .reserve("card-finance", invocation, &params, at, 60)
+            .unwrap();
+        billing
+            .settle(invocation, &tokens, "priced-model", provider, target, at)
+            .unwrap();
+    }
+    // Credits given and taken by hand, two of them in the period; a note moves none.
+    for (credits, reason, at) in [
+        (5_000_000, "活动赠送", start + 200),
+        (-1_000_000, "更正", start + 300),
+        (7_000_000, "补偿", end),
+    ] {
+        billing
+            .adjust_balance("card-finance", credits, "admin", reason, at)
+            .unwrap();
+    }
+    billing
+        .set_card_note("card-finance", Some("VIP"), "admin", start + 400)
+        .unwrap();
+
+    let (status, body) = admin_call(
+        &app,
+        Method::GET,
+        &format!("/api/v1/admin/financials?fromSecs={start}&toSecs={end}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        (body["fromSecs"].as_u64(), body["toSecs"].as_u64()),
+        (Some(start), Some(end))
+    );
+    assert_eq!(body["dashboard"]["total_requests"], 1);
+    let adjustments = &body["adjustments"];
+    assert_eq!(
+        json!([
+            adjustments["count"],
+            adjustments["positiveMicroCredits"],
+            adjustments["negativeMicroCredits"],
+            adjustments["netMicroCredits"]
+        ]),
+        json!([2, 5_000_000, -1_000_000, 4_000_000])
+    );
+    // Made without a kind: credits given for no request are a gift, credits taken a correction.
+    assert_eq!(
+        adjustments["byKind"]["gift"]["positiveMicroCredits"],
+        5_000_000
+    );
+    assert_eq!(
+        adjustments["byKind"]["correction"]["negativeMicroCredits"],
+        -1_000_000
+    );
+    let providers = body["byProvider"].as_array().unwrap();
+    assert_eq!(providers.len(), 1, "{body}");
+    assert_eq!(providers[0]["providerId"], "prov-a");
+    assert_eq!(providers[0]["requests"], 1);
+    assert_eq!(providers[0]["uncachedInputTokens"], 1_000_000);
+    // ¥7 per million tokens in and out.
+    assert_eq!(providers[0]["costMicroCny"], 14_000_000);
+    assert_eq!(body["margin"]["costedRequests"], 1);
+    assert_eq!(body["margin"]["uncostedRequests"], 0);
+    // Two credits at one fen.
+    assert_eq!(body["margin"]["revenueMicroCny"], 20_000);
+    assert_eq!(body["sales"]["issuedCards"], 1);
+    assert_eq!(body["sales"]["issuedValueMicroCny"], 30_000_000);
+    assert_eq!(body["sales"]["activatedCards"], 1);
+    assert_eq!(body["planPrices"][0]["templateId"], "tier-1000");
+    assert_eq!(body["planPrices"][3]["priceMicroCny"], 250_000_000);
+    // Now, whatever the period: the three usable cards' balances.
+    assert_eq!(body["liability"]["cards"], 3);
+    assert_eq!(
+        body["liability"]["microCredits"],
+        10_000_000 + 5_000_000 + 1_000_000_000 - 4_000_000 + 11_000_000
+    );
+
+    let (status, body) = admin_call(&app, Method::GET, "/api/v1/admin/financials", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["dashboard"]["total_requests"], 2);
+    assert_eq!(body["byProvider"].as_array().unwrap().len(), 2);
+    assert_eq!(body["fromSecs"], serde_json::Value::Null);
+    assert_eq!(body["adjustments"]["count"], 3);
+    assert_eq!(body["adjustments"]["netMicroCredits"], 11_000_000);
+    // An estimated cost is not a known one, wherever requests are counted as costed.
+    assert_eq!(
+        (
+            &body["margin"]["costedRequests"],
+            &body["margin"]["uncostedRequests"],
+            &body["margin"]["uncostedCredits"],
+            &body["margin"]["estimatedRequests"]
+        ),
+        (&json!(1), &json!(1), &json!(2_000_000), &json!(1))
+    );
+    assert_eq!(
+        (
+            &body["estimates"]["costedRequests"],
+            &body["estimates"]["uncostedRequests"],
+            &body["estimates"]["estimatedRequests"],
+            &body["estimates"]["faceValueLessCostMicroCny"]
+        ),
+        (&json!(1), &json!(1), &json!(1), &serde_json::Value::Null)
+    );
+    for (query, message) in [
+        ("fromSecs=soon", "fromSecs and toSecs must be whole seconds"),
+        ("fromSecs=10&toSecs=10", "fromSecs must be before toSecs"),
+    ] {
+        let (status, body) = admin_call(
+            &app,
+            Method::GET,
+            &format!("/api/v1/admin/financials?{query}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, json!({"success": false, "error": message}));
+    }
+
+    // The ledger export keeps its columns first and adds readable ones.
+    let request = Request::builder()
+        .uri("/api/v1/admin/exports/ledger.csv")
+        .header("x-admin-key", TEST_ADMIN_KEY)
+        .body(Body::empty())
+        .unwrap();
+    let response = tower::ServiceExt::oneshot(app, request).await.unwrap();
+    let csv = String::from_utf8(
+        axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(csv.starts_with(
+        "id,card_id,ts,kind,invocation_id,exposed_model,provider_id,input_tokens,output_tokens,\
+         credits_charged,provider_cost_micro_cny,time_utc,provider_name,cache_read_tokens,\
+         cache_write_tokens,credits,revenue_cny,cost_cny,operator,reason,rate_card_version,\
+         key_id,kind,cash_cny\n"
+    ));
+}
+
+#[tokio::test]
+async fn traces_are_filtered_on_the_server_with_totals_for_the_whole_match() {
+    let (billing, app) = setup_admin_app();
+    for (id, card, model, ts, status, provider, credits) in [
+        (
+            "t1",
+            "card-a",
+            "claude:opus",
+            100,
+            billing::TraceStatus::Success,
+            "prov-a",
+            5,
+        ),
+        (
+            "t2",
+            "card-a",
+            "claude:opus",
+            200,
+            billing::TraceStatus::Error,
+            "prov-b",
+            0,
+        ),
+        (
+            "t3",
+            "card-a",
+            "claude:opus",
+            300,
+            billing::TraceStatus::Error,
+            "prov-b",
+            0,
+        ),
+        (
+            "t4",
+            "card-b",
+            "claude:opus",
+            400,
+            billing::TraceStatus::Error,
+            "prov-b",
+            0,
+        ),
+        (
+            "t5",
+            "card-a",
+            "other-model",
+            500,
+            billing::TraceStatus::Error,
+            "prov-b",
+            0,
+        ),
+    ] {
+        billing.record_trace(billing::RequestTrace {
+            id: id.into(),
+            card_id: card.into(),
+            ts,
+            invocation_id: format!("{card}:{id}"),
+            exposed_model: model.into(),
+            status,
+            provider_id: Some(provider.into()),
+            credits_charged: credits,
+            provider_cost_micro_cny: credits * 10,
+            ..billing::RequestTrace::default()
+        });
+    }
+    let (status, body) = admin_call(
+        &app,
+        Method::GET,
+        "/api/v1/admin/traces?cardId=card-a&model=claude%3Aopus&fromSecs=100&toSecs=400&limit=1",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["count"], 1);
+    assert_eq!(body["traces"][0]["id"], "t3");
+    assert_eq!(
+        body["totals"],
+        json!({"count": 3, "failures": 2, "creditsCharged": 5, "costMicroCny": 50,
+            "interruptedCharged": 0, "interruptedChargedMicroCredits": 0})
+    );
+    let (_, body) = admin_call(
+        &app,
+        Method::GET,
+        "/api/v1/admin/traces?provider=prov-b&status=error",
+        None,
+    )
+    .await;
+    let ids: Vec<_> = body["traces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|trace| trace["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["t5", "t4", "t3", "t2"]);
+    assert_eq!(body["totals"]["failures"], 4);
+    // The console's card filter keeps working.
+    let (_, body) = admin_call(
+        &app,
+        Method::GET,
+        "/api/v1/admin/traces?card_id=card-b",
+        None,
+    )
+    .await;
+    assert_eq!(body["count"], 1);
+    for (query, message) in [
+        (
+            "status=lost",
+            "status must be success, error, client_aborted or in_progress",
+        ),
+        ("toSecs=-1", "fromSecs and toSecs must be whole seconds"),
+    ] {
+        let (status, body) = admin_call(
+            &app,
+            Method::GET,
+            &format!("/api/v1/admin/traces?{query}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], message);
+    }
+}
+
+/// A change that could not be saved says so, without the storage error, which names the
+/// server's paths: a status change, an adjustment, a publication, an issuance, and a sync.
+#[tokio::test]
+async fn a_change_that_could_not_be_saved_names_no_storage_error() {
+    let dir = std::env::temp_dir().join(format!(
+        "kiro-admin-unsaved-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let path = dir.join("billing_state.json");
+    let (billing, app) = setup_admin_app();
+    billing.set_master_kek(billing::MasterKek::from_bytes([6; 32]));
+    billing.save_to_file(&path).unwrap();
+    let not_saved = "The change could not be saved, so nothing was changed; retry shortly";
+    // Each fails with saving working until then, so none is refused for an earlier failure.
+    let unsaved = |status: StatusCode, body: serde_json::Value| {
+        billing.inject_persistence_fault(false);
+        billing.save_to_file(&path).unwrap();
+        (status, body)
+    };
+
+    billing.inject_persistence_fault(true);
+    let (status, body) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/cards/status",
+        Some(json!({"cardId": "card-admin-02", "action": "freeze", "reason": "调查"})),
+    )
+    .await;
+    let (status, body) = unsaved(status, body);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body, json!({"success": false, "error": not_saved}));
+
+    billing.inject_persistence_fault(true);
+    let (status, body) = adjust(
+        &app,
+        "adjust-unsaved",
+        json!({"cardId": "card-admin-02", "deltaPoints": 1.0, "reason": "补偿"}),
+    )
+    .await;
+    let (status, body) = unsaved(status, body);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body, json!({"success": false, "error": not_saved}));
+
+    billing.inject_persistence_fault(true);
+    let (status, body) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/commercial-config",
+        Some(json!({
+            "expected_revision": billing.commercial_config().revision,
+            "reason": "unsaved publication",
+            "groups": [billing::Group::pro_plus("new-tier", "New tier")],
+            "rate_cards": [billing::RateCard::new("default", "Default", 100)],
+        })),
+    )
+    .await;
+    let (status, body) = unsaved(status, body);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body, json!({"success": false, "error": not_saved}));
+    assert!(billing.get_group("new-tier").is_none());
+
+    billing.inject_persistence_fault(true);
+    let (status, body) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/cards/batch",
+        Some(json!({"count": 1, "groupId": "group-pro-plus"})),
+    )
+    .await;
+    let (status, body) = unsaved(status, body);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["message"], not_saved);
+
+    billing.inject_persistence_fault(true);
+    let (status, body) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/snapshot/sync",
+        Some(json!({})),
+    )
+    .await;
+    let (status, body) = unsaved(status, body);
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["message"], "The saved state could not be written");
+
+    // Nothing was changed.
+    let card = billing.get_card("card-admin-02").unwrap();
+    assert_eq!(
+        (card.status, card.credit_total),
+        (CardStatus::Active, 5_000_000)
+    );
+    assert_eq!(billing.list_all_cards().len(), 2);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn stats_say_when_the_state_was_last_saved_and_whether_saving_works() {
+    let dir = std::env::temp_dir().join(format!(
+        "kiro-admin-stats-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let path = dir.join("billing_state.json");
+    let (billing, app) = setup_admin_app();
+    billing.set_master_kek(billing::MasterKek::from_bytes([5; 32]));
+    let (_, stats) = admin_call(&app, Method::GET, "/api/v1/admin/stats", None).await;
+    // Not saved anywhere yet.
+    assert_eq!(stats["lastSavedAtSecs"], serde_json::Value::Null);
+    assert_eq!(stats["persistenceReady"], true);
+
+    let before = gateway::now_secs();
+    billing.save_to_file(&path).unwrap();
+    billing.record_trace(billing::RequestTrace {
+        id: "trace-stats".into(),
+        card_id: "card-admin-02".into(),
+        ts: gateway::now_secs(),
+        invocation_id: "card-admin-02:inv".into(),
+        exposed_model: "model".into(),
+        provider_id: Some("backup".into()),
+        attempt_chain: vec![
+            billing::AttemptRecord {
+                key_id: "key-a".into(),
+                provider_id: "primary".into(),
+                success: false,
+                error: Some("http_429".into()),
+                latency_ms: 5,
+            },
+            billing::AttemptRecord {
+                key_id: "key-b".into(),
+                provider_id: "backup".into(),
+                success: true,
+                error: None,
+                latency_ms: 5,
+            },
+        ],
+        ..billing::RequestTrace::default()
+    });
+    let (status, stats) = admin_call(&app, Method::GET, "/api/v1/admin/stats", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let saved_at = stats["lastSavedAtSecs"].as_u64().unwrap();
+    assert!(
+        saved_at >= before && saved_at <= gateway::now_secs(),
+        "{stats}"
+    );
+    assert_eq!(stats["persistenceReady"], true);
+    assert_eq!(stats["persistenceError"], serde_json::Value::Null);
+    assert!(stats["stateBytes"].as_u64().unwrap() > 0);
+    // Attempts by provider and Key, and requests by model, beside the existing activity.
+    let activity = &stats["activity"];
+    assert!(activity["providers"].is_array());
+    assert_eq!(activity["providerAttempts"][0]["providerId"], "backup");
+    let primary = activity["providerAttempts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["providerId"] == "primary")
+        .unwrap();
+    assert_eq!(primary["last1h"]["takenOver"], 1);
+    assert_eq!(primary["last7d"]["failuresByKind"]["http_429"], 1);
+    assert_eq!(activity["keyAttempts"].as_array().unwrap().len(), 2);
+    assert_eq!(activity["modelHealth"][0]["model"], "model");
+    assert!(activity["modelUsage7d"].is_array());
+
+    // A failed write: saving stops, and the stats say why without the server's paths.
+    billing.inject_persistence_fault(true);
+    let (status, body) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/cards/note",
+        Some(json!({"cardId": "card-admin-02", "note": "VIP"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        body["error"],
+        "The change could not be saved, so nothing was changed; retry shortly"
+    );
+    assert_eq!(billing.get_card("card-admin-02").unwrap().note, None);
+    let (_, stats) = admin_call(&app, Method::GET, "/api/v1/admin/stats", None).await;
+    assert_eq!(stats["persistenceReady"], false);
+    assert_eq!(
+        stats["persistenceError"],
+        "The saved state could not be written"
+    );
+    assert_eq!(stats["lastSavedAtSecs"], saved_at);
+    billing.inject_persistence_fault(false);
+
+    // After a restart, the loaded state's save time and size.
+    let restarted = BillingEngine::new();
+    restarted.set_master_kek(billing::MasterKek::from_bytes([5; 32]));
+    restarted.load_from_file(&path).unwrap();
+    assert_eq!(restarted.last_saved_at(), Some(saved_at));
+    assert_eq!(restarted.state_size().0, billing.state_size().0);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A plan as the console publishes it, into group-pro-plus.
+fn plan_json(id: &str, name: &str, price_cny: f64) -> serde_json::Value {
+    json!({"id": id, "name": name, "points": 300, "price_cny": price_cny, "validity_days": 7,
+           "max_devices": 1, "concurrency": 1, "default_group_id": "group-pro-plus",
+           "kiro_plan_type": "CUSTOM", "on_sale": true, "sort_order": 5})
+}
+
+async fn publish_plans(
+    app: &axum::Router,
+    billing: &BillingEngine,
+    plans: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    let (status, body) = admin_call(
+        app,
+        Method::POST,
+        "/api/v1/admin/commercial-config",
+        Some(json!({
+            "expected_revision": billing.commercial_config().revision,
+            "reason": "套餐调整",
+            "plans": plans,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["config"].clone()
+}
+
+#[tokio::test]
+async fn cards_are_issued_from_the_plan_catalog_and_keep_their_plan() {
+    let (billing, app) = setup_admin_app();
+    billing.set_master_kek(billing::MasterKek::from_bytes([37; 32]));
+    billing.upsert_group(billing::Group::pro_plus("group-other", "Other"));
+    // Before any plan is published, the four tiers.
+    let (_, config) = admin_call(&app, Method::GET, "/api/v1/admin/commercial-config", None).await;
+    let ids: Vec<_> = config["config"]["plans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|plan| plan["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids, ["tier-1000", "tier-2000", "tier-5000", "tier-10000"]);
+    // A plan for more devices than a card binds would be on sale and never issue a card.
+    let mut family = plan_json("family", "家庭卡", 20.0);
+    family["max_devices"] = json!(2);
+    let (status, body) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/commercial-config",
+        Some(json!({
+            "expected_revision": billing.commercial_config().revision,
+            "reason": "套餐调整",
+            "plans": [family.clone()],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        body["error"],
+        "Invalid billing state: Plans allow exactly 1 device, as cards bind one: family"
+    );
+    family["max_devices"] = json!(1);
+    let mut old = plan_json("old", "旧卡", 1.0);
+    old["on_sale"] = json!(false);
+    let config = publish_plans(
+        &app,
+        &billing,
+        vec![plan_json("trial-7d", "体验卡", 9.9), family, old],
+    )
+    .await;
+    assert_eq!(config["plans"][0]["id"], "family");
+    assert_eq!(config["cards_by_plan"]["trial-7d"], 0);
+
+    // One stored before publication bounded it still issues no card.
+    let mut state = billing.export_snapshot();
+    for plan in state.plans.iter_mut().flatten() {
+        if plan.id == "family" {
+            plan.max_devices = 2;
+        }
+    }
+    billing.import_snapshot(state);
+    let issue = |body: serde_json::Value| {
+        let app = app.clone();
+        async move { admin_call(&app, Method::POST, "/api/v1/admin/cards/batch", Some(body)).await }
+    };
+    // Into a group other than the plan's default: the console warns, the server issues.
+    let (status, body) =
+        issue(json!({"count": 2, "groupId": "group-other", "planId": "trial-7d"})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let issued = &body["cards"][0];
+    assert_eq!(issued["planId"], "trial-7d");
+    assert_eq!(issued["virtualPlanName"], "体验卡");
+    assert_eq!(issued["creditTotal"], 300_000_000);
+    assert_eq!(issued["groupId"], "group-other");
+    assert_eq!(
+        issued["plan"],
+        json!({"id": "trial-7d", "name": "体验卡", "points": 300, "priceMicroCny": 9_900_000,
+               "paidMicroCny": null, "validityDays": 7, "maxDevices": 1, "concurrency": 1,
+               "kiroPlanType": "CUSTOM"})
+    );
+    let card_id = issued["cardId"].as_str().unwrap().to_string();
+    // templateId still names a plan, and so does the old default.
+    for (body, plan, name) in [
+        (
+            json!({"count": 1, "groupId": "group-pro-plus", "templateId": "tier-5000"}),
+            "tier-5000",
+            "PRO Max",
+        ),
+        (
+            json!({"count": 1, "groupId": "group-pro-plus"}),
+            "tier-2000",
+            "PRO+",
+        ),
+        (
+            json!({"count": 1, "groupId": "group-pro-plus", "templateId": "standard-monthly", "planId": "standard-monthly"}),
+            "tier-2000",
+            "PRO+",
+        ),
+    ] {
+        let (status, response) = issue(body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let card = billing
+            .get_card(response["cards"][0]["cardId"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(card.plan.as_ref().map(|p| p.id.as_str()), Some(plan));
+        assert_eq!(card.plan_name(), Some(name));
+    }
+    for (body, message) in [
+        (
+            json!({"count": 1, "groupId": "group-pro-plus", "planId": "trial-7d", "templateId": "tier-1000"}),
+            "planId and templateId name different plans",
+        ),
+        (
+            json!({"count": 1, "groupId": "group-pro-plus", "planId": "ghost"}),
+            "unknown plan",
+        ),
+        (
+            json!({"count": 1, "groupId": "group-pro-plus", "planId": "old"}),
+            "plan is not on sale",
+        ),
+        (
+            json!({"count": 1, "groupId": "group-pro-plus", "planId": "family"}),
+            "cards have one device; issue from a plan with max_devices 1",
+        ),
+        (
+            json!({"count": 1, "groupId": "group-pro-plus", "planId": "trial-7d", "creditTotal": 2_000_000_000i64}),
+            "issuance requires an enabled group, the plan's credits, and maxDevices=1",
+        ),
+    ] {
+        let (status, response) = issue(body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(response["message"], message);
+    }
+
+    // The card keeps the plan as it was sold, whatever the catalog becomes.
+    publish_plans(
+        &app,
+        &billing,
+        vec![plan_json("trial-7d", "体验卡Plus", 12.0)],
+    )
+    .await;
+    let (_, cards) = admin_call(&app, Method::GET, "/api/v1/admin/cards?limit=500", None).await;
+    let view = |id: &str| {
+        cards["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|card| card["id"] == id)
+            .cloned()
+            .unwrap()
+    };
+    let card = view(&card_id);
+    assert_eq!(
+        (&card["planId"], &card["planName"], &card["kiroPlanType"]),
+        (&json!("trial-7d"), &json!("体验卡"), &json!("CUSTOM"))
+    );
+    assert_eq!(card["plan"]["priceMicroCny"], 9_900_000);
+    assert_eq!(card["activationDurationSecs"], 7 * 86_400);
+    // A card from before the catalog: its tier by its credits, or none.
+    let legacy = view("card-admin-01");
+    assert_eq!(
+        (
+            &legacy["planId"],
+            &legacy["planName"],
+            &legacy["kiroPlanType"],
+            &legacy["plan"]
+        ),
+        (&json!(null), &json!(null), &json!("CUSTOM"), &json!(null))
+    );
+    let (_, history) = admin_call(
+        &app,
+        Method::GET,
+        &format!("/api/v1/admin/cards/history?card_id={card_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(history["card"]["planName"], "体验卡");
+
+    // Finance prices plans from the catalog and each card at what it was sold for.
+    let (_, finance) = admin_call(&app, Method::GET, "/api/v1/admin/financials", None).await;
+    let trial_price = finance["planPrices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|plan| plan["planId"] == "trial-7d")
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        trial_price,
+        json!({"templateId": "trial-7d", "planId": "trial-7d", "name": "体验卡Plus",
+               "points": 300, "priceMicroCny": 12_000_000, "onSale": true})
+    );
+    let trial_sales = finance["sales"]["byPlan"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|plan| plan["planId"] == "trial-7d")
+        .cloned()
+        .unwrap();
+    assert_eq!(trial_sales["issuedCards"], 2);
+    assert_eq!(trial_sales["issuedValueMicroCny"], 19_800_000);
+    assert_eq!(trial_sales["priceMicroCny"], 12_000_000);
+
+    // Cards were issued from it: it is taken off sale, not removed.
+    let (status, body) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/commercial-config",
+        Some(json!({
+            "expected_revision": billing.commercial_config().revision,
+            "reason": "停售",
+            "removed_plans": ["trial-7d"],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        body["error"],
+        "Invalid billing state: Plans cards were issued from can only be taken off sale: trial-7d"
+    );
+    let (_, config) = admin_call(&app, Method::GET, "/api/v1/admin/commercial-config", None).await;
+    assert_eq!(config["config"]["cards_by_plan"]["trial-7d"], 2);
+}
+
+/// The operator sees where each group's hidden Kiro background calls go, and why: they are
+/// billed at that model's price.
+#[tokio::test]
+async fn stats_name_each_groups_fast_model_and_why() {
+    let (billing, app) = setup_admin_app();
+    billing.upsert_group(billing::group::Group::pro_plus("group-fast", "Fast"));
+    for (order, model, credits) in [(0, "big-model", 9_000_000), (1, "small-model", 1_000_000)] {
+        let mut map = billing::group::ModelMap::new(
+            format!("map-{model}"),
+            "group-fast",
+            model,
+            "prov",
+            format!("up-{model}"),
+        );
+        map.sort_order = order;
+        billing.upsert_model_map(map);
+        billing.upsert_rate_card_version(billing::rate_card::RateCardVersion {
+            id: format!("price-{model}"),
+            rate_card_id: "default".into(),
+            model: model.into(),
+            currency: billing::rate_card::Currency::Cny,
+            pricing_mode: billing::rate_card::PricingMode::Fixed,
+            input_price_per_m: 0.0,
+            output_price_per_m: 0.0,
+            cache_creation_price_per_m: 0.0,
+            cache_read_price_per_m: 0.0,
+            fixed_input_credit_per_m: credits,
+            fixed_output_credit_per_m: credits,
+            fixed_cache_creation_credit_per_m: 0,
+            fixed_cache_read_credit_per_m: 0,
+            per_call_credit: 0,
+            margin_multiplier: 1.0,
+            effective_from_secs: 0,
+            official: None,
+        });
+    }
+
+    let (status, stats) = admin_call(&app, Method::GET, "/api/v1/admin/stats", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let fast = stats["simpleTaskModels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|group| group["groupId"] == "group-fast")
+        .cloned()
+        .unwrap();
+    assert_eq!(fast["model"], "small-model", "{fast}");
+    assert_eq!(fast["via"], "cheapest");
+}
+
+/// A compensation may name several requests. A refusal says which of them stopped it and
+/// what was found for each, beside the message; the traces mark each request compensated.
+#[tokio::test]
+async fn a_compensation_of_several_requests_names_each_refused_one() {
+    let (billing, app) = setup_admin_app();
+    billing.upsert_card(Card::new("card-other", "group-admin", 1_000));
+    charged_request(&billing, "card-admin-02", "card-admin-02:inv-1", 1_000_000);
+    charged_request(&billing, "card-admin-02", "card-admin-02:inv-2", 3_000_000);
+    charged_request(&billing, "card-other", "card-other:inv-9", 2_000_000);
+    let body = |points: f64, ids: serde_json::Value| {
+        json!({"cardId": "card-admin-02", "deltaPoints": points, "reason": "补偿中断",
+            "invocationIds": ids})
+    };
+
+    let (status, response) = adjust(
+        &app,
+        "several-both",
+        json!({"cardId": "card-admin-02", "deltaPoints": 1.0, "reason": "补偿中断",
+            "invocationId": "card-admin-02:inv-1", "invocationIds": ["card-admin-02:inv-2"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+    assert_eq!(
+        response["error"],
+        "Give invocationId or invocationIds, not both"
+    );
+    let too_many: Vec<String> = (0..51).map(|i| format!("card-admin-02:inv-{i}")).collect();
+    for ids in [json!([]), json!(too_many), json!(["card admin"])] {
+        let (status, response) = adjust(&app, "several-bad", body(1.0, ids)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(
+            response["error"],
+            "invocationIds must name 1 to 50 requests, each 1-257 ASCII letters, digits, -_.:"
+        );
+    }
+
+    let (status, response) = adjust(
+        &app,
+        "several-unknown",
+        body(1.0, json!(["card-admin-02:inv-1", "card-admin-02:nope"])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{response}");
+    assert_eq!(response["success"], false);
+    assert_eq!(response["error"], "1 of the requests were not found");
+    assert_eq!(
+        response["refusal"],
+        json!({"kind": "unknown", "requests": [{"invocationId": "card-admin-02:nope"}]})
+    );
+    // One request keeps the message it always had, and gains the same account of it.
+    let (status, response) = adjust(
+        &app,
+        "single-unknown",
+        json!({"cardId": "card-admin-02", "deltaPoints": 1.0, "reason": "补偿中断",
+            "invocationId": "card-admin-02:nope"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{response}");
+    assert_eq!(
+        response["error"],
+        "Request card-admin-02:nope was not found"
+    );
+    assert_eq!(response["refusal"]["kind"], "unknown");
+
+    let (status, response) = adjust(
+        &app,
+        "several-other",
+        body(1.0, json!(["card-admin-02:inv-1", "card-other:inv-9"])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    assert_eq!(
+        response["error"],
+        "1 of the requests were made by another card"
+    );
+    assert_eq!(
+        response["refusal"],
+        json!({"kind": "otherCard", "requests": [{"invocationId": "card-other:inv-9",
+            "cardId": "card-other", "chargedMicroCredits": 2_000_000,
+            "chargedAtSecs": 1_700_000_000u64}]})
+    );
+
+    let (status, response) = adjust(
+        &app,
+        "several-over",
+        body(5.0, json!(["card-admin-02:inv-1", "card-admin-02:inv-2"])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    assert_eq!(
+        response["error"],
+        "A compensation of 5 credits is more than the 4 credits these 2 requests were \
+         charged; send allowRepeat with a reason to compensate more"
+    );
+    assert_eq!(response["refusal"]["kind"], "over");
+    assert_eq!(response["refusal"]["askedMicroCredits"], 5_000_000);
+    assert_eq!(response["refusal"]["chargedTotalMicroCredits"], 4_000_000);
+    assert_eq!(response["refusal"]["requests"].as_array().unwrap().len(), 2);
+
+    let (status, response) = adjust(
+        &app,
+        "several-paid",
+        body(4.0, json!(["card-admin-02:inv-1", "card-admin-02:inv-2"])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let event = newest_event(&app, "card-admin-02", "adjust").await;
+    assert_eq!(event["invocationId"], serde_json::Value::Null);
+    assert_eq!(
+        event["detail"]["invocationIds"],
+        json!(["card-admin-02:inv-1", "card-admin-02:inv-2"])
+    );
+    assert_eq!(
+        event["detail"]["chargedMicroCredits"],
+        json!([1_000_000, 3_000_000])
+    );
+
+    // Each request is marked with its share of what was given back, and when.
+    let (status, listed) = admin_call(&app, Method::GET, "/api/v1/admin/traces", None).await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    let trace = |id: &str| {
+        listed["traces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|trace| trace["invocation_id"] == id)
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(
+        trace("card-admin-02:inv-1")["compensatedMicroCredits"],
+        1_000_000
+    );
+    assert_eq!(
+        trace("card-admin-02:inv-2")["compensatedMicroCredits"],
+        3_000_000
+    );
+    assert!(trace("card-admin-02:inv-2")["compensatedAtSecs"].is_u64());
+    let untouched = trace("card-other:inv-9");
+    assert_eq!(
+        untouched["compensatedMicroCredits"],
+        serde_json::Value::Null
+    );
+    assert_eq!(untouched["compensatedAtSecs"], serde_json::Value::Null);
+
+    let (status, response) = adjust(
+        &app,
+        "several-repeat",
+        body(1.0, json!(["card-admin-02:inv-2", "card-admin-02:inv-1"])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    assert_eq!(
+        response["error"],
+        "2 of the requests were already compensated; send allowRepeat with a reason to \
+         compensate them again"
+    );
+    let earlier = &response["refusal"]["requests"][0];
+    assert_eq!(response["refusal"]["kind"], "repeat");
+    assert_eq!(earlier["invocationId"], "card-admin-02:inv-2");
+    assert_eq!(earlier["cardId"], "card-admin-02");
+    assert_eq!(earlier["chargedMicroCredits"], 3_000_000);
+    assert_eq!(earlier["compensatedMicroCredits"], 3_000_000);
+    assert!(earlier["compensatedAtSecs"].is_u64());
+    assert_eq!(earlier["operator"], "admin");
+    assert_eq!(earlier["reason"], "补偿中断");
+    assert_eq!(
+        billing
+            .get_card("card-admin-02")
+            .unwrap()
+            .available_credits(),
+        5_000_000 + 4_000_000
+    );
+}
+
+/// Money that moves with a card is recorded in yuan: an adjustment's kind and cash, an
+/// upgrade's payment, a reseller's price at issuance; the financials add them up.
+#[tokio::test]
+async fn money_movements_carry_their_kind_and_the_yuan() {
+    let (billing, app) = setup_admin_app();
+    billing.set_master_kek(billing::MasterKek::from_bytes([41; 32]));
+    let adjustment = |points: f64, extra: serde_json::Value| {
+        let mut body =
+            json!({"cardId": "card-admin-02", "deltaPoints": points, "reason": "客户退款"});
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        body
+    };
+    for (key, body, message) in [
+        (
+            "kind-bad",
+            adjustment(1.0, json!({"kind": "bonus"})),
+            "kind must be compensation, gift, refund or correction",
+        ),
+        (
+            "kind-refund-no-cash",
+            adjustment(-1.0, json!({"kind": "refund"})),
+            "A refund needs cashMicroCny, the money returned to the customer",
+        ),
+        (
+            "kind-gift-cash",
+            adjustment(1.0, json!({"kind": "gift", "cashMicroCny": 5})),
+            "cashMicroCny is refused for a compensation or a gift",
+        ),
+    ] {
+        let (status, response) = adjust(&app, key, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{key}: {response}");
+        assert_eq!(response["error"], message, "{key}");
+    }
+    let (status, response) = adjust(
+        &app,
+        "kind-refund",
+        adjustment(-2.0, json!({"kind": "refund", "cashMicroCny": 6_000_000})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let event = newest_event(&app, "card-admin-02", "adjust").await;
+    assert_eq!(
+        event["detail"],
+        json!({"kind": "refund", "cashMicroCny": 6_000_000})
+    );
+
+    let upgrade = |body: serde_json::Value| {
+        let app = app.clone();
+        async move {
+            admin_call(
+                &app,
+                Method::POST,
+                "/api/v1/admin/cards/upgrade",
+                Some(body),
+            )
+            .await
+        }
+    };
+    let base = json!({"cardId": "card-admin-02", "planId": "tier-5000",
+        "creditsDelta": 4_000_000_000i64, "cashMicroCny": 75_000_000, "reason": "升级 PRO Max"});
+    let with = |extra: serde_json::Value| {
+        let mut body = base.clone();
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        body
+    };
+    for (body, status, message) in [
+        (
+            with(json!({"planId": "nope"})),
+            StatusCode::NOT_FOUND,
+            "Unknown plan: nope",
+        ),
+        (
+            with(json!({"groupId": "nope"})),
+            StatusCode::NOT_FOUND,
+            "Unknown group: nope",
+        ),
+        (
+            with(json!({"creditsDelta": -1})),
+            StatusCode::BAD_REQUEST,
+            "creditsDelta must be 0-10000000000000 micro-credits",
+        ),
+        (
+            with(json!({"cashMicroCny": -1})),
+            StatusCode::BAD_REQUEST,
+            "cashMicroCny must be 0-100000000000 micro-CNY",
+        ),
+        (
+            with(json!({"extendDays": 3651})),
+            StatusCode::BAD_REQUEST,
+            "extendDays must be between 0 and 3650",
+        ),
+        (
+            with(json!({"reason": " "})),
+            StatusCode::BAD_REQUEST,
+            "A reason of 1 to 200 bytes is required",
+        ),
+        (
+            with(json!({"cardId": "card-missing"})),
+            StatusCode::NOT_FOUND,
+            "Card card-missing not found",
+        ),
+    ] {
+        let (got, response) = upgrade(body).await;
+        assert_eq!(got, status, "{response}");
+        assert_eq!(response, json!({"success": false, "error": message}));
+    }
+    let (status, response) = upgrade(base.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["card"]["planId"], "tier-5000");
+    assert_eq!(response["card"]["plan"]["paidMicroCny"], 75_000_000);
+    assert_eq!(response["card"]["groupId"], "group-pro-plus");
+    let event = newest_event(&app, "card-admin-02", "upgrade").await;
+    assert_eq!(event["credits"], 4_000_000_000i64);
+    assert_eq!(event["reason"], "升级 PRO Max");
+    assert_eq!(event["detail"]["renewal"], false);
+    assert_eq!(event["detail"]["previousGroupId"], "group-admin");
+    assert_eq!(event["detail"]["cashMicroCny"], 75_000_000);
+
+    // A reseller's price, kept on each card and counted by sales.
+    let (status, response) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/cards/batch",
+        Some(
+            json!({"count": 2, "groupId": "group-pro-plus", "planId": "tier-2000",
+            "unitPriceCny": 38.0}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["cards"][0]["plan"]["paidMicroCny"], 38_000_000);
+    let (status, response) = admin_call(
+        &app,
+        Method::POST,
+        "/api/v1/admin/cards/batch",
+        Some(
+            json!({"count": 1, "groupId": "group-pro-plus", "planId": "tier-2000",
+            "unitPriceCny": 38.123}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+    assert_eq!(
+        response["message"],
+        "unitPriceCny must be 0-100000 yuan, to the fen"
+    );
+
+    let (status, financials) =
+        admin_call(&app, Method::GET, "/api/v1/admin/financials", None).await;
+    assert_eq!(status, StatusCode::OK, "{financials}");
+    assert_eq!(
+        financials["adjustments"]["byKind"]["refund"],
+        json!({"count": 1, "positiveMicroCredits": 0, "negativeMicroCredits": -2_000_000,
+            "cashMicroCny": 6_000_000})
+    );
+    assert_eq!(financials["adjustments"]["byKind"]["gift"]["count"], 0);
+    // The upgrade is not an adjustment.
+    assert_eq!(financials["adjustments"]["count"], 1);
+    assert_eq!(
+        financials["cash"],
+        json!({"salesMicroCny": 76_000_000, "upgradesMicroCny": 75_000_000,
+            "refundsMicroCny": 6_000_000, "netMicroCny": 145_000_000})
+    );
+    assert_eq!(financials["sales"]["issuedValueMicroCny"], 76_000_000);
 }

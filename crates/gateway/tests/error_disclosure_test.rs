@@ -87,6 +87,8 @@ async fn failing_upstream_response() -> (StatusCode, String) {
                 versions: vec![],
                 removed_models: vec![],
                 cancelled_versions: vec![],
+                plans: vec![],
+                removed_plans: vec![],
             },
             1_700_000_000,
         )

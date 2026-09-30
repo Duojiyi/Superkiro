@@ -37,3 +37,5 @@ Windows 与 Mac 复用部署锁、历史版本防替换、原子清单更新以�
 默认仍要求最终字节的运行验收。若发布负责人在已知尚未完成真机验收、未签名的情况下明确要求换包，可记录为测试版发布授权，不得记录成验收通过。授权记录须包含 `approvalBasis=user-directed-beta-publication`、`runtimeAcceptance=false`、`sourceCommit`、构建编号以及精确字节摘要；`approvedForPublication=true` 仅表示本次公开发布授权。公开清单同步保留 `runtimeAcceptance=false` 和 `signature=unsigned`，系统要求注明测试版及真机验收未完成。CI provenance 的验收字段不修改。
 
 短文件名仍按版本不可变：同名已存在文件必须核对 SHA256，不能覆盖不同字节。历史长文件名和旧下载链接保留，旧命名的版本冲突检查仍然生效。
+
+本次未完成真机验收的测试版使用 `--optional` 发布（`mandatory=false`），不强制客户安装。系统代码签名的 `signature=unsigned` 与更新清单的密码学签名不是一回事：仍须保留并验证 `updateSignature`。策略/发布脚本后续合并不改变已发布包的源码标识，不允许重新构建后覆盖同版本不同字节。

@@ -89,9 +89,19 @@ async fn open_streams_are_cut_and_billed_for_what_they_streamed_when_the_gateway
                 .to_string()
         })
         .collect();
+    // Kiro retries a temporary error, which the next gateway serves; no note is added to
+    // the answer, where it would stay in the conversation.
     assert_eq!(
         names.last().map(String::as_str),
         Some("InternalServerException")
+    );
+    assert_eq!(
+        names
+            .iter()
+            .filter(|name| *name == "assistantResponseEvent")
+            .count(),
+        1,
+        "{names:?}"
     );
 
     let ledger = billing.list_ledger_entries_for_card("card-stop", None);

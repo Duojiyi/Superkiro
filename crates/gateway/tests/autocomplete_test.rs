@@ -10,9 +10,29 @@ use serde_json::Value;
 use wiremock::matchers::{method as wm_method, path as wm_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// Kiro pops "Autocomplete Failed: Maximum Kiro usage reached for this month." for a
+/// throttled completion, on every pause in typing; the default answers with none.
 #[tokio::test]
-async fn test_autocomplete_throttled_default_mode() {
-    let handler = GenerateCompletionsHandler::default();
+async fn the_default_answers_no_completions_without_an_error() {
+    let app = FacadeRegistry::default().into_router();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/GenerateCompletions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"fileContext":{"leftFileContent":"fn main() {"}}"#,
+        ))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+    let val: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(val["completions"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn test_autocomplete_throttled_mode() {
+    let handler = GenerateCompletionsHandler::new().with_mode(AutocompleteMode::Throttled);
     let mut registry = FacadeRegistry::new();
     registry.register(handler);
     let app = registry.into_router();

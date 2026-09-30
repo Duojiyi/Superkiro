@@ -1,0 +1,97 @@
+/* 模型与定价: the pricing views, the preview, and the pricing drawers. Selectors carry enough
+   classes to hold against index.css, which the bundle places after this file. */
+
+/* The page's views stay mounted (their edits survive switching); a hidden one takes no room. */
+.commercial-editor [hidden] {display: none !important;}
+
+/* Margins: red below 0, amber below 20%. */
+.admin-app .is-loss {color: var(--danger); font-weight: 600;}
+.admin-app .is-thin {color: var(--warning);}
+
+/* The preview every pricing change starts with. */
+.admin-app .modal.pricing-preview-dialog {width: min(1040px, calc(100vw - 48px)); max-width: none; max-height: calc(100vh - 48px); overflow-y: auto;}
+.pricing-preview-dialog > * {flex: none;}
+.pricing-preview-dialog .preview-scroll {max-height: 48vh; overflow: auto; border: 1px solid var(--border-subtle); border-radius: 6px;}
+.pricing-preview-dialog .preview-table td {vertical-align: top; white-space: normal; font-size: 13px;}
+.pricing-preview-dialog .preview-table th {position: sticky; top: 0; z-index: 1;}
+.pricing-preview-dialog .preview-table td.nowrap {white-space: nowrap;}
+.pricing-preview-dialog .preview-table .is-up {color: var(--danger);}
+.pricing-preview-dialog .preview-table .is-down {color: var(--success);}
+.pricing-preview-dialog tr.is-flagged td {background: var(--danger-bg);}
+.pricing-preview-dialog .preview-groups {display: block; font-size: 12px; color: var(--text-3);}
+.pricing-preview-dialog .preview-flag {display: block; font-size: 12px; color: var(--danger); font-weight: 600;}
+.pricing-preview-dialog .preview-routes {margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 2px;}
+.pricing-preview-dialog .preview-checks {display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; border: 1px solid var(--danger); border-radius: 6px; background: var(--danger-bg);}
+.pricing-preview-dialog .preview-extra {display: flex; flex-direction: column; gap: 8px; font-size: 13px;}
+.pricing-preview-dialog .preview-extra table {max-width: 640px;}
+
+/* 定价设置 and 官方价表 */
+.pricing-settings, .official-table {display: flex; flex-direction: column; gap: 14px;}
+.pricing-settings .provider-costs td, .official-table .official-prices td {vertical-align: top; white-space: normal;}
+.pricing-settings .provider-costs input {width: 96px; text-align: right;}
+.pricing-settings .route-override {display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; font-size: 13px;}
+.admin-app .settings-actions {display: flex; flex-wrap: wrap; align-items: center; gap: 8px;}
+.admin-app .settings-actions .action-bar-reason {flex: 1; min-width: 220px;}
+.official-table .panel-head {flex-wrap: wrap; gap: 8px 12px;}
+.official-table .official-prices input {width: 100%; min-width: 64px;}
+.official-table .official-prices td.num input {text-align: right; max-width: 96px;}
+.official-table tr.is-edited td:first-child {box-shadow: inset 3px 0 0 var(--warning);}
+.official-table .csv-input {min-height: 120px; width: 100%;}
+.official-table .official-csv[open] {display: flex; flex-direction: column; gap: 8px;}
+
+/* 结算参数 on 财务对账, read only */
+.settings-panel .settings-facts {margin: 0 0 8px; padding: 0; list-style: none; display: flex; flex-wrap: wrap; gap: 6px 24px;}
+
+/* Pricing drawers are wide enough for their tables. */
+.admin-app .drawer.price-drawer {width: min(960px, calc(100vw - 240px));}
+@media (max-width: 900px) {.admin-app .drawer.price-drawer {width: 100vw;}}
+.route-cost-drawer .pricing-result {margin: 0;}
+.route-cost {display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; font-size: 13px;}
+
+/* The official-price block 调价 and 上架 share, and the drawers around it. */
+.official-fields {display: flex; flex-direction: column; gap: 10px;}
+.official-fields .official-source {display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 16px;}
+.official-fields .priced-as {display: inline-flex; align-items: center; gap: 8px;}
+.official-fields .priced-as select {min-width: 220px;}
+.admin-app .price-drawer .pricing-result {display: flex; flex-direction: column; gap: 4px; margin: 0; padding: 10px 12px; border: 1px solid var(--border-subtle); border-radius: 6px; background: var(--bg-muted);}
+.admin-app .price-drawer .pricing-result p {margin: 0;}
+.price-drawer .scheduled-price {display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px 12px;}
+.price-drawer .restore-line {display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 10px; margin: 0;}
+.price-drawer .table-choice, .listing-drawer .listing-groups {display: flex; flex-direction: column; gap: 6px; margin: 0; padding: 0; border: 0;}
+.listing-drawer .listing-group {display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px; min-height: 34px;}
+.listing-drawer .listing-group .check-field {min-width: 104px;}
+.listing-drawer .listing-group select {width: 260px; max-width: 100%;}
+
+/* 模型与定价's list: one row per customer model, its groups as chips. */
+.model-sheet .sheet-toolbar {flex-wrap: wrap; gap: 8px 12px;}
+.model-sheet .sheet-group, .model-sheet .chip-with-input {display: inline-flex; align-items: center; gap: 6px; font-size: 13px;}
+.model-sheet .sheet-filters {display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px;}
+.model-sheet .chip-with-input input {width: 48px; min-height: 30px; text-align: right;}
+.admin-app .sheet-table td {vertical-align: top; padding-top: 8px; padding-bottom: 8px;}
+.admin-app .sheet-table .cell-sub {display: block; margin-top: 2px; font-size: 12px; font-weight: 400; color: var(--text-3); white-space: nowrap;}
+.admin-app .sheet-table .cell-sub.is-warning {color: var(--warning);}
+/* Allow descriptive cells to wrap with wider platform font metrics. */
+.admin-app .sheet-table .col-model, .admin-app .sheet-table .col-display {white-space: normal; overflow-wrap: anywhere;}
+.admin-app .sheet-table .col-model .capabilities {margin-left: 8px; flex-wrap: wrap;}
+.admin-app .sheet-table .cell-sub {white-space: normal;}
+.admin-app .sheet-table th {white-space: normal;}
+.admin-app .sheet-table .capability {font-size: 12px; color: var(--text-3);}
+.sheet-table .group-chips {display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px;}
+.sheet-table .group-chip {font-size: 11px; line-height: 18px; padding: 0 6px; border-radius: 9px; background: var(--neutral-bg); color: var(--text-2); font-weight: 400; white-space: nowrap;}
+.sheet-table .group-chip.is-off {background: transparent; border: 1px dashed var(--border); color: var(--text-3);}
+.sheet-table .route-line {display: block; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;}
+.sheet-table .route-line.mono {font-size: 12px; color: var(--text-2);}
+.admin-app .sheet-table .col-status {white-space: nowrap;}
+.admin-app .sheet-table tr.is-marked td {background: var(--warning-bg);}
+@media (max-width: 1439px) {.admin-app .sheet-table .row-action-wide, .admin-app .sheet-table .capability-label {display: none;} .sheet-table .route-line {max-width: 150px;}}
+/* The editor: which of the model's groups an edit goes to. */
+.mapping-editor .edit-scope {display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; margin: 0 0 12px; padding: 8px 12px; border: 1px solid var(--border-subtle); border-radius: 6px; background: var(--bg-muted);}
+.state-dialog .state-groups {display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 0; padding: 0; border: 0;}
+/* Kiro's background calls: where each group's go, above the model list and on 分组与权益. */
+.fast-models {display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-surface); font-size: 13px;}
+.fast-models .field-label {margin: 0;}
+.fast-model {white-space: nowrap;}
+.fast-model .tag {margin-left: 4px;}
+.config-table .col-fast .cell-sub {display: block; font-size: 12px; color: var(--text-3);}
+.fast-alias .check-field {margin-top: 6px;}
+.sheet-table .group-chips .tag {height: 18px; font-size: 11px;}

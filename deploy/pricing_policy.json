@@ -1,9 +1,8 @@
 {
-  "id": "official-024-20260920",
+  "id": "kimera-retail-gpt025-claude035-20260928",
   "credit_face_value_cny": 0.03,
-  "credits_per_official_usd": 8,
   "upstream_multiplier": 0.08,
-  "retail_multiplier": 0.24,
+  "retail_multiplier": 0.35,
   "tiers": [
     {
       "id": "tier-1000",
@@ -102,10 +101,18 @@
     "gpt-5.6-sol": 272000,
     "gpt-5.6-terra": 272000
   },
-  "priced_as": {
-    "claude-opus-5-5": "claude-opus-5"
-  },
+  "priced_as": {},
   "upstream_price_basis": {
-    "hanyue-max/claude-opus-5-5": "claude-opus-5"
+    "hanyue-max/claude-opus-5-5": [
+      2,
+      25,
+      6.25,
+      0.5
+    ]
+  },
+  "model_retail_multipliers": {
+    "gpt-6-astra": 0.25,
+    "gpt-5.6-sol": 0.25,
+    "gpt-5.6-terra": 0.25
   }
 }

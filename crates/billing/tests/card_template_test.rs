@@ -98,6 +98,43 @@ fn test_normalization_and_constant_time_verification() {
     ));
 }
 
+/// A card's ID is `card-` and the first 16 hex digits of its code's hash. The admin console
+/// derives it in the browser to find a card from the code a customer quotes; these pairs are
+/// the ones its own tests check against.
+#[test]
+fn test_card_id_is_the_start_of_the_code_hash() {
+    let id_of = |raw: &str| format!("card-{}", &hash_card_code(raw)[..16]);
+    for (raw, id) in [
+        (
+            "kiro-9F83-A1B2-C3D4-E5F6-7A8B-9C0D-1E2F-3A4B",
+            "card-74f48022ecefbdeb",
+        ),
+        (
+            "  kiro 9f83 a1b2 c3d4 e5f6 7a8b 9c0d 1e2f 3a4b  ",
+            "card-74f48022ecefbdeb",
+        ),
+        (
+            "kiro-3eba-7810-bb00-a2e3-465a-fcc8-b9de-7471",
+            "card-b802b003e19a4e48",
+        ),
+        (
+            "kiro-0000-0000-0000-0000-0000-0000-0000-0001",
+            "card-b48b34bd2116ba5a",
+        ),
+    ] {
+        assert_eq!(id_of(raw), id, "{raw}");
+    }
+    // The prefix is part of what is hashed: the hex alone belongs to no card.
+    assert_ne!(
+        id_of("3eba-7810-bb00-a2e3-465a-fcc8-b9de-7471"),
+        "card-b802b003e19a4e48"
+    );
+    let template = CardTemplate::tier("tier-1000", "grp-1").unwrap();
+    for generated in generate_batch(&template, 5, None, 1_000_000).unwrap() {
+        assert_eq!(generated.card.id, id_of(&generated.raw_code));
+    }
+}
+
 #[test]
 fn test_audit_b_activation_begins_timing_lifecycle() {
     let tpl = CardTemplate::daily("tpl-daily", "grp-1"); // 86,400s (1 day)

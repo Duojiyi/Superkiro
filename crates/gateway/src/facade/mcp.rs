@@ -1,7 +1,7 @@
 //! MCP (Model Context Protocol) endpoint handler for Kiro IDE (Spec §15.1, §18.7, P4-3).
 //!
 //! Handles JSON-RPC 2.0 MCP requests from Kiro IDE:
-//! - `tools/list`: Lists available MCP tools (including `web_search`).
+//! - `tools/list`: Lists available MCP tools: `web_search` when a search backend is configured.
 //! - `tools/call`: Executes tool calls, routing `web_search` to the configured search source.
 //! - `initialize`: Responds to MCP handshake and protocol negotiation.
 
@@ -35,9 +35,30 @@ pub struct SearchResponsePayload {
     pub total_results: usize,
 }
 
+/// Which search service answers Kiro's `web_search`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchBackend {
+    /// None configured, unless a custom backend URL is: Kiro is offered no web search, and a
+    /// search that still arrives (from a tool list it kept) fails as a tool error Kiro
+    /// reports, never as an empty result.
+    #[default]
+    None,
+    /// SearXNG, or any service answering `GET <url>?q=...&format=json` with SearXNG's
+    /// `results` (`title`, `url`, `content`), with an optional Bearer key.
+    Searxng,
+    /// Brave Search API: `GET /res/v1/web/search`, key in `X-Subscription-Token`.
+    Brave,
+    /// Tavily: `POST /search`, Bearer key.
+    Tavily,
+}
+
 /// Configurable search source settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchSourceConfig {
+    #[serde(default)]
+    pub backend: SearchBackend,
+    /// The SearXNG endpoint; for Brave and Tavily, an optional replacement for their own.
     pub custom_backend_url: Option<String>,
     pub api_key: Option<String>,
     pub max_results: usize,
@@ -47,10 +68,21 @@ pub struct SearchSourceConfig {
 impl Default for SearchSourceConfig {
     fn default() -> Self {
         Self {
+            backend: SearchBackend::None,
             custom_backend_url: None,
             api_key: None,
             max_results: 10,
             timeout_secs: 15,
+        }
+    }
+}
+
+impl SearchSourceConfig {
+    /// The backend searches go to: the one named, or SearXNG when only its URL is given.
+    pub fn effective_backend(&self) -> SearchBackend {
+        match self.backend {
+            SearchBackend::None if self.custom_backend_url.is_some() => SearchBackend::Searxng,
+            backend => backend,
         }
     }
 }
@@ -79,7 +111,8 @@ pub struct McpToolCallParams {
     pub arguments: HashMap<String, Value>,
 }
 
-/// Search engine runner querying either a custom search backend or DuckDuckGo.
+/// Run a search on the configured backend. An error is shown to the model and the
+/// customer as the tool's failure, so it names what failed and never a key or a URL.
 pub async fn execute_search(
     client: &reqwest::Client,
     config: &SearchSourceConfig,
@@ -93,128 +126,139 @@ pub async fn execute_search(
             total_results: 0,
         });
     }
-
-    if let Some(ref backend_url) = config.custom_backend_url {
-        // Custom search source backend (e.g. SearXNG, custom search API)
-        let mut req = client
-            .get(backend_url)
-            .query(&[("q", query_trimmed), ("format", "json")]);
-        if let Some(ref key) = config.api_key {
-            req = req.header("Authorization", format!("Bearer {}", key));
+    let max_results = config.max_results.clamp(1, 20);
+    let key = config.api_key.as_deref().filter(|key| !key.is_empty());
+    let (request, pick): (_, fn(&Value) -> Vec<SearchResultItem>) = match config.effective_backend()
+    {
+        SearchBackend::None => {
+            return Err("web search is not configured on this gateway".to_string())
         }
-
-        let resp = req
-            .timeout(Duration::from_secs(config.timeout_secs))
-            .send()
-            .await
-            .map_err(|e| format!("Custom search backend request failed: {e}"))?;
-
-        if !resp.status().is_success() {
-            return Err(format!(
-                "Custom search backend returned status {}",
-                resp.status()
-            ));
-        }
-
-        let json_body: Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse custom search backend response: {e}"))?;
-
-        // Standard SearXNG / generic array mapping
-        let mut results = Vec::new();
-        if let Some(items) = json_body["results"].as_array() {
-            for item in items.iter().take(config.max_results) {
-                let title = item["title"].as_str().unwrap_or("Untitled").to_string();
-                let url = item["url"].as_str().unwrap_or("").to_string();
-                let snippet = item["content"]
-                    .as_str()
-                    .or_else(|| item["snippet"].as_str())
-                    .unwrap_or("")
-                    .to_string();
-                results.push(SearchResultItem {
-                    title,
-                    url,
-                    snippet,
-                    published_date: None,
-                });
+        SearchBackend::Searxng => {
+            let url = config.custom_backend_url.as_deref().unwrap_or_default();
+            let mut request = client
+                .get(url)
+                .query(&[("q", query_trimmed), ("format", "json")]);
+            if let Some(key) = key {
+                request = request.bearer_auth(key);
             }
+            (request, searxng_results)
         }
+        SearchBackend::Brave => {
+            let Some(key) = key else {
+                return Err("the Brave Search API key is not configured".to_string());
+            };
+            let url = config
+                .custom_backend_url
+                .as_deref()
+                .unwrap_or("https://api.search.brave.com/res/v1/web/search");
+            let request = client
+                .get(url)
+                .header("Accept", "application/json")
+                .header("X-Subscription-Token", key)
+                .query(&[("q", query_trimmed), ("count", &max_results.to_string())]);
+            (request, brave_results)
+        }
+        SearchBackend::Tavily => {
+            let Some(key) = key else {
+                return Err("the Tavily API key is not configured".to_string());
+            };
+            let url = config
+                .custom_backend_url
+                .as_deref()
+                .unwrap_or("https://api.tavily.com/search");
+            let request = client.post(url).bearer_auth(key).json(&json!({
+                "query": query_trimmed,
+                "max_results": max_results,
+                "search_depth": "basic",
+            }));
+            (request, tavily_results)
+        }
+    };
 
-        let total = results.len();
-        return Ok(SearchResponsePayload {
-            query: query_trimmed.to_string(),
-            results,
-            total_results: total,
-        });
-    }
-
-    // Default built-in source: DuckDuckGo Instant Answer API
-    let ddg_url = "https://api.duckduckgo.com/";
-    let resp = client
-        .get(ddg_url)
-        .query(&[
-            ("q", query_trimmed),
-            ("format", "json"),
-            ("no_html", "1"),
-            ("skip_disambig", "1"),
-        ])
+    let response = request
         .timeout(Duration::from_secs(config.timeout_secs))
         .send()
-        .await;
-
-    match resp {
-        Ok(r) if r.status().is_success() => {
-            if let Ok(ddg) = r.json::<Value>().await {
-                let mut results = Vec::new();
-
-                // 1. Primary abstract if available
-                if let Some(heading) = ddg["Heading"].as_str() {
-                    let abstract_text = ddg["AbstractText"].as_str().unwrap_or("");
-                    let abstract_url = ddg["AbstractURL"].as_str().unwrap_or("");
-                    if !heading.is_empty() && !abstract_text.is_empty() {
-                        results.push(SearchResultItem {
-                            title: heading.to_string(),
-                            url: abstract_url.to_string(),
-                            snippet: abstract_text.to_string(),
-                            published_date: None,
-                        });
-                    }
-                }
-
-                // 2. Related topics
-                if let Some(topics) = ddg["RelatedTopics"].as_array() {
-                    for topic in topics
-                        .iter()
-                        .take(config.max_results.saturating_sub(results.len()))
-                    {
-                        if let (Some(text), Some(url)) =
-                            (topic["Text"].as_str(), topic["FirstURL"].as_str())
-                        {
-                            let title = text.split(" - ").next().unwrap_or("Result").to_string();
-                            results.push(SearchResultItem {
-                                title,
-                                url: url.to_string(),
-                                snippet: text.to_string(),
-                                published_date: None,
-                            });
-                        }
-                    }
-                }
-
-                let total = results.len();
-                return Ok(SearchResponsePayload {
-                    query: query_trimmed.to_string(),
-                    results,
-                    total_results: total,
-                });
+        .await
+        .map_err(|error| {
+            if error.is_timeout() {
+                "the search backend did not answer in time".to_string()
+            } else {
+                "the search backend could not be reached".to_string()
             }
-        }
-        _ => {}
+        })?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "the search backend answered HTTP {}",
+            response.status().as_u16()
+        ));
     }
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|_| "the search backend returned an unreadable answer".to_string())?;
+    let mut results = pick(&body);
+    results.truncate(max_results);
+    let total = results.len();
+    Ok(SearchResponsePayload {
+        query: query_trimmed.to_string(),
+        results,
+        total_results: total,
+    })
+}
 
-    // Never manufacture evidence when an external search request fails.
-    Err("Search backend unavailable or returned an invalid response".to_string())
+fn searxng_results(body: &Value) -> Vec<SearchResultItem> {
+    items(&body["results"], "content")
+}
+
+fn brave_results(body: &Value) -> Vec<SearchResultItem> {
+    items(&body["web"]["results"], "description")
+}
+
+fn tavily_results(body: &Value) -> Vec<SearchResultItem> {
+    items(&body["results"], "content")
+}
+
+/// The fields Kiro prints from each result: title, URL and snippet, as plain text.
+fn items(results: &Value, snippet_field: &str) -> Vec<SearchResultItem> {
+    results
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let url = item["url"].as_str().filter(|url| !url.is_empty())?;
+            let snippet = item[snippet_field]
+                .as_str()
+                .or_else(|| item["snippet"].as_str())
+                .unwrap_or_default();
+            Some(SearchResultItem {
+                title: plain_text(item["title"].as_str().unwrap_or("Untitled")),
+                url: url.to_string(),
+                snippet: plain_text(snippet),
+                published_date: None,
+            })
+        })
+        .collect()
+}
+
+/// Search snippets highlight matches with markup (`<strong>`) and escape entities.
+fn plain_text(html: &str) -> String {
+    let mut text = String::with_capacity(html.len());
+    let mut in_tag = false;
+    for c in html.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            _ if !in_tag => text.push(c),
+            _ => {}
+        }
+    }
+    text.replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
 }
 
 /// Facade handler for `/mcp`.
@@ -317,27 +361,34 @@ impl FacadeHandler for McpHandler {
                         .into_response()
                 }
                 "tools/list" => {
+                    // Without a backend every search fails, and a model offered the tool
+                    // keeps calling it. Kiro offers the tools listed here as its
+                    // remote_web_search; given none, it keeps the empty list and offers no
+                    // web search at all.
+                    let tools = if self.config.effective_backend() == SearchBackend::None {
+                        json!([])
+                    } else {
+                        json!([
+                            {
+                                "name": "web_search",
+                                "description": "Performs web search for up-to-date information, documentation, and news.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "query": {
+                                            "type": "string",
+                                            "description": "The search query keywords"
+                                        }
+                                    },
+                                    "required": ["query"]
+                                }
+                            }
+                        ])
+                    };
                     let resp = json!({
                         "jsonrpc": "2.0",
                         "id": req_id,
-                        "result": {
-                            "tools": [
-                                {
-                                    "name": "web_search",
-                                    "description": "Performs web search for up-to-date information, documentation, and news.",
-                                    "inputSchema": {
-                                        "type": "object",
-                                        "properties": {
-                                            "query": {
-                                                "type": "string",
-                                                "description": "The search query keywords"
-                                            }
-                                        },
-                                        "required": ["query"]
-                                    }
-                                }
-                            ]
-                        }
+                        "result": { "tools": tools }
                     });
                     (
                         StatusCode::OK,
@@ -434,18 +485,17 @@ impl FacadeHandler for McpHandler {
                             )
                                 .into_response()
                         }
+                        // Kiro reads a result for its `results` alone, so a failure sent as
+                        // one became "Found 0 search result(s)", reported as a success. As a
+                        // JSON-RPC error it is the tool's failure, which the model can tell
+                        // apart from nothing found.
                         Err(e) => {
                             let resp = json!({
                                 "jsonrpc": "2.0",
                                 "id": req_id,
-                                "result": {
-                                    "content": [
-                                        {
-                                            "type": "text",
-                                            "text": format!("{{\"error\": \"Web search failed: {e}\"}}")
-                                        }
-                                    ],
-                                    "isError": true
+                                "error": {
+                                    "code": -32000,
+                                    "message": format!("Web search failed: {e}")
                                 }
                             });
 

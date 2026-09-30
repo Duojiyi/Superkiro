@@ -368,6 +368,14 @@ fn shrunk(value: Option<Arc<str>>) -> PreparedImage {
     }
 }
 
+/// What identifies an image's raw bytes: their SHA-256.
+pub fn image_key(raw_bytes: &[u8]) -> [u8; 32] {
+    ring::digest::digest(&ring::digest::SHA256, raw_bytes)
+        .as_ref()
+        .try_into()
+        .expect("SHA-256 digests are 32 bytes")
+}
+
 /// Shrink one image from [`Inspection::NeedsShrink`] without blocking the async workers.
 ///
 /// A cached result is returned at once. Otherwise the decode waits for one of the
@@ -375,10 +383,16 @@ fn shrunk(value: Option<Arc<str>>) -> PreparedImage {
 /// image is `Busy` for this request; a decode already running still finishes, keeps its
 /// permit until then, and caches its result for the next turn.
 pub async fn shrink_image(raw_bytes: Vec<u8>, deadline: Instant) -> PreparedImage {
-    let key: [u8; 32] = ring::digest::digest(&ring::digest::SHA256, &raw_bytes)
-        .as_ref()
-        .try_into()
-        .expect("SHA-256 digests are 32 bytes");
+    let key = image_key(&raw_bytes);
+    shrink_image_keyed(raw_bytes, key, deadline).await
+}
+
+/// [`shrink_image`] for bytes whose [`image_key`] is `key`.
+pub async fn shrink_image_keyed(
+    raw_bytes: Vec<u8>,
+    key: [u8; 32],
+    deadline: Instant,
+) -> PreparedImage {
     if let Some(value) = cached_shrink(&key) {
         return shrunk(value);
     }

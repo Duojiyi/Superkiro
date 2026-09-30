@@ -1,5 +1,6 @@
 // Final-build auth gate regression: localhost fixture only, no deployed services.
 const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
+const recordToasts=require('./toasts.cjs');
 const http=require('node:http'),fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
 const fixture=require('./fixture-api.cjs')();
 // Confirmations are the console's own dialog (role alertdialog), never window.confirm.
@@ -28,6 +29,7 @@ const server=http.createServer(async(req,res)=>{
   const browser=await chromium.launch({headless:true,...(process.env.CHROME_PATH?{executablePath:process.env.CHROME_PATH}:{})});
   try {
     const page=await browser.newPage({viewport:{width:320,height:740}});
+    const toasts=await recordToasts(page);
     const origin=`http://127.0.0.1:${server.address().port}`, errors=[];
     page.on('pageerror',e=>errors.push(e.message));
     page.on('dialog',d=>{errors.push('native dialog: '+d.message());void d.dismiss();});
@@ -68,7 +70,7 @@ const server=http.createServer(async(req,res)=>{
     await nav('安全与审计');await answer(page,false);
     await page.getByLabel('Key ID',{exact:true}).waitFor();
     await nav('安全与审计');await answer(page,true);
-    await page.getByText('双因素验证未启用（在服务器配置中开启）',{exact:true}).waitFor();
+    await page.getByText('登录使用用户名和密码（未启用双因素验证）',{exact:true}).waitFor();
     await page.getByRole('button',{name:'下线全部会话',exact:true}).click();await answer(page,false);
     assert.equal(fixture.writes.filter(w=>w.endpoint==='session/revoke').length,0);
     await nav('卡密资产');
@@ -86,15 +88,15 @@ const server=http.createServer(async(req,res)=>{
     assert(await modal.evaluate(e=>e.contains(document.activeElement)));
     await page.keyboard.press('Escape');assert.equal(await page.getByRole('dialog').count(),0);
     assert(await batch.evaluate(e=>e===document.activeElement));assert.equal(await page.locator('.workspace').evaluate(e=>e.inert),false);
-    await page.getByRole('button',{name:'查看卡密',exact:true}).first().click();
-    modal=page.getByRole('dialog',{name:'查看卡密',exact:true});await modal.waitFor();
+    await page.getByRole('button',{name:'显示卡密',exact:true}).first().click();
+    modal=page.getByRole('dialog',{name:'显示卡密',exact:true});await modal.waitFor();
     assert(await modal.evaluate(e=>{const r=e.firstElementChild.getBoundingClientRect();return r.left>=0&&r.right<=innerWidth;}));
     await page.evaluate(()=>Object.defineProperty(navigator,'clipboard',{configurable:true,value:{writeText:async()=>{throw new Error('denied');}}}));
     await modal.getByRole('button',{name:'复制',exact:true}).click();
     await modal.getByRole('alert').filter({hasText:'复制失败'}).waitFor();
     await page.evaluate(()=>Object.defineProperty(navigator,'clipboard',{configurable:true,value:{writeText:async()=>{}}}));
     await modal.getByRole('button',{name:'复制',exact:true}).click();
-    await page.getByRole('status').filter({hasText:'已复制卡密'}).waitFor();
+    await toasts.shown('已复制卡密');
     assert.equal(await modal.getByRole('alert').count(),0,'a successful copy clears the copy error');
     await page.keyboard.press('Escape');assert.equal(await page.getByLabel('卡密明文').count(),0);
     await nav('公告管理');

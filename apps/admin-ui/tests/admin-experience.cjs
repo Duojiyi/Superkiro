@@ -1,6 +1,7 @@
 // Built UI + authenticated local fixture. No deployed services, added dependencies or production writes.
 // Run after npm run build: node tests/admin-experience.cjs
 const {chromium} = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
+const recordToasts = require('./toasts.cjs');
 const http = require('node:http'), fs = require('node:fs'), path = require('node:path'), assert = require('node:assert/strict');
 const fixture = require('./fixture-api.cjs')();
 const root = path.resolve(__dirname, '../dist');
@@ -24,14 +25,16 @@ async function waitFor(ready) {
   try {
     const page = await browser.newPage({viewport: {width: 1280, height: 900}});
     page.setDefaultTimeout(12000);
+    const toasts = await recordToasts(page);
     const origin = `http://127.0.0.1:${server.address().port}`, errors = [];
     page.on('pageerror', error => errors.push(error.message));
     const nativeDialogs = []; page.on('dialog', dialog => {nativeDialogs.push(dialog.message()); void dialog.dismiss();});
     await page.route('**/*', route => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
     let cardsMode = 'fail', tracesMode = 'fail', noticesMode = 'fail', heldCards;
-    let sessionCsrf = 'fixture-csrf';
+    let sessionCsrf = 'fixture-csrf', sessionHeld = null;
     await page.route('**/api/v1/admin/session', async route => {
       if (route.request().method() !== 'GET') return route.continue();
+      if (sessionHeld) await sessionHeld;
       const response = await route.fetch(), data = await response.json();
       return route.fulfill({response, json: {...data, csrfToken: sessionCsrf}});
     });
@@ -51,11 +54,16 @@ async function waitFor(ready) {
     const nav = name => page.getByRole('navigation').getByRole('button', {name, exact: true}).click();
     const refreshed = () => page.waitForFunction(() => [...document.querySelectorAll('.topbar button')].some(b => b.textContent === '刷新' && !b.disabled));
     const refresh = async () => {await button('刷新').click(); await refreshed();};
+    // Returning to the window re-checks the session in the background, the workspace aria-busy until
+    // the answer is applied. The answer is held until the check shows, so a quick one is not missed,
+    // and what follows is judged on the answer applied, not merely received.
     const focusRecheck = async () => {
-      const response = page.waitForResponse(response => response.url().endsWith('/api/v1/admin/session') && response.request().method() === 'GET');
+      let release; sessionHeld = new Promise(resolve => {release = resolve;});
+      const checking = page.locator('.workspace-shell[aria-busy="true"]');
       await page.evaluate(() => window.dispatchEvent(new Event('focus')));
-      await response;
-      await page.waitForFunction(() => ![...document.querySelectorAll('[role="status"]')].some(node => node.textContent?.trim() === '正在检查会话…'));
+      await checking.waitFor();
+      sessionHeld = null; release();
+      await checking.waitFor({state: 'detached'});
     };
     const emptyFailure = () => page.locator('.list-state').getByText('加载失败', {exact: true});
     // Confirmations are the console's own dialog; irreversible actions also need the word typed.
@@ -117,7 +125,7 @@ async function waitFor(ready) {
 
     await nav('调用追踪'); await button('下一页').click();
     await traceTab('in_progress');
-    assert.equal(await button('详情').count(), 1); await page.locator('tbody').getByText('进行中', {exact: true}).waitFor();
+    assert.equal(await button('详情').count(), 1); await page.locator('tbody').getByText('可能已中断', {exact: true}).waitFor();
     assert.equal(await button('上一页').count(), 0, 'a filter change returns to a single page');
     await page.getByLabel('搜索调用记录').fill('  fixture-trace-23  '); assert.equal(await button('详情').count(), 1);
     await traceTab('error');
@@ -171,15 +179,15 @@ async function waitFor(ready) {
     await page.keyboard.press('Escape'); await page.getByRole('dialog', {name: '卡密调账'}).waitFor({state: 'detached'});
     await button('更多操作').first().click(); await page.getByRole('menuitem', {name: '封禁', exact: true}).click();
     const banConfirm = page.getByRole('alertdialog'); await banConfirm.waitFor();
-    assert((await banConfirm.innerText()).includes('封禁后不能恢复')); await answer(false);
+    assert((await banConfirm.innerText()).includes('之后可以解封（要填原因）')); await answer(false);
     assert.equal(fixture.writes.filter(w => w.endpoint === 'cards/status').length, 0);
     console.log('PASS: quantity validation without coercion, confirmation context, cancellation without writes, dialog focus and Escape');
 
     await nav('供应商与 Key');
     await page.route('**/api/v1/admin/providers/status', route => route.fulfill({json: {success: false}}));
-    await page.getByRole('switch').first().click(); await answer(true);
+    toasts.mark(); await page.getByRole('switch').first().click(); await answer(true);
     await page.getByRole('alert').filter({hasText: '切换结果未确认'}).waitFor();
-    assert.equal(await page.locator('.toast').filter({hasText: '已停用'}).count(), 0);
+    assert(!(await toasts.since()).some(text => text.includes('已停用')), 'no success toast for a negative acknowledgement');
     await button('关闭提示').click(); await nav('调用追踪');
     let prunePosts = 0, heldPrune;
     await page.route('**/api/v1/admin/traces/prune', route => {prunePosts++; heldPrune = route;});
@@ -197,11 +205,11 @@ async function waitFor(ready) {
     await busyItem.evaluate(el => el.click()); assert.equal(prunePosts, 1); await page.keyboard.press('Escape');
     assert.equal(heldPrune.request().headers()['x-csrf-token'], 'fixture-csrf');
     assert(Math.abs(heldPrune.request().postDataJSON().cutoffSecs - (Date.now() / 1000 - 30 * 86400)) < 10);
-    await heldPrune.fulfill({json: {success: false}}); await page.getByRole('alert').filter({hasText: '清理结果未确认'}).waitFor();
-    assert.equal(await page.locator('.toast').filter({hasText: '已删除'}).count(), 0);
+    toasts.mark(); await heldPrune.fulfill({json: {success: false}}); await page.getByRole('alert').filter({hasText: '清理结果未确认'}).waitFor();
+    assert(!(await toasts.since()).some(text => text.includes('已删除')), 'no success toast for an unconfirmed prune');
     await button('关闭提示').click(); heldPrune = null;
     await openPrune(); await answer(true); await waitFor(() => heldPrune);
-    await heldPrune.fulfill({json: {success: true, pruned: 7}}); await page.getByRole('status').filter({hasText: '已删除 7 条记录'}).waitFor();
+    await heldPrune.fulfill({json: {success: true, pruned: 7}}); await toasts.shown('已删除 7 条记录');
     assert.equal(prunePosts, 2); await refreshed();
     console.log('PASS: provider negative acknowledgement; prune impact confirmation, CSRF, pending lock and accurate success/failure');
 
@@ -211,8 +219,8 @@ async function waitFor(ready) {
     await nav('卡密资产');
     const sensitiveSearch = page.getByLabel('搜索卡密', {exact: true});
     await sensitiveSearch.fill('fixture-card-0');
-    await button('查看卡密').first().click();
-    const sensitiveDialog = page.getByRole('dialog', {name: '查看卡密', exact: true});
+    await button('显示卡密').first().click();
+    const sensitiveDialog = page.getByRole('dialog', {name: '显示卡密', exact: true});
     await sensitiveDialog.waitFor();
     await focusRecheck();
     assert.equal(await sensitiveDialog.count(), 1, 'same CSRF must keep the sensitive dialog');
@@ -223,7 +231,7 @@ async function waitFor(ready) {
     assert.equal(await page.getByLabel('正文内容', {exact: true}).inputValue(), '同一会话校验后应保留的正文');
 
     await nav('卡密资产');
-    await button('查看卡密').first().click();
+    await button('显示卡密').first().click();
     await sensitiveDialog.waitFor();
     sessionCsrf = 'fixture-csrf-rotated';
     await focusRecheck();

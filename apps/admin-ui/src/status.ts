@@ -17,6 +17,16 @@ export function cardStatusView(status: string): StatusView {
   return CARD[status as AdminCardItem['status']] ?? {label: status || '未知', tone: 'outline'};
 }
 
+/**
+ * A card's status as it works now. The server checks a card's validity only when the card is
+ * used, so one past its date still reads active (or frozen): it is 已到期. The server's own
+ * effectiveStatus comes first when it sends one.
+ */
+export function cardState(card: {status: AdminCardItem['status']; validUntil?: number | null; effectiveStatus?: unknown}, nowSecs: number): AdminCardItem['status'] {
+  if (typeof card.effectiveStatus === 'string' && card.effectiveStatus in CARD) return card.effectiveStatus as AdminCardItem['status'];
+  return (card.status === 'active' || card.status === 'frozen') && card.validUntil != null && card.validUntil <= nowSecs ? 'expired' : card.status;
+}
+
 type Row = Record<string, unknown>;
 
 /** Seconds of cooldown left for a key, or 0. */
@@ -62,12 +72,15 @@ export function failureLabel(value: unknown): string {
   return words ? `HTTP ${code} · ${words}` : `HTTP ${code}`;
 }
 
+/** The upstream refused the Key itself (invalid, HTTP 401, or without permission, 403): only a new secret fixes it. */
+export const credentialFailure = (key: Row) => key.health_state === 'unhealthy' || ['http_401', 'http_403'].includes(String(key.last_error ?? ''));
+
 export function keyStatusView(key: Row, nowSecs: number): StatusView {
   if (key.enabled === false) return {label: '已停用', tone: 'neutral'};
   const lastError = failureLabel(key.last_error), error = lastError ? `最近错误：${lastError}` : undefined;
   const alert = keyAlert(key, nowSecs), cooldown = keyCooldownLeft(key, nowSecs);
   if (alert === 'unhealthy') return {label: '不可用', tone: 'danger', title: error};
-  if (alert === 'degraded') return {label: '恢复中', tone: 'warning', title: ['冷却已结束，重新接请求，还没成功过', error].filter(Boolean).join('\n')};
+  if (alert === 'degraded') return {label: '冷却后试用中', tone: 'warning', title: ['冷却已结束，重新接请求，还没成功过', error].filter(Boolean).join('\n')};
   if (alert === 'cooldown') {
     if (cooldown <= 0) return {label: '冷却中', tone: 'warning', title: error};
     return {label: `冷却中 · ${cooldownText(cooldown)}`, tone: 'warning', title: [`${cooldownText(cooldown)}后恢复`, error].filter(Boolean).join('\n')};
@@ -82,14 +95,89 @@ export function providerFormatLabel(provider: Row): string | null {
   return !format ? null : ['open_ai', 'openai'].includes(format) ? 'OpenAI' : format === 'anthropic' ? 'Anthropic' : format;
 }
 
+/**
+ * The saved billing state against its ceiling, where every save fails and so every request is
+ * refused: archive the ledger soon from the server's warning level, and now from the level at
+ * which the server logs "archive … now" (a quarter of the ceiling: billing's STATE_URGENT_BYTES).
+ * Null when the server does not report its size.
+ */
+export function storageLevel(stats: {stateBytes?: unknown; stateWarningBytes?: unknown; stateCeilingBytes?: unknown} | null | undefined):
+  {bytes: number; warning: number; urgent: number; ceiling: number; level: 'ok' | 'soon' | 'now'} | null {
+  const [bytes, warning, ceiling] = [stats?.stateBytes, stats?.stateWarningBytes, stats?.stateCeilingBytes].map(Number);
+  if (![bytes, warning, ceiling].every(value => Number.isFinite(value) && value >= 0) || !ceiling) return null;
+  const urgent = ceiling / 4;
+  return {bytes, warning, urgent, ceiling, level: bytes >= urgent ? 'now' : bytes >= warning ? 'soon' : 'ok'};
+}
+
+// Why the server could not save, in its words (admin.rs persistence_problem), and what fixes it.
+const PERSISTENCE_PROBLEMS: Record<string, {text: string; fix: string}> = {
+  'The saved state has reached its size ceiling; archive old ledger entries': {text: '保存的数据到了大小上限', fix: '请现在归档旧账本（下方“归档账本…”）'},
+  'The disk holding the saved state is full': {text: '保存数据的磁盘满了', fix: '请清理服务器上保存数据的磁盘'},
+  'The saved state cannot be written: permission denied': {text: '没有写入保存文件的权限', fix: '请检查服务器进程对保存文件所在目录的写权限'},
+  'Saving this state needs the master key, which is not configured': {text: '保存这些数据需要主密钥，服务器没有配置', fix: '请在服务器上配置主密钥后重启'},
+  'The saved state could not be written': {text: '保存的数据写不进去', fix: '请查看服务器日志'},
+};
+
+/**
+ * Whether the server's latest change is saved, and when it last saved. While a save has failed the
+ * server refuses every change and every request, so a problem is the most urgent thing to fix.
+ * Null when the server reports neither.
+ */
+export function persistence(stats: {persistenceReady?: unknown; persistenceError?: unknown; lastSavedAtSecs?: unknown} | null | undefined):
+  {ready: boolean | null; problem: {text: string; fix: string} | null; savedAt: number | null} | null {
+  const ready = typeof stats?.persistenceReady === 'boolean' ? stats.persistenceReady : null;
+  const savedAt = typeof stats?.lastSavedAtSecs === 'number' && stats.lastSavedAtSecs > 0 ? stats.lastSavedAtSecs : null;
+  if (ready === null && savedAt === null) return null;
+  const said = typeof stats?.persistenceError === 'string' ? stats.persistenceError : '';
+  const problem = ready === false ? PERSISTENCE_PROBLEMS[said] ?? {text: said || '保存失败', fix: '请查看服务器日志'} : null;
+  return {ready, problem, savedAt};
+}
+
 export const TRACE_IN_PROGRESS = ['pending', 'running', 'in_progress'];
 
-export function traceStatusView(status: unknown): StatusView {
+/** 进行中 for longer than this: no request runs that long, so it was most likely cut off (a restart, a lost connection). */
+export const TRACE_STUCK_SECS = 30 * 60;
+
+/** A request still 进行中 more than 30 minutes after it started. */
+export function traceStuck(trace: {status?: unknown; ts?: unknown}, nowSecs: number): boolean {
+  const started = Number(trace.ts);
+  return TRACE_IN_PROGRESS.includes(String(trace.status)) && Number.isFinite(started) && started > 0 && nowSecs - started > TRACE_STUCK_SECS;
+}
+
+/**
+ * Refusals for the card or the request itself (billing's CARD_REFUSALS): the balance or limits, a
+ * prompt too long for the model, a capability it lacks, a model the card may not or cannot name.
+ * They say nothing about a model's or an upstream's health and are counted apart from failures.
+ */
+export const REQUEST_REFUSALS = ['insufficient_balance', 'concurrency_limit', 'usage_limit', 'input_too_long', 'unsupported_capability', 'invalid_model', 'model_not_listed', 'model_retired'];
+
+/** A request refused for the card or the request itself: 拒绝, not 失败. */
+export const refusedTrace = (trace: {status?: unknown; error_class?: unknown}) => trace.status === 'error' && REQUEST_REFUSALS.includes(String(trace.error_class ?? ''));
+
+const REFUSED: StatusView = {label: '拒绝', tone: 'neutral', title: '按卡的额度或请求本身拒绝（例如余额不足、输入过长），不算失败，也没有扣费'};
+
+/** A request's badge: its status, 拒绝 for a refusal, 可能已中断 for one running far too long. */
+export function traceView(trace: {status?: unknown; error_class?: unknown; ts?: unknown}, nowSecs: number): StatusView {
+  return refusedTrace(trace) ? REFUSED : traceStatusView(trace.status, traceStuck(trace, nowSecs));
+}
+
+/** A refusal that stands for the same refusal again within a minute: 同类拒绝 ×3, with when the last was. */
+export function repeatedRefusal(trace: {repeats?: unknown; last_seen_secs?: unknown}): {text: string; title: string} | null {
+  const repeats = Number(trace.repeats);
+  if (!Number.isInteger(repeats) || repeats <= 0) return null;
+  const last = Number(trace.last_seen_secs), at = Number.isFinite(last) && last > 0 ? new Date(last * 1000) : null;
+  const clock = at ? `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}:${String(at.getSeconds()).padStart(2, '0')}` : '';
+  return {text: `同类拒绝 ×${repeats + 1}`, title: `一分钟内这张卡因同一原因被拒绝了 ${repeats + 1} 次，只记这一条${clock ? `；最后一次 ${clock}` : ''}`};
+}
+
+export function traceStatusView(status: unknown, stuck = false): StatusView {
   switch (String(status)) {
     case 'success': return {label: '成功', tone: 'success'};
     case 'error': return {label: '失败', tone: 'danger'};
     case 'client_aborted': return {label: '客户端中断', tone: 'warning'};
-    default: return TRACE_IN_PROGRESS.includes(String(status)) ? {label: '进行中', tone: 'info'} : {label: String(status ?? '未知'), tone: 'outline'};
+    default: return TRACE_IN_PROGRESS.includes(String(status))
+      ? (stuck ? {label: '可能已中断', tone: 'warning'} : {label: '进行中', tone: 'info'})
+      : {label: String(status ?? '未知'), tone: 'outline'};
   }
 }
 
@@ -105,11 +193,37 @@ const ERROR_CLASS: Record<string, string> = {
   invalid_model: '模型 ID 无效',
   no_route: '无可用线路',
   unsupported_capability: '模型不支持这项能力',
+  input_too_long: '输入超过模型的上下文长度',
+  // Refused for the card's own balance or limits, before any upstream was tried.
+  insufficient_balance: '余额不足',
+  concurrency_limit: '超过并发上限',
+  usage_limit: '超过每日或每月用量上限',
 };
 
 /** A failure class in words; unknown classes are shown as they are. */
 export const errorClassLabel = (value: unknown): string =>
   typeof value === 'string' && value ? ERROR_CLASS[value] ?? value : '';
+
+/** Refusals for the card's own balance or limits: they say nothing about the model or its route. */
+export const CARD_LIMIT_REFUSALS = ['insufficient_balance', 'concurrency_limit', 'usage_limit'];
+
+const points = (micro: unknown) => typeof micro === 'number' && Number.isFinite(micro)
+  ? (micro / 1_000_000).toLocaleString('en-US', {maximumFractionDigits: 2}) : null;
+
+/** A request's failure in words, with what a balance refusal needed: 余额不足：需要 20.3 积分，余额 15 积分. */
+export function traceFailureText(trace: {error_class?: string | null; needed_micro_credits?: unknown; available_micro_credits?: unknown}): string {
+  const label = errorClassLabel(trace.error_class);
+  if (trace.error_class !== 'insufficient_balance') return label;
+  const needed = points(trace.needed_micro_credits), available = points(trace.available_micro_credits);
+  return needed === null ? label : `${label}：需要 ${needed} 积分${available === null ? '' : `，余额 ${available} 积分`}`;
+}
+
+/** What a refusal for the card's own limits means for the customer, for the request's details. */
+export const CARD_LIMIT_NOTE: Record<string, string> = {
+  insufficient_balance: '请求开始前要按最大输出预留积分；余额不够预留，这次没有发给上游，也没有扣费。',
+  concurrency_limit: '这张卡同时进行的请求已到上限，这次没有发给上游，也没有扣费。',
+  usage_limit: '这张卡已到每日或每月用量上限，这次没有发给上游，也没有扣费。',
+};
 
 export function noticeStatusView(notice: AdminAnnouncement, nowSecs: number): StatusView {
   if (!notice.enabled) return {label: '已撤回', tone: 'neutral'};

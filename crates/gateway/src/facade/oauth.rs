@@ -548,6 +548,55 @@ impl FacadeHandler for RefreshTokenHandler {
     }
 }
 
+/// Handler for `POST /logout`: Kiro's sign-out, sent with the refresh token after Kiro has
+/// already dropped its tokens. A card's sign-in is its device binding, which the customer
+/// portal manages, so there is nothing to end here; answered 404, the sign-out logged a
+/// failure every time.
+pub struct LogoutHandler;
+
+impl FacadeHandler for LogoutHandler {
+    fn method(&self) -> Method {
+        Method::POST
+    }
+
+    fn path(&self) -> &'static str {
+        "/logout"
+    }
+
+    fn handle<'a>(&'a self, req: Request<Body>) -> BoxFuture<'a, Response> {
+        Box::pin(async move {
+            super::discard_body(req.into_body(), 64 * 1024).await;
+            axum::response::IntoResponse::into_response(StatusCode::NO_CONTENT)
+        })
+    }
+}
+
+/// Handler for `DELETE /account`, Kiro's "Delete account". A card is not an account the
+/// customer can delete from Kiro. Kiro shows the message of a 4xx as "Failed to delete
+/// account: AuthService client: {message}"; a 404 said only that the request failed.
+pub struct DeleteAccountHandler;
+
+impl FacadeHandler for DeleteAccountHandler {
+    fn method(&self) -> Method {
+        Method::DELETE
+    }
+
+    fn path(&self) -> &'static str {
+        "/account"
+    }
+
+    fn handle<'a>(&'a self, _req: Request<Body>) -> BoxFuture<'a, Response> {
+        Box::pin(async move {
+            json_response(
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({
+                    "message": "本服务的账号就是你的卡密，不能在 Kiro 中删除。如需停用或解绑，请联系你的服务商或使用自助门户。"
+                }),
+            )
+        })
+    }
+}
+
 /// Convert Unix timestamp seconds to ISO-8601 string (e.g. `2026-09-10T12:00:00Z`).
 pub fn format_epoch_to_iso8601(epoch_secs: u64) -> String {
     let days = epoch_secs / 86400;

@@ -38,9 +38,11 @@ struct Outcome {
     billing: BillingEngine,
 }
 
+/// An OpenAI stream as it is sent: an opening chunk naming the role, then `frames`.
 fn sse(frames: &[Value]) -> String {
-    let mut sse: Vec<String> = frames
-        .iter()
+    let opening = json!({"id": "0", "choices": [{"delta": {"role": "assistant", "content": ""}}]});
+    let mut sse: Vec<String> = std::iter::once(&opening)
+        .chain(frames)
         .map(|frame| format!("data: {frame}"))
         .collect();
     sse.push("data: [DONE]".into());
@@ -112,6 +114,8 @@ async fn run_after(first: &[Value], frames: &[Value]) -> Outcome {
                 versions: vec![],
                 removed_models: vec![],
                 cancelled_versions: vec![],
+                plans: vec![],
+                removed_plans: vec![],
             },
             1_700_000_000,
         )
@@ -174,10 +178,14 @@ async fn a_complete_but_empty_response_is_relayed_once_and_billed() {
         "an empty turn is not a server error: {}",
         outcome.body
     );
+    // Kiro shows its own refusal for `content_filtered`; a second message beside it stayed
+    // in the conversation.
     assert!(
-        outcome.body.contains("内容安全策略"),
-        "the turn must explain itself"
+        outcome.body.contains("content_filtered"),
+        "{}",
+        outcome.body
     );
+    assert!(!outcome.body.contains("内容安全策略"), "{}", outcome.body);
     for key in outcome.pool.list_keys() {
         assert!(
             key.cooldown_until.is_none(),
@@ -251,7 +259,13 @@ async fn an_empty_ordinary_stop_is_retried_without_harming_the_key() {
             "a shared key was put into cooldown"
         );
     }
-    assert!(outcome.body.contains("InternalServerException"));
+    // Billed once, it is told in words Kiro shows and does not retry.
+    assert_eq!(outcome.status, StatusCode::BAD_REQUEST, "{}", outcome.body);
+    assert!(
+        outcome.body.contains("ValidationException"),
+        "{}",
+        outcome.body
+    );
     let entries = usage_entries(&outcome.billing).await;
     assert_eq!(entries.len(), 1, "billed once, not per attempt");
     assert_eq!(entries[0].input_tokens, 50);
@@ -282,4 +296,35 @@ async fn an_empty_attempt_followed_by_an_answer_bills_only_the_answer() {
     let entries = usage_entries(&outcome.billing).await;
     assert_eq!(entries.len(), 1);
     assert_eq!((entries[0].input_tokens, entries[0].output_tokens), (70, 3));
+}
+
+/// Thinking that used the whole output limit leaves no answer. Kiro completes such a turn
+/// on its thinking alone, so the turn says why: the notice was sent only when nothing at all
+/// had streamed, and thinking counted.
+#[tokio::test]
+async fn thinking_that_uses_up_the_output_limit_says_so() {
+    let outcome = run(&[
+        json!({"id": "1", "choices": [{"delta": {"reasoning_content": "Let me think about this carefully"}}]}),
+        json!({"id": "1", "choices": [{"delta": {}, "finish_reason": "length"}]}),
+        json!({"id": "1", "choices": [], "usage": {"prompt_tokens": 50, "completion_tokens": 8192, "total_tokens": 8242}}),
+    ])
+    .await;
+    assert_eq!(outcome.status, StatusCode::OK, "{}", outcome.body);
+    assert_eq!(outcome.upstream_calls, 1);
+    assert!(outcome.body.contains("达到输出上限"), "{}", outcome.body);
+    assert!(outcome.body.contains("max_tokens"), "{}", outcome.body);
+    let entries = usage_entries(&outcome.billing).await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].output_tokens, 8192);
+
+    // With an answer, the limit needs no notice.
+    let outcome = run(&[
+        json!({"id": "1", "choices": [{"delta": {"reasoning_content": "Thinking"}}]}),
+        json!({"id": "1", "choices": [{"delta": {"content": "The answer"}}]}),
+        json!({"id": "1", "choices": [{"delta": {}, "finish_reason": "length"}]}),
+        json!({"id": "1", "choices": [], "usage": {"prompt_tokens": 50, "completion_tokens": 8192, "total_tokens": 8242}}),
+    ])
+    .await;
+    assert_eq!(outcome.status, StatusCode::OK, "{}", outcome.body);
+    assert!(!outcome.body.contains("达到输出上限"), "{}", outcome.body);
 }

@@ -35,7 +35,12 @@ impl FacadeHandler for CommercialHandler {
                     &serde_json::json!({"success":true,"config":self.billing.commercial_config()}),
                 );
             }
-            let bytes = match axum::body::to_bytes(req.into_body(), 256 * 1024).await {
+            let bytes = match axum::body::to_bytes(
+                req.into_body(),
+                billing::engine::MAX_COMMERCIAL_UPDATE_BYTES,
+            )
+            .await
+            {
                 Ok(b) => b,
                 Err(_) => {
                     return json_response(
@@ -61,17 +66,16 @@ impl FacadeHandler for CommercialHandler {
                     StatusCode::OK,
                     &serde_json::json!({"success":true,"config":config}),
                 ),
-                Err(e) => {
-                    let status = if matches!(e, BillingError::Persistence(_)) {
-                        StatusCode::SERVICE_UNAVAILABLE
-                    } else {
-                        StatusCode::CONFLICT
-                    };
-                    json_response(
-                        status,
-                        &serde_json::json!({"success":false,"error":e.to_string()}),
-                    )
-                }
+                // One that could not be saved says so, without the storage error, which names
+                // server paths.
+                Err(BillingError::Persistence(_)) => json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &serde_json::json!({"success":false,"error":super::admin::NOT_SAVED}),
+                ),
+                Err(e) => json_response(
+                    StatusCode::CONFLICT,
+                    &serde_json::json!({"success":false,"error":e.to_string()}),
+                ),
             }
         })
     }
