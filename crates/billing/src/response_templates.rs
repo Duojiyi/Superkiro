@@ -251,6 +251,7 @@ fn validate_receipt(receipt: &ResponseTemplateReceipt) -> Result<(), BillingErro
                 receipt.content_key.as_str()
             ),
             ("fsWrite", "path", "text")
+                | ("fs_write", "path", "text")
                 | ("Write", "file_path", "content")
                 | ("write_file" | "writeFile", "path", "content")
         )

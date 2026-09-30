@@ -94,7 +94,7 @@ fn string_fits(schema: &Value, value: &str) -> bool {
 
 fn tool_keys(name: &str) -> Option<(&'static str, &'static str)> {
     match name {
-        "fsWrite" => Some(("path", "text")),
+        "fsWrite" | "fs_write" => Some(("path", "text")),
         "Write" => Some(("file_path", "content")),
         "write_file" | "writeFile" => Some(("path", "content")),
         _ => None,
@@ -446,18 +446,8 @@ pub(super) async fn respond(
         file_path: variant.file_path.clone(),
         completion: variant.completion.clone(),
         tool_name: tool_name.clone(),
-        path_key: if tool_name == "Write" {
-            "file_path"
-        } else {
-            "path"
-        }
-        .into(),
-        content_key: if tool_name == "fsWrite" {
-            "text"
-        } else {
-            "content"
-        }
-        .into(),
+        path_key: tool_keys(&tool_name).expect("validated file tool").0.into(),
+        content_key: tool_keys(&tool_name).expect("validated file tool").1.into(),
         content: variant.content.clone(),
         price_microcredits: variant.price_microcredits,
         created_at_secs: now,
@@ -526,6 +516,14 @@ mod tests {
         );
         assert!(matching_variant(&rules, "create pelican later", "claude").is_none());
         assert!(matching_variant(&rules, "create pelican", "unknown").is_none());
+    }
+    #[test]
+    fn current_kiro_snake_case_writer_preserves_text_for_replay() {
+        let tool = Tool::Direct(ToolSpecification::new("fs_write", "Write a file", schema()));
+        let (name, input) = file_tool(&[tool], "index.html", "<svg>中文</svg>").unwrap();
+        assert_eq!(name, "fs_write");
+        assert_eq!(input, json!({"path":"index.html","text":"<svg>中文</svg>"}));
+        assert_eq!(tool_keys(&name), Some(("path", "text")));
     }
     #[test]
     fn tool_schema_checked_and_arguments_escaped() {

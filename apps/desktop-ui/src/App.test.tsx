@@ -34,7 +34,7 @@ describe('safe contract',()=>{
 });
 describe('React states',()=>{
  it('login verifies without activating; no Kiro means no trim or fake samples',async()=>{setup();render(<App/>);await login();expect(screen.getByRole('heading',{name:'未找到 Kiro'})).toBeTruthy();expect(invoke.mock.calls.some(([,p])=>p.path==='/api/activate')).toBe(false);fireEvent.click(screen.getByRole('button',{name:/设置/}));await screen.findByText('Kiro 未运行');expect((screen.getByRole('button',{name:'立即整理'}) as HTMLButtonElement).disabled).toBe(true);expect(invoke.mock.calls.some(([,p])=>p.path==='/api/memory/sample'||p.path==='/api/memory/trim')).toBe(false);expect(document.querySelectorAll('.spark i')).toHaveLength(0);});
- it('usage empty state is not an error',async()=>{setup(true);render(<App/>);await login();await connect();fireEvent.click(screen.getByRole('button',{name:'刷新 ↻'}));await waitFor(()=>expect(document.querySelector('.pending-indicator')).toBeNull());expect(screen.getByText('今日已用积分')).toBeTruthy();expect(screen.queryByText(/用量刷新失败/)).toBeNull();expect(screen.getByText('— 积分')).toBeTruthy();});
+ it('usage empty state is not an error',async()=>{setup(true);render(<App/>);await login();await connect();fireEvent.click(screen.getByRole('button',{name:'刷新 ↻'}));await waitFor(()=>expect(document.querySelector('.pending-indicator')).toBeNull());expect(screen.queryByText('今日已用积分')).toBeNull();expect(screen.queryByText(/用量刷新失败/)).toBeNull();expect(screen.queryByText('— 积分')).toBeNull();});
  it('verification errors stay on login and redact raw payloads',async()=>{setup();const original=invoke.getMockImplementation()!;invoke.mockImplementation((command,payload)=>payload.path==='/api/verify-card'?Promise.reject({...supportError('SK-AUTH-001'),message:'secret upstream token'}):original(command,payload));render(<App/>);await waitFor(()=>expect((screen.getByLabelText('记住卡密') as HTMLInputElement).disabled).toBe(false));fireEvent.change(screen.getByLabelText('输入你的卡密'),{target:{value:'secret-card'}});fireEvent.click(screen.getByRole('button',{name:'登录 →'}));await screen.findByRole('button',{name:'重新登录 →'});expect(screen.getByRole('alert').textContent).not.toContain('secret');expect(screen.queryByRole('navigation')).toBeNull();});
  it('blocks activation for an older Kiro without sending activate',async()=>{setup(true);const original=invoke.getMockImplementation()!;invoke.mockImplementation((command,payload)=>payload.path==='/api/status'?original(command,payload).then((v:any)=>({...v,kiro_compatible:false,minimum_kiro_version:'1.1.14'})):original(command,payload));render(<App/>);await login();fireEvent.click(screen.getByRole('button',{name:'启用连接'}));await screen.findByRole('heading',{name:'需要升级 Kiro'});expect(screen.getByText(/1.1.14/)).toBeTruthy();expect(invoke.mock.calls.some(([,p])=>p.path==='/api/activate')).toBe(false);});
  it('blocks activation when Kiro compatibility is unknown',async()=>{setup(true);const original=invoke.getMockImplementation()!;invoke.mockImplementation((command,payload)=>payload.path==='/api/status'?original(command,payload).then((v:any)=>({...v,kiro_compatible:undefined})):original(command,payload));render(<App/>);await login();fireEvent.click(screen.getByRole('button',{name:'启用连接'}));await screen.findByRole('heading',{name:'无法确认 Kiro 版本'});expect(invoke.mock.calls.some(([,p])=>p.path==='/api/activate')).toBe(false);});
@@ -60,7 +60,7 @@ describe('real maintenance status',()=>{
 describe('recovery and stale usage regressions',()=>{
  it.each([{has_snapshot:true,authenticated:false},{has_snapshot:false,authenticated:false,recovery_pending:true}])('opens recovery without a token or card: %j',async(recovery)=>{setup(false);HTMLDialogElement.prototype.showModal=function(){this.open=true;};const original=invoke.getMockImplementation()!;let restored=false;invoke.mockImplementation(async(command,payload)=>{if(payload.path==='/api/restore'){restored=true;return {success:true};}const result=await original(command,payload);return payload.path==='/api/status'&&!restored?{...result,...recovery}:result;});render(<App/>);await screen.findByRole('heading',{name:'本机配置待恢复'});expect(screen.queryByLabelText('输入你的卡密')).toBeNull();expect(screen.queryByRole('button',{name:'修复并重新连接'})).toBeNull();expect(screen.queryByRole('button',{name:'启用连接'})).toBeNull();fireEvent.click(screen.getByRole('button',{name:'还原 Kiro 配置'}));fireEvent.submit(document.querySelector('dialog form')!);await screen.findByRole('heading',{name:'卡密登录'});expect(invoke.mock.calls.some(([,p])=>p.path==='/api/verify-card')).toBe(false);expect(invoke).toHaveBeenCalledWith('api',{path:'/api/restore',method:'POST',body:{close_kiro_confirmed:true}});});
  it('startup recovery opens overview without a card',async()=>{setup(false,true);render(<App/>);await screen.findByRole('heading',{name:'本机配置待恢复'});expect(screen.getByRole('button',{name:'还原 Kiro 配置'})).toBeTruthy();});
- it('failed usage refresh preserves confirmed balance but hides daily values',async()=>{setup(true);const original=invoke.getMockImplementation()!;let fail=false;invoke.mockImplementation(async(command,payload)=>{if(payload.path==='/api/usage'){if(fail)throw supportError('SK-NET-002');return {usage:{availableCredits:977,usageBreakdownList:[{dimensionType:'CREDIT',currentUsageWithPrecision:10,usageLimitWithPrecision:987}]},settledUsage:{todayPoints:123,todayTokens:456}};}const result=await original(command,payload);return payload.path==='/api/status'?{...result,authenticated:true,has_snapshot:true,recovery_pending:true}:result;});render(<App/>);await screen.findByText('977');await screen.findByText('123 积分');fail=true;fireEvent.click(screen.getByRole('button',{name:'刷新 ↻'}));await screen.findByText('用量刷新失败，保留最近确认余额；今日用量暂不可用。');fireEvent.click(screen.getByRole('button',{name:/概览/}));expect(screen.getByText('用量刷新失败，保留最近确认余额；今日用量暂不可用。')).toBeTruthy();expect(screen.getByText('977')).toBeTruthy();expect(screen.queryByText('123 积分')).toBeNull();expect(screen.queryByText('456')).toBeNull();});
+ it('failed usage refresh preserves confirmed balance but hides daily values',async()=>{setup(true);const original=invoke.getMockImplementation()!;let fail=false;invoke.mockImplementation(async(command,payload)=>{if(payload.path==='/api/usage'){if(fail)throw supportError('SK-NET-002');return {usage:{availableCredits:977,usageBreakdownList:[{dimensionType:'CREDIT',currentUsageWithPrecision:10,usageLimitWithPrecision:987}]},settledUsage:{todayPoints:123,todayTokens:456}};}const result=await original(command,payload);return payload.path==='/api/status'?{...result,authenticated:true,has_snapshot:true,recovery_pending:true}:result;});render(<App/>);await screen.findByText('977');expect(screen.queryByText('123 积分')).toBeNull();fail=true;fireEvent.click(screen.getByRole('button',{name:'刷新 ↻'}));await screen.findByText('余额刷新失败，保留最近确认余额。');fireEvent.click(screen.getByRole('button',{name:/概览/}));expect(screen.getByText('余额刷新失败，保留最近确认余额。')).toBeTruthy();expect(screen.getByText('977')).toBeTruthy();expect(screen.queryByText('123 积分')).toBeNull();expect(screen.queryByText('456')).toBeNull();});
 });
 
 describe('confirmed restoration before exit',()=>{
@@ -78,7 +78,7 @@ describe('desktop tray event',()=>{
 });
 
 describe('billing time zone',()=>{
- it('labels UTC day totals without using local today',async()=>{setup(true);const original=invoke.getMockImplementation()!;invoke.mockImplementation(async(command,payload)=>{if(payload.path==='/api/usage')return {usage:{usageBreakdownList:[{dimensionType:'CREDIT',currentUsageWithPrecision:1,usageLimitWithPrecision:100}]},settledUsage:{timezone:'UTC',windowStart:'2026-09-19T00:00:00Z',windowEnd:'2026-09-20T00:00:00Z',todayPoints:1,todayTokens:2}};const result=await original(command,payload);return payload.path==='/api/status'?{...result,authenticated:true,has_snapshot:true}:result;});render(<App/>);await screen.findByText('1 积分');expect(screen.getByText('今日已用积分')).toBeTruthy();expect(screen.getByTitle(/UTC/).getAttribute('title')).toContain('已结算');expect(document.body.textContent).not.toMatch(/tokens/i);});
+ it('keeps settled usage out of the overview',async()=>{setup(true);const original=invoke.getMockImplementation()!;invoke.mockImplementation(async(command,payload)=>{if(payload.path==='/api/usage')return {usage:{usageBreakdownList:[{dimensionType:'CREDIT',currentUsageWithPrecision:1,usageLimitWithPrecision:100}]},settledUsage:{timezone:'UTC',windowStart:'2026-09-19T00:00:00Z',windowEnd:'2026-09-20T00:00:00Z',todayPoints:1,todayTokens:2}};const result=await original(command,payload);return payload.path==='/api/status'?{...result,authenticated:true,has_snapshot:true}:result;});render(<App/>);await screen.findByText('剩余积分');expect(screen.queryByText('今日已用积分')).toBeNull();expect(screen.queryByText('1 积分')).toBeNull();expect(document.body.textContent).not.toMatch(/tokens/i);});
 });
 
 
@@ -114,7 +114,7 @@ describe('motion follows real pending work',()=>{
   await waitFor(()=>expect(reject).toBeTypeOf('function'));
   expect(document.querySelectorAll('.spark i')).toHaveLength(0);
   reject(supportError('SK-NET-002'));
-  await screen.findByText(kind==='usage'?'用量刷新失败，保留最近确认余额；今日用量暂不可用。':'采样失败，当前占用与维护结果未确认');
+  await screen.findByText(kind==='usage'?'余额刷新失败，保留最近确认余额。':'采样失败，当前占用与维护结果未确认');
   expect(document.querySelector('.pending-indicator')).toBeNull();
   expect(document.querySelectorAll('.spark i')).toHaveLength(0);
  });
@@ -339,7 +339,7 @@ describe('audit timeout recovery',()=>{
  it('clears usage errors when switching to a newly verified card',async()=>{
   setup(true);HTMLDialogElement.prototype.showModal=function(){this.open=true;};const original=invoke.getMockImplementation()!;
   invoke.mockImplementation((command,payload)=>payload.path==='/api/usage'?Promise.reject(supportError('SK-NET-002','failed')):original(command,payload));
-  render(<App/>);await login();await connect();fireEvent.click(screen.getByRole('button',{name:'刷新 ↻'}));await screen.findByText('用量刷新失败，保留最近确认余额；今日用量暂不可用。');
+  render(<App/>);await login();await connect();fireEvent.click(screen.getByRole('button',{name:'刷新 ↻'}));await screen.findByText('余额刷新失败，保留最近确认余额。');
   fireEvent.click(screen.getByRole('button',{name:/设置/}));fireEvent.click(screen.getByRole('button',{name:/切换卡密/}));fireEvent.submit(document.querySelector('dialog form')!);
   await screen.findByRole('button',{name:'登录 →'});await login();expect(screen.queryByText(/用量刷新失败/)).toBeNull();expect(document.querySelector('.balance-value')?.textContent).toBe('100');
  });
@@ -351,7 +351,7 @@ describe('cross-card in-flight usage isolation',()=>{
   setup(true);HTMLDialogElement.prototype.showModal=function(){this.open=true;};const original=invoke.getMockImplementation()!;
   let resolveUsage!:(value:unknown)=>void;
   invoke.mockImplementation((command,payload)=>payload.path==='/api/usage'?new Promise(resolve=>{resolveUsage=resolve;}):original(command,payload));
-  render(<App/>);await login();await connect();fireEvent.click(screen.getByRole('button',{name:'刷新 ↻'}));await screen.findByText('正在刷新用量，余额仍为最近确认值。');
+  render(<App/>);await login();await connect();fireEvent.click(screen.getByRole('button',{name:'刷新 ↻'}));await screen.findByText('正在刷新余额，仍显示最近确认值。');
   fireEvent.click(screen.getByRole('button',{name:/设置/}));fireEvent.click(screen.getByRole('button',{name:/切换卡密/}));fireEvent.submit(document.querySelector('dialog form')!);
   await screen.findByRole('button',{name:'登录 →'});await login();
   resolveUsage({usage:{availableCredits:777,usageBreakdownList:[{dimensionType:'CREDIT',currentUsageWithPrecision:99,usageLimitWithPrecision:100}]}});
@@ -419,7 +419,7 @@ it('does not derive a balance from legacy total minus used without a confirmed b
  invoke.mockImplementation(async(c,p)=>{const result=await original(c,p);return p.path==='/api/status'?{...result,authenticated:true,has_snapshot:true}:result;});
  render(<App/>);await screen.findByRole('button',{name:'打开 Kiro ↗'});
  await waitFor(()=>expect(invoke.mock.calls.some(([,p])=>p.path==='/api/usage')).toBe(true));
- fireEvent.click(screen.getByRole('button',{name:'刷新 ↻'}));await waitFor(()=>expect(document.querySelector('.pending-indicator')).toBeNull());expect(screen.getByText('今日已用积分')).toBeTruthy();
+ fireEvent.click(screen.getByRole('button',{name:'刷新 ↻'}));await waitFor(()=>expect(document.querySelector('.pending-indicator')).toBeNull());expect(screen.queryByText('今日已用积分')).toBeNull();
  fireEvent.click(screen.getByRole('button',{name:/概览/}));expect(document.querySelector('.balance-value')?.textContent).toBe('—');
  expect(screen.queryByText(/余额更新于/)).toBeNull();
 });
@@ -623,9 +623,9 @@ describe('updated desktop UI contracts',()=>{
    return original(c,p);
   });
   render(<App/>);await login();expect(document.querySelector('.balance-value')?.textContent).toBe('123.5');
-  expect(screen.getByText('总积分 234.6')).toBeTruthy();await connect();
-  fireEvent.click(screen.getByRole('button',{name:'刷新 ↻'}));await screen.findByText('3.5 积分');
-  expect(screen.getByText('今日已用积分')).toBeTruthy();
+  expect(screen.queryByText('总积分 234.6')).toBeNull();await connect();
+  fireEvent.click(screen.getByRole('button',{name:'刷新 ↻'}));await waitFor(()=>expect(document.querySelector('.pending-indicator')).toBeNull());
+  expect(screen.queryByText('今日已用积分')).toBeNull();
   expect(screen.queryByText('Test model')).toBeNull();
   expect(document.body.textContent).not.toMatch(/USD|\$|999\.999|888\.888|12\.345|3\.456|4\.567|5\.678/);
  });
@@ -715,18 +715,18 @@ describe('points usage and navigation',()=>{
    const value=await original(c,p);
    return p.path==='/api/status'?{...value,authenticated:true,has_snapshot:true}:value;
   });
-  render(<App/>);await screen.findByText('0 积分');
+  render(<App/>);await screen.findByText('100');
   const nav=within(screen.getByRole('navigation',{name:'主导航'}));
   expect(nav.getAllByRole('button')).toHaveLength(3);
   for(const name of ['概览','用量','设置'])expect(nav.getByRole('button',{name})).toBeTruthy();
   expect(nav.queryByRole('button',{name:'诊断'})).toBeNull();
-  expect(screen.getByText('今日已用积分').getAttribute('title')).toBe('按 UTC 日期统计，仅含已结算请求');
+  expect(screen.queryByText('今日已用积分')).toBeNull();
   expect(screen.getByText('剩余积分')).toBeTruthy();
   expect(document.body.textContent).not.toMatch(/tokens|987654321|123456789|Kiro 当前占用/i);
-  expect(document.querySelectorAll('.metrics > div')).toHaveLength(1);
+  expect(document.querySelectorAll('.metrics > div')).toHaveLength(0);
   invoke.mockClear();refreshed=true;
   fireEvent.click(screen.getByRole('button',{name:'刷新 ↻'}));
-  await screen.findByText('12.3 积分');
+  await screen.findByText('88.9');
   expect(document.querySelector('.balance-value')?.textContent).toBe('88.9');
   const calls=invoke.mock.calls.map(([,p])=>p.path);
   expect(calls.filter(path=>path==='/api/usage')).toHaveLength(1);
@@ -891,10 +891,10 @@ describe('launch and restored usage contracts',()=>{
  it('clears settled today usage after restore while retaining the confirmed balance',async()=>{
   setup(true);const original=invoke.getMockImplementation()!;
   invoke.mockImplementation((c,p)=>p.path==='/api/usage'?Promise.resolve({usage:{availableCredits:87,usageBreakdownList:[{dimensionType:'CREDIT',currentUsageWithPrecision:13,usageLimitWithPrecision:100}]},settledUsage:{timezone:'UTC',todayPoints:13}}):original(c,p));
-  render(<App/>);await login();await connect();await screen.findByText('13 积分');
+  render(<App/>);await login();await connect();await screen.findByText('87');
   fireEvent.click(screen.getByRole('button',{name:'还原 Kiro 配置'}));fireEvent.submit(document.querySelector('dialog form')!);
   await screen.findByText('Kiro 配置已还原，当前卡密与积分信息已保留。');
-  expect(screen.queryByText('13 积分')).toBeNull();expect(screen.getByText('— 积分')).toBeTruthy();
+  expect(screen.queryByText('13 积分')).toBeNull();expect(screen.queryByText('— 积分')).toBeNull();
   expect(document.querySelector('.balance-value')?.textContent).toBe('87');
   fireEvent.click(screen.getByRole('button',{name:'刷新 ↻'}));
   await waitFor(()=>expect((screen.getByRole('button',{name:'刷新 ↻'}) as HTMLButtonElement).disabled).toBe(false));
