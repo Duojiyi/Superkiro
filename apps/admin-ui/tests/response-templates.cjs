@@ -26,6 +26,13 @@ const server = http.createServer(async (req, res) => {
       if (postMode === 'uncertain') return reply({error:'Response lost after commit'},500);
       return reply({success:true,config});
     }
+    if (req.url === '/api/v1/admin/response-templates/preview') {
+      assert.equal(req.headers['x-csrf-token'], 'fixture-csrf');
+      let raw = ''; for await (const chunk of req) raw += chunk;
+      const body = JSON.parse(raw); assert.equal(body.model, 'gpt-5');
+      assert.equal(body.rules[0].match_mode, 'intent');
+      return reply({success: true, winner: body.rules[0].id, matches: [{rule_id: body.rules[0].id, name: body.rules[0].name, result: {matched: true, reason: 'intent_groups_matched', missing_groups: []}}]});
+    }
     if (req.url.startsWith('/api/')) return await fixture.handle(req,res);
     const file=decodeURIComponent(req.url.split('?')[0]).replace(/^\/admin\/?/,'')||'index.html';
     if (!files.has(file)) return reply({error:'Not found'},404);
@@ -111,6 +118,21 @@ const server = http.createServer(async (req, res) => {
     assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,'narrow console must not overflow');
     if (process.env.TEMPLATE_SCREENSHOTS) await page.screenshot({path:path.join(__dirname,'templates-narrow.png'),fullPage:true});
     await page.setViewportSize({width:1440,height:1000});
+    await variant(1).getByLabel('启用可编辑时间线与完整回执文案').check();
+    await variant(1).getByLabel('最早写文件（秒）').fill('170');
+    await variant(1).getByLabel('最晚写文件（秒）').fill('230');
+    await variant(1).getByLabel('文件下发文案').fill('模板 {file_path} / {price}');
+    await variant(1).getByLabel('写入成功回执').fill('完成 {file_path}');
+    await page.getByLabel('请求模型', {exact:true}).selectOption('gpt-5');
+    await page.getByLabel('用户请求', {exact:true}).fill('创建一个鹈鹕骑单车网页动画');
+    await button('预览命中结果').click(); await page.getByRole('status').filter({hasText:'最终命中'}).waitFor();
+    await page.getByLabel('发布原因（必填）').fill('时间线和意图匹配'); postMode='success'; await publish();
+    await page.getByText('响应模板已发布',{exact:true}).waitFor();
+    const delivery = posts.at(-1).rules[0].variants[0].delivery;
+    assert.equal(delivery.write_min_ms, 170000); assert.equal(delivery.write_max_ms, 230000);
+    assert.deepEqual(delivery.messages.map(m=>m.at_ms), [10000,40000]);
+    assert.equal(delivery.success,'完成 {file_path}');
+    console.log('PASS: editable timeline, full receipt wording and authenticated draft preview');
     await button('删除规则').click();await accept();await page.getByLabel('发布原因（必填）').fill('关闭模板规则');postMode='success';await publish();await page.getByText('尚无规则，不拦截任何请求。',{exact:false}).waitFor();assert.deepEqual(posts.at(-1).rules,[]);
     assert.deepEqual(errors,[]);
     console.log('PASS: rejection preserves drafts; uncertain commits verified by GET without retry; exact fees, inert HTML, narrow layout and publishing empty rules');

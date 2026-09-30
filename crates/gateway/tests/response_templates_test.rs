@@ -124,11 +124,13 @@ fn rules() -> Vec<ResponseTemplateRule> {
         name: "Test template".into(),
         enabled: true,
         match_mode: "exact".into(),
+        intent: None,
         match_text: "create pelican".into(),
         variants: [("gpt-test", 250_000), ("claude-test", 350_000)]
             .into_iter()
             .map(|(model, price)| ResponseTemplateVariant {
                 delay_ms: 0,
+                delivery: None,
                 model_id: model.into(),
                 file_path: "index.html".into(),
                 content: format!("<!doctype html><svg aria-label=\"{model}\">中文\n</svg>"),
@@ -1120,4 +1122,352 @@ async fn delayed_template_uses_current_time_and_does_not_charge_an_expired_card(
     set_template_delay(&billing, 0);
     let (status, _) = send(router, "after-validity-extension", body("gpt-test")).await;
     assert_eq!(status, StatusCode::OK);
+}
+
+fn set_timeline(billing: &BillingEngine, min: u32, max: u32) {
+    use billing::engine::{ResponseTemplateDelivery, ResponseTemplateMessage};
+    let mut config = billing.response_template_config();
+    config.rules[0].variants[0].price_microcredits = 9_500_000;
+    config.rules[0].variants[0].delivery = Some(ResponseTemplateDelivery {
+        write_min_ms: min,
+        write_max_ms: max,
+        messages: vec![
+            ResponseTemplateMessage {
+                at_ms: 10,
+                text: "first\n".into(),
+            },
+            ResponseTemplateMessage {
+                at_ms: 30,
+                text: "second\n".into(),
+            },
+        ],
+        dispatch: "send {file_path} {price}".into(),
+        success: "confirmed {file_path}".into(),
+        failure: "failed {file_path}".into(),
+        unknown: "unknown {file_path}".into(),
+        replay: "replay {file_path}".into(),
+        continuation: "separate request please".into(),
+    });
+    billing
+        .publish_response_templates(
+            ResponseTemplateUpdate {
+                expected_revision: config.revision,
+                reason: "timeline regression".into(),
+                rules: config.rules,
+            },
+            gateway::now_secs(),
+        )
+        .unwrap();
+}
+async fn raw_send(router: axum::Router, id: &str) -> axum::response::Response {
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/generateAssistantResponse")
+        .header("content-type", "application/json")
+        .header("amz-sdk-invocation-id", id)
+        .body(Body::from(body("gpt-test").to_string()))
+        .unwrap();
+    req.extensions_mut().insert(AuthClaims {
+        card_id: "card".into(),
+        group_id: "group".into(),
+        token_version: 1,
+        exp: 9_999_999_999,
+        iat: 1_000_000_000,
+    });
+    router.oneshot(req).await.unwrap()
+}
+fn decode_chunks(bytes: &[u8]) -> Vec<Value> {
+    let mut decoder = kiro_wire::EventStreamDecoder::new();
+    decoder.feed(bytes).unwrap();
+    let mut values = vec![];
+    while let Some(frame) = decoder.decode().unwrap() {
+        values.push(serde_json::from_slice(&frame.payload).unwrap());
+    }
+    values
+}
+#[tokio::test]
+async fn streamed_timeline_defers_exact_debit_and_uses_custom_receipts_and_replay() {
+    let billing = engine();
+    set_timeline(&billing, 80, 120);
+    let router = app(&billing);
+    let start = tokio::time::Instant::now();
+    let response = raw_send(router.clone(), "timeline").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(billing.ledger_entries().is_empty());
+    let mut stream = response.into_body();
+    let first = stream.frame().await.unwrap().unwrap().into_data().unwrap();
+    assert!(start.elapsed() >= Duration::from_millis(10));
+    assert_eq!(decode_chunks(&first)[0]["content"], "first\n");
+    assert!(billing.ledger_entries().is_empty());
+    let second = stream.frame().await.unwrap().unwrap().into_data().unwrap();
+    assert!(start.elapsed() >= Duration::from_millis(30));
+    assert_eq!(decode_chunks(&second)[0]["content"], "second\n");
+    assert!(billing.ledger_entries().is_empty());
+    let tail = stream.collect().await.unwrap().to_bytes();
+    assert!(start.elapsed() >= Duration::from_millis(80));
+    let values = decode_chunks(&tail);
+    let id = tool_id(&values);
+    assert!(values
+        .iter()
+        .any(|v| v["content"] == "send index.html 9.500000"));
+    assert_eq!(billing.ledger_entries().len(), 1);
+    assert_eq!(billing.ledger_entries()[0].credits_charged, 9_500_000);
+    assert_eq!(billing.ledger_entries()[0].provider_cost_micro_cny, 0);
+    let (status, replay) = send(router.clone(), "timeline", body("gpt-test")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(tool_id(&replay), id);
+    assert!(replay.iter().any(|v| v["content"] == "replay index.html"));
+    for (i, status, expected) in [
+        (0, Some("success"), "confirmed index.html"),
+        (1, Some("error"), "failed index.html"),
+        (2, None, "unknown index.html"),
+    ] {
+        let (_, ack) = send(
+            router.clone(),
+            &format!("timeline-ack-{i}"),
+            acknowledgement(&id, status),
+        )
+        .await;
+        assert!(
+            ack.iter()
+                .any(|v| v["content"].as_str().is_some_and(|s| s.trim() == expected)),
+            "{ack:?}"
+        );
+    }
+    assert_eq!(
+        billing
+            .ledger_entries()
+            .iter()
+            .map(|e| e.credits_charged)
+            .sum::<i64>(),
+        9_500_000
+    );
+}
+#[tokio::test]
+async fn streamed_cancel_releases_idempotency_and_card_capacity_without_background_charge() {
+    let billing = engine();
+    set_timeline(&billing, 100, 100);
+    let mut card = billing.get_card("card").unwrap();
+    card.max_concurrency = 1;
+    billing.upsert_card(card);
+    let router = app(&billing);
+    let mut response = raw_send(router.clone(), "cancel-stream").await.into_body();
+    response.frame().await.unwrap().unwrap();
+    assert!(!raw_send(router.clone(), "cancel-stream")
+        .await
+        .status()
+        .is_success());
+    assert_eq!(
+        raw_send(router.clone(), "other-stream").await.status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    drop(response);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(billing.ledger_entries().is_empty());
+    let (status, values) = send(router, "cancel-stream", body("gpt-test")).await;
+    assert_eq!(status, StatusCode::OK, "{values:?}");
+    assert_eq!(billing.ledger_entries().len(), 1);
+}
+#[tokio::test]
+async fn timeline_changed_config_refuses_before_dispatch_and_can_retry() {
+    let billing = engine();
+    set_timeline(&billing, 60, 60);
+    let router = app(&billing);
+    let mut response = raw_send(router.clone(), "changed-stream").await.into_body();
+    response.frame().await.unwrap().unwrap();
+    set_timeline(&billing, 70, 70);
+    let bytes = response.collect().await.unwrap().to_bytes();
+    assert!(!decode_chunks(&bytes).iter().any(|p| p["name"] == "fsWrite"));
+    assert!(billing.ledger_entries().is_empty());
+    assert_eq!(
+        send(router, "changed-stream", body("gpt-test")).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(billing.ledger_entries().len(), 1);
+}
+#[tokio::test]
+async fn preview_is_authenticated_read_only_and_uses_production_matcher() {
+    use gateway::facade::{
+        admin::AdminAuthState, response_templates_admin::ResponseTemplatePreviewHandler,
+        FacadeHandler,
+    };
+    let h = ResponseTemplatePreviewHandler {
+        auth: Arc::new(AdminAuthState::new("preview-only-key")),
+    };
+    assert_eq!(
+        h.handle(Request::builder().body(Body::empty()).unwrap())
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let request = json!({"rules": rules(), "prompt":"create pelican", "model":"gpt-test"});
+    let r = h
+        .handle(
+            Request::builder()
+                .method("POST")
+                .header("x-admin-key", "preview-only-key")
+                .body(Body::from(request.to_string()))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let v: Value =
+        serde_json::from_slice(&r.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(v["matches"][0]["result"]["matched"], true);
+    assert_eq!(v["winner"], rules()[0].id);
+}
+
+fn set_template_keepalive(billing: &BillingEngine, seconds: u64) {
+    let mut config = billing.runtime_settings_config();
+    config.settings.keepalive_secs = seconds;
+    billing
+        .publish_runtime_settings(
+            billing::engine::RuntimeSettingsUpdate {
+                expected_revision: config.revision,
+                reason: "template keepalive regression".into(),
+                settings: config.settings,
+            },
+            gateway::now_secs(),
+        )
+        .unwrap();
+}
+
+fn clear_timeline_messages(billing: &BillingEngine) {
+    let mut config = billing.response_template_config();
+    config.rules[0].variants[0]
+        .delivery
+        .as_mut()
+        .unwrap()
+        .messages
+        .clear();
+    billing
+        .publish_response_templates(
+            ResponseTemplateUpdate {
+                expected_revision: config.revision,
+                reason: "silent timeline regression".into(),
+                rules: config.rules,
+            },
+            gateway::now_secs(),
+        )
+        .unwrap();
+}
+
+async fn next_template_keepalive(body: &mut Body) {
+    let bytes = tokio::time::timeout(Duration::from_secs(4), body.frame())
+        .await
+        .expect("template must emit protocol keepalives during the wait")
+        .expect("stream must remain open")
+        .unwrap()
+        .into_data()
+        .unwrap();
+    assert_eq!(bytes.as_ref(), kiro_wire::encoder::encode_keepalive());
+}
+
+#[tokio::test]
+async fn timeline_keepalives_without_messages_use_runtime_interval_and_debit_once() {
+    let billing = engine();
+    set_timeline(&billing, 4_200, 4_200);
+    clear_timeline_messages(&billing);
+    set_template_keepalive(&billing, 2);
+    let router = app(&billing);
+    let start = tokio::time::Instant::now();
+    let response = raw_send(router.clone(), "silent-heartbeats").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut response = response.into_body();
+    // An active response keeps its interval snapshot; new requests use the update.
+    set_template_keepalive(&billing, 1);
+    for n in 1..=2 {
+        next_template_keepalive(&mut response).await;
+        assert!(start.elapsed() >= Duration::from_secs(n * 2));
+        assert!(billing.ledger_entries().is_empty());
+        assert!(billing
+            .export_snapshot()
+            .response_template_receipts
+            .is_empty());
+    }
+    let bytes = response.collect().await.unwrap().to_bytes();
+    assert!(start.elapsed() >= Duration::from_millis(4_200));
+    assert_eq!(tool_event(&decode_chunks(&bytes))["name"], "fsWrite");
+    assert_eq!(billing.ledger_entries().len(), 1);
+    assert_eq!(billing.ledger_entries()[0].credits_charged, 9_500_000);
+    let (status, values) = send(router, "silent-heartbeats", body("gpt-test")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(tool_event(&values)["name"], "fsWrite");
+    assert_eq!(billing.ledger_entries().len(), 1);
+}
+
+#[tokio::test]
+async fn cancelling_after_keepalive_releases_guards_without_debit_and_allows_retry() {
+    let billing = engine();
+    set_timeline(&billing, 2_200, 2_200);
+    clear_timeline_messages(&billing);
+    set_template_keepalive(&billing, 1);
+    let mut card = billing.get_card("card").unwrap();
+    card.max_concurrency = 1;
+    billing.upsert_card(card);
+    let router = app(&billing);
+    let mut response = raw_send(router.clone(), "cancel-heartbeats")
+        .await
+        .into_body();
+    next_template_keepalive(&mut response).await;
+    assert!(billing.ledger_entries().is_empty());
+    assert_eq!(
+        raw_send(router.clone(), "cancel-heartbeats").await.status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        raw_send(router.clone(), "other-heartbeats").await.status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    drop(response);
+    tokio::time::sleep(Duration::from_millis(1_300)).await;
+    assert!(billing.ledger_entries().is_empty());
+    assert!(billing
+        .export_snapshot()
+        .response_template_receipts
+        .is_empty());
+    set_timeline(&billing, 60, 60);
+    let (status, values) = send(router, "cancel-heartbeats", body("gpt-test")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(tool_event(&values)["name"], "fsWrite");
+    assert_eq!(billing.ledger_entries().len(), 1);
+    assert_eq!(billing.ledger_entries()[0].credits_charged, 9_500_000);
+}
+
+#[tokio::test]
+async fn sparse_timeline_keepalives_preserve_messages_and_failed_debit_is_retryable() {
+    let billing = engine();
+    set_timeline(&billing, 2_200, 2_200);
+    set_template_keepalive(&billing, 1);
+    let router = app(&billing);
+    let mut response = raw_send(router.clone(), "sparse-heartbeats")
+        .await
+        .into_body();
+    for text in ["first\n", "second\n"] {
+        let bytes = response
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        assert_eq!(decode_chunks(&bytes)[0]["content"], text);
+    }
+    next_template_keepalive(&mut response).await;
+    assert!(billing.ledger_entries().is_empty());
+    // Publishing a new template during the wait must still prevent the old debit.
+    set_timeline(&billing, 60, 60);
+    next_template_keepalive(&mut response).await;
+    let bytes = response.collect().await.unwrap().to_bytes();
+    assert!(!decode_chunks(&bytes).iter().any(|p| p["name"] == "fsWrite"));
+    assert!(billing.ledger_entries().is_empty());
+    assert!(billing
+        .export_snapshot()
+        .response_template_receipts
+        .is_empty());
+    assert_eq!(
+        send(router, "sparse-heartbeats", body("gpt-test")).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(billing.ledger_entries().len(), 1);
 }

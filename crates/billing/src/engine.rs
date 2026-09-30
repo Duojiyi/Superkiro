@@ -28,9 +28,14 @@ pub use runtime_settings::{
 #[path = "response_templates.rs"]
 mod response_templates;
 pub use response_templates::{
-    ResponseTemplateAudit, ResponseTemplateConfig, ResponseTemplateReceipt, ResponseTemplateRule,
-    ResponseTemplateUpdate, ResponseTemplateVariant,
+    validate_response_template_rules, ResponseTemplateAudit, ResponseTemplateConfig,
+    ResponseTemplateDelivery, ResponseTemplateIntent, ResponseTemplateMessage,
+    ResponseTemplateReceipt, ResponseTemplateRule, ResponseTemplateUpdate, ResponseTemplateVariant,
 };
+
+#[path = "template_matcher.rs"]
+mod template_matcher;
+pub use template_matcher::{preview_template_match, TemplateMatchPreview};
 
 #[cfg(test)]
 type SnapshotSaveHook = (Arc<std::sync::Barrier>, Arc<std::sync::Barrier>);
