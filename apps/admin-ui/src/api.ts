@@ -1,3 +1,4 @@
+import type {RuntimeConfig, RuntimeUpdate} from './runtimeSettings';
 import type {KeyAttempts, ModelHealth, ProviderAttempts} from './health';
 /** A refused request: the server's words, its status, and the rest of its answer (a refusal's `refusal` object, say). */
 import type {ResponseTemplateConfig, ResponseTemplateUpdate} from './responseTemplates';
@@ -540,6 +541,13 @@ export class AdminApiClient {
 
   async revealCard(cardId: string): Promise<{ success: boolean; rawCode: string }> {
     return this.request('/api/v1/admin/cards/reveal', {method: 'POST', body: JSON.stringify({cardId})});
+  }
+
+  async getRuntimeSettings(): Promise<{success: boolean; config: RuntimeConfig}> {
+    return this.request('/api/v1/admin/runtime-settings');
+  }
+  async publishRuntimeSettings(update: RuntimeUpdate): Promise<{success: boolean; config: RuntimeConfig}> {
+    return this.request('/api/v1/admin/runtime-settings', {method: 'POST', body: JSON.stringify(update)});
   }
 
   async getResponseTemplates(): Promise<{success: boolean; config: ResponseTemplateConfig}> {

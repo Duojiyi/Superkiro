@@ -33,9 +33,13 @@ const UPDATE_KEYS: &[&str] = &["346633520d5a0d37dbf8cc09028724118a84c7eb14181596
 const TEST_UPDATE_KEY: &str = "197f6b23e16c8532c6abc838facd5ea789be0c76b2920334039bfa8b3d368d61";
 
 fn trusted_keys() -> Vec<&'static str> {
-    let mut keys = UPDATE_KEYS.to_vec();
+    let keys = UPDATE_KEYS.to_vec();
     #[cfg(debug_assertions)]
-    keys.push(TEST_UPDATE_KEY);
+    let keys = {
+        let mut keys = keys;
+        keys.push(TEST_UPDATE_KEY);
+        keys
+    };
     keys
 }
 

@@ -1,3 +1,4 @@
+import {PELICAN_OPUS55_HTML} from './pelicanTemplate';
 import type {Row} from './types';
 
 export interface ResponseTemplateVariant {
@@ -7,6 +8,7 @@ export interface ResponseTemplateVariant {
   preamble: string;
   completion: string;
   price_microcredits: number;
+  delay_ms?: number;
 }
 export interface ResponseTemplateRule {
   id: string;
@@ -36,10 +38,10 @@ export function templateCredits(micro: number): string {
   return `${Math.floor(micro / 1_000_000)}.${String(micro % 1_000_000).padStart(6, '0')}`.replace(/\.?0+$/, '');
 }
 export function templateDrafts(rules: ResponseTemplateRule[]): TemplateRuleDraft[] {
-  return rules.map(rule => ({...rule, variants: rule.variants.map(({price_microcredits, ...variant}) => ({...variant, price_credits: templateCredits(price_microcredits)}))}));
+  return rules.map(rule => ({...rule, variants: rule.variants.map(({price_microcredits, ...variant}) => ({...variant, delay_ms: variant.delay_ms ?? 0, price_credits: templateCredits(price_microcredits)}))}));
 }
 export function newTemplateVariant(): TemplateVariantDraft {
-  return {model_id: '', file_path: 'output.html', content: '', preamble: '这是固定模板服务，不是上游模型生成，不消耗或虚构上游 tokens。', completion: '模板文件生成指令已发送；服务费按下发收取一次，成功或失败回执均免费。实际文件写入取决于客户端兼容工具的执行结果。', price_credits: '0'};
+  return {delay_ms: 1500, model_id: '', file_path: 'output.html', content: '', preamble: '这是固定模板服务，不是上游模型生成，不消耗或虚构上游 tokens。', completion: '模板文件生成指令已发送；服务费按下发收取一次，成功或失败回执均免费。实际文件写入取决于客户端兼容工具的执行结果。', price_credits: '0'};
 }
 export function newTemplateRule(): TemplateRuleDraft {
   return {id: crypto.randomUUID(), name: '新规则', enabled: false, match_mode: 'exact', match_text: '', variants: [newTemplateVariant()]};
@@ -77,6 +79,7 @@ export function parseTemplateRules(drafts: TemplateRuleDraft[]): {rules: Respons
       if (!variant.model_id.trim() || models.has(variant.model_id)) return {error: `${at}请选择模型；同一规则不能重复选择同一模型。`};
       if (!/^[A-Za-z0-9_.:/-]{1,128}$/.test(variant.model_id)) return {error: `${at}模型 ID 无效，请从商业模型目录重选。`};
       models.add(variant.model_id);
+      if (!Number.isInteger(variant.delay_ms ?? 0) || (variant.delay_ms ?? 0) < 0 || (variant.delay_ms ?? 0) > 30000) return {error: at + '等待时间须为 0–30000 毫秒。'};
       if ([variant.preamble, variant.completion].some(text => bytes(text) > 4096 || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/.test(text))) return {error: `${at}前置和完成消息各不能超过 4096 字节或包含非法控制字符。`};
       if (!safeTemplatePath(variant.file_path)) return {error: `${at}请使用安全的相对 .html 路径，例如 pages/demo.html，不含 ..、反斜杠或绝对路径。`};
       if (!variant.content.trim()) return {error: `${at}请填写完整 HTML 代码。`};
@@ -94,6 +97,5 @@ export function parseTemplateRules(drafts: TemplateRuleDraft[]): {rules: Respons
 
 export function pelicanTemplateRule(): TemplateRuleDraft {
   const rule = newTemplateRule();
-  return {...rule, name: '示例：鹈鹕骑自行车', match_text: '画一只骑自行车的鹈鹕', variants: [{...rule.variants[0], file_path: 'examples/pelican.html',
-    content: '<!doctype html>\n<html lang="zh-CN">\n<meta charset="utf-8">\n<title>鹈鹕骑自行车</title>\n<body>\n<h1>鹈鹕骑自行车 · 模板示例</h1>\n<svg viewBox="0 0 400 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="骑自行车的鹈鹕">\n  <g fill="none" stroke="#334155" stroke-width="5"><circle cx="100" cy="175" r="45"/><circle cx="300" cy="175" r="45"/><path d="M100 175L155 110L210 175H100M155 110H270L210 175M300 175L260 80H285"/></g>\n  <ellipse cx="195" cy="90" rx="45" ry="30" fill="#cbd5e1"/>\n  <path d="M210 85Q215 10 245 35L275 55L235 60" fill="#cbd5e1"/>\n  <path d="M245 43L330 60L245 65Z" fill="#f59e0b"/><circle cx="240" cy="38" r="4"/>\n  <path d="M185 115L195 145L220 145" fill="none" stroke="#f59e0b" stroke-width="6"/>\n</svg>\n<p>这是预设模板，并非上游模型实时生成。</p>\n</body>\n</html>'}]};
+  return {...rule, name: '鹈鹕骑自行车 · Opus 5.5', match_mode: 'contains', match_text: '在根目录创建一个独立 HTML 文件，用 SVG 绘制一只鹈鹕骑自行车的 2D 动画。不得使用外部图片、第三方库或网络资源。', variants: [{...rule.variants[0], model_id: 'claude-opus-5-5', file_path: 'pelican-bicycle-opus5.5.html', content: PELICAN_OPUS55_HTML, delay_ms: 1500}]};
 }

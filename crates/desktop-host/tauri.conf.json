@@ -18,6 +18,7 @@
         "minWidth": 480,
         "minHeight": 540,
         "decorations": false,
+        "maximizable": false,
         "transparent": true
       }
     ],
@@ -32,8 +33,7 @@
           "permissions": [
             "core:event:allow-listen",
             "core:event:allow-unlisten",
-            "core:window:allow-start-dragging",
-            "core:window:allow-internal-toggle-maximize"
+            "core:window:allow-start-dragging"
           ]
         }
       ]

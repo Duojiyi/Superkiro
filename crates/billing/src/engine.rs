@@ -19,6 +19,12 @@ pub use commercial::{
     MAX_OFFICIAL_PRICES, MAX_PROVIDER_MULTIPLIERS, MAX_ROUTE_COSTS,
 };
 
+#[path = "runtime_settings.rs"]
+mod runtime_settings;
+pub use runtime_settings::{
+    RuntimeSettings, RuntimeSettingsConfig, RuntimeSettingsUpdate, TimeoutProfile,
+};
+
 #[path = "response_templates.rs"]
 mod response_templates;
 pub use response_templates::{
@@ -245,6 +251,8 @@ pub struct BillingEngine {
     cards: Arc<RwLock<HashMap<String, Card>>>,
     consumed_refresh_tokens: Arc<RwLock<HashMap<String, u64>>>,
     active_reservations: Arc<Mutex<HashMap<String, usize>>>,
+    // Process-local admission only: never a reservation, debit, or snapshot field.
+    template_waits: Arc<Mutex<std::collections::HashSet<(String, String)>>>,
     reservations: Arc<RwLock<HashMap<String, CreditReservation>>>,
     ledger: Arc<RwLock<Vec<LedgerEntry>>>,
     rates: Arc<RwLock<HashMap<String, PricingRates>>>,
@@ -256,6 +264,7 @@ pub struct BillingEngine {
     rate_card_versions: Arc<RwLock<Vec<RateCardVersion>>>,
     rate_card_audit_logs: Arc<RwLock<Vec<RateCardAuditLog>>>,
     commercial_audit_logs: Arc<RwLock<Vec<CommercialAudit>>>,
+    runtime_settings: Arc<RwLock<RuntimeSettingsConfig>>,
     response_templates: Arc<RwLock<ResponseTemplateConfig>>,
     response_template_receipts: Arc<RwLock<Vec<ResponseTemplateReceipt>>>,
     settings: Arc<RwLock<BillingSettings>>,
@@ -295,6 +304,20 @@ pub struct BillingEngine {
     #[cfg(test)]
     save_snapshot_hook: Arc<Mutex<Option<SnapshotSaveHook>>>,
     require_anchor: Arc<RwLock<bool>>,
+}
+
+/// A template execution slot, released even when the waiting future is cancelled.
+#[derive(Debug)]
+#[must_use = "keep this slot alive through the template delay and debit"]
+pub struct TemplateWaitSlot {
+    waits: Arc<Mutex<std::collections::HashSet<(String, String)>>>,
+    key: (String, String),
+}
+
+impl Drop for TemplateWaitSlot {
+    fn drop(&mut self) {
+        self.waits.lock().unwrap().remove(&self.key);
+    }
 }
 
 /// Request-owned protection against orphan reclamation.
@@ -387,6 +410,8 @@ pub struct BillingSnapshot {
     pub rate_card_audit_logs: Vec<RateCardAuditLog>,
     #[serde(default)]
     pub commercial_audit_logs: Vec<CommercialAudit>,
+    #[serde(default)]
+    pub runtime_settings: RuntimeSettingsConfig,
     #[serde(default)]
     pub response_templates: ResponseTemplateConfig,
     #[serde(default)]
@@ -751,6 +776,7 @@ impl BillingEngine {
             cards: Arc::new(RwLock::new(HashMap::new())),
             consumed_refresh_tokens: Arc::new(RwLock::new(HashMap::new())),
             active_reservations: Arc::new(Mutex::new(HashMap::new())),
+            template_waits: Arc::new(Mutex::new(std::collections::HashSet::new())),
             reservations: Arc::new(RwLock::new(HashMap::new())),
             ledger: Arc::new(RwLock::new(Vec::new())),
             rates: Arc::new(RwLock::new(HashMap::new())),
@@ -762,6 +788,7 @@ impl BillingEngine {
             rate_card_versions: Arc::new(RwLock::new(Vec::new())),
             rate_card_audit_logs: Arc::new(RwLock::new(Vec::new())),
             commercial_audit_logs: Arc::new(RwLock::new(Vec::new())),
+            runtime_settings: Arc::new(RwLock::new(RuntimeSettingsConfig::default())),
             response_templates: Arc::new(RwLock::new(ResponseTemplateConfig::default())),
             response_template_receipts: Arc::new(RwLock::new(Vec::new())),
             settings: Arc::new(RwLock::new(BillingSettings::default())),
@@ -802,6 +829,27 @@ impl BillingEngine {
                     .unwrap_or(false),
             )),
         }
+    }
+
+    // Call under state_lock so admission is atomic with both kinds of request.
+    fn active_card_concurrency(
+        &self,
+        card_id: &str,
+        reservations: &HashMap<String, CreditReservation>,
+        exclude_template: Option<&str>,
+    ) -> u32 {
+        let held = reservations
+            .values()
+            .filter(|r| r.card_id == card_id && r.state == ReservationState::Held)
+            .count();
+        let waiting = self.template_waits.lock().unwrap();
+        (held
+            + waiting
+                .iter()
+                .filter(|(card, invocation)| {
+                    card == card_id && exclude_template != Some(invocation.as_str())
+                })
+                .count()) as u32
     }
 
     /// Hold before reserving, and keep alive through stream settlement. The janitor
@@ -894,6 +942,7 @@ impl BillingEngine {
             rate_card_versions: self.rate_card_versions.read().unwrap().clone(),
             rate_card_audit_logs: self.rate_card_audit_logs.read().unwrap().clone(),
             commercial_audit_logs: self.commercial_audit_logs.read().unwrap().clone(),
+            runtime_settings: self.runtime_settings.read().unwrap().clone(),
             response_templates: self.response_templates.read().unwrap().clone(),
             response_template_receipts: self.response_template_receipts.read().unwrap().clone(),
             settings: self.settings.read().unwrap().clone(),
@@ -980,6 +1029,7 @@ impl BillingEngine {
         *self.rate_card_versions.write().unwrap() = snapshot.rate_card_versions;
         *self.rate_card_audit_logs.write().unwrap() = snapshot.rate_card_audit_logs;
         *self.commercial_audit_logs.write().unwrap() = snapshot.commercial_audit_logs;
+        *self.runtime_settings.write().unwrap() = snapshot.runtime_settings;
         *self.response_templates.write().unwrap() = snapshot.response_templates;
         *self.response_template_receipts.write().unwrap() = snapshot.response_template_receipts;
         *self.settings.write().unwrap() = snapshot.settings;
@@ -2465,6 +2515,14 @@ impl BillingEngine {
         // and cost a copy and a write of the whole state per request. The next write, this
         // request's settlement among them, saves it with everything else.
         let _state_guard = self.state_lock.write().unwrap();
+        if self
+            .template_waits
+            .lock()
+            .unwrap()
+            .contains(&(card_id.to_string(), invocation_id.to_string()))
+        {
+            return Err(BillingError::DuplicateInvocation(invocation_id.to_string()));
+        }
         let mut reservations = self.reservations.write().unwrap();
         let pending_settlements = self.pending_settlements.read().unwrap();
 
@@ -2567,10 +2625,7 @@ impl BillingEngine {
         }
 
         // 3a. Check card concurrency quota (Spec §14.9 Fair-Use)
-        let active_concurrency = reservations
-            .values()
-            .filter(|r| r.card_id == card_id && r.state == ReservationState::Held)
-            .count() as u32;
+        let active_concurrency = self.active_card_concurrency(card_id, &reservations, None);
 
         if active_concurrency >= card.max_concurrency {
             return Err(BillingError::ConcurrencyLimitExceeded {
@@ -4865,14 +4920,101 @@ impl BillingEngine {
         topups.get(id).cloned()
     }
 
-    /// Redeem a top-up code against a card.
-    ///
-    /// Atomically:
-    /// 1. Verifies code has not been redeemed.
-    /// 2. Marks code redeemed by this card.
-    /// 3. Increases card credit balance.
-    /// 4. Extends card validity duration (reactivates expired cards).
-    /// 5. Writes append-only `usage_ledger` entry with `kind = topup`.
+    /// Atomically transfer an unused card balance and consume the source card.
+    pub fn renew_with_card(
+        &self,
+        card_id: &str,
+        raw_code: &str,
+        now: u64,
+    ) -> Result<LedgerEntry, BillingError> {
+        let _guard = self.state_lock.write().unwrap();
+        let sequence = self
+            .snapshot_sequence
+            .load(Ordering::Acquire)
+            .saturating_add(1);
+        let mut candidate = self.export_snapshot_locked(
+            sequence,
+            self.last_snapshot_checksum.read().unwrap().clone(),
+        );
+        let hash = crate::card::hash_card_code(raw_code.trim());
+        let source = candidate
+            .cards
+            .values()
+            .find(|c| c.code_hash == hash)
+            .cloned()
+            .ok_or(BillingError::InvalidOrRedeemedTopupCode)?;
+        if source.id == card_id
+            || source.status != CardStatus::Unactivated
+            || source.activated_at.is_some()
+            || source.valid_until.is_some()
+            || source.credit_used != 0
+            || source.credit_reserved != 0
+            || !source.bound_devices.is_empty()
+            || source.credit_total <= 0
+        {
+            return Err(BillingError::InvalidOrRedeemedTopupCode);
+        }
+        let target = candidate
+            .cards
+            .get_mut(card_id)
+            .ok_or_else(|| BillingError::CardNotFound(card_id.to_string()))?;
+        if !matches!(target.status, CardStatus::Active | CardStatus::Expired)
+            || target.activated_at.is_none()
+        {
+            return Err(BillingError::Card(CardError::NotActive(target.status)));
+        }
+        target.credit_total = target
+            .credit_total
+            .checked_add(source.credit_total)
+            .ok_or_else(|| BillingError::InvalidState("Credit overflow".into()))?;
+        if let Some(until) = target.valid_until {
+            target.valid_until = Some(until.max(now.saturating_add(30 * 86400)));
+        }
+        target.status = CardStatus::Active;
+        let updated_target = target.clone();
+        let mut updated_source = source.clone();
+        updated_source.status = CardStatus::Voided;
+        updated_source.credit_used = source.credit_total;
+        let entry = LedgerEntry {
+            id: format!("renew-{}", source.id),
+            card_id: card_id.to_string(),
+            kind: LedgerKind::Topup,
+            invocation_id: Some(format!("renew-{}", source.id)),
+            exposed_model: "card_renewal".into(),
+            provider_id: "system".into(),
+            target_model: "card_renewal".into(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            credits_charged: source.credit_total,
+            provider_cost_micro_cny: 0,
+            rate_card_version: None,
+            ts_secs: now,
+            operator_id: Some("card-holder".into()),
+            reason: Some(format!("Renewed using card {}", source.id)),
+            credit_face_value_cny: None,
+            detail: None,
+        };
+        let mut debit = entry.clone();
+        debit.id = format!("renew-debit-{}", source.id);
+        debit.card_id = source.id.clone();
+        debit.kind = LedgerKind::Adjustment;
+        debit.credits_charged = -source.credit_total;
+        debit.reason = Some(format!("Transferred to card {card_id}"));
+        candidate
+            .cards
+            .insert(source.id.clone(), updated_source.clone());
+        candidate.ledger.extend([entry.clone(), debit.clone()]);
+        self.commit_candidate_snapshot(&candidate, || {
+            let mut cards = self.cards.write().unwrap();
+            cards.insert(card_id.to_string(), updated_target);
+            cards.insert(source.id, updated_source);
+            self.ledger.write().unwrap().extend([entry.clone(), debit]);
+            entry
+        })
+    }
+
     pub fn redeem_topup(
         &self,
         card_id: &str,
@@ -5797,7 +5939,7 @@ impl BillingEngine {
         })
     }
 
-    /// UTC today plus the preceding 29 days, through now. Never substitute traces
+    /// Since activation (legacy cards: last 30 UTC days). Never substitute traces
     /// for missing ledger details: archived summaries lack tokens/model dimensions.
     pub fn settled_usage(
         &self,
@@ -5805,10 +5947,12 @@ impl BillingEngine {
         now_secs: u64,
     ) -> Option<crate::settled_usage::SettledUsage> {
         let _state_guard = self.state_lock.read().unwrap();
-        if !self.cards.read().unwrap().contains_key(card_id) {
+        let activated_at = self.cards.read().unwrap().get(card_id)?.activated_at;
+        let (fallback, end) = crate::settled_usage::window(now_secs);
+        let start = activated_at.unwrap_or(fallback);
+        if start >= end {
             return None;
         }
-        let (start, end) = crate::settled_usage::window(now_secs);
         if self
             .archived_ledger_summary
             .read()
@@ -5825,6 +5969,7 @@ impl BillingEngine {
             ledger.iter(),
             card_id,
             now_secs,
+            activated_at,
         ))
     }
 
@@ -7294,6 +7439,11 @@ fn validate_template_invocation_capacity(
 }
 
 fn validate_snapshot(snapshot: &BillingSnapshot) -> std::io::Result<()> {
+    snapshot
+        .runtime_settings
+        .settings
+        .validate()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     validate_template_invocation_capacity(&snapshot.archived_ledger_summary)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
     response_templates::validate_snapshot_state(snapshot)

@@ -128,6 +128,7 @@ fn rules() -> Vec<ResponseTemplateRule> {
         variants: [("gpt-test", 250_000), ("claude-test", 350_000)]
             .into_iter()
             .map(|(model, price)| ResponseTemplateVariant {
+                delay_ms: 0,
                 model_id: model.into(),
                 file_path: "index.html".into(),
                 content: format!("<!doctype html><svg aria-label=\"{model}\">中文\n</svg>"),
@@ -832,4 +833,290 @@ async fn production_cookie_session_enforces_csrf_before_template_publication() {
     )
     .unwrap();
     assert_eq!(readback["config"], published["config"]);
+}
+
+fn set_template_delay(billing: &BillingEngine, delay_ms: u32) {
+    let mut config = billing.response_template_config();
+    config.rules[0].variants[0].delay_ms = delay_ms;
+    billing
+        .publish_response_templates(
+            ResponseTemplateUpdate {
+                expected_revision: config.revision,
+                reason: "delay regression".into(),
+                rules: config.rules,
+            },
+            gateway::now_secs(),
+        )
+        .unwrap();
+}
+#[tokio::test]
+async fn delay_is_cancellable_before_debit_and_invalid_tools_do_not_wait() {
+    let billing = engine();
+    set_template_delay(&billing, 500);
+    let before = billing.export_snapshot();
+    assert!(tokio::time::timeout(
+        Duration::from_millis(40),
+        send(app(&billing), "cancel-delay", body("gpt-test"))
+    )
+    .await
+    .is_err());
+    assert_finances_unchanged(&billing, &before);
+    let mut invalid = body("gpt-test");
+    invalid["conversationState"]["currentMessage"]["userInputMessage"]["userInputMessageContext"]
+        ["tools"] = json!([]);
+    let (status, _) = tokio::time::timeout(
+        Duration::from_millis(300),
+        send(app(&billing), "invalid-delay", invalid),
+    )
+    .await
+    .expect("invalid tool must not wait");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_finances_unchanged(&billing, &before);
+}
+#[tokio::test]
+async fn delayed_template_waits_once_and_replay_does_not_double_charge() {
+    let billing = engine();
+    set_template_delay(&billing, 60);
+    let start = tokio::time::Instant::now();
+    let mut request = body("gpt-test");
+    request["conversationState"]["currentMessage"]["userInputMessage"]["content"] =
+        json!("create pelican  ");
+    let (status, _) = send(app(&billing), "delayed-once", request.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(start.elapsed() >= Duration::from_millis(60));
+    let before = billing.export_snapshot();
+    let (status, _) = send(app(&billing), "delayed-once", request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_finances_unchanged(&billing, &before);
+}
+
+// Poll the in-memory request directly to its first suspension (the template delay).
+// No scheduler sleeps or real upstream are needed to establish the in-flight request.
+async fn poll_template_wait<F: std::future::Future>(mut request: std::pin::Pin<&mut F>) {
+    std::future::poll_fn(|cx| {
+        assert!(request.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn delayed_templates_enforce_card_concurrency_and_cancel_releases_slot() {
+    let billing = engine();
+    let mut card = billing.get_card("card").unwrap();
+    card.max_concurrency = 1;
+    billing.upsert_card(card);
+    set_template_delay(&billing, 30_000);
+    let before = billing.export_snapshot();
+    let router = app(&billing);
+    let mut waiting = Box::pin(send(router.clone(), "waiting-template", body("gpt-test")));
+    poll_template_wait(waiting.as_mut()).await;
+
+    let (status, _) = tokio::time::timeout(
+        Duration::from_millis(300),
+        send(router.clone(), "parallel-template", body("gpt-test")),
+    )
+    .await
+    .expect("a full card must reject before the 30-second delay");
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_finances_unchanged(&billing, &before);
+    assert!(billing.export_snapshot().reservations.is_empty());
+    assert!(billing
+        .export_snapshot()
+        .response_template_receipts
+        .is_empty());
+
+    drop(waiting);
+    assert_finances_unchanged(&billing, &before);
+    set_template_delay(&billing, 0);
+    // Reuse the cancelled invocation on the same router: neither admission nor
+    // idempotency may remain stuck. The final charge must exclude its own slot.
+    let (status, _) = send(router, "waiting-template", body("gpt-test")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(billing.ledger_entries().len(), before.ledger.len() + 1);
+    assert_eq!(billing.get_card("card").unwrap().credit_used, 250_000);
+}
+
+#[tokio::test]
+async fn template_waits_and_ordinary_reservations_share_the_card_limit() {
+    use billing::{BillingError, ReservationEstimateParams};
+    let billing = engine();
+    let mut card = billing.get_card("card").unwrap();
+    card.max_concurrency = 1;
+    billing.upsert_card(card);
+    set_template_delay(&billing, 30_000);
+    let before = billing.export_snapshot();
+    let router = app(&billing);
+    let mut waiting = Box::pin(send(
+        router.clone(),
+        "template-holds-slot",
+        body("gpt-test"),
+    ));
+    poll_template_wait(waiting.as_mut()).await;
+    let params = ReservationEstimateParams::new(0, 0);
+    assert!(matches!(
+        billing.reserve("card", "ordinary", &params, gateway::now_secs(), 60),
+        Err(BillingError::ConcurrencyLimitExceeded { current: 1, max: 1 })
+    ));
+    assert_finances_unchanged(&billing, &before);
+    assert!(billing.export_snapshot().reservations.is_empty());
+
+    drop(waiting);
+    billing
+        .reserve("card", "ordinary", &params, gateway::now_secs(), 60)
+        .expect("cancelling the template frees capacity for ordinary requests");
+    let (status, _) = tokio::time::timeout(
+        Duration::from_millis(300),
+        send(router.clone(), "ordinary-holds-slot", body("gpt-test")),
+    )
+    .await
+    .expect("ordinary reservations must also block template admission immediately");
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    billing.release("ordinary").unwrap();
+    set_template_delay(&billing, 0);
+    let (status, _) = send(router, "after-ordinary-release", body("gpt-test")).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn ineligible_templates_reject_before_waiting_without_consuming_a_slot() {
+    for frozen in [false, true] {
+        let billing = engine();
+        let eligible = billing.get_card("card").unwrap();
+        let mut card = eligible.clone();
+        card.max_concurrency = 1;
+        if frozen {
+            card.status = CardStatus::Frozen;
+        } else {
+            card.credit_total = 0;
+        }
+        billing.upsert_card(card);
+        set_template_delay(&billing, 30_000);
+        let before = billing.export_snapshot();
+        let (status, _) = tokio::time::timeout(
+            Duration::from_millis(300),
+            send(app(&billing), "ineligible-wait", body("gpt-test")),
+        )
+        .await
+        .expect("eligibility and available credit must be checked before waiting");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_finances_unchanged(&billing, &before);
+        let mut card = eligible;
+        card.max_concurrency = 1;
+        billing.upsert_card(card);
+        set_template_delay(&billing, 0);
+        let (status, _) = send(app(&billing), "eligible-again", body("gpt-test")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+}
+
+#[tokio::test]
+async fn delayed_template_rechecks_credit_at_debit_and_releases_failed_slot() {
+    let billing = engine();
+    let mut card = billing.get_card("card").unwrap();
+    card.max_concurrency = 1;
+    billing.upsert_card(card.clone());
+    set_template_delay(&billing, 20);
+    let router = app(&billing);
+    let mut waiting = Box::pin(send(router.clone(), "credit-changed", body("gpt-test")));
+    poll_template_wait(waiting.as_mut()).await;
+    let mut empty = card.clone();
+    empty.credit_total = 0;
+    billing.upsert_card(empty);
+    let before = billing.export_snapshot();
+    let (status, _) = waiting.await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_finances_unchanged(&billing, &before);
+    billing.upsert_card(card);
+    set_template_delay(&billing, 0);
+    let (status, _) = send(router, "after-failed-charge", body("gpt-test")).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn legacy_snapshot_without_delay_and_with_empty_content_still_loads() {
+    for content in ["<html>legacy</html>", "", " \t\n"] {
+        let billing = engine();
+        let (status, _) = send(app(&billing), "before-upgrade", body("gpt-test")).await;
+        assert_eq!(status, StatusCode::OK);
+        let before = billing.export_snapshot();
+        let mut legacy = serde_json::to_value(&before).unwrap();
+        for rule in legacy["response_templates"]["rules"]
+            .as_array_mut()
+            .unwrap()
+        {
+            for variant in rule["variants"].as_array_mut().unwrap() {
+                variant.as_object_mut().unwrap().remove("delay_ms");
+                variant["content"] = json!(content);
+            }
+        }
+        let directory = SnapshotDir::new();
+        let path = directory.0.join("legacy.json");
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let restored = BillingEngine::new();
+        restored
+            .load_from_file(&path)
+            .expect("old valid billing state must remain loadable");
+        assert_finances_unchanged(&restored, &before);
+        let config = restored.response_template_config();
+        assert!(config
+            .rules
+            .iter()
+            .flat_map(|r| &r.variants)
+            .all(|v| v.delay_ms == 0));
+        let (status, _) = send(app(&restored), "after-upgrade", body("gpt-test")).await;
+        if content.trim().is_empty() {
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_finances_unchanged(&restored, &before);
+            assert!(restored
+                .publish_response_templates(
+                    ResponseTemplateUpdate {
+                        expected_revision: config.revision,
+                        reason: "must not republish empty legacy content".into(),
+                        rules: config.rules,
+                    },
+                    gateway::now_secs(),
+                )
+                .is_err());
+        } else {
+            assert_eq!(status, StatusCode::OK);
+        }
+    }
+}
+
+#[tokio::test]
+async fn delayed_template_uses_current_time_and_does_not_charge_an_expired_card() {
+    let billing = engine();
+    set_template_delay(&billing, 1_100);
+    let mut card = billing.get_card("card").unwrap();
+    card.max_concurrency = 1;
+    let valid_until = gateway::now_secs() + 1;
+    card.valid_until = Some(valid_until);
+    billing.upsert_card(card);
+    let before = billing.export_snapshot();
+    let router = app(&billing);
+    let mut waiting = Box::pin(send(
+        router.clone(),
+        "expires-during-delay",
+        body("gpt-test"),
+    ));
+    // Admission succeeds while the card is active; it must be rechecked after waiting.
+    poll_template_wait(waiting.as_mut()).await;
+    let (status, _) = waiting.await;
+    assert!(gateway::now_secs() >= valid_until);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_finances_unchanged(&billing, &before);
+    assert!(billing
+        .export_snapshot()
+        .response_template_receipts
+        .is_empty());
+    assert!(billing.export_snapshot().reservations.is_empty());
+
+    // The failed final check also releases the wait slot.
+    let mut card = billing.get_card("card").unwrap();
+    card.valid_until = Some(gateway::now_secs() + 86_400);
+    billing.upsert_card(card);
+    set_template_delay(&billing, 0);
+    let (status, _) = send(router, "after-validity-extension", body("gpt-test")).await;
+    assert_eq!(status, StatusCode::OK);
 }

@@ -179,6 +179,7 @@ fn template_engine(path: &std::path::Path) -> (BillingEngine, String) {
                     match_mode: "contains".into(),
                     match_text: "make a page".into(),
                     variants: vec![ResponseTemplateVariant {
+                        delay_ms: 0,
                         model_id: "model-a".into(),
                         file_path: "index.html".into(),
                         content: "<html>page</html>".into(),

@@ -153,3 +153,24 @@ fn empty_usage_is_real_zero_and_unknown_card_is_unavailable() {
     assert!(stats.models.is_empty());
     assert!(engine.settled_usage("missing", 100).is_none());
 }
+
+#[test]
+fn activation_history_includes_old_days_and_model_daily_totals() {
+    let engine = setup();
+    let mut card = Card::new("card", "group-pro-plus", 1_000_000_000);
+    card.status = CardStatus::Active;
+    card.activated_at = Some(86_400 + 100);
+    engine.upsert_card(card);
+    settle(&engine, "card", "before-activation", "excluded", 86_400);
+    let charge = settle(&engine, "card", "first", "model-one", 86_400 + 100);
+    settle(&engine, "card", "latest", "model-two", 100 * 86_400);
+    let stats = engine.settled_usage("card", 100 * 86_400).unwrap();
+    assert_eq!(stats.activated_at, Some(86_400 + 100));
+    assert_eq!(stats.window_start, 86_400 + 100);
+    assert_eq!(stats.daily.len(), 100);
+    assert_eq!(stats.total_points, (charge * 2) as f64 / 1_000_000.0);
+    assert_eq!(stats.models.len(), 2);
+    assert_eq!(stats.models[0].daily[0].date, "1970-01-02");
+    assert_eq!(stats.models[0].daily[0].points, charge as f64 / 1_000_000.0);
+    assert_eq!(stats.daily[1].points, 0.0);
+}

@@ -215,12 +215,6 @@ async fn native_inner(
     let arg = args.first().and_then(Value::as_str).unwrap_or("");
     match method.as_str() {
         "minimize" => window.minimize().map_err(|e| e.to_string())?,
-        "maximize" => if window.is_maximized().map_err(|e| e.to_string())? {
-            window.unmaximize()
-        } else {
-            window.maximize()
-        }
-        .map_err(|e| e.to_string())?,
         "drag" => window.start_dragging().map_err(|e| e.to_string())?,
         "screen" => resize_screen(&window, arg)?,
         "get_close_behavior" => {

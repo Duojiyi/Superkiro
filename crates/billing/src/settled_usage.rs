@@ -6,7 +6,9 @@ use std::collections::{BTreeMap, HashSet};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SettledUsage {
-    /// All totals cover [window_start, window_end), not lifetime consumption.
+    pub activated_at: Option<u64>,
+    pub total_points: f64,
+    /// All totals cover [window_start, window_end); activation is absent on legacy cards.
     pub total_tokens: u64,
     pub today_points: f64,
     pub today_tokens: u64,
@@ -29,6 +31,7 @@ pub struct ModelUsage {
     pub name: String,
     pub tokens: u64,
     pub points: f64,
+    pub daily: Vec<DailyUsage>,
 }
 
 pub(crate) fn window(now_secs: u64) -> (u64, u64) {
@@ -42,12 +45,16 @@ pub(crate) fn aggregate<'a>(
     entries: impl Iterator<Item = &'a LedgerEntry>,
     card_id: &str,
     now_secs: u64,
+    activated_at: Option<u64>,
 ) -> SettledUsage {
-    let (start, end) = window(now_secs);
+    let (fallback, end) = window(now_secs);
+    let start = activated_at.unwrap_or(fallback);
     let today = now_secs / 86_400;
     let mut days = BTreeMap::<u64, (i64, u64)>::new();
     let mut models = BTreeMap::<String, (i64, u64)>::new();
     let mut seen = HashSet::new();
+    let mut model_days = BTreeMap::<String, BTreeMap<u64, (i64, u64)>>::new();
+    let mut total_micro = 0i64;
     let mut total_tokens = 0u64;
     for entry in entries.filter(|e| {
         e.card_id == card_id && e.kind == LedgerKind::Usage && e.ts_secs >= start && e.ts_secs < end
@@ -62,9 +69,15 @@ pub(crate) fn aggregate<'a>(
         // Ledger input_tokens already includes cache-read and cache-creation tokens.
         let tokens = entry.input_tokens.saturating_add(entry.output_tokens);
         total_tokens = total_tokens.saturating_add(tokens);
+        total_micro = total_micro.saturating_add(entry.credits_charged);
         for value in [
             days.entry(entry.ts_secs / 86_400).or_default(),
             models.entry(entry.exposed_model.clone()).or_default(),
+            model_days
+                .entry(entry.exposed_model.clone())
+                .or_default()
+                .entry(entry.ts_secs / 86_400)
+                .or_default(),
         ] {
             value.0 = value.0.saturating_add(entry.credits_charged);
             value.1 = value.1.saturating_add(tokens);
@@ -72,7 +85,7 @@ pub(crate) fn aggregate<'a>(
     }
     let points = |micro: i64| micro as f64 / crate::MICRO_CREDITS_PER_CREDIT as f64;
     let (today_credits, today_tokens) = days.get(&today).copied().unwrap_or_default();
-    let daily = if days.is_empty() {
+    let daily = if days.is_empty() && activated_at.is_none() {
         Vec::new()
     } else {
         (start / 86_400..=today)
@@ -87,6 +100,8 @@ pub(crate) fn aggregate<'a>(
             .collect()
     };
     SettledUsage {
+        activated_at,
+        total_points: points(total_micro),
         total_tokens,
         today_points: points(today_credits),
         today_tokens,
@@ -94,6 +109,16 @@ pub(crate) fn aggregate<'a>(
         models: models
             .into_iter()
             .map(|(name, (micro, tokens))| ModelUsage {
+                daily: model_days
+                    .remove(&name)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(day, (micro, tokens))| DailyUsage {
+                        date: utc_date(day),
+                        points: points(micro),
+                        tokens,
+                    })
+                    .collect(),
                 name,
                 tokens,
                 points: points(micro),

@@ -467,13 +467,6 @@ async fn attempt_with_key(
     retries: usize,
     now_secs: u64,
 ) -> Result<BoxStream<'static, Result<ProviderStreamEvent, ProviderError>>, ProviderError> {
-    let config = ProviderConfig::new(
-        &provider.base_url,
-        &key.api_key,
-        model,
-        Duration::from_secs(600),
-    );
-
     let req_to_use;
     let req_ref = if chat_req.model == model {
         chat_req
@@ -485,6 +478,13 @@ async fn attempt_with_key(
         };
         &req_to_use
     };
+
+    let config = ProviderConfig::new(
+        &provider.base_url,
+        &key.api_key,
+        model,
+        super::retry::limits_for(req_ref).started,
+    );
 
     let result = super::retry::ATTEMPT_KEY
         .scope(

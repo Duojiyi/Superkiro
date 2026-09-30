@@ -23,7 +23,9 @@ use crate::provider::retry::UpstreamLimits;
 use crate::provider::ProviderRuntimeRegistry;
 use crate::provider::{ModelProvider, ProviderConfig, ProviderError};
 use crate::security::{ContentGuardrailConfig, GuardrailError};
-use crate::stream::{create_stream_guard, BillingSettler, KiroError, StreamGuardConfig};
+use crate::stream::{
+    create_stream_guard_with_send_deadline, BillingSettler, KiroError, StreamGuardConfig,
+};
 use crate::translate::to_provider::{
     prepare_images, translate_kiro_to_chat_request, TranslationContext,
 };
@@ -244,7 +246,7 @@ impl GenerateAssistantResponseHandler {
                             StatusCode::BAD_REQUEST,
                             "InvalidRequestException",
                             "amz-sdk-invocation-id must be 1 to 128 letters, digits, '.', '_', ':' or '-'",
-                        )
+                        );
                     }
                 },
             };
@@ -298,17 +300,17 @@ impl GenerateAssistantResponseHandler {
                         {
                             Ok(BodyRead::Body(bytes)) => bytes,
                             Ok(BodyRead::TooLarge) => {
-                                return body_too_large(self.content_guardrail.max_body_bytes)
+                                return body_too_large(self.content_guardrail.max_body_bytes);
                             }
                             Ok(BodyRead::Throttled) => {
-                                return self.large_bodies.throttled_response()
+                                return self.large_bodies.throttled_response();
                             }
                             Err(_) => {
                                 return error_response(
                                     StatusCode::BAD_REQUEST,
                                     "SerializationException",
                                     "Invalid retry body",
-                                )
+                                );
                             }
                         };
                         let parsed: GenerateAssistantResponseRequest =
@@ -319,7 +321,7 @@ impl GenerateAssistantResponseHandler {
                                         StatusCode::BAD_REQUEST,
                                         "SerializationException",
                                         "Invalid retry request",
-                                    )
+                                    );
                                 }
                             };
                         if let Err(error) =
@@ -346,7 +348,8 @@ impl GenerateAssistantResponseHandler {
                         }
                     }
                     return error_response(
-                        StatusCode::CONFLICT, "InvocationAlreadyCompletedException",
+                        StatusCode::CONFLICT,
+                        "InvocationAlreadyCompletedException",
                         "Request with amz-sdk-invocation-id has already completed; use a new invocation id",
                     );
                 }
@@ -507,6 +510,8 @@ impl GenerateAssistantResponseHandler {
                 }
             };
 
+            let runtime_settings = self.billing.runtime_settings_config().settings;
+
             // Disclosed local templates bypass upstream/token reservation, but their
             // atomic fixed-price transaction still enforces the card and model limits.
             if let (Some(caller), Some(parsed)) = (claims.as_ref(), parsed_request.as_ref()) {
@@ -520,7 +525,9 @@ impl GenerateAssistantResponseHandler {
                         &invocation_key,
                         &model,
                         crate::now_secs(),
-                    ) {
+                    )
+                    .await
+                    {
                         if response.status().is_success() {
                             idempotency_guard.commit(crate::idempotency::CompletedInvocation {
                                 completed_at: std::time::Instant::now(),
@@ -674,7 +681,13 @@ impl GenerateAssistantResponseHandler {
                 };
 
                 if let Err(e) = self
-                    .reserve_waiting(card_id, &invocation_key, &reserve_params, now_secs)
+                    .reserve_waiting(
+                        card_id,
+                        &invocation_key,
+                        &reserve_params,
+                        now_secs,
+                        runtime_settings.reservation_ttl_secs(),
+                    )
                     .await
                 {
                     match e {
@@ -694,7 +707,10 @@ impl GenerateAssistantResponseHandler {
                                 StatusCode::TOO_MANY_REQUESTS,
                                 "ThrottlingException",
                                 "CONCURRENCY_LIMIT_EXCEEDED",
-                                &format!("Card concurrency quota exceeded ({}/{}). Please wait for active requests to finish.", current, max),
+                                &format!(
+                                    "Card concurrency quota exceeded ({}/{}). Please wait for active requests to finish.",
+                                    current, max
+                                ),
                                 Some(1),
                             );
                         }
@@ -1285,12 +1301,20 @@ impl GenerateAssistantResponseHandler {
             // arrived) begins the answer: headers, then keepalives while the route finishes
             // behind them, and a failure ends it with the exception frame Kiro reads as it
             // would the error response. A route that ends sooner is answered as before.
-            let limits = self
-                .upstream_limits
-                .unwrap_or_else(|| crate::provider::retry::UpstreamLimits::for_request(&chat_req));
+            let limits = self.upstream_limits.unwrap_or_else(|| {
+                crate::provider::retry::UpstreamLimits::for_request(&chat_req)
+                    .with_runtime_settings(
+                        &runtime_settings,
+                        &chat_req.model,
+                        chat_req.reasoning_effort,
+                    )
+            });
             let route = match self.upstream_limits {
                 Some(limits) => crate::provider::retry::Route::with_limits(limits),
-                None => crate::provider::retry::Route::new(limits.total),
+                None => crate::provider::retry::Route::with_settings(
+                    limits.total,
+                    runtime_settings.clone(),
+                ),
             };
             if one_shot {
                 route.not_read_again();
@@ -1427,6 +1451,7 @@ impl GenerateAssistantResponseHandler {
                     }
                     let mut direct_config = provider_config.clone();
                     direct_config.model = target_model.clone();
+                    direct_config.timeout = route.limits_for(&chat_req).started;
                     let routing = {
                         let provider = provider.clone();
                         let client = self.client.clone();
@@ -1513,7 +1538,7 @@ impl GenerateAssistantResponseHandler {
                 billing::context::ModelContextLibrary::resolve(&actual_target_model).context_window
             });
             let guard_config = StreamGuardConfig {
-                keepalive_interval: Duration::from_secs(20),
+                keepalive_interval: Duration::from_secs(runtime_settings.keepalive_secs),
                 // The model the customer asked for. The target, a fallback included, is
                 // internal routing and stays in the server-side traces.
                 model_id: requested_model.to_string(),
@@ -1531,16 +1556,10 @@ impl GenerateAssistantResponseHandler {
                 })
                 .or_else(|| self.provider.as_ref().map(|provider| provider.name()))
                 .unwrap_or_default();
-            let watchdog = self
-                .upstream_limits
-                .unwrap_or_else(|| {
-                    crate::provider::retry::UpstreamLimits::for_model_on(
-                        &actual_target_model,
-                        chat_req.reasoning_effort,
-                        format,
-                    )
-                })
-                .watchdog();
+            let mut final_request = chat_req.clone();
+            final_request.model = actual_target_model.clone();
+            let final_limits = route.limits_on(&final_request, format);
+            let watchdog = final_limits.watchdog();
 
             // The stream's settler bills or returns the hold from here on.
             hold.armed = false;
@@ -1569,12 +1588,19 @@ impl GenerateAssistantResponseHandler {
             } else {
                 Box::pin(WatchdogStream::new(upstream_stream, watchdog))
             };
-            let guarded_stream = create_stream_guard(
+            let guarded_stream = create_stream_guard_with_send_deadline(
                 upstream_stream,
                 guard_config,
                 Some(ctx.tool_registry),
                 Some(idempotency_guard),
                 Some(settler),
+                // A committed response can still move to a longer-running fallback.
+                // Each actual attempt keeps its own frozen per-model watchdog.
+                if committed {
+                    Duration::from_secs(runtime_settings.reservation_ttl_secs())
+                } else {
+                    final_limits.started
+                },
             );
 
             (
@@ -1595,13 +1621,14 @@ impl GenerateAssistantResponseHandler {
         invocation_key: &str,
         params: &ReservationEstimateParams,
         now_secs: u64,
+        ttl_secs: u64,
     ) -> Result<(), billing::engine::BillingError> {
         let until = tokio::time::Instant::now() + self.card_slot_wait;
         let mut now_secs = now_secs;
         loop {
             match self
                 .billing
-                .reserve(card_id, invocation_key, params, now_secs, 660)
+                .reserve(card_id, invocation_key, params, now_secs, ttl_secs)
             {
                 Err(error)
                     if frees_up(&error)
@@ -1933,7 +1960,7 @@ fn reservation_refusal(error: &billing::engine::BillingError) -> Response {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "InternalServerException",
                 "Credit reservation is temporarily unavailable",
-            )
+            );
         }
     };
     error_response(StatusCode::BAD_REQUEST, "ValidationException", &message)
@@ -2055,7 +2082,7 @@ fn guardrail_refusal(error: &GuardrailError) -> Response {
                 StatusCode::BAD_REQUEST,
                 "ValidationException",
                 &other.to_string(),
-            )
+            );
         }
     };
     validation_error(reason, &message)

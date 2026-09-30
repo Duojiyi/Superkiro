@@ -48,6 +48,8 @@ pub struct ResponseTemplateVariant {
     pub preamble: String,
     pub completion: String,
     pub price_microcredits: i64,
+    #[serde(default)]
+    pub delay_ms: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,6 +200,7 @@ fn validate_rules(rules: &[ResponseTemplateRule]) -> Result<(), BillingError> {
                 || !models.insert(&variant.model_id)
                 || !safe_html_path(&variant.file_path)
                 || variant.content.len() > 256 * 1024
+                || variant.delay_ms > 30_000
                 || !message(&variant.preamble)
                 || !message(&variant.completion)
                 || !(0..=1_000_000_000).contains(&variant.price_microcredits)
@@ -358,6 +361,15 @@ impl BillingEngine {
         now: u64,
     ) -> Result<ResponseTemplateConfig, BillingError> {
         validate_rules(&update.rules)?;
+        // Old snapshots may contain enabled empty variants; keep them loadable, but
+        // refuse new publications and execution of such variants.
+        if update
+            .rules
+            .iter()
+            .any(|r| r.enabled && r.variants.iter().any(|v| v.content.trim().is_empty()))
+        {
+            return Err(invalid("enabled templates require nonempty HTML"));
+        }
         if !crate::valid_id(&update.expected_revision, 128)
             || !crate::valid_id(&update.reason, 1024)
         {
@@ -400,6 +412,98 @@ impl BillingEngine {
         Ok(result)
     }
 
+    /// Admit a local template before its cancellable delay, without reserving money.
+    pub fn begin_response_template_wait(
+        &self,
+        expected_revision: &str,
+        rule_id: &str,
+        model_id: &str,
+        card_id: &str,
+        invocation_id: &str,
+        now: u64,
+    ) -> Result<TemplateWaitSlot, BillingError> {
+        let _guard = self.state_lock.write().unwrap();
+        let config = self.response_templates.read().unwrap();
+        if config.revision != expected_revision {
+            return Err(invalid("configuration changed; reload before waiting"));
+        }
+        let variant = config
+            .rules
+            .iter()
+            .find(|rule| rule.id == rule_id && rule.enabled)
+            .and_then(|rule| rule.variants.iter().find(|v| v.model_id == model_id))
+            .ok_or_else(|| invalid("enabled rule or exact model variant not found"))?;
+        if variant.content.trim().is_empty() {
+            return Err(invalid("empty legacy template cannot be executed"));
+        }
+        let card = self
+            .cards
+            .read()
+            .unwrap()
+            .get(card_id)
+            .cloned()
+            .ok_or_else(|| BillingError::CardNotFound(card_id.into()))?;
+        self.check_response_template_card(&card, model_id, variant.price_microcredits, now)?;
+        let key = (card_id.to_string(), invocation_id.to_string());
+        let reservations = self.reservations.read().unwrap();
+        let pending = self.pending_settlements.read().unwrap();
+        if self.template_waits.lock().unwrap().contains(&key)
+            || reservations
+                .get(invocation_id)
+                .is_some_and(|r| r.state != ReservationState::Released)
+            || pending.contains_key(invocation_id)
+        {
+            return Err(BillingError::DuplicateInvocation(invocation_id.into()));
+        }
+        let current = self.active_card_concurrency(card_id, &reservations, None);
+        if current >= card.max_concurrency {
+            return Err(BillingError::ConcurrencyLimitExceeded {
+                current,
+                max: card.max_concurrency,
+            });
+        }
+        check_quota(
+            &card,
+            variant.price_microcredits,
+            now,
+            &reservations,
+            &pending,
+            &self.ledger.read().unwrap(),
+            &self.archived_ledger_summary.read().unwrap(),
+        )?;
+        self.template_waits.lock().unwrap().insert(key.clone());
+        Ok(TemplateWaitSlot {
+            waits: self.template_waits.clone(),
+            key,
+        })
+    }
+
+    // Both admission and final debit run this under state_lock. Eligibility can change
+    // during the delay, and the wait slot intentionally reserves no credit.
+    fn check_response_template_card(
+        &self,
+        card: &Card,
+        model_id: &str,
+        price: i64,
+        now: u64,
+    ) -> Result<(), BillingError> {
+        card.check_can_reserve(price, now)?;
+        if card.outstanding_debt() > 0 {
+            return Err(invalid("card has outstanding debt"));
+        }
+        if !self.groups.read().unwrap().contains_key(&card.group_id)
+            || !self
+                .model_maps
+                .read()
+                .unwrap()
+                .iter()
+                .any(|m| m.group_id == card.group_id && !m.retired && m.matches_model(model_id))
+        {
+            return Err(invalid("model is not allowed for the card group"));
+        }
+        Ok(())
+    }
+
     /// The caller authorizes a match; billing resolves the exact model variant under the
     /// state lock. Replays return DuplicateInvocation, never a second charge. Retrieve
     /// the scoped receipt to recover a response after a lost acknowledgement.
@@ -430,6 +534,9 @@ impl BillingEngine {
             .and_then(|rule| rule.variants.iter().find(|v| v.model_id == model_id))
             .ok_or_else(|| invalid("enabled rule or exact model variant not found"))?
             .clone();
+        if variant.content.trim().is_empty() {
+            return Err(invalid("empty legacy template cannot be executed"));
+        }
         if receipt.model_id != model_id
             || receipt.file_path != variant.file_path
             || receipt.completion != variant.completion
@@ -488,23 +595,12 @@ impl BillingEngine {
             .get(&receipt.card_id)
             .cloned()
             .ok_or_else(|| BillingError::CardNotFound(receipt.card_id.clone()))?;
-        card.check_can_reserve(variant.price_microcredits, now)?;
-        if card.outstanding_debt() > 0 {
-            return Err(invalid("card has outstanding debt"));
-        }
-        if !candidate.groups.contains_key(&card.group_id)
-            || !candidate
-                .model_maps
-                .iter()
-                .any(|m| m.group_id == card.group_id && !m.retired && m.matches_model(model_id))
-        {
-            return Err(invalid("model is not allowed for the card group"));
-        }
-        let current = candidate
-            .reservations
-            .values()
-            .filter(|r| r.card_id == card.id && r.state == ReservationState::Held)
-            .count() as u32;
+        self.check_response_template_card(&card, model_id, variant.price_microcredits, now)?;
+        let current = self.active_card_concurrency(
+            &card.id,
+            &candidate.reservations,
+            Some(&receipt.invocation_id),
+        );
         if current >= card.max_concurrency {
             return Err(BillingError::ConcurrencyLimitExceeded {
                 current,
@@ -615,6 +711,7 @@ mod tests {
             match_mode: "contains".into(),
             match_text: "make a page".into(),
             variants: vec![ResponseTemplateVariant {
+                delay_ms: 0,
                 model_id: "model-a".into(),
                 file_path: "pages/index.html".into(),
                 content: "<html>model A</html>".into(),
@@ -668,6 +765,85 @@ mod tests {
             price_microcredits: 10,
             created_at_secs: 0,
         }
+    }
+
+    #[test]
+    fn template_wait_admission_is_atomic_and_process_local() {
+        let (e, revision) = setup(10);
+        let mut card = e.get_card("card").unwrap();
+        card.max_concurrency = 1;
+        e.upsert_card(card);
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let e = e.clone();
+                let revision = revision.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    e.begin_response_template_wait(
+                        &revision,
+                        "landing",
+                        "model-a",
+                        "card",
+                        &format!("wait-{i}"),
+                        NOW,
+                    )
+                })
+            })
+            .collect();
+        // Keep every successful guard alive until all admission attempts finish.
+        let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        for result in &results {
+            if let Err(error) = result {
+                assert!(matches!(
+                    error,
+                    BillingError::ConcurrencyLimitExceeded { current: 1, max: 1 }
+                ));
+            }
+        }
+        let winner = results.iter().position(|r| r.is_ok()).unwrap();
+        assert!(matches!(
+            e.begin_response_template_wait(
+                &revision,
+                "landing",
+                "model-a",
+                "card",
+                &format!("wait-{winner}"),
+                NOW,
+            ),
+            Err(BillingError::DuplicateInvocation(_))
+        ));
+        let snapshot = e.export_snapshot();
+        assert!(snapshot.reservations.is_empty());
+        assert!(snapshot.ledger.is_empty());
+        assert!(snapshot.response_template_receipts.is_empty());
+        assert_eq!(snapshot.cards["card"].credit_used, 0);
+        assert_eq!(snapshot.cards["card"].credit_reserved, 0);
+        let restarted = BillingEngine::new();
+        restarted.import_snapshot(snapshot);
+        let _fresh = restarted
+            .begin_response_template_wait(
+                &revision,
+                "landing",
+                "model-a",
+                "card",
+                "after-restart",
+                NOW,
+            )
+            .unwrap();
+        drop(results);
+        let _next = e
+            .begin_response_template_wait(
+                &revision,
+                "landing",
+                "model-a",
+                "card",
+                "after-drop",
+                NOW,
+            )
+            .unwrap();
     }
 
     fn charge(
