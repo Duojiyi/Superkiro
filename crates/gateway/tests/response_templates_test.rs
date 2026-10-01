@@ -1134,10 +1134,12 @@ fn set_timeline(billing: &BillingEngine, min: u32, max: u32) {
         messages: vec![
             ResponseTemplateMessage {
                 at_ms: 10,
+                at_max_ms: None,
                 text: "first\n".into(),
             },
             ResponseTemplateMessage {
                 at_ms: 30,
+                at_max_ms: None,
                 text: "second\n".into(),
             },
         ],
@@ -1470,4 +1472,37 @@ async fn sparse_timeline_keepalives_preserve_messages_and_failed_debit_is_retrya
         StatusCode::OK
     );
     assert_eq!(billing.ledger_entries().len(), 1);
+}
+
+#[tokio::test]
+async fn streamed_random_message_windows_keep_order_and_single_charge() {
+    let billing = engine();
+    set_timeline(&billing, 110, 130);
+    let mut config = billing.response_template_config();
+    let delivery = config.rules[0].variants[0].delivery.as_mut().unwrap();
+    delivery.messages[1].at_ms = 50;
+    delivery.messages[1].at_max_ms = Some(80);
+    billing
+        .publish_response_templates(
+            ResponseTemplateUpdate {
+                expected_revision: config.revision,
+                reason: "random windows".into(),
+                rules: config.rules,
+            },
+            gateway::now_secs(),
+        )
+        .unwrap();
+    let start = tokio::time::Instant::now();
+    let mut stream = raw_send(app(&billing), "random-windows").await.into_body();
+    for (text, earliest) in [("first\n", 10), ("second\n", 50)] {
+        let data = stream.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(decode_chunks(&data)[0]["content"], text);
+        assert!(start.elapsed() >= Duration::from_millis(earliest));
+        assert!(billing.ledger_entries().is_empty());
+    }
+    let tail = stream.collect().await.unwrap().to_bytes();
+    assert!(start.elapsed() >= Duration::from_millis(110));
+    assert!(!tool_id(&decode_chunks(&tail)).is_empty());
+    assert_eq!(billing.ledger_entries().len(), 1);
+    assert_eq!(billing.ledger_entries()[0].credits_charged, 9_500_000);
 }

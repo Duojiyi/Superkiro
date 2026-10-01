@@ -95,3 +95,16 @@ assert(!t.sameTemplateRules(saved,reordered), 'uncertain save must detect a diff
 const omitted = JSON.parse(JSON.stringify(saved));
 delete omitted[0].intent; delete omitted[0].variants[0].delivery;
 assert(t.sameTemplateRules(saved,omitted), 'absent optional fields preserve save equality');
+
+const randomDraft = valid(); randomDraft.variants[0].delivery = {...t.newTemplateDelivery(), write_min_ms:110000, write_max_ms:130000, messages:[{at_ms:10000,text:'first'},{at_ms:50000,at_max_ms:80000,text:'second'}]};
+assert.ok(t.parseTemplateRules([randomDraft]).rules);
+for (const at_max_ms of [49999,110001,-1,80000.5,NaN,Infinity]) {
+ const d=structuredClone(randomDraft); d.variants[0].delivery.messages[1].at_max_ms=at_max_ms; assert.ok(t.parseTemplateRules([d]).error, String(at_max_ms));
+}
+const overlap=structuredClone(randomDraft);overlap.variants[0].delivery.messages[0].at_max_ms=50000;assert.ok(t.parseTemplateRules([overlap]).error);
+const fixed=t.parseTemplateRules([randomDraft]).rules;const nullable=structuredClone(fixed);nullable[0].variants[0].delivery.messages[0].at_max_ms=null;
+assert(t.sameTemplateRules(fixed,nullable),'null and omitted upper bound are equivalent');
+assert.equal(opusExample.variants[0].file_path,'pelican-bicycle.html');
+assert(!/<script\b|@keyframes|https?:\/\//i.test(opusExample.variants[0].content));
+assert(opusExample.variants[0].content.includes('<animateTransform'));
+console.log('PASS: bounded random message windows and legacy fixed-time compatibility');

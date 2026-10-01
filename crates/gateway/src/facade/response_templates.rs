@@ -539,7 +539,11 @@ pub(super) async fn respond(
                     Ok(b) => b,
                     Err(_) => return Some(encoding_error()),
                 };
-            events.push((m.at_ms, event, false));
+            let message_at = match random_delay(m.at_ms, m.at_max_ms.unwrap_or(m.at_ms)) {
+                Ok(at) => at,
+                Err(_) => return Some(encoding_error()),
+            };
+            events.push((message_at, event, false));
         }
         // Independent protocol keepalives also cover empty/sparse display timelines.
         // Snapshot the validated runtime interval for this request. These bounded,

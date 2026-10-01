@@ -52,6 +52,9 @@ pub struct ResponseTemplateIntent {
 #[serde(deny_unknown_fields)]
 pub struct ResponseTemplateMessage {
     pub at_ms: u32,
+    /// Optional inclusive upper bound; absent keeps legacy fixed-time messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_max_ms: Option<u32>,
     pub text: String,
 }
 
@@ -292,10 +295,16 @@ fn validate_delivery(d: &ResponseTemplateDelivery) -> Result<(), BillingError> {
     if d.write_min_ms > d.write_max_ms
         || d.write_max_ms > 300_000
         || d.messages.len() > 16
+        || d.messages.iter().any(|m| {
+            let latest = m.at_max_ms.unwrap_or(m.at_ms);
+            latest < m.at_ms
+                || latest > d.write_min_ms
+                || m.text.trim().is_empty()
+                || !message(&m.text)
+        })
         || d.messages
-            .iter()
-            .any(|m| m.at_ms > d.write_min_ms || m.text.trim().is_empty() || !message(&m.text))
-        || d.messages.windows(2).any(|w| w[0].at_ms >= w[1].at_ms)
+            .windows(2)
+            .any(|w| w[0].at_max_ms.unwrap_or(w[0].at_ms) >= w[1].at_ms)
         || [
             &d.dispatch,
             &d.success,
@@ -307,7 +316,7 @@ fn validate_delivery(d: &ResponseTemplateDelivery) -> Result<(), BillingError> {
         .iter()
         .any(|s| !message(s))
     {
-        return Err(invalid("invalid delivery: 0–300000ms, ordered absolute message times before earliest dispatch, up to 16 messages"));
+        return Err(invalid("invalid delivery: 0–300000ms, ordered non-overlapping absolute message windows before earliest dispatch, up to 16 messages"));
     }
     Ok(())
 }
@@ -1675,5 +1684,36 @@ mod tests {
                 .is_err());
         }
         assert!(e.ledger_entries().is_empty());
+    }
+    #[test]
+    fn response_template_random_message_windows_validate_and_preserve_legacy() {
+        let base = serde_json::json!({
+            "write_min_ms":110000,"write_max_ms":130000,
+            "messages":[{"at_ms":10000,"text":"first"},{"at_ms":50000,"at_max_ms":80000,"text":"second"}],
+            "dispatch":"write","success":"ok","failure":"failed","unknown":"unknown","replay":"retry","continuation":"next"
+        });
+        let delivery: ResponseTemplateDelivery = serde_json::from_value(base.clone()).unwrap();
+        assert!(validate_delivery(&delivery).is_ok());
+        assert_eq!(delivery.messages[0].at_max_ms, None);
+        assert!(serde_json::to_value(&delivery.messages[0])
+            .unwrap()
+            .get("at_max_ms")
+            .is_none());
+        for upper in [49999, 110001, 300001] {
+            let mut invalid = delivery.clone();
+            invalid.messages[1].at_max_ms = Some(upper);
+            assert!(validate_delivery(&invalid).is_err());
+        }
+        let mut overlap = delivery.clone();
+        overlap.messages[0].at_max_ms = Some(50000);
+        assert!(validate_delivery(&overlap).is_err());
+        let mut fixed = delivery;
+        fixed.messages[1].at_max_ms = Some(50000);
+        assert!(validate_delivery(&fixed).is_ok());
+        for invalid in [serde_json::json!(-1), serde_json::json!(1.5)] {
+            let mut value = base.clone();
+            value["messages"][1]["at_max_ms"] = invalid;
+            assert!(serde_json::from_value::<ResponseTemplateDelivery>(value).is_err());
+        }
     }
 }

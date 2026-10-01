@@ -121,6 +121,8 @@ const server = http.createServer(async (req, res) => {
     await variant(1).getByLabel('启用可编辑时间线与完整回执文案').check();
     await variant(1).getByLabel('最早写文件（秒）').fill('170');
     await variant(1).getByLabel('最晚写文件（秒）').fill('230');
+    await variant(1).getByLabel('第 2 段 · 最早发送（秒）').fill('50');
+    await variant(1).getByLabel('第 2 段 · 最晚发送（秒）').fill('80');
     await variant(1).getByLabel('文件下发文案').fill('模板 {file_path} / {price}');
     await variant(1).getByLabel('写入成功回执').fill('完成 {file_path}');
     await page.getByLabel('请求模型', {exact:true}).selectOption('gpt-5');
@@ -130,7 +132,8 @@ const server = http.createServer(async (req, res) => {
     await page.getByText('响应模板已发布',{exact:true}).waitFor();
     const delivery = posts.at(-1).rules[0].variants[0].delivery;
     assert.equal(delivery.write_min_ms, 170000); assert.equal(delivery.write_max_ms, 230000);
-    assert.deepEqual(delivery.messages.map(m=>m.at_ms), [10000,40000]);
+    assert.deepEqual(delivery.messages.map(m=>m.at_ms), [10000,50000]);
+    assert.equal(delivery.messages[1].at_max_ms,80000);
     assert.equal(delivery.success,'完成 {file_path}');
     console.log('PASS: editable timeline, full receipt wording and authenticated draft preview');
     await button('删除规则').click();await accept();await page.getByLabel('发布原因（必填）').fill('关闭模板规则');postMode='success';await publish();await page.getByText('尚无规则，不拦截任何请求。',{exact:false}).waitFor();assert.deepEqual(posts.at(-1).rules,[]);

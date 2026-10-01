@@ -3,7 +3,7 @@ import type {Row} from './types';
 
 export interface TemplateIntent {groups: string[][]; exclude: string[]}
 export interface TemplateDelivery {
-  write_min_ms: number; write_max_ms: number; messages: Array<{at_ms: number; text: string}>;
+  write_min_ms: number; write_max_ms: number; messages: Array<{at_ms: number; at_max_ms?: number | null; text: string}>;
   dispatch: string; success: string; failure: string; unknown: string; replay: string; continuation: string;
 }
 export function newTemplateDelivery(): TemplateDelivery {
@@ -201,7 +201,7 @@ export function parseTemplateRules(drafts: TemplateRuleDraft[]): {rules: Respons
       if (variant.delivery) {
         const d = variant.delivery;
         const time = (n: number) => Number.isInteger(n) && n >= 0 && n <= 300000;
-        if (!time(d.write_min_ms) || !time(d.write_max_ms) || d.write_min_ms > d.write_max_ms || d.messages.length > 16 || d.messages.some((m, i) => !time(m.at_ms) || m.at_ms > d.write_min_ms || (i > 0 && m.at_ms <= d.messages[i - 1].at_ms) || !m.text.trim())) return {error: `${at}时间线须递增，最多 16 段，所有文案时间不得晚于最早写入时间；随机写入范围为 0–300 秒。`};
+        if (!time(d.write_min_ms) || !time(d.write_max_ms) || d.write_min_ms > d.write_max_ms || d.messages.length > 16 || d.messages.some((m, i) => !time(m.at_ms) || !time(m.at_max_ms ?? m.at_ms) || (m.at_max_ms ?? m.at_ms) < m.at_ms || (m.at_max_ms ?? m.at_ms) > d.write_min_ms || (i > 0 && m.at_ms <= (d.messages[i - 1].at_max_ms ?? d.messages[i - 1].at_ms)) || !m.text.trim())) return {error: `${at}时间范围须递增且不重叠，最多 16 段，每段最晚发送不得晚于最早写入；范围为 0–300 秒。`};
         if ([d.dispatch, d.success, d.failure, d.unknown, d.replay, d.continuation, ...d.messages.map(m => m.text)].some(s => bytes(s) > 4096 || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/.test(s))) return {error: `${at}每段文案最多 4096 字节，不允许非法控制字符。`};
       }
       const {price_credits: _price, ...rest} = variant;
@@ -215,13 +215,13 @@ export function parseTemplateRules(drafts: TemplateRuleDraft[]): {rules: Respons
 
 export function pelicanTemplateRule(): TemplateRuleDraft {
   const rule = newTemplateRule();
-  return {...rule, name: '鹈鹕骑自行车 · Opus 5.5', match_mode: 'intent', intent: pelicanIntent(), match_text: '在根目录创建一个独立 HTML 文件，用 SVG 绘制一只鹈鹕骑自行车的 2D 动画。不得使用外部图片、第三方库或网络资源。', variants: [{...rule.variants[0], model_id: 'claude-opus-5-5', file_path: 'pelican-bicycle-opus5.5.html', content: PELICAN_OPUS55_HTML, delay_ms: 1500}]};
+  return {...rule, name: '鹈鹕骑自行车 · Opus 5.5', match_mode: 'intent', intent: pelicanIntent(), match_text: '在根目录创建一个独立 HTML 文件，用 SVG 绘制一只鹈鹕骑自行车的 2D 动画。不得使用外部图片、第三方库或网络资源。', variants: [{...rule.variants[0], model_id: 'claude-opus-5-5', file_path: 'pelican-bicycle.html', content: PELICAN_OPUS55_HTML, delay_ms: 1500}]};
 }
 
 /** JSON object order and absent/null optional fields do not change saved rules. */
 export function sameTemplateRules(a: ResponseTemplateRule[], b: ResponseTemplateRule[]): boolean {
   const canonical = (rules: ResponseTemplateRule[]) => JSON.stringify(rules, (key, value) => {
-    if ((key === 'intent' || key === 'delivery') && value == null) return undefined;
+    if ((key === 'intent' || key === 'delivery' || key === 'at_max_ms') && value == null) return undefined;
     return value && typeof value === 'object' && !Array.isArray(value)
       ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b))) : value;
   });
