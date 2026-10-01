@@ -42,21 +42,28 @@ def publication_metadata(item, receipt):
     return item
 
 
-def prepare(source, version, acceptance, key, mandatory=True):
+def prepare(source, version, acceptance, key, mandatory=True, *, unpacked_source=None, unpacked_provenance=None):
     check_version(version)
     data = Path(source).read_bytes()
     if data[:2] != b'MZ':
         raise ValueError('Expected native Windows executable')
+    receipt = json.loads(Path(acceptance).read_text(encoding='utf-8-sig'))
+    packing = None
+    identity = data
+    if unpacked_source is not None or unpacked_provenance is not None:
+        from packed_windows import verify_packed
+        identity, packing = verify_packed(data, version, receipt, unpacked_source, unpacked_provenance)
+    elif isinstance(receipt, dict) and 'packing' in receipt:
+        raise ValueError('Packed approval requires the original CI artifact and provenance')
     # Built as another version, the client would take this release for newer than itself
     # and install it again at every start.
-    if data.count(update_signing.release_marker(version)) != 1:
+    if identity.count(update_signing.release_marker(version)) != 1:
         raise ValueError('The executable was not built as this release '
                          '(set SUPERKIRO_RELEASE_VERSION to it when building)')
     # A debug build trusts a test key anyone can derive and a redirecting variable.
-    if update_signing.debug_build(data):
+    if update_signing.debug_build(identity) or update_signing.debug_build(data):
         raise ValueError('A debug build cannot be published; build with --release')
     digest = hashlib.sha256(data).hexdigest()
-    receipt = json.loads(Path(acceptance).read_text(encoding='utf-8-sig'))
     expected = dict(version=version, sha256=digest, size=len(data), platform='windows', arch='x64')
     if (not isinstance(receipt, dict) or receipt.get('approvedForPublication') is not True
             or any(receipt.get(k) != v for k, v in expected.items())):
@@ -64,6 +71,8 @@ def prepare(source, version, acceptance, key, mandatory=True):
     item = dict(expected, url=f'/downloads/Superkiro-{version}-Windows.exe',
                 signature='unsigned',
                 systemRequirements='Windows 10/11 x64 · WebView2 · 单文件免安装 · Rust + Tauri')
+    if packing is not None:
+        item.update(packaging='user-supplied-packed', originalSha256=packing['originalSha256'])
     return data, update_signing.signed_entry(publication_metadata(item, receipt), key, mandatory)
 
 
@@ -183,12 +192,15 @@ def main():
     parser.add_argument('--version', required=True)
     parser.add_argument('--source', type=Path, required=True)
     parser.add_argument('--acceptance', type=Path, required=True)
+    parser.add_argument('--unpacked-source', type=Path, help='Original unmodified CI EXE for an explicitly approved packed derivative')
+    parser.add_argument('--unpacked-provenance', type=Path, help='Original CI provenance, bound by SHA256 in the packing receipt')
     parser.add_argument('--update-key', type=Path, default=update_signing.KEY)
     parser.add_argument('--optional', action='store_true',
                         help='let installed clients postpone this update')
     args = parser.parse_args()
     data, item = prepare(args.source, args.version, args.acceptance,
-                         update_signing.load(args.update_key), mandatory=not args.optional)
+                         update_signing.load(args.update_key), mandatory=not args.optional,
+                         unpacked_source=args.unpacked_source, unpacked_provenance=args.unpacked_provenance)
     sys.path.insert(0, str(ROOT))
     from deploy.release_candidate import pinned_connection
     ssh = pinned_connection(json.load(sys.stdin))

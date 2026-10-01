@@ -39,3 +39,25 @@ Windows 与 Mac 复用部署锁、历史版本防替换、原子清单更新以�
 短文件名仍按版本不可变：同名已存在文件必须核对 SHA256，不能覆盖不同字节。历史长文件名和旧下载链接保留，旧命名的版本冲突检查仍然生效。
 
 本次未完成真机验收的测试版使用 `--optional` 发布（`mandatory=false`），不强制客户安装。系统代码签名的 `signature=unsigned` 与更新清单的密码学签名不是一回事：仍须保留并验证 `updateSignature`。策略/发布脚本后续合并不改变已发布包的源码标识，不允许重新构建后覆盖同版本不同字节。
+
+
+## Windows 加壳后发布
+
+加壳可能隐藏原始 `superkiro-release` 标记，不能补写标记冒充原生构建，
+也不能关闭默认发布检查。显式传入 `--unpacked-source` 与
+`--unpacked-provenance`，提供保留不变的原始 CI EXE 和原始 provenance。
+此分支仍校验原始构建的 release/debug 标记，核对 CI 提交、构建编号、
+平台和字节摘要，并在 Windows 上读取最终字节快照的 PE x64 架构及
+FileVersion/ProductVersion 固定版本资源；默认不带参数的行为不变。
+
+最终字节验收收据需额外包含 `packing`：
+`approvedForPackedPublication=true`、`originalSha256`、`originalSize`、
+`provenanceSha256`、`packedSha256`、`packedSize`；以及顶层
+`sourceCommit`、`buildRun`。这代表操作员明确确认用户提供的加壳衍生物，
+不是 CI 对加壳代码的证明，不证明加壳前后行为等价，更不是运行验收。
+不得重写 CI provenance，把它伪装成最终加壳字节的构建证据。
+
+只有加壳包经过真实运行和升级验证后，才能记录运行验收通过。
+未验收而由用户明确授权的测试发布继续使用 `runtimeAcceptance=false`
+和 `--optional`，不强制升级。公开清单标明 `packaging=user-supplied-packed`
+及 `originalSha256`，更新签名、下载 SHA256/大小全部绑定最终加壳字节。
