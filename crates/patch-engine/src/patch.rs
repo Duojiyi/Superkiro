@@ -1054,6 +1054,10 @@ fn repair_credit_display(content: &str) -> String {
 }
 
 #[cfg(test)]
+#[path = "../tests/patch/kiro_124.rs"]
+mod kiro_124_tests;
+
+#[cfg(test)]
 #[path = "../tests/patch/credit_display.rs"]
 mod credit_display_tests;
 
