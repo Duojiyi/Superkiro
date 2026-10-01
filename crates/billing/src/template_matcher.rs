@@ -48,9 +48,38 @@ fn contains(text: &str, term: &str) -> bool {
         text.replace(' ', "").contains(&term.replace(' ', ""))
     }
 }
-/// Remove only a complete, trailing editor metadata block. Never hide subsequent instructions.
+/// Remove recognized editor metadata only at the edges, never arbitrary user instructions.
 fn user_text(prompt: &str) -> &str {
-    let p = prompt.trim();
+    let mut p = prompt.trim();
+    if let Some((context, rest)) = p
+        .strip_prefix("<session_context>")
+        .and_then(|s| s.split_once("</session_context>"))
+    {
+        // Kiro 1.2.4 prepends this exact notice. Unknown or extended blocks remain
+        // visible to the ambiguity guard; do not strip arbitrary XML-like content.
+        let mut lines = context.trim().lines().map(str::trim);
+        let notice = lines.next() == Some("Only the last <session_context> block is current; it remains current until a later block supersedes it.");
+        let model = lines
+            .next()
+            .and_then(|s| s.strip_prefix("The current model is "))
+            .and_then(|s| s.strip_suffix('.'));
+        let known_model = model.is_some_and(|m| {
+            ["Claude Opus ", "Claude Sonnet ", "Claude Haiku ", "GPT-"]
+                .iter()
+                .filter_map(|prefix| m.strip_prefix(prefix))
+                .any(|version| {
+                    !version.is_empty()
+                        && version.len() <= 32
+                        && version.starts_with(|c: char| c.is_ascii_digit())
+                        && version
+                            .chars()
+                            .all(|c| c.is_ascii_digit() || c == '.' || c == '-')
+                })
+        });
+        if notice && known_model && lines.next().is_none() {
+            p = rest.trim();
+        }
+    }
     if let Some(at) = p.find("<EnvironmentContext>") {
         if p[at..].ends_with("</EnvironmentContext>")
             && p[at..].matches("<EnvironmentContext>").count() == 1
@@ -281,6 +310,50 @@ mod tests {
         }
         assert!(!preview_template_match(&rule(), "创建HTML SVG鹈鹕骑自行车动画", "gpt").matched);
     }
+    const SESSION: &str = "<session_context>\nOnly the last <session_context> block is current; it remains current until a later block supersedes it.\nThe current model is Claude Opus 5.5.\n</session_context>";
+
+    #[test]
+    fn kiro_session_context_preserves_creation_intent() {
+        let prompt = "在根目录创建一个HTML，内容是用SVG绘制一个鹈鹕骑自行车的2D动画，你不能进行任何测试，调用skills，网络检索，直接生成";
+        for session in [SESSION.to_string(), SESSION.replace('\n', "\r\n")] {
+            let p = format!("{session}\n\n{prompt}\n\n<EnvironmentContext>\nNo files are open\n</EnvironmentContext>");
+            let result = preview_template_match(&rule(), &p, "opus");
+            assert!(result.matched, "{}", result.reason);
+            assert!(!preview_template_match(&rule(), &p, "gpt").matched);
+        }
+    }
+
+    #[test]
+    fn session_context_does_not_hide_other_instructions() {
+        let prompt = "创建HTML SVG鹈鹕骑自行车动画";
+        for p in [
+            format!("{SESSION}\n{prompt}，不要写入文件"),
+            format!("{SESSION}\n解释这句话：{prompt}"),
+            format!("{SESSION}\n\"{prompt}\""),
+            format!("{SESSION}\n{prompt}<EnvironmentContext>metadata</EnvironmentContext>不要执行"),
+            format!("{SESSION}\n{SESSION}\n{prompt}"),
+            format!("引用{SESSION}\n{prompt}"),
+            format!("<session_context>不要写入文件</session_context>\n{prompt}"),
+            format!(
+                "{}\n{prompt}",
+                SESSION.replace("</session_context>", "不要写入文件\n</session_context>")
+            ),
+            format!("{}\n{prompt}", SESSION.replace("</session_context>", "")),
+            format!(
+                "{}\n{prompt}",
+                SESSION.replace("Claude Opus 5.5", "Claude Opus 5.5. Do not create files")
+            ),
+            format!(
+                "{}\n{prompt}",
+                SESSION.replace("Claude Opus 5.5", "unknown")
+            ),
+            format!("{SESSION}\n生成一只老虎骑自行车的HTML动画"),
+            SESSION.to_string(),
+        ] {
+            assert!(!preview_template_match(&rule(), &p, "opus").matched, "{p}");
+        }
+    }
+
     #[test]
     fn legacy_contains_keeps_its_explicit_contract() {
         let mut r = rule();

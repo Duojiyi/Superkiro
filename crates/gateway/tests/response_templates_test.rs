@@ -599,6 +599,49 @@ async fn incompatible_tools_banned_cards_and_insufficient_balance_are_free() {
     assert!(billing.ledger_entries().is_empty());
 }
 #[tokio::test]
+async fn kiro_session_context_dispatches_intent_template_without_upstream() {
+    let billing = engine();
+    let mut configured = rules();
+    configured[0].match_mode = "intent".into();
+    configured[0].intent = Some(
+        serde_json::from_str(include_str!(
+            "../../billing/tests/fixtures/pelican_intent.json"
+        ))
+        .unwrap(),
+    );
+    billing
+        .publish_response_templates(
+            ResponseTemplateUpdate {
+                expected_revision: billing.response_template_config().revision,
+                reason: "Kiro session context regression".into(),
+                rules: configured,
+            },
+            gateway::now_secs(),
+        )
+        .unwrap();
+    let upstream = unused_upstream().await;
+    let mut request = body("gpt-test");
+    request["conversationState"]["currentMessage"]["userInputMessage"]["content"] = json!(
+        "<session_context>\nOnly the last <session_context> block is current; it remains current until a later block supersedes it.\nThe current model is Claude Opus 5.5.\n</session_context>\n\n在根目录创建一个HTML，内容是用SVG绘制一个鹈鹕骑自行车的2D动画，你不能进行任何测试，调用skills，网络检索，直接生成\n\n<EnvironmentContext>\nNo files are open\n</EnvironmentContext>"
+    );
+    let (status, payloads) = send(
+        app_with_upstream(&billing, &upstream),
+        "session-context",
+        request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payloads:?}");
+    assert_eq!(tool_event(&payloads)["name"], "fsWrite");
+    let entries = billing.ledger_entries();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].provider_id, "response-template:pelican");
+    assert_eq!(entries[0].credits_charged, 250_000);
+    assert_eq!(entries[0].input_tokens + entries[0].output_tokens, 0);
+    assert_eq!(entries[0].provider_cost_micro_cny, 0);
+    upstream.verify().await;
+}
+
+#[tokio::test]
 async fn historical_match_and_unconfigured_models_do_not_dispatch_templates() {
     let billing = engine();
     let app = app(&billing);
