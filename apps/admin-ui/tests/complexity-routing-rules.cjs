@@ -42,7 +42,7 @@ const ids = ['p1', 'p2'];
 assert.deepEqual(plain(rules.moveProvider(ids, 1, -1)), ['p2', 'p1']);
 assert.deepEqual(plain(rules.moveProvider(ids, 0, -1)), ids); assert.deepEqual(plain(rules.moveProvider(ids, 0, 1)), ['p2', 'p1']);
 assert.deepEqual(ids, ['p1', 'p2']);
-assert.equal(rules.budgetDay(0), '1970-01-01（UTC）'); assert.equal(rules.budgetDay(1), '1970-01-02（UTC）'); assert.equal(rules.budgetDay(Infinity), '日期不可用');
+assert.equal(rules.budgetDay(0), '尚未开始'); assert.equal(rules.budgetDay(1), '1970-01-02（UTC）'); assert.equal(rules.budgetDay(Infinity), '日期不可用');
 for (const reason of ['decision_capacity_exhausted', 'no_eligible_route', 'simple_route_unavailable', 'continuation_route_unavailable', 'default_route', 'classifier_unconfigured', 'disabled', 'capability_required', 'continuation_without_state', 'task_continuation', 'insufficient_context', 'empty_task', 'classifier_circuit_open', 'classifier_unavailable', 'classifier_busy', 'classification_pending', 'budget_exhausted', 'semantic_simple', 'semantic_complex', 'semantic_uncertain', 'classifier_timeout', 'classifier_transport_error', 'classifier_invalid_input', 'classifier_invalid_response', 'classifier_http_error']) {
   assert(!rules.decisionReason(reason).includes('未识别'), reason); assert(/[\u4e00-\u9fff]/.test(rules.decisionReason(reason)));
 }
