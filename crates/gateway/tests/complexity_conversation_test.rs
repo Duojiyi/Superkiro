@@ -77,7 +77,9 @@ impl Fixture {
         // This binary owns the process-wide table. Every fixture installs the same table
         // before constructing a handler, including when cargo runs the tests in parallel.
         install_provider_options(ProviderOptionsTable::default().with_no_documents(&[CHEAP]));
-        let server = MockServer::start().await;
+        // Keep a dedicated endpoint: the process-wide classifier client must not reuse
+        // a pooled mock server connection across separate tokio::test runtimes.
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/classifier/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
