@@ -68,7 +68,8 @@ export default function RuntimeSettingsPage({guards, onDirtyChange, onBusyChange
     {config && <p className="muted">{dirty ? '有未保存草稿' : '当前参数已保存'}</p>}
     {error && <p role="alert">{error}</p>}
     {draft && <fieldset disabled={busy} style={{border: 0, padding: 0}}>
-      <div className="table-scroll" tabIndex={0} role="region" aria-label="超时设置表（可横向滚动）"><table className="data-table"><caption className="sr-only">各模型超时设置，单位为秒，可横向滚动查看</caption><thead><tr><th scope="col">参数</th><th scope="col">普通模型</th><th scope="col">思考模型</th><th scope="col">Claude</th></tr></thead>
+      <p className="field-hint" id="runtime-table-hint">窄屏下可左右滚动表格，查看普通模型、思考模型和 Claude 的设置。</p>
+      <div className="table-scroll" tabIndex={0} role="region" aria-describedby="runtime-table-hint" aria-label="超时设置表（可横向滚动）"><table className="table"><caption className="sr-only">各模型超时设置，单位为秒，可横向滚动查看</caption><thead><tr><th scope="col">参数</th><th scope="col">普通模型</th><th scope="col">思考模型</th><th scope="col">Claude</th></tr></thead>
         <tbody>{timeoutFields.map(f => <tr key={f.key}><th scope="row">{f.label}（{f.min}–{f.max}）</th>{(['standard', 'reasoning', 'claude'] as const).map(group => <td key={group}>
           <input aria-label={`${group} ${f.label}`} type="number" min={f.min} max={f.max} step="1" value={draft[group][f.key]} onChange={e => setDraft({...draft, [group]: {...draft[group], [f.key]: Number(e.target.value)}})}/>
         </td>)}</tr>)}</tbody></table></div>

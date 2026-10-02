@@ -176,6 +176,17 @@ const server = http.createServer(async (req, res) => {
     assert.equal(await messageChoice.inputValue(), '');
     console.log('PASS: multiple code/message candidates, selection reindexing, persisted choices, random selection and selected-candidate deletion');
     await button('删除规则').click();await accept();await page.getByLabel('发布原因（必填）').fill('关闭模板规则');postMode='success';await publish();await page.getByText('尚无规则，不拦截任何请求。',{exact:false}).waitFor();assert.deepEqual(posts.at(-1).rules,[]);
+    config={...config,revision:'response-template:v1:'+ 'a'.repeat(64),rules:posts[1].rules};
+    await read(); await page.getByText(`当前基准版本：${config.revision}`,{exact:true}).waitFor();
+    const codeEditor=variant(1).getByLabel(/^候选 1 · 完整 HTML 代码/);
+    await codeEditor.fill('<p>'+ 'x'.repeat(512)+'</p>');
+    for (const width of [720,390,320]) {
+      await page.setViewportSize({width,height:1000});
+      assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,`populated templates and long revision must fit ${width}px`);
+      assert.equal(await page.locator('.page-content').evaluate(el=>el.scrollWidth>el.clientWidth),false,`template content must not overflow its ${width}px pane`);
+      assert.equal(await codeEditor.evaluate(el=>el.scrollWidth>el.clientWidth),true,'long code scrolls inside its editor');
+    }
+    console.log('PASS: populated templates, full-length revision and locally scrolling code fit tablet and phone widths');
     assert.deepEqual(errors,[]);
     console.log('PASS: rejection preserves drafts; uncertain commits verified by GET without retry; exact fees, inert HTML, narrow layout and publishing empty rules');
   } finally {await browser?.close();server.close();}
