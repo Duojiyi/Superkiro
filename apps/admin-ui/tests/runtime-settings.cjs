@@ -26,3 +26,5 @@ for (let code = 0; code <= 0x9f; code++) {
  if (code <= 0x1f || code >= 0x7f) assert.ok(exportsObject.runtimeReasonError('valid' + String.fromCharCode(code)), 'reject control ' + code);
 }
 console.log('Runtime settings and reason validation passed');
+
+for (const invalid of [null, {}, {...valid(), standard: null}]) assert.ok(runtimeError(invalid), 'malformed settings return useful validation instead of throwing');

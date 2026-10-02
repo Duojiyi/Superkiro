@@ -108,3 +108,48 @@ assert.equal(opusExample.variants[0].file_path,'pelican-bicycle.html');
 assert(!/<script\b|@keyframes|https?:\/\//i.test(opusExample.variants[0].content));
 assert(opusExample.variants[0].content.includes('<animateTransform'));
 console.log('PASS: bounded random message windows and legacy fixed-time compatibility');
+
+
+assert.equal(t.adjustTemplateSelection(3, 1), 2, 'deleting an earlier candidate shifts an explicit selection');
+assert.equal(t.adjustTemplateSelection(1, 1), undefined, 'deleting the selected candidate clears selection');
+assert.equal(t.adjustTemplateSelection(0, 1), 0, 'deleting a later candidate keeps selection');
+const codeCandidates = valid();
+codeCandidates.variants[0].content_alternatives = [
+  {file_path: 'pages/second.html', content: '<html>second</html>'},
+  {file_path: 'pages/third.html', content: '<html>third</html>'}
+];
+for (const selected of [undefined, 0, 1, 2]) {
+  const d = structuredClone(codeCandidates);
+  d.variants[0].content_alternative_index = selected;
+  assert.ok(t.parseTemplateRules([d]).rules, `code candidate selection ${selected}`);
+}
+for (const bad of [3, -1, 1.5, NaN]) {
+  const d = structuredClone(codeCandidates); d.variants[0].content_alternative_index = bad;
+  assert.ok(t.parseTemplateRules([d]).error, `invalid code candidate selection ${bad}`);
+}
+const unsafeCode = structuredClone(codeCandidates); unsafeCode.variants[0].content_alternatives[0].file_path = '../escape.html';
+assert.ok(t.parseTemplateRules([unsafeCode]).error, 'extra code candidate paths use the same traversal guard');
+const oversizedCode = structuredClone(codeCandidates); oversizedCode.variants[0].content_alternatives[0].content = 'a'.repeat(256 * 1024 + 1);
+assert.match(t.parseTemplateRules([oversizedCode]).error, /256 KiB/);
+const tooManyCode = structuredClone(codeCandidates); tooManyCode.variants[0].content_alternatives = Array.from({length: 32}, (_, i) => ({file_path: `pages/${i}.html`, content: '<html>x</html>'}));
+assert.match(t.parseTemplateRules([tooManyCode]).error, /32 份/);
+const messageCandidates = valid();
+messageCandidates.variants[0].delivery = {...t.newTemplateDelivery(), messages: [{at_ms: 1000, text: 'first', alternatives: ['second', 'third'], selected_index: 2}]};
+assert.ok(t.parseTemplateRules([messageCandidates]).rules, 'message candidates support explicit selection');
+const randomMessages = structuredClone(messageCandidates); randomMessages.variants[0].delivery.messages[0].selected_index = undefined;
+assert.ok(t.parseTemplateRules([randomMessages]).rules, 'message candidates support random selection');
+for (const bad of [3, -1, 1.5, NaN]) {
+  const d = structuredClone(messageCandidates); d.variants[0].delivery.messages[0].selected_index = bad;
+  assert.ok(t.parseTemplateRules([d]).error, `invalid message candidate selection ${bad}`);
+}
+const tooManyMessages = structuredClone(messageCandidates); tooManyMessages.variants[0].delivery.messages[0].alternatives = Array.from({length: 16}, (_, i) => `alternative-${i}`);
+assert.match(t.parseTemplateRules([tooManyMessages]).error, /16 条/);
+const legacyCandidates = structuredClone(t.parseTemplateRules([messageCandidates]).rules);
+delete legacyCandidates[0].variants[0].content_alternatives;
+delete legacyCandidates[0].variants[0].content_alternative_index;
+delete legacyCandidates[0].variants[0].delivery.messages[0].alternatives;
+delete legacyCandidates[0].variants[0].delivery.messages[0].selected_index;
+assert.equal(t.templateDrafts(legacyCandidates)[0].variants[0].content_alternatives.length, 0);
+assert.deepEqual(plain(t.templateDrafts(legacyCandidates)[0].variants[0].delivery.messages[0].alternatives), []);
+assert(t.sameTemplateRules(t.parseTemplateRules(t.templateDrafts(legacyCandidates)).rules, legacyCandidates), 'legacy candidates omitted fields remain semantically equal');
+console.log('PASS: multiple code/message candidates, bounds, random selection, and legacy normalization');

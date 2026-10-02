@@ -9,6 +9,8 @@ const MAX_RECEIPTS_PER_CARD: usize = 256;
 // Bound serialized bytes too: code can expand during JSON escaping.
 const MAX_RECEIPT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RECEIPT_BYTES_PER_CARD: usize = 2 * 1024 * 1024;
+const MAX_CONTENT_ALTERNATIVES: usize = 31;
+const MAX_MESSAGE_ALTERNATIVES: usize = 15;
 
 fn receipt_bytes(receipt: &ResponseTemplateReceipt) -> Result<usize, BillingError> {
     serde_json::to_vec(receipt)
@@ -50,12 +52,24 @@ pub struct ResponseTemplateIntent {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ResponseTemplateContentAlternative {
+    pub file_path: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResponseTemplateMessage {
     pub at_ms: u32,
     /// Optional inclusive upper bound; absent keeps legacy fixed-time messages.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at_max_ms: Option<u32>,
     pub text: String,
+    /// Additional candidates for this same time window. An omitted index chooses randomly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alternatives: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_index: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +92,12 @@ pub struct ResponseTemplateVariant {
     pub model_id: String,
     pub file_path: String,
     pub content: String,
+    /// The legacy path/content pair is candidate zero; these are extra code candidates.
+    /// An omitted index chooses randomly when alternatives exist.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content_alternatives: Vec<ResponseTemplateContentAlternative>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_alternative_index: Option<u8>,
     pub preamble: String,
     pub completion: String,
     pub price_microcredits: i64,
@@ -157,6 +177,9 @@ pub struct ResponseTemplateReceipt {
     pub price_microcredits: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery: Option<ResponseTemplateDelivery>,
+    /// Chosen zero-based message indices; absent in legacy receipts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub message_selections: Vec<u8>,
     pub created_at_secs: u64,
 }
 
@@ -255,7 +278,17 @@ pub fn validate_response_template_rules(
             if !crate::group::valid_model_id(&variant.model_id)
                 || !models.insert(&variant.model_id)
                 || !safe_html_path(&variant.file_path)
+                || (!variant.content_alternatives.is_empty() && variant.content.trim().is_empty())
                 || variant.content.len() > 256 * 1024
+                || variant.content_alternatives.len() > MAX_CONTENT_ALTERNATIVES
+                || variant
+                    .content_alternative_index
+                    .is_some_and(|index| usize::from(index) > variant.content_alternatives.len())
+                || variant.content_alternatives.iter().any(|alternative| {
+                    !safe_html_path(&alternative.file_path)
+                        || alternative.content.trim().is_empty()
+                        || alternative.content.len() > 256 * 1024
+                })
                 || variant.delay_ms > 30_000
                 || !message(&variant.preamble)
                 || !message(&variant.completion)
@@ -269,6 +302,11 @@ pub fn validate_response_template_rules(
                 validate_delivery(delivery)?;
             }
             total += variant.content.len();
+            total += variant
+                .content_alternatives
+                .iter()
+                .map(|alternative| alternative.content.len())
+                .sum::<usize>();
             if total > 2 * 1024 * 1024 {
                 return Err(invalid("HTML content exceeds 2 MiB"));
             }
@@ -301,6 +339,12 @@ fn validate_delivery(d: &ResponseTemplateDelivery) -> Result<(), BillingError> {
                 || latest > d.write_min_ms
                 || m.text.trim().is_empty()
                 || !message(&m.text)
+                || m.alternatives.len() > MAX_MESSAGE_ALTERNATIVES
+                || m.selected_index
+                    .is_some_and(|index| usize::from(index) > m.alternatives.len())
+                || m.alternatives
+                    .iter()
+                    .any(|text| text.trim().is_empty() || !message(text))
         })
         || d.messages
             .windows(2)
@@ -316,12 +360,44 @@ fn validate_delivery(d: &ResponseTemplateDelivery) -> Result<(), BillingError> {
         .iter()
         .any(|s| !message(s))
     {
-        return Err(invalid("invalid delivery: 0–300000ms, ordered non-overlapping absolute message windows before earliest dispatch, up to 16 messages"));
+        return Err(invalid("invalid delivery: 0–300000ms, ordered non-overlapping absolute message windows before earliest dispatch, up to 16 slots and 16 candidates per slot"));
     }
     Ok(())
 }
 
+fn variant_contains_content(
+    variant: &ResponseTemplateVariant,
+    file_path: &str,
+    content: &str,
+) -> bool {
+    (variant.file_path == file_path && variant.content == content)
+        || variant
+            .content_alternatives
+            .iter()
+            .any(|alternative| alternative.file_path == file_path && alternative.content == content)
+}
+
 fn validate_receipt(receipt: &ResponseTemplateReceipt) -> Result<(), BillingError> {
+    if !receipt.message_selections.is_empty() {
+        let delivery = receipt
+            .delivery
+            .as_ref()
+            .ok_or_else(|| invalid("message selections require delivery"))?;
+        if receipt.message_selections.len() != delivery.messages.len()
+            || receipt
+                .message_selections
+                .iter()
+                .zip(&delivery.messages)
+                .any(|(index, message)| {
+                    usize::from(*index) > message.alternatives.len()
+                        || message
+                            .selected_index
+                            .is_some_and(|selected| selected != *index)
+                })
+        {
+            return Err(invalid("invalid receipt message selections"));
+        }
+    }
     if let Some(d) = &receipt.delivery {
         validate_delivery(d)?;
     }
@@ -531,8 +607,13 @@ impl BillingEngine {
             .find(|rule| rule.id == rule_id && rule.enabled)
             .and_then(|rule| rule.variants.iter().find(|v| v.model_id == model_id))
             .ok_or_else(|| invalid("enabled rule or exact model variant not found"))?;
-        if variant.content.trim().is_empty() {
-            return Err(invalid("empty legacy template cannot be executed"));
+        if variant.content.trim().is_empty()
+            && variant
+                .content_alternatives
+                .iter()
+                .all(|alternative| alternative.content.trim().is_empty())
+        {
+            return Err(invalid("empty template cannot be executed"));
         }
         let card = self
             .cards
@@ -632,14 +713,18 @@ impl BillingEngine {
             .and_then(|rule| rule.variants.iter().find(|v| v.model_id == model_id))
             .ok_or_else(|| invalid("enabled rule or exact model variant not found"))?
             .clone();
-        if variant.content.trim().is_empty() {
-            return Err(invalid("empty legacy template cannot be executed"));
+        if variant.content.trim().is_empty()
+            && variant
+                .content_alternatives
+                .iter()
+                .all(|alternative| alternative.content.trim().is_empty())
+        {
+            return Err(invalid("empty template cannot be executed"));
         }
         if receipt.model_id != model_id
-            || receipt.file_path != variant.file_path
             || receipt.delivery != variant.delivery
             || receipt.completion != variant.completion
-            || receipt.content != variant.content
+            || !variant_contains_content(&variant, &receipt.file_path, &receipt.content)
             || receipt.price_microcredits != variant.price_microcredits
         {
             return Err(invalid("receipt disagrees with the configured variant"));
@@ -732,7 +817,7 @@ impl BillingEngine {
             reason: Some("fixed local response service".into()),
             credit_face_value_cny: Some(candidate.settings.credit_face_value_cny),
             detail: Some(serde_json::json!({"response_template_rule_id": rule_id,
-                "file_path": variant.file_path, "conversation_id": receipt.conversation_id,
+                "file_path": receipt.file_path, "conversation_id": receipt.conversation_id,
                 "tool_use_id": receipt.tool_use_id})),
         };
         candidate.cards.insert(card.id.clone(), card.clone());
@@ -816,6 +901,8 @@ mod tests {
                 model_id: "model-a".into(),
                 file_path: "pages/index.html".into(),
                 content: "<html>model A</html>".into(),
+                content_alternatives: vec![],
+                content_alternative_index: None,
                 preamble: "Creating page".into(),
                 completion: "Page created".into(),
                 price_microcredits: price,
@@ -905,6 +992,7 @@ mod tests {
             content: "<html>model A</html>".into(),
             price_microcredits: 10,
             delivery: None,
+            message_selections: vec![],
             created_at_secs: 0,
         }
     }
@@ -1535,6 +1623,65 @@ mod tests {
         ] {
             assert!(safe_html_path(path), "rejected {path:?}");
         }
+    }
+
+    #[test]
+    fn response_template_alternative_candidates_validate_bounds_and_legacy_fields() {
+        let legacy = serde_json::to_value(rules(0)).unwrap();
+        let decoded: Vec<ResponseTemplateRule> = serde_json::from_value(legacy).unwrap();
+        assert!(decoded[0].variants[0].content_alternatives.is_empty());
+        assert!(decoded[0].variants[0].content_alternative_index.is_none());
+
+        let mut valid = rules(0);
+        valid[0].variants[0].content_alternatives = vec![ResponseTemplateContentAlternative {
+            file_path: "pages/alternate.html".into(),
+            content: "<html>alternate</html>".into(),
+        }];
+        valid[0].variants[0].content_alternative_index = Some(1);
+        assert!(validate_response_template_rules(&valid).is_ok());
+        for path in ["../escape.html", "/absolute.html", "pages\\escape.html"] {
+            let mut invalid = valid.clone();
+            invalid[0].variants[0].content_alternatives[0].file_path = path.into();
+            assert!(
+                validate_response_template_rules(&invalid).is_err(),
+                "accepted {path:?}"
+            );
+        }
+        let mut oversized = valid.clone();
+        oversized[0].variants[0].content_alternatives[0].content = "x".repeat(256 * 1024 + 1);
+        assert!(validate_response_template_rules(&oversized).is_err());
+        let mut bad_index = valid.clone();
+        bad_index[0].variants[0].content_alternative_index = Some(2);
+        assert!(validate_response_template_rules(&bad_index).is_err());
+        let mut too_many = rules(0);
+        too_many[0].variants[0].content_alternatives = (0..32)
+            .map(|i| ResponseTemplateContentAlternative {
+                file_path: format!("pages/alternate-{i}.html"),
+                content: "<html>alternate</html>".into(),
+            })
+            .collect();
+        assert!(validate_response_template_rules(&too_many).is_err());
+
+        let mut delivery: ResponseTemplateDelivery = serde_json::from_value(serde_json::json!({
+            "write_min_ms": 1000,
+            "write_max_ms": 2000,
+            "messages": [{"at_ms": 0, "text": "first"}],
+            "dispatch": "dispatch",
+            "success": "success",
+            "failure": "failure",
+            "unknown": "unknown",
+            "replay": "replay",
+            "continuation": "continuation"
+        }))
+        .unwrap();
+        delivery.messages[0].alternatives = (0..15).map(|i| format!("alternative-{i}")).collect();
+        delivery.messages[0].selected_index = Some(15);
+        assert!(validate_delivery(&delivery).is_ok());
+        delivery.messages[0].selected_index = Some(16);
+        assert!(validate_delivery(&delivery).is_err());
+        delivery.messages[0].selected_index = None;
+        delivery.messages[0].alternatives.push("too-many".into());
+        assert!(validate_delivery(&delivery).is_err());
     }
 
     #[test]

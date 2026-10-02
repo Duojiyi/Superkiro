@@ -134,6 +134,8 @@ fn rules() -> Vec<ResponseTemplateRule> {
                 model_id: model.into(),
                 file_path: "index.html".into(),
                 content: format!("<!doctype html><svg aria-label=\"{model}\">中文\n</svg>"),
+                content_alternatives: vec![],
+                content_alternative_index: None,
                 preamble: "配置的开场白".into(),
                 completion: "配置的完成提示".into(),
                 price_microcredits: price,
@@ -251,6 +253,204 @@ async fn same_prompt_selects_model_content_and_exact_price_without_tokens() {
         9_400_000
     );
 }
+#[tokio::test]
+async fn code_and_message_candidates_support_explicit_selection_and_replay() {
+    use billing::engine::{
+        ResponseTemplateContentAlternative, ResponseTemplateDelivery, ResponseTemplateMessage,
+    };
+    let billing = engine();
+    let mut config = billing.response_template_config();
+    let variant = &mut config.rules[0].variants[0];
+    variant.file_path = "main.html".into();
+    variant.content = "<main>one</main>".into();
+    variant.content_alternatives = vec![
+        ResponseTemplateContentAlternative {
+            file_path: "second.html".into(),
+            content: "<main>two</main>".into(),
+        },
+        ResponseTemplateContentAlternative {
+            file_path: "third.html".into(),
+            content: "<main>three</main>".into(),
+        },
+    ];
+    variant.content_alternative_index = Some(2);
+    variant.delivery = Some(ResponseTemplateDelivery {
+        write_min_ms: 0,
+        write_max_ms: 0,
+        messages: vec![ResponseTemplateMessage {
+            at_ms: 0,
+            at_max_ms: None,
+            text: "message one".into(),
+            alternatives: vec!["message two".into(), "message three".into()],
+            selected_index: Some(2),
+        }],
+        dispatch: "dispatch {file_path}".into(),
+        success: "success {file_path}".into(),
+        failure: "failure {file_path}".into(),
+        unknown: "unknown {file_path}".into(),
+        replay: "replay {file_path}".into(),
+        continuation: "continuation".into(),
+    });
+    billing
+        .publish_response_templates(
+            ResponseTemplateUpdate {
+                expected_revision: config.revision,
+                reason: "candidate selection regression".into(),
+                rules: config.rules,
+            },
+            gateway::now_secs(),
+        )
+        .unwrap();
+
+    let router = app(&billing);
+    let (status, first) = send(router.clone(), "candidate-selection", body("gpt-test")).await;
+    assert_eq!(status, StatusCode::OK, "{first:?}");
+    let event = tool_event(&first);
+    let input: Value = serde_json::from_str(event["input"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        input,
+        json!({"path": "third.html", "text": "<main>three</main>"})
+    );
+    let text = first
+        .iter()
+        .filter_map(|value| value["content"].as_str())
+        .collect::<String>();
+    assert!(text.contains("message three"), "{text}");
+    assert!(
+        !text.contains("message one") && !text.contains("message two"),
+        "{text}"
+    );
+    let id = tool_id(&first);
+    let receipt = billing
+        .response_template_receipt("card", "conversation", &id, gateway::now_secs())
+        .unwrap();
+    assert_eq!(receipt.file_path, "third.html");
+    assert_eq!(receipt.content, "<main>three</main>");
+    assert_eq!(receipt.message_selections, vec![2]);
+
+    let (status, replay) = send(router, "candidate-selection", body("gpt-test")).await;
+    assert_eq!(status, StatusCode::OK, "{replay:?}");
+    assert_eq!(tool_event(&replay), event);
+    assert!(replay
+        .iter()
+        .any(|value| value["content"] == "replay third.html"));
+    assert_eq!(billing.ledger_entries().len(), 1);
+    assert_eq!(
+        billing.ledger_entries()[0].detail.as_ref().unwrap()["file_path"],
+        "third.html"
+    );
+    let directory = SnapshotDir::new();
+    let restored = directory.restart(&billing);
+    let before = restored.export_snapshot();
+    let restored_receipt = restored
+        .response_template_receipt("card", "conversation", &id, gateway::now_secs())
+        .unwrap();
+    assert_eq!(restored_receipt, receipt);
+    let (status, replay) = send(app(&restored), "candidate-selection", body("gpt-test")).await;
+    assert_eq!(status, StatusCode::OK, "{replay:?}");
+    assert_eq!(tool_event(&replay), event);
+    assert_finances_unchanged(&restored, &before);
+}
+
+#[tokio::test]
+async fn random_candidates_stay_within_the_configured_sets() {
+    use billing::engine::{
+        ResponseTemplateContentAlternative, ResponseTemplateDelivery, ResponseTemplateMessage,
+    };
+    let billing = engine();
+    let mut config = billing.response_template_config();
+    let variant = &mut config.rules[0].variants[0];
+    variant.price_microcredits = 0;
+    variant.content_alternatives = vec![
+        ResponseTemplateContentAlternative {
+            file_path: "random-a.html".into(),
+            content: "<a>".into(),
+        },
+        ResponseTemplateContentAlternative {
+            file_path: "random-b.html".into(),
+            content: "<b>".into(),
+        },
+    ];
+    variant.content_alternative_index = None;
+    variant.delivery = Some(ResponseTemplateDelivery {
+        write_min_ms: 0,
+        write_max_ms: 0,
+        messages: vec![ResponseTemplateMessage {
+            at_ms: 0,
+            at_max_ms: None,
+            text: "message-a".into(),
+            alternatives: vec!["message-b".into()],
+            selected_index: None,
+        }],
+        dispatch: "{file_path}".into(),
+        success: "ok".into(),
+        failure: "failed".into(),
+        unknown: "unknown".into(),
+        replay: "replay".into(),
+        continuation: "continue".into(),
+    });
+    billing
+        .publish_response_templates(
+            ResponseTemplateUpdate {
+                expected_revision: config.revision,
+                reason: "random candidate regression".into(),
+                rules: config.rules,
+            },
+            gateway::now_secs(),
+        )
+        .unwrap();
+
+    let allowed_paths = ["index.html", "random-a.html", "random-b.html"];
+    let allowed_messages = ["message-a", "message-b"];
+    for index in 0..32 {
+        let (status, payloads) = send(
+            app(&billing),
+            &format!("random-candidate-{index}"),
+            body("gpt-test"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{payloads:?}");
+        let event = tool_event(&payloads);
+        let input: Value = serde_json::from_str(event["input"].as_str().unwrap()).unwrap();
+        assert!(
+            allowed_paths.contains(&input["path"].as_str().unwrap()),
+            "{input}"
+        );
+        let text = payloads
+            .iter()
+            .filter_map(|value| value["content"].as_str())
+            .collect::<String>();
+        assert!(
+            allowed_messages
+                .iter()
+                .any(|message| text.contains(message)),
+            "{text}"
+        );
+        let receipt = billing
+            .response_template_receipt(
+                "card",
+                "conversation",
+                &tool_id(&payloads),
+                gateway::now_secs(),
+            )
+            .unwrap();
+        assert_eq!(input["path"], receipt.file_path);
+        assert_eq!(input["text"], receipt.content);
+        assert_eq!(receipt.message_selections.len(), 1);
+        let selected_message = allowed_messages[usize::from(receipt.message_selections[0])];
+        assert!(text.contains(selected_message), "{text}");
+        let (status, replay) = send(
+            app(&billing),
+            &format!("random-candidate-{index}"),
+            body("gpt-test"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{replay:?}");
+        assert_eq!(tool_event(&replay), event);
+    }
+    assert_eq!(billing.ledger_entries().len(), 32);
+}
+
 #[tokio::test]
 async fn acknowledgements_are_free_scoped_honest_and_do_not_retrigger() {
     let billing = engine();
@@ -1179,11 +1379,15 @@ fn set_timeline(billing: &BillingEngine, min: u32, max: u32) {
                 at_ms: 10,
                 at_max_ms: None,
                 text: "first\n".into(),
+                alternatives: vec![],
+                selected_index: None,
             },
             ResponseTemplateMessage {
                 at_ms: 30,
                 at_max_ms: None,
                 text: "second\n".into(),
+                alternatives: vec![],
+                selected_index: None,
             },
         ],
         dispatch: "send {file_path} {price}".into(),

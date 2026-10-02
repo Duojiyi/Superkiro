@@ -19,6 +19,13 @@ pub use commercial::{
     MAX_OFFICIAL_PRICES, MAX_PROVIDER_MULTIPLIERS, MAX_ROUTE_COSTS,
 };
 
+#[path = "complexity_routing.rs"]
+mod complexity_routing;
+pub use complexity_routing::{
+    Complexity, ComplexityRoutingConfig, ComplexityRoutingState, ComplexityRoutingUpdate,
+    RoutingBudget, RoutingClassifier, RoutingDecision, RoutingMode, RoutingPolicy,
+};
+
 #[path = "runtime_settings.rs"]
 mod runtime_settings;
 pub use runtime_settings::{
@@ -29,8 +36,9 @@ pub use runtime_settings::{
 mod response_templates;
 pub use response_templates::{
     validate_response_template_rules, ResponseTemplateAudit, ResponseTemplateConfig,
-    ResponseTemplateDelivery, ResponseTemplateIntent, ResponseTemplateMessage,
-    ResponseTemplateReceipt, ResponseTemplateRule, ResponseTemplateUpdate, ResponseTemplateVariant,
+    ResponseTemplateContentAlternative, ResponseTemplateDelivery, ResponseTemplateIntent,
+    ResponseTemplateMessage, ResponseTemplateReceipt, ResponseTemplateRule, ResponseTemplateUpdate,
+    ResponseTemplateVariant,
 };
 
 #[path = "template_matcher.rs"]
@@ -270,6 +278,7 @@ pub struct BillingEngine {
     rate_card_audit_logs: Arc<RwLock<Vec<RateCardAuditLog>>>,
     commercial_audit_logs: Arc<RwLock<Vec<CommercialAudit>>>,
     runtime_settings: Arc<RwLock<RuntimeSettingsConfig>>,
+    complexity_routing: Arc<RwLock<ComplexityRoutingState>>,
     response_templates: Arc<RwLock<ResponseTemplateConfig>>,
     response_template_receipts: Arc<RwLock<Vec<ResponseTemplateReceipt>>>,
     settings: Arc<RwLock<BillingSettings>>,
@@ -417,6 +426,8 @@ pub struct BillingSnapshot {
     pub commercial_audit_logs: Vec<CommercialAudit>,
     #[serde(default)]
     pub runtime_settings: RuntimeSettingsConfig,
+    #[serde(default)]
+    pub complexity_routing: ComplexityRoutingState,
     #[serde(default)]
     pub response_templates: ResponseTemplateConfig,
     #[serde(default)]
@@ -794,6 +805,7 @@ impl BillingEngine {
             rate_card_audit_logs: Arc::new(RwLock::new(Vec::new())),
             commercial_audit_logs: Arc::new(RwLock::new(Vec::new())),
             runtime_settings: Arc::new(RwLock::new(RuntimeSettingsConfig::default())),
+            complexity_routing: Arc::new(RwLock::new(ComplexityRoutingState::default())),
             response_templates: Arc::new(RwLock::new(ResponseTemplateConfig::default())),
             response_template_receipts: Arc::new(RwLock::new(Vec::new())),
             settings: Arc::new(RwLock::new(BillingSettings::default())),
@@ -948,6 +960,7 @@ impl BillingEngine {
             rate_card_audit_logs: self.rate_card_audit_logs.read().unwrap().clone(),
             commercial_audit_logs: self.commercial_audit_logs.read().unwrap().clone(),
             runtime_settings: self.runtime_settings.read().unwrap().clone(),
+            complexity_routing: self.complexity_routing.read().unwrap().clone(),
             response_templates: self.response_templates.read().unwrap().clone(),
             response_template_receipts: self.response_template_receipts.read().unwrap().clone(),
             settings: self.settings.read().unwrap().clone(),
@@ -1035,6 +1048,7 @@ impl BillingEngine {
         *self.rate_card_audit_logs.write().unwrap() = snapshot.rate_card_audit_logs;
         *self.commercial_audit_logs.write().unwrap() = snapshot.commercial_audit_logs;
         *self.runtime_settings.write().unwrap() = snapshot.runtime_settings;
+        *self.complexity_routing.write().unwrap() = snapshot.complexity_routing;
         *self.response_templates.write().unwrap() = snapshot.response_templates;
         *self.response_template_receipts.write().unwrap() = snapshot.response_template_receipts;
         *self.settings.write().unwrap() = snapshot.settings;
@@ -7444,6 +7458,8 @@ fn validate_template_invocation_capacity(
 }
 
 fn validate_snapshot(snapshot: &BillingSnapshot) -> std::io::Result<()> {
+    complexity_routing::validate_snapshot_state(&snapshot.complexity_routing)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
     snapshot
         .runtime_settings
         .settings
