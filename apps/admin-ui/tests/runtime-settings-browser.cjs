@@ -128,6 +128,7 @@ const server = http.createServer(async (req, res) => {
     await page.setViewportSize({width:320,height:844});
     assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1));
     assert(await page.locator('tbody th').first().evaluate(el=>el.getBoundingClientRect().width>=2*parseFloat(getComputedStyle(el).fontSize)),'parameter labels must not collapse into single-character columns');
+    assert.equal(await page.locator('tbody th').first().evaluate(el=>getComputedStyle(el).whiteSpace),'nowrap','parameter names and bounds stay together in the scrolling table');
     assert(await page.getByRole('region',{name:'超时设置表（可横向滚动）'}).evaluate(el=>{el.scrollLeft=40;return el.scrollLeft>0;}),'wide settings table must retain local horizontal scrolling');
     console.log('PASS: global refresh keeps runtime draft, explicit read discards it; narrow table has keyboard focus and accessible caption');
     assert.deepEqual(errors,[]);assert.deepEqual(serverErrors,[]);
