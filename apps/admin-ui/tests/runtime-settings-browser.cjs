@@ -118,6 +118,8 @@ const server = http.createServer(async (req, res) => {
     await button('刷新').click();await page.getByRole('status').filter({hasText:'全局刷新未覆盖草稿'}).waitFor();
     assert.equal(await reason.inputValue(),'keep draft on global refresh');assert.equal(await keepalive.inputValue(),'22');
     await button('重新读取').click();await accept();await saved();
+    config={...config,revision:'runtime-'+ 'a'.repeat(64)};
+    await button('重新读取').click();await page.locator('.page-inner p').filter({hasText:config.revision}).waitFor();
     await page.setViewportSize({width:390,height:844});
     await page.getByRole('region',{name:'超时设置表（可横向滚动）'}).focus();
     assert.equal(await page.evaluate(()=>document.activeElement?.getAttribute('role')),'region');

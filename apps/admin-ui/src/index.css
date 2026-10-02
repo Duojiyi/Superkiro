@@ -249,7 +249,7 @@ fieldset {min-width: 0; border: 0; padding: 0; margin: 0;}
 .session-warning {padding: 4px 10px; border-radius: 12px; background: var(--warning-bg); color: #6c4a00; font-size: 12px; font-weight: 500; white-space: nowrap;}
 .busy-chip {padding: 4px 10px; border-radius: 12px; background: var(--neutral-bg); color: var(--text-2); font-size: 12px;}
 .page-content {flex: 1; min-height: 0; overflow-y: auto; padding: 20px 24px 32px;}
-.page-inner {max-width: 1600px; margin: 0 auto;}
+.page-inner {max-width: 1600px; margin: 0 auto; overflow-wrap: anywhere;}
 .page-inner.is-wide {max-width: 1760px;}
 .page-stack {display: flex; flex-direction: column; gap: 16px; min-width: 0;}
 .page-banners {position: sticky; top: 0; z-index: 6; display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; background: var(--bg-page);}
