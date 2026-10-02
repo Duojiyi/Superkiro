@@ -341,7 +341,7 @@ class PortalBrowserTests(unittest.TestCase):
         # Keep the 250ms motion state deterministic on loaded CI runners. Scrolling past the
         # top stops the motion, so start from the top once any earlier scroll has settled.
         self.page.evaluate('window.scrollTo(0, 0)')
-        self.page.wait_for_function('window.scrollY === 0')
+        expect(self.page.locator('html')).to_have_js_property('scrollTop', 0)
         self.page.wait_for_timeout(200)
         self.page.clock.install()
         self.page.clock.pause_at(self.page.evaluate('Date.now() + 1000'))
@@ -639,10 +639,11 @@ class PortalBrowserTests(unittest.TestCase):
             with self.subTest(pending=pending):
                 self.goto('/device')
                 self.verify()
-                self.page.evaluate("""pending=>{window.pendingActions=[];window.fetch=url=>{const action=url.split('/').pop();pendingActions.push(action);const result=action==='challenge'?{success:true,challengeToken:'fixture-token'}:{success:true,remainingDevices:[]};const reply=()=>new Response(JSON.stringify(result),{status:200});return action===pending?new Promise(resolve=>{window.finishPending=()=>resolve(reply());}):Promise.resolve(reply());};}""", pending)
+                self.page.evaluate("""pending=>{window.pendingActions=[];window.fetch=url=>{const action=url.split('/').pop();pendingActions.push(action);const result=action==='challenge'?{success:true,challengeToken:'fixture-token'}:{success:true,remainingDevices:[]};const reply=()=>new Response(JSON.stringify(result),{status:200});return action===pending?new Promise(resolve=>{window.finishPending=()=>resolve(reply());document.documentElement.pendingAction=action;}):Promise.resolve(reply());};}""", pending)
                 self.page.locator('#request-unbind').click()
                 self.page.locator('#confirm-unbind').click()
-                self.page.wait_for_function('window.finishPending !== undefined')
+                # Locator assertions retry without eval inside the page's CSP.
+                expect(self.page.locator('html')).to_have_js_property('pendingAction', pending)
                 self.page.evaluate("""async()=>{dispatchEvent(new Event('pagehide'));window.finishPending();await new Promise(resolve=>setTimeout(resolve,0));}""")
                 expect(self.page.locator('#recovery')).to_be_hidden()
                 expect(self.page.locator('#account')).to_be_hidden()
