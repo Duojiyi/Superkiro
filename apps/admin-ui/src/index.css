@@ -845,3 +845,25 @@ div.attention-item:hover {background: transparent;}
 .template-server-code {max-height: 360px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 12px;}
 .response-templates .panel-head {flex-wrap: wrap;}
 @media (max-width: 960px) {.template-layout {grid-template-columns: minmax(0, 1fr);}}
+
+/* Smart routing keeps the console's existing controls and stacks naturally on small screens. */
+.routing-page {display: grid; gap: 16px; min-width: 0;}
+.routing-page .section-card {min-width: 0; overflow-wrap: anywhere;}
+.routing-page .section-card > *, .routing-editor > *, .routing-preview-form > * {margin-bottom: 12px;}
+.routing-page legend {font-weight: 600; padding-bottom: 8px;}
+.routing-policy {border: 1px solid var(--border); border-radius: var(--radius); padding: 12px;}
+.routing-policy > *, .routing-chain li {margin-bottom: 12px;}
+.routing-chain {min-width: 0; padding: 8px 0;}
+.routing-chain ol {list-style: none; padding: 0; margin: 0;}
+.routing-chain li {display: grid; gap: 8px;}
+.routing-page details {border-top: 1px solid var(--border-subtle); padding-top: 10px;}
+.routing-page summary {cursor: pointer;}
+.routing-decision p {margin: 8px 0;}
+.routing-page select {max-width: 100%;}
+.routing-page .check-field {align-items: flex-start;}
+.routing-page .check-field input {flex-shrink: 0; margin-top: 3px;}
+@media (max-width: 640px) {
+  .routing-page .form-grid {grid-template-columns: minmax(0, 1fr);}
+  .routing-page .button-row > .field {width: 100%;}
+  .routing-page .btn {height: auto; min-height: 36px; white-space: normal;}
+}

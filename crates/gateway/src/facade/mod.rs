@@ -20,6 +20,7 @@ pub mod admin_login;
 pub mod client;
 pub mod commercial;
 pub mod completions;
+pub mod complexity_routing_admin;
 pub mod conversation;
 pub mod healthz;
 pub mod mcp;
@@ -361,6 +362,21 @@ impl FacadeRegistry {
                 billing: billing.clone(),
                 auth: auth.clone(),
                 publish: true,
+            })
+            .register(complexity_routing_admin::ComplexityRoutingHandler {
+                billing: billing.clone(),
+                auth: auth.clone(),
+                publish: false,
+            })
+            .register(complexity_routing_admin::ComplexityRoutingHandler {
+                billing: billing.clone(),
+                auth: auth.clone(),
+                publish: true,
+            })
+            .register(complexity_routing_admin::ComplexityRoutingPreviewHandler {
+                billing: billing.clone(),
+                auth: auth.clone(),
+                runtime: runtime.clone(),
             })
             .register(runtime_settings_admin::RuntimeSettingsHandler {
                 billing: billing.clone(),

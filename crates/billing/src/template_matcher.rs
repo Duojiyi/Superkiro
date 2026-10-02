@@ -269,6 +269,8 @@ mod tests {
                 model_id: "opus".into(),
                 file_path: "x.html".into(),
                 content: "html".into(),
+                content_alternatives: vec![],
+                content_alternative_index: None,
                 preamble: "".into(),
                 completion: "".into(),
                 price_microcredits: 0,

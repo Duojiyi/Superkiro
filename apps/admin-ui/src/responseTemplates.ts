@@ -2,13 +2,16 @@ import {PELICAN_OPUS55_HTML} from './pelicanTemplate';
 import type {Row} from './types';
 
 export interface TemplateIntent {groups: string[][]; exclude: string[]}
+export interface TemplateDeliveryMessage {
+  at_ms: number; at_max_ms?: number | null; text: string; alternatives: string[]; selected_index?: number | null;
+}
 export interface TemplateDelivery {
-  write_min_ms: number; write_max_ms: number; messages: Array<{at_ms: number; at_max_ms?: number | null; text: string}>;
+  write_min_ms: number; write_max_ms: number; messages: TemplateDeliveryMessage[];
   dispatch: string; success: string; failure: string; unknown: string; replay: string; continuation: string;
 }
 export function newTemplateDelivery(): TemplateDelivery {
   return {write_min_ms: 170000, write_max_ms: 230000,
-    messages: [{at_ms: 10000, text: '已匹配预设动画模板，正在等待配置的文件发送时间。\n'}, {at_ms: 40000, text: '将提供独立 HTML 文件，无需外部资源。\n'}],
+    messages: [{at_ms: 10000, text: '已匹配预设动画模板，正在等待配置的文件发送时间。\n', alternatives: []}, {at_ms: 40000, text: '将提供独立 HTML 文件，无需外部资源。\n', alternatives: []}],
     dispatch: '正在发送预设模板 {file_path} 的文件写入指令，本次收费 {price} 积分。',
     success: '客户端报告已写入 {file_path}。', failure: '客户端报告写入 {file_path} 失败，请检查工具返回的错误。本轮不重复扣费。',
     unknown: '已收到 {file_path} 的回执，但未确认写入成功。', replay: '恢复原模板文件写入指令，不重复扣费。',
@@ -106,10 +109,13 @@ export function pelicanIntent(): TemplateIntent {
   ]
 };
 }
+export interface ResponseTemplateContentAlternative {file_path: string; content: string}
 export interface ResponseTemplateVariant {
   model_id: string;
   file_path: string;
   content: string;
+  content_alternatives: ResponseTemplateContentAlternative[];
+  content_alternative_index?: number | null;
   preamble: string;
   completion: string;
   price_microcredits: number;
@@ -131,8 +137,14 @@ export type TemplateVariantDraft = Omit<ResponseTemplateVariant, 'price_microcre
 export type TemplateRuleDraft = Omit<ResponseTemplateRule, 'variants'> & {variants: TemplateVariantDraft[]};
 export const MAX_TEMPLATE_ITEMS = 32;
 export const MAX_TEMPLATE_BYTES = 256 * 1024;
+export const MAX_TEMPLATE_CONTENT_ALTERNATIVES = 31;
+export const MAX_TEMPLATE_MESSAGE_ALTERNATIVES = 15;
 export const MAX_TEMPLATES_BYTES = 2 * 1024 * 1024;
 const bytes = (text: string) => new TextEncoder().encode(text).length;
+export function adjustTemplateSelection(selected: number | null | undefined, removed: number): number | undefined {
+  if (selected == null || selected === removed) return undefined;
+  return selected > removed ? selected - 1 : selected;
+}
 
 /** Decimal text to integer microcredits, without floating-point rounding or a paid fallback. */
 export function templatePrice(text: string): number | null {
@@ -145,10 +157,19 @@ export function templateCredits(micro: number): string {
   return `${Math.floor(micro / 1_000_000)}.${String(micro % 1_000_000).padStart(6, '0')}`.replace(/\.?0+$/, '');
 }
 export function templateDrafts(rules: ResponseTemplateRule[]): TemplateRuleDraft[] {
-  return rules.map(rule => ({...rule, variants: rule.variants.map(({price_microcredits, ...variant}) => ({...variant, delay_ms: variant.delay_ms ?? 0, price_credits: templateCredits(price_microcredits)}))}));
+  return rules.map(rule => ({...rule, variants: rule.variants.map(({price_microcredits, ...variant}) => ({
+    ...variant,
+    content_alternatives: variant.content_alternatives ?? [],
+    content_alternative_index: variant.content_alternative_index ?? undefined,
+    delivery: variant.delivery ? {...variant.delivery, messages: variant.delivery.messages.map(message => ({
+      ...message, alternatives: message.alternatives ?? [], selected_index: message.selected_index ?? undefined,
+    }))} : variant.delivery,
+    delay_ms: variant.delay_ms ?? 0,
+    price_credits: templateCredits(price_microcredits),
+  }))}));
 }
 export function newTemplateVariant(): TemplateVariantDraft {
-  return {delay_ms: 1500, model_id: '', file_path: 'output.html', content: '', preamble: '这是固定模板服务，不是上游模型生成，不消耗或虚构上游 tokens。', completion: '模板文件生成指令已发送；服务费按下发收取一次，成功或失败回执均免费。实际文件写入取决于客户端兼容工具的执行结果。', price_credits: '0'};
+  return {delay_ms: 1500, model_id: '', file_path: 'output.html', content: '', content_alternatives: [], content_alternative_index: undefined, preamble: '这是固定模板服务，不是上游模型生成，不消耗或虚构上游 tokens。', completion: '模板文件生成指令已发送；服务费按下发收取一次，成功或失败回执均免费。实际文件写入取决于客户端兼容工具的执行结果。', price_credits: '0'};
 }
 export function newTemplateRule(): TemplateRuleDraft {
   return {id: crypto.randomUUID(), name: '新规则', enabled: false, match_mode: 'exact', match_text: '', variants: [newTemplateVariant()]};
@@ -194,18 +215,30 @@ export function parseTemplateRules(drafts: TemplateRuleDraft[]): {rules: Respons
       if (!Number.isInteger(variant.delay_ms ?? 0) || (variant.delay_ms ?? 0) < 0 || (variant.delay_ms ?? 0) > 30000) return {error: at + '等待时间须为 0–30000 毫秒。'};
       if ([variant.preamble, variant.completion].some(text => bytes(text) > 4096 || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/.test(text))) return {error: `${at}前置和完成消息各不能超过 4096 字节或包含非法控制字符。`};
       if (!safeTemplatePath(variant.file_path)) return {error: `${at}请使用安全的相对 .html 路径，例如 pages/demo.html，不含 ..、反斜杠或绝对路径。`};
-      if (!variant.content.trim()) return {error: `${at}请填写完整 HTML 代码。`};
-      if (bytes(variant.content) > MAX_TEMPLATE_BYTES) return {error: `${at}代码不能超过 256 KiB（UTF-8）。`};
+      const contentAlternatives = variant.content_alternatives ?? [];
+      if (contentAlternatives.length > MAX_TEMPLATE_CONTENT_ALTERNATIVES) return {error: `${at}最多 32 份 HTML 代码。`};
+      const codeCandidates = [{file_path: variant.file_path, content: variant.content}, ...contentAlternatives];
+      if (codeCandidates.some(candidate => !safeTemplatePath(candidate.file_path))) return {error: `${at}所有代码候选都必须使用安全的相对 .html 路径。`};
+      if (codeCandidates.some(candidate => !candidate.content.trim())) return {error: `${at}请为每个代码候选填写完整 HTML 代码。`};
+      if (codeCandidates.some(candidate => bytes(candidate.content) > MAX_TEMPLATE_BYTES)) return {error: `${at}每份代码不能超过 256 KiB（UTF-8）。`};
+      const selectedCode = variant.content_alternative_index;
+      if (selectedCode != null && (!Number.isInteger(selectedCode) || selectedCode < 0 || selectedCode >= codeCandidates.length)) return {error: `${at}指定的代码候选序号无效。`};
       const price = templatePrice(variant.price_credits);
       if (price === null) return {error: `${at}服务费须为 0–1000 credits，最多 6 位小数；不会自动改为收费价格。`};
       if (variant.delivery) {
         const d = variant.delivery;
         const time = (n: number) => Number.isInteger(n) && n >= 0 && n <= 300000;
-        if (!time(d.write_min_ms) || !time(d.write_max_ms) || d.write_min_ms > d.write_max_ms || d.messages.length > 16 || d.messages.some((m, i) => !time(m.at_ms) || !time(m.at_max_ms ?? m.at_ms) || (m.at_max_ms ?? m.at_ms) < m.at_ms || (m.at_max_ms ?? m.at_ms) > d.write_min_ms || (i > 0 && m.at_ms <= (d.messages[i - 1].at_max_ms ?? d.messages[i - 1].at_ms)) || !m.text.trim())) return {error: `${at}时间范围须递增且不重叠，最多 16 段，每段最晚发送不得晚于最早写入；范围为 0–300 秒。`};
-        if ([d.dispatch, d.success, d.failure, d.unknown, d.replay, d.continuation, ...d.messages.map(m => m.text)].some(s => bytes(s) > 4096 || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/.test(s))) return {error: `${at}每段文案最多 4096 字节，不允许非法控制字符。`};
+        if (!time(d.write_min_ms) || !time(d.write_max_ms) || d.write_min_ms > d.write_max_ms || d.messages.length > 16 || d.messages.some((m, i) => {
+          const alternatives = m.alternatives ?? [];
+          const count = 1 + alternatives.length;
+          return !time(m.at_ms) || !time(m.at_max_ms ?? m.at_ms) || (m.at_max_ms ?? m.at_ms) < m.at_ms || (m.at_max_ms ?? m.at_ms) > d.write_min_ms || (i > 0 && m.at_ms <= (d.messages[i - 1].at_max_ms ?? d.messages[i - 1].at_ms)) || !m.text.trim() || alternatives.length > MAX_TEMPLATE_MESSAGE_ALTERNATIVES || alternatives.some(text => !text.trim()) || (m.selected_index != null && (!Number.isInteger(m.selected_index) || m.selected_index < 0 || m.selected_index >= count));
+        })) return {error: `${at}时间范围须递增且不重叠，最多 16 个时间段；每段最多 16 条候选文案，序号必须有效。`};
+        const messageTexts = d.messages.flatMap(m => [m.text, ...(m.alternatives ?? [])]);
+        if ([d.dispatch, d.success, d.failure, d.unknown, d.replay, d.continuation, ...messageTexts].some(s => bytes(s) > 4096 || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/.test(s))) return {error: `${at}每段文案最多 4096 字节，不允许非法控制字符。`};
       }
       const {price_credits: _price, ...rest} = variant;
-      variants.push({...rest, delivery: rest.delivery ?? undefined, price_microcredits: price});
+      const delivery = rest.delivery && {...rest.delivery, messages: rest.delivery.messages.map(m => ({...m, alternatives: m.alternatives ?? [], selected_index: m.selected_index ?? undefined}))};
+      variants.push({...rest, content_alternatives: contentAlternatives, content_alternative_index: selectedCode ?? undefined, delivery: delivery ?? undefined, price_microcredits: price});
     }
     rules.push({...draft, intent: draft.intent ?? undefined, variants});
   }
@@ -221,7 +254,8 @@ export function pelicanTemplateRule(): TemplateRuleDraft {
 /** JSON object order and absent/null optional fields do not change saved rules. */
 export function sameTemplateRules(a: ResponseTemplateRule[], b: ResponseTemplateRule[]): boolean {
   const canonical = (rules: ResponseTemplateRule[]) => JSON.stringify(rules, (key, value) => {
-    if ((key === 'intent' || key === 'delivery' || key === 'at_max_ms') && value == null) return undefined;
+    if ((key === 'intent' || key === 'delivery' || key === 'at_max_ms' || key === 'content_alternative_index' || key === 'selected_index') && value == null) return undefined;
+    if ((key === 'content_alternatives' || key === 'alternatives') && Array.isArray(value) && value.length === 0) return undefined;
     return value && typeof value === 'object' && !Array.isArray(value)
       ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b))) : value;
   });
