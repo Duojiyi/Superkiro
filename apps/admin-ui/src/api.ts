@@ -1,3 +1,4 @@
+import type {RoutingConfig, RoutingStatus, RoutingUpdate, RoutingPreview, RoutingPreviewInput} from './complexityRouting';
 import type {RuntimeConfig, RuntimeUpdate} from './runtimeSettings';
 import type {KeyAttempts, ModelHealth, ProviderAttempts} from './health';
 /** A refused request: the server's words, its status, and the rest of its answer (a refusal's `refusal` object, say). */
@@ -541,6 +542,16 @@ export class AdminApiClient {
 
   async revealCard(cardId: string): Promise<{ success: boolean; rawCode: string }> {
     return this.request('/api/v1/admin/cards/reveal', {method: 'POST', body: JSON.stringify({cardId})});
+  }
+
+  async getComplexityRouting(): Promise<{success: boolean; config: RoutingConfig; status: RoutingStatus}> {
+    return this.request('/api/v1/admin/complexity-routing');
+  }
+  async publishComplexityRouting(update: RoutingUpdate): Promise<{success: boolean; config: RoutingConfig}> {
+    return this.request('/api/v1/admin/complexity-routing', {method: 'POST', body: JSON.stringify(update)});
+  }
+  async previewComplexityRouting(input: RoutingPreviewInput): Promise<RoutingPreview> {
+    return this.request('/api/v1/admin/complexity-routing/preview', {method: 'POST', body: JSON.stringify(input)});
   }
 
   async getRuntimeSettings(): Promise<{success: boolean; config: RuntimeConfig}> {

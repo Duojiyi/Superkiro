@@ -20,7 +20,9 @@ export const timeoutFields: Array<{key: keyof TimeoutProfile; label: string; min
   {key: 'idle_secs', label: '流空闲等待', min: 10, max: 3600},
 ];
 export function runtimeError(s: RuntimeSettings): string {
+  if (!s || typeof s !== 'object') return '服务器未返回有效运行配置';
   for (const p of [s.standard, s.reasoning, s.claude]) {
+    if (!p || typeof p !== 'object') return '服务器未返回完整超时配置';
     if (timeoutFields.some(f => !Number.isInteger(p[f.key]) || p[f.key] < f.min || p[f.key] > f.max)) return '所有超时须为范围内的整数秒';
     if (p.headers_secs > p.attempt_secs || p.attempt_secs > p.total_secs || p.total_secs > p.started_secs || p.idle_secs > p.started_secs || s.keepalive_secs >= p.idle_secs || p.commit_secs > p.total_secs) return '须满足：响应头 ≤ 单次启动 ≤ 启动总预算 ≤ 请求上限，空闲 ≤ 请求上限，保活间隔 < 空闲';
   }

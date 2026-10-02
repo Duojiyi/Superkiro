@@ -4,7 +4,7 @@ import {adminApi, AdminApiError} from '../api';
 import {confirmAction} from '../components/confirm';
 import {toast} from '../components/toast';
 import {Switch, TopbarActions} from '../components/ui';
-import {MAX_TEMPLATE_ITEMS, pelicanIntent, newTemplateRule, sameTemplateRules, newTemplateVariant, parseTemplateRules, pelicanTemplateRule, templateDrafts, templateModels, templatePrice,
+import {MAX_TEMPLATE_ITEMS, MAX_TEMPLATE_CONTENT_ALTERNATIVES, adjustTemplateSelection, pelicanIntent, newTemplateRule, sameTemplateRules, newTemplateVariant, parseTemplateRules, pelicanTemplateRule, templateDrafts, templateModels, templatePrice,
   type ResponseTemplateConfig, type ResponseTemplateRule, type TemplateRuleDraft, type TemplateVariantDraft} from '../responseTemplates';
 import type {Row, WriteGuards} from '../types';
 
@@ -133,7 +133,7 @@ export default function ResponseTemplatesPage({models, modelsFailed, refreshEpoc
       <p>固定服务费按每条生成文件指令在下发时收取一次；成功或失败的工具结果回执均免费，不重复收费。新变体默认 <strong>0 credits（免费）</strong>，不会自动套用模型的 token 单价。</p>
       <p>实际写出文件需要客户端声明兼容工具：<code>fsWrite(path,text)</code>、<code>Write(file_path,content)</code>、<code>write_file(path,content)</code> 或 <code>writeFile(path,content)</code>。下发指令不代表文件已写入成功。</p>
       <p>未匹配到模型变体时，继续正常模型服务。后端默认没有任何规则，示例只加入本地草稿，不自动启用或发布。</p>
-      <p className="muted">从上到下为规则优先级；完整匹配、包含匹配或保守意图匹配。最多 32 条规则，每条最多 32 个不同模型变体；每份代码 ≤256 KiB，总配置 ≤2 MiB。</p>
+      <p className="muted">从上到下为规则优先级；完整匹配、包含匹配或保守意图匹配。最多 32 条规则，每条最多 32 个不同模型变体；每份代码 ≤256 KiB；每个模型变体最多 32 份代码候选，每个时间段最多 16 条候选文案；总配置 ≤2 MiB。</p>
       <div className="button-row"><button type="button" className="btn" disabled={busy} onClick={() => void read()}>{busy ? '处理中…' : '读取服务器版本'}</button>
         <span className="muted">{config ? `当前基准版本：${config.revision}${dirty ? ' · 有未发布的修改' : ''}` : '尚未读取配置，禁止发布'}</span></div>
     </section>
@@ -179,11 +179,18 @@ export default function ResponseTemplatesPage({models, modelsFailed, refreshEpoc
                 {variant.model_id && !choices.some(model => model.id === variant.model_id) && <option value={variant.model_id}>{variant.model_id}（配置中已有，当前模型目录未找到）</option>}
                 {choices.map(model => <option key={model.id} value={model.id} disabled={rule.variants.some((other, i) => i !== index && other.model_id === model.id)}>{model.label}</option>)}
               </select><span className="field-hint">使用客户端可见的模型 ID；同一规则内不可重复。未列出的旧 ID 会保留，不自动替换。</span></label>
-              <label className="field"><span className="field-label">相对 HTML 文件路径</span><input value={variant.file_path} placeholder="pages/demo.html" onChange={event => updateVariant(index, {file_path: event.target.value})}/></label>
+              <label className="field"><span className="field-label">候选 1 · 相对 HTML 文件路径</span><input value={variant.file_path} placeholder="pages/demo.html" onChange={event => updateVariant(index, {file_path: event.target.value})}/></label>
               <label className="field"><span className="field-label">固定服务费（credits / 生成文件指令）</span><input type="text" inputMode="decimal" value={variant.price_credits} onChange={event => updateVariant(index, {price_credits: event.target.value})}/>
                 <span className="field-hint">0–1000，最多 6 位小数；{templatePrice(variant.price_credits) === null ? '价格格式无效' : `${templatePrice(variant.price_credits)} microcredits${templatePrice(variant.price_credits) === 0 ? ' · 免费' : ' · 收费'}`}。成功或失败回执均免费。</span></label>
-              <label className="field field-span"><span className="field-label">完整 HTML 代码</span><textarea className="template-code" rows={16} spellCheck={false} value={variant.content} onChange={event => updateVariant(index, {content: event.target.value})}/>
+              <label className="field"><span className="field-label">代码选择方式</span><select value={variant.content_alternative_index == null ? '' : String(variant.content_alternative_index)} onChange={event => updateVariant(index, {content_alternative_index: event.target.value === '' ? undefined : Number(event.target.value)})}><option value="">随机选择（多份代码）</option>{[variant, ...(variant.content_alternatives ?? [])].map((_, candidate) => <option key={candidate} value={candidate}>指定第 {candidate + 1} 份代码</option>)}</select></label>
+              <label className="field field-span"><span className="field-label">候选 1 · 完整 HTML 代码</span><textarea className="template-code" rows={16} spellCheck={false} value={variant.content} onChange={event => updateVariant(index, {content: event.target.value})}/>
                 <span className="field-hint">完整代码可编辑，只作为文本保存；管理后台不会渲染或执行。UTF-8：{new TextEncoder().encode(variant.content).length} / 262144 字节。</span></label>
+              {(variant.content_alternatives ?? []).map((alternative, alternativeIndex) => <div className="field field-span" key={alternativeIndex}>
+                <label className="field"><span className="field-label">候选 {alternativeIndex + 2} · 相对 HTML 文件路径</span><input value={alternative.file_path} placeholder="pages/demo.html" onChange={event => updateVariant(index, {content_alternatives: (variant.content_alternatives ?? []).map((item, i) => i === alternativeIndex ? {...item, file_path: event.target.value} : item)})}/></label>
+                <label className="field"><span className="field-label">候选 {alternativeIndex + 2} · 完整 HTML 代码</span><textarea className="template-code" rows={16} spellCheck={false} value={alternative.content} onChange={event => updateVariant(index, {content_alternatives: (variant.content_alternatives ?? []).map((item, i) => i === alternativeIndex ? {...item, content: event.target.value} : item)})}/><span className="field-hint">UTF-8：{new TextEncoder().encode(alternative.content).length} / 262144 字节。</span></label>
+                <button type="button" className="btn-text" onClick={() => updateVariant(index, {content_alternatives: (variant.content_alternatives ?? []).filter((_, i) => i !== alternativeIndex), content_alternative_index: adjustTemplateSelection(variant.content_alternative_index, alternativeIndex + 1)})}>删除此代码候选</button>
+              </div>)}
+              <button type="button" className="btn" disabled={(variant.content_alternatives ?? []).length >= MAX_TEMPLATE_CONTENT_ALTERNATIVES} onClick={() => updateVariant(index, {content_alternatives: [...(variant.content_alternatives ?? []), {file_path: 'output.html', content: ''}]})}>新增代码候选</button>
               {!variant.delivery && <label className="field"><span className="field-label">响应延迟（毫秒，0–30000）</span><input type="number" min="0" max="30000" step="1" value={variant.delay_ms ?? 0} onChange={event => updateVariant(index, {delay_ms: Number(event.target.value)})}/></label>}
               {!variant.delivery && <label className="field"><span className="field-label">前置消息</span><textarea value={variant.preamble} onChange={event => updateVariant(index, {preamble: event.target.value})}/></label>}
               {!variant.delivery && <label className="field"><span className="field-label">完成消息</span><textarea value={variant.completion} onChange={event => updateVariant(index, {completion: event.target.value})}/></label>}

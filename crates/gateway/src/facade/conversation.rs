@@ -921,6 +921,7 @@ impl GenerateAssistantResponseHandler {
             let mut model_supports_reasoning = false;
             let mut configured_context_window = None;
             let mut mapped_model = false;
+            let mut mapped_model_id = None;
 
             if let Some(ref claims) = claims {
                 if let Some(group) = self.billing.get_group(&claims.group_id) {
@@ -932,6 +933,7 @@ impl GenerateAssistantResponseHandler {
                     {
                         target_model = m.target_model.clone();
                         fallback_targets = m.full_target_chain();
+                        mapped_model_id = Some(m.id.clone());
                         model_supports_vision = m.supports_vision;
                         model_supports_reasoning = m.supports_reasoning;
                         configured_context_window = Some(
@@ -1104,6 +1106,55 @@ impl GenerateAssistantResponseHandler {
             // Which upstreams may take this request, and what an upstream's refusal of it
             // is about, depend on the PDFs it sends.
             let pdfs = crate::translate::documents::RequestPdfs::of(&kiro_req);
+            // Capture only bounded routing text before the potentially large wire body is dropped.
+            let complexity_config = self.billing.complexity_routing_config();
+            let complexity_policy = mapped_model_id
+                .as_ref()
+                .and_then(|id| {
+                    complexity_config.policies.iter().find(|p| {
+                        &p.model_map_id == id && p.mode != billing::engine::RoutingMode::Off
+                    })
+                })
+                .cloned()
+                .or_else(|| {
+                    self.billing.routing_decision(&invocation_key).map(|d| {
+                        billing::engine::RoutingPolicy {
+                            model_map_id: d.model_map_id,
+                            mode: d.mode,
+                            simple_provider_ids: d.provider_ids.clone(),
+                            complex_provider_ids: d.provider_ids,
+                        }
+                    })
+                });
+            let complexity_request =
+                complexity_policy
+                    .as_ref()
+                    .zip(claims.as_ref())
+                    .map(
+                        |(policy, caller)| crate::complexity_routing::RoutingRequest {
+                            invocation_id: invocation_key.clone(),
+                            scope: crate::complexity_routing::digest(&(
+                                &caller.card_id,
+                                &kiro_req.conversation_state.conversation_id,
+                                &policy.model_map_id,
+                            )),
+                            request_hash: crate::complexity_routing::digest_bytes(&body_bytes),
+                            input: crate::complexity_routing::RoutingInput::from_kiro(
+                                &kiro_req,
+                                matches!(
+                            chat_req.reasoning_effort,
+                            Some(
+                                kiro_wire::requests::conversation::ReasoningEffort::High
+                                    | kiro_wire::requests::conversation::ReasoningEffort::Xhigh
+                                    | kiro_wire::requests::conversation::ReasoningEffort::Max
+                            )
+                        ),
+                            ),
+                            eligible_provider_ids: Vec::new(),
+                            preview: false,
+                            now: crate::now_secs(),
+                        },
+                    );
             // Only the translation is used from here on. A large request gives its place in
             // the gate back now (or once the archive is done with its copy), not when the
             // answer ends.
@@ -1292,6 +1343,59 @@ impl GenerateAssistantResponseHandler {
                     "Request upstream attempt budget exhausted; submit a new request to retry",
                 );
             }
+            if let (Some(policy), Some(mut request)) =
+                (complexity_policy.as_ref(), complexity_request)
+            {
+                request.eligible_provider_ids =
+                    candidates.iter().map(|item| item.0.provider().id).collect();
+                let classifier_pool = complexity_config
+                    .classifier
+                    .as_ref()
+                    .and_then(|c| find_pool(&c.provider_id))
+                    .filter(|pool| {
+                        card_group.as_ref().is_some_and(|g| {
+                            g.can_access_provider(pool.provider().group_id.as_deref())
+                        })
+                    });
+                let decision = match crate::complexity_routing::ComplexityRouter::shared()
+                    .decide(
+                        &self.billing,
+                        &complexity_config,
+                        policy,
+                        request,
+                        classifier_pool,
+                    )
+                    .await
+                {
+                    Ok(d) => d,
+                    Err(_) => {
+                        let _ = self.billing.release(&invocation_key);
+                        return error_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "InternalServerException",
+                            "Routing decision could not be saved; retry later",
+                        );
+                    }
+                };
+                let named: Vec<_> = candidates
+                    .into_iter()
+                    .map(|item| (item.0.provider().id, item))
+                    .collect();
+                candidates = crate::complexity_routing::apply_decision(&named, &decision)
+                    .into_iter()
+                    .map(|(_, item)| item)
+                    .collect();
+                if candidates.is_empty() {
+                    let _ = self.billing.release(&invocation_key);
+                    self.record_refusal(
+                        claims.as_ref(),
+                        &invocation_key,
+                        requested_model,
+                        "no_route",
+                    );
+                    return no_route_for_group();
+                }
+            }
             // The route primes an attempt through the model's first content, retrying and
             // failing over within the attempt budget. Kiro gives up on a request that sends it
             // nothing for 60 seconds, so a route still going at `commit` (after the request
@@ -1344,6 +1448,13 @@ impl GenerateAssistantResponseHandler {
                                             now_secs,
                                         )
                                         .await;
+                                        if let Ok(served) = &result {
+                                            // Metadata only: user settlement still belongs to the normal stream path.
+                                            let _ = billing.record_routing_served(
+                                                &invocation_key,
+                                                &served.provider.id,
+                                            );
+                                        }
                                         let attempts = crate::provider::retry::ATTEMPTS
                                             .with(|records| records.lock().unwrap().clone());
                                         (result, attempts)

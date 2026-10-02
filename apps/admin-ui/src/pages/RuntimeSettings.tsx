@@ -5,12 +5,14 @@ import {toast} from '../components/toast';
 import {runtimeError, runtimeReasonError, timeoutFields, type RuntimeConfig, type RuntimeSettings} from '../runtimeSettings';
 import type {WriteGuards} from '../types';
 
-export default function RuntimeSettingsPage({guards, onDirtyChange, onBusyChange}: {
-  guards: WriteGuards; onDirtyChange: (value: boolean) => void; onBusyChange: (value: boolean) => void;
+export default function RuntimeSettingsPage({guards, onDirtyChange, onBusyChange, refreshEpoch = 0}: {
+  guards: WriteGuards; refreshEpoch?: number; onDirtyChange: (value: boolean) => void; onBusyChange: (value: boolean) => void;
 }) {
   const [config, setConfig] = useState<RuntimeConfig | null>(null);
   const [draft, setDraft] = useState<RuntimeSettings | null>(null);
   const [reason, setReason] = useState(''), [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const epoch = useRef(refreshEpoch);
   const [busy, setBusy] = useState(false), [blocked, setBlocked] = useState(false);
   const alive = useRef(true), pending = useRef(false);
   const dirty = !!config && (JSON.stringify(config.settings) !== JSON.stringify(draft) || !!reason);
@@ -18,7 +20,13 @@ export default function RuntimeSettingsPage({guards, onDirtyChange, onBusyChange
   useEffect(() => {alive.current = true; void read(); return () => {alive.current = false;};}, []);
   useEffect(() => {onDirtyChange(dirty); return () => onDirtyChange(false);}, [dirty, onDirtyChange]);
   useEffect(() => {onBusyChange(busy); return () => onBusyChange(false);}, [busy, onBusyChange]);
-  const adopt = (next: RuntimeConfig) => {setConfig(next); setDraft(next.settings); setReason(''); setError(''); setBlocked(false);};
+  useEffect(() => {
+    if (epoch.current === refreshEpoch) return;
+    epoch.current = refreshEpoch;
+    if (dirty) setNotice('全局刷新未覆盖草稿；要丢弃修改，请使用“重新读取”。');
+    else void read();
+  }, [refreshEpoch]);
+  const adopt = (next: RuntimeConfig) => {setConfig(next); setDraft(next.settings); setReason(''); setError(''); setNotice(''); setBlocked(false);};
   async function read() {
     if (pending.current) return;
     pending.current = true; setBusy(true);
@@ -51,19 +59,23 @@ export default function RuntimeSettingsPage({guards, onDirtyChange, onBusyChange
       }
     } finally {pending.current = false; guards.writing.current = false; if (alive.current) setBusy(false);}
   }
-  return <section className="section-card">
+  return <section className="section-card" aria-busy={busy}>
     <h3>上游与流式响应超时</h3>
-    <p>单位：秒。无需重新编译或重启；新请求使用同一配置快照，包括重试和后备路由。版本：{config?.revision ?? '读取中'}</p>
+    <p>单位：秒。无需重新编译或重启；新请求使用同一配置快照，包括重试和后备路由。版本：{config?.revision ?? (busy ? '读取中' : '尚未读取')}</p>
     <p>供应商地址、模型映射、价格请使用对应后台页面；密钥和监听端口等启动安全参数不在此开放。</p>
+    {busy && <p role="status">{config ? '正在处理运行参数，请稍候…' : '正在读取运行参数…'}</p>}
+    {notice && <p role="status">{notice}</p>}
+    {config && <p className="muted">{dirty ? '有未保存草稿' : '当前参数已保存'}</p>}
     {error && <p role="alert">{error}</p>}
     {draft && <fieldset disabled={busy} style={{border: 0, padding: 0}}>
-      <div className="table-scroll"><table className="data-table"><thead><tr><th>参数</th><th>普通模型</th><th>思考模型</th><th>Claude</th></tr></thead>
-        <tbody>{timeoutFields.map(f => <tr key={f.key}><th>{f.label}（{f.min}–{f.max}）</th>{(['standard', 'reasoning', 'claude'] as const).map(group => <td key={group}>
+      <div className="table-scroll" tabIndex={0} role="region" aria-label="超时设置表（可横向滚动）"><table className="data-table"><caption className="sr-only">各模型超时设置，单位为秒，可横向滚动查看</caption><thead><tr><th scope="col">参数</th><th scope="col">普通模型</th><th scope="col">思考模型</th><th scope="col">Claude</th></tr></thead>
+        <tbody>{timeoutFields.map(f => <tr key={f.key}><th scope="row">{f.label}（{f.min}–{f.max}）</th>{(['standard', 'reasoning', 'claude'] as const).map(group => <td key={group}>
           <input aria-label={`${group} ${f.label}`} type="number" min={f.min} max={f.max} step="1" value={draft[group][f.key]} onChange={e => setDraft({...draft, [group]: {...draft[group], [f.key]: Number(e.target.value)}})}/>
         </td>)}</tr>)}</tbody></table></div>
       <label className="field">OpenAI 格式思考空闲（10–3600 秒；按目标模型请求上限截断）<input type="number" min="10" max="3600" value={draft.openai_reasoning_idle_secs} onChange={e => setDraft({...draft, openai_reasoning_idle_secs: Number(e.target.value)})}/></label>
       <label className="field">客户端保活间隔（1–25 秒）<input type="number" min="1" max="25" value={draft.keepalive_secs} onChange={e => setDraft({...draft, keepalive_secs: Number(e.target.value)})}/></label>
-      <label className="field">修改原因<input maxLength={1024} value={reason} onChange={e => setReason(e.target.value)}/></label>
+      <label className="field">修改原因<input maxLength={1024} aria-describedby="runtime-reason-hint" value={reason} onChange={e => setReason(e.target.value)}/></label>
+      <p id="runtime-reason-hint" className="field-hint">发布需填写修改原因，最多 1024 UTF-8 字节。</p>
     </fieldset>}
     {validation && <p role="alert">{validation}</p>}
     <div className="button-row"><button className="btn" disabled={busy} onClick={() => void reload()}>重新读取</button><button className="btn btn-primary" disabled={busy || blocked || !dirty || !draft || !!validation || !reason.trim()} onClick={() => void publish()}>发布运行参数</button></div>

@@ -53,6 +53,8 @@ class PortalBrowserTests(unittest.TestCase):
 
     def setUp(self):
         self.context = self.browser.new_context(viewport={'width': 1440, 'height': 1000})
+        self.context.route('**/*', lambda route: route.continue_()
+                           if route.request.url.startswith(self.origin + '/') else route.abort())
         self.page = self.context.new_page()
         self.errors = []
         self.calls = []
@@ -193,7 +195,7 @@ class PortalBrowserTests(unittest.TestCase):
                          dict(release, platform='macos', arch='arm64', url='/downloads/fixture-arm.dmg'),
                          dict(release, platform='macos', arch='x64', url='/downloads/fixture-x64.dmg')]}
         self.page.locator('#retry-releases').click()
-        # The status is hidden while loading too, so wait for the links, then check it.
+        # Wait for the links before checking the final, quiet success state.
         for key, url in [('windows-x64', '/downloads/fixture-win.exe'),
                          ('macos-arm64', '/downloads/fixture-arm.dmg'),
                          ('macos-x64', '/downloads/fixture-x64.dmg')]:
@@ -228,7 +230,7 @@ class PortalBrowserTests(unittest.TestCase):
         # A lockout's own wait is shown; with none given, the page must not invent one.
         for status, headers, text in [(400, {}, '验证未通过'), (429, {'Retry-After': '30'}, '30 秒'),
                                       (429, {'Retry-After': '900'}, '15 分钟'), (429, {}, '等待时间未知'),
-                                      (404, {}, '尚未开放'), (503, {}, '验证未通过')]:
+                                      (404, {}, '尚未开放'), (503, {}, '服务暂不可用')]:
             self.fail_action, self.fail_status, self.fail_headers = 'query', status, headers
             self.page.locator('#card').fill(CARD)
             self.page.locator('#verify').click()
@@ -339,7 +341,7 @@ class PortalBrowserTests(unittest.TestCase):
         # Keep the 250ms motion state deterministic on loaded CI runners. Scrolling past the
         # top stops the motion, so start from the top once any earlier scroll has settled.
         self.page.evaluate('window.scrollTo(0, 0)')
-        self.page.wait_for_function('window.scrollY === 0')
+        expect(self.page.locator('html')).to_have_js_property('scrollTop', 0)
         self.page.wait_for_timeout(200)
         self.page.clock.install()
         self.page.clock.pause_at(self.page.evaluate('Date.now() + 1000'))
@@ -473,6 +475,189 @@ class PortalBrowserTests(unittest.TestCase):
                 expect(message).not_to_contain_text(DEVICE)
                 expect(self.page.locator('#recovery')).to_be_hidden()
                 expect(self.page.locator('#verify-form')).to_be_visible()
+
+    def test_20_release_loading_and_retry_focus(self):
+        self.goto()
+        expect(self.page.locator('#retry-releases')).to_be_visible()
+        self.page.evaluate("""()=>{window.fetch=()=>new Promise(resolve=>{window.finishRelease=()=>resolve(new Response(JSON.stringify({releases:[]}),{status:200}));});}""")
+        self.page.locator('#retry-releases').click()
+        expect(self.page.locator('#release-status')).to_contain_text('正在获取发布信息')
+        expect(self.page.locator('#hero-release-status')).to_contain_text('正在获取发布信息')
+        expect(self.page.locator('#retry-releases')).to_be_visible()
+        expect(self.page.locator('#retry-releases')).to_be_disabled()
+        self.assert_disabled('windows-x64')
+        self.page.evaluate('window.finishRelease()')
+        expect(self.page.locator('#retry-releases')).to_be_enabled()
+        self.page.reload()
+        expect(self.page.locator('#retry-releases')).to_be_visible()
+        release = dict(platform='windows', arch='x64', version='1.2.3-test',
+                       url='/downloads/fixture-win.exe', sha256='ab' * 32,
+                       size=10485760, systemRequirements='Fixture OS', signature='unsigned')
+        self.manifest = {'releases': [release, dict(release, platform='macos', arch='arm64'),
+                                     dict(release, platform='macos', arch='x64')]}
+        self.page.locator('#retry-releases').click()
+        expect(self.page.locator('#retry-releases')).to_be_hidden()
+        expect(self.page.locator('.downloads [data-download="windows-x64"]')).to_be_focused()
+        # A slow refresh must not steal focus once the user has moved elsewhere.
+        ready = self.manifest
+        self.manifest = {'releases': []}
+        self.goto()
+        expect(self.page.locator('#retry-releases')).to_be_visible()
+        self.page.evaluate('''()=>{window.fetch=()=>new Promise(resolve=>{window.finishRelease=payload=>resolve(new Response(JSON.stringify(payload),{status:200}));});}''')
+        self.page.locator('#retry-releases').click()
+        link = self.page.locator('footer a[href="/docs"]')
+        link.focus()
+        self.page.evaluate('payload=>window.finishRelease(payload)', ready)
+        expect(self.page.locator('#retry-releases')).to_be_hidden()
+        expect(link).to_be_focused()
+
+    def test_21_empty_devices_explain_next_step(self):
+        self.query['boundDevices'] = []
+        self.page.set_viewport_size({'width': 320, 'height': 812})
+        self.goto('/device')
+        self.verify()
+        expect(self.page.locator('#bound-device')).to_contain_text('暂无已绑定设备')
+        expect(self.page.locator('#bound-device')).to_be_disabled()
+        expect(self.page.locator('#bound-device')).to_have_attribute('aria-describedby', 'device-help')
+        expect(self.page.locator('#device-help')).to_contain_text('无需解绑')
+        expect(self.page.locator('#device-help')).to_contain_text('新客户端验证')
+        self.assertEqual([action for action, _ in self.calls], ['query'])
+        self.screenshot('ux-empty-device-mobile.png')
+
+    def test_22_whitespace_card_and_query_recovery(self):
+        self.page.set_viewport_size({'width': 320, 'height': 812})
+        self.goto('/device')
+        self.page.locator('#card').fill('   ')
+        self.page.locator('#verify').click()
+        expect(self.page.locator('#device-message')).to_contain_text('请输入卡密')
+        expect(self.page.locator('#card')).to_have_attribute('aria-invalid', 'true')
+        expect(self.page.locator('#card')).to_be_focused()
+        self.assertEqual(self.calls, [])
+        self.page.locator('#card').fill(CARD)
+        self.assertIsNone(self.page.locator('#card').get_attribute('aria-invalid'))
+        self.page.evaluate("""()=>{window.fetch=()=>new Promise((resolve,reject)=>{window.failQuery=()=>reject(new TypeError('fixture offline'));});}""")
+        self.page.locator('#verify').click()
+        expect(self.page.locator('#card')).to_be_disabled()
+        expect(self.page.locator('#verify-form')).to_have_attribute('aria-busy', 'true')
+        self.page.evaluate('window.failQuery()')
+        expect(self.page.locator('#device-message')).to_contain_text('网络中断')
+        expect(self.page.locator('#card')).to_be_enabled()
+        expect(self.page.locator('#card')).to_be_focused()
+        expect(self.page.locator('#verify')).to_be_enabled()
+        self.screenshot('ux-query-error-mobile.png')
+
+    def test_23_docs_navigation_focus_and_skip_link(self):
+        self.page.set_viewport_size({'width': 320, 'height': 812})
+        self.goto('/docs')
+        self.page.locator('.docs-nav a[href="#models"]').click()
+        heading = self.page.locator('[data-doc="models"] h1')
+        expect(heading).to_be_focused()
+        expect(self.page).to_have_title('模型与积分 · Superkiro')
+        box = heading.bounding_box()
+        self.assertGreaterEqual(box['y'], 0)
+        self.assertLess(box['y'], 812)
+        self.page.locator('.skip').focus()
+        self.page.keyboard.press('Enter')
+        expect(self.page.locator('#main')).to_be_focused()
+        expect(self.page.locator('[data-doc="models"]')).to_be_visible()
+        self.assertTrue(self.page.url.endswith('#models'))
+        self.page.locator('.docs-nav a[href="#restore"]').click()
+        self.page.go_back()
+        expect(heading).to_be_focused()
+        expect(self.page).to_have_title('模型与积分 · Superkiro')
+        self.screenshot('ux-docs-mobile.png')
+
+    def test_24_mobile_menu_closes_on_escape_and_navigation(self):
+        self.page.set_viewport_size({'width': 320, 'height': 812})
+        self.goto('/')
+        menu = self.page.locator('.menu')
+        menu.click()
+        expect(menu).to_have_attribute('aria-label', '关闭导航菜单')
+        self.page.locator('#site-nav a').first.focus()
+        self.page.keyboard.press('Escape')
+        expect(menu).to_be_focused()
+        expect(menu).to_have_attribute('aria-expanded', 'false')
+        expect(menu).to_have_attribute('aria-label', '打开导航菜单')
+        expect(self.page.locator('#site-nav')).to_be_hidden()
+        menu.click()
+        self.page.locator('#site-nav a[href="/#downloads"]').click()
+        expect(menu).to_have_attribute('aria-expanded', 'false')
+        expect(self.page.locator('#site-nav')).to_be_hidden()
+        expect(self.page.locator('#downloads')).to_be_in_viewport()
+
+    def test_25_http_errors_without_json_remain_actionable(self):
+        for status, text in [(429, '30 秒'), (403, '凭证已失效或请求被拒绝'),
+                             (404, '尚未开放'), (503, '服务暂不可用')]:
+            with self.subTest(status=status):
+                self.goto('/device')
+                self.page.route('**/api/v1/portal/query', lambda r:
+                                r.fulfill(status=status, headers={'Retry-After': '30'},
+                                          content_type='text/html', body='<p>Fixture error</p>'))
+                self.page.locator('#card').fill(CARD)
+                self.page.locator('#verify').click()
+                expect(self.page.locator('#device-message')).to_contain_text(text)
+                expect(self.page.locator('#card')).to_be_focused()
+                expect(self.page.locator('#account')).to_be_hidden()
+                self.page.unroute('**/api/v1/portal/query')
+
+    def test_26_invalid_query_is_not_an_empty_account(self):
+        for payload in [None, {'success': True}, dict(self.query, boundDevices=[None])]:
+            with self.subTest(payload=payload):
+                self.goto('/device')
+                self.page.route('**/api/v1/portal/query', lambda r:
+                                r.fulfill(content_type='application/json', body=json.dumps(payload)))
+                self.page.locator('#card').fill(CARD)
+                self.page.locator('#verify').click()
+                expect(self.page.locator('#device-message')).to_contain_text('服务返回格式异常')
+                expect(self.page.locator('#account')).to_be_hidden()
+                expect(self.page.locator('#card')).to_be_focused()
+                self.page.unroute('**/api/v1/portal/query')
+
+    def test_27_pagehide_resets_busy_form_and_ignores_late_errors(self):
+        self.goto('/device')
+        self.page.evaluate("""()=>{window.fetch=()=>new Promise((resolve,reject)=>{window.failQuery=()=>reject(new TypeError('fixture offline'));});}""")
+        self.page.locator('#card').fill(CARD)
+        self.page.locator('#verify').click()
+        self.page.evaluate("dispatchEvent(new Event('pagehide'))")
+        expect(self.page.locator('#verify')).to_be_enabled()
+        expect(self.page.locator('#card')).to_be_enabled()
+        expect(self.page.locator('#device-message')).to_be_empty()
+        self.page.evaluate('''payload=>{window.fetch=()=>new Promise(resolve=>{window.finishQuery=()=>resolve(new Response(JSON.stringify(payload),{status:200}));});}''', self.query)
+        self.page.locator('#card').fill(CARD)
+        self.page.locator('#verify').click()
+        self.page.evaluate('''async()=>{window.failQuery();await new Promise(resolve=>setTimeout(resolve,0));}''')
+        expect(self.page.locator('#device-message')).to_contain_text('正在查询')
+        expect(self.page.locator('#verify')).to_be_disabled()
+        expect(self.page.locator('#card')).to_be_disabled()
+        expect(self.page.locator('#account')).to_be_hidden()
+        self.page.evaluate('window.finishQuery()')
+        expect(self.page.locator('#account')).to_be_visible()
+        expect(self.page.locator('#verify')).to_be_enabled()
+
+    def test_28_leaving_during_unbind_ignores_late_responses(self):
+        for pending in ['challenge', 'unbind']:
+            with self.subTest(pending=pending):
+                self.goto('/device')
+                self.verify()
+                self.page.evaluate("""pending=>{window.pendingActions=[];window.fetch=url=>{const action=url.split('/').pop();pendingActions.push(action);const result=action==='challenge'?{success:true,challengeToken:'fixture-token'}:{success:true,remainingDevices:[]};const reply=()=>new Response(JSON.stringify(result),{status:200});return action===pending?new Promise(resolve=>{window.finishPending=()=>resolve(reply());document.documentElement.pendingAction=action;}):Promise.resolve(reply());};}""", pending)
+                self.page.locator('#request-unbind').click()
+                self.page.locator('#confirm-unbind').click()
+                # Locator assertions retry without eval inside the page's CSP.
+                expect(self.page.locator('html')).to_have_js_property('pendingAction', pending)
+                self.page.evaluate("""async()=>{dispatchEvent(new Event('pagehide'));window.finishPending();await new Promise(resolve=>setTimeout(resolve,0));}""")
+                expect(self.page.locator('#recovery')).to_be_hidden()
+                expect(self.page.locator('#account')).to_be_hidden()
+                expect(self.page.locator('#device-message')).to_be_empty()
+                expect(self.page.locator('#verify')).to_be_enabled()
+                self.assertEqual(self.page.evaluate('window.pendingActions'),
+                                 ['challenge'] if pending == 'challenge' else ['challenge', 'unbind'])
+        self.goto('/device')
+        self.verify()
+        self.page.locator('#request-unbind').click()
+        self.page.evaluate("dispatchEvent(new Event('pagehide'))")
+        expect(self.page.locator('#confirm-dialog')).not_to_be_visible()
+        expect(self.page.locator('#verify')).to_be_enabled()
+        expect(self.page.locator('#masked-card')).to_be_empty()
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

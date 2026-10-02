@@ -8,7 +8,7 @@ import type {Intent, Tab} from './types';
 export interface Route {tab: Tab; params: Record<string, string>}
 
 const PATHS: Record<Tab, string> = {overview: 'overview', cards: 'cards', traces: 'traces', groups: 'groups', plans: 'plans', models: 'models',
-  runtime: 'runtime', templates: 'templates', providers: 'providers', announcements: 'announcements', reconciliation: 'finance', security: 'security'};
+  runtime: 'runtime', routing: 'routing', templates: 'templates', providers: 'providers', announcements: 'announcements', reconciliation: 'finance', security: 'security'};
 
 type Check = (value: string) => boolean;
 const text: Check = value => !!value && value.length <= 512 && !/[\x00-\x1f\x7f]/.test(value);

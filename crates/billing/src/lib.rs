@@ -51,8 +51,10 @@ pub use engine::{
     read_snapshot_anchor, verify_ledger_archive, verify_ledger_archive_with, ArchivedCardSummary,
     ArchivedLedgerPayload, ArchivedLedgerReceipt, ArchivedLedgerSummary, BalanceAdjustment,
     BillingEngine, BillingError, BillingSnapshot, CardReconciliation, CardUpgrade,
-    CompensatedRequest, IssuanceOrder, PendingSettlement, SnapshotAnchor,
-    SnapshotVerificationReport, UnpaidCharge, ValidityExtension,
+    CompensatedRequest, Complexity, ComplexityRoutingConfig, ComplexityRoutingState,
+    ComplexityRoutingUpdate, IssuanceOrder, PendingSettlement, RoutingBudget, RoutingClassifier,
+    RoutingDecision, RoutingMode, RoutingPolicy, SnapshotAnchor, SnapshotVerificationReport,
+    UnpaidCharge, ValidityExtension,
 };
 pub use generator::{export_csv, export_json, generate_batch, generate_card, GeneratedCard};
 pub use group::{FallbackTarget, Group, ModelMap, ProviderBindingMode};

@@ -92,6 +92,46 @@ fn random_delay(min: u32, max: u32) -> Result<u32, ring::error::Unspecified> {
     }
 }
 
+fn choose_index(selected: Option<u8>, count: usize) -> Result<usize, ring::error::Unspecified> {
+    debug_assert!(count > 0);
+    if let Some(index) = selected.map(usize::from) {
+        return (index < count)
+            .then_some(index)
+            .ok_or(ring::error::Unspecified);
+    }
+    if count == 1 {
+        Ok(0)
+    } else {
+        random_delay(0, (count - 1) as u32).map(|index| index as usize)
+    }
+}
+
+fn selected_content(
+    variant: &ResponseTemplateVariant,
+) -> Result<(&str, &str), ring::error::Unspecified> {
+    let index = choose_index(
+        variant.content_alternative_index,
+        1 + variant.content_alternatives.len(),
+    )?;
+    if index == 0 {
+        Ok((&variant.file_path, &variant.content))
+    } else {
+        let alternative = &variant.content_alternatives[index - 1];
+        Ok((&alternative.file_path, &alternative.content))
+    }
+}
+
+fn selected_message(
+    message: &billing::engine::ResponseTemplateMessage,
+) -> Result<(u8, &str), ring::error::Unspecified> {
+    let index = choose_index(message.selected_index, 1 + message.alternatives.len())?;
+    if index == 0 {
+        Ok((0, &message.text))
+    } else {
+        Ok((index as u8, &message.alternatives[index - 1]))
+    }
+}
+
 /// Only the current user turn can match; historical prompts and tool output cannot retrigger it.
 fn matching_variant<'a>(
     rules: &'a [ResponseTemplateRule],
@@ -465,15 +505,19 @@ pub(super) async fn respond(
     }
     let config = billing.response_template_config();
     let (rule, variant) = matching_variant(&config.rules, &user.content, model)?;
-    if variant.content.trim().is_empty() {
-        return Some(error_response(
-            StatusCode::BAD_REQUEST,
-            "ValidationException",
-            "命中的历史模板内容为空，请联系管理员修正；本次未调用上游或扣费。",
-        ));
-    }
+    let (file_path, content) = match selected_content(variant) {
+        Ok(content) if !content.1.trim().is_empty() => content,
+        Ok(_) => {
+            return Some(error_response(
+                StatusCode::BAD_REQUEST,
+                "ValidationException",
+                "命中的历史模板内容为空，请联系管理员修正；本次未调用上游或扣费。",
+            ));
+        }
+        Err(_) => return Some(encoding_error()),
+    };
     let tools = context.map(|ctx| ctx.tools.as_slice()).unwrap_or_default();
-    let Some((tool_name, input)) = file_tool(tools, &variant.file_path, &variant.content) else {
+    let Some((tool_name, input)) = file_tool(tools, file_path, content) else {
         return Some(error_response(
             StatusCode::BAD_REQUEST,
             "ValidationException",
@@ -495,12 +539,12 @@ pub(super) async fn respond(
         "[固定模板服务，非模型实时生成；不调用上游，token 用量为 0；本次写入指令收费 {:.6} 积分，回执不重复收费]\n{}\n准备向客户端发送 {} 的文件写入指令，尚未确认文件已创建。",
         variant.price_microcredits as f64 / 1_000_000.0,
         variant.preamble,
-        variant.file_path
+        file_path
     );
     let text = variant
         .delivery
         .as_ref()
-        .map(|d| render_message(&d.dispatch, &variant.file_path, variant.price_microcredits))
+        .map(|d| render_message(&d.dispatch, file_path, variant.price_microcredits))
         .unwrap_or(legacy_text);
     // Encode everything before the durable debit; even a response construction error is free.
     let bytes = match frames(
@@ -532,8 +576,14 @@ pub(super) async fn respond(
             Err(_) => return Some(encoding_error()),
         };
         let mut events = Vec::new();
+        let mut message_selections = Vec::with_capacity(delivery.messages.len());
         for m in &delivery.messages {
-            let text = render_message(&m.text, &variant.file_path, variant.price_microcredits);
+            let (message_index, message) = match selected_message(m) {
+                Ok(message) => message,
+                Err(_) => return Some(encoding_error()),
+            };
+            message_selections.push(message_index);
+            let text = render_message(message, file_path, variant.price_microcredits);
             let event =
                 match encode_event("assistantResponseEvent", &AssistantResponseEvent::new(text)) {
                     Ok(b) => b,
@@ -563,14 +613,15 @@ pub(super) async fn respond(
             card_id: card_id.into(),
             conversation_id: state.conversation_id.clone(),
             model_id: model.into(),
-            file_path: variant.file_path.clone(),
+            file_path: file_path.to_owned(),
             completion: variant.completion.clone(),
             tool_name: tool_name.clone(),
             path_key: tool_keys(&tool_name).unwrap().0.into(),
             content_key: tool_keys(&tool_name).unwrap().1.into(),
-            content: variant.content.clone(),
+            content: content.to_owned(),
             price_microcredits: variant.price_microcredits,
             delivery: variant.delivery.clone(),
+            message_selections,
             created_at_secs: 0,
         };
         let committed = DeliveryCommitted(Arc::new(AtomicBool::new(false)));
@@ -655,14 +706,15 @@ pub(super) async fn respond(
         card_id: card_id.into(),
         conversation_id: state.conversation_id.clone(),
         model_id: model.into(),
-        file_path: variant.file_path.clone(),
+        file_path: file_path.to_owned(),
         completion: variant.completion.clone(),
         tool_name: tool_name.clone(),
         path_key: tool_keys(&tool_name).expect("validated file tool").0.into(),
         content_key: tool_keys(&tool_name).expect("validated file tool").1.into(),
-        content: variant.content.clone(),
+        content: content.to_owned(),
         price_microcredits: variant.price_microcredits,
         delivery: None,
+        message_selections: vec![],
         created_at_secs: now,
     };
     let entry =
@@ -695,6 +747,8 @@ mod tests {
             model_id: model.into(),
             file_path: "index.html".into(),
             content: format!("<svg>{model}</svg>"),
+            content_alternatives: vec![],
+            content_alternative_index: None,
             preamble: String::new(),
             completion: String::new(),
             price_microcredits: 123_456,
