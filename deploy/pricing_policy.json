@@ -1,8 +1,8 @@
 {
-  "id": "kimera-gpt-cost015-retail025-claude035-20261003",
+  "id": "kimera-gpt-cost015-retail025-claude070-20261003",
   "credit_face_value_cny": 0.03,
-  "upstream_multiplier": 0.08,
-  "retail_multiplier": 0.35,
+  "upstream_multiplier": 0.13,
+  "retail_multiplier": 0.7,
   "tiers": [
     {
       "id": "tier-1000",
@@ -104,7 +104,7 @@
     ]
   },
   "provider_upstream_multipliers": {
-    "kimera-primary": 0.08,
+    "kimera-primary": 0.13,
     "kimera-direct": 0.15,
     "hanyue-max": 0.22,
     "88888ai-claude": 1.0

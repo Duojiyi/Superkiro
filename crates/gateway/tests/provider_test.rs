@@ -478,6 +478,10 @@ fn gpt6_astra_medium_effort_uses_compatible_upstream_value() {
     let body = OpenAiProvider.translate_request(&request).unwrap();
     assert_eq!(body["reasoning_effort"], "high");
 
+    request.model = "openai/gpt-6-astra".into();
+    let body = OpenAiProvider.translate_request(&request).unwrap();
+    assert_eq!(body["reasoning_effort"], "high");
+
     request.model = "gpt-5.6-sol".into();
     let body = OpenAiProvider.translate_request(&request).unwrap();
     assert_eq!(body["reasoning_effort"], "medium");

@@ -104,6 +104,13 @@ fn normalized(model: &str) -> String {
     name.rsplit('/').next().unwrap_or(&name).to_string()
 }
 
+/// Kimera's Astra endpoint accepts `high` for the otherwise advertised `medium` effort.
+/// Keep this check aligned with the family table so provider prefixes are handled too.
+pub fn is_gpt6_astra(model: &str) -> bool {
+    let name = normalized(model);
+    name.strip_prefix("openai-").unwrap_or(&name) == "gpt-6-astra"
+}
+
 /// The family of the model a request is sent to, from its name as an upstream knows it:
 /// `claude-opus-4-7`, `claude-sonnet-4.6`, `anthropic/claude-opus-5-5`, `o3-mini`, ...
 pub fn family(model: &str) -> ModelFamily {

@@ -853,7 +853,6 @@ async fn empty_completed_stream_releases_credits_and_allows_retry() {
             credit_multiplier: 1.0,
             margin_multiplier: 1.0,
             billing_multiplier: 1.0,
-            billing_multiplier: 1.0,
             model: Some("claude-3-5-sonnet".to_string()),
         };
         billing

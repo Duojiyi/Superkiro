@@ -208,12 +208,16 @@ impl ModelMap {
             (Some(actual), Some(threshold)) => effort_rank(actual) >= effort_rank(threshold),
             _ => false,
         };
-        let thinking = thinking_on
-            .then_some(thinking_multiplier.unwrap_or(1.0))
-            .unwrap_or(1.0);
-        let context = (context_threshold.is_some_and(|threshold| input_tokens > threshold))
-            .then_some(context_multiplier.unwrap_or(1.0))
-            .unwrap_or(1.0);
+        let thinking = if thinking_on {
+            thinking_multiplier.unwrap_or(1.0)
+        } else {
+            1.0
+        };
+        let context = if context_threshold.is_some_and(|threshold| input_tokens > threshold) {
+            context_multiplier.unwrap_or(1.0)
+        } else {
+            1.0
+        };
         (thinking * context).max(1.0)
     }
 

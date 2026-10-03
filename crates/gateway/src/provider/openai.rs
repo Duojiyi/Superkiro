@@ -179,7 +179,7 @@ impl ModelProvider for OpenAiProvider {
             // on full Kiro requests, while the same route accepts the equivalent high
             // effort request. Keep the client/billing effort unchanged and normalize only
             // the upstream wire value for this one compatibility quirk.
-            let effort = if req.model.eq_ignore_ascii_case("gpt-6-astra") && effort == Medium {
+            let effort = if super::family::is_gpt6_astra(&req.model) && effort == Medium {
                 High
             } else {
                 effort

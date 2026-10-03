@@ -15,6 +15,7 @@ def setUpModule():
     original_policy = script.POLICY
     legacy = copy.deepcopy(original_policy)
     legacy['retail_multiplier'] = 0.24
+    legacy['upstream_multiplier'] = 0.08
     legacy['provider_upstream_multipliers'] = {
         'kimera-primary': 0.08, 'kimera-direct': 0.06, 'hanyue-max': 0.22}
     legacy['priced_as'] = {'claude-opus-5-5': 'claude-opus-5'}
@@ -263,7 +264,8 @@ class RouteCostTests(unittest.TestCase):
 
 
 class MigrateTests(unittest.TestCase):
-    before = config([mapping('claude-opus-5')], [live_version('claude-opus-5')])
+    def setUp(self):
+        self.before = config([mapping('claude-opus-5')], [live_version('claude-opus-5')])
 
     def test_publishes_revision_checked_reads_back_and_waits_for_activation(self):
         update, _ = script.publication(self.before, script.POLICY, 1000, 1030)

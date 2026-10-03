@@ -1,11 +1,11 @@
 # Kimera retail policy
 
-Current policy: `kimera-gpt-cost015-retail025-claude035-20261003`.
+Current policy: `kimera-gpt-cost015-retail025-claude070-20261003`.
 
 | Model family | Kimera cost multiplier | Retail multiplier |
 | --- | ---: | ---: |
 | GPT (gpt-6-astra, gpt-5.6-sol; terra retired) | 0.15 | 0.25 |
-| Claude | 0.08 | 0.35 |
+| Claude | 0.13 | 0.70 |
 
 `pricing_policy.json` keeps the default retail multiplier plus explicit `model_retail_multipliers`. Retail overrides follow the exposed model, not a mutable provider route. Cost multipliers remain provider-specific. Opus 5.5 retains its approved Opus 5 pricing alias; retired Hanyue historical cost metadata is not a live Kimera cost basis.
 
