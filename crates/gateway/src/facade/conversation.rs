@@ -647,6 +647,33 @@ impl GenerateAssistantResponseHandler {
                 // the limit, the upstream's report of an overflow, which Kiro compacts for
                 // just the same, decides. Refused on the estimate alone, Chinese-heavy
                 // conversations that fit were compacted, and each compaction is billed.
+                let billing_multiplier =
+                    claims
+                        .as_ref()
+                        .and_then(|claims| {
+                            self.billing
+                                .list_models_for_group(&claims.group_id, false)
+                                .into_iter()
+                                .find(|m| m.matches_model(requested_model_for_reservation))
+                        })
+                        .map(|model| {
+                            model.billing_multiplier(
+                                request_for_reservation
+                                    .and_then(|request| request.reasoning_effort())
+                                    .map(|effort| {
+                                        match effort {
+                            kiro_wire::requests::conversation::ReasoningEffort::Low => "low",
+                            kiro_wire::requests::conversation::ReasoningEffort::Medium => "medium",
+                            kiro_wire::requests::conversation::ReasoningEffort::High => "high",
+                            kiro_wire::requests::conversation::ReasoningEffort::Xhigh => "xhigh",
+                            kiro_wire::requests::conversation::ReasoningEffort::Max => "max",
+                        }
+                                    }),
+                                estimated_input_tokens,
+                            )
+                        })
+                        .unwrap_or(1.0);
+
                 if estimated_input_tokens > input_limit.saturating_mul(ESTIMATE_ERROR) {
                     self.record_refusal(
                         claims.as_ref(),
@@ -674,6 +701,7 @@ impl GenerateAssistantResponseHandler {
                     output_rate_per_m: 60_000_000,
                     credit_multiplier: 1.0,
                     margin_multiplier: 1.0,
+                    billing_multiplier,
                     model: Some(requested_model_for_reservation.to_string()),
                 };
 

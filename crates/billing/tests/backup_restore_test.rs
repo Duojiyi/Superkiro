@@ -64,6 +64,7 @@ fn test_t07_verify_snapshot_integrity_clean_state() {
         output_rate_per_m: 30_000_000,
         credit_multiplier: 1.0,
         margin_multiplier: 1.0,
+        billing_multiplier: 1.0,
         model: None,
     };
     engine

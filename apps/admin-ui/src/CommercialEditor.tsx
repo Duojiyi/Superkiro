@@ -145,17 +145,17 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
     const chosen = backups[index];
     if (chosen) updateFields({target_provider_id: chosen.provider_id, target_model: chosen.target_model, fallback_chain: backups.map((backup, i) => i === index ? primary : backup)});
   };
-  const numericFields = ['virtual_usage_limit', 'margin_multiplier', 'context_window', 'max_output', 'credit_multiplier', 'rate_multiplier'];
+  const numericFields = ['virtual_usage_limit', 'margin_multiplier', 'context_window', 'max_output', 'credit_multiplier', 'rate_multiplier', 'thinking_surcharge_multiplier', 'context_surcharge_multiplier'];
   // Shown in the customer's model list; left empty, the server derives them.
-  const optionalFields = ['display_name', 'description', 'rate_multiplier'];
-  const tokenFields = ['context_window', 'max_output'];
+  const optionalFields = ['display_name', 'description', 'rate_multiplier', 'thinking_surcharge_multiplier', 'thinking_surcharge_threshold', 'context_surcharge_multiplier', 'context_surcharge_threshold'];
+  const tokenFields = ['context_window', 'max_output', 'context_surcharge_threshold'];
   const checkFields = ['issuance_enabled', 'visible', 'supports_tools', 'supports_vision', 'supports_reasoning'];
-  const fields = kind === 'groups' ? ['name', 'issuance_enabled', 'virtual_plan_name', 'virtual_usage_limit', 'rate_card_id', 'margin_multiplier'] : ['exposed_model_id', 'aliases', 'display_name', 'description', 'rate_multiplier', 'target_provider_id', 'target_model', 'group_id', 'context_window', 'max_output', 'credit_multiplier', 'visible', 'supports_tools', 'supports_vision', 'supports_reasoning'];
-  const labels: Record<string, string> = {name: '名称', issuance_enabled: '可发新卡', virtual_plan_name: '对外套餐名', virtual_usage_limit: '显示用量上限', rate_card_id: '价格表', margin_multiplier: '分组倍率', exposed_model_id: '模型 ID', aliases: '别名', target_provider_id: '供应商', target_model: '上游模型', group_id: '分组', context_window: '上下文', max_output: '最大输出', credit_multiplier: '模型倍率', display_name: '显示名称', description: '说明', rate_multiplier: '显示倍率', visible: '客户可见', supports_tools: '工具', supports_vision: '图片', supports_reasoning: '推理'};
+  const fields = kind === 'groups' ? ['name', 'issuance_enabled', 'virtual_plan_name', 'virtual_usage_limit', 'rate_card_id', 'margin_multiplier'] : ['exposed_model_id', 'aliases', 'display_name', 'description', 'rate_multiplier', 'target_provider_id', 'target_model', 'group_id', 'context_window', 'max_output', 'credit_multiplier', 'thinking_surcharge_multiplier', 'thinking_surcharge_threshold', 'context_surcharge_multiplier', 'context_surcharge_threshold', 'visible', 'supports_tools', 'supports_vision', 'supports_reasoning'];
+  const labels: Record<string, string> = {name: '名称', issuance_enabled: '可发新卡', virtual_plan_name: '对外套餐名', virtual_usage_limit: '显示用量上限', rate_card_id: '价格表', margin_multiplier: '分组倍率', exposed_model_id: '模型 ID', aliases: '别名', target_provider_id: '供应商', target_model: '上游模型', group_id: '分组', context_window: '上下文', max_output: '最大输出', credit_multiplier: '模型倍率', display_name: '显示名称', description: '说明', rate_multiplier: '显示倍率', thinking_surcharge_multiplier: '思考倍率', thinking_surcharge_threshold: '思考阈值', context_surcharge_multiplier: '长上下文倍率', context_surcharge_threshold: '长上下文阈值', visible: '客户可见', supports_tools: '工具', supports_vision: '图片', supports_reasoning: '推理'};
   // Accessible names the tests and screen readers already know; each contains its visible label.
   const ariaLabels: Record<string, string> = {context_window: '上下文长度', max_output: '最大输出', margin_multiplier: '分组倍率', credit_multiplier: '模型倍率'};
-  const tips: Record<string, string> = {issuance_enabled: '关闭后不能再发新卡，已发的卡不受影响', margin_multiplier: '这个分组的卡按它加倍扣费，与模型倍率、版本倍率相乘；不加倍填 1', virtual_plan_name: '客户端显示的套餐名，与发卡套餐无关', virtual_usage_limit: '只在客户端显示，不是卡内积分', rate_multiplier: 'Kiro 的模型列表里给客户看的倍率，只影响显示，不影响扣费；留空按价格自动换算', aliases: '客户用这些 ID 请求时也由这个模型服务，多个用逗号隔开', credit_multiplier: '这个模型自己的倍率，与分组倍率、版本倍率相乘；不加倍填 1', target_model: '可从列表选，也可直接输入'};
-  const placeholders: Record<string, string> = {display_name: '留空用模型 ID', aliases: '如 claude-sonnet-latest', description: '留空自动生成', rate_multiplier: '如 1.3，留空自动换算', context_window: '如 272K', max_output: '如 128K', target_model: '选择或输入'};
+  const tips: Record<string, string> = {issuance_enabled: '关闭后不能再发新卡，已发的卡不受影响', margin_multiplier: '这个分组的卡按它加倍扣费，与模型倍率、版本倍率相乘；不加倍填 1', virtual_plan_name: '客户端显示的套餐名，与发卡套餐无关', virtual_usage_limit: '只在客户端显示，不是卡内积分', thinking_surcharge_multiplier: '达到思考阈值后按此倍率扣费；留空关闭', thinking_surcharge_threshold: 'low/medium/high/xhigh/max/ultra；留空使用系列默认值', context_surcharge_multiplier: '超过长上下文阈值后按此倍率扣费；留空关闭', context_surcharge_threshold: '超过此输入 Tokens 后触发；留空使用系列默认值', rate_multiplier: 'Kiro 的模型列表里给客户看的倍率，只影响显示，不影响扣费；留空按价格自动换算', aliases: '客户用这些 ID 请求时也由这个模型服务，多个用逗号隔开', credit_multiplier: '这个模型自己的倍率，与分组倍率、版本倍率相乘；不加倍填 1', target_model: '可从列表选，也可直接输入'};
+  const placeholders: Record<string, string> = {display_name: '留空用模型 ID', aliases: '如 claude-sonnet-latest', description: '留空自动生成', rate_multiplier: '如 1.3，留空自动换算', thinking_surcharge_multiplier: '如 3，留空关闭', thinking_surcharge_threshold: '如 max，留空使用默认', context_surcharge_multiplier: '如 2，留空关闭', context_surcharge_threshold: '如 272K，留空使用默认', context_window: '如 272K', max_output: '如 128K', target_model: '选择或输入'};
   // An unpublished draft survives a session end, restored only onto the configuration it
   // was made from; the draft holds no secret.
   const draftKey = `admin-commercial-draft:v1:${kind}`;
@@ -473,7 +473,7 @@ export default function CommercialEditor({ kind, onDirtyChange, onBusyChange, ca
       </>;
     }
     const token = tokenFields.includes(field);
-    const multiplier = ['margin_multiplier', 'credit_multiplier'].includes(field);
+    const multiplier = ['margin_multiplier', 'credit_multiplier', 'thinking_surcharge_multiplier', 'context_surcharge_multiplier'].includes(field);
     const input = <input aria-label={aria} placeholder={placeholders[field]} type={numericFields.includes(field) && !token ? 'number' : 'text'} step={token ? '1' : 'any'}
       value={String(selectedRow[field] ?? '')}
       onChange={event => updateField(field, optionalFields.includes(field) && !event.target.value.trim() ? null : token ? parseTokenInput(event.target.value) : numericFields.includes(field) && event.target.value.trim() ? Number(event.target.value) : event.target.value)}/>;

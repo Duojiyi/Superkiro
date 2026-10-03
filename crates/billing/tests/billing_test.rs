@@ -18,6 +18,7 @@ fn default_estimate_params() -> ReservationEstimateParams {
         output_rate_per_m: 60_000_000, // 60 credits / 1M
         credit_multiplier: 1.0,
         margin_multiplier: 1.0,
+        billing_multiplier: 1.0,
         model: None,
     }
 }

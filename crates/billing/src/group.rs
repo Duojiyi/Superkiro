@@ -105,6 +105,16 @@ pub struct ModelMap {
     pub supports_vision: bool,
     pub supports_reasoning: bool,
     pub credit_multiplier: f64,
+    /// Optional request-specific surcharge when reasoning reaches this effort.
+    #[serde(default)]
+    pub thinking_surcharge_multiplier: Option<f64>,
+    #[serde(default)]
+    pub thinking_surcharge_threshold: Option<String>,
+    /// Optional request-specific surcharge when estimated input exceeds this token count.
+    #[serde(default)]
+    pub context_surcharge_multiplier: Option<f64>,
+    #[serde(default)]
+    pub context_surcharge_threshold: Option<u64>,
     pub visible: bool,
     pub sort_order: i32,
     #[serde(default)]
@@ -156,6 +166,10 @@ impl ModelMap {
             supports_vision: true,
             supports_reasoning: false,
             credit_multiplier: 1.0,
+            thinking_surcharge_multiplier: None,
+            thinking_surcharge_threshold: None,
+            context_surcharge_multiplier: None,
+            context_surcharge_threshold: None,
             visible: true,
             sort_order: 0,
             aliases: Vec::new(),
@@ -165,6 +179,42 @@ impl ModelMap {
             rate_multiplier: None,
             retired: false,
         }
+    }
+
+    /// Resolve the optional request surcharge. Built-in defaults keep the initial FABLE/GPT
+    /// rollout enabled while every other model remains at 1x; published fields override them.
+    pub fn billing_multiplier(&self, effort: Option<&str>, input_tokens: u64) -> f64 {
+        let fable = self.exposed_model_id.starts_with("claude-fable-")
+            || self.target_model.starts_with("claude-fable-");
+        let gpt =
+            self.exposed_model_id.starts_with("gpt-") || self.target_model.starts_with("gpt-");
+        let thinking_threshold = self
+            .thinking_surcharge_threshold
+            .as_deref()
+            .or(fable.then_some("max"));
+        let thinking_multiplier = self.thinking_surcharge_multiplier.or(fable.then_some(3.0));
+        let context_threshold = self.context_surcharge_threshold.or(gpt.then_some(272_000));
+        let context_multiplier = self.context_surcharge_multiplier.or(gpt.then_some(2.0));
+        let effort_rank = |value: &str| match value.to_ascii_lowercase().as_str() {
+            "low" => 0,
+            "medium" => 1,
+            "high" => 2,
+            "xhigh" => 3,
+            "max" => 4,
+            "ultra" => 5,
+            _ => -1,
+        };
+        let thinking_on = match (effort, thinking_threshold) {
+            (Some(actual), Some(threshold)) => effort_rank(actual) >= effort_rank(threshold),
+            _ => false,
+        };
+        let thinking = thinking_on
+            .then_some(thinking_multiplier.unwrap_or(1.0))
+            .unwrap_or(1.0);
+        let context = (context_threshold.is_some_and(|threshold| input_tokens > threshold))
+            .then_some(context_multiplier.unwrap_or(1.0))
+            .unwrap_or(1.0);
+        (thinking * context).max(1.0)
     }
 
     /// Whether customers see the model: visible and not retired.
@@ -203,5 +253,46 @@ impl ModelMap {
         });
         targets.extend(self.fallback_chain.clone());
         targets
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ModelMap;
+
+    fn model(id: &str) -> ModelMap {
+        ModelMap::new("m", "g", id, "p", id)
+    }
+
+    #[test]
+    fn fable_max_effort_is_three_times_and_other_efforts_are_normal() {
+        let m = model("claude-fable-5");
+        assert_eq!(m.billing_multiplier(Some("high"), 1), 1.0);
+        assert_eq!(m.billing_multiplier(Some("max"), 1), 3.0);
+        assert_eq!(m.billing_multiplier(Some("ultra"), 1), 3.0);
+    }
+
+    #[test]
+    fn gpt_context_threshold_is_strictly_greater_than_272k() {
+        let m = model("gpt-6-astra");
+        assert_eq!(m.billing_multiplier(None, 272_000), 1.0);
+        assert_eq!(m.billing_multiplier(None, 272_001), 2.0);
+    }
+
+    #[test]
+    fn unrelated_models_are_not_surcharged() {
+        let m = model("claude-sonnet");
+        assert_eq!(m.billing_multiplier(Some("max"), 1_000_000), 1.0);
+    }
+
+    #[test]
+    fn published_overrides_are_generic_and_composable() {
+        let mut m = model("custom-model");
+        m.thinking_surcharge_threshold = Some("high".into());
+        m.thinking_surcharge_multiplier = Some(1.5);
+        m.context_surcharge_threshold = Some(100);
+        m.context_surcharge_multiplier = Some(2.0);
+        assert_eq!(m.billing_multiplier(Some("max"), 101), 3.0);
+        assert_eq!(m.billing_multiplier(Some("medium"), 101), 2.0);
     }
 }

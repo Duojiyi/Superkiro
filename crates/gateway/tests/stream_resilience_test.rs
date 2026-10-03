@@ -104,6 +104,7 @@ async fn test_t06_ttfb_timeout_releases_reservation() {
         output_rate_per_m: 60_000_000,
         credit_multiplier: 1.0,
         margin_multiplier: 1.0,
+        billing_multiplier: 1.0,
         model: Some("claude-3-5-sonnet".to_string()),
     };
     let _res = billing
@@ -183,6 +184,7 @@ async fn test_t06_partial_text_then_eof_without_usage_settles_and_fails_idempote
         output_rate_per_m: 60_000_000,
         credit_multiplier: 1.0,
         margin_multiplier: 1.0,
+        billing_multiplier: 1.0,
         model: Some("claude-3-5-sonnet".to_string()),
     };
     let _res = billing
@@ -274,6 +276,7 @@ async fn test_t06_error_after_usage_settles_actual_usage() {
         output_rate_per_m: 60_000_000,
         credit_multiplier: 1.0,
         margin_multiplier: 1.0,
+        billing_multiplier: 1.0,
         model: Some("claude-3-5-sonnet".to_string()),
     };
     let _res = billing
@@ -375,6 +378,7 @@ async fn test_t06_clean_stream_done_settles_and_commits_idempotency() {
         output_rate_per_m: 60_000_000,
         credit_multiplier: 1.0,
         margin_multiplier: 1.0,
+        billing_multiplier: 1.0,
         model: Some("claude-3-5-sonnet".to_string()),
     };
     let _res = billing
@@ -475,6 +479,7 @@ async fn test_t06_duplicate_done_events_are_idempotent() {
         output_rate_per_m: 60_000_000,
         credit_multiplier: 1.0,
         margin_multiplier: 1.0,
+        billing_multiplier: 1.0,
         model: Some("claude-3-5-sonnet".to_string()),
     };
     let _res = billing
@@ -548,6 +553,7 @@ async fn test_t06_client_disconnect_settles_and_aborts() {
         output_rate_per_m: 60_000_000,
         credit_multiplier: 1.0,
         margin_multiplier: 1.0,
+        billing_multiplier: 1.0,
         model: Some("claude-3-5-sonnet".to_string()),
     };
     let _res = billing
@@ -642,6 +648,7 @@ async fn test_t06_cold_restart_recovers_unsettled_reservations() {
         output_rate_per_m: 60_000_000,
         credit_multiplier: 1.0,
         margin_multiplier: 1.0,
+        billing_multiplier: 1.0,
         model: Some("claude-3-5-sonnet".to_string()),
     };
     let _res = billing
@@ -683,6 +690,7 @@ async fn test_t06_malformed_sse_error_settles_and_fails_idempotency() {
         output_rate_per_m: 60_000_000,
         credit_multiplier: 1.0,
         margin_multiplier: 1.0,
+        billing_multiplier: 1.0,
         model: Some("claude-3-5-sonnet".to_string()),
     };
     let _res = billing
@@ -773,6 +781,7 @@ async fn test_t06_concurrent_retry_conflict_and_settlement_io_fault() {
         output_rate_per_m: 60_000_000,
         credit_multiplier: 1.0,
         margin_multiplier: 1.0,
+        billing_multiplier: 1.0,
         model: Some("claude-3-5-sonnet".to_string()),
     };
 
@@ -843,6 +852,8 @@ async fn empty_completed_stream_releases_credits_and_allows_retry() {
             output_rate_per_m: 60_000_000,
             credit_multiplier: 1.0,
             margin_multiplier: 1.0,
+            billing_multiplier: 1.0,
+            billing_multiplier: 1.0,
             model: Some("claude-3-5-sonnet".to_string()),
         };
         billing
@@ -932,6 +943,7 @@ async fn completed_tool_invocation_settles_once_and_replay_is_rejected() {
         output_rate_per_m: 60_000_000,
         credit_multiplier: 1.0,
         margin_multiplier: 1.0,
+        billing_multiplier: 1.0,
         model: Some("claude-3-5-sonnet".to_string()),
     };
     billing
@@ -1014,6 +1026,7 @@ async fn send_backpressure_deadline_drops_upstream_settles_once_and_releases_per
         output_rate_per_m: 60_000_000,
         credit_multiplier: 1.0,
         margin_multiplier: 1.0,
+        billing_multiplier: 1.0,
         model: Some("claude-3-5-sonnet".to_string()),
     };
     billing
@@ -1399,6 +1412,7 @@ async fn a_streamed_response_records_its_time_to_first_output() {
         output_rate_per_m: 60_000_000,
         credit_multiplier: 1.0,
         margin_multiplier: 1.0,
+        billing_multiplier: 1.0,
         model: Some("claude-3-5-sonnet".to_string()),
     };
     billing

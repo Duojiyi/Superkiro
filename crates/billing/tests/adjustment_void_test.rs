@@ -679,6 +679,7 @@ fn test_reserve_and_settle_persistence_failure_leaves_memory_untouched() {
         output_rate_per_m: 60_000_000,
         credit_multiplier: 1.0,
         margin_multiplier: 1.0,
+        billing_multiplier: 1.0,
         model: None,
     };
 

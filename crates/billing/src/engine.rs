@@ -2607,13 +2607,15 @@ impl BillingEngine {
             let rcv = self
                 .resolve_price(rate_card_id, &models, now_secs)
                 .ok_or_else(|| BillingError::ModelNotPriced(model.clone()))?;
-            let amt = rcv.calculate_reserve_amount(
+            let amt = (rcv.calculate_reserve_amount(
                 params.estimated_input_tokens,
                 params.max_output_tokens,
                 group_margin,
                 model_multiplier,
                 &settings,
-            );
+            ) as f64
+                * params.billing_multiplier)
+                .ceil() as i64;
             // The routes that may serve it, whose costs its settlement reads.
             let routes: Vec<(String, String)> = model_map
                 .map(|m| {
@@ -2626,6 +2628,7 @@ impl BillingEngine {
             let pricing = LockedPricing {
                 group_margin,
                 model_multiplier,
+                billing_multiplier: params.billing_multiplier,
                 settings: settings.for_routes(&routes, model),
                 routes: routes
                     .iter()
@@ -2861,33 +2864,40 @@ impl BillingEngine {
         // flight changes neither its price version nor these. It is costed at them too,
         // unless the route that served it could not serve it then.
         let served = format!("{provider_id}/{target_model}");
-        let (group_margin, model_multiplier, settings, route_settings) = match locked_pricing {
-            Some(locked) => {
-                let route_settings = (!locked.routes.is_empty()
-                    && !locked.routes.contains(&served))
-                .then(|| candidate.settings.clone());
-                (
-                    locked.group_margin,
-                    locked.model_multiplier,
-                    locked.settings,
-                    route_settings,
-                )
-            }
-            None => (
-                group_margin,
-                model_multiplier,
-                candidate.settings.clone(),
-                None,
-            ),
-        };
+        let (group_margin, model_multiplier, billing_multiplier, settings, route_settings) =
+            match locked_pricing {
+                Some(locked) => {
+                    let route_settings = (!locked.routes.is_empty()
+                        && !locked.routes.contains(&served))
+                    .then(|| candidate.settings.clone());
+                    (
+                        locked.group_margin,
+                        locked.model_multiplier,
+                        locked.billing_multiplier,
+                        locked.settings,
+                        route_settings,
+                    )
+                }
+                None => (
+                    group_margin,
+                    model_multiplier,
+                    1.0,
+                    candidate.settings.clone(),
+                    None,
+                ),
+            };
         let (charge, mut cost_micro_cny, version_id) = if let Some(ref rcv) = resolved_rcv {
             let cost = rcv.calculate_cost_micro_cny(tokens, &settings);
-            let charge = rcv.calculate_charge(tokens, group_margin, model_multiplier, &settings);
+            let charge = (rcv.calculate_charge(tokens, group_margin, model_multiplier, &settings)
+                as f64
+                * billing_multiplier)
+                .ceil() as i64;
             (charge, cost, Some(rcv.id.clone()))
         } else {
             let rates_read = self.rates.read().unwrap();
             let model_rate = rates_read.get(exposed_model).unwrap_or(&self.default_rates);
-            let charge = model_rate.calculate_charge(tokens);
+            let charge =
+                (model_rate.calculate_charge(tokens) as f64 * billing_multiplier).ceil() as i64;
             let cost = crate::ledger::ceil_nonnegative_to_i64(
                 (tokens.uncached_input_tokens as f64 * 15.0
                     + tokens.cache_creation_tokens as f64 * 15.0

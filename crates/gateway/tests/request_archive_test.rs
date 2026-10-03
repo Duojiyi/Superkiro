@@ -106,6 +106,7 @@ async fn an_administrator_reads_a_request_and_the_models_reply_for_24_hours() {
         output_rate_per_m: 60_000_000,
         credit_multiplier: 1.0,
         margin_multiplier: 1.0,
+        billing_multiplier: 1.0,
         model: Some("claude-opus-5".to_string()),
     };
     billing

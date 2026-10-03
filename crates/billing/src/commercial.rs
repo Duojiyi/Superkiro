@@ -446,6 +446,12 @@ impl BillingEngine {
                     .as_deref()
                     .is_some_and(|text_| !text(text_, 256))
                 || m.rate_multiplier.is_some_and(|rate| !positive(rate))
+                || m.thinking_surcharge_multiplier
+                    .is_some_and(|v| !positive(v))
+                || m.context_surcharge_multiplier.is_some_and(|v| !positive(v))
+                || m.thinking_surcharge_threshold.as_deref().is_some_and(|v| {
+                    !matches!(v, "low" | "medium" | "high" | "xhigh" | "max" | "ultra")
+                })
                 || !ids.insert(("map", m.id.clone()))
             {
                 return Err(invalid("Invalid or duplicate model mapping"));

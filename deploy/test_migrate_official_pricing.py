@@ -15,6 +15,8 @@ def setUpModule():
     original_policy = script.POLICY
     legacy = copy.deepcopy(original_policy)
     legacy['retail_multiplier'] = 0.24
+    legacy['provider_upstream_multipliers'] = {
+        'kimera-primary': 0.08, 'kimera-direct': 0.06, 'hanyue-max': 0.22}
     legacy['priced_as'] = {'claude-opus-5-5': 'claude-opus-5'}
     legacy.pop('model_retail_multipliers', None)
     script.POLICY = legacy

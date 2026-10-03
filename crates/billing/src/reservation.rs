@@ -8,6 +8,10 @@ use crate::ledger::ceil_nonnegative_to_i64;
 use crate::rate_card::BillingSettings;
 use serde::{Deserialize, Serialize};
 
+fn one_multiplier() -> f64 {
+    1.0
+}
+
 /// Lifecycle states of a credit reservation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -28,6 +32,8 @@ pub struct ReservationEstimateParams {
     pub output_rate_per_m: i64,
     pub credit_multiplier: f64,
     pub margin_multiplier: f64,
+    /// Frozen request-specific surcharge multiplier.
+    pub billing_multiplier: f64,
     pub model: Option<String>,
 }
 
@@ -40,6 +46,7 @@ impl ReservationEstimateParams {
             output_rate_per_m: 60_000_000,
             credit_multiplier: 1.0,
             margin_multiplier: 1.0,
+            billing_multiplier: 1.0,
             model: None,
         }
     }
@@ -69,6 +76,8 @@ impl ReservationEstimateParams {
 pub struct LockedPricing {
     pub group_margin: f64,
     pub model_multiplier: f64,
+    #[serde(default = "one_multiplier")]
+    pub billing_multiplier: f64,
     pub settings: BillingSettings,
     /// The routes, `<provider>/<upstream model>`, that could serve it when it was reserved:
     /// its mapping's primary and fallbacks, whose costs `settings` keeps. Empty for a request
