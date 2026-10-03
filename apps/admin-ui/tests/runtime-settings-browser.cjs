@@ -118,11 +118,18 @@ const server = http.createServer(async (req, res) => {
     await button('刷新').click();await page.getByRole('status').filter({hasText:'全局刷新未覆盖草稿'}).waitFor();
     assert.equal(await reason.inputValue(),'keep draft on global refresh');assert.equal(await keepalive.inputValue(),'22');
     await button('重新读取').click();await accept();await saved();
+    config={...config,revision:'runtime:v1:'+ 'a'.repeat(64)};
+    await button('重新读取').click();await page.locator('.page-inner p').filter({hasText:config.revision}).waitFor();
     await page.setViewportSize({width:390,height:844});
     await page.getByRole('region',{name:'超时设置表（可横向滚动）'}).focus();
     assert.equal(await page.evaluate(()=>document.activeElement?.getAttribute('role')),'region');
     assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1));
     assert.equal(await page.locator('table caption').textContent(),'各模型超时设置，单位为秒，可横向滚动查看');
+    await page.setViewportSize({width:320,height:844});
+    assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1));
+    assert(await page.locator('tbody th').first().evaluate(el=>el.getBoundingClientRect().width>=2*parseFloat(getComputedStyle(el).fontSize)),'parameter labels must not collapse into single-character columns');
+    assert.equal(await page.locator('tbody th').first().evaluate(el=>getComputedStyle(el).whiteSpace),'nowrap','parameter names and bounds stay together in the scrolling table');
+    assert(await page.getByRole('region',{name:'超时设置表（可横向滚动）'}).evaluate(el=>{el.scrollLeft=40;return el.scrollLeft>0;}),'wide settings table must retain local horizontal scrolling');
     console.log('PASS: global refresh keeps runtime draft, explicit read discards it; narrow table has keyboard focus and accessible caption');
     assert.deepEqual(errors,[]);assert.deepEqual(serverErrors,[]);
     console.log('PASS: uncertain/malformed receipts preserve drafts and require GET reconciliation without duplicate POST; no browser/server errors');

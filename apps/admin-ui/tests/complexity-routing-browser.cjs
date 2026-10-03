@@ -6,7 +6,7 @@ const fixture = require('./fixture-api.cjs')();
 fixture.config.models[0].fallback_chain = [{provider_id:'fixture-openai',target_model:'fixture-answer'}];
 const files = new Map(), writes = [], previews = [], serverErrors = [], externalRequests = [];
 let config = {revision:'routing-r1', classifier:null, policies:[], audit:[]};
-let status = {retained_decisions:0,budget:{day:20000,calls:0,cost_micro_cny:0},recent_decisions:[]};
+let status = {retained_decisions:0,budget:{day:0,calls:0,cost_micro_cny:0},recent_decisions:[]};
 let readMode = 'hold', writeMode = 'success', previewMode = 'success', referenceFail = false, releaseRead, releaseWrite, releasePreview;
 const server = http.createServer(async (req, res) => {
   const reply = (value, code = 200) => {res.writeHead(code, {'Content-Type':'application/json'});res.end(JSON.stringify(value));};
@@ -98,12 +98,16 @@ const server = http.createServer(async (req, res) => {
     readMode='success';await button('重新读取').click();await reason.waitFor();await idle();
     assert.equal(new URL(page.url()).hash,'#/routing');assert.equal(await page.title(),'智能分流 · Superkiro');
     await page.getByText('暂无分流策略，所有模型使用原路由。',{exact:true}).waitFor();await page.getByText('暂无分类记录。',{exact:true}).waitFor();
+    await page.getByText('预算日期：尚未开始',{exact:false}).waitFor();
+    assert.equal(await page.getByText('1970-01-01',{exact:false}).count(),0);
+    status.budget.day=20000;
     assert.equal(await button('快速关停全部').isDisabled(),true);
     console.log('PASS: authenticated navigation, explicit loading, failed/malformed reads, retry and empty states');
 
     await page.getByText('保留记录：0 / 20000 条', {exact:false}).waitFor();
     status.retained_decisions=20000; await button('重新读取').click();
     await page.getByRole('status').filter({hasText:'记录容量已满'}).waitFor();
+    await page.getByText('预算日期：2024-10-04（UTC）',{exact:false}).waitFor();
     status.retained_decisions=0; await button('重新读取').click();
     await page.getByText('保留记录：0 / 20000 条', {exact:false}).waitFor();
     await field('配置分类器（不自动开启任何模型）').check();

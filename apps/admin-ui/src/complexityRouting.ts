@@ -143,6 +143,7 @@ const reasons: Record<string, string> = {
 };
 export const decisionReason = (reason: string) => reasons[reason] ?? '服务器返回了未识别原因，请结合模式与结果人工核查';
 export function budgetDay(day: number): string {
+  if (day === 0) return '尚未开始';
   const date = new Date(day * 86400000);
   return Number.isSafeInteger(day) && Number.isFinite(date.getTime()) ? date.toISOString().slice(0, 10) + '（UTC）' : '日期不可用';
 }
