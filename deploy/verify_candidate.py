@@ -27,7 +27,7 @@ try:
     check('New image running and healthy', out.read().decode().strip() == release['image'] + ' healthy')
     sftp = ssh.open_sftp()
     for name in ['gateway.env', 'caddy.env', 'root.crt']:
-        old = sftp.open(release['backup'] + '/configuration/' + name).read()
+        old = sftp.open(release['backup'].replace('/backups/release-', '/config-backups/release-') + '/' + name).read()
         current = sftp.open('/etc/kiro-byok/' + name).read()
         check('Unchanged protected configuration: ' + name, old == current)
     web = json.loads(sftp.open('/etc/kiro-byok/admin-access.json').read())
