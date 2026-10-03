@@ -175,6 +175,15 @@ impl ModelProvider for OpenAiProvider {
 
         if let Some(effort) = req.reasoning_effort {
             use kiro_wire::requests::conversation::ReasoningEffort::*;
+            // Kimera's GPT-6 Astra route currently rejects `reasoning_effort=medium`
+            // on full Kiro requests, while the same route accepts the equivalent high
+            // effort request. Keep the client/billing effort unchanged and normalize only
+            // the upstream wire value for this one compatibility quirk.
+            let effort = if req.model.eq_ignore_ascii_case("gpt-6-astra") && effort == Medium {
+                High
+            } else {
+                effort
+            };
             body["reasoning_effort"] = serde_json::json!(match effort {
                 Low => "low",
                 Medium => "medium",

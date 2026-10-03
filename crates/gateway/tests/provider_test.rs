@@ -470,6 +470,20 @@ fn kiro_tool_schemas_reach_the_upstream_unwrapped() {
 }
 
 #[test]
+fn gpt6_astra_medium_effort_uses_compatible_upstream_value() {
+    use kiro_wire::requests::conversation::ReasoningEffort;
+
+    let mut request = create_test_request("gpt-6-astra");
+    request.reasoning_effort = Some(ReasoningEffort::Medium);
+    let body = OpenAiProvider.translate_request(&request).unwrap();
+    assert_eq!(body["reasoning_effort"], "high");
+
+    request.model = "gpt-5.6-sol".into();
+    let body = OpenAiProvider.translate_request(&request).unwrap();
+    assert_eq!(body["reasoning_effort"], "medium");
+}
+
+#[test]
 fn a_thinking_signature_reaches_the_stream_and_replays_only_to_its_model() {
     use gateway::provider::{ProviderOptions, ThinkingBlock};
     let events = AnthropicProvider
